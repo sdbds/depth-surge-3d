@@ -1030,6 +1030,28 @@
                                 <option value="cpu">Force CPU</option>
                             </select>
                         </div>
+                        <div class="mb-3">
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="sceneDetection" checked>
+                                <label class="form-check-label" for="sceneDetection">Scene Detection</label>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="sceneCutThreshold">Scene Cut Threshold</label>
+                            <input type="number" class="form-control" id="sceneCutThreshold" value="0.55" step="0.05" min="0" max="1">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="minSceneFrames">Minimum Scene Frames</label>
+                            <input type="number" class="form-control" id="minSceneFrames" value="8" step="1" min="1">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="rawStorageDtype">Raw Depth Storage</label>
+                            <select class="form-select" id="rawStorageDtype">
+                                <option value="auto" selected>Auto</option>
+                                <option value="float16">Float16</option>
+                                <option value="float32">Float32</option>
+                            </select>
+                        </div>
                     </div>
 
                     <!-- Step 3: Stereo Pair Generation -->
@@ -1039,16 +1061,30 @@
                             <h6 class="step-title">Stereo Pair Generation</h6>
                         </div>
                         <div class="mb-3">
-                            <label class="form-label">Stereo Baseline <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Controls 3D strength. Larger = stronger 3D effect but more artifacts. Start with 0.035-0.05 for subtle, clean results."></i></label>
-                            <input type="number" class="form-control" id="baseline" value="0.065" step="0.005" min="0.02" max="0.15">
-                            <small class="form-text text-muted">Distance between virtual cameras in meters (0.02-0.15, default: 0.065 = average human IPD)
-                            <br><strong>Tip:</strong> Reduce to 0.035-0.05 if you see artifacts or warping</small>
+                            <label class="form-label" for="stereoStrength">Stereo Strength</label>
+                            <input type="number" class="form-control" id="stereoStrength" value="2.0" step="0.1" min="0" max="5">
                         </div>
                         <div class="mb-3">
-                            <label class="form-label">Focal Length <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Works with baseline to control depth perception. Higher = stronger depth separation. Lower = gentler transitions."></i></label>
-                            <input type="number" class="form-control" id="focalLength" value="1000" step="50" min="500" max="2000">
-                            <small class="form-text text-muted">Virtual camera focal length (500-2000px, default: 1000)
-                            <br><strong>Conservative:</strong> 700-800 | <strong>Aggressive:</strong> 1200-1500</small>
+                            <label class="form-label" for="convergence">Convergence</label>
+                            <input type="number" class="form-control" id="convergence" value="0.5" step="0.05" min="0" max="1">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="occlusionFill">Occlusion Fill</label>
+                            <select class="form-select" id="occlusionFill">
+                                <option value="background" selected>Background propagation</option>
+                                <option value="none">None</option>
+                            </select>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="stereoIoWorkers">Stereo I/O Workers</label>
+                            <input type="number" class="form-control" id="stereoIoWorkers" value="4" step="1" min="1" max="16">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="migrateLegacy">Legacy Resume Data</label>
+                            <select class="form-select" id="migrateLegacy">
+                                <option value="archive" selected>Archive</option>
+                                <option value="delete">Delete explicitly</option>
+                            </select>
                         </div>
                         <div class="mb-3">
                             <label class="form-label">3D Strength Presets</label>
@@ -1083,7 +1119,7 @@
                                 <option value="equidistant">Equidistant (f*θ)</option>
                                 <option value="stereographic" selected>Stereographic (2f*tan(θ/2))</option>
                                 <option value="equisolid">Equisolid Angle (2f*sin(θ/2))</option>
-                                <option value="orthographic">Orthographic (f*sin(θ))</option>
+                                <option value="orthogonal">Orthographic (f*sin(θ))</option>
                             </select>
                             <small class="form-text text-muted">Mathematical projection model for fisheye lens</small>
                         </div>
@@ -1116,16 +1152,6 @@
     <i class="fas fa-search-plus"></i> Zoom/crop for fisheye projection (hemispherical to fit VR display)<br>
     <strong>0.5</strong> = zoomed in (hides edges) | <strong>0.7</strong> = balanced (default) | <strong>1.0</strong> = full circle | <strong>>1.0</strong> = show more FOV
 </small>
-                        </div>
-                        <div class="mb-3">
-                            <label class="form-label">Hole Filling Quality <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Higher quality uses multi-pass inpainting with adaptive parameters and edge preservation for best stereo quality."></i></label>
-                            <select class="form-select" id="holeFillQuality">
-                                <option value="fast" selected>Fast (Quick TELEA inpainting)</option>
-                                <option value="advanced">Advanced (Navier-Stokes + bilateral filter)</option>
-                                <option value="high">High (Multi-pass + edge preservation)</option>
-                            </select>
-                            <small class="form-text text-muted">Balance between processing speed and stereo quality
-                            <br><strong>Warning:</strong> Advanced is 3-5x slower with often minimal visual improvement</small>
                         </div>
                         <div class="step-indicator">Cropping removes edge artifacts from stereo generation</div>
                     </div>
@@ -2137,12 +2163,18 @@
             const settings = {
                 start_time: document.getElementById('startTime').value || null,
                 end_time: document.getElementById('endTime').value || null,
-                resolution: document.getElementById('resolution').value,
                 target_fps: document.getElementById('targetFps').value === 'original' ? null : parseInt(document.getElementById('targetFps').value),
                 vr_format: document.getElementById('vrFormat').value,
                 vr_resolution: vrResolution,
-                baseline: parseFloat(document.getElementById('baseline').value),
-                focal_length: parseInt(document.getElementById('focalLength').value),
+                stereo_strength: parseFloat(document.getElementById('stereoStrength').value),
+                convergence: parseFloat(document.getElementById('convergence').value),
+                occlusion_fill: document.getElementById('occlusionFill').value,
+                scene_detection: document.getElementById('sceneDetection').checked,
+                scene_cut_threshold: parseFloat(document.getElementById('sceneCutThreshold').value),
+                min_scene_frames: parseInt(document.getElementById('minSceneFrames').value),
+                raw_storage_dtype: document.getElementById('rawStorageDtype').value,
+                stereo_io_workers: parseInt(document.getElementById('stereoIoWorkers').value),
+                migrate_legacy: document.getElementById('migrateLegacy').value,
                 preserve_audio: document.getElementById('preserveAudio').checked,
                 keep_intermediates: document.getElementById('keepIntermediates').checked,
                 video_encoder: document.getElementById('videoEncoder').value,
@@ -2159,7 +2191,6 @@
                 fisheye_fov: parseFloat(document.getElementById('fisheyeFov').value),
                 crop_factor: document.getElementById('cropFactor') ? parseFloat(document.getElementById('cropFactor').value) : 0.7,
                 fisheye_crop_factor: parseFloat(document.getElementById('fisheyeCropFactor').value),
-                hole_fill_quality: document.getElementById('holeFillQuality').value,
                 upscale_model: document.getElementById('applyUpscaling').checked ? document.getElementById('upscaleModel').value : 'none',
                 experimental_frame_interpolation: document.getElementById('experimentalFrameInterpolation').checked,
                 enable_live_preview: document.getElementById('enableLivePreview').checked,
@@ -2942,7 +2973,7 @@
 
         // Settings persistence functions
         function saveSettings() {
-            const SETTINGS_VERSION = 2; // Must match version in loadSettings()
+            const SETTINGS_VERSION = 3; // Must match version in loadSettings()
             const settings = {
                 version: SETTINGS_VERSION,
                 // Time range
@@ -2952,8 +2983,15 @@
                 // VR settings
                 vrFormat: document.getElementById('vrFormat').value,
                 vrResolution: document.getElementById('vrResolution').value,
-                baseline: document.getElementById('baseline').value,
-                focalLength: document.getElementById('focalLength').value,
+                stereoStrength: document.getElementById('stereoStrength').value,
+                convergence: document.getElementById('convergence').value,
+                occlusionFill: document.getElementById('occlusionFill').value,
+                sceneDetection: document.getElementById('sceneDetection').checked,
+                sceneCutThreshold: document.getElementById('sceneCutThreshold').value,
+                minSceneFrames: document.getElementById('minSceneFrames').value,
+                rawStorageDtype: document.getElementById('rawStorageDtype').value,
+                stereoIoWorkers: document.getElementById('stereoIoWorkers').value,
+                migrateLegacy: document.getElementById('migrateLegacy').value,
                 
                 // Video enhancement
                 resolution: document.getElementById('resolution').value,
@@ -2974,7 +3012,6 @@
                 fisheyeFov: document.getElementById('fisheyeFov').value,
                 cropFactor: document.getElementById('cropFactor').value,
                 fisheyeCropFactor: document.getElementById('fisheyeCropFactor').value,
-                holeFillQuality: document.getElementById('holeFillQuality').value,
                 applyUpscaling: document.getElementById('applyUpscaling').checked,
                 upscaleModel: document.getElementById('upscaleModel').value,
 
@@ -2986,7 +3023,7 @@
         }
         
         function loadSettings() {
-            const SETTINGS_VERSION = 2; // Increment to force reset of old settings
+            const SETTINGS_VERSION = 3; // Increment to force reset of old settings
             const savedSettings = localStorage.getItem('stereoProjectorSettings');
             if (!savedSettings) return;
 
@@ -3035,8 +3072,15 @@
                 endTime: '',
                 vrFormat: 'side_by_side',
                 vrResolution: 'auto',
-                baseline: '0.065',
-                focalLength: '1000',
+                stereoStrength: '2.0',
+                convergence: '0.5',
+                occlusionFill: 'background',
+                sceneDetection: true,
+                sceneCutThreshold: '0.55',
+                minSceneFrames: '8',
+                rawStorageDtype: 'auto',
+                stereoIoWorkers: '4',
+                migrateLegacy: 'archive',
                 resolution: 'original',
                 targetFps: 'original',
                 superSample: 'auto',
@@ -3052,7 +3096,6 @@
                 fisheyeFov: '180',
                 cropFactor: '1.0',
                 fisheyeCropFactor: '0.7',
-                holeFillQuality: 'fast',
                 applyUpscaling: false,
                 upscaleModel: 'x2'
             };
@@ -3084,10 +3127,11 @@
         // Auto-save settings when they change
         function setupAutoSave() {
             const settingsElements = [
-                'startTime', 'endTime', 'vrFormat', 'vrResolution', 'baseline', 'focalLength',
+                'startTime', 'endTime', 'vrFormat', 'vrResolution', 'stereoStrength', 'convergence', 'occlusionFill',
+                'sceneDetection', 'sceneCutThreshold', 'minSceneFrames', 'rawStorageDtype', 'stereoIoWorkers', 'migrateLegacy',
                 'resolution', 'targetFps', 'superSample', 'device', 'modelSize', 'depthModelType', 'depthResolution', 'videoEncoder',
                 'preserveAudio', 'keepIntermediates', 'applyDistortion', 'fisheyeProjection', 'fisheyeFov', 'cropFactor',
-                'fisheyeCropFactor', 'holeFillQuality', 'applyUpscaling', 'upscaleModel', 'experimentalFrameInterpolation'
+                'fisheyeCropFactor', 'applyUpscaling', 'upscaleModel', 'experimentalFrameInterpolation'
             ];
             
             settingsElements.forEach(id => {
@@ -3101,25 +3145,25 @@
         
         // 3D Strength preset functions
         function set3DPreset(preset) {
-            const baselineEl = document.getElementById('baseline');
-            const focalLengthEl = document.getElementById('focalLength');
-            const holeFillEl = document.getElementById('holeFillQuality');
+            const strengthEl = document.getElementById('stereoStrength');
+            const convergenceEl = document.getElementById('convergence');
+            const fillEl = document.getElementById('occlusionFill');
             
             switch(preset) {
                 case 'subtle':
-                    baselineEl.value = '0.035';
-                    focalLengthEl.value = '700';
-                    holeFillEl.value = 'fast';
+                    strengthEl.value = '1.0';
+                    convergenceEl.value = '0.5';
+                    fillEl.value = 'background';
                     break;
                 case 'balanced':
-                    baselineEl.value = '0.065';
-                    focalLengthEl.value = '1000';
-                    holeFillEl.value = 'fast';
+                    strengthEl.value = '2.0';
+                    convergenceEl.value = '0.5';
+                    fillEl.value = 'background';
                     break;
                 case 'strong':
-                    baselineEl.value = '0.10';
-                    focalLengthEl.value = '1200';
-                    holeFillEl.value = 'fast';
+                    strengthEl.value = '3.5';
+                    convergenceEl.value = '0.45';
+                    fillEl.value = 'background';
                     break;
             }
             saveSettings(); // Save the new values

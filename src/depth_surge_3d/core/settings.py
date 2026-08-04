@@ -29,6 +29,7 @@ _OPTIONAL_SETTING_NAMES = {
     "denoising_steps",
     "seed",
     "processing_mode",
+    "video_encoder",
     "per_eye_width",
     "per_eye_height",
     "vr_output_width",
@@ -50,7 +51,7 @@ _EXISTING_BOOLEAN_SETTINGS = {
 }
 _EXISTING_CHOICE_SETTINGS = {
     "vr_format": {"side_by_side", "over_under"},
-    "fisheye_projection": {"equidistant", "equisolid", "stereographic"},
+    "fisheye_projection": {"equidistant", "equisolid", "orthogonal", "stereographic"},
     "super_sample": {"auto", "none", "1080p", "4k"},
     "upscale_model": {"none", "x2", "x4", "x4-conservative"},
 }
@@ -197,6 +198,8 @@ def _validate_optional_setting(name: str, value: object) -> Any:
         return _validate_depth_resolution(value)
     if name in {"device", "processing_mode"}:
         return _validate_optional_mode(name, value)
+    if name == "video_encoder":
+        return _choice(name, value, {"auto", "libx264", "nvenc"})
     raise ValueError(f"unknown setting: {name}")
 
 

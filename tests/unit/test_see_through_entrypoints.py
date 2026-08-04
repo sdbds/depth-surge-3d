@@ -106,6 +106,8 @@ def test_web_resume_restores_saved_processing_settings(tmp_path):
     saved_settings = {
         "depth_model_version": "see_through",
         "depth_resolution": "768",
+        "stereo_strength": 3.0,
+        "convergence": 0.4,
         "baseline": 0.04,
         "focal_length": 800,
         "apply_distortion": False,
@@ -119,7 +121,77 @@ def test_web_resume_restores_saved_processing_settings(tmp_path):
     result = web_app.detect_resume_settings(tmp_path)
 
     for key, value in saved_settings.items():
+        if key in {"baseline", "focal_length"}:
+            continue
         assert result[key] == value
+    assert "baseline" not in result
+    assert "focal_length" not in result
+
+
+def test_web_process_validates_final_settings_before_starting(tmp_path):
+    import app as web_app
+
+    output_root = tmp_path / "output"
+    output_dir = output_root / "job"
+    output_dir.mkdir(parents=True)
+    source_video = output_dir / "source.mp4"
+    source_video.touch()
+    web_app.app.config["OUTPUT_FOLDER"] = str(output_root)
+    web_app.current_processing.update(
+        {"active": False, "session_id": None, "thread": None, "stop_requested": False}
+    )
+    settings = {
+        "stereo_strength": 3.0,
+        "convergence": 0.4,
+        "occlusion_fill": "none",
+        "scene_detection": False,
+        "scene_cut_threshold": 0.7,
+        "min_scene_frames": 12,
+        "raw_storage_dtype": "float32",
+        "stereo_io_workers": 3,
+        "migrate_legacy": "archive",
+    }
+
+    with (
+        patch.object(web_app, "find_source_video", return_value=source_video),
+        patch.object(web_app.socketio, "start_background_task", return_value=MagicMock()) as start,
+    ):
+        response = web_app.app.test_client().post(
+            "/process",
+            json={"output_dir": str(output_dir), "settings": settings},
+        )
+
+    assert response.status_code == 200
+    validated = start.call_args.args[3]
+    for key, value in settings.items():
+        assert validated[key] == value
+
+
+def test_web_process_rejects_removed_explicit_settings(tmp_path):
+    import app as web_app
+
+    output_root = tmp_path / "output"
+    output_dir = output_root / "job"
+    output_dir.mkdir(parents=True)
+    source_video = output_dir / "source.mp4"
+    source_video.touch()
+    web_app.app.config["OUTPUT_FOLDER"] = str(output_root)
+    web_app.current_processing.update(
+        {"active": False, "session_id": None, "thread": None, "stop_requested": False}
+    )
+
+    with (
+        patch.object(web_app, "find_source_video", return_value=source_video),
+        patch.object(web_app.socketio, "start_background_task") as start,
+    ):
+        response = web_app.app.test_client().post(
+            "/process",
+            json={"output_dir": str(output_dir), "settings": {"baseline": 0.065}},
+        )
+
+    assert response.status_code == 400
+    assert "removed setting" in response.get_json()["error"]
+    start.assert_not_called()
 
 
 def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp_path, monkeypatch):
@@ -136,7 +208,7 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
         "device": "cuda",
         "denoising_steps": 4,
         "seed": 1026,
-        "baseline": 0.04,
+        "stereo_strength": 3.0,
         "keep_intermediates": False,
         "vr_format": "side_by_side",
     }
@@ -174,7 +246,7 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
     resume_kwargs = projector.process_video.call_args.kwargs
     assert resume_kwargs["video_path"] == "source.mkv"
     assert resume_kwargs["output_dir"] == str(tmp_path)
-    assert resume_kwargs["baseline"] == 0.04
+    assert resume_kwargs["stereo_strength"] == 3.0
     assert resume_kwargs["keep_intermediates"] is False
     for metadata_key in (
         "depth_model_version",

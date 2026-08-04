@@ -67,6 +67,7 @@ from src.depth_surge_3d.utils.system.console import warning as console_warning  
 from src.depth_surge_3d.inference.depth.video_depth_estimator_see_through import (  # noqa: E402
     DEFAULT_SEE_THROUGH_REPO,
 )
+from src.depth_surge_3d.core.settings import validate_settings  # noqa: E402
 
 from flask import Flask, render_template, request, jsonify  # noqa: E402
 from flask_socketio import SocketIO  # noqa: E402
@@ -83,6 +84,18 @@ from depth_surge_3d.processing import VideoProcessor  # noqa: E402
 VERBOSE = False
 SHUTDOWN_FLAG = False
 ACTIVE_PROCESSES = set()
+
+
+def _validate_web_settings(settings: dict[str, Any], *, source: str) -> dict[str, Any]:
+    """Validate Web settings while preserving null as source-frame FPS."""
+    preserve_source_fps = settings.get("target_fps", object()) is None
+    values = dict(settings)
+    if preserve_source_fps:
+        values.pop("target_fps")
+    validated = validate_settings(values, source=source)
+    if preserve_source_fps:
+        validated["target_fps"] = None
+    return validated
 
 
 def vprint(*args: Any, **kwargs: Any) -> None:
@@ -1157,6 +1170,11 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:
     output_dir_str = data.get("output_dir")
     settings = data.get("settings", {})
 
+    try:
+        settings = _validate_web_settings(settings, source="explicit")
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
     if not output_dir_str:
         return jsonify({"error": "No output directory provided"}), 400
 
@@ -1265,22 +1283,10 @@ def resume_processing():
 
 def detect_resume_settings(output_path):
     """Detect processing settings from existing output directory"""
-    settings = {
-        "vr_format": "side_by_side",
-        "baseline": 0.065,
-        "focal_length": 1000,
-        "preserve_audio": True,
-        "keep_intermediates": True,
-        "device": "auto",
-        "super_sample": "auto",
-        "apply_distortion": True,
-        "fisheye_projection": "stereographic",
-        "fisheye_fov": 105,
-        "crop_factor": 1.0,
-        "vr_resolution": "auto",
-        "fisheye_crop_factor": 1.0,
-        "hole_fill_quality": "fast",
-    }
+    settings = _validate_web_settings(
+        {"device": "auto", "target_fps": None},
+        source="explicit",
+    )
 
     # A resume must use the exact model and geometry from the interrupted run.
     # Directory-shape inference is only a fallback for legacy jobs without metadata.
@@ -1295,8 +1301,7 @@ def detect_resume_settings(output_path):
         saved_data = load_processing_settings(settings_file)
         saved_settings = saved_data.get("processing_settings") if saved_data else None
         if isinstance(saved_settings, dict):
-            settings.update(saved_settings)
-            return settings
+            return _validate_web_settings(saved_settings, source="legacy_disk")
 
     # Try to detect VR format from directory structure
     if (output_path / INTERMEDIATE_DIRS["vr_frames"]).exists():
