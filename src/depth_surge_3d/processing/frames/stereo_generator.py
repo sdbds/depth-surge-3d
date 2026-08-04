@@ -15,11 +15,40 @@ from pathlib import Path
 from typing import Any
 
 from ...utils import (
-    depth_to_disparity,
     create_shifted_image,
     hole_fill_image,
 )
 from ...core.constants import PREVIEW_FRAME_SAMPLE_RATE
+from .depth_storage import canonical_json_hash
+
+
+CANONICAL_DEPTH_SCHEMA_VERSION = 1
+CANONICAL_DEPTH_ALGORITHM_VERSION = "scene-percentile-v1"
+CANONICAL_METADATA_REQUIRED_FIELDS = {
+    "source_raw_fingerprint",
+    "source_model_fingerprint",
+    "scene_manifest_fingerprint",
+    "depth_bounds_fingerprint",
+    "native_shape",
+}
+
+
+def _canonical_to_signed_pixel_disparity(
+    canonical: np.ndarray,
+    *,
+    render_width: int,
+    stereo_strength: float,
+    convergence: float,
+) -> np.ndarray:
+    """Convert canonical relative disparity to signed target-pixel disparity."""
+    values = np.asarray(canonical, dtype=np.float32)
+    if not np.isfinite(values).all():
+        raise ValueError("Canonical disparity must be finite")
+    return (
+        (values - np.float32(convergence))
+        * np.float32(render_width)
+        * np.float32(stereo_strength / 100.0)
+    )
 
 
 def _process_single_stereo_pair(
@@ -47,16 +76,21 @@ def _process_single_stereo_pair(
             interpolation=cv2.INTER_LINEAR,
         )
 
-    # Create stereo pair
-    disparity_map = depth_to_disparity(depth_map, settings["baseline"], settings["focal_length"])
+    disparity_map = _canonical_to_signed_pixel_disparity(
+        depth_map,
+        render_width=frame_width,
+        stereo_strength=float(settings.get("stereo_strength", 2.0)),
+        convergence=float(settings.get("convergence", 0.5)),
+    )
 
     left_img = create_shifted_image(frame, disparity_map, "left")
     right_img = create_shifted_image(frame, disparity_map, "right")
 
     # Apply hole filling
-    if settings["hole_fill_quality"] in ["fast", "advanced"]:
-        left_img = hole_fill_image(left_img, method=settings["hole_fill_quality"])
-        right_img = hole_fill_image(right_img, method=settings["hole_fill_quality"])
+    hole_fill_quality = settings.get("hole_fill_quality", "none")
+    if hole_fill_quality in ["fast", "advanced"]:
+        left_img = hole_fill_image(left_img, method=hole_fill_quality)
+        right_img = hole_fill_image(right_img, method=hole_fill_quality)
 
     # Save if paths provided
     if left_path:
@@ -71,7 +105,7 @@ def _process_single_stereo_pair_from_files(
     args: tuple[str, str, str, str, str, dict[str, Any], float | None],
 ) -> str:
     """Load one frame/depth pair, write stereo outputs, and return only its name."""
-    frame_path, depth_path, frame_name, left_path, right_path, settings, depth_scale = args
+    frame_path, depth_path, frame_name, left_path, right_path, settings, encoding_scale = args
     frame = cv2.imread(frame_path, cv2.IMREAD_COLOR)
     depth_map = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
     if frame is None:
@@ -79,10 +113,12 @@ def _process_single_stereo_pair_from_files(
     if depth_map is None:
         raise OSError(f"Could not load depth map: {depth_path}")
 
-    if depth_scale is None:
-        depth_scale = 65535.0 if depth_map.dtype == np.uint16 else 255.0
-    depth_float = depth_map.astype(np.float32) / depth_scale
-    _process_single_stereo_pair((frame, depth_float, frame_name, left_path, right_path, settings))
+    if depth_map.dtype != np.uint16:
+        raise TypeError(f"Canonical disparity must be uint16: {depth_path}")
+    if encoding_scale is None:
+        raise ValueError("Canonical disparity encoding scale is required")
+    canonical = depth_map.astype(np.float32) / np.float32(encoding_scale)
+    _process_single_stereo_pair((frame, canonical, frame_name, left_path, right_path, settings))
     return frame_name
 
 
@@ -212,7 +248,7 @@ class StereoPairGenerator:
             right_dir = directories["right_frames"]
             left_dir.mkdir(parents=True, exist_ok=True)
             right_dir.mkdir(parents=True, exist_ok=True)
-            depth_scale = self._get_depth_file_scale(depth_files)
+            metadata = self._get_canonical_metadata(depth_files, frame_files)
 
             args_list, completed = self._build_file_work_items(
                 frame_files,
@@ -220,7 +256,7 @@ class StereoPairGenerator:
                 left_dir,
                 right_dir,
                 settings,
-                depth_scale,
+                float(metadata["encoding_scale"]),
             )
 
             if not args_list:
@@ -263,7 +299,7 @@ class StereoPairGenerator:
         left_dir: Path,
         right_dir: Path,
         settings: dict[str, Any],
-        depth_scale: float | None,
+        encoding_scale: float,
     ) -> tuple[list[tuple[str, str, str, str, str, dict[str, Any], float | None]], int]:
         args_list = []
         completed = 0
@@ -282,21 +318,60 @@ class StereoPairGenerator:
                     str(left_path),
                     str(right_path),
                     settings,
-                    depth_scale,
+                    encoding_scale,
                 )
             )
         return args_list, completed
 
     @staticmethod
-    def _get_depth_file_scale(depth_files: list[Path]) -> float | None:
-        """Read cache encoding metadata once; local depth PNGs use dtype-based scaling."""
+    def _get_canonical_metadata(depth_files: list[Path], frame_files: list[Path]) -> dict[str, Any]:
+        """Load and validate the required local canonical disparity contract."""
         if not depth_files:
-            return None
+            raise ValueError("Canonical disparity files are required")
         metadata_file = depth_files[0].parent / "metadata.json"
         if not metadata_file.is_file():
-            return None
+            raise ValueError(f"Canonical disparity metadata is missing: {metadata_file}")
         try:
             metadata = json.loads(metadata_file.read_text())
-            return float(metadata.get("depth_scale", 1000.0))
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            return None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError(f"Canonical disparity metadata is invalid: {metadata_file}") from error
+
+        fingerprint = metadata.get("fingerprint")
+        unhashed = {key: value for key, value in metadata.items() if key != "fingerprint"}
+        valid = (
+            CANONICAL_METADATA_REQUIRED_FIELDS.issubset(metadata)
+            and metadata.get("schema_version") == CANONICAL_DEPTH_SCHEMA_VERSION
+            and metadata.get("algorithm_version") == CANONICAL_DEPTH_ALGORITHM_VERSION
+            and metadata.get("representation") == "relative_disparity"
+            and metadata.get("near_value") == 1.0
+            and metadata.get("far_value") == 0.0
+            and metadata.get("encoding") == "uint16_png"
+            and metadata.get("encoding_scale") == 65535.0
+            and metadata.get("num_frames") == len(depth_files)
+            and metadata.get("frame_names") == [path.name for path in frame_files]
+            and isinstance(fingerprint, str)
+            and fingerprint == canonical_json_hash(unhashed)
+        )
+        if not valid:
+            raise ValueError("Canonical disparity metadata does not match this render input")
+
+        expected_paths = [
+            metadata_file.parent / f"{Path(frame_name).stem}.png"
+            for frame_name in metadata["frame_names"]
+        ]
+        if [path.resolve() for path in depth_files] != [path.resolve() for path in expected_paths]:
+            raise ValueError("Canonical disparity files do not match the metadata path manifest")
+
+        native_shape = tuple(int(value) for value in metadata["native_shape"])
+        if len(native_shape) != 2 or any(value < 1 for value in native_shape):
+            raise ValueError("Canonical disparity metadata has an invalid native shape")
+        for path in depth_files:
+            payload = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if (
+                payload is None
+                or payload.dtype != np.uint16
+                or payload.ndim != 2
+                or payload.shape != native_shape
+            ):
+                raise ValueError(f"Canonical disparity payload does not match metadata: {path}")
+        return metadata

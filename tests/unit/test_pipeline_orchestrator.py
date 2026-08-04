@@ -249,7 +249,7 @@ class TestExecutePipeline:
         directories = {
             "base": tmp_path,
             "frames": tmp_path / "frames",
-            "depth_maps": tmp_path / "depth",
+            "disparity_maps": tmp_path / "disparity",
             "left_frames": tmp_path / "left",
             "right_frames": tmp_path / "right",
             "left_cropped": tmp_path / "left_cropped",
@@ -276,7 +276,10 @@ class TestExecutePipeline:
             video_encoder,
         )
 
-        with patch.object(orchestrator, "_finalize_processing"):
+        with (
+            patch.object(orchestrator, "_finalize_processing"),
+            patch.object(orchestrator, "_print_saved_to") as saved_to,
+        ):
             result = orchestrator._execute_pipeline(
                 "source.mp4",
                 tmp_path,
@@ -288,6 +291,7 @@ class TestExecutePipeline:
         assert result is True
         depth_processor.generate_depth_map_files.assert_called_once()
         stereo_generator.create_stereo_pairs_from_files.assert_called_once()
+        saved_to.assert_any_call(directories["disparity_maps"], "Canonical disparity maps")
 
 
 class TestHandleStepError:

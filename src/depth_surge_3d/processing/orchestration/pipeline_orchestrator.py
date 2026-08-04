@@ -167,14 +167,14 @@ class ProcessingOrchestrator:
 
         fps = video_properties.get("fps", 30.0)
 
-        # Step 2: Generate depth maps (delegated to depth_processor)
+        # Step 2: Generate canonical disparity maps (delegated to depth_processor)
         depth_files = self.depth_processor.generate_depth_map_files(
             frame_files, settings, directories, progress_tracker
         )
         if depth_files is None:
             return False
-        print(step_complete(f"Step 2: Prepared {len(depth_files)} depth maps"))
-        self._print_saved_to(directories.get("depth_maps"), "Depth maps")
+        print(step_complete(f"Step 2: Prepared {len(depth_files)} canonical disparity maps"))
+        self._print_saved_to(directories.get("disparity_maps"), "Canonical disparity maps")
         print()  # Blank line after step
 
         # Execute steps 3-8

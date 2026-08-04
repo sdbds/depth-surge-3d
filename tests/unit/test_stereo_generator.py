@@ -2,19 +2,79 @@
 
 import pytest
 import cv2
+import json
 import numpy as np
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from src.depth_surge_3d.processing.frames.stereo_generator import (
     StereoPairGenerator,
+    _canonical_to_signed_pixel_disparity,
     _process_single_stereo_pair,
 )
 from src.depth_surge_3d.processing.frames import stereo_generator
+from src.depth_surge_3d.processing.frames.depth_storage import canonical_json_hash
+
+
+def _write_canonical_metadata(depth_dir: Path, frame_names: list[str], shape=(8, 8)) -> None:
+    metadata = {
+        "schema_version": 1,
+        "algorithm_version": "scene-percentile-v1",
+        "representation": "relative_disparity",
+        "near_value": 1.0,
+        "far_value": 0.0,
+        "encoding": "uint16_png",
+        "encoding_scale": 65535.0,
+        "num_frames": len(frame_names),
+        "frame_names": frame_names,
+        "native_shape": list(shape),
+        "source_raw_fingerprint": "raw",
+        "source_model_fingerprint": "model",
+        "scene_manifest_fingerprint": "scene",
+        "depth_bounds_fingerprint": "bounds",
+    }
+    metadata["fingerprint"] = canonical_json_hash(metadata)
+    (depth_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
 
 class TestProcessSingleStereoPair:
     """Test _process_single_stereo_pair worker function."""
+
+    def test_canonical_disparity_uses_target_width_strength_and_convergence(self):
+        canonical = np.array([[0.0, 0.5, 1.0]], dtype=np.float32)
+
+        disparity = _canonical_to_signed_pixel_disparity(
+            canonical,
+            render_width=200,
+            stereo_strength=2.0,
+            convergence=0.5,
+        )
+
+        np.testing.assert_allclose(disparity, [[-2.0, 0.0, 2.0]])
+
+    def test_near_marker_is_rightward_in_left_eye(self):
+        frame = np.zeros((5, 100, 3), dtype=np.uint8)
+        frame[:, 50] = 255
+        canonical = np.ones((5, 100), dtype=np.float32)
+
+        left, right, _ = _process_single_stereo_pair(
+            (
+                frame,
+                canonical,
+                "frame_0000",
+                None,
+                None,
+                {
+                    "stereo_strength": 4.0,
+                    "convergence": 0.5,
+                    "hole_fill_quality": "none",
+                },
+            )
+        )
+
+        left_x = int(np.argmax(left[2, :, 0]))
+        right_x = int(np.argmax(right[2, :, 0]))
+        assert left_x > right_x
 
     def test_process_pair_basic(self, tmp_path):
         """Test basic stereo pair processing."""
@@ -32,7 +92,7 @@ class TestProcessSingleStereoPair:
         }
 
         with patch(
-            "src.depth_surge_3d.processing.frames.stereo_generator.depth_to_disparity"
+            "src.depth_surge_3d.processing.frames.stereo_generator._canonical_to_signed_pixel_disparity"
         ) as mock_disp:
             with patch(
                 "src.depth_surge_3d.processing.frames.stereo_generator.create_shifted_image"
@@ -64,7 +124,7 @@ class TestProcessSingleStereoPair:
         }
 
         with patch(
-            "src.depth_surge_3d.processing.frames.stereo_generator.depth_to_disparity"
+            "src.depth_surge_3d.processing.frames.stereo_generator._canonical_to_signed_pixel_disparity"
         ) as mock_disp:
             with patch(
                 "src.depth_surge_3d.processing.frames.stereo_generator.create_shifted_image"
@@ -359,6 +419,7 @@ class TestCreateStereoPairs:
             cv2.imwrite(str(depth_path), np.full((8, 8), 32768, dtype=np.uint16))
             frame_files.append(frame_path)
             depth_files.append(depth_path)
+        _write_canonical_metadata(depth_dir, [path.name for path in frame_files])
         settings = {
             "baseline": 0.01,
             "focal_length": 10,
@@ -382,3 +443,81 @@ class TestCreateStereoPairs:
         assert result is True
         assert len(list(left_dir.glob("*.png"))) == 2
         assert len(list(right_dir.glob("*.png"))) == 2
+
+    def test_create_stereo_pairs_from_files_rejects_missing_canonical_metadata(self, tmp_path):
+        frame_dir = tmp_path / "frames"
+        depth_dir = tmp_path / "depth"
+        left_dir = tmp_path / "left"
+        right_dir = tmp_path / "right"
+        for directory in (frame_dir, depth_dir, left_dir, right_dir):
+            directory.mkdir()
+        frame_path = frame_dir / "frame_0000.png"
+        depth_path = depth_dir / "frame_0000.png"
+        cv2.imwrite(str(frame_path), np.zeros((8, 8, 3), dtype=np.uint8))
+        cv2.imwrite(str(depth_path), np.full((8, 8), 32768, dtype=np.uint16))
+
+        result = StereoPairGenerator().create_stereo_pairs_from_files(
+            [frame_path],
+            [depth_path],
+            {"left_frames": left_dir, "right_frames": right_dir},
+            {"stereo_strength": 2.0, "convergence": 0.5},
+        )
+
+        assert result is False
+
+    def test_canonical_metadata_requires_source_fingerprints(self, tmp_path):
+        frame_path = tmp_path / "frame_0000.png"
+        depth_path = tmp_path / "depth_0000.png"
+        frame_path.write_bytes(b"frame")
+        depth_path.write_bytes(b"depth")
+        _write_canonical_metadata(tmp_path, [frame_path.name])
+        metadata_path = tmp_path / "metadata.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata.pop("source_raw_fingerprint")
+        metadata.pop("fingerprint")
+        metadata["fingerprint"] = canonical_json_hash(metadata)
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="does not match"):
+            StereoPairGenerator._get_canonical_metadata([depth_path], [frame_path])
+
+    def test_canonical_metadata_rejects_depth_file_from_another_directory(self, tmp_path):
+        canonical_dir = tmp_path / "canonical"
+        foreign_dir = tmp_path / "foreign"
+        canonical_dir.mkdir()
+        foreign_dir.mkdir()
+        frame_files = [tmp_path / "frame_0000.png", tmp_path / "frame_0001.png"]
+        depth_files = [
+            canonical_dir / "frame_0000.png",
+            foreign_dir / "frame_0001.png",
+        ]
+        for path in depth_files:
+            cv2.imwrite(str(path), np.zeros((8, 8), dtype=np.uint16))
+        _write_canonical_metadata(canonical_dir, [path.name for path in frame_files])
+
+        with pytest.raises(ValueError, match="path manifest"):
+            StereoPairGenerator._get_canonical_metadata(depth_files, frame_files)
+
+    def test_wrong_native_shape_is_rejected_before_workers_start(self, tmp_path):
+        frame_dir = tmp_path / "frames"
+        depth_dir = tmp_path / "depth"
+        left_dir = tmp_path / "left"
+        right_dir = tmp_path / "right"
+        for directory in (frame_dir, depth_dir, left_dir, right_dir):
+            directory.mkdir()
+        frame_path = frame_dir / "frame_0000.png"
+        depth_path = depth_dir / "frame_0000.png"
+        cv2.imwrite(str(frame_path), np.zeros((8, 8, 3), dtype=np.uint8))
+        cv2.imwrite(str(depth_path), np.zeros((4, 4), dtype=np.uint16))
+        _write_canonical_metadata(depth_dir, [frame_path.name], shape=(8, 8))
+
+        with patch("multiprocessing.Pool") as pool:
+            result = StereoPairGenerator().create_stereo_pairs_from_files(
+                [frame_path],
+                [depth_path],
+                {"left_frames": left_dir, "right_frames": right_dir},
+                {"stereo_strength": 2.0, "convergence": 0.5},
+            )
+
+        assert result is False
+        pool.assert_not_called()
