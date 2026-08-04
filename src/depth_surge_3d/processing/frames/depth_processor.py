@@ -42,7 +42,6 @@ from ...utils import (
     get_cache_size,
 )
 from ...utils import calculate_optimal_chunk_size, get_vram_info
-from ...utils import resize_image
 from ...inference.depth.types import DepthBatch, DepthRepresentation
 from .depth_normalizer import (
     SceneDepthBounds,
@@ -50,6 +49,7 @@ from .depth_normalizer import (
     encode_canonical_png,
 )
 from .depth_storage import (
+    RawDepthFingerprintError,
     RawDepthStore,
     build_model_fingerprint,
     canonical_json_hash,
@@ -211,16 +211,28 @@ class DepthMapProcessor:
         if restored is not None:
             return restored
 
-        manifest = self._load_or_analyze_scenes(frame_files, scene_dir, settings)
+        manifest = self._load_or_analyze_scenes(
+            frame_files,
+            scene_dir,
+            raw_dir,
+            canonical_dir,
+            settings,
+            str(semantic_fingerprint["source_frame_fingerprint"]),
+        )
         frame_names = [path.name for path in frame_files]
         requested_dtype = str(settings.get("raw_storage_dtype", "auto"))
 
-        raw_store = self._open_raw_store_if_present(
-            raw_dir,
-            frame_names=frame_names,
-            semantic_fingerprint=semantic_fingerprint,
-            requested_dtype=requested_dtype,
-        )
+        try:
+            raw_store = self._open_raw_store_if_present(
+                raw_dir,
+                frame_names=frame_names,
+                semantic_fingerprint=semantic_fingerprint,
+                requested_dtype=requested_dtype,
+            )
+        except (RawDepthFingerprintError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self._reset_stage_directory(raw_dir)
+            self._reset_stage_directory(canonical_dir)
+            raw_store = None
         final_state = self._load_final_scene_state(scene_dir, manifest)
         existing = self._try_reuse_local_canonical_stage(
             raw_store,
@@ -407,7 +419,10 @@ class DepthMapProcessor:
         self,
         frame_files: list[Path],
         scene_dir: Path,
+        raw_dir: Path,
+        canonical_dir: Path,
         settings: dict[str, Any],
+        source_frame_fingerprint: str,
     ) -> dict[str, Any]:
         manifest_path = scene_dir / "scene_manifest.json"
         expected_names = [path.name for path in frame_files]
@@ -420,12 +435,27 @@ class DepthMapProcessor:
                 and manifest.get("status") in {"candidate", "final"}
                 and manifest.get("frame_names") == expected_names
                 and manifest.get("settings") == scene_settings
+                and manifest.get("source_frame_fingerprint") == source_frame_fingerprint
                 and len(manifest.get("scene_ids", [])) == len(frame_files)
             )
-            if not valid:
-                raise ValueError("Existing scene manifest does not match this source or settings")
-            return manifest
-        return analyze_scenes(frame_files, scene_dir, **scene_settings)
+            if valid:
+                return manifest
+            self._reset_stage_directory(scene_dir)
+            self._reset_stage_directory(raw_dir)
+            self._reset_stage_directory(canonical_dir)
+        manifest = analyze_scenes(frame_files, scene_dir, **scene_settings)
+        manifest["source_frame_fingerprint"] = source_frame_fingerprint
+        self._atomic_write_json(scene_dir / "scene_manifest.json", manifest)
+        return manifest
+
+    @staticmethod
+    def _reset_stage_directory(directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        for path in directory.iterdir():
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
 
     @staticmethod
     def _source_frame_fingerprint(frame_files: list[Path]) -> str:
@@ -445,7 +475,7 @@ class DepthMapProcessor:
         }
         fingerprint = build_model_fingerprint(self.depth_estimator, depth_settings)
         fingerprint["source_frame_fingerprint"] = self._source_frame_fingerprint(frame_files)
-        fingerprint["preprocessing_algorithm"] = "native-depth-adapter-v1"
+        fingerprint["preprocessing_algorithm"] = "native-depth-adapter-v2"
         return fingerprint
 
     @staticmethod
@@ -1212,12 +1242,6 @@ class DepthMapProcessor:
             if frame is None:
                 print(f"Warning: Could not load {frame_file}")
                 continue
-
-            # Apply super sampling if needed
-            if settings["super_sample"] != "none":
-                target_width = max(frame.shape[1], settings["per_eye_width"] * 2)
-                target_height = max(frame.shape[0], settings["per_eye_height"] * 2)
-                frame = resize_image(frame, target_width, target_height)
 
             chunk_frames.append(frame)
 

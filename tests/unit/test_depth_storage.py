@@ -96,7 +96,9 @@ def test_auto_store_promotes_completed_files_without_reinference(tmp_path: Path)
     assert store.metadata["storage_provenance"] == "promoted_float16_to_float32"
     with np.load(first_path, allow_pickle=False) as payload:
         assert payload["values"].dtype == np.float32
-        np.testing.assert_array_equal(payload["values"], first.astype(np.float16).astype(np.float32)[0])
+        np.testing.assert_array_equal(
+            payload["values"], first.astype(np.float16).astype(np.float32)[0]
+        )
 
 
 def test_explicit_float16_can_resume_as_float32_without_deleting_completed_files(
@@ -149,6 +151,16 @@ def test_semantic_fingerprint_mismatch_rejects_partial_raw_directory(tmp_path: P
 
     with pytest.raises(RawDepthFingerprintError, match="semantic fingerprint"):
         _open(tmp_path / "raw", values, semantic={"model": "b"})
+
+
+def test_requested_dtype_change_is_rejected_unless_it_promotes_float16(
+    tmp_path: Path,
+) -> None:
+    values = np.array([[[0.1]]], dtype=np.float32)
+    _open(tmp_path / "raw", values, requested_dtype="float16")
+
+    with pytest.raises(RawDepthFingerprintError, match="requested dtype"):
+        _open(tmp_path / "raw", values, requested_dtype="auto")
 
 
 def test_disk_budget_uses_uncompressed_raw_and_canonical_payloads(tmp_path: Path) -> None:

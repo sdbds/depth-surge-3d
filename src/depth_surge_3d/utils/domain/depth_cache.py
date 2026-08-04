@@ -39,6 +39,7 @@ DEPTH_CACHE_SETTING_KEYS = (
 )
 
 CANONICAL_CACHE_SCHEMA_VERSION = 1
+CANONICAL_CACHE_ALGORITHM_VERSION = "scene-percentile-v1"
 CANONICAL_CACHE_REQUIRED_FIELDS = {
     "algorithm_version",
     "representation",
@@ -66,6 +67,8 @@ def _canonical_json_hash(payload: Any) -> str:
 
 def _is_valid_canonical_metadata(metadata: dict[str, Any], num_frames: int) -> bool:
     if metadata.get("schema_version") != CANONICAL_CACHE_SCHEMA_VERSION:
+        return False
+    if metadata.get("algorithm_version") != CANONICAL_CACHE_ALGORITHM_VERSION:
         return False
     if not CANONICAL_CACHE_REQUIRED_FIELDS.issubset(metadata):
         return False

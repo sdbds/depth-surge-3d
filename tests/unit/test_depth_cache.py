@@ -311,6 +311,27 @@ class TestGetCachedDepthMaps:
 
         assert result is None
 
+    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
+    def test_cached_file_lookup_rejects_previous_canonical_algorithm(
+        self, mock_cache_dir, tmp_path
+    ):
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        mock_cache_dir.return_value = cache_dir
+        video_file = tmp_path / "test.mp4"
+        video_file.write_bytes(b"test")
+        settings = {"depth_model_version": "v3"}
+        cache_entry = cache_dir / compute_cache_key(str(video_file), settings)
+        cache_entry.mkdir()
+        metadata = canonical_metadata(["frame_000000.png"])
+        metadata["algorithm_version"] = "scene-percentile-v0"
+        metadata.pop("fingerprint")
+        metadata["fingerprint"] = canonical_json_hash(metadata)
+        (cache_entry / "metadata.json").write_text(json.dumps(metadata))
+        (cache_entry / "depth_000000.png").write_bytes(b"png")
+
+        assert depth_cache.get_cached_depth_map_files(str(video_file), settings, 1) is None
+
 
 class TestSaveDepthMapsToCache:
     """Test save_depth_maps_to_cache function."""

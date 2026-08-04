@@ -22,14 +22,17 @@ class FakeRelativeDepthEstimator:
     def __init__(self) -> None:
         self.calls = 0
         self.fail_on_inference = False
+        self.revision = "test-revision-1"
+        self.batch_lengths: list[int] = []
 
     def get_model_info(self) -> dict[str, str]:
-        return {"family": "fake-relative", "revision": "test-revision-1"}
+        return {"family": "fake-relative", "revision": self.revision}
 
     def estimate_depth_batch(self, frames: np.ndarray, **_kwargs) -> DepthBatch:
         if self.fail_on_inference:
             raise AssertionError("resume must not repeat completed inference")
         self.calls += 1
+        self.batch_lengths.append(len(frames))
         native = np.array(
             [[0.0, 0.25, 0.5], [0.5, 0.75, 1.0]],
             dtype=np.float32,
@@ -94,6 +97,17 @@ def _run_pipeline(
     )
     assert result is not None
     return result
+
+
+def test_native_frame_preprocessing_has_a_new_fingerprint_version(
+    source_frames: list[Path],
+    pipeline_settings: dict[str, object],
+) -> None:
+    processor = DepthMapProcessor(FakeRelativeDepthEstimator())
+
+    fingerprint = processor._raw_semantic_fingerprint(source_frames, pipeline_settings)
+
+    assert fingerprint["preprocessing_algorithm"] == "native-depth-adapter-v2"
 
 
 def test_file_pipeline_persists_native_raw_before_canonicalization(
@@ -189,6 +203,106 @@ def test_resume_from_candidate_manifest_reuses_raw_and_is_byte_identical(
     )
 
     assert [path.read_bytes() for path in resumed_files] == expected_bytes
+
+
+def test_source_frame_change_invalidates_scene_and_downstream_stages(
+    source_frames: list[Path],
+    stage_directories: dict[str, Path],
+    pipeline_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    estimator = FakeRelativeDepthEstimator()
+    _run_pipeline(
+        estimator,
+        source_frames,
+        stage_directories,
+        pipeline_settings,
+        monkeypatch,
+    )
+    manifest_path = stage_directories["scene_data"] / "scene_manifest.json"
+    first_manifest = json.loads(manifest_path.read_text())
+    first_source_fingerprint = first_manifest["source_frame_fingerprint"]
+
+    changed = np.full((6, 8, 3), 255, dtype=np.uint8)
+    assert cv2.imwrite(str(source_frames[0]), changed)
+    estimator.calls = 0
+    estimator.batch_lengths.clear()
+    _run_pipeline(
+        estimator,
+        source_frames,
+        stage_directories,
+        pipeline_settings,
+        monkeypatch,
+    )
+
+    second_manifest = json.loads(manifest_path.read_text())
+    assert second_manifest["source_frame_fingerprint"] != first_source_fingerprint
+    assert estimator.calls == 2
+
+
+def test_model_fingerprint_change_rebuilds_raw_stage_instead_of_aborting(
+    source_frames: list[Path],
+    stage_directories: dict[str, Path],
+    pipeline_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    estimator = FakeRelativeDepthEstimator()
+    _run_pipeline(
+        estimator,
+        source_frames,
+        stage_directories,
+        pipeline_settings,
+        monkeypatch,
+    )
+    estimator.revision = "test-revision-2"
+    estimator.calls = 0
+    estimator.batch_lengths.clear()
+
+    _run_pipeline(
+        estimator,
+        source_frames,
+        stage_directories,
+        pipeline_settings,
+        monkeypatch,
+    )
+
+    assert estimator.calls == 2
+
+
+def test_partial_temporal_chunk_replays_original_context_without_overwriting_completed_raw(
+    source_frames: list[Path],
+    stage_directories: dict[str, Path],
+    pipeline_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    estimator = FakeRelativeDepthEstimator()
+    first_files = _run_pipeline(
+        estimator,
+        source_frames,
+        stage_directories,
+        pipeline_settings,
+        monkeypatch,
+    )
+    completed_raw = stage_directories["depth_raw"] / f"{source_frames[0].stem}.npz"
+    completed_bytes = completed_raw.read_bytes()
+    missing_raw = stage_directories["depth_raw"] / f"{source_frames[1].stem}.npz"
+    missing_raw.unlink()
+    for path in first_files:
+        path.unlink()
+    (stage_directories["disparity_maps"] / "metadata.json").unlink()
+    estimator.calls = 0
+    estimator.batch_lengths.clear()
+
+    _run_pipeline(
+        estimator,
+        source_frames,
+        stage_directories,
+        pipeline_settings,
+        monkeypatch,
+    )
+
+    assert estimator.batch_lengths == [2]
+    assert completed_raw.read_bytes() == completed_bytes
 
 
 def test_completed_canonical_stage_resumes_without_raw_payloads(

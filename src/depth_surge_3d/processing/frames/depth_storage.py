@@ -57,7 +57,9 @@ def _hash_file(path: Path) -> str:
 def build_model_fingerprint(estimator: Any, settings: dict[str, Any]) -> dict[str, Any]:
     """Build a stable semantic fingerprint for one estimator configuration."""
 
-    model_info = _jsonable(estimator.get_model_info() if hasattr(estimator, "get_model_info") else {})
+    model_info = _jsonable(
+        estimator.get_model_info() if hasattr(estimator, "get_model_info") else {}
+    )
     model_path_value = getattr(estimator, "model_path", None)
     model_path = Path(model_path_value) if model_path_value else None
     weight_sha256 = _hash_file(model_path) if model_path and model_path.is_file() else None
@@ -116,7 +118,9 @@ def estimate_depth_disk_bytes(
     canonical_allowance = canonical_payload * 1.10
     if keep_intermediates:
         return int(raw_allowance + canonical_allowance)
-    atomic_overlap = 2 * max(native_width * native_height * storage_bytes, native_width * native_height * 2)
+    atomic_overlap = 2 * max(
+        native_width * native_height * storage_bytes, native_width * native_height * 2
+    )
     return int(max(raw_allowance, canonical_allowance) + atomic_overlap)
 
 
@@ -161,7 +165,13 @@ class RawDepthStore:
         if metadata_path.is_file():
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             store = cls(directory, metadata)
-            store._validate_existing(frame_names, representation, semantic, first_values)
+            store._validate_existing(
+                frame_names,
+                representation,
+                semantic,
+                requested_dtype,
+                first_values,
+            )
             if metadata.get("storage_status") == "promoting":
                 store.promote_to_float32(requested_dtype=requested_dtype)
             elif metadata.get("selected_dtype") == "float16" and requested_dtype == "float32":
@@ -221,6 +231,7 @@ class RawDepthStore:
         frame_names: list[str],
         representation: DepthRepresentation,
         semantic_fingerprint: dict[str, Any],
+        requested_dtype: str,
         first_values: np.ndarray | None,
     ) -> None:
         if self.metadata.get("schema_version") != RAW_DEPTH_SCHEMA_VERSION:
@@ -231,6 +242,12 @@ class RawDepthStore:
             raise RawDepthFingerprintError("Raw-depth representation mismatch")
         if self.metadata.get("frame_names") != list(frame_names):
             raise RawDepthFingerprintError("Raw-depth source frame manifest mismatch")
+        persisted_request = self.metadata.get("requested_dtype")
+        promotes_float16 = (
+            self.metadata.get("selected_dtype") == "float16" and requested_dtype == "float32"
+        )
+        if persisted_request != requested_dtype and not promotes_float16:
+            raise RawDepthFingerprintError("Raw-depth requested dtype mismatch")
         if first_values is not None:
             values = np.asarray(first_values)
             if values.ndim != 3 or list(values.shape[1:]) != self.metadata.get("native_shape"):
@@ -305,9 +322,10 @@ class RawDepthStore:
 
         if requested_dtype not in {"auto", "float32"}:
             raise ValueError("Float32 promotion requires auto or float32 storage")
-        if self.metadata.get("selected_dtype") == "float32" and self.metadata.get(
-            "storage_status"
-        ) == "ready":
+        if (
+            self.metadata.get("selected_dtype") == "float32"
+            and self.metadata.get("storage_status") == "ready"
+        ):
             return
 
         if self.metadata.get("storage_status") != "promoting":
