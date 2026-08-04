@@ -6,6 +6,7 @@ import cv2
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from src.depth_surge_3d.inference.depth.types import DepthBatch, DepthRepresentation
 from src.depth_surge_3d.processing.frames.depth_processor import DepthMapProcessor
 
 
@@ -142,8 +143,14 @@ class TestGenerateDepthMaps:
     ):
         """Long videos retain only one inference chunk in memory."""
         estimator = Mock()
-        estimator.estimate_depth_batch.side_effect = lambda frames, **kwargs: np.full(
-            (len(frames), frames.shape[1], frames.shape[2]), 0.5, dtype=np.float32
+        estimator.model_path = None
+        estimator.get_model_info.return_value = {
+            "family": "processor-test",
+            "revision": "1",
+        }
+        estimator.estimate_depth_batch.side_effect = lambda frames, **kwargs: DepthBatch(
+            np.full((len(frames), 2, 3), 0.5, dtype=np.float32),
+            DepthRepresentation.INVERSE_DEPTH,
         )
         processor = DepthMapProcessor(estimator)
         depth_dir = tmp_path / "depth_maps"
@@ -467,6 +474,26 @@ class TestProcessChunkDepth:
         assert result is not None
         assert len(result) == 3
         mock_estimator.estimate_depth_batch.assert_called_once()
+
+    def test_process_chunk_depth_unwraps_depth_batch(
+        self, mock_estimator, mock_progress_tracker, temp_frames
+    ):
+        values = np.full((3, 2, 3), 0.25, dtype=np.float32)
+        mock_estimator.estimate_depth_batch.return_value = DepthBatch(
+            values, DepthRepresentation.INVERSE_DEPTH
+        )
+        processor = DepthMapProcessor(mock_estimator)
+        frames = [np.zeros((4, 5, 3), dtype=np.uint8) for _ in range(3)]
+
+        result = processor._process_chunk_depth(
+            frames,
+            temp_frames,
+            {"target_fps": 30},
+            {},
+            input_size=6,
+        )
+
+        assert result is values
 
     def test_process_chunk_depth_with_save(
         self, mock_estimator, mock_progress_tracker, temp_frames, tmp_path
@@ -853,6 +880,21 @@ class TestGenerateDepthMapsBatch:
         assert result is not None
         assert len(result) == 5
         mock_estimator.estimate_depth_batch.assert_called_once()
+
+    def test_batch_generation_unwraps_depth_batch(self, mock_estimator, mock_progress_tracker):
+        values = np.full((5, 2, 3), 0.25, dtype=np.float32)
+        mock_estimator.estimate_depth_batch.return_value = DepthBatch(
+            values, DepthRepresentation.INVERSE_DEPTH
+        )
+        processor = DepthMapProcessor(mock_estimator)
+
+        result = processor._generate_depth_maps_batch(
+            np.zeros((5, 4, 5, 3), dtype=np.uint8),
+            {"target_fps": 30, "depth_resolution": "6"},
+            mock_progress_tracker,
+        )
+
+        assert result is values
 
     def test_batch_generation_auto_resolution(self, mock_estimator, mock_progress_tracker):
         """Test batch generation with auto resolution."""

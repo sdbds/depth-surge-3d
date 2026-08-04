@@ -694,6 +694,11 @@ def analyze_processing_progress(output_dir: Path, settings_data: dict[str, Any])
         if progress["vr_frames_created"] > 0:
             progress["frames_processed"] = progress["vr_frames_created"]
             progress["can_resume_from_intermediates"] = True
+        elif "disparity_maps" in progress["intermediate_stages"]:
+            depth_frames = progress["intermediate_stages"]["disparity_maps"]["frames_found"]
+            if depth_frames > 0:
+                progress["frames_processed"] = depth_frames
+                progress["can_resume_from_intermediates"] = True
         elif "depth_maps" in progress["intermediate_stages"]:
             depth_frames = progress["intermediate_stages"]["depth_maps"]["frames_found"]
             if depth_frames > 0:

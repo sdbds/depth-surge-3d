@@ -265,7 +265,7 @@ UPSCALE_MODELS = ["none", "x2", "x4", "x4-conservative"]
 # Directory names for intermediate files
 # Numbered to match processing steps (6-8 steps total based on optional features):
 # Step 1: Extract Frames (00_original_frames)
-# Step 2: Generate Depth Maps (02_depth_maps)
+# Step 2: Analyze scenes and generate canonical disparity
 # Step 3: Create Stereo Pairs (04_left_frames, 04_right_frames)
 # Step 4: Apply Distortion - OPTIONAL (05_left_distorted, 05_right_distorted)
 # Step 5: Crop Frames (06_left_cropped, 06_right_cropped)
@@ -275,7 +275,10 @@ UPSCALE_MODELS = ["none", "x2", "x4", "x4-conservative"]
 INTERMEDIATE_DIRS = {
     "frames": "00_original_frames",  # Step 1: Extracted input frames
     "supersampled": "01_supersampled_frames",  # Legacy: Super sampling (deprecated)
-    "depth_maps": "02_depth_maps",  # Step 2: AI-generated depth maps
+    "scene_data": "01_scene_data",  # Candidate/final scene manifests and bounds
+    "depth_raw": "02_depth_raw",  # Native model output with explicit representation
+    "disparity_maps": "03_disparity_maps",  # Canonical relative-disparity maps
+    "depth_maps": "03_disparity_maps",  # Temporary internal alias until renderer migration
     "left_frames": "04_left_frames",  # Step 3: Stereo pair - left eye
     "right_frames": "04_right_frames",  # Step 3: Stereo pair - right eye
     "left_distorted": "05_left_distorted",  # Step 4: Fisheye distortion - left (optional)

@@ -206,6 +206,9 @@ class TestCreateOutputDirectories:
         # Should create all directories from INTERMEDIATE_DIRS
         assert "base" in result
         assert "frames" in result
+        assert "scene_data" in result
+        assert "depth_raw" in result
+        assert "disparity_maps" in result
         assert "depth_maps" in result
         assert "left_frames" in result
         assert "right_frames" in result
@@ -213,7 +216,10 @@ class TestCreateOutputDirectories:
 
         assert result["base"] == base_path
         assert result["frames"] == base_path / "00_original_frames"
-        assert result["depth_maps"] == base_path / "02_depth_maps"
+        assert result["scene_data"] == base_path / "01_scene_data"
+        assert result["depth_raw"] == base_path / "02_depth_raw"
+        assert result["disparity_maps"] == base_path / "03_disparity_maps"
+        assert result["depth_maps"] == result["disparity_maps"]
         assert result["left_frames"] == base_path / "04_left_frames"
         assert result["right_frames"] == base_path / "04_right_frames"
         assert result["vr_frames"] == base_path / "99_vr_frames"
@@ -234,6 +240,9 @@ class TestCreateOutputDirectories:
 
         # Retention controls post-success cleanup, not pipeline storage.
         assert "frames" in result
+        assert "scene_data" in result
+        assert "depth_raw" in result
+        assert "disparity_maps" in result
         assert "depth_maps" in result
         assert "left_frames" in result
         assert "right_frames" in result
@@ -255,6 +264,9 @@ class TestCreateOutputDirectories:
         # Should create all directories (default is True)
         assert "base" in result
         assert "frames" in result
+        assert "scene_data" in result
+        assert "depth_raw" in result
+        assert "disparity_maps" in result
         assert "depth_maps" in result
         assert "vr_frames" in result
 
@@ -1050,7 +1062,7 @@ class TestAnalyzeProcessingProgress:
         def truediv_side_effect(dir_name):
             if "99_vr_frames" in str(dir_name):
                 return mock_vr_dir
-            elif "02_depth_maps" in str(dir_name):
+            elif "03_disparity_maps" in str(dir_name):
                 return mock_depth_dir
             else:
                 mock_other = MagicMock(spec=Path)
@@ -1084,7 +1096,7 @@ class TestAnalyzeProcessingProgress:
         def truediv_side_effect(dir_name):
             if "99_vr_frames" in str(dir_name):
                 return mock_vr_dir
-            elif "02_depth_maps" in str(dir_name):
+            elif "03_disparity_maps" in str(dir_name):
                 return mock_depth_dir
             else:
                 mock_other = MagicMock(spec=Path)

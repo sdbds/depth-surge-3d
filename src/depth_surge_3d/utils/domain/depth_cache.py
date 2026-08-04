@@ -31,7 +31,57 @@ DEPTH_CACHE_SETTING_KEYS = (
     "temporal_window_overlap",
     "denoising_steps",
     "seed",
+    "scene_detection",
+    "scene_cut_threshold",
+    "min_scene_frames",
+    "raw_storage_dtype",
+    "model_fingerprint",
 )
+
+CANONICAL_CACHE_SCHEMA_VERSION = 1
+CANONICAL_CACHE_REQUIRED_FIELDS = {
+    "algorithm_version",
+    "representation",
+    "near_value",
+    "far_value",
+    "encoding",
+    "encoding_scale",
+    "num_frames",
+    "frame_names",
+    "native_shape",
+    "source_raw_fingerprint",
+    "source_model_fingerprint",
+    "scene_manifest_fingerprint",
+    "depth_bounds_fingerprint",
+    "fingerprint",
+}
+
+
+def _canonical_json_hash(payload: Any) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(
+        "ascii"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _is_valid_canonical_metadata(metadata: dict[str, Any], num_frames: int) -> bool:
+    if metadata.get("schema_version") != CANONICAL_CACHE_SCHEMA_VERSION:
+        return False
+    if not CANONICAL_CACHE_REQUIRED_FIELDS.issubset(metadata):
+        return False
+    if metadata.get("representation") != "relative_disparity":
+        return False
+    if metadata.get("near_value") != 1.0 or metadata.get("far_value") != 0.0:
+        return False
+    if metadata.get("encoding") != "uint16_png" or metadata.get("encoding_scale") != 65535.0:
+        return False
+    if metadata.get("num_frames") != num_frames:
+        return False
+    if len(metadata.get("frame_names", [])) != num_frames:
+        return False
+    fingerprint = metadata.get("fingerprint")
+    unhashed = {key: value for key, value in metadata.items() if key != "fingerprint"}
+    return isinstance(fingerprint, str) and fingerprint == _canonical_json_hash(unhashed)
 
 
 def get_cache_dir() -> Path:
@@ -109,7 +159,9 @@ def get_cached_depth_maps(
         Cached depth maps array, or None if not found/invalid
     """
     try:
-        depth_files = get_cached_depth_map_files(video_path, depth_settings, num_frames)
+        depth_files = get_cached_depth_map_files(
+            video_path, depth_settings, num_frames, require_canonical=False
+        )
         if depth_files is None:
             return None
 
@@ -135,7 +187,12 @@ def get_cached_depth_maps(
 
 
 def get_cached_depth_map_files(
-    video_path: str, depth_settings: dict[str, Any], num_frames: int
+    video_path: str,
+    depth_settings: dict[str, Any],
+    num_frames: int,
+    *,
+    require_canonical: bool = True,
+    expected_model_fingerprint: str | None = None,
 ) -> list[Path] | None:
     """Return validated cache paths without decoding the depth images."""
     cache_entry_dir = get_cache_dir() / compute_cache_key(video_path, depth_settings)
@@ -147,6 +204,13 @@ def get_cached_depth_map_files(
         with open(metadata_file, "r") as f:
             metadata = json.load(f)
         if metadata.get("num_frames") != num_frames:
+            return None
+        if require_canonical and not _is_valid_canonical_metadata(metadata, num_frames):
+            return None
+        if (
+            expected_model_fingerprint is not None
+            and metadata.get("source_model_fingerprint") != expected_model_fingerprint
+        ):
             return None
 
         depth_files = [cache_entry_dir / f"depth_{i:06d}.png" for i in range(num_frames)]
@@ -211,6 +275,14 @@ def save_depth_map_files_to_cache(
     """Copy disk-backed uint16 depth maps into the global cache with bounded memory."""
     metadata_tmp: Path | None = None
     try:
+        if not depth_files:
+            return False
+        source_metadata_path = depth_files[0].parent / "metadata.json"
+        with source_metadata_path.open("r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        if not _is_valid_canonical_metadata(metadata, len(depth_files)):
+            return False
+
         cache_entry_dir = get_cache_dir() / compute_cache_key(video_path, depth_settings)
         cache_entry_dir.mkdir(parents=True, exist_ok=True)
 
@@ -219,17 +291,10 @@ def save_depth_map_files_to_cache(
             if source.resolve() != destination.resolve():
                 shutil.copy2(source, destination)
 
-        metadata = {
-            "num_frames": len(depth_files),
-            "video_path": str(video_path),
-            "depth_settings": {k: depth_settings.get(k) for k in DEPTH_CACHE_SETTING_KEYS},
-            "cache_version": "2.0",
-            "depth_scale": 65535.0,
-        }
         metadata_file = cache_entry_dir / "metadata.json"
         metadata_tmp = cache_entry_dir / "metadata.json.tmp"
-        with open(metadata_tmp, "w") as f:
-            json.dump(metadata, f, indent=2)
+        with open(metadata_tmp, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, sort_keys=True)
         metadata_tmp.replace(metadata_file)
         return True
     except (OSError, TypeError, ValueError):

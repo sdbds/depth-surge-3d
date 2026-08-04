@@ -9,6 +9,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
+from src.depth_surge_3d.processing.frames.depth_storage import canonical_json_hash
 from src.depth_surge_3d.utils.domain import depth_cache
 
 from src.depth_surge_3d.utils.domain.depth_cache import (
@@ -19,6 +20,27 @@ from src.depth_surge_3d.utils.domain.depth_cache import (
     clear_cache,
     get_cache_size,
 )
+
+
+def canonical_metadata(frame_names: list[str]) -> dict:
+    metadata = {
+        "schema_version": 1,
+        "algorithm_version": "scene-percentile-v1",
+        "representation": "relative_disparity",
+        "near_value": 1.0,
+        "far_value": 0.0,
+        "encoding": "uint16_png",
+        "encoding_scale": 65535.0,
+        "num_frames": len(frame_names),
+        "frame_names": frame_names,
+        "native_shape": [4, 4],
+        "source_raw_fingerprint": "raw-fingerprint",
+        "source_model_fingerprint": "model-fingerprint",
+        "scene_manifest_fingerprint": "scene-fingerprint",
+        "depth_bounds_fingerprint": "bounds-fingerprint",
+    }
+    metadata["fingerprint"] = canonical_json_hash(metadata)
+    return metadata
 
 
 class TestGetCacheDir:
@@ -235,7 +257,7 @@ class TestGetCachedDepthMaps:
         cache_entry = cache_dir / compute_cache_key(str(video_file), settings)
         cache_entry.mkdir()
         (cache_entry / "metadata.json").write_text(
-            json.dumps({"num_frames": 2, "depth_scale": 65535.0})
+            json.dumps(canonical_metadata(["frame_000000.png", "frame_000001.png"]))
         )
         expected = [cache_entry / f"depth_{i:06d}.png" for i in range(2)]
         for path in expected:
@@ -246,6 +268,48 @@ class TestGetCachedDepthMaps:
 
         assert result == expected
         imread.assert_not_called()
+
+    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
+    def test_cached_file_lookup_rejects_invalid_canonical_fingerprint(
+        self, mock_cache_dir, tmp_path
+    ):
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        mock_cache_dir.return_value = cache_dir
+        video_file = tmp_path / "test.mp4"
+        video_file.write_bytes(b"test")
+        settings = {"depth_model_version": "v3"}
+        cache_entry = cache_dir / compute_cache_key(str(video_file), settings)
+        cache_entry.mkdir()
+        metadata = canonical_metadata(["frame_000000.png"])
+        metadata["source_raw_fingerprint"] = "tampered"
+        (cache_entry / "metadata.json").write_text(json.dumps(metadata))
+        (cache_entry / "depth_000000.png").write_bytes(b"png")
+
+        assert depth_cache.get_cached_depth_map_files(str(video_file), settings, 1) is None
+
+    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
+    def test_cached_file_lookup_rejects_model_fingerprint_mismatch(self, mock_cache_dir, tmp_path):
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        mock_cache_dir.return_value = cache_dir
+        video_file = tmp_path / "test.mp4"
+        video_file.write_bytes(b"test")
+        settings = {"depth_model_version": "v3"}
+        cache_entry = cache_dir / compute_cache_key(str(video_file), settings)
+        cache_entry.mkdir()
+        metadata = canonical_metadata(["frame_000000.png"])
+        (cache_entry / "metadata.json").write_text(json.dumps(metadata))
+        (cache_entry / "depth_000000.png").write_bytes(b"png")
+
+        result = depth_cache.get_cached_depth_map_files(
+            str(video_file),
+            settings,
+            1,
+            expected_model_fingerprint="different-model",
+        )
+
+        assert result is None
 
 
 class TestSaveDepthMapsToCache:
@@ -334,6 +398,8 @@ class TestSaveDepthMapsToCache:
                 np.full((4, 4), i * 65535, dtype=np.uint16),
             )
             depth_files.append(depth_file)
+        source_metadata = canonical_metadata([path.name for path in depth_files])
+        (depth_dir / "metadata.json").write_text(json.dumps(source_metadata))
 
         assert depth_cache.save_depth_map_files_to_cache(str(video_file), settings, depth_files)
 
@@ -341,8 +407,7 @@ class TestSaveDepthMapsToCache:
         cached_files = [cache_entry / f"depth_{i:06d}.png" for i in range(2)]
         assert all(path.exists() for path in cached_files)
         metadata = json.loads((cache_entry / "metadata.json").read_text())
-        assert metadata["num_frames"] == 2
-        assert metadata["depth_scale"] == 65535.0
+        assert metadata == source_metadata
 
 
 class TestClearCache:
