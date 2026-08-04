@@ -2,7 +2,7 @@
 
 ## Status
 
-Revision 2, updated after external review on 2026-08-04. The user approved a
+Revision 3, updated after external review on 2026-08-04. The user approved a
 Torch/CUDA-first renderer and explicitly rejected backward compatibility in the
 final state. Implementation is split into three independently verifiable
 commits so contract, geometry, and persistence failures can be isolated.
@@ -51,19 +51,25 @@ which can modify legitimate source content while missing actual occlusions.
 ```text
 00_original_frames
   -> scene pre-pass
-01_scene_data/scene_manifest.json
+01_scene_data/scene_manifest.json (status=candidate)
   -> raw model inference with explicit representation
-02_depth_raw/*.npy + metadata.json
-  -> deterministic per-scene bounds
+02_depth_raw/*.npz + metadata.json
+  -> GLOBAL BARRIER: every raw frame is complete
+01_scene_data/depth_samples.npz
+  -> deterministic fixed-point scene merge and final bounds
 01_scene_data/depth_bounds.json
+01_scene_data/scene_manifest.json (status=final)
   -> pure canonicalization
 03_disparity_maps/*.png + metadata.json
   -> Torch forward splat + GPU background fill
 04_left_frames/*.png + 04_right_frames/*.png
 ```
 
-The first three stages are restartable independently. Canonicalization is a pure
-function of one raw map, its representation, and persisted scene bounds.
+The first three stages are restartable independently, but canonicalization may
+not overlap raw inference. Every raw frame and every candidate scene sample set
+must exist before deterministic scene merging and final bounds begin.
+Canonicalization is then a pure function of one raw map, its representation,
+the final scene manifest, and persisted final bounds.
 
 ## Depth Output Contract
 
@@ -85,8 +91,10 @@ Estimator adapters declare representation explicitly:
 - Depth Anything 3 non-metric models: `RELATIVE_DEPTH`.
 - See-Through Marigold: `RELATIVE_DEPTH`.
 
-Estimators may resize output but must not apply per-frame min/max
-normalization. Metric values remain in metres in `02_depth_raw`.
+Estimators must return their native model-output resolution and must not resize
+to source-frame dimensions or apply per-frame min/max normalization. Metric
+values remain in metres until raw persistence. Native dimensions are recorded
+in metadata; canonical disparity is resized exactly once at the render boundary.
 
 Each adapter has a contract test that checks both its declared enum and the full
 near/far direction through canonical conversion. These tests do not load large
@@ -100,6 +108,7 @@ and before depth inference, reads the persisted source frames, and writes an
 atomic `01_scene_data/scene_manifest.json` containing:
 
 - schema and algorithm versions;
+- `status: candidate` or `status: final`;
 - ordered frame names and scene IDs;
 - candidate cut frame indexes;
 - `scene_detection`, `scene_cut_threshold`, and `min_scene_frames` settings.
@@ -109,32 +118,63 @@ Defaults are `scene_detection=true`, `scene_cut_threshold=0.55`, and
 `min_scene_frames=8`. They are typed processing settings and persisted rather
 than hidden constants. Disabling detection assigns every frame to scene zero.
 
-Candidate cuts are provisional. After raw-depth statistics are available,
-adjacent candidate scenes are merged when the maximum difference between their
-low/high bounds is no more than 10 percent of their combined disparity span.
-This guard makes a false-positive visual cut harmless when depth distributions
-are materially unchanged. The finalized scene IDs are written atomically back
-to the manifest before canonical maps are generated.
+Candidate cuts are provisional and the first manifest is always written with
+`status: candidate`. Canonicalization accepts only `status: final`.
+
+After all raw-depth samples exist, adjacent candidate scenes are merged when the
+maximum difference between their low/high bounds is no more than 10 percent of
+their combined disparity span. Merging is deterministic:
+
+1. Preserve candidate scenes and their sample arrays in source-frame order.
+2. Scan left to right. When two neighbors merge, concatenate their original
+   sample arrays in that order, recompute 2nd/98th percentile bounds, replace
+   the pair at the lower index, and compare that merged scene with its new right
+   neighbor. When a pair does not merge, advance the cursor by one.
+3. Finish the pass, then repeat complete left-to-right passes until a pass makes
+   no merge. Every successful merge reduces scene count, so termination occurs
+   in at most `candidate_scene_count - 1` passes.
+4. Never resample frames after a merge.
+
+Final bounds are calculated from each fixed-point sample union, not combined
+from child percentiles. Write `depth_bounds.json` first. Then atomically replace
+the manifest with final scene IDs, `status: final`, and the bounds-file
+fingerprint. A crash before the final manifest replacement leaves a candidate
+manifest, so resume reruns finalization rather than canonicalizing provisional
+IDs. A final manifest with missing or mismatched bounds is also rejected and
+finalized again.
 
 The normalizer never reads RGB frames and never owns scene-detection state. It
 consumes raw depth plus persisted scene IDs and bounds only.
 
 ## Raw Depth and Scene Bounds
 
-`DepthProcessor` writes each estimator result atomically as a float32 `.npy`
-file in `02_depth_raw`. The directory's `metadata.json` records representation,
-model fingerprint, frame count, dimensions, and schema version.
+`DepthProcessor` converts model output to float16 and writes each native-resolution
+map atomically as a zlib-compressed `.npz` file in `02_depth_raw`. Float16 is a
+storage encoding only: canonical conversion reads it into float32 before safe
+reciprocal, sampling, percentile, or arithmetic. The directory's
+`metadata.json` records representation, model fingerprint, frame count, native
+dimensions, storage dtype, compression, and schema version.
+
+Finite model values outside the float16 representable range fail raw persistence
+with the offending model and value range; they are never silently clipped.
+Non-finite model values remain permitted and canonicalize as invalid.
 
 Bounds are deterministic and bounded-memory:
 
 1. Convert selected raw values to an unscaled disparity score. Positive depth
    uses a safe reciprocal; inverse depth passes through.
-2. For each scene, select at most 32 frame indexes evenly across its duration.
+2. For each candidate scene, select at most 32 frame indexes evenly across its
+   duration.
 3. From each selected frame, take a uniform grid of at most 64 by 64 valid
    pixels.
-4. Pool those samples and calculate the 2nd and 98th percentiles once.
-5. Persist the bounds in `01_scene_data/depth_bounds.json` with the selected
-   frame indexes and algorithm version.
+4. Persist every candidate scene's pooled float32 samples, selected frame
+   indexes, and source-frame order in `01_scene_data/depth_samples.npz`. The
+   maximum payload per candidate scene is 131,072 floats, or 512 KiB before
+   compression.
+5. Calculate provisional bounds for the merge guard, run the fixed-point merge,
+   and calculate final 2nd/98th percentile bounds from final sample unions.
+6. Persist only final bounds in `01_scene_data/depth_bounds.json`, including the
+   sample-file fingerprint and algorithm version.
 
 Empty or flat scenes receive equal bounds and canonicalize to zero disparity.
 There is no EMA or other mutable scaling state.
@@ -168,6 +208,34 @@ Canonical maps are encoded as uint16 PNG in `03_disparity_maps`.
 
 Global cache save and restore copy or recreate the same required metadata. The
 stereo stage reads only the local `03_disparity_maps/metadata.json`.
+
+## Raw-depth Disk Budget and Retention
+
+Before raw inference, estimate native output dimensions from the selected depth
+resolution while preserving source aspect ratio. Refuse to start unless current
+free space covers the expected peak:
+
+- raw allowance: `frames * native_width * native_height * 2 * 1.25` bytes;
+- canonical allowance: `frames * native_width * native_height * 2 * 1.10`
+  bytes;
+- with `keep_intermediates=true`, peak is the sum;
+- otherwise peak is the larger allowance plus two frame payloads for atomic
+  write overlap.
+
+The estimate intentionally assumes no compression benefit. After the first raw
+map reveals actual native dimensions, repeat the check with those dimensions
+before processing the remaining frames. Failure reports required, available,
+and output-path bytes before more model work is performed.
+
+When `keep_intermediates=false`, each raw `.npz` is deleted only after its
+canonical PNG has been atomically written, read back, and validated against
+final metadata. If a crash leaves both files, resume validates the canonical
+file and then removes its redundant raw file. `keep_intermediates=true` retains
+raw maps for replay and inspection.
+
+The global raw-depth barrier remains: retention lowers post-canonicalization and
+final disk usage but cannot lower the peak required before final scene bounds
+exist.
 
 ## User-facing Controls
 
@@ -258,9 +326,10 @@ CPU mode invokes the same Torch renderer on `torch.device("cpu")` and is the
 reference path for exact tests. CUDA parity tests use numerical tolerances.
 
 The production video pipeline always uses file-backed raw and canonical depth.
-The legacy in-memory depth API calculates `N*H*W*4` before inference and rejects
-requests above 512 MiB with guidance to use file-backed processing. This limit
-does not claim to bound source-frame memory owned by callers.
+The legacy in-memory depth API calculates `N*native_H*native_W*4` before
+inference and rejects requests above 512 MiB with guidance to use file-backed
+processing. This limit does not claim to bound source-frame memory owned by
+callers.
 
 ## Cache and Resume
 
@@ -270,7 +339,8 @@ Increment stage and depth-cache schemas. Resume validation operates per stage:
   video fingerprint match. It is never discarded solely because depth or stereo
   schema changed.
 - Old or missing scene metadata invalidates `01_scene_data` and every later
-  stage.
+  stage. A schema-valid `status: candidate` manifest resumes scene finalization
+  but is never accepted by canonicalization.
 - Old raw-depth metadata invalidates `02_depth_raw` and every later stage.
 - Old or missing canonical metadata invalidates `03_disparity_maps` and every
   later stage.
@@ -280,9 +350,12 @@ The user-facing resume message lists preserved and invalidated stages. No
 heuristic migration of old depth PNGs is permitted because they do not record
 whether the source model emitted depth or inverse depth.
 
-Partial raw inference resumes by frame filename. Scene bounds are generated only
-after all selected sample frames exist. Partial canonicalization resumes safely
-because it is a pure function of persisted raw maps and bounds.
+Partial raw inference resumes by frame filename. Scene samples and bounds are
+finalized only after every raw frame exists, which is the global barrier. A
+crash between writing final bounds and replacing the candidate manifest reruns
+the deterministic finalization step. Partial canonicalization resumes safely
+because it is a pure function of persisted raw maps, a final manifest, and
+fingerprinted final bounds.
 
 ## Error Handling
 
@@ -301,11 +374,12 @@ because it is a pure function of persisted raw maps and bounds.
 ### Slice 1: Depth Contract and Canonical Disparity
 
 Add `DepthBatch`, adapter declarations/tests, scene pre-pass, raw-depth storage,
-deterministic scene bounds, pure canonicalization, and local metadata. Keep the
-current inverse-remap renderer temporarily through a narrow adapter that bypasses
-the old physical formula and supplies a positive, near-first pixel-disparity
-map directly. Run unit tests and one real short clip; inspect near/far direction
-and chunk/resume identity before continuing.
+persisted candidate samples, deterministic fixed-point scene merging and bounds,
+pure canonicalization, disk preflight/retention, and local metadata. Keep the
+current inverse-remap renderer temporarily through a narrow adapter that
+bypasses the old physical formula and supplies a positive, near-first
+pixel-disparity map directly. Run unit tests and one real short clip; inspect
+near/far direction and clean/chunk/resume identity before continuing.
 
 ### Slice 2: Torch DIBR
 
@@ -333,7 +407,15 @@ Tests are written before their production changes and cover:
 - no estimator performs per-frame min/max normalization;
 - deterministic scene IDs, false-cut merge guard, robust bounds, outliers, flat
   maps, and non-finite values;
+- left-to-right fixed-point merge order, pooled-sample union, and final bounds
+  recomputation after every merge;
+- candidate manifests cannot canonicalize, including a simulated crash after
+  final bounds are written but before the final manifest replacement;
 - clean, chunked, and resumed canonical output identity;
+- native-resolution float16 compressed raw round trips through float32
+  canonicalization without source-frame upsampling;
+- disk-budget refusal before inference and raw retention/cleanup after validated
+  canonical writes;
 - local metadata creation and global-cache metadata round trip;
 - constant-disparity translation and left/right symmetry;
 - a non-symmetric sign test asserting a near foreground centroid has
@@ -363,11 +445,15 @@ Performance numbers are observations, not portable test thresholds.
 - All five estimator mode declarations produce `canonical_near > canonical_far`.
 - No estimator performs per-frame min/max normalization.
 - Canonical output is identical across a resume boundary and a clean run.
+- Canonicalization cannot start until all raw frames exist and the scene
+  manifest has `status: final` with matching final-bounds fingerprint.
 - No production stereo path calls inverse remap or colour-derived hole masking.
 - A foreground/background collision always renders the nearer colour.
 - Valid black source content is unchanged unless its explicit splat mask is
   invalid.
 - `03_disparity_maps/metadata.json` is written locally and required by stereo.
+- Raw depth is stored compressed at native model resolution, and insufficient
+  disk space fails before long-running inference begins.
 - Resume with the previous schema preserves valid original frames and rebuilds
   only scene/depth/downstream stages.
 - CPU tests pass and CUDA-specific tests pass on the available NVIDIA GPU.
