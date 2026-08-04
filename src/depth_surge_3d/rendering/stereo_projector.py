@@ -12,7 +12,7 @@ import numpy as np
 import subprocess
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from ..inference import (
     create_see_through_depth_estimator,
@@ -67,6 +67,7 @@ class StereoProjector:
         self.device = device
         self.metric = metric
         self.stereo_renderer = stereo_renderer
+        self.depth_estimator: Any
 
         if depth_model_version == "see_through":
             self.depth_estimator = create_see_through_depth_estimator(model_path, device, metric)
@@ -234,7 +235,10 @@ class StereoProjector:
             render_settings = StereoRenderSettings(
                 stereo_strength=float(settings.get("stereo_strength", 2.0)),
                 convergence=float(settings.get("convergence", 0.5)),
-                occlusion_fill=str(settings.get("occlusion_fill", "background")),
+                occlusion_fill=cast(
+                    Literal["none", "background"],
+                    str(settings.get("occlusion_fill", "background")),
+                ),
             )
             stereo = self._get_stereo_renderer().render(
                 image,
@@ -345,6 +349,11 @@ class StereoProjector:
                 return False
         return True
 
+    def load_model(self) -> bool:
+        """Load the configured estimator once for validation or processing."""
+
+        return self._ensure_model_loaded()
+
     def _get_stereo_renderer(self) -> StereoRenderer:
         if self.stereo_renderer is None:
             estimator_device = str(getattr(self.depth_estimator, "device", self.device))
@@ -359,6 +368,8 @@ class StereoProjector:
     ) -> int:
         if depth_resolution == "auto":
             return max(image.shape[0], image.shape[1])
+        if not isinstance(depth_resolution, (str, int)) or isinstance(depth_resolution, bool):
+            return 1080
         try:
             return int(depth_resolution)
         except (ValueError, TypeError):

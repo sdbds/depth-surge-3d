@@ -18,6 +18,7 @@ from typing import Any
 
 from ...core.constants import DA3_MODEL_NAMES, DEFAULT_DA3_MODEL
 from .attention_backend import install_da3_flash_attention
+from .model_artifact import resolve_hf_snapshot
 from .types import DepthBatch, DepthRepresentation
 
 
@@ -68,6 +69,7 @@ class VideoDepthEstimatorDA3:
         self.metric = metric
         self.verbose = verbose
         self.model = None
+        self.artifact_identity: str | None = None
 
     def _determine_device(self, device: str) -> str:
         """Determine the best device to use for inference."""
@@ -145,13 +147,15 @@ class VideoDepthEstimatorDA3:
 
             # Resolve model ID
             hf_model_id = self._resolve_model_id()
+            resolved_model_path, artifact_identity = resolve_hf_snapshot(hf_model_id)
 
             # Load model (suppress all library output)
             print(f"Loading Depth Anything V3 model: {hf_model_id}")
             with suppress_output():
-                self.model = DepthAnything3.from_pretrained(hf_model_id)
+                self.model = DepthAnything3.from_pretrained(resolved_model_path)
                 self.model = self.model.to(device=self.device)  # type: ignore[attr-defined]
                 self.model.eval()  # type: ignore[attr-defined]
+            self.artifact_identity = artifact_identity
 
             model_variant = "Metric-" if self.metric else ""
             print(f"Loaded {model_variant}Depth-Anything-V3 ({self.model_name}) on {self.device}")
@@ -260,6 +264,7 @@ class VideoDepthEstimatorDA3:
             "loaded": self.model is not None,
             "temporal_consistency": False,  # DA3 processes frames independently
             "memory_efficient": True,  # Key advantage of DA3
+            "artifact_identity": self.artifact_identity,
         }
 
     def unload_model(self) -> None:

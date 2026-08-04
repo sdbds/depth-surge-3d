@@ -1664,9 +1664,6 @@
                                                 <select class="form-select" id="frameSource">
                                                     <option value="auto">Auto-detect highest stage</option>
                                                     <option value="vr_frames">Final VR frames (99_vr_frames)</option>
-                                                    <option value="left_right_final">Final stereo pairs (6_*_frames_final)</option>
-                                                    <option value="left_right_fisheye">Fisheye frames (5_*_frames_fisheye)</option>
-                                                    <option value="left_right_basic">Basic stereo pairs (4_*_frames)</option>
                                                 </select>
                                             </div>
                                             
@@ -2235,14 +2232,21 @@
                 return;
             }
             
+            const resumePayload = {
+                output_dir: resumeDirectory,
+                migrate_legacy: document.getElementById('migrateLegacy').value
+            };
+            const resumeRawStorageDtype = document.getElementById('rawStorageDtype').value;
+            if (resumeRawStorageDtype === 'float32') {
+                resumePayload.raw_storage_dtype = resumeRawStorageDtype;
+            }
+
             fetch('/resume', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({
-                    output_dir: resumeDirectory
-                })
+                body: JSON.stringify(resumePayload)
             })
             .then(response => response.json())
             .then(data => {

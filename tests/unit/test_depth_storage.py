@@ -58,6 +58,25 @@ def test_model_fingerprint_hashes_local_weights_and_is_deterministic(tmp_path: P
     assert first["model_info"]["revision"] == "abc123"
 
 
+def test_model_fingerprint_uses_loaded_remote_artifact_identity() -> None:
+    class RemoteEstimator:
+        def __init__(self, artifact_identity: str) -> None:
+            self.artifact_identity = artifact_identity
+
+        def get_model_info(self) -> dict:
+            return {
+                "model_name": "owner/model",
+                "artifact_identity": self.artifact_identity,
+            }
+
+    first = build_model_fingerprint(RemoteEstimator("hf:owner/model@aaa"), {})
+    second = build_model_fingerprint(RemoteEstimator("hf:owner/model@bbb"), {})
+
+    assert first["artifact_identity"] == "hf:owner/model@aaa"
+    assert second["artifact_identity"] == "hf:owner/model@bbb"
+    assert first != second
+
+
 def test_auto_store_selects_float16_and_writes_atomic_compressed_files(tmp_path: Path) -> None:
     first = np.array([[[0.0, 0.5], [1.0, np.nan]]], dtype=np.float32)
     store = _open(tmp_path / "raw", first)
@@ -151,6 +170,16 @@ def test_semantic_fingerprint_mismatch_rejects_partial_raw_directory(tmp_path: P
 
     with pytest.raises(RawDepthFingerprintError, match="semantic fingerprint"):
         _open(tmp_path / "raw", values, semantic={"model": "b"})
+
+
+def test_existing_corrupt_raw_payload_is_rejected_before_resume(tmp_path: Path) -> None:
+    values = np.array([[[0.1, 0.2]]], dtype=np.float32)
+    store = _open(tmp_path / "raw", values)
+    payload = store.write_batch(["frame_000000.png"], values)[0]
+    payload.write_bytes(b"not-an-npz")
+
+    with pytest.raises(RawDepthFingerprintError, match="payload"):
+        _open(tmp_path / "raw", values)
 
 
 def test_requested_dtype_change_is_rejected_unless_it_promotes_float16(

@@ -174,8 +174,10 @@ def _validate_optional_text(name: str, value: object) -> str | None:
 
 
 def _validate_depth_resolution(value: object) -> int | str:
-    if isinstance(value, str) or (isinstance(value, Integral) and not isinstance(value, bool)):
+    if isinstance(value, str):
         return value
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        return int(value)
     raise ValueError("depth_resolution must be auto or an integer resolution")
 
 

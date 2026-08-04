@@ -167,9 +167,9 @@ def _install_flash_attention(module_names: tuple[str, ...]) -> int:
     for module_name in module_names:
         try:
             module = importlib.import_module(module_name)
-            functional = module.F
+            functional = getattr(module, "F")
             if not isinstance(functional, _FunctionalProxy):
-                module.F = _FunctionalProxy(functional)
+                setattr(module, "F", _FunctionalProxy(functional))
             enabled_modules += 1
         except Exception as exc:
             logger.debug("Could not adapt %s for FlashAttention 2: %s", module_name, exc)

@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from .attention_backend import install_diffusers_flash_attention
+from .model_artifact import resolve_hf_snapshot
 from .types import DepthBatch, DepthRepresentation
 
 
@@ -81,17 +82,18 @@ def _load_see_through_pipeline(
     )
     from module.see_through.vendor.modules.marigold import MarigoldDepthPipeline
 
+    resolved_repo, artifact_identity = resolve_hf_snapshot(repo_id, cache_dir=cache_dir)
     common_kwargs: dict[str, Any] = {
         "cache_dir": str(cache_dir),
         "torch_dtype": dtype,
     }
     unet = UNetFrameConditionModel.from_pretrained(
-        repo_id,
+        resolved_repo,
         subfolder="unet",
         **common_kwargs,
     )
     pipeline = MarigoldDepthPipeline.from_pretrained(
-        repo_id,
+        resolved_repo,
         unet=unet,
         **common_kwargs,
     )
@@ -99,6 +101,7 @@ def _load_see_through_pipeline(
     if hasattr(pipeline, "set_progress_bar_config"):
         pipeline.set_progress_bar_config(disable=True)
     pipeline.cache_tag_embeds()
+    pipeline._depth_surge_artifact_identity = artifact_identity
     return pipeline
 
 
@@ -130,6 +133,7 @@ class SeeThroughDepthEstimator:
         self.pipeline_loader = pipeline_loader or _load_see_through_pipeline
         self.verbose = verbose
         self.model: Any | None = None
+        self.artifact_identity: str | None = None
 
     @staticmethod
     def _determine_device(device: str) -> str:
@@ -164,6 +168,9 @@ class SeeThroughDepthEstimator:
                 device=self.device,
                 dtype=dtype,
             )
+            artifact_identity = getattr(self.model, "_depth_surge_artifact_identity", None)
+            if isinstance(artifact_identity, str):
+                self.artifact_identity = artifact_identity
             print(
                 "Loaded See-Through Marigold "
                 f"on {self.device} ({dtype}, {self.processing_resolution}px, "
@@ -258,6 +265,7 @@ class SeeThroughDepthEstimator:
             "denoising_steps": self.denoising_steps,
             "seed": self.seed,
             "source": "qinglong-captions/module/see_through",
+            "artifact_identity": self.artifact_identity,
         }
 
     def unload_model(self) -> None:

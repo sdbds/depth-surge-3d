@@ -24,6 +24,12 @@ from ...core.constants import (
     INTERMEDIATE_DIRS,
     DEFAULT_FALLBACK_FPS,
 )
+from ..frames.source_frame_manifest import (
+    file_sha256,
+    read_source_frame_manifest,
+    source_frame_manifest_mismatch_reason,
+    write_source_frame_manifest,
+)
 
 
 class VideoEncoder:
@@ -201,7 +207,19 @@ class VideoEncoder:
             and abs(len(existing_frames) - expected_frames) <= frame_count_tolerance
             and self._has_downstream_progress(directories)
         )
-        if expected_frames > 0 and (exact_count or tolerated_vfr_drift):
+        source_path = Path(video_path)
+        reusable_manifest = False
+        if source_path.is_file():
+            source_hash = file_sha256(source_path)
+            reusable_manifest = (
+                source_frame_manifest_mismatch_reason(
+                    read_source_frame_manifest(frames_dir),
+                    existing_frames,
+                    source_hash,
+                )
+                is None
+            )
+        if expected_frames > 0 and (exact_count or tolerated_vfr_drift) and reusable_manifest:
             print(f"  Reusing {len(existing_frames)} already extracted frames")
             return existing_frames
 
@@ -209,6 +227,7 @@ class VideoEncoder:
         # Clear only this stage's exact output pattern before a full re-extraction.
         for frame_file in existing_frames:
             frame_file.unlink(missing_ok=True)
+        (frames_dir / "metadata.json").unlink(missing_ok=True)
 
         # Convert frame numbers to timestamps for more efficient seeking
         start_time = start_frame / fps if fps > 0 else 0
@@ -267,7 +286,10 @@ class VideoEncoder:
             print(f"Error extracting frames: {e}")
             return []
 
-        return get_frame_files(frames_dir)
+        frame_files = get_frame_files(frames_dir)
+        if frame_files:
+            write_source_frame_manifest(frame_files, video_path)
+        return frame_files
 
     @staticmethod
     def _has_downstream_progress(directories: dict[str, Path]) -> bool:

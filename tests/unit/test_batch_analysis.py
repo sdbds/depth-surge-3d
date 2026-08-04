@@ -208,13 +208,13 @@ class TestDetectHighestStageWithFrames:
         def truediv_handler(dirname):
             if "99_vr_frames" in str(dirname):
                 return mock_vr_dir
-            elif "02_depth_maps" in str(dirname):
+            elif "03_disparity_maps" in str(dirname):
                 return mock_depth_dir
             return MagicMock(spec=Path, exists=lambda: False)
 
         mock_batch_path.__truediv__.side_effect = truediv_handler
 
-        stages = {"99_vr_frames": "VR frames", "02_depth_maps": "Depth maps"}
+        stages = {"99_vr_frames": "VR frames", "03_disparity_maps": "Disparity maps"}
 
         stage_num, stage_name, frame_count = _detect_highest_stage(mock_batch_path, stages)
 
@@ -426,11 +426,11 @@ class TestCreateVideoFromBatch:
 
     @patch("subprocess.run")
     def test_create_video_specific_frame_source(self, mock_run):
-        """Test creating video with specific frame source."""
+        """The only explicit frame source is the assembled VR stage."""
         mock_batch_path = Path("/tmp/batch")
 
         settings = {
-            "frame_source": "left_right_basic",
+            "frame_source": "vr_frames",
             "quality": "high",
             "fps": "original",
             "output_filename": "test_output.mp4",
@@ -448,6 +448,17 @@ class TestCreateVideoFromBatch:
         call_args = mock_run.call_args[0][0]
         assert "-crf" in call_args
         assert "18" in call_args
+        assert call_args[call_args.index("-framerate") + 1] == "30"
+
+    @patch("subprocess.run")
+    def test_create_video_rejects_removed_frame_sources(self, mock_run):
+        with pytest.raises(ValueError, match="Unsupported frame source"):
+            create_video_from_batch(
+                Path("/tmp/batch"),
+                {"frame_source": "left_right_basic"},
+            )
+
+        mock_run.assert_not_called()
 
     @patch("subprocess.run")
     def test_create_video_ffmpeg_error(self, mock_run):

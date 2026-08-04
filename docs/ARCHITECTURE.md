@@ -1,218 +1,137 @@
 # Technical Architecture
 
-## Overview
+## Pipeline
 
-Depth Surge 3D uses a multi-stage processing pipeline that combines AI-powered depth estimation with stereoscopic rendering techniques to convert monocular 2D video into 3D VR format.
+Depth Surge 3D converts monocular video through restartable, fingerprinted
+stages:
 
-## How It Works
-
-The conversion process combines computer vision with stereoscopic rendering:
-
-1. **AI Depth Analysis**: Video-Depth-Anything processes video frames with temporal consistency to create smooth depth maps across time, estimating the 3D structure of the scene without requiring specialized camera equipment.
-
-2. **Stereo Pair Generation**: Using the predicted depth information, the system generates separate left and right eye images by shifting pixels based on their distance from the viewer - closer objects appear more separated, distant objects less so.
-
-3. **VR Optimization**: The stereo pairs are processed through configurable fisheye distortion and projection models to match different VR headset optics.
-
-4. **Format Adaptation**: Final output can be rendered in standard VR formats (side-by-side or over-under) with resolution options from preview quality to 8K.
-
-The result is 3D video that maintains the original content's motion and timing while adding depth perception suitable for VR viewing.
-
-## Processing Pipeline
-
-The conversion follows a 7-step pipeline with resume capability:
-
-### Step 1: Video Preprocessing
-- **Frame Extraction**: FFmpeg extracts frames from the source video
-- **Time Range Handling**: Processes only the specified time range if `-s`/`-e` flags are used
-- **Optional Enhancement**: Resolution upscaling and frame interpolation
-- **Audio Extraction**: Immediately extracts audio to lossless FLAC format for reuse
-
-**Resume**: Skips if frames already exist in the output directory
-
-### Step 2: AI Depth Analysis
-- **Model**: Video-Depth-Anything neural network with temporal consistency
-- **Chunked Processing**: Processes frames in 32-frame sliding windows with overlap
-- **Output**: Grayscale depth maps showing estimated distance of every pixel
-- **Memory Management**: Automatic batching to prevent CUDA out-of-memory errors
-
-**Resume**: Skips if depth maps already exist (when `--keep-intermediates` is enabled)
-
-### Step 3: Disparity Conversion
-- **Depth to Disparity**: Converts depth values to horizontal pixel shifts
-- **Stereo Parameters**: Uses baseline and focal length to calculate shift amounts
-- **Normalization**: Ensures disparity values are appropriate for the target resolution
-
-### Step 4: Stereo Image Generation
-- **Symmetric Generation**: Creates both left and right eye images with proper disparity
-- **Pixel Shifting**: Moves pixels horizontally based on their depth
-- **Hole Filling**: Fills gaps created by pixel shifts using inpainting techniques
-- **Quality Modes**: Fast (basic inpainting) or Advanced (depth-guided filling)
-
-**Resume**: Skips if stereo pairs already exist (when `--keep-intermediates` is enabled)
-
-### Step 5: VR Lens Simulation (Optional)
-- **Fisheye Distortion**: Applies lens distortion based on projection model
-- **Projection Models**: Stereographic, equidistant, equisolid, orthographic
-- **Field of View**: Configurable FOV from 75° to 180°
-- **Headset Compatibility**: Matches VR headset optical characteristics
-
-**Resume**: Skips if distorted frames already exist (when distortion is enabled)
-
-### Step 6: Format Assembly
-- **VR Format Creation**: Combines stereo pairs into side-by-side or over-under format
-- **Resolution Scaling**: Scales to target VR resolution with proper aspect ratio
-- **Center Cropping**: Optional cropping to remove edge artifacts
-
-**Resume**: Skips if VR frames already exist
-
-### Step 7: Audio Integration
-- **Audio Synchronization**: Combines VR frames with pre-extracted audio
-- **Time Alignment**: Maintains perfect lip-sync with original video
-- **Codec Selection**: H.264 video with AAC audio for wide compatibility
-- **Quality Settings**: High-bitrate encoding for VR-quality output
-
-## Video Enhancement Features
-
-### Frame Interpolation
-- **Algorithm**: FFmpeg's minterpolate with motion compensation
-- **Target FPS**: Configurable (default 60fps for smooth VR)
-- **Motion Vectors**: Estimates motion between frames for smooth interpolation
-- **Trade-off**: Adds processing time but significantly improves VR comfort
-
-### Upscaling
-- **Algorithm**: Lanczos resampling (high-quality)
-- **Minimum Resolution**: Enforces minimum output quality (default 1080p)
-- **Aspect Ratio**: Preserves original aspect ratio
-- **Smart Upscaling**: Only upscales if source is below target resolution
-
-### Audio Preservation
-- **Immediate Extraction**: Audio extracted to FLAC on upload/initial processing
-- **Lossless Format**: Preserves full audio quality for final video
-- **Time Range Sync**: Automatically syncs audio with processed time range
-- **Reuse**: Pre-extracted audio reused in resume scenarios
-
-## Video-Depth-Anything Integration
-
-### Model Architecture
-- **Base**: Depth Anything V2 architecture
-- **Temporal Consistency**: Specialized for smooth depth across video frames
-- **Window Size**: 32-frame chunks with overlap
-- **Available Sizes**:
-  - Small (24.8M params) - Fast, lower quality
-  - Base (97.5M params) - Balanced
-  - Large (335.3M params) - Best quality (default)
-
-### Depth Estimation Process
-1. **Frame Batching**: Groups frames into 32-frame windows
-2. **Overlap Processing**: Windows overlap to ensure temporal smoothness
-3. **Feature Extraction**: Vision Transformer (ViT) extracts image features
-4. **Depth Prediction**: Predicts relative depth for each pixel
-5. **Temporal Alignment**: Ensures consistent depth values across frames
-
-### Memory Optimization
-- **Chunked Processing**: Processes depth maps in small batches (default: 5 frames)
-- **CUDA Management**: Explicit GPU memory cleanup between batches
-- **Adaptive Batching**: Automatically reduces batch size if OOM errors occur
-
-## Storage Architecture
-
-### Generation-Specific Directories
-Each processing session creates a self-contained timestamped directory:
-
-```
-output/
-└── timestamp_videoname_timestamp/
-    ├── original_video.mp4      # Source video
-    ├── original_audio.flac     # Pre-extracted audio
-    ├── frames/                 # Extracted frames
-    ├── depth_maps/            # AI depth maps (optional)
-    ├── left_frames/           # Left eye images (optional)
-    ├── right_frames/          # Right eye images (optional)
-    ├── vr_frames/             # Final VR frames
-    ├── settings.json          # Processing parameters
-    └── output.mp4             # Final 3D video
+```text
+source video
+  -> 00_original_frames
+  -> 01_scene_data (candidate cuts, final segments, samples, bounds)
+  -> 02_depth_raw (native model output and representation metadata)
+  -> global barrier: all raw inference complete
+  -> 03_disparity_maps (canonical relative disparity)
+  -> 04_left_frames + 04_right_frames (forward-splat DIBR)
+  -> optional projection, crop, and upscale stages
+  -> 99_vr_frames
+  -> encoded video with optional source audio
 ```
 
-**Benefits**:
-- **Self-contained**: All files for one conversion in one directory
-- **Resume-friendly**: Original video always available for resume
-- **No duplication**: Eliminates redundant uploads/ directory
-- **Easy cleanup**: Delete entire directory when done
+The frame, scene, raw-depth, canonical, and stereo stages have separate
+metadata. `00_original_frames/metadata.json` anchors the exact encoded PNG
+bytes to the source-video SHA-256 after extraction completes. A stage is reused
+only when its schema, frame manifest, settings, model identity, and upstream
+fingerprints match.
 
-### Settings File
-Each processing session saves complete metadata:
-- Processing parameters (all CLI flags)
-- Video properties (resolution, fps, duration)
-- Timestamps (created, completed, duration)
-- Status tracking (in_progress, completed, failed)
-- Output information (filename, format, resolution)
+## Depth Contract
 
-## Performance Characteristics
+Every estimator returns a `DepthBatch` containing float32 values and one
+explicit `DepthRepresentation`:
 
-### Processing Speed
-- **GPU (RTX 4070+ class)**: ~2-4 seconds per output frame
-- **GPU (Mid-range)**: ~5-10 seconds per output frame
-- **CPU**: ~30-60 seconds per output frame
-- **Overall**: ~10x faster with GPU acceleration
+- `METRIC_DEPTH`: positive physical distance; converted with a safe reciprocal.
+- `INVERSE_DEPTH`: near-is-large score; passed through.
+- `RELATIVE_DEPTH`: affine-relative distance; converted with linear negation.
 
-### Memory Usage
-- **GPU VRAM**: ~2-4GB for depth estimation
-- **System RAM**: ~2-8GB depending on resolution
-- **Disk Space**: ~10-50GB for intermediate files (high-res, long clips)
+Non-finite values are invalid. Non-positive values are invalid only for metric
+physical distance. Estimators never perform per-frame min/max normalization.
 
-### Chunked Processing
-- **Default batch size**: 5 depth maps at a time
-- **Automatic adjustment**: Reduces batch size on OOM errors
-- **Memory cleanup**: Explicit CUDA cache clearing between batches
-- **Progress tracking**: Per-frame progress updates
+Raw output is stored at model-native resolution. The first inference chunk
+selects `float16` or `float32` storage for the whole raw directory and records
+the choice. A preflight estimate checks disk space before long inference.
+Remote DA3 and See-Through repositories are resolved to one immutable Hub
+snapshot before loading; that resolved artifact identity is part of the raw
+fingerprint.
 
-## Code Structure
+## Scene Canonicalization
 
-### Main Components
+Scene cuts are analyzed from source-frame luma histograms before depth
+canonicalization. Candidate manifests carry `status: candidate`; only a
+`status: final` manifest may drive canonical output.
 
-**`depth_surge_3d.py`**: Command-line interface and argument parsing
+After all raw frames exist, deterministic depth samples are pooled per candidate
+segment. Adjacent segments are merged left-to-right, repeatedly until stable.
+Merged samples are the union of their child sample sets. Final 2nd/98th
+percentiles are then computed once for each final segment.
 
-**`app.py`**: Flask web server with SocketIO for real-time updates
+Canonicalization is a pure function of raw depth, representation, final scene
+ID, and final bounds. Output is relative disparity in `[0, 1]`, where `1` is
+near. Empty and flat scenes produce `0.5`. Canonical maps use `uint16` PNG and
+store exact upstream fingerprints in `metadata.json`.
 
-**`src/depth_surge_3d/processing/video_processor.py`**: Core processing pipeline
-- VideoProcessor class with 7-step processing
-- Resume capability with step-level skipping
-- Progress tracking and callbacks
+## Stereo Renderer
 
-**`src/depth_surge_3d/models/video_depth_estimator.py`**: Depth estimation wrapper
-- VideoDepthAnything integration
-- Model loading and management
-- Chunked depth map generation
+Canonical relative disparity is resized to the render target with bilinear
+interpolation before pixel disparity is computed:
 
-**`src/depth_surge_3d/processing/image_processor.py`**: Image manipulation
-- Stereo pair generation
-- Fisheye distortion
-- Hole filling algorithms
+```text
+d = (r - convergence) * target_width * stereo_strength / 100
+left_target_x  = source_x + d / 2
+right_target_x = source_x - d / 2
+```
 
-**`src/depth_surge_3d/utils/`**: Utility modules
-- Resolution calculation and validation
-- VR format assembly
-- Settings management
+Both eyes use the same signed `d` as the depth key. A banded CUDA forward splat
+performs bilinear horizontal scattering. Each target column first elects a
+near-surface winner from contributions with weight at least `0.5`; when no such
+vote exists, all contributions participate. Visibility is the one-sided test
+`d >= winner - 0.25 px`, preserving low-weight antialiasing tails without
+letting them control the depth vote.
 
-### Refactoring Standards
+Invalid splat pixels are represented by explicit masks, never inferred from
+color. `background` occlusion fill propagates farther visible pixels
+horizontally within each row and band. It cannot reconstruct unseen texture;
+wide gaps can become a constant-color run from the selected background edge.
 
-The codebase follows strict quality standards:
-- **Complexity**: All functions maintained at ≤10 McCabe complexity
-- **Type Hints**: Complete type annotations on all functions
-- **Error Handling**: Comprehensive try-catch with graceful fallbacks
-- **Documentation**: Clear docstrings with parameter descriptions
-- **Code Style**: Black formatting, flake8 linting
+## Memory And I/O
 
-## Browser Compatibility
+CUDA scatter bands use a deterministic byte budget. The per-source-pixel budget
+includes color/value tensors, weights, projected disparity, and int64 scatter
+indices. Background fill executes inside each full-row band, so no full-frame
+GPU buffer remains except the final uint8 eye outputs.
 
-### Web UI
-- **Chrome/Edge**: Full feature support
-- **Firefox**: Full feature support
-- **Safari**: Basic support (some WebSocket limitations)
+Stereo decode and output work is bounded by both `stereo_io_workers` and a host
+byte budget. End-to-end throughput measurements include decode, render, image
+encoding, and writes; GPU kernel time is reported separately.
 
-### Real-time Features
-- **SocketIO**: WebSocket-based progress updates
-- **Threading**: async_mode='threading' for concurrent processing
-- **Progress Tracking**: Sub-progress bars for detailed feedback
-- **Frame Previews**: Live depth map and stereo frame previews
+The legacy in-memory depth API rejects projected outputs over 512 MiB. The main
+video pipeline remains file-backed.
+
+## Resume And Migration
+
+Resume decisions are deterministic and reported before mutation. The selected
+settings file is fixed for the whole operation. Web resume resolves only the
+source path and SHA-256 recorded by that file. Source frames require the saved
+source-video SHA-256, their extraction-time content fingerprint, a contiguous
+frame manifest, matching dimensions, and readable payloads. Raw reuse
+additionally requires the exact fingerprint of the loaded estimator and
+validates every persisted NPZ. Canonical and stereo PNGs are decoded and checked
+for their declared dtype and shape before reuse.
+
+A depth or stereo schema change does not by itself invalidate valid
+`00_original_frames`. Raw model changes invalidate raw depth and every
+downstream stage. Canonical changes invalidate canonical disparity and
+downstream stages. Render-setting changes invalidate stereo output and
+downstream stages.
+
+Old generated directories are archived under `legacy_v1/` by default.
+Non-interactive runs never delete them implicitly; deletion requires
+`--migrate-legacy delete`. Removed keys found in an on-disk settings file are
+listed and stripped during migration, while the same keys supplied explicitly
+are validation errors. Web migration is deferred to the processing thread until
+the model fingerprint is available. Failed archive/settings transactions move
+stages back to their original paths. Explicit deletion commits after stage
+movement and settings migration; staging cleanup is post-commit garbage
+collection, so an interrupted cleanup is reported without an impossible partial
+rollback.
+
+## Main Components
+
+- `depth_surge_3d.py`: CLI, validation, and resume entry point.
+- `app.py`: Flask and Socket.IO Web UI.
+- `processing/frames/depth_processor.py`: scene, raw-depth, canonical, and cache
+  orchestration.
+- `processing/frames/depth_normalizer.py`: representation conversion and pure
+  scene canonicalization.
+- `processing/frames/stereo_generator.py`: bounded stereo I/O pipeline.
+- `rendering/stereo_projector.py`: banded CUDA forward splat and occlusion fill.
+- `io/resume.py`: stage validation, reports, and legacy migration.

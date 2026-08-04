@@ -13,10 +13,6 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-import cv2
-import numpy as np
-
-
 DEPTH_CACHE_SETTING_KEYS = (
     "depth_model_version",
     "model_path",
@@ -147,57 +143,16 @@ def compute_cache_key(video_path: str, depth_settings: dict[str, Any]) -> str:
     return hasher.hexdigest()
 
 
-def get_cached_depth_maps(
-    video_path: str, depth_settings: dict[str, Any], num_frames: int
-) -> np.ndarray | None:
-    """
-    Try to load depth maps from cache.
-
-    Args:
-        video_path: Path to input video
-        depth_settings: Depth-related settings
-        num_frames: Expected number of frames
-
-    Returns:
-        Cached depth maps array, or None if not found/invalid
-    """
-    try:
-        depth_files = get_cached_depth_map_files(
-            video_path, depth_settings, num_frames, require_canonical=False
-        )
-        if depth_files is None:
-            return None
-
-        metadata_file = depth_files[0].parent / "metadata.json"
-        with open(metadata_file, "r") as f:
-            metadata = json.load(f)
-        depth_scale = float(metadata.get("depth_scale", 1000.0))
-
-        # Load depth maps
-        depth_maps = []
-        for depth_file in depth_files:
-            depth_img = cv2.imread(str(depth_file), cv2.IMREAD_UNCHANGED)
-            if depth_img is None:
-                return None
-            depth_float = depth_img.astype(np.float32) / depth_scale
-            depth_maps.append(depth_float)
-
-        return np.array(depth_maps)
-
-    except Exception:
-        # If anything fails, just return None (cache miss)
-        return None
-
-
 def get_cached_depth_map_files(
     video_path: str,
     depth_settings: dict[str, Any],
     num_frames: int,
-    *,
-    require_canonical: bool = True,
-    expected_model_fingerprint: str | None = None,
 ) -> list[Path] | None:
     """Return validated cache paths without decoding the depth images."""
+    expected_model_fingerprint = depth_settings.get("model_fingerprint")
+    if not isinstance(expected_model_fingerprint, str) or not expected_model_fingerprint:
+        return None
+
     cache_entry_dir = get_cache_dir() / compute_cache_key(video_path, depth_settings)
     metadata_file = cache_entry_dir / "metadata.json"
     if not metadata_file.exists():
@@ -206,14 +161,9 @@ def get_cached_depth_map_files(
     try:
         with open(metadata_file, "r") as f:
             metadata = json.load(f)
-        if metadata.get("num_frames") != num_frames:
+        if not _is_valid_canonical_metadata(metadata, num_frames):
             return None
-        if require_canonical and not _is_valid_canonical_metadata(metadata, num_frames):
-            return None
-        if (
-            expected_model_fingerprint is not None
-            and metadata.get("source_model_fingerprint") != expected_model_fingerprint
-        ):
+        if metadata.get("source_model_fingerprint") != expected_model_fingerprint:
             return None
 
         depth_files = [cache_entry_dir / f"depth_{i:06d}.png" for i in range(num_frames)]
@@ -224,52 +174,21 @@ def get_cached_depth_map_files(
         return None
 
 
-def save_depth_maps_to_cache(
-    video_path: str, depth_settings: dict[str, Any], depth_maps: np.ndarray
-) -> bool:
-    """
-    Save depth maps to global cache.
-
-    Args:
-        video_path: Path to input video
-        depth_settings: Depth-related settings
-        depth_maps: Depth maps to cache [N, H, W]
-
-    Returns:
-        True if saved successfully
-    """
+def _load_cacheable_metadata(
+    depth_files: list[Path], expected_model_fingerprint: str
+) -> dict[str, Any] | None:
+    source_metadata_path = depth_files[0].parent / "metadata.json"
     try:
-        cache_key = compute_cache_key(video_path, depth_settings)
-        cache_dir = get_cache_dir()
-        cache_entry_dir = cache_dir / cache_key
-
-        # Create cache entry directory
-        cache_entry_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save metadata
-        metadata = {
-            "num_frames": len(depth_maps),
-            "video_path": str(video_path),
-            "depth_settings": {k: depth_settings.get(k) for k in DEPTH_CACHE_SETTING_KEYS},
-            "cache_version": "1.0",
-        }
-
-        metadata_file = cache_entry_dir / "metadata.json"
-        with open(metadata_file, "w") as f:
-            json.dump(metadata, f, indent=2)
-
-        # Save depth maps (scaled to uint16 for efficient storage)
-        for i, depth_map in enumerate(depth_maps):
-            depth_file = cache_entry_dir / f"depth_{i:06d}.png"
-            # Scale to uint16 (multiply by 1000 for 3 decimal precision)
-            depth_uint16 = (depth_map * 1000.0).astype(np.uint16)
-            cv2.imwrite(str(depth_file), depth_uint16)
-
-        return True
-
-    except Exception:
-        # If saving fails, just return False (non-critical)
-        return False
+        with source_metadata_path.open("r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    checks = (
+        _is_valid_canonical_metadata(metadata, len(depth_files)),
+        metadata.get("source_model_fingerprint") == expected_model_fingerprint,
+        metadata.get("frame_names") == [path.name for path in depth_files],
+    )
+    return metadata if all(checks) else None
 
 
 def save_depth_map_files_to_cache(
@@ -280,12 +199,12 @@ def save_depth_map_files_to_cache(
     try:
         if not depth_files:
             return False
-        source_metadata_path = depth_files[0].parent / "metadata.json"
-        with source_metadata_path.open("r", encoding="utf-8") as handle:
-            metadata = json.load(handle)
-        if not _is_valid_canonical_metadata(metadata, len(depth_files)):
+        expected_model_fingerprint = depth_settings.get("model_fingerprint")
+        if not isinstance(expected_model_fingerprint, str) or not expected_model_fingerprint:
             return False
-
+        metadata = _load_cacheable_metadata(depth_files, expected_model_fingerprint)
+        if metadata is None:
+            return False
         cache_entry_dir = get_cache_dir() / compute_cache_key(video_path, depth_settings)
         cache_entry_dir.mkdir(parents=True, exist_ok=True)
 

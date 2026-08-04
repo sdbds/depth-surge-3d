@@ -282,11 +282,9 @@ UPSCALE_MODELS = ["none", "x2", "x4", "x4-conservative"]
 # Step 8: Create Final Video
 INTERMEDIATE_DIRS = {
     "frames": "00_original_frames",  # Step 1: Extracted input frames
-    "supersampled": "01_supersampled_frames",  # Legacy: Super sampling (deprecated)
     "scene_data": "01_scene_data",  # Candidate/final scene manifests and bounds
     "depth_raw": "02_depth_raw",  # Native model output with explicit representation
     "disparity_maps": "03_disparity_maps",  # Canonical relative-disparity maps
-    "depth_maps": "03_disparity_maps",  # Temporary internal alias until renderer migration
     "left_frames": "04_left_frames",  # Step 3: Stereo pair - left eye
     "right_frames": "04_right_frames",  # Step 3: Stereo pair - right eye
     "left_distorted": "05_left_distorted",  # Step 4: Fisheye distortion - left (optional)
@@ -295,8 +293,6 @@ INTERMEDIATE_DIRS = {
     "right_cropped": "06_right_cropped",  # Step 5: Center cropped - right
     "left_upscaled": "07_left_upscaled",  # Step 6: AI upscaled - left (optional)
     "right_upscaled": "07_right_upscaled",  # Step 6: AI upscaled - right (optional)
-    "left_final": "08_left_final",  # Legacy: kept for compatibility
-    "right_final": "08_right_final",  # Legacy: kept for compatibility
     "vr_frames": "99_vr_frames",  # Step 7: Final VR assembled frames
 }
 

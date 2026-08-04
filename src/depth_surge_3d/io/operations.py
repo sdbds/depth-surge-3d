@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -377,18 +378,18 @@ def get_available_space(directory: Path) -> int:
     Side Effects:
         Queries filesystem for disk space information
     """
-    try:
-        stat = os.statvfs(directory)
-        return stat.f_bavail * stat.f_frsize
-    except (OSError, AttributeError):
-        # Fallback for systems without statvfs
+    statvfs = getattr(os, "statvfs", None)
+    if statvfs is not None:
         try:
-            import shutil
-
-            _, _, free = shutil.disk_usage(directory)
-            return free
-        except (OSError, ImportError):
-            return 0
+            stat = statvfs(directory)
+            return int(stat.f_bavail * stat.f_frsize)
+        except (OSError, AttributeError):
+            pass
+    try:
+        _, _, free = shutil.disk_usage(directory)
+        return int(free)
+    except OSError:
+        return 0
 
 
 def _hash_file_sha256(path: Path) -> str:
@@ -583,9 +584,13 @@ def find_settings_file(output_dir: Path, batch_name: str | None = None) -> Path 
             if settings_file.exists():
                 return settings_file
         else:
-            # Find any settings file
-            for file_path in output_dir.glob("*-settings.json"):
-                return file_path
+            candidates = sorted(
+                output_dir.glob("*-settings.json"),
+                key=lambda path: (path.stat().st_mtime_ns, path.name),
+                reverse=True,
+            )
+            if candidates:
+                return candidates[0]
 
         return None
 
@@ -715,12 +720,6 @@ def analyze_processing_progress(  # noqa: C901
             if depth_frames > 0:
                 progress["frames_processed"] = depth_frames
                 progress["can_resume_from_intermediates"] = True
-        elif "depth_maps" in progress["intermediate_stages"]:
-            depth_frames = progress["intermediate_stages"]["depth_maps"]["frames_found"]
-            if depth_frames > 0:
-                progress["frames_processed"] = depth_frames
-                progress["can_resume_from_intermediates"] = True
-
         return progress
 
     except Exception as e:

@@ -1,11 +1,46 @@
 """Unit tests for final video encoding."""
 
+import hashlib
+import json
 from unittest.mock import MagicMock, patch
 
 import cv2
 import numpy as np
 
 from src.depth_surge_3d.processing.video.video_encoder import VideoEncoder
+from src.depth_surge_3d.processing.frames.source_frame_manifest import (
+    write_source_frame_manifest,
+)
+
+
+def test_extract_frames_writes_content_bound_stage_manifest(tmp_path):
+    source_video = tmp_path / "source.mp4"
+    source_video.write_bytes(b"source-video")
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+
+    def extract(_command, **_kwargs):
+        for index in range(1, 3):
+            frame = np.full((2, 3, 3), index, dtype=np.uint8)
+            assert cv2.imwrite(str(frames_dir / f"frame_{index:06d}.png"), frame)
+        return MagicMock(returncode=0)
+
+    with patch(
+        "src.depth_surge_3d.processing.video.video_encoder.subprocess.run",
+        side_effect=extract,
+    ):
+        frame_files = VideoEncoder().extract_frames(
+            str(source_video),
+            {"base": tmp_path, "frames": frames_dir},
+            {"frame_count": 2, "fps": 30.0},
+            {"start_time": None, "end_time": None},
+        )
+
+    metadata = json.loads((frames_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["frame_names"] == [path.name for path in frame_files]
+    assert metadata["source_video_sha256"] == hashlib.sha256(source_video.read_bytes()).hexdigest()
+    assert metadata["source_frame_fingerprint"]
+    assert metadata["fingerprint"]
 
 
 def test_create_video_preserves_fractional_source_fps_when_target_is_original(tmp_path):
@@ -66,10 +101,13 @@ def test_extract_frames_reuses_complete_existing_sequence(tmp_path):
         path = frames_dir / f"frame_{i:06d}.png"
         cv2.imwrite(str(path), np.zeros((2, 2, 3), dtype=np.uint8))
         expected.append(path)
+    source_video = tmp_path / "source.mp4"
+    source_video.write_bytes(b"source-video")
+    write_source_frame_manifest(expected, source_video)
 
     with patch("src.depth_surge_3d.processing.video.video_encoder.subprocess.run") as run:
         result = VideoEncoder().extract_frames(
-            "source.mp4",
+            str(source_video),
             {"base": tmp_path, "frames": frames_dir},
             {"frame_count": 3, "fps": 30.0},
             {"start_time": None, "end_time": None},
@@ -91,11 +129,14 @@ def test_extract_frames_tolerates_small_vfr_metadata_count_drift(tmp_path):
         path.write_bytes(b"png")
         expected.append(path)
     (depth_dir / "frame_000001.png").write_bytes(b"depth")
+    source_video = tmp_path / "source.mp4"
+    source_video.write_bytes(b"source-video")
+    write_source_frame_manifest(expected, source_video)
 
     with patch("src.depth_surge_3d.processing.video.video_encoder.subprocess.run") as run:
         result = VideoEncoder().extract_frames(
-            "source.mp4",
-            {"base": tmp_path, "frames": frames_dir, "depth_maps": depth_dir},
+            str(source_video),
+            {"base": tmp_path, "frames": frames_dir, "disparity_maps": depth_dir},
             {"frame_count": 100, "fps": 23.98},
             {"start_time": None, "end_time": None},
         )
@@ -146,7 +187,7 @@ def test_extract_frames_does_not_reuse_empty_sequence_with_stale_downstream_file
     ) as run:
         result = VideoEncoder().extract_frames(
             "source.mp4",
-            {"base": tmp_path, "frames": frames_dir, "depth_maps": depth_dir},
+            {"base": tmp_path, "frames": frames_dir, "disparity_maps": depth_dir},
             {"frame_count": 2, "fps": 30.0},
             {"start_time": None, "end_time": None},
         )

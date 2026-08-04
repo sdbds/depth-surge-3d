@@ -156,14 +156,14 @@ def test_cuda_peak_memory_fits_splat_budget() -> None:
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    baseline = torch.cuda.memory_allocated()
+    initial_bytes = torch.cuda.memory_allocated()
 
     image = torch.rand((height, width, 3), device="cuda")
     disparity = torch.rand((height, width), device="cuda")
     disparity.mul_(20.0).sub_(10.0)
     result = forward_splat_band(image, disparity, eye_sign=1)
     torch.cuda.synchronize()
-    peak_bytes = torch.cuda.max_memory_allocated() - baseline
+    peak_bytes = torch.cuda.max_memory_allocated() - initial_bytes
 
     assert result.image.shape == image.shape
     assert peak_bytes <= height * width * 192

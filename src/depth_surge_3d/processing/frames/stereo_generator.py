@@ -12,7 +12,7 @@ import traceback
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal, cast
 
 import cv2
 import numpy as np
@@ -526,7 +526,10 @@ class StereoPairGenerator:
         return StereoRenderSettings(
             stereo_strength=float(settings.get("stereo_strength", 2.0)),
             convergence=float(settings.get("convergence", 0.5)),
-            occlusion_fill=str(settings.get("occlusion_fill", "background")),
+            occlusion_fill=cast(
+                Literal["none", "background"],
+                str(settings.get("occlusion_fill", "background")),
+            ),
         )
 
     def create_stereo_pairs(
@@ -613,12 +616,15 @@ class StereoPairGenerator:
             stage_changed = self._prepare_stereo_stage(left_dir, right_dir, stage_metadata)
             if stage_changed:
                 self._reset_downstream_stages(directories)
-            work_items, completed = self._build_file_work_items(
+            work_items, completed, repaired_outputs = self._build_file_work_items(
                 frame_files,
                 depth_files,
                 left_dir,
                 right_dir,
+                render_shape,
             )
+            if repaired_outputs and not stage_changed:
+                self._reset_downstream_stages(directories)
             if not work_items:
                 print(f"  Reusing {completed} existing stereo pairs")
                 return True
@@ -797,16 +803,30 @@ class StereoPairGenerator:
         depth_files: list[Path],
         left_dir: Path,
         right_dir: Path,
-    ) -> tuple[list[_FileWorkItem], int]:
+        render_shape: tuple[int, int],
+    ) -> tuple[list[_FileWorkItem], int, bool]:
         work_items: list[_FileWorkItem] = []
         completed = 0
+        repaired_outputs = False
         for index, (frame_file, depth_file) in enumerate(zip(frame_files, depth_files)):
             frame_name = frame_file.stem
             left_path = left_dir / f"{frame_name}.png"
             right_path = right_dir / f"{frame_name}.png"
-            if left_path.is_file() and right_path.is_file():
+            pair_is_valid = True
+            for path in (left_path, right_path):
+                payload = cv2.imread(str(path), cv2.IMREAD_UNCHANGED) if path.is_file() else None
+                if (
+                    payload is None
+                    or payload.dtype != np.uint8
+                    or payload.ndim != 3
+                    or payload.shape != (*render_shape, 3)
+                ):
+                    pair_is_valid = False
+                    break
+            if pair_is_valid:
                 completed += 1
                 continue
+            repaired_outputs = repaired_outputs or left_path.exists() or right_path.exists()
             left_path.unlink(missing_ok=True)
             right_path.unlink(missing_ok=True)
             work_items.append(
@@ -819,7 +839,7 @@ class StereoPairGenerator:
                     right_path=right_path,
                 )
             )
-        return work_items, completed
+        return work_items, completed, repaired_outputs
 
     @staticmethod
     def _get_canonical_metadata(

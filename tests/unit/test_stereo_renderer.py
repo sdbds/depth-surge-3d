@@ -394,7 +394,7 @@ def test_renderer_peak_cuda_memory_fits_fixed_band_budget() -> None:
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    baseline = torch.cuda.memory_allocated()
+    initial_bytes = torch.cuda.memory_allocated()
 
     generator = np.random.default_rng(23)
     frame = generator.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
@@ -405,7 +405,7 @@ def test_renderer_peak_cuda_memory_fits_fixed_band_budget() -> None:
         StereoRenderSettings(stereo_strength=5.0, occlusion_fill="background"),
     )
     torch.cuda.synchronize()
-    peak_bytes = torch.cuda.max_memory_allocated() - baseline
+    peak_bytes = torch.cuda.max_memory_allocated() - initial_bytes
 
     assert result.left_image.shape == frame.shape
     assert peak_bytes <= height * width * SPLAT_BYTES_PER_PIXEL

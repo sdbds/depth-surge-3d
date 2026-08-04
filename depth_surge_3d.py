@@ -34,6 +34,9 @@ from depth_surge_3d.io.resume import (  # noqa: E402
     apply_legacy_migration,
     build_resume_report,
 )
+from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
+    build_current_model_fingerprint,
+)
 
 
 def _print_resume_report(report) -> None:
@@ -405,15 +408,11 @@ def main():  # noqa: C901
             source="legacy_disk",
         )
         processing_settings["migrate_legacy"] = args.migrate_legacy
-
-        try:
-            resume_report = build_resume_report(args.resume, processing_settings)
-            _print_resume_report(resume_report)
-            apply_legacy_migration(resume_report, args.migrate_legacy)
-            processing_settings = resume_report.migrated_settings
-        except (OSError, TypeError, ValueError) as exc:
-            print(f"Cannot migrate resume data: {exc}")
-            return 1
+        if any(
+            value == "--raw-storage-dtype" or value.startswith("--raw-storage-dtype=")
+            for value in sys.argv[1:]
+        ):
+            processing_settings["raw_storage_dtype"] = args.raw_storage_dtype
 
         projector = create_stereo_projector(
             model_path=processing_settings.get("model_path"),
@@ -421,6 +420,28 @@ def main():  # noqa: C901
             metric=bool(processing_settings.get("use_metric_depth", False)),
             depth_model_version=processing_settings.get("depth_model_version", "v2"),
         )
+        if not projector.load_model():
+            print("Could not load depth estimation model")
+            return 1
+        model_fingerprint = build_current_model_fingerprint(
+            projector.depth_estimator,
+            processing_settings,
+        )
+
+        try:
+            resume_report = build_resume_report(
+                Path(args.resume).resolve(),
+                processing_settings,
+                source_video=video_path,
+                model_fingerprint=model_fingerprint,
+                settings_file=resume_info["settings_file"],
+            )
+            _print_resume_report(resume_report)
+            apply_legacy_migration(resume_report, args.migrate_legacy)
+            processing_settings = resume_report.migrated_settings
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"Cannot migrate resume data: {exc}")
+            return 1
 
         print("Resuming processing...")
         print(f"Input: {video_path}")

@@ -1,179 +1,82 @@
 # Parameters Reference
 
-## Command Line Options
+Run `python depth_surge_3d.py --help` for the complete CLI generated from the
+current parser. The options below are the controls that materially affect depth
+and stereo output.
 
-### Basic Options
+## Input And Output
 
-- **`input_video`**: Path to input video file
-- **`-o, --output`**: Output directory (default: ./output)
-- **`-m, --model`**: Path to Video-Depth-Anything model file (auto-downloads if missing)
-- **`-f, --format`**: VR format - 'side_by_side' or 'over_under' (default: side_by_side)
-- **`--device`**: Processing device - 'cpu', 'cuda', or 'auto' (default: auto)
+- `input_video`: source video path.
+- `-o, --output-dir`: output root. Default: `./output`.
+- `--resume DIRECTORY`: resume a processing directory.
+- `-s, --start` and `-e, --end`: optional time range.
+- `-f, --format`: `side_by_side` or `over_under`.
+- `--vr-resolution`: named per-eye resolution, `auto`, or `custom`.
+- `--target-fps`: output frame rate. Omit it to preserve the source rate.
+- `--no-audio`: omit source audio.
+- `--no-intermediates`: remove restartable working files after validated output.
 
-### Time Range Options
+## Stereo Rendering
 
-- **`-s, --start`**: Start time in mm:ss or hh:mm:ss format (e.g., 01:30 or 00:01:30)
-- **`-e, --end`**: End time in mm:ss or hh:mm:ss format (e.g., 03:45 or 00:03:45)
+- `--stereo-strength`: full near-to-far horizontal disparity as a percentage of
+  render width. Default: `2.0`; valid range: `0.0` to `5.0`.
+- `--convergence`: canonical relative disparity placed at zero parallax.
+  Default: `0.5`; valid range: `0.0` to `1.0`.
+- `--occlusion-fill`: `background` fills horizontal disocclusion gaps from
+  farther visible pixels; `none` leaves gaps invalid.
+- `--stereo-io-workers`: bounded decode/encode worker count. Default is derived
+  from the host CPU count; valid range: `1` to `8`.
 
-### Resolution Options
+The renderer first resizes canonical disparity to the target frame size, then
+computes pixel disparity using the target width:
 
-- **`--vr-resolution`**: Resolution format including all aspect ratios (default: auto)
-  - **Square**: square-480, square-720, square-1k, square-2k, square-3k, square-4k, square-5k
-  - **16:9**: 16x9-480p, 16x9-720p, 16x9-1080p, 16x9-1440p, 16x9-4k, 16x9-5k, 16x9-8k
-  - **Legacy Wide**: wide-2k, wide-4k, ultrawide
-  - **Cinema**: cinema-2k, cinema-4k (ultra-wide, recommend over-under)
-  - **Custom**: custom:WIDTHxHEIGHT (e.g., custom:1920x1080)
-
-- **`--resolution`**: Minimum resolution - '720p', '1080p', '4k', or 'original' (default: 1080p)
-- **`--fps`**: Target framerate for output video (default: 60)
-
-### Stereo Parameters
-
-- **`-b, --baseline`**: Stereo baseline distance (default: 0.065 - average human IPD)
-  - Range: 0.02m (subtle) to 0.15m (very strong)
-  - Larger baseline = stronger 3D effect
-
-- **`-fl, --focal-length`**: Virtual focal length (default: 1000)
-  - Range: 500px (wide-angle) to 2000px (telephoto)
-  - Higher focal length = objects appear closer
-
-### Fisheye/Distortion Options
-
-- **`--fisheye-projection`**: Projection model (default: stereographic)
-  - Options: stereographic, equidistant, equisolid, orthographic
-
-- **`--fisheye-fov`**: Field of view in degrees (default: 105, range: 75-180)
-
-- **`--crop-factor`**: Center crop factor (default: 1.0 - no crop)
-  - Range: 0.5 to 1.0
-  - Lower values = more aggressive cropping
-
-### Quality Options
-
-- **`--hole-fill-quality`**: Hole filling quality - 'fast' or 'advanced' (default: fast)
-  - **fast**: ~2-4 seconds per frame, basic gap filling
-  - **advanced**: ~8-15 seconds per frame, sophisticated depth-guided filling
-
-### Output Options
-
-- **`--no-audio`**: Do not preserve audio from original video (audio preserved by default)
-- **`--no-intermediates`**: Don't save intermediate depth maps and stereo frames
-- **`--resume`**: Resume processing from an existing output directory
-
-## Stereo Parameters Deep Dive
-
-### Baseline and Focal Length Relationship
-
-The **baseline** (distance between virtual cameras) and **focal length** work together to control 3D depth strength:
-
-**Tuning Strategy**:
-```bash
-# Subtle 3D for comfortable viewing
---baseline 0.04 --focal-length 800
-
-# Strong 3D for dramatic effect
---baseline 0.10 --focal-length 1200
-
-# Balanced (default)
---baseline 0.065 --focal-length 1000
+```text
+d = (relative_disparity - convergence) * target_width * stereo_strength / 100
+left_target_x  = source_x + d / 2
+right_target_x = source_x - d / 2
 ```
 
-### Managing Artifacts and "Invented Pixels"
+Near surfaces therefore move right in the left eye and left in the right eye.
+Both eyes share the same depth key; only the target-coordinate sign changes.
 
-**Common Artifacts**:
-- **Stretching/warping**: Objects appear distorted at depth boundaries
-- **Floating pixels**: Disconnected visual elements
-- **Edge artifacts**: Jagged or broken object boundaries
-- **"Invented pixels"**: AI fills gaps with estimated content that may not match reality
+## Scene Scaling
 
-**Artifact Reduction Strategies**:
+- `--scene-detection` / `--no-scene-detection`: enable deterministic scene
+  segmentation. Default: enabled.
+- `--scene-cut-threshold`: luma-histogram cut threshold. Default: `0.55`.
+- `--min-scene-frames`: minimum candidate segment length. Default: `8`.
 
-1. **Reduce 3D Strength** (most effective):
-   ```bash
-   # Conservative settings for clean results
-   --baseline 0.035 --focal-length 700
-   ```
+Raw model output is converted by representation, then each final scene uses
+fixed 2nd/98th percentile bounds. Canonical values are reproducible across
+chunks and resume boundaries. Empty or flat scenes use `0.5`.
 
-2. **Adjust Hole Filling**:
-   - `--hole-fill-quality fast`: Simple inpainting, fewer artifacts but visible gaps
-   - `--hole-fill-quality advanced`: Better gap filling but may introduce AI "hallucinations"
+## Raw Depth Storage
 
-3. **Crop More Aggressively**:
-   ```bash
-   # Remove problematic edges
-   --crop-factor 0.8
-   ```
+- `--raw-storage-dtype`: `auto`, `float16`, or `float32`. The first inference
+  chunk fixes the directory dtype and records it in metadata.
+- `--migrate-legacy`: `archive` (default) or `delete` for generated stages from
+  an older on-disk schema. Deletion is always explicit.
 
-**Trade-offs to Understand**:
-- **Strong 3D vs. Clean Image**: More dramatic depth = more artifacts
-- **Hole Filling Quality vs. Performance**: Advanced filling is 3-5x slower with marginal visual improvement
-- **Edge Preservation vs. 3D Effect**: Keeping original content vs. creating convincing stereo
+The pipeline stores native-resolution model output in `02_depth_raw`; it does
+not persist an upsampled copy. Canonical `uint16` maps live in
+`03_disparity_maps` and carry fingerprints for the model, raw stage, scene
+manifest, and bounds.
 
-**When to Reduce 3D Strength**:
-- Content with many depth discontinuities (trees, hair, complex objects)
-- Fast camera movement or quick subject motion
-- Scenes with reflective surfaces or transparent objects
-- When artifacts are more distracting than the 3D effect is beneficial
+## Model And Projection
 
-**Remember**: Subtle, clean 3D is often more enjoyable than aggressive 3D with artifacts. Start conservative and increase strength only if the content handles it well.
+- `--depth-model-version`: `v2`, `v3`, or `see_through`.
+- `--model`: checkpoint path, model name, or repository as appropriate.
+- `--metric`: select metric output where the adapter supports it.
+- `--device`: `auto`, `cuda`, or `cpu`.
+- `--fisheye-projection`: `stereographic`, `equidistant`, `equisolid`, or
+  `orthogonal`.
+- `--fisheye-fov`: projection field of view in degrees.
+- `--no-distortion`: keep rectilinear stereo images.
+- `--crop-factor` and `--fisheye-crop-factor`: post-render crop controls.
 
-## VR Format Selection
+## Tuning
 
-### Format Recommendations
-
-- **Ultra-wide content (>2.2:1)**: Cinema formats with **over-under** layout recommended
-- **Wide content (>1.6:1)**: Wide formats, consider **over-under** for better preservation
-- **Standard content**: Square formats work best with **side-by-side**
-
-### Resolution Options by Aspect Ratio
-
-**Square formats** (1:1 aspect ratio - optimized for VR headsets):
-- square-480 → 480×480 per eye (quick testing)
-- square-720 → 720×720 per eye (preview)
-- square-1k → 1024×1024 per eye (good quality)
-- square-2k → 2048×2048 per eye (high quality)
-- square-3k → 3072×3072 per eye (very high quality)
-- square-4k → 4096×4096 per eye (ultra quality)
-- square-5k → 5120×5120 per eye (maximum quality)
-
-**16:9 Standard Formats**:
-- 16x9-480p → 854×480 per eye (quick testing)
-- 16x9-720p → 1280×720 per eye (HD)
-- 16x9-1080p → 1920×1080 per eye (Full HD)
-- 16x9-1440p → 2560×1440 per eye (QHD)
-- 16x9-4k → 3840×2160 per eye (Ultra HD)
-- 16x9-5k → 5120×2880 per eye (5K)
-- 16x9-8k → 7680×4320 per eye (8K)
-
-**Custom Resolutions**:
-```bash
-# Command Line
-python depth_surge_3d.py --vr-resolution custom:1920x1080 input.mp4
-python depth_surge_3d.py --vr-resolution custom:2560x1600 input.mp4  # Custom aspect ratio
-```
-
-### Auto-Detection
-
-The system automatically detects your content's aspect ratio and recommends the best format and resolution combination based on:
-- Source video aspect ratio
-- Content type (wide, ultra-wide, standard)
-- VR format selected (side-by-side or over-under)
-
-## Performance vs. Quality Trade-offs
-
-**Hole Filling Quality Impact**:
-- **Fast**: ~2-4 seconds per frame, basic gap filling
-- **Advanced**: ~8-15 seconds per frame, sophisticated depth-guided filling
-- **Reality**: Advanced mode often provides only 10-20% visual improvement despite 3-4x processing time
-
-**Optimization Recommendations**:
-```bash
-# Fast processing for testing
---hole-fill-quality fast --vr-resolution 16x9-720p
-
-# Balanced quality/speed
---hole-fill-quality fast --vr-resolution 16x9-1080p
-
-# Maximum quality (slow)
---hole-fill-quality advanced --vr-resolution 16x9-4k
-```
+Start with the defaults. Reduce `--stereo-strength` when depth edges feel
+uncomfortable or expose too much hidden background. Move `--convergence`
+toward the canonical value of the subject that should sit on the display plane.
+Changing scene detection affects scaling boundaries, not stereo geometry.

@@ -1,11 +1,10 @@
-"""
-
-from __future__ import annotations
-Video depth estimation model management using Video-Depth-Anything.
+"""Video depth estimation model management using Video-Depth-Anything.
 
 This module handles loading and interfacing with the Video-Depth-Anything model,
 which provides temporal consistency for video depth estimation.
 """
+
+from __future__ import annotations
 
 import os
 import sys
@@ -43,7 +42,7 @@ class VideoDepthEstimator:
         self.metric = metric
         self.temporal_window_overlap = temporal_window_overlap
         self.model = None
-        self.model_config = None
+        self.model_config: dict[str, object] | None = None
 
     def _determine_device(self, device: str) -> str:
         """Determine the best device to use for inference."""
@@ -74,7 +73,8 @@ class VideoDepthEstimator:
                 print(f"Cannot determine model type from path: {self.model_path}")
                 return False
 
-            self.model_config = MODEL_CONFIGS[model_type]  # type: ignore[assignment]
+            model_config = MODEL_CONFIGS[model_type]
+            self.model_config = model_config
 
             # Import and load model
             repo_path = Path(VIDEO_DEPTH_ANYTHING_REPO_DIR)
@@ -83,7 +83,7 @@ class VideoDepthEstimator:
 
             from video_depth_anything.video_depth import VideoDepthAnything
 
-            self.model = VideoDepthAnything(**self.model_config, metric=self.metric)
+            self.model = VideoDepthAnything(**model_config, metric=self.metric)
 
             # Load state dict and fix key names if needed
             state_dict = torch.load(self.model_path, map_location="cpu")
@@ -218,9 +218,7 @@ class VideoDepthEstimator:
             # Process all at once (original behavior)
             values = self._estimate_depth_single_batch(frames, target_fps, input_size, fp32)
         representation = (
-            DepthRepresentation.METRIC_DEPTH
-            if self.metric
-            else DepthRepresentation.INVERSE_DEPTH
+            DepthRepresentation.METRIC_DEPTH if self.metric else DepthRepresentation.INVERSE_DEPTH
         )
         return DepthBatch(np.asarray(values, dtype=np.float32), representation)
 

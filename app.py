@@ -79,7 +79,14 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from depth_surge_3d.rendering import create_stereo_projector  # noqa: E402
 from depth_surge_3d.processing import VideoProcessor  # noqa: E402
-from depth_surge_3d.io.resume import apply_legacy_migration, build_resume_report  # noqa: E402
+from depth_surge_3d.io.resume import (  # noqa: E402
+    apply_legacy_migration,
+    build_resume_report,
+    resolve_resume_source_video,
+)
+from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
+    build_current_model_fingerprint,
+)
 
 # Global flags and state
 VERBOSE = False
@@ -848,7 +855,11 @@ class ProgressCallback:
 
 
 def process_video_async(  # noqa: C901
-    session_id: str, video_path: str | Path, settings: dict[str, Any], output_dir: str | Path
+    session_id: str,
+    video_path: str | Path,
+    settings: dict[str, Any],
+    output_dir: str | Path,
+    resume_context: dict[str, Any] | None = None,
 ) -> None:
     """Process video in background thread"""
     import torch  # Import here to avoid CUDA initialization issues in main thread
@@ -919,8 +930,24 @@ def process_video_async(  # noqa: C901
         )
 
         # Ensure the model is loaded before processing
-        if not projector.depth_estimator.load_model():
+        if not projector.load_model():
             raise Exception("Failed to load depth estimation model")
+
+        if resume_context is not None:
+            model_fingerprint = build_current_model_fingerprint(
+                projector.depth_estimator,
+                settings,
+            )
+            resume_report = build_resume_report(
+                output_dir,
+                settings,
+                source_video=video_path,
+                model_fingerprint=model_fingerprint,
+                settings_file=resume_context.get("settings_file"),
+            )
+            migration_mode = resume_context.get("migration_mode", "archive")
+            apply_legacy_migration(resume_report, migration_mode)
+            settings = resume_report.migrated_settings
 
         # Get video info for progress tracking
         video_info = get_video_info(video_path)
@@ -1253,39 +1280,57 @@ def resume_processing():
     data = request.json
     output_dir = data.get("output_dir")
     migrate_legacy = data.get("migrate_legacy", "archive")
+    raw_storage_dtype = data.get("raw_storage_dtype")
 
     try:
+        resume_overrides = {"migrate_legacy": migrate_legacy}
+        if raw_storage_dtype is not None:
+            resume_overrides["raw_storage_dtype"] = raw_storage_dtype
         validated_migration = validate_settings(
-            {"migrate_legacy": migrate_legacy},
+            resume_overrides,
             source="explicit",
         )
         migrate_legacy = validated_migration["migrate_legacy"]
+        if raw_storage_dtype is not None:
+            raw_storage_dtype = validated_migration["raw_storage_dtype"]
     except (TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
 
     if not output_dir:
         return jsonify({"error": "No output directory provided"}), 400
 
-    output_path = Path(output_dir)
+    output_path = Path(output_dir).resolve()
+    allowed_base = Path(app.config["OUTPUT_FOLDER"]).resolve()
+    try:
+        output_path.relative_to(allowed_base)
+    except ValueError:
+        return jsonify({"error": "Output directory must be within the managed output folder"}), 403
     if not output_path.exists():
         return jsonify({"error": "Output directory does not exist"}), 404
 
-    # Look for source video in the output directory
-    source_video = find_source_video(output_path)
+    from depth_surge_3d.io.operations import find_settings_file
 
-    if not source_video:
-        return (
-            jsonify({"error": "Could not find source video file in output directory for resuming"}),
-            404,
+    settings_file = find_settings_file(output_path)
+    try:
+        source_video = resolve_resume_source_video(
+            output_path,
+            settings_file=settings_file,
         )
-
+    except (OSError, TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 409
     # Try to detect settings from existing files/directories
-    settings = detect_resume_settings(output_path)
+    settings = detect_resume_settings(output_path, settings_file=settings_file)
     settings["migrate_legacy"] = migrate_legacy
+    if raw_storage_dtype is not None:
+        settings["raw_storage_dtype"] = raw_storage_dtype
 
     try:
-        resume_report = build_resume_report(output_path, settings)
-        apply_legacy_migration(resume_report, migrate_legacy)
+        resume_report = build_resume_report(
+            output_path,
+            settings,
+            source_video=source_video,
+            settings_file=settings_file,
+        )
         settings = resume_report.migrated_settings
     except (OSError, TypeError, ValueError) as exc:
         return jsonify({"error": f"Could not migrate resume data: {exc}"}), 409
@@ -1295,7 +1340,12 @@ def resume_processing():
 
     # Start processing in background using socketio's method for proper context handling
     thread = socketio.start_background_task(
-        process_video_async, session_id, source_video, settings, output_path
+        process_video_async,
+        session_id,
+        source_video,
+        settings,
+        output_path,
+        {"migration_mode": migrate_legacy, "settings_file": settings_file},
     )
     current_processing["thread"] = thread
 
@@ -1309,7 +1359,7 @@ def resume_processing():
     )
 
 
-def detect_resume_settings(output_path):
+def detect_resume_settings(output_path, *, settings_file=None):
     """Detect processing settings from existing output directory"""
     settings = _validate_web_settings(
         {"device": "auto", "target_fps": None},
@@ -1318,13 +1368,10 @@ def detect_resume_settings(output_path):
 
     # A resume must use the exact model and geometry from the interrupted run.
     # Directory-shape inference is only a fallback for legacy jobs without metadata.
-    from depth_surge_3d.io.operations import load_processing_settings
+    from depth_surge_3d.io.operations import find_settings_file, load_processing_settings
 
-    settings_files = sorted(
-        output_path.glob("*-settings.json"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
+    selected = settings_file or find_settings_file(output_path)
+    settings_files = [selected] if selected is not None else []
     for settings_file in settings_files:
         saved_data = load_processing_settings(settings_file)
         saved_settings = saved_data.get("processing_settings") if saved_data else None
@@ -1445,16 +1492,15 @@ def analyze_batch_directory(batch_path):  # noqa: C901
     # Check for different processing stages
     stages = {
         INTERMEDIATE_DIRS["vr_frames"]: "Final VR frames",
-        INTERMEDIATE_DIRS["left_final"]: "Final left frames",
-        INTERMEDIATE_DIRS["right_final"]: "Final right frames",
+        INTERMEDIATE_DIRS["left_upscaled"]: "Upscaled left frames",
+        INTERMEDIATE_DIRS["right_upscaled"]: "Upscaled right frames",
         INTERMEDIATE_DIRS["left_distorted"]: "Distorted left frames",
         INTERMEDIATE_DIRS["right_distorted"]: "Distorted right frames",
         INTERMEDIATE_DIRS["left_cropped"]: "Cropped left frames",
         INTERMEDIATE_DIRS["right_cropped"]: "Cropped right frames",
-        INTERMEDIATE_DIRS["left_frames"]: "Basic left frames",
-        INTERMEDIATE_DIRS["right_frames"]: "Basic right frames",
-        INTERMEDIATE_DIRS["depth_maps"]: "Depth maps",
-        INTERMEDIATE_DIRS["supersampled"]: "Super sampled frames",
+        INTERMEDIATE_DIRS["left_frames"]: "Stereo left frames",
+        INTERMEDIATE_DIRS["right_frames"]: "Stereo right frames",
+        INTERMEDIATE_DIRS["disparity_maps"]: "Canonical disparity maps",
         INTERMEDIATE_DIRS["frames"]: "Original frames",
     }
 
@@ -1471,13 +1517,20 @@ def analyze_batch_directory(batch_path):  # noqa: C901
                     analysis["frame_count"] = frame_count
 
     # Detect VR format and resolution from highest stage
-    if highest_stage_num >= 6:  # Final frames available
+    if highest_stage_num > 0:
         sample_frame_dirs = [
             d
             for d in [
-                INTERMEDIATE_DIRS["left_final"],
-                INTERMEDIATE_DIRS["right_final"],
                 INTERMEDIATE_DIRS["vr_frames"],
+                INTERMEDIATE_DIRS["left_upscaled"],
+                INTERMEDIATE_DIRS["right_upscaled"],
+                INTERMEDIATE_DIRS["left_cropped"],
+                INTERMEDIATE_DIRS["right_cropped"],
+                INTERMEDIATE_DIRS["left_distorted"],
+                INTERMEDIATE_DIRS["right_distorted"],
+                INTERMEDIATE_DIRS["left_frames"],
+                INTERMEDIATE_DIRS["right_frames"],
+                INTERMEDIATE_DIRS["frames"],
             ]
             if (batch_path / d).exists()
         ]
@@ -1529,29 +1582,9 @@ def create_video_from_batch(batch_path, settings):  # noqa: C901
     output_filename = settings.get("output_filename")
 
     # Determine frame directory to use
-    if frame_source == "auto":
-        # Auto-detect highest available stage
-        stages = [
-            INTERMEDIATE_DIRS["vr_frames"],
-            INTERMEDIATE_DIRS["left_final"],
-            INTERMEDIATE_DIRS["right_final"],
-        ]
-        frame_dir = None
-        for stage in stages:
-            stage_path = batch_path / stage
-            if stage_path.exists() and list(stage_path.glob("*.png")):
-                frame_dir = stage_path
-                break
-    else:
-        # Use specified stage
-        stage_mapping = {
-            "vr_frames": INTERMEDIATE_DIRS["vr_frames"],
-            "left_right_final": INTERMEDIATE_DIRS["left_final"],
-            "left_right_fisheye": INTERMEDIATE_DIRS["left_distorted"],
-            "left_right_basic": INTERMEDIATE_DIRS["left_frames"],
-        }
-        stage_name = stage_mapping.get(frame_source, INTERMEDIATE_DIRS["vr_frames"])
-        frame_dir = batch_path / stage_name
+    if frame_source not in {"auto", "vr_frames"}:
+        raise ValueError(f"Unsupported frame source: {frame_source}")
+    frame_dir = batch_path / INTERMEDIATE_DIRS["vr_frames"]
 
     if not frame_dir or not frame_dir.exists():
         raise Exception(f"Frame directory not found: {frame_dir}")

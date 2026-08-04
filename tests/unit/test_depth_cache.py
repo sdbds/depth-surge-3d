@@ -1,6 +1,4 @@
-"""
-Unit tests for depth cache utilities.
-"""
+"""Unit tests for canonical depth cache utilities."""
 
 import json
 from pathlib import Path
@@ -11,15 +9,15 @@ import numpy as np
 
 from src.depth_surge_3d.processing.frames.depth_storage import canonical_json_hash
 from src.depth_surge_3d.utils.domain import depth_cache
-
 from src.depth_surge_3d.utils.domain.depth_cache import (
-    get_cache_dir,
-    compute_cache_key,
-    get_cached_depth_maps,
-    save_depth_maps_to_cache,
     clear_cache,
+    compute_cache_key,
+    get_cache_dir,
     get_cache_size,
 )
+
+
+MODEL_FINGERPRINT = "model-fingerprint"
 
 
 def canonical_metadata(frame_names: list[str]) -> dict:
@@ -35,7 +33,7 @@ def canonical_metadata(frame_names: list[str]) -> dict:
         "frame_names": frame_names,
         "native_shape": [4, 4],
         "source_raw_fingerprint": "raw-fingerprint",
-        "source_model_fingerprint": "model-fingerprint",
+        "source_model_fingerprint": MODEL_FINGERPRINT,
         "scene_manifest_fingerprint": "scene-fingerprint",
         "depth_bounds_fingerprint": "bounds-fingerprint",
     }
@@ -43,610 +41,311 @@ def canonical_metadata(frame_names: list[str]) -> dict:
     return metadata
 
 
-class TestGetCacheDir:
-    """Test get_cache_dir function."""
+def canonical_settings(**overrides) -> dict:
+    return {
+        "depth_model_version": "v3",
+        "model_fingerprint": MODEL_FINGERPRINT,
+        **overrides,
+    }
 
+
+def create_cache_entry(cache_dir: Path, video_file: Path, settings: dict, metadata: dict):
+    entry = cache_dir / compute_cache_key(str(video_file), settings)
+    entry.mkdir()
+    (entry / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+    for i in range(metadata.get("num_frames", 0)):
+        (entry / f"depth_{i:06d}.png").write_bytes(b"png")
+    return entry
+
+
+class TestGetCacheDir:
     @patch.dict("os.environ", {"XDG_CACHE_HOME": "/tmp/xdg_cache"})
     def test_cache_dir_with_xdg(self):
-        """Test cache dir uses XDG_CACHE_HOME when set."""
         cache_dir = get_cache_dir()
         assert cache_dir == Path("/tmp/xdg_cache") / "depth-surge-3d" / "depth_cache"
-        assert "depth-surge-3d" in str(cache_dir)
-        assert "depth_cache" in str(cache_dir)
 
     @patch.dict("os.environ", {}, clear=True)
     def test_cache_dir_without_xdg(self, tmp_path):
-        """Test cache dir uses ~/.cache when XDG_CACHE_HOME not set."""
-        # Use tmp_path to avoid permission issues with mocking
         with patch("pathlib.Path.home", return_value=tmp_path):
             cache_dir = get_cache_dir()
-            expected = tmp_path / ".cache" / "depth-surge-3d" / "depth_cache"
-            assert cache_dir == expected
-            assert cache_dir.exists()  # Should be created
+            assert cache_dir == tmp_path / ".cache" / "depth-surge-3d" / "depth_cache"
+            assert cache_dir.exists()
 
 
 class TestComputeCacheKey:
-    """Test compute_cache_key function."""
-
-    def test_cache_key_format(self, tmp_path):
-        """Test cache key is 32 hex characters."""
-        # Create test video file
+    def test_cache_key_is_stable_hex(self, tmp_path):
         video_file = tmp_path / "test.mp4"
         video_file.write_bytes(b"test video content" * 1000)
+        settings = canonical_settings(model_size="base", depth_resolution=518)
 
-        settings = {
-            "depth_model_version": "v3",
-            "model_size": "base",
-            "depth_resolution": 518,
-        }
+        first = compute_cache_key(str(video_file), settings)
+        second = compute_cache_key(str(video_file), settings)
 
-        cache_key = compute_cache_key(str(video_file), settings)
-        assert len(cache_key) == 32
-        assert all(c in "0123456789abcdef" for c in cache_key)
+        assert first == second
+        assert len(first) == 32
+        assert all(character in "0123456789abcdef" for character in first)
 
-    def test_cache_key_different_videos(self, tmp_path):
-        """Test different videos produce different cache keys."""
+    def test_cache_key_changes_with_video(self, tmp_path):
         video1 = tmp_path / "video1.mp4"
         video1.write_bytes(b"content1" * 1000)
-
         video2 = tmp_path / "video2.mp4"
         video2.write_bytes(b"content2" * 1000)
 
-        settings = {"depth_model_version": "v3"}
+        assert compute_cache_key(str(video1), canonical_settings()) != compute_cache_key(
+            str(video2), canonical_settings()
+        )
 
-        key1 = compute_cache_key(str(video1), settings)
-        key2 = compute_cache_key(str(video2), settings)
-
-        assert key1 != key2
-
-    def test_cache_key_different_settings(self, tmp_path):
-        """Test different settings produce different cache keys."""
+    def test_cache_key_changes_with_inference_inputs(self, tmp_path):
         video_file = tmp_path / "test.mp4"
         video_file.write_bytes(b"test content" * 1000)
+        base = canonical_settings(
+            model_path="24yearsold/seethroughv0.0.1_marigold",
+            start_time="03:15",
+            end_time="03:22",
+            super_sample="none",
+        )
+        base_key = compute_cache_key(str(video_file), base)
 
-        settings1 = {"depth_model_version": "v3", "model_size": "small"}
-        settings2 = {"depth_model_version": "v3", "model_size": "large"}
-
-        key1 = compute_cache_key(str(video_file), settings1)
-        key2 = compute_cache_key(str(video_file), settings2)
-
-        assert key1 != key2
-
-    def test_cache_key_same_video_same_settings(self, tmp_path):
-        """Test same video and settings produce same cache key."""
-        video_file = tmp_path / "test.mp4"
-        video_file.write_bytes(b"test content" * 1000)
-
-        settings = {"depth_model_version": "v3", "model_size": "base"}
-
-        key1 = compute_cache_key(str(video_file), settings)
-        key2 = compute_cache_key(str(video_file), settings)
-
-        assert key1 == key2
-
-    def test_cache_key_changes_for_inference_source_and_frame_range(self, tmp_path):
-        """A cache entry cannot be reused for another checkpoint, clip, or input scale."""
-        video_file = tmp_path / "test.mp4"
-        video_file.write_bytes(b"test content" * 1000)
-        base_settings = {
-            "depth_model_version": "see_through",
-            "model_path": "24yearsold/seethroughv0.0.1_marigold",
-            "start_time": "03:15",
-            "end_time": "03:22",
-            "super_sample": "none",
-        }
-        base_key = compute_cache_key(str(video_file), base_settings)
-
-        changes = (
+        for change in (
+            {"model_fingerprint": "another-model"},
             {"model_path": "24yearsold/a-different-checkpoint"},
             {"start_time": "10:00", "end_time": "10:07"},
             {"super_sample": "auto"},
+        ):
+            assert compute_cache_key(str(video_file), {**base, **change}) != base_key
+
+    def test_cache_key_handles_large_file(self, tmp_path):
+        video_file = tmp_path / "large.mp4"
+        video_file.write_bytes(b"x" * (3 * 1024 * 1024))
+
+        key = compute_cache_key(str(video_file), canonical_settings())
+
+        assert len(key) == 32
+
+
+class TestGetCachedDepthMapFiles:
+    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
+    def test_cache_miss_without_metadata(self, mock_cache_dir, tmp_path):
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        mock_cache_dir.return_value = cache_dir
+        video_file = tmp_path / "test.mp4"
+        video_file.write_bytes(b"test")
+
+        assert (
+            depth_cache.get_cached_depth_map_files(
+                str(video_file), canonical_settings(), num_frames=1
+            )
+            is None
         )
-        for change in changes:
-            changed_settings = {**base_settings, **change}
-            assert compute_cache_key(str(video_file), changed_settings) != base_key
-
-
-class TestGetCachedDepthMaps:
-    """Test get_cached_depth_maps function."""
 
     @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_cache_miss_no_directory(self, mock_cache_dir, tmp_path):
-        """Test cache miss when directory doesn't exist."""
-        mock_cache_dir.return_value = tmp_path / "cache"
-
-        video_file = tmp_path / "test.mp4"
-        video_file.write_bytes(b"test")
-
-        settings = {"depth_model_version": "v3"}
-        result = get_cached_depth_maps(str(video_file), settings, 10)
-
-        assert result is None
-
-    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_cache_miss_no_metadata(self, mock_cache_dir, tmp_path):
-        """Test cache miss when metadata file missing."""
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-        mock_cache_dir.return_value = cache_dir
-
-        video_file = tmp_path / "test.mp4"
-        video_file.write_bytes(b"test")
-
-        settings = {"depth_model_version": "v3"}
-        cache_key = compute_cache_key(str(video_file), settings)
-
-        # Create cache entry dir but no metadata
-        (cache_dir / cache_key).mkdir()
-
-        result = get_cached_depth_maps(str(video_file), settings, 10)
-
-        assert result is None
-
-    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_cache_miss_frame_count_mismatch(self, mock_cache_dir, tmp_path):
-        """Test cache miss when frame count doesn't match."""
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-        mock_cache_dir.return_value = cache_dir
-
-        video_file = tmp_path / "test.mp4"
-        video_file.write_bytes(b"test")
-
-        settings = {"depth_model_version": "v3"}
-        cache_key = compute_cache_key(str(video_file), settings)
-
-        cache_entry = cache_dir / cache_key
-        cache_entry.mkdir()
-
-        # Create metadata with different frame count
-        metadata = {"num_frames": 5}
-        with open(cache_entry / "metadata.json", "w") as f:
-            json.dump(metadata, f)
-
-        result = get_cached_depth_maps(str(video_file), settings, 10)
-
-        assert result is None
-
-    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_cache_hit_success(self, mock_cache_dir, tmp_path):
-        """Test successful cache hit."""
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-        mock_cache_dir.return_value = cache_dir
-
-        video_file = tmp_path / "test.mp4"
-        video_file.write_bytes(b"test")
-
-        settings = {"depth_model_version": "v3"}
-        cache_key = compute_cache_key(str(video_file), settings)
-
-        cache_entry = cache_dir / cache_key
-        cache_entry.mkdir()
-
-        # Create metadata
-        num_frames = 3
-        metadata = {"num_frames": num_frames}
-        with open(cache_entry / "metadata.json", "w") as f:
-            json.dump(metadata, f)
-
-        # Create depth map files
-        expected_depths = []
-        for i in range(num_frames):
-            depth_data = np.random.default_rng(i).random((100, 100)).astype(np.float32)
-            depth_uint16 = (depth_data * 1000.0).astype(np.uint16)
-            cv2.imwrite(str(cache_entry / f"depth_{i:06d}.png"), depth_uint16)
-            expected_depths.append(depth_uint16.astype(np.float32) / 1000.0)
-
-        result = get_cached_depth_maps(str(video_file), settings, num_frames)
-
-        assert result is not None
-        assert len(result) == num_frames
-        assert result.shape == (num_frames, 100, 100)
-        np.testing.assert_allclose(result, np.asarray(expected_depths), atol=0.0)
-
-    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_cached_file_lookup_does_not_decode_all_depth_maps(self, mock_cache_dir, tmp_path):
-        """File-based callers can reuse a cache without allocating an array stack."""
+    def test_valid_canonical_cache_returns_paths_without_decoding(self, mock_cache_dir, tmp_path):
         cache_dir = tmp_path / "cache"
         cache_dir.mkdir()
         mock_cache_dir.return_value = cache_dir
         video_file = tmp_path / "test.mp4"
         video_file.write_bytes(b"test")
-        settings = {"depth_model_version": "v3"}
-        cache_entry = cache_dir / compute_cache_key(str(video_file), settings)
-        cache_entry.mkdir()
-        (cache_entry / "metadata.json").write_text(
-            json.dumps(canonical_metadata(["frame_000000.png", "frame_000001.png"]))
+        settings = canonical_settings()
+        entry = create_cache_entry(
+            cache_dir,
+            video_file,
+            settings,
+            canonical_metadata(["frame_000000.png", "frame_000001.png"]),
         )
-        expected = [cache_entry / f"depth_{i:06d}.png" for i in range(2)]
-        for path in expected:
-            path.write_bytes(b"png")
 
-        with patch("src.depth_surge_3d.utils.domain.depth_cache.cv2.imread") as imread:
-            result = depth_cache.get_cached_depth_map_files(str(video_file), settings, 2)
+        result = depth_cache.get_cached_depth_map_files(str(video_file), settings, 2)
 
-        assert result == expected
-        imread.assert_not_called()
+        assert result == [entry / "depth_000000.png", entry / "depth_000001.png"]
 
     @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_cached_file_lookup_rejects_invalid_canonical_fingerprint(
-        self, mock_cache_dir, tmp_path
-    ):
+    def test_lookup_rejects_missing_or_mismatched_model_fingerprint(self, mock_cache_dir, tmp_path):
         cache_dir = tmp_path / "cache"
         cache_dir.mkdir()
         mock_cache_dir.return_value = cache_dir
         video_file = tmp_path / "test.mp4"
         video_file.write_bytes(b"test")
-        settings = {"depth_model_version": "v3"}
-        cache_entry = cache_dir / compute_cache_key(str(video_file), settings)
-        cache_entry.mkdir()
+
+        missing = {"depth_model_version": "v3"}
+        create_cache_entry(cache_dir, video_file, missing, canonical_metadata(["frame_000000.png"]))
+        mismatch = canonical_settings(model_fingerprint="different-model")
+        create_cache_entry(
+            cache_dir, video_file, mismatch, canonical_metadata(["frame_000000.png"])
+        )
+
+        assert depth_cache.get_cached_depth_map_files(str(video_file), missing, 1) is None
+        assert depth_cache.get_cached_depth_map_files(str(video_file), mismatch, 1) is None
+
+    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
+    def test_lookup_rejects_invalid_metadata_fingerprint(self, mock_cache_dir, tmp_path):
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        mock_cache_dir.return_value = cache_dir
+        video_file = tmp_path / "test.mp4"
+        video_file.write_bytes(b"test")
+        settings = canonical_settings()
         metadata = canonical_metadata(["frame_000000.png"])
         metadata["source_raw_fingerprint"] = "tampered"
-        (cache_entry / "metadata.json").write_text(json.dumps(metadata))
-        (cache_entry / "depth_000000.png").write_bytes(b"png")
+        create_cache_entry(cache_dir, video_file, settings, metadata)
 
         assert depth_cache.get_cached_depth_map_files(str(video_file), settings, 1) is None
 
     @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_cached_file_lookup_rejects_model_fingerprint_mismatch(self, mock_cache_dir, tmp_path):
+    def test_lookup_rejects_previous_algorithm(self, mock_cache_dir, tmp_path):
         cache_dir = tmp_path / "cache"
         cache_dir.mkdir()
         mock_cache_dir.return_value = cache_dir
         video_file = tmp_path / "test.mp4"
         video_file.write_bytes(b"test")
-        settings = {"depth_model_version": "v3"}
-        cache_entry = cache_dir / compute_cache_key(str(video_file), settings)
-        cache_entry.mkdir()
-        metadata = canonical_metadata(["frame_000000.png"])
-        (cache_entry / "metadata.json").write_text(json.dumps(metadata))
-        (cache_entry / "depth_000000.png").write_bytes(b"png")
-
-        result = depth_cache.get_cached_depth_map_files(
-            str(video_file),
-            settings,
-            1,
-            expected_model_fingerprint="different-model",
-        )
-
-        assert result is None
-
-    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_cached_file_lookup_rejects_previous_canonical_algorithm(
-        self, mock_cache_dir, tmp_path
-    ):
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-        mock_cache_dir.return_value = cache_dir
-        video_file = tmp_path / "test.mp4"
-        video_file.write_bytes(b"test")
-        settings = {"depth_model_version": "v3"}
-        cache_entry = cache_dir / compute_cache_key(str(video_file), settings)
-        cache_entry.mkdir()
+        settings = canonical_settings()
         metadata = canonical_metadata(["frame_000000.png"])
         metadata["algorithm_version"] = "scene-percentile-v0"
         metadata.pop("fingerprint")
         metadata["fingerprint"] = canonical_json_hash(metadata)
-        (cache_entry / "metadata.json").write_text(json.dumps(metadata))
-        (cache_entry / "depth_000000.png").write_bytes(b"png")
+        create_cache_entry(cache_dir, video_file, settings, metadata)
+
+        assert depth_cache.get_cached_depth_map_files(str(video_file), settings, 1) is None
+
+    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
+    def test_lookup_rejects_missing_depth_file(self, mock_cache_dir, tmp_path):
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        mock_cache_dir.return_value = cache_dir
+        video_file = tmp_path / "test.mp4"
+        video_file.write_bytes(b"test")
+        settings = canonical_settings()
+        entry = create_cache_entry(
+            cache_dir,
+            video_file,
+            settings,
+            canonical_metadata(["frame_000000.png", "frame_000001.png"]),
+        )
+        (entry / "depth_000001.png").unlink()
+
+        assert depth_cache.get_cached_depth_map_files(str(video_file), settings, 2) is None
+
+    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
+    def test_lookup_rejects_invalid_json(self, mock_cache_dir, tmp_path):
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        mock_cache_dir.return_value = cache_dir
+        video_file = tmp_path / "test.mp4"
+        video_file.write_bytes(b"test")
+        settings = canonical_settings()
+        entry = cache_dir / compute_cache_key(str(video_file), settings)
+        entry.mkdir()
+        (entry / "metadata.json").write_text("{ invalid json", encoding="utf-8")
 
         assert depth_cache.get_cached_depth_map_files(str(video_file), settings, 1) is None
 
 
-class TestSaveDepthMapsToCache:
-    """Test save_depth_maps_to_cache function."""
-
+class TestSaveDepthMapFiles:
     @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_save_success(self, mock_cache_dir, tmp_path):
-        """Test successful save to cache."""
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-        mock_cache_dir.return_value = cache_dir
-
-        video_file = tmp_path / "test.mp4"
-        video_file.write_bytes(b"test content" * 1000)
-
-        settings = {
-            "depth_model_version": "v3",
-            "model_size": "base",
-            "depth_resolution": 518,
-        }
-
-        depth_maps = np.random.rand(3, 100, 100).astype(np.float32)
-
-        success = save_depth_maps_to_cache(str(video_file), settings, depth_maps)
-
-        assert success is True
-
-        # Verify files were created
-        cache_key = compute_cache_key(str(video_file), settings)
-        cache_entry = cache_dir / cache_key
-
-        assert cache_entry.exists()
-        assert (cache_entry / "metadata.json").exists()
-        assert (cache_entry / "depth_000000.png").exists()
-        assert (cache_entry / "depth_000001.png").exists()
-        assert (cache_entry / "depth_000002.png").exists()
-
-    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_save_metadata_content(self, mock_cache_dir, tmp_path):
-        """Test metadata content is correct."""
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-        mock_cache_dir.return_value = cache_dir
-
-        video_file = tmp_path / "test.mp4"
-        video_file.write_bytes(b"test")
-
-        settings = {
-            "depth_model_version": "v3",
-            "model_size": "base",
-            "depth_resolution": 518,
-            "use_metric_depth": False,
-        }
-
-        depth_maps = np.random.rand(2, 50, 50).astype(np.float32)
-
-        save_depth_maps_to_cache(str(video_file), settings, depth_maps)
-
-        cache_key = compute_cache_key(str(video_file), settings)
-        metadata_file = cache_dir / cache_key / "metadata.json"
-
-        with open(metadata_file, "r") as f:
-            metadata = json.load(f)
-
-        assert metadata["num_frames"] == 2
-        assert metadata["cache_version"] == "1.0"
-        assert metadata["depth_settings"]["depth_model_version"] == "v3"
-        assert metadata["depth_settings"]["model_size"] == "base"
-
-    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_save_depth_map_files_streams_pngs_to_cache(self, mock_cache_dir, tmp_path):
-        """Disk-backed depth maps are cached one file at a time."""
+    def test_save_copies_canonical_files_and_exact_metadata(self, mock_cache_dir, tmp_path):
         cache_dir = tmp_path / "cache"
         cache_dir.mkdir()
         mock_cache_dir.return_value = cache_dir
         video_file = tmp_path / "test.mp4"
         video_file.write_bytes(b"test")
-        settings = {"depth_model_version": "v3"}
+        settings = canonical_settings()
         depth_dir = tmp_path / "depth"
         depth_dir.mkdir()
         depth_files = []
         for i in range(2):
-            depth_file = depth_dir / f"frame_{i:06d}.png"
-            cv2.imwrite(
-                str(depth_file),
-                np.full((4, 4), i * 65535, dtype=np.uint16),
-            )
-            depth_files.append(depth_file)
-        source_metadata = canonical_metadata([path.name for path in depth_files])
-        (depth_dir / "metadata.json").write_text(json.dumps(source_metadata))
+            path = depth_dir / f"frame_{i:06d}.png"
+            assert cv2.imwrite(str(path), np.full((4, 4), i * 65535, dtype=np.uint16))
+            depth_files.append(path)
+        metadata = canonical_metadata([path.name for path in depth_files])
+        (depth_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
         assert depth_cache.save_depth_map_files_to_cache(str(video_file), settings, depth_files)
 
-        cache_entry = cache_dir / compute_cache_key(str(video_file), settings)
-        cached_files = [cache_entry / f"depth_{i:06d}.png" for i in range(2)]
-        assert all(path.exists() for path in cached_files)
-        metadata = json.loads((cache_entry / "metadata.json").read_text())
-        assert metadata == source_metadata
-
-
-class TestClearCache:
-    """Test clear_cache function."""
+        entry = cache_dir / compute_cache_key(str(video_file), settings)
+        assert (entry / "depth_000000.png").exists()
+        assert (entry / "depth_000001.png").exists()
+        assert json.loads((entry / "metadata.json").read_text(encoding="utf-8")) == metadata
 
     @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_clear_empty_cache(self, mock_cache_dir, tmp_path):
-        """Test clearing empty cache."""
-        cache_dir = tmp_path / "cache"
-        mock_cache_dir.return_value = cache_dir
-
-        count = clear_cache()
-
-        assert count == 0
-
-    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_clear_cache_with_entries(self, mock_cache_dir, tmp_path):
-        """Test clearing cache with entries."""
+    def test_save_rejects_missing_or_mismatched_model_fingerprint(self, mock_cache_dir, tmp_path):
         cache_dir = tmp_path / "cache"
         cache_dir.mkdir()
         mock_cache_dir.return_value = cache_dir
+        video_file = tmp_path / "test.mp4"
+        video_file.write_bytes(b"test")
+        depth_dir = tmp_path / "depth"
+        depth_dir.mkdir()
+        depth_file = depth_dir / "frame_000000.png"
+        assert cv2.imwrite(str(depth_file), np.zeros((4, 4), dtype=np.uint16))
+        (depth_dir / "metadata.json").write_text(
+            json.dumps(canonical_metadata([depth_file.name])), encoding="utf-8"
+        )
 
-        # Create some cache entries
+        assert not depth_cache.save_depth_map_files_to_cache(str(video_file), {}, [depth_file])
+        assert not depth_cache.save_depth_map_files_to_cache(
+            str(video_file), canonical_settings(model_fingerprint="different-model"), [depth_file]
+        )
+
+    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
+    def test_save_rejects_frame_names_that_do_not_match_sources(self, mock_cache_dir, tmp_path):
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        mock_cache_dir.return_value = cache_dir
+        video_file = tmp_path / "test.mp4"
+        video_file.write_bytes(b"test")
+        depth_dir = tmp_path / "depth"
+        depth_dir.mkdir()
+        depth_file = depth_dir / "frame_000000.png"
+        assert cv2.imwrite(str(depth_file), np.zeros((4, 4), dtype=np.uint16))
+        (depth_dir / "metadata.json").write_text(
+            json.dumps(canonical_metadata(["another_frame.png"])), encoding="utf-8"
+        )
+
+        assert not depth_cache.save_depth_map_files_to_cache(
+            str(video_file), canonical_settings(), [depth_file]
+        )
+
+
+class TestCacheMaintenance:
+    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
+    def test_clear_cache_counts_removed_entries(self, mock_cache_dir, tmp_path):
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        mock_cache_dir.return_value = cache_dir
+        for name in ("entry1", "entry2"):
+            entry = cache_dir / name
+            entry.mkdir()
+            (entry / "file.txt").write_text("test", encoding="utf-8")
+
+        assert clear_cache() == 2
+        assert not any(cache_dir.iterdir())
+
+    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
+    def test_clear_cache_ignores_failed_entry(self, mock_cache_dir, tmp_path):
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        mock_cache_dir.return_value = cache_dir
         (cache_dir / "entry1").mkdir()
-        (cache_dir / "entry1" / "file.txt").write_text("test")
         (cache_dir / "entry2").mkdir()
-        (cache_dir / "entry2" / "file.txt").write_text("test")
 
-        count = clear_cache()
-
-        assert count == 2
-        assert not (cache_dir / "entry1").exists()
-        assert not (cache_dir / "entry2").exists()
-
-
-class TestGetCacheSize:
-    """Test get_cache_size function."""
+        with patch("shutil.rmtree", side_effect=[OSError("failed"), None]):
+            assert clear_cache() == 1
 
     @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_cache_size_empty(self, mock_cache_dir, tmp_path):
-        """Test cache size for empty cache."""
-        cache_dir = tmp_path / "cache"
-        mock_cache_dir.return_value = cache_dir
-
-        num_entries, total_size = get_cache_size()
-
-        assert num_entries == 0
-        assert total_size == 0
-
-    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_cache_size_with_entries(self, mock_cache_dir, tmp_path):
-        """Test cache size with entries."""
+    def test_cache_size_reports_entries_and_bytes(self, mock_cache_dir, tmp_path):
         cache_dir = tmp_path / "cache"
         cache_dir.mkdir()
         mock_cache_dir.return_value = cache_dir
-
-        # Create cache entries
         entry1 = cache_dir / "entry1"
         entry1.mkdir()
-        (entry1 / "file1.txt").write_bytes(b"x" * 100)
-        (entry1 / "file2.txt").write_bytes(b"x" * 200)
-
+        (entry1 / "one.bin").write_bytes(b"x" * 100)
         entry2 = cache_dir / "entry2"
         entry2.mkdir()
-        (entry2 / "file3.txt").write_bytes(b"x" * 300)
+        (entry2 / "two.bin").write_bytes(b"x" * 300)
 
-        num_entries, total_size = get_cache_size()
-
-        assert num_entries == 2
-        assert total_size == 600
-
-
-class TestEdgeCases:
-    """Test edge cases and error handling."""
-
-    def test_cache_key_large_file(self, tmp_path):
-        """Test cache key computation with large file (>2MB)."""
-        # Create a file larger than 2MB to trigger seek from end
-        video_file = tmp_path / "large.mp4"
-        video_file.write_bytes(b"x" * (3 * 1024 * 1024))  # 3MB
-
-        settings = {"depth_model_version": "v3"}
-        cache_key = compute_cache_key(str(video_file), settings)
-
-        # Should still produce valid 32-char hex key
-        assert len(cache_key) == 32
-        assert all(c in "0123456789abcdef" for c in cache_key)
+        assert get_cache_size() == (2, 400)
 
     @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_cache_hit_missing_depth_file(self, mock_cache_dir, tmp_path):
-        """Test cache miss when depth file is missing."""
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-        mock_cache_dir.return_value = cache_dir
+    def test_cache_size_for_missing_directory_is_zero(self, mock_cache_dir, tmp_path):
+        mock_cache_dir.return_value = tmp_path / "cache"
 
-        video_file = tmp_path / "test.mp4"
-        video_file.write_bytes(b"test")
-
-        settings = {"depth_model_version": "v3"}
-        cache_key = compute_cache_key(str(video_file), settings)
-
-        cache_entry = cache_dir / cache_key
-        cache_entry.mkdir()
-
-        # Create metadata
-        num_frames = 3
-        metadata = {"num_frames": num_frames}
-        with open(cache_entry / "metadata.json", "w") as f:
-            json.dump(metadata, f)
-
-        # Create only first 2 depth files (missing 3rd)
-        for i in range(2):
-            depth_data = np.random.rand(100, 100).astype(np.float32)
-            depth_uint16 = (depth_data * 1000.0).astype(np.uint16)
-            cv2.imwrite(str(cache_entry / f"depth_{i:06d}.png"), depth_uint16)
-
-        result = get_cached_depth_maps(str(video_file), settings, num_frames)
-
-        # Should return None (cache miss)
-        assert result is None
-
-    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_cache_hit_corrupted_depth_file(self, mock_cache_dir, tmp_path):
-        """Test cache miss when depth file is corrupted."""
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-        mock_cache_dir.return_value = cache_dir
-
-        video_file = tmp_path / "test.mp4"
-        video_file.write_bytes(b"test")
-
-        settings = {"depth_model_version": "v3"}
-        cache_key = compute_cache_key(str(video_file), settings)
-
-        cache_entry = cache_dir / cache_key
-        cache_entry.mkdir()
-
-        # Create metadata
-        num_frames = 2
-        metadata = {"num_frames": num_frames}
-        with open(cache_entry / "metadata.json", "w") as f:
-            json.dump(metadata, f)
-
-        # Create first valid depth file
-        depth_data = np.random.rand(100, 100).astype(np.float32)
-        depth_uint16 = (depth_data * 1000.0).astype(np.uint16)
-        cv2.imwrite(str(cache_entry / "depth_000000.png"), depth_uint16)
-
-        # Create corrupted second depth file
-        (cache_entry / "depth_000001.png").write_text("corrupted")
-
-        result = get_cached_depth_maps(str(video_file), settings, num_frames)
-
-        # Should return None (cache miss due to corrupted file)
-        assert result is None
-
-    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    def test_cache_hit_invalid_metadata(self, mock_cache_dir, tmp_path):
-        """Test cache miss when metadata is invalid JSON."""
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-        mock_cache_dir.return_value = cache_dir
-
-        video_file = tmp_path / "test.mp4"
-        video_file.write_bytes(b"test")
-
-        settings = {"depth_model_version": "v3"}
-        cache_key = compute_cache_key(str(video_file), settings)
-
-        cache_entry = cache_dir / cache_key
-        cache_entry.mkdir()
-
-        # Create invalid metadata
-        (cache_entry / "metadata.json").write_text("{ invalid json")
-
-        result = get_cached_depth_maps(str(video_file), settings, 10)
-
-        # Should return None (cache miss)
-        assert result is None
-
-    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    @patch("cv2.imwrite")
-    def test_save_failure_exception(self, mock_imwrite, mock_cache_dir, tmp_path):
-        """Test save_depth_maps_to_cache handles exceptions gracefully."""
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-        mock_cache_dir.return_value = cache_dir
-
-        video_file = tmp_path / "test.mp4"
-        video_file.write_bytes(b"test")
-
-        settings = {"depth_model_version": "v3"}
-        depth_maps = np.random.rand(2, 50, 50).astype(np.float32)
-
-        # Make cv2.imwrite raise an exception
-        mock_imwrite.side_effect = Exception("Write failed")
-
-        success = save_depth_maps_to_cache(str(video_file), settings, depth_maps)
-
-        # Should return False (graceful failure)
-        assert success is False
-
-    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
-    @patch("shutil.rmtree")
-    def test_clear_cache_exception(self, mock_rmtree, mock_cache_dir, tmp_path):
-        """Test clear_cache handles exceptions gracefully."""
-        cache_dir = tmp_path / "cache"
-        cache_dir.mkdir()
-        mock_cache_dir.return_value = cache_dir
-
-        # Create cache entries
-        (cache_dir / "entry1").mkdir()
-        (cache_dir / "entry2").mkdir()
-
-        # Make rmtree raise exception for first entry but succeed for second
-        mock_rmtree.side_effect = [Exception("Delete failed"), None]
-
-        count = clear_cache()
-
-        # Should skip failed entry and count only successful one
-        assert count == 1
+        assert get_cache_size() == (0, 0)

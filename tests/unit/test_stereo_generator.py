@@ -293,6 +293,31 @@ def test_resume_skips_only_complete_stereo_pairs(tmp_path: Path) -> None:
     assert (directories["right_frames"] / "frame_0001.png").is_file()
 
 
+def test_resume_regenerates_a_corrupt_stereo_pair(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=2)
+    assert StereoPairGenerator(renderer=_FakeRenderer()).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(),
+    )
+    corrupt_right = directories["right_frames"] / "frame_0000.png"
+    corrupt_right.write_bytes(b"corrupt")
+    renderer = _FakeRenderer()
+
+    result = StereoPairGenerator(renderer=renderer).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(),
+    )
+
+    assert result is True
+    assert len(renderer.calls) == 1
+    restored = cv2.imread(str(corrupt_right), cv2.IMREAD_UNCHANGED)
+    assert restored is not None and restored.shape == (8, 8, 3)
+
+
 def test_canonical_fingerprint_change_invalidates_existing_stereo_pairs(tmp_path: Path) -> None:
     frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=2)
     directories["vr_frames"] = tmp_path / "vr"

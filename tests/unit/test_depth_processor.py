@@ -61,82 +61,22 @@ class TestGenerateDepthMaps:
 
         return frame_files
 
-    def test_generate_from_cache_existing_depth_maps(
-        self, mock_estimator, mock_progress_tracker, temp_frames, tmp_path
+    def test_legacy_array_api_always_generates_fresh(
+        self, mock_estimator, mock_progress_tracker, temp_frames
     ):
-        """Test loading existing depth maps when keep_intermediates=True."""
+        """The bounded array API never reads or writes the canonical file cache."""
         processor = DepthMapProcessor(mock_estimator, verbose=False)
-
-        # Create existing depth maps
-        depth_dir = tmp_path / "depth_maps"
-        depth_dir.mkdir()
-        for i in range(3):
-            depth_map = np.random.randint(0, 255, (100, 100), dtype=np.uint8)
-            cv2.imwrite(str(depth_dir / f"frame_{i:04d}.png"), depth_map)
-
-        settings = {"keep_intermediates": True}
-        directories = {"depth_maps": depth_dir}
-
-        result = processor.generate_depth_maps(
-            temp_frames, settings, directories, mock_progress_tracker
-        )
-
-        assert result is not None
-        assert len(result) == 3
-        # Should not call estimator if loading from cache
-        mock_estimator.estimate_depth_batch.assert_not_called()
-
-    def test_generate_from_global_cache(
-        self, mock_estimator, mock_progress_tracker, temp_frames, tmp_path
-    ):
-        """Test loading from global depth cache."""
-        processor = DepthMapProcessor(mock_estimator, verbose=False)
-
-        settings = {"video_path": "/test/video.mp4"}
-        directories = {}
-
-        cached_depths = np.random.rand(3, 100, 100)
-
-        with patch(
-            "src.depth_surge_3d.processing.frames.depth_processor.get_cached_depth_maps",
-            return_value=cached_depths,
-        ):
-            with patch(
-                "src.depth_surge_3d.processing.frames.depth_processor.get_cache_size",
-                return_value=(5, 10240),
-            ):
-                result = processor.generate_depth_maps(
-                    temp_frames, settings, directories, mock_progress_tracker
-                )
-
-        assert result is not None
-        assert len(result) == 3
-        mock_estimator.estimate_depth_batch.assert_not_called()
-
-    def test_generate_new_depth_maps(
-        self, mock_estimator, mock_progress_tracker, temp_frames, tmp_path
-    ):
-        """Test generating new depth maps when no cache exists."""
-        processor = DepthMapProcessor(mock_estimator, verbose=False)
-
         settings = {"video_path": "/test/video.mp4", "depth_resolution": "1080"}
         directories = {}
+        expected = np.random.rand(3, 100, 100)
 
-        with patch.object(processor, "_generate_depth_maps_chunked") as mock_chunked:
-            mock_chunked.return_value = np.random.rand(3, 100, 100)
+        with patch.object(processor, "_generate_depth_maps_chunked", return_value=expected) as run:
+            result = processor.generate_depth_maps(
+                temp_frames, settings, directories, mock_progress_tracker
+            )
 
-            with patch(
-                "src.depth_surge_3d.processing.frames.depth_processor.get_cached_depth_maps",
-                return_value=None,
-            ):
-                with patch.object(processor, "_save_to_depth_cache"):
-                    result = processor.generate_depth_maps(
-                        temp_frames, settings, directories, mock_progress_tracker
-                    )
-
-        assert result is not None
-        assert len(result) == 3
-        mock_chunked.assert_called_once()
+        assert result is expected
+        run.assert_called_once_with(temp_frames, settings, directories, mock_progress_tracker)
 
     def test_generate_depth_map_files_writes_each_chunk_without_stacking(
         self, mock_progress_tracker, temp_frames, tmp_path
@@ -153,7 +93,7 @@ class TestGenerateDepthMaps:
             DepthRepresentation.INVERSE_DEPTH,
         )
         processor = DepthMapProcessor(estimator)
-        depth_dir = tmp_path / "depth_maps"
+        depth_dir = tmp_path / "03_disparity_maps"
         depth_dir.mkdir()
         settings = {
             "depth_resolution": "1080",
@@ -171,7 +111,7 @@ class TestGenerateDepthMaps:
             result = processor.generate_depth_map_files(
                 temp_frames,
                 settings,
-                {"depth_maps": depth_dir},
+                {"base": tmp_path, "disparity_maps": depth_dir},
                 mock_progress_tracker,
             )
 
@@ -491,38 +431,6 @@ class TestProcessChunkDepth:
 
         assert result is values
 
-    def test_process_chunk_depth_with_save(
-        self, mock_estimator, mock_progress_tracker, temp_frames, tmp_path
-    ):
-        """Test chunk processing with intermediate saving."""
-        processor = DepthMapProcessor(mock_estimator, verbose=False)
-
-        chunk_frames = [np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8) for _ in range(3)]
-        depth_dir = tmp_path / "depth_maps"
-        depth_dir.mkdir()
-
-        settings = {
-            "target_fps": 30,
-            "keep_intermediates": True,
-            "super_sample": "none",
-            "per_eye_width": 100,
-            "per_eye_height": 100,
-        }
-        directories = {"depth_maps": depth_dir}
-
-        with patch.object(processor, "_save_depth_maps") as mock_save:
-            result = processor._process_chunk_depth(
-                chunk_frames,
-                temp_frames,
-                settings,
-                directories,
-                input_size=1080,
-                progress_tracker=mock_progress_tracker,
-            )
-
-        assert result is not None
-        mock_save.assert_called_once()
-
     def test_process_chunk_depth_fallback_fps(
         self, mock_estimator, mock_progress_tracker, temp_frames
     ):
@@ -645,208 +553,6 @@ class TestGenerateDepthMapsChunked:
                     )
 
         assert result is None
-
-
-class TestSaveDepthMaps:
-    """Test depth map saving."""
-
-    @pytest.fixture
-    def processor(self):
-        """Create processor instance."""
-        return DepthMapProcessor(Mock(), verbose=False)
-
-    @pytest.fixture
-    def mock_progress_tracker(self):
-        """Create mock progress tracker."""
-        tracker = Mock()
-        tracker.send_preview_frame = Mock()
-        return tracker
-
-    @pytest.fixture
-    def temp_frames(self, tmp_path):
-        """Create temporary frame files."""
-        frame_files = []
-        for i in range(3):
-            frame_files.append(tmp_path / f"frame_{i:04d}.png")
-        return frame_files
-
-    def test_save_depth_maps(self, processor, mock_progress_tracker, temp_frames, tmp_path):
-        """Test saving depth maps to disk."""
-        depth_dir = tmp_path / "depth"
-        depth_dir.mkdir()
-
-        depth_maps = np.random.rand(3, 100, 100)
-
-        processor._save_depth_maps(depth_maps, temp_frames, depth_dir, mock_progress_tracker)
-
-        # Check files were created
-        saved_files = list(depth_dir.glob("*.png"))
-        assert len(saved_files) == 3
-
-    def test_save_depth_maps_with_preview(
-        self, processor, mock_progress_tracker, temp_frames, tmp_path
-    ):
-        """Test saving with preview frames."""
-        depth_dir = tmp_path / "depth"
-        depth_dir.mkdir()
-
-        depth_maps = np.random.rand(3, 100, 100)
-
-        processor._save_depth_maps(depth_maps, temp_frames, depth_dir, mock_progress_tracker)
-
-        # Should send preview for first and last frame
-        assert mock_progress_tracker.send_preview_frame.called
-
-
-class TestTryLoadExistingDepthMaps:
-    """Test loading existing depth maps."""
-
-    @pytest.fixture
-    def processor(self):
-        """Create processor instance."""
-        return DepthMapProcessor(Mock(), verbose=False)
-
-    @pytest.fixture
-    def mock_progress_tracker(self):
-        """Create mock progress tracker."""
-        tracker = Mock()
-        tracker.update_progress = Mock()
-        return tracker
-
-    @pytest.fixture
-    def temp_frames(self, tmp_path):
-        """Create temporary frame files."""
-        return [tmp_path / f"frame_{i:04d}.png" for i in range(3)]
-
-    def test_load_existing_success(self, processor, mock_progress_tracker, temp_frames, tmp_path):
-        """Test successful loading of existing depth maps."""
-        depth_dir = tmp_path / "depth_maps"
-        depth_dir.mkdir()
-
-        # Create existing depth maps
-        for i in range(3):
-            depth_map = np.random.randint(0, 255, (100, 100), dtype=np.uint8)
-            cv2.imwrite(str(depth_dir / f"frame_{i:04d}.png"), depth_map)
-
-        directories = {"depth_maps": depth_dir}
-
-        result = processor._try_load_existing_depth_maps(
-            temp_frames, directories, mock_progress_tracker
-        )
-
-        assert result is not None
-        assert len(result) == 3
-
-    def test_load_existing_missing_directory(self, processor, mock_progress_tracker, temp_frames):
-        """Test loading when directory doesn't exist."""
-        directories = {}
-
-        result = processor._try_load_existing_depth_maps(
-            temp_frames, directories, mock_progress_tracker
-        )
-
-        assert result is None
-
-    def test_load_existing_insufficient_maps(
-        self, processor, mock_progress_tracker, temp_frames, tmp_path
-    ):
-        """Test loading when not enough depth maps exist."""
-        depth_dir = tmp_path / "depth_maps"
-        depth_dir.mkdir()
-
-        # Only create 1 depth map when 3 are needed
-        depth_map = np.random.randint(0, 255, (100, 100), dtype=np.uint8)
-        cv2.imwrite(str(depth_dir / "frame_0000.png"), depth_map)
-
-        directories = {"depth_maps": depth_dir}
-
-        result = processor._try_load_existing_depth_maps(
-            temp_frames, directories, mock_progress_tracker
-        )
-
-        assert result is None
-
-
-class TestTryLoadCachedDepthMaps:
-    """Test loading from global cache."""
-
-    @pytest.fixture
-    def processor(self):
-        """Create processor instance."""
-        return DepthMapProcessor(Mock(), verbose=False)
-
-    @pytest.fixture
-    def mock_progress_tracker(self):
-        """Create mock progress tracker."""
-        tracker = Mock()
-        tracker.update_progress = Mock()
-        return tracker
-
-    def test_load_cached_success(self, processor, mock_progress_tracker):
-        """Test successful cache loading."""
-        cached_depths = np.random.rand(5, 100, 100)
-
-        with patch(
-            "src.depth_surge_3d.processing.frames.depth_processor.get_cached_depth_maps",
-            return_value=cached_depths,
-        ):
-            with patch(
-                "src.depth_surge_3d.processing.frames.depth_processor.get_cache_size",
-                return_value=(10, 20480),
-            ):
-                result = processor._try_load_cached_depth_maps(
-                    "/test/video.mp4", {}, 5, mock_progress_tracker
-                )
-
-        assert result is not None
-        assert len(result) == 5
-
-    def test_load_cached_miss(self, processor, mock_progress_tracker):
-        """Test cache miss."""
-        with patch(
-            "src.depth_surge_3d.processing.frames.depth_processor.get_cached_depth_maps",
-            return_value=None,
-        ):
-            result = processor._try_load_cached_depth_maps(
-                "/test/video.mp4", {}, 5, mock_progress_tracker
-            )
-
-        assert result is None
-
-
-class TestSaveToDepthCache:
-    """Test saving to global cache."""
-
-    @pytest.fixture
-    def processor(self):
-        """Create processor instance."""
-        return DepthMapProcessor(Mock(), verbose=False)
-
-    def test_save_to_cache_success(self, processor):
-        """Test successful cache saving."""
-        depth_maps = np.random.rand(5, 100, 100)
-
-        with patch(
-            "src.depth_surge_3d.processing.frames.depth_processor.save_depth_maps_to_cache",
-            return_value=True,
-        ):
-            with patch(
-                "src.depth_surge_3d.processing.frames.depth_processor.get_cache_size",
-                return_value=(11, 30720),
-            ):
-                processor._save_to_depth_cache("/test/video.mp4", {}, depth_maps)
-        # Should not raise any errors
-
-    def test_save_to_cache_failure(self, processor):
-        """Test cache save failure."""
-        depth_maps = np.random.rand(5, 100, 100)
-
-        with patch(
-            "src.depth_surge_3d.processing.frames.depth_processor.save_depth_maps_to_cache",
-            return_value=False,
-        ):
-            processor._save_to_depth_cache("/test/video.mp4", {}, depth_maps)
-        # Should not raise any errors
 
 
 class TestGenerateDepthMapsBatch:

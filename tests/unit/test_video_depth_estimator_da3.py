@@ -1,8 +1,11 @@
 """Unit tests for VideoDepthEstimatorDA3."""
 
 import numpy as np
+import pytest
 import torch
 from unittest.mock import patch, MagicMock
+
+import src.depth_surge_3d.inference.depth.video_depth_estimator_da3 as da3_module
 
 from src.depth_surge_3d.inference.depth.video_depth_estimator_da3 import (
     VideoDepthEstimatorDA3,
@@ -10,6 +13,16 @@ from src.depth_surge_3d.inference.depth.video_depth_estimator_da3 import (
 )
 from src.depth_surge_3d.inference.depth.types import DepthRepresentation
 from src.depth_surge_3d.core.constants import DA3_MODEL_NAMES, DEFAULT_DA3_MODEL
+
+
+@pytest.fixture(autouse=True)
+def _pin_fake_da3_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        da3_module,
+        "resolve_hf_snapshot",
+        lambda repo_id, **_kwargs: (repo_id, f"hf:{repo_id}@test-revision"),
+        raising=False,
+    )
 
 
 class TestVideoDepthEstimatorDA3:
@@ -89,6 +102,30 @@ class TestVideoDepthEstimatorDA3:
                 mock_da3.from_pretrained.assert_called_once()
                 mock_model.to.assert_called_once_with(device="cpu")
                 mock_model.eval.assert_called_once()
+
+    def test_load_model_pins_and_reports_resolved_weight_snapshot(self, tmp_path, monkeypatch):
+        snapshot = tmp_path / "hub" / "snapshots" / ("a" * 40)
+        snapshot.mkdir(parents=True)
+        identity = f"hf:owner/model@{'a' * 40}"
+        resolve = MagicMock(return_value=(str(snapshot), identity))
+        monkeypatch.setattr(da3_module, "resolve_hf_snapshot", resolve)
+        mock_da3 = MagicMock()
+        mock_model = MagicMock()
+        mock_model.to.return_value = mock_model
+        mock_model.eval.return_value = mock_model
+        mock_da3.from_pretrained.return_value = mock_model
+
+        with patch.dict(
+            "sys.modules",
+            {"depth_anything_3": MagicMock(), "depth_anything_3.api": MagicMock()},
+        ):
+            with patch("depth_anything_3.api.DepthAnything3", mock_da3):
+                estimator = VideoDepthEstimatorDA3(model_name="owner/model", device="cpu")
+                assert estimator.load_model() is True
+
+        resolve.assert_called_once_with("owner/model")
+        mock_da3.from_pretrained.assert_called_once_with(str(snapshot))
+        assert estimator.get_model_info()["artifact_identity"] == identity
 
     def test_load_model_installs_flash_attention_before_loading_weights(self, capsys):
         """Test that DA3 enables the FA2 adapter before model construction."""
@@ -340,8 +377,6 @@ class TestEstimateDepthBatch:
 
     def test_estimate_depth_batch_success(self):
         """Test successful depth estimation."""
-        import torch
-
         estimator = VideoDepthEstimatorDA3(device="cpu", verbose=True)
         estimator.model = MagicMock()
 
@@ -362,8 +397,6 @@ class TestEstimateDepthBatch:
 
     def test_estimate_depth_batch_preserves_native_resolution(self):
         """DA3 output stays at the model's native resolution."""
-        import torch
-
         estimator = VideoDepthEstimatorDA3(device="cpu", verbose=False)
         estimator.model = MagicMock()
 

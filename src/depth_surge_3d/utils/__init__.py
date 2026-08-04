@@ -1,7 +1,4 @@
-"""Utility modules for Depth Surge 3D.
-
-Re-exports all utility modules for backward compatibility.
-"""
+"""Public utility modules for Depth Surge 3D."""
 
 # System utilities
 from .system import (
@@ -25,9 +22,7 @@ from .system import (
 from .domain import (
     get_cache_dir,
     compute_cache_key,
-    get_cached_depth_maps,
     get_cached_depth_map_files,
-    save_depth_maps_to_cache,
     save_depth_map_files_to_cache,
     clear_cache,
     get_cache_size,
@@ -60,8 +55,6 @@ from .imaging import (
     apply_fisheye_distortion,
     apply_fisheye_square_crop,
     create_vr_frame,
-    process_video_serial,
-    process_video_batch,
 )
 
 __all__ = [
@@ -83,9 +76,7 @@ __all__ = [
     # Domain utilities
     "get_cache_dir",
     "compute_cache_key",
-    "get_cached_depth_maps",
     "get_cached_depth_map_files",
-    "save_depth_maps_to_cache",
     "save_depth_map_files_to_cache",
     "clear_cache",
     "get_cache_size",
@@ -115,6 +106,4 @@ __all__ = [
     "apply_fisheye_distortion",
     "apply_fisheye_square_crop",
     "create_vr_frame",
-    "process_video_serial",
-    "process_video_batch",
 ]

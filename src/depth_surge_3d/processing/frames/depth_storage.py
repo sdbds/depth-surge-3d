@@ -15,6 +15,19 @@ from ...inference.depth.types import DepthRepresentation
 
 RAW_DEPTH_SCHEMA_VERSION = 1
 RAW_STORAGE_DTYPES = {"auto", "float16", "float32"}
+DEPTH_MODEL_SETTING_KEYS = (
+    "depth_model_version",
+    "model_path",
+    "model_size",
+    "depth_resolution",
+    "use_metric_depth",
+    "device",
+    "super_sample",
+    "temporal_window_size",
+    "temporal_window_overlap",
+    "denoising_steps",
+    "seed",
+)
 
 
 class RawDepthFingerprintError(ValueError):
@@ -66,6 +79,7 @@ def build_model_fingerprint(estimator: Any, settings: dict[str, Any]) -> dict[st
     artifact_identity = (
         weight_sha256
         or model_info.get("weight_sha256")
+        or model_info.get("artifact_identity")
         or model_info.get("revision")
         or canonical_json_hash(model_info)
     )
@@ -76,6 +90,18 @@ def build_model_fingerprint(estimator: Any, settings: dict[str, Any]) -> dict[st
         "weight_sha256": weight_sha256,
         "artifact_identity": artifact_identity,
     }
+
+
+def select_depth_model_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    """Select only settings that can change estimator output."""
+
+    return {key: settings.get(key) for key in DEPTH_MODEL_SETTING_KEYS if key in settings}
+
+
+def build_current_model_fingerprint(estimator: Any, settings: dict[str, Any]) -> dict[str, Any]:
+    """Fingerprint the loaded estimator with its depth-affecting settings."""
+
+    return build_model_fingerprint(estimator, select_depth_model_settings(settings))
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -234,6 +260,19 @@ class RawDepthStore:
         requested_dtype: str,
         first_values: np.ndarray | None,
     ) -> None:
+        self._validate_existing_identity(frame_names, representation, semantic_fingerprint)
+        self._validate_existing_storage(requested_dtype, first_values)
+        completed_count = self.validate_payloads()
+        if self.metadata.get("completed_count") != completed_count:
+            self.metadata["completed_count"] = completed_count
+            _atomic_write_json(self.metadata_path, self.metadata)
+
+    def _validate_existing_identity(
+        self,
+        frame_names: list[str],
+        representation: DepthRepresentation,
+        semantic_fingerprint: dict[str, Any],
+    ) -> None:
         if self.metadata.get("schema_version") != RAW_DEPTH_SCHEMA_VERSION:
             raise RawDepthFingerprintError("Raw-depth schema version mismatch")
         if self.metadata.get("semantic_fingerprint") != semantic_fingerprint:
@@ -242,6 +281,12 @@ class RawDepthStore:
             raise RawDepthFingerprintError("Raw-depth representation mismatch")
         if self.metadata.get("frame_names") != list(frame_names):
             raise RawDepthFingerprintError("Raw-depth source frame manifest mismatch")
+
+    def _validate_existing_storage(
+        self,
+        requested_dtype: str,
+        first_values: np.ndarray | None,
+    ) -> None:
         persisted_request = self.metadata.get("requested_dtype")
         promotes_float16 = (
             self.metadata.get("selected_dtype") == "float16" and requested_dtype == "float32"
@@ -256,6 +301,68 @@ class RawDepthStore:
             expected = self._fingerprint(self.metadata)
             if self.metadata.get("fingerprint") != expected:
                 raise RawDepthFingerprintError("Raw-depth storage fingerprint mismatch")
+
+    def _payload_contract(self) -> tuple[list[str], list[int], set[np.dtype]]:
+        frame_names = self.metadata.get("frame_names")
+        native_shape = self.metadata.get("native_shape")
+        selected_dtype = self.metadata.get("selected_dtype")
+        storage_status = self.metadata.get("storage_status")
+        if not isinstance(frame_names, list):
+            raise RawDepthFingerprintError("Raw-depth payload metadata is invalid")
+        if not all(isinstance(name, str) for name in frame_names):
+            raise RawDepthFingerprintError("Raw-depth payload metadata is invalid")
+        if not isinstance(native_shape, list) or len(native_shape) != 2:
+            raise RawDepthFingerprintError("Raw-depth payload metadata is invalid")
+        if not all(isinstance(value, int) and value > 0 for value in native_shape):
+            raise RawDepthFingerprintError("Raw-depth payload metadata is invalid")
+        if selected_dtype not in {"float16", "float32"}:
+            raise RawDepthFingerprintError("Raw-depth payload metadata is invalid")
+        if storage_status not in {"ready", "promoting"}:
+            raise RawDepthFingerprintError("Raw-depth payload metadata is invalid")
+
+        allowed_dtypes = {np.dtype(selected_dtype)}
+        if storage_status == "promoting":
+            allowed_dtypes = {np.dtype("float16"), np.dtype("float32")}
+        return frame_names, native_shape, allowed_dtypes
+
+    @staticmethod
+    def _load_validated_payload(
+        path: Path,
+        native_shape: list[int],
+        allowed_dtypes: set[np.dtype],
+    ) -> None:
+        try:
+            with np.load(path, allow_pickle=False) as payload:
+                if set(payload.files) != {"values"}:
+                    raise ValueError("expected exactly one values array")
+                values = np.asarray(payload["values"])
+        except Exception as error:
+            raise RawDepthFingerprintError(f"Raw-depth payload is unreadable: {path}") from error
+        if values.ndim != 2 or list(values.shape) != native_shape:
+            raise RawDepthFingerprintError(f"Raw-depth payload shape mismatch: {path}")
+        if values.dtype not in allowed_dtypes:
+            raise RawDepthFingerprintError(f"Raw-depth payload dtype mismatch: {path}")
+
+    def validate_payloads(self) -> int:
+        """Validate every persisted map and return the actual completed count."""
+
+        frame_names, native_shape, allowed_dtypes = self._payload_contract()
+
+        expected_paths = {self.path_for(name).resolve() for name in frame_names}
+        actual_paths = {path.resolve() for path in self.directory.glob("*.npz")}
+        unexpected = actual_paths.difference(expected_paths)
+        if unexpected:
+            names = ", ".join(sorted(path.name for path in unexpected))
+            raise RawDepthFingerprintError(f"Unexpected raw-depth payload files: {names}")
+
+        completed = 0
+        for frame_name in frame_names:
+            path = self.path_for(frame_name)
+            if not path.is_file():
+                continue
+            self._load_validated_payload(path, native_shape, allowed_dtypes)
+            completed += 1
+        return completed
 
     def path_for(self, frame_name: str) -> Path:
         return self.directory / f"{Path(frame_name).stem}.npz"
@@ -302,6 +409,8 @@ class RawDepthStore:
             values = np.asarray(payload["values"])
         if values.ndim != 2:
             raise ValueError(f"Raw-depth file must contain one [H,W] map: {path}")
+        if list(values.shape) != self.metadata.get("native_shape"):
+            raise RawDepthFingerprintError(f"Raw-depth file shape mismatch: {path}")
         if self.metadata.get("storage_status") == "ready":
             expected = np.dtype(self.metadata["selected_dtype"])
             if values.dtype != expected:

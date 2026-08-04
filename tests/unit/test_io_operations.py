@@ -1,5 +1,7 @@
 """Unit tests for io_operations.py pure helper functions."""
 
+import os
+
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from src.depth_surge_3d.io.operations import (
@@ -209,7 +211,7 @@ class TestCreateOutputDirectories:
         assert "scene_data" in result
         assert "depth_raw" in result
         assert "disparity_maps" in result
-        assert "depth_maps" in result
+        assert "depth_maps" not in result
         assert "left_frames" in result
         assert "right_frames" in result
         assert "vr_frames" in result
@@ -219,7 +221,6 @@ class TestCreateOutputDirectories:
         assert result["scene_data"] == base_path / "01_scene_data"
         assert result["depth_raw"] == base_path / "02_depth_raw"
         assert result["disparity_maps"] == base_path / "03_disparity_maps"
-        assert result["depth_maps"] == result["disparity_maps"]
         assert result["left_frames"] == base_path / "04_left_frames"
         assert result["right_frames"] == base_path / "04_right_frames"
         assert result["vr_frames"] == base_path / "99_vr_frames"
@@ -243,7 +244,7 @@ class TestCreateOutputDirectories:
         assert "scene_data" in result
         assert "depth_raw" in result
         assert "disparity_maps" in result
-        assert "depth_maps" in result
+        assert "depth_maps" not in result
         assert "left_frames" in result
         assert "right_frames" in result
         assert "vr_frames" in result
@@ -267,7 +268,7 @@ class TestCreateOutputDirectories:
         assert "scene_data" in result
         assert "depth_raw" in result
         assert "disparity_maps" in result
-        assert "depth_maps" in result
+        assert "depth_maps" not in result
         assert "vr_frames" in result
 
 
@@ -921,6 +922,18 @@ class TestFindSettingsFile:
             result = find_settings_file(mock_dir, None)
 
         assert result == mock_file
+
+    def test_find_settings_file_without_batch_name_uses_newest_file(self, tmp_path):
+        from src.depth_surge_3d.io.operations import find_settings_file
+
+        older = tmp_path / "older-settings.json"
+        newer = tmp_path / "newer-settings.json"
+        older.write_text("{}", encoding="utf-8")
+        newer.write_text("{}", encoding="utf-8")
+        os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
+
+        assert find_settings_file(tmp_path) == newer
 
     def test_find_settings_file_not_found(self):
         """Test when settings file not found."""

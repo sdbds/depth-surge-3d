@@ -145,10 +145,7 @@ class TestEntryPointImports:
             progress,
             resolution,
         )
-        from depth_surge_3d.utils.imaging import (  # noqa: F401
-            image_processing,
-            video_processing,
-        )
+        from depth_surge_3d.utils.imaging import image_processing  # noqa: F401
         from depth_surge_3d.utils.system import (  # noqa: F401
             check_cuda,
             console,

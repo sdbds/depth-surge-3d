@@ -32,4 +32,3 @@ class DepthBatch:
             raise ValueError("DepthBatch.values must have shape [N,H,W]")
         if not isinstance(self.representation, DepthRepresentation):
             raise TypeError("DepthBatch.representation must be a DepthRepresentation")
-

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -69,6 +69,7 @@ class TestSeeThroughDepthEstimator:
         cache_dir = source_root / "huggingface" / "hub"
         cache_dir.mkdir(parents=True)
         pipeline = MagicMock()
+        pipeline._depth_surge_artifact_identity = "hf:owner/model@resolved"
         loader = MagicMock(return_value=pipeline)
 
         estimator = module.SeeThroughDepthEstimator(
@@ -89,6 +90,53 @@ class TestSeeThroughDepthEstimator:
             device="cpu",
             dtype=torch.float32,
         )
+        assert estimator.get_model_info()["artifact_identity"] == ("hf:owner/model@resolved")
+
+    def test_default_loader_pins_both_components_to_one_snapshot(self, tmp_path, monkeypatch):
+        module = _module()
+        source_root = _make_vendor_tree(tmp_path / "qinglong-captions")
+        cache_dir = source_root / "huggingface" / "hub"
+        snapshot = tmp_path / "hub" / "snapshots" / ("b" * 40)
+        snapshot.mkdir(parents=True)
+        identity = f"hf:owner/model@{'b' * 40}"
+        resolve = MagicMock(return_value=(str(snapshot), identity))
+        monkeypatch.setattr(module, "resolve_hf_snapshot", resolve, raising=False)
+
+        layer_module = ModuleType("layerdiff3d")
+        marigold_module = ModuleType("marigold")
+        unet_type = MagicMock()
+        pipeline_type = MagicMock()
+        unet = MagicMock()
+        pipeline = MagicMock()
+        unet_type.from_pretrained.return_value = unet
+        pipeline_type.from_pretrained.return_value = pipeline
+        layer_module.UNetFrameConditionModel = unet_type
+        marigold_module.MarigoldDepthPipeline = pipeline_type
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "module.see_through.vendor.modules.layerdiffuse.layerdiff3d": layer_module,
+                "module.see_through.vendor.modules.marigold": marigold_module,
+            },
+        ):
+            result = module._load_see_through_pipeline(
+                repo_id="owner/model",
+                source_root=source_root,
+                cache_dir=cache_dir,
+                device="cpu",
+                dtype=torch.float32,
+            )
+
+        resolve.assert_called_once_with("owner/model", cache_dir=cache_dir)
+        unet_type.from_pretrained.assert_called_once_with(
+            str(snapshot),
+            subfolder="unet",
+            cache_dir=str(cache_dir),
+            torch_dtype=torch.float32,
+        )
+        assert pipeline_type.from_pretrained.call_args.args[0] == str(snapshot)
+        assert result._depth_surge_artifact_identity == identity
 
     def test_estimate_depth_batch_uses_full_frame_layer_contract_and_fixed_seed(self):
         module = _module()

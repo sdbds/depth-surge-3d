@@ -79,19 +79,22 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
 
 ## Architecture Essentials
 
-### Processing Pipeline (7 Steps)
-1. Frame Extraction → 2. Depth Maps → 3. Load Frames → 4. Stereo Pairs → 5. Fisheye Distortion → 6. VR Assembly → 7. Audio Integration
+### Processing Pipeline
+1. Frame Extraction -> 2. Scene Analysis -> 3. Native Raw Depth -> 4. Canonical Disparity -> 5. DIBR Stereo Pairs -> 6. Optional Projection/Crop/Upscale -> 7. VR Assembly -> 8. Audio Integration
 
-Each step has resume capability (skips if intermediate files exist).
+Each step has resume capability and reuses intermediates only after its
+fingerprint and payload contract validate.
 
 ### Output Structure
 ```
 output/videoname_timestamp/
-├── 00_original_frames/
-├── 02_depth_maps/
+├── 00_original_frames/metadata.json
+├── 01_scene_data/
+├── 02_depth_raw/
+├── 03_disparity_maps/
 ├── 04_left_frames/ + 04_right_frames/
 ├── 99_vr_frames/
-├── settings.json
+├── <batch>-settings.json
 └── videoname_3D_side_by_side.mp4
 ```
 

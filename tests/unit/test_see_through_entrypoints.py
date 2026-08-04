@@ -66,7 +66,7 @@ def test_web_runner_uses_relative_see_through_repo(tmp_path):
     )
 
     projector = MagicMock()
-    projector.depth_estimator.load_model.return_value = False
+    projector.load_model.return_value = False
 
     with (
         patch("torch.cuda.is_available", return_value=True),
@@ -194,22 +194,38 @@ def test_web_process_rejects_removed_explicit_settings(tmp_path):
     start.assert_not_called()
 
 
-def test_web_resume_requires_current_request_to_authorize_legacy_delete(tmp_path):
+def test_web_resume_requires_current_request_to_authorize_legacy_delete(tmp_path, monkeypatch):
+    import hashlib
+
     import app as web_app
 
     output_dir = tmp_path / "job"
     output_dir.mkdir()
     source_video = output_dir / "source.mp4"
-    source_video.touch()
+    source_video.write_bytes(b"source-video")
+    settings_file = output_dir / "job-settings.json"
+    settings_file.write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "source_video": str(source_video),
+                    "source_video_name": source_video.name,
+                    "source_video_sha256": hashlib.sha256(source_video.read_bytes()).hexdigest(),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(web_app.app.config, "OUTPUT_FOLDER", str(tmp_path))
     web_app.current_processing.update(
         {"active": False, "session_id": None, "thread": None, "stop_requested": False}
     )
     report = MagicMock()
     report.migrated_settings = {"migrate_legacy": "archive"}
+    report.settings_file = settings_file
     report.to_dict.return_value = {"preserved_stages": ["frames"]}
 
     with (
-        patch.object(web_app, "find_source_video", return_value=source_video),
         patch.object(
             web_app,
             "detect_resume_settings",
@@ -217,7 +233,149 @@ def test_web_resume_requires_current_request_to_authorize_legacy_delete(tmp_path
         ),
         patch.object(web_app, "build_resume_report", return_value=report) as build,
         patch.object(web_app, "apply_legacy_migration") as migrate,
-        patch.object(web_app.socketio, "start_background_task", return_value=MagicMock()),
+        patch.object(web_app.socketio, "start_background_task", return_value=MagicMock()) as start,
+    ):
+        response = web_app.app.test_client().post(
+            "/resume",
+            json={
+                "output_dir": str(output_dir),
+                "raw_storage_dtype": "float32",
+            },
+        )
+
+    assert response.status_code == 200
+    assert build.call_args.args[1]["migrate_legacy"] == "archive"
+    assert build.call_args.args[1]["raw_storage_dtype"] == "float32"
+    assert build.call_args.kwargs["source_video"] == source_video
+    assert build.call_args.kwargs["settings_file"] == settings_file
+    migrate.assert_not_called()
+    resume_context = start.call_args.args[5]
+    assert resume_context == {
+        "migration_mode": "archive",
+        "settings_file": settings_file,
+    }
+
+
+def test_web_background_resume_validates_loaded_model_before_migration(tmp_path):
+    import app as web_app
+
+    output_dir = tmp_path / "job"
+    output_dir.mkdir()
+    source_video = output_dir / "source.mp4"
+    source_video.touch()
+    settings_file = output_dir / "job-settings.json"
+    settings_file.write_text("{}", encoding="utf-8")
+    settings = {
+        "depth_model_version": "v3",
+        "model_size": "large",
+        "device": "cpu",
+        "use_metric_depth": False,
+    }
+    projector = MagicMock()
+    projector.load_model.return_value = True
+    fingerprint = {"backend": "loaded.Estimator"}
+    report = MagicMock()
+    report.migrated_settings = settings
+
+    with (
+        patch("torch.cuda.is_available", return_value=False),
+        patch.object(web_app, "create_stereo_projector", return_value=projector),
+        patch.object(
+            web_app,
+            "build_current_model_fingerprint",
+            return_value=fingerprint,
+        ) as build_fingerprint,
+        patch.object(web_app, "build_resume_report", return_value=report) as build_report,
+        patch.object(web_app, "apply_legacy_migration") as migrate,
+        patch.object(web_app, "get_video_info", return_value=None),
+    ):
+        web_app.process_video_async(
+            "test-session",
+            source_video,
+            settings,
+            output_dir,
+            {"migration_mode": "archive", "settings_file": settings_file},
+        )
+
+    build_fingerprint.assert_called_once_with(projector.depth_estimator, settings)
+    build_report.assert_called_once_with(
+        output_dir,
+        settings,
+        source_video=source_video,
+        model_fingerprint=fingerprint,
+        settings_file=settings_file,
+    )
+    migrate.assert_called_once_with(report, "archive")
+
+
+def test_web_resume_rejects_output_directory_outside_managed_root(tmp_path, monkeypatch):
+    import app as web_app
+
+    output_root = tmp_path / "managed"
+    output_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    web_app.current_processing.update(
+        {"active": False, "session_id": None, "thread": None, "stop_requested": False}
+    )
+    monkeypatch.setitem(web_app.app.config, "OUTPUT_FOLDER", str(output_root))
+
+    with (
+        patch.object(web_app, "find_source_video") as find_source,
+        patch.object(web_app, "build_resume_report") as build,
+        patch.object(web_app, "apply_legacy_migration") as migrate,
+        patch.object(web_app.socketio, "start_background_task") as start,
+    ):
+        response = web_app.app.test_client().post(
+            "/resume",
+            json={"output_dir": str(outside), "migrate_legacy": "delete"},
+        )
+
+    assert response.status_code == 403
+    find_source.assert_not_called()
+    build.assert_not_called()
+    migrate.assert_not_called()
+    start.assert_not_called()
+
+
+def test_web_resume_uses_source_recorded_by_exact_settings_file(tmp_path, monkeypatch):
+    import hashlib
+    import json
+
+    import app as web_app
+
+    output_root = tmp_path / "managed"
+    output_dir = output_root / "job"
+    output_dir.mkdir(parents=True)
+    correct_source = output_dir / "source.avi"
+    correct_source.write_bytes(b"correct-source")
+    (output_dir / "distractor.mp4").write_bytes(b"unrelated-video")
+    settings_file = output_dir / "job-settings.json"
+    settings_file.write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "source_video": str(correct_source),
+                    "source_video_name": correct_source.name,
+                    "source_video_sha256": hashlib.sha256(correct_source.read_bytes()).hexdigest(),
+                    "settings_schema_version": 2,
+                },
+                "processing_settings": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(web_app.app.config, "OUTPUT_FOLDER", str(output_root))
+    web_app.current_processing.update(
+        {"active": False, "session_id": None, "thread": None, "stop_requested": False}
+    )
+    report = MagicMock()
+    report.migrated_settings = {}
+    report.to_dict.return_value = {}
+
+    with (
+        patch.object(web_app, "build_resume_report", return_value=report),
+        patch.object(web_app.socketio, "start_background_task", return_value=MagicMock()) as start,
     ):
         response = web_app.app.test_client().post(
             "/resume",
@@ -225,14 +383,55 @@ def test_web_resume_requires_current_request_to_authorize_legacy_delete(tmp_path
         )
 
     assert response.status_code == 200
-    assert build.call_args.args[1]["migrate_legacy"] == "archive"
-    migrate.assert_called_once_with(report, "archive")
+    assert start.call_args.args[2] == correct_source.resolve()
+
+
+def test_web_resume_rejects_saved_source_hash_mismatch(tmp_path, monkeypatch):
+    import json
+
+    import app as web_app
+
+    output_root = tmp_path / "managed"
+    output_dir = output_root / "job"
+    output_dir.mkdir(parents=True)
+    source_video = output_dir / "source.avi"
+    source_video.write_bytes(b"changed-source")
+    (output_dir / "distractor.mp4").write_bytes(b"unrelated-video")
+    (output_dir / "job-settings.json").write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "source_video": str(source_video),
+                    "source_video_name": source_video.name,
+                    "source_video_sha256": "0" * 64,
+                    "settings_schema_version": 2,
+                },
+                "processing_settings": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(web_app.app.config, "OUTPUT_FOLDER", str(output_root))
+    web_app.current_processing.update(
+        {"active": False, "session_id": None, "thread": None, "stop_requested": False}
+    )
+
+    with patch.object(web_app.socketio, "start_background_task") as start:
+        response = web_app.app.test_client().post(
+            "/resume",
+            json={"output_dir": str(output_dir)},
+        )
+
+    assert response.status_code == 409
+    assert "source video" in response.get_json()["error"].lower()
+    start.assert_not_called()
 
 
 def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp_path, monkeypatch):
     """CLI resume must rebuild the saved estimator and pass only process-video options."""
     cli = _load_cli_module()
     projector = MagicMock()
+    projector.load_model.return_value = True
     projector.process_video.return_value = True
     saved_settings = {
         "depth_model_version": "see_through",
@@ -255,6 +454,11 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
         "recommendations": [],
         "settings_file": tmp_path / "job-settings.json",
     }
+    report = MagicMock()
+    report.stages = ()
+    report.removed_settings = ()
+    report.migrated_settings = cli.validate_settings(saved_settings, source="legacy_disk")
+    model_fingerprint = {"backend": "loaded.Estimator"}
     monkeypatch.setattr(cli.sys, "argv", ["depth_surge_3d.py", "--resume", str(tmp_path)])
 
     with (
@@ -268,6 +472,13 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
             },
         ),
         patch.object(cli, "create_stereo_projector", return_value=projector) as create_projector,
+        patch.object(
+            cli,
+            "build_current_model_fingerprint",
+            return_value=model_fingerprint,
+        ) as build_fingerprint,
+        patch.object(cli, "build_resume_report", return_value=report) as build_report,
+        patch.object(cli, "apply_legacy_migration") as migrate,
     ):
         result = cli.main()
 
@@ -278,6 +489,16 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
         metric=False,
         depth_model_version="see_through",
     )
+    projector.load_model.assert_called_once_with()
+    build_fingerprint.assert_called_once_with(projector.depth_estimator, report.migrated_settings)
+    build_report.assert_called_once_with(
+        tmp_path,
+        report.migrated_settings,
+        source_video="source.mkv",
+        model_fingerprint=model_fingerprint,
+        settings_file=resume_info["settings_file"],
+    )
+    migrate.assert_called_once_with(report, "archive")
     resume_kwargs = projector.process_video.call_args.kwargs
     assert resume_kwargs["video_path"] == "source.mkv"
     assert resume_kwargs["output_dir"] == str(tmp_path)

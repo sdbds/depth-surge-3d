@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
-"""
+"""Batch directory analysis and final VR video creation."""
 
 from __future__ import annotations
-Batch Analysis Utilities
-Extracted from app.py for batch directory analysis and video creation
-"""
 
 import json
 import subprocess
@@ -13,6 +10,21 @@ from typing import Any
 from datetime import datetime
 
 from ..core.constants import INTERMEDIATE_DIRS
+
+
+CURRENT_FRAME_STAGES = {
+    INTERMEDIATE_DIRS["vr_frames"]: "Final VR frames",
+    INTERMEDIATE_DIRS["left_upscaled"]: "Upscaled left frames",
+    INTERMEDIATE_DIRS["right_upscaled"]: "Upscaled right frames",
+    INTERMEDIATE_DIRS["left_cropped"]: "Cropped left frames",
+    INTERMEDIATE_DIRS["right_cropped"]: "Cropped right frames",
+    INTERMEDIATE_DIRS["left_distorted"]: "Distorted left frames",
+    INTERMEDIATE_DIRS["right_distorted"]: "Distorted right frames",
+    INTERMEDIATE_DIRS["left_frames"]: "Stereo left frames",
+    INTERMEDIATE_DIRS["right_frames"]: "Stereo right frames",
+    INTERMEDIATE_DIRS["disparity_maps"]: "Canonical disparity maps",
+    INTERMEDIATE_DIRS["frames"]: "Original frames",
+}
 
 
 # Lazy import cv2 to avoid blocking module loading when cv2 is not available
@@ -40,24 +52,10 @@ def analyze_batch_directory(batch_path: Path) -> dict[str, Any]:
     """
     batch_path = Path(batch_path)
 
-    # Define processing stages
-    stages = {
-        INTERMEDIATE_DIRS["vr_frames"]: "Final VR frames",
-        INTERMEDIATE_DIRS["left_final"]: "Final left frames",
-        INTERMEDIATE_DIRS["right_final"]: "Final right frames",
-        INTERMEDIATE_DIRS["left_distorted"]: "Distorted left frames",
-        INTERMEDIATE_DIRS["right_distorted"]: "Distorted right frames",
-        INTERMEDIATE_DIRS["left_cropped"]: "Cropped left frames",
-        INTERMEDIATE_DIRS["right_cropped"]: "Cropped right frames",
-        INTERMEDIATE_DIRS["left_frames"]: "Basic left frames",
-        INTERMEDIATE_DIRS["right_frames"]: "Basic right frames",
-        INTERMEDIATE_DIRS["depth_maps"]: "Depth maps",
-        INTERMEDIATE_DIRS["supersampled"]: "Super sampled frames",
-        INTERMEDIATE_DIRS["frames"]: "Original frames",
-    }
-
     # Detect highest processing stage and frame count
-    highest_stage_num, highest_stage_name, frame_count = _detect_highest_stage(batch_path, stages)
+    highest_stage_num, highest_stage_name, frame_count = _detect_highest_stage(
+        batch_path, CURRENT_FRAME_STAGES
+    )
 
     # Detect VR format and resolution
     vr_format, resolution = _detect_vr_format_and_resolution(batch_path, highest_stage_num)
@@ -96,29 +94,9 @@ def create_video_from_batch(batch_path: Path, settings: dict[str, Any]) -> Path 
     output_filename = settings.get("output_filename")
 
     # Determine frame directory to use
-    if frame_source == "auto":
-        # Auto-detect highest available stage
-        stages = [
-            INTERMEDIATE_DIRS["vr_frames"],
-            INTERMEDIATE_DIRS["left_final"],
-            INTERMEDIATE_DIRS["right_final"],
-        ]
-        frame_dir = None
-        for stage in stages:
-            stage_path = batch_path / stage
-            if stage_path.exists() and list(stage_path.glob("*.png")):
-                frame_dir = stage_path
-                break
-    else:
-        # Use specified stage
-        stage_mapping = {
-            "vr_frames": INTERMEDIATE_DIRS["vr_frames"],
-            "left_right_final": INTERMEDIATE_DIRS["left_final"],
-            "left_right_fisheye": INTERMEDIATE_DIRS["left_distorted"],
-            "left_right_basic": INTERMEDIATE_DIRS["left_frames"],
-        }
-        stage_name = stage_mapping.get(frame_source, INTERMEDIATE_DIRS["vr_frames"])
-        frame_dir = batch_path / stage_name
+    if frame_source not in {"auto", "vr_frames"}:
+        raise ValueError(f"Unsupported frame source: {frame_source}")
+    frame_dir = batch_path / INTERMEDIATE_DIRS["vr_frames"]
 
     if not frame_dir or not frame_dir.exists():
         raise ValueError(f"No frames found in selected stage: {frame_source}")
@@ -137,7 +115,7 @@ def create_video_from_batch(batch_path: Path, settings: dict[str, Any]) -> Path 
         "ffmpeg",
         "-y",
         "-framerate",
-        str(fps),
+        "30" if fps == "original" else str(fps),
         "-i",
         str(frame_dir / "frame_%06d.png"),
     ]
@@ -208,15 +186,19 @@ def _detect_vr_format_and_resolution(batch_path: Path, highest_stage_num: int) -
     vr_format = "unknown"
     resolution = "unknown"
 
-    if highest_stage_num < 50:  # Final frames not available
-        return vr_format, resolution
-
     sample_frame_dirs = [
         d
         for d in [
-            INTERMEDIATE_DIRS["left_final"],
-            INTERMEDIATE_DIRS["right_final"],
             INTERMEDIATE_DIRS["vr_frames"],
+            INTERMEDIATE_DIRS["left_upscaled"],
+            INTERMEDIATE_DIRS["right_upscaled"],
+            INTERMEDIATE_DIRS["left_cropped"],
+            INTERMEDIATE_DIRS["right_cropped"],
+            INTERMEDIATE_DIRS["left_distorted"],
+            INTERMEDIATE_DIRS["right_distorted"],
+            INTERMEDIATE_DIRS["left_frames"],
+            INTERMEDIATE_DIRS["right_frames"],
+            INTERMEDIATE_DIRS["frames"],
         ]
         if (batch_path / d).exists()
     ]
