@@ -353,11 +353,17 @@ class TestEstimateDepthBatchDecisionLogic:
         estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cuda")
         estimator.model = MagicMock()
 
-        # High-res video (>2K) with 70 frames should trigger chunking
-        frames = np.random.rand(70, 2160, 3840, 3).astype(np.uint8)
+        # Only shape drives this branch; broadcast views avoid a 13 GiB fixture.
+        frames = np.broadcast_to(
+            np.zeros((1, 1, 1, 3), dtype=np.uint8),
+            (70, 2160, 3840, 3),
+        )
 
         with patch.object(estimator, "_estimate_depth_chunked") as mock_chunked:
-            mock_chunked.return_value = np.random.rand(70, 2160, 3840)
+            mock_chunked.return_value = np.broadcast_to(
+                np.zeros((1, 1, 1), dtype=np.float32),
+                (70, 2160, 3840),
+            )
             estimator.estimate_depth_batch(frames)
 
             mock_chunked.assert_called_once()
