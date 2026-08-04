@@ -89,6 +89,43 @@ class TestVideoDepthEstimatorDA3:
                 mock_model.to.assert_called_once_with(device="cpu")
                 mock_model.eval.assert_called_once()
 
+    def test_load_model_installs_flash_attention_before_loading_weights(self, capsys):
+        """Test that DA3 enables the FA2 adapter before model construction."""
+        events = []
+        mock_da3 = MagicMock()
+        mock_model = MagicMock()
+        mock_model.to.return_value = mock_model
+        mock_model.eval.return_value = mock_model
+
+        def load_weights(_model_id):
+            events.append("load")
+            return mock_model
+
+        mock_da3.from_pretrained.side_effect = load_weights
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "depth_anything_3": MagicMock(),
+                "depth_anything_3.api": MagicMock(),
+                "xformers": MagicMock(),
+            },
+        ):
+            with patch("depth_anything_3.api.DepthAnything3", mock_da3):
+                with patch(
+                    "src.depth_surge_3d.inference.depth.video_depth_estimator_da3."
+                    "install_da3_flash_attention",
+                    side_effect=lambda: events.append("install") or 2,
+                ) as install_adapter:
+                    estimator = VideoDepthEstimatorDA3(device="cpu")
+                    assert estimator.load_model() is True
+
+        assert events == ["install", "load"]
+        install_adapter.assert_called_once_with()
+        output = capsys.readouterr().out
+        assert "FlashAttention 2 enabled for DA3" in output
+        assert "xformers detected - auxiliary optimized kernels available" in output
+
     def test_load_model_metric_override(self):
         """Test metric model override."""
         with patch.dict(

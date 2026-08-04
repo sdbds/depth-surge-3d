@@ -81,22 +81,22 @@ class DistortionProcessor:
                     right_img, settings["fisheye_fov"], settings["fisheye_projection"]
                 )
 
-                # Save distorted frames if keeping intermediates
-                if settings["keep_intermediates"]:
-                    frame_name = left_file.stem
-                    if "left_distorted" in directories:
-                        cv2.imwrite(
-                            str(directories["left_distorted"] / f"{frame_name}.png"),
-                            left_distorted,
-                        )
-                    if "right_distorted" in directories:
-                        cv2.imwrite(
-                            str(directories["right_distorted"] / f"{frame_name}.png"),
-                            right_distorted,
-                        )
+                # Distorted frames are required by the crop stage. Retention is
+                # handled only after the final video has encoded successfully.
+                frame_name = left_file.stem
+                if "left_distorted" in directories:
+                    cv2.imwrite(
+                        str(directories["left_distorted"] / f"{frame_name}.png"),
+                        left_distorted,
+                    )
+                if "right_distorted" in directories:
+                    cv2.imwrite(
+                        str(directories["right_distorted"] / f"{frame_name}.png"),
+                        right_distorted,
+                    )
 
                 # Update progress
-                if i % 5 == 0 or i == len(left_files) - 1:
+                if progress_tracker and (i % 5 == 0 or i == len(left_files) - 1):
                     progress_tracker.update_progress(
                         "Applying distortion",
                         phase="distortion",
@@ -157,7 +157,7 @@ class DistortionProcessor:
                 self._crop_single_frame_pair(left_file, right_file, directories, settings)
 
                 # Update progress more frequently (every frame for slow operations)
-                if i % 1 == 0 or i == len(left_files) - 1:
+                if progress_tracker and (i % 1 == 0 or i == len(left_files) - 1):
                     progress_tracker.update_progress(
                         f"Cropping frame {i + 1}/{len(left_files)}",
                         phase="cropping",

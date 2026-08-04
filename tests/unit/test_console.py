@@ -150,6 +150,18 @@ class TestCompletionBanner:
         assert long_path in output
         assert "1000" in output
 
+    @patch("sys.stdout", new_callable=StringIO)
+    def test_completion_banner_is_encodable_on_windows_gbk_console(self, mock_stdout):
+        """The success banner must not turn a completed Windows job into a failure."""
+        completion_banner(
+            output_file="C:/output/video.mp4",
+            processing_time="10s",
+            num_frames=24,
+            vr_format="side_by_side",
+        )
+
+        mock_stdout.getvalue().encode("gbk")
+
 
 class TestColorsDisable:
     """Test Colors.disable() functionality."""

@@ -3,10 +3,13 @@ Unit tests for depth cache utilities.
 """
 
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import cv2
 import numpy as np
+
+from src.depth_surge_3d.utils.domain import depth_cache
 
 from src.depth_surge_3d.utils.domain.depth_cache import (
     get_cache_dir,
@@ -25,7 +28,7 @@ class TestGetCacheDir:
     def test_cache_dir_with_xdg(self):
         """Test cache dir uses XDG_CACHE_HOME when set."""
         cache_dir = get_cache_dir()
-        assert str(cache_dir).startswith("/tmp/xdg_cache")
+        assert cache_dir == Path("/tmp/xdg_cache") / "depth-surge-3d" / "depth_cache"
         assert "depth-surge-3d" in str(cache_dir)
         assert "depth_cache" in str(cache_dir)
 
@@ -98,6 +101,28 @@ class TestComputeCacheKey:
         key2 = compute_cache_key(str(video_file), settings)
 
         assert key1 == key2
+
+    def test_cache_key_changes_for_inference_source_and_frame_range(self, tmp_path):
+        """A cache entry cannot be reused for another checkpoint, clip, or input scale."""
+        video_file = tmp_path / "test.mp4"
+        video_file.write_bytes(b"test content" * 1000)
+        base_settings = {
+            "depth_model_version": "see_through",
+            "model_path": "24yearsold/seethroughv0.0.1_marigold",
+            "start_time": "03:15",
+            "end_time": "03:22",
+            "super_sample": "none",
+        }
+        base_key = compute_cache_key(str(video_file), base_settings)
+
+        changes = (
+            {"model_path": "24yearsold/a-different-checkpoint"},
+            {"start_time": "10:00", "end_time": "10:07"},
+            {"super_sample": "auto"},
+        )
+        for change in changes:
+            changed_settings = {**base_settings, **change}
+            assert compute_cache_key(str(video_file), changed_settings) != base_key
 
 
 class TestGetCachedDepthMaps:
@@ -184,16 +209,43 @@ class TestGetCachedDepthMaps:
             json.dump(metadata, f)
 
         # Create depth map files
+        expected_depths = []
         for i in range(num_frames):
-            depth_data = np.random.rand(100, 100).astype(np.float32)
+            depth_data = np.random.default_rng(i).random((100, 100)).astype(np.float32)
             depth_uint16 = (depth_data * 1000.0).astype(np.uint16)
             cv2.imwrite(str(cache_entry / f"depth_{i:06d}.png"), depth_uint16)
+            expected_depths.append(depth_uint16.astype(np.float32) / 1000.0)
 
         result = get_cached_depth_maps(str(video_file), settings, num_frames)
 
         assert result is not None
         assert len(result) == num_frames
         assert result.shape == (num_frames, 100, 100)
+        np.testing.assert_allclose(result, np.asarray(expected_depths), atol=0.0)
+
+    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
+    def test_cached_file_lookup_does_not_decode_all_depth_maps(self, mock_cache_dir, tmp_path):
+        """File-based callers can reuse a cache without allocating an array stack."""
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        mock_cache_dir.return_value = cache_dir
+        video_file = tmp_path / "test.mp4"
+        video_file.write_bytes(b"test")
+        settings = {"depth_model_version": "v3"}
+        cache_entry = cache_dir / compute_cache_key(str(video_file), settings)
+        cache_entry.mkdir()
+        (cache_entry / "metadata.json").write_text(
+            json.dumps({"num_frames": 2, "depth_scale": 65535.0})
+        )
+        expected = [cache_entry / f"depth_{i:06d}.png" for i in range(2)]
+        for path in expected:
+            path.write_bytes(b"png")
+
+        with patch("src.depth_surge_3d.utils.domain.depth_cache.cv2.imread") as imread:
+            result = depth_cache.get_cached_depth_map_files(str(video_file), settings, 2)
+
+        assert result == expected
+        imread.assert_not_called()
 
 
 class TestSaveDepthMapsToCache:
@@ -262,6 +314,35 @@ class TestSaveDepthMapsToCache:
         assert metadata["cache_version"] == "1.0"
         assert metadata["depth_settings"]["depth_model_version"] == "v3"
         assert metadata["depth_settings"]["model_size"] == "base"
+
+    @patch("src.depth_surge_3d.utils.domain.depth_cache.get_cache_dir")
+    def test_save_depth_map_files_streams_pngs_to_cache(self, mock_cache_dir, tmp_path):
+        """Disk-backed depth maps are cached one file at a time."""
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        mock_cache_dir.return_value = cache_dir
+        video_file = tmp_path / "test.mp4"
+        video_file.write_bytes(b"test")
+        settings = {"depth_model_version": "v3"}
+        depth_dir = tmp_path / "depth"
+        depth_dir.mkdir()
+        depth_files = []
+        for i in range(2):
+            depth_file = depth_dir / f"frame_{i:06d}.png"
+            cv2.imwrite(
+                str(depth_file),
+                np.full((4, 4), i * 65535, dtype=np.uint16),
+            )
+            depth_files.append(depth_file)
+
+        assert depth_cache.save_depth_map_files_to_cache(str(video_file), settings, depth_files)
+
+        cache_entry = cache_dir / compute_cache_key(str(video_file), settings)
+        cached_files = [cache_entry / f"depth_{i:06d}.png" for i in range(2)]
+        assert all(path.exists() for path in cached_files)
+        metadata = json.loads((cache_entry / "metadata.json").read_text())
+        assert metadata["num_frames"] == 2
+        assert metadata["depth_scale"] == 65535.0
 
 
 class TestClearCache:

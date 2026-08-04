@@ -17,6 +17,7 @@ import numpy as np
 from typing import Any
 
 from ...core.constants import DA3_MODEL_NAMES, DEFAULT_DA3_MODEL
+from .attention_backend import install_da3_flash_attention
 
 
 @contextmanager
@@ -112,11 +113,11 @@ class VideoDepthEstimatorDA3:
         return hf_model_id
 
     def _check_xformers(self) -> None:
-        """Check if xformers is available for optimized attention."""
+        """Check if xformers auxiliary optimized kernels are available."""
         try:
             import xformers  # noqa: F401
 
-            print("xformers detected - using optimized attention")
+            print("xformers detected - auxiliary optimized kernels available")
         except Exception:
             print(
                 "Warning: xformers not available. "
@@ -139,6 +140,8 @@ class VideoDepthEstimatorDA3:
             with suppress_output():
                 from depth_anything_3.api import DepthAnything3
 
+            flash_attention_modules = install_da3_flash_attention()
+
             # Resolve model ID
             hf_model_id = self._resolve_model_id()
 
@@ -151,6 +154,14 @@ class VideoDepthEstimatorDA3:
 
             model_variant = "Metric-" if self.metric else ""
             print(f"Loaded {model_variant}Depth-Anything-V3 ({self.model_name}) on {self.device}")
+
+            if flash_attention_modules:
+                print(
+                    "FlashAttention 2 enabled for DA3 "
+                    f"({flash_attention_modules} attention modules, SDPA fallback active)"
+                )
+            else:
+                print("FlashAttention 2 unavailable - using PyTorch SDPA")
 
             # Check for optimizations
             self._check_xformers()

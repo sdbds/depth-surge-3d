@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from ...core.constants import (
-    DEPTH_MAP_SCALE,
     DEPTH_MAP_SCALE_FLOAT,
+    DEPTH_MAP_STORAGE_SCALE,
     DEFAULT_FALLBACK_FPS,
     RESOLUTION_4K,
     RESOLUTION_1440P,
@@ -33,7 +33,9 @@ from ...core.constants import (
 )
 from ...utils import (
     get_cached_depth_maps,
+    get_cached_depth_map_files,
     save_depth_maps_to_cache,
+    save_depth_map_files_to_cache,
     get_cache_size,
 )
 from ...utils import calculate_optimal_chunk_size, get_vram_info
@@ -130,6 +132,159 @@ class DepthMapProcessor:
 
         return depth_maps
 
+    def generate_depth_map_files(
+        self,
+        frame_files: list[Path],
+        settings: dict[str, Any],
+        directories: dict[str, Path],
+        progress_tracker,
+    ) -> list[Path] | None:
+        """Generate depth maps to disk while retaining only one inference chunk in memory."""
+        if not frame_files:
+            return None
+
+        depth_dir = directories.get("depth_maps")
+        if depth_dir is None:
+            print("Error: Depth map working directory is unavailable")
+            return None
+        depth_dir.mkdir(parents=True, exist_ok=True)
+
+        expected_files = [depth_dir / f"{frame_file.stem}.png" for frame_file in frame_files]
+        if all(path.is_file() for path in expected_files):
+            self._report_file_cache_hit(
+                expected_files,
+                progress_tracker,
+                "depth maps already exist",
+            )
+            return expected_files
+
+        video_path = settings.get("video_path")
+        if video_path:
+            cached_files = get_cached_depth_map_files(str(video_path), settings, len(frame_files))
+            if cached_files is not None:
+                self._report_file_cache_hit(
+                    cached_files,
+                    progress_tracker,
+                    "global depth cache",
+                )
+                return cached_files
+
+        print("Step 2/7: Generating depth maps (temporal consistency enabled)...")
+        print("  Using disk-backed chunked processing...")
+        if progress_tracker:
+            progress_tracker.update_progress(
+                "Generating depth maps",
+                phase="depth_estimation",
+                frame_num=0,
+                step_name="Depth Map Generation",
+                step_progress=0,
+                step_total=len(frame_files),
+            )
+
+        depth_files = self._generate_depth_map_files_chunked(
+            frame_files,
+            settings,
+            directories,
+            progress_tracker,
+        )
+        if depth_files is None:
+            return None
+
+        if video_path:
+            if save_depth_map_files_to_cache(str(video_path), settings, depth_files):
+                print("  Depth maps saved to global cache for future runs")
+            else:
+                print("  Warning: Could not save depth maps to global cache")
+        return depth_files
+
+    @staticmethod
+    def _report_file_cache_hit(depth_files: list[Path], progress_tracker, source: str) -> None:
+        print(f"Step 2/7: Reusing {len(depth_files)} depth maps from {source}")
+        if progress_tracker:
+            progress_tracker.update_progress(
+                f"Reused {len(depth_files)} depth maps",
+                phase="depth_estimation",
+                frame_num=len(depth_files),
+                step_name="Depth Map Generation",
+                step_progress=len(depth_files),
+                step_total=len(depth_files),
+            )
+
+    def _generate_depth_map_files_chunked(
+        self,
+        frame_files: list[Path],
+        settings: dict[str, Any],
+        directories: dict[str, Path],
+        progress_tracker,
+    ) -> list[Path] | None:
+        """Run inference per chunk and persist each result before loading the next chunk."""
+        sample_frame = cv2.imread(str(frame_files[0]))
+        if sample_frame is None:
+            return None
+
+        frame_h, frame_w = sample_frame.shape[:2]
+        chunk_size, input_size = self._determine_chunk_params(
+            frame_w,
+            frame_h,
+            settings.get("depth_resolution", "auto"),
+        )
+        print(f"  Processing in chunks of {chunk_size} frames (input_size={input_size})...")
+        self._clear_gpu_memory()
+
+        depth_dir = directories["depth_maps"]
+        depth_files = [depth_dir / f"{frame_file.stem}.png" for frame_file in frame_files]
+        num_frames = len(frame_files)
+        total_chunks = (num_frames + chunk_size - 1) // chunk_size
+
+        for chunk_start in range(0, num_frames, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, num_frames)
+            chunk_files = frame_files[chunk_start:chunk_end]
+            chunk_outputs = depth_files[chunk_start:chunk_end]
+            chunk_num = chunk_start // chunk_size + 1
+
+            if not all(path.is_file() for path in chunk_outputs):
+                chunk_frames = self._load_chunk_frames(chunk_files, settings)
+                if chunk_frames is None or len(chunk_frames) != len(chunk_files):
+                    print("Error: Not all frames could be loaded in chunk")
+                    return None
+
+                try:
+                    chunk_depth_maps = self._process_chunk_depth(
+                        chunk_frames,
+                        chunk_files,
+                        settings,
+                        directories,
+                        input_size,
+                        progress_tracker,
+                    )
+                    if chunk_depth_maps is None or len(chunk_depth_maps) != len(chunk_files):
+                        print("Error: Depth estimator returned an unexpected frame count")
+                        return None
+                    if not all(path.is_file() for path in chunk_outputs):
+                        print("Error: Could not persist all depth maps in chunk")
+                        return None
+                except Exception as e:
+                    print(f"Error processing chunk {chunk_start}-{chunk_end}: {e}")
+                    return None
+                finally:
+                    if "chunk_frames" in locals():
+                        del chunk_frames
+                    if "chunk_depth_maps" in locals():
+                        del chunk_depth_maps
+                    self._clear_gpu_memory()
+
+            if progress_tracker:
+                progress_tracker.update_progress(
+                    f"Chunk {chunk_num}/{total_chunks}: Depth maps {chunk_end}/{num_frames}",
+                    phase="depth_estimation",
+                    frame_num=chunk_end,
+                    step_name="Depth Map Generation",
+                    step_progress=chunk_end,
+                    step_total=num_frames,
+                )
+
+        return depth_files
+
     def _determine_chunk_params(
         self, frame_w: int, frame_h: int, depth_resolution: str = "auto"
     ) -> tuple[int, int]:
@@ -188,6 +343,10 @@ class DepthMapProcessor:
             # Fallback to fixed sizing (CPU or no CUDA)
             chunk_size = self._get_chunk_size_for_resolution(input_size)
             print(f"  CPU mode: {chunk_size} frames/chunk")
+
+        max_batch_size = getattr(self.depth_estimator, "max_batch_size", None)
+        if isinstance(max_batch_size, int) and max_batch_size > 0:
+            chunk_size = min(chunk_size, max_batch_size)
 
         return chunk_size, input_size
 
@@ -321,8 +480,8 @@ class DepthMapProcessor:
             chunk_frames_array, target_fps=target_fps, input_size=input_size, fp32=False
         )
 
-        # Save depth maps immediately to free memory
-        if settings["keep_intermediates"] and "depth_maps" in directories:
+        # Depth files are required working state. Retention is handled after encoding.
+        if "depth_maps" in directories:
             self._save_depth_maps(
                 chunk_depth_maps, chunk_files, directories["depth_maps"], progress_tracker
             )
@@ -479,10 +638,15 @@ class DepthMapProcessor:
             - Writes depth map images to disk
         """
         for i, (depth_map, frame_file) in enumerate(zip(depth_maps, frame_files)):
-            depth_vis = (depth_map * DEPTH_MAP_SCALE).astype("uint8")
+            depth_vis = np.clip(
+                depth_map * DEPTH_MAP_STORAGE_SCALE,
+                0,
+                DEPTH_MAP_STORAGE_SCALE,
+            ).astype(np.uint16)
             frame_name = frame_file.stem
             depth_path = depth_dir / f"{frame_name}.png"
-            cv2.imwrite(str(depth_path), depth_vis)
+            if not cv2.imwrite(str(depth_path), depth_vis):
+                raise OSError(f"Could not write depth map: {depth_path}")
 
             # Send preview frame
             if progress_tracker and hasattr(progress_tracker, "send_preview_frame"):
@@ -521,9 +685,14 @@ class DepthMapProcessor:
         # Load existing depth maps
         depth_maps = []
         for depth_file in existing_depth_maps[: len(frame_files)]:
-            depth_img = cv2.imread(str(depth_file), cv2.IMREAD_GRAYSCALE)
+            depth_img = cv2.imread(str(depth_file), cv2.IMREAD_UNCHANGED)
             if depth_img is not None:
-                depth_maps.append(depth_img.astype(float) / DEPTH_MAP_SCALE_FLOAT)
+                depth_scale = (
+                    DEPTH_MAP_STORAGE_SCALE
+                    if depth_img.dtype == np.uint16
+                    else DEPTH_MAP_SCALE_FLOAT
+                )
+                depth_maps.append(depth_img.astype(float) / depth_scale)
 
         if len(depth_maps) == len(frame_files):
             if progress_tracker:

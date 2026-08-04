@@ -10,10 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-import cv2
-import numpy as np
-
 from ...io.operations import (
+    cleanup_intermediate_files,
     create_output_directories,
     save_processing_settings,
     update_processing_status,
@@ -170,32 +168,21 @@ class ProcessingOrchestrator:
         fps = video_properties.get("fps", 30.0)
 
         # Step 2: Generate depth maps (delegated to depth_processor)
-        depth_maps = self.depth_processor.generate_depth_maps(
+        depth_files = self.depth_processor.generate_depth_map_files(
             frame_files, settings, directories, progress_tracker
         )
-        if depth_maps is None:
+        if depth_files is None:
             return False
-        print(step_complete(f"Step 2: Generated {len(depth_maps)} depth maps"))
+        print(step_complete(f"Step 2: Prepared {len(depth_files)} depth maps"))
         self._print_saved_to(directories.get("depth_maps"), "Depth maps")
         print()  # Blank line after step
-
-        # Load frames for stereo generation
-        frames = []
-        for frame_file in frame_files:
-            img = cv2.imread(str(frame_file))
-            if img is not None:
-                frames.append(img)
-        frames = np.array(frames) if frames else None  # type: ignore[assignment]
-        if frames is None:
-            return False
 
         # Execute steps 3-8
         return self._execute_remaining_steps(
             directories,
             settings,
-            frames,  # type: ignore[arg-type]
-            depth_maps,
             frame_files,
+            depth_files,
             fps,
             video_path,
             output_path,
@@ -206,9 +193,8 @@ class ProcessingOrchestrator:
         self,
         directories: dict[str, Path],
         settings: dict[str, Any],
-        frames: np.ndarray,
-        depth_maps: np.ndarray,
         frame_files: list[Path],
+        depth_files: list[Path],
         fps: float,
         video_path: str,
         output_path: Path,
@@ -221,9 +207,8 @@ class ProcessingOrchestrator:
         Args:
             directories: Dictionary of processing directories
             settings: Processing settings
-            frames: Frame images as numpy array
-            depth_maps: Depth map images as numpy array
             frame_files: List of extracted frame files
+            depth_files: List of disk-backed depth map files
             fps: Video frames per second
             video_path: Input video path
             output_path: Output directory path
@@ -240,8 +225,12 @@ class ProcessingOrchestrator:
         num_frames = len(frame_files)
 
         # Step 3: Create stereo pairs (delegated to stereo_generator)
-        if not self.stereo_generator.create_stereo_pairs(
-            frames, depth_maps, frame_files, directories, settings, progress_tracker
+        if not self.stereo_generator.create_stereo_pairs_from_files(
+            frame_files,
+            depth_files,
+            directories,
+            settings,
+            progress_tracker,
         ):
             return self._handle_step_error("Stereo pair creation failed")
         print(step_complete(f"Step 3: Created {num_frames} stereo pairs"))
@@ -438,6 +427,10 @@ class ProcessingOrchestrator:
                         "processing_time_seconds": elapsed_time,
                     },
                 )
+
+            if not settings.get("keep_intermediates", True):
+                removed_count = cleanup_intermediate_files(output_path)
+                print(f"Removed {removed_count} temporary processing files")
         elif self._settings_file:
             update_processing_status(
                 self._settings_file, "failed", {"error": "Video creation failed"}

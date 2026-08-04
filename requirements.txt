@@ -11,12 +11,18 @@ torchvision>=0.15.0
 
 # Application dependencies
 tqdm>=4.65.0
-transformers>=4.30.0
+transformers>=4.56.0,<5
 flask>=3.0.0
 flask-socketio>=5.3.0
 eventlet>=0.35.0
 einops>=0.7.0
 easydict>=1.9
+
+# Experimental See-Through Marigold depth backend
+diffusers>=0.35.1
+accelerate>=0.34.0
+safetensors>=0.4.0
+PyYAML>=6.0
 
 # Depth Anything V3 dependencies
 # IMPORTANT: Install with --no-build-isolation to avoid numpy recompilation issues

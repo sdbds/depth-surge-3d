@@ -119,7 +119,7 @@ class TestNoOrphanedImports:
             if ".venv" in str(py_file) or "__pycache__" in str(py_file):
                 continue
 
-            content = py_file.read_text()
+            content = py_file.read_text(encoding="utf-8")
             # Check for old import pattern (but not the new one)
             if "utils.console" in content and "utils.system.console" not in content:
                 bad_imports.append(str(py_file.relative_to(project_root)))
@@ -135,7 +135,7 @@ class TestNoOrphanedImports:
             if ".venv" in str(py_file) or "__pycache__" in str(py_file):
                 continue
 
-            content = py_file.read_text()
+            content = py_file.read_text(encoding="utf-8")
             # Check for old import pattern (but not the new one)
             if "utils.resolution" in content and "utils.domain.resolution" not in content:
                 bad_imports.append(str(py_file.relative_to(project_root)))
@@ -151,7 +151,7 @@ class TestNoOrphanedImports:
             if ".venv" in str(py_file) or "__pycache__" in str(py_file):
                 continue
 
-            content = py_file.read_text()
+            content = py_file.read_text(encoding="utf-8")
             # Check for old import pattern (but not the new one)
             if "utils.depth_cache" in content and "utils.domain.depth_cache" not in content:
                 bad_imports.append(str(py_file.relative_to(project_root)))
@@ -171,7 +171,7 @@ class TestNoOrphanedImports:
             if "test_imports.py" in str(py_file):
                 continue  # Skip this test file itself
 
-            content = py_file.read_text()
+            content = py_file.read_text(encoding="utf-8")
             # Check for old import pattern
             if "processing.video_processor import VideoProcessor" in content:
                 bad_imports.append(str(py_file.relative_to(project_root)))

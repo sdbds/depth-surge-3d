@@ -121,6 +121,13 @@ RESOLUTION_CATEGORIES = {
 
 # VR Headset Presets (optimized settings for popular headsets)
 VR_HEADSET_PRESETS: dict[str, dict[str, int | float | str]] = {
+    "pimax-crystal-light": {
+        "name": "Pimax Crystal Light",
+        "per_eye_width": 2880,
+        "per_eye_height": 2880,
+        "fisheye_fov": 110,
+        "description": "Optimized for Pimax Crystal Light (2880x2880 per eye, 110 degree FOV)",
+    },
     "quest-3": {
         "name": "Meta Quest 3",
         "per_eye_width": 2064,
@@ -237,6 +244,7 @@ SIGNAL_SHUTDOWN_TIMEOUT = 5  # seconds - timeout for graceful shutdown
 DEFAULT_INTERPOLATION = "cv2.INTER_CUBIC"
 DEPTH_MAP_SCALE = 255  # Scale factor for converting float depth [0-1] to uint8 [0-255]
 DEPTH_MAP_SCALE_FLOAT = 255.0  # Float version for division operations
+DEPTH_MAP_STORAGE_SCALE = 65535.0  # Preserve depth precision in disk-backed uint16 PNGs
 MIN_DEPTH_VALUE = 0.0
 MAX_DEPTH_VALUE = 1.0
 

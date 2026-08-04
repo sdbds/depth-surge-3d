@@ -127,6 +127,24 @@ class TestAssembleVRFrames:
         vr_files = list(temp_frames["vr_frames"].glob("*.png"))
         assert len(vr_files) == 3
 
+    def test_assemble_vr_frames_without_progress_tracker(self, temp_frames):
+        """CLI assembly succeeds without a web progress tracker."""
+        assembler = VRFrameAssembler()
+        settings = {
+            "vr_format": "side_by_side",
+            "keep_intermediates": True,
+            "per_eye_width": 200,
+            "per_eye_height": 100,
+        }
+
+        result = assembler.assemble_vr_frames(
+            temp_frames,
+            settings,
+            progress_tracker=None,
+        )
+
+        assert result is True
+
     def test_assemble_vr_frames_mismatched_count(self, temp_frames, mock_progress_tracker):
         """Test VR assembly with mismatched frame counts."""
         assembler = VRFrameAssembler()

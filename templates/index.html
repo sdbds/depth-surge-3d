@@ -943,18 +943,20 @@
                             <h6 class="step-title">Depth Analysis</h6>
                         </div>
                         <div class="mb-3">
-                            <label class="form-label">Depth Model Version <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="V3: Lower VRAM (~50% less), faster, newer architecture (default). V2: Better temporal consistency (smoother), higher VRAM."></i></label>
+                            <label class="form-label">Depth Model Version <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="V3: General-purpose default. V2: Better temporal consistency. See-Through: Experimental relative depth for 2D animation."></i></label>
                             <select class="form-select" id="depthModelVersion">
                                 <option value="v3" selected>Depth-Anything V3 (Default, Lower VRAM, Faster)</option>
                                 <option value="v2">Video-Depth-Anything V2 (Temporal Consistency)</option>
+                                <option value="see_through">See-Through Marigold (Experimental, 2D Animation)</option>
                             </select>
                             <small class="form-text text-muted">
                                 <i class="fas fa-film"></i> V2: 32-frame temporal windows for smooth depth<br>
                                 <i class="fas fa-bolt"></i> V3: Frame-by-frame, ~50% less VRAM, optional xformers optimization<br>
+                                <i class="fas fa-palette"></i> See-Through: Relative depth specialized for anime artwork<br>
                                 <i class="fas fa-link"></i> <a href="https://github.com/ByteDance-Seed/Depth-Anything-3" target="_blank" style="color: var(--accent-lime);">V3 Info</a> | <a href="https://github.com/DepthAnything/Depth-Anything-V2" target="_blank" style="color: var(--accent-lime);">V2 Info</a>
                             </small>
                         </div>
-                        <div class="mb-3">
+                        <div class="mb-3" id="modelSizeSettings">
                             <label class="form-label">Depth Model Size <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Smaller models use less VRAM but may be slightly less accurate. Use Small if you have OOM errors."></i></label>
                             <select class="form-select" id="modelSize">
                                 <option value="vitb" selected>Base (Balanced, ~8GB VRAM) - Recommended</option>
@@ -972,6 +974,7 @@
                                 <option value="auto" selected>Auto (Match Source Resolution)</option>
                                 <option value="518">SD - 518px (Fast, Low VRAM)</option>
                                 <option value="720">HD - 720px (Balanced)</option>
+                                <option value="768">See-Through Native - 768px</option>
                                 <option value="1080">Full HD - 1080px (High Quality)</option>
                                 <option value="1440">2K - 1440px (Only if upscaling frames)</option>
                                 <option value="2160">4K - 2160px (Only for 4K source)</option>
@@ -981,7 +984,7 @@
                                 <i class="fas fa-exclamation-triangle"></i> Don't exceed source resolution (wastes VRAM)
                             </small>
                         </div>
-                        <div class="mb-3">
+                        <div class="mb-3" id="depthModelTypeSettings">
                             <label class="form-label">Depth Model Type <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Metric models provide actual depth in meters (better for VR). Relative models only provide depth ordering."></i></label>
                             <select class="form-select" id="depthModelType">
                                 <option value="metric" selected>Metric Depth (Accurate meters, best for VR)</option>
@@ -1184,6 +1187,7 @@
                             <label class="form-label">VR Headset Preset <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Select your VR headset for optimized resolution and FOV settings. Choosing a preset will automatically configure resolution and field of view."></i></label>
                             <select class="form-select" id="headsetPreset">
                                 <option value="none" selected>None (Manual Settings)</option>
+                                <option value="pimax-crystal-light">Pimax Crystal Light (2880×2880 per eye, 110° FOV)</option>
                                 <option value="quest-3">Meta Quest 3 (2064×2208 per eye, 110° FOV)</option>
                                 <option value="quest-2">Meta Quest 2 (1832×1920 per eye, 100° FOV)</option>
                                 <option value="psvr2">PlayStation VR2 (2000×2040 per eye, 110° FOV)</option>
@@ -1879,6 +1883,7 @@
 
         // VR Headset Preset selection handler
         const headsetPresets = {
+            'pimax-crystal-light': { width: 2880, height: 2880, fov: 110 },
             'quest-3': { width: 2064, height: 2208, fov: 110 },
             'quest-2': { width: 1832, height: 1920, fov: 100 },
             'psvr2': { width: 2000, height: 2040, fov: 110 },
@@ -1894,16 +1899,19 @@
                 // Reset to auto/default settings
                 document.getElementById('vrResolution').value = 'auto';
                 document.getElementById('fisheyeFov').value = '180';
-                document.getElementById('customResolution').value = '';
+                document.getElementById('customWidth').value = '';
+                document.getElementById('customHeight').value = '';
+                document.getElementById('vrResolution').dispatchEvent(new Event('change'));
                 return;
             }
 
             const settings = headsetPresets[preset];
             if (settings) {
                 // Set custom resolution
-                const customRes = `${settings.width}x${settings.height}`;
-                document.getElementById('customResolution').value = customRes;
                 document.getElementById('vrResolution').value = 'custom';
+                document.getElementById('customWidth').value = settings.width;
+                document.getElementById('customHeight').value = settings.height;
+                document.getElementById('vrResolution').dispatchEvent(new Event('change'));
 
                 // Set FOV
                 document.getElementById('fisheyeFov').value = settings.fov;
@@ -3159,9 +3167,10 @@
                 <div class="toast align-items-center text-white bg-info border-0" role="alert" style="position: fixed; top: 20px; right: 20px; z-index: 9999;">
                     <div class="d-flex">
                         <div class="toast-body">
-                            <i class="fas fa-info-circle"></i> ${message}
+                            <i class="fas fa-info-circle"></i>
+                            <span class="resumable-job-message"></span>
                             <div class="mt-2">
-                                <button class="btn btn-sm btn-light me-2" onclick="resumeJob('${job.path}')">Resume</button>
+                                <button type="button" class="btn btn-sm btn-light me-2 resume-job-button">Resume</button>
                                 <button class="btn btn-sm btn-outline-light" data-bs-dismiss="toast">Dismiss</button>
                             </div>
                         </div>
@@ -3171,6 +3180,10 @@
 
             const toastContainer = document.createElement('div');
             toastContainer.innerHTML = toastHtml;
+            const messageElement = toastContainer.querySelector('.resumable-job-message');
+            messageElement.textContent = message;
+            const resumeButton = toastContainer.querySelector('.resume-job-button');
+            resumeButton.addEventListener('click', () => resumeJob(job.path));
             document.body.appendChild(toastContainer);
 
             const toastElement = toastContainer.querySelector('.toast');
@@ -3197,10 +3210,21 @@
             setTimeout(() => resumeField.classList.remove('bg-warning'), 2000);
         }
 
-        // Toggle temporal window settings visibility based on depth model version
-        document.getElementById('depthModelVersion').addEventListener('change', function() {
-            const isV2 = this.value === 'v2';
+        function updateDepthModelControls() {
+            const modelVersion = document.getElementById('depthModelVersion').value;
+            const isV2 = modelVersion === 'v2';
+            const isSeeThrough = modelVersion === 'see_through';
             document.getElementById('temporalWindowSettings').style.display = isV2 ? 'block' : 'none';
+            document.getElementById('modelSizeSettings').style.display = isSeeThrough ? 'none' : 'block';
+            document.getElementById('depthModelTypeSettings').style.display = isSeeThrough ? 'none' : 'block';
+            if (isSeeThrough) {
+                document.getElementById('depthResolution').value = '768';
+            }
+        }
+
+        // Toggle model-specific settings based on depth backend.
+        document.getElementById('depthModelVersion').addEventListener('change', function() {
+            updateDepthModelControls();
         });
 
         // Update temporal window size value display
@@ -3239,9 +3263,7 @@
             // Update system info every 5 seconds
             setInterval(updateSystemInfo, 5000);
 
-            // Initialize temporal window settings visibility
-            const isV2 = document.getElementById('depthModelVersion').value === 'v2';
-            document.getElementById('temporalWindowSettings').style.display = isV2 ? 'block' : 'none';
+            updateDepthModelControls();
         });
     </script>
 </body>

@@ -222,7 +222,7 @@ class TestCreateOutputDirectories:
         assert mock_mkdir.called
 
     def test_create_output_directories_without_intermediates(self):
-        """Test creating output directories without intermediates."""
+        """Temporary stage directories exist until successful cleanup."""
         base_path = Path("/tmp/output")
 
         with patch("pathlib.Path.mkdir") as mock_mkdir:
@@ -232,16 +232,14 @@ class TestCreateOutputDirectories:
         assert "base" in result
         assert result["base"] == base_path
 
-        # Should not create early-stage intermediate directories
-        assert "frames" not in result
-        assert "depth_maps" not in result
-        assert "left_frames" not in result
-        assert "right_frames" not in result
-
-        # Should still create necessary output directories (vr_frames, cropped frames)
-        # These are needed for final output even without intermediates
+        # Retention controls post-success cleanup, not pipeline storage.
+        assert "frames" in result
+        assert "depth_maps" in result
+        assert "left_frames" in result
+        assert "right_frames" in result
         assert "vr_frames" in result
-        assert "left_cropped" in result or "right_cropped" in result
+        assert "left_cropped" in result
+        assert "right_cropped" in result
 
         # mkdir should be called
         assert mock_mkdir.called
@@ -414,7 +412,7 @@ class TestGetAvailableSpace:
         mock_stat.f_bavail = 1000
         mock_stat.f_frsize = 4096
 
-        with patch("os.statvfs", return_value=mock_stat):
+        with patch("os.statvfs", return_value=mock_stat, create=True):
             result = get_available_space(Path("/tmp"))
 
         assert result == 1000 * 4096
@@ -423,7 +421,7 @@ class TestGetAvailableSpace:
         """Test getting available space with shutil fallback."""
         from src.depth_surge_3d.io.operations import get_available_space
 
-        with patch("os.statvfs", side_effect=AttributeError()):
+        with patch("os.statvfs", side_effect=AttributeError(), create=True):
             with patch("shutil.disk_usage", return_value=(0, 0, 5000000)):
                 result = get_available_space(Path("/tmp"))
 
@@ -433,7 +431,7 @@ class TestGetAvailableSpace:
         """Test getting available space when all methods fail."""
         from src.depth_surge_3d.io.operations import get_available_space
 
-        with patch("os.statvfs", side_effect=OSError()):
+        with patch("os.statvfs", side_effect=OSError(), create=True):
             with patch("shutil.disk_usage", side_effect=OSError()):
                 result = get_available_space(Path("/tmp"))
 

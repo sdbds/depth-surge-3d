@@ -137,6 +137,44 @@ class TestGenerateDepthMaps:
         assert len(result) == 3
         mock_chunked.assert_called_once()
 
+    def test_generate_depth_map_files_writes_each_chunk_without_stacking(
+        self, mock_progress_tracker, temp_frames, tmp_path
+    ):
+        """Long videos retain only one inference chunk in memory."""
+        estimator = Mock()
+        estimator.estimate_depth_batch.side_effect = lambda frames, **kwargs: np.full(
+            (len(frames), frames.shape[1], frames.shape[2]), 0.5, dtype=np.float32
+        )
+        processor = DepthMapProcessor(estimator)
+        depth_dir = tmp_path / "depth_maps"
+        depth_dir.mkdir()
+        settings = {
+            "depth_resolution": "1080",
+            "target_fps": 30,
+            "keep_intermediates": False,
+            "super_sample": "none",
+            "per_eye_width": 100,
+            "per_eye_height": 100,
+        }
+
+        with (
+            patch.object(processor, "_determine_chunk_params", return_value=(2, 1080)),
+            patch.object(processor, "_clear_gpu_memory"),
+        ):
+            result = processor.generate_depth_map_files(
+                temp_frames,
+                settings,
+                {"depth_maps": depth_dir},
+                mock_progress_tracker,
+            )
+
+        assert result == [depth_dir / f"frame_{i:04d}.png" for i in range(3)]
+        assert all(path.exists() for path in result)
+        assert all(
+            cv2.imread(str(path), cv2.IMREAD_UNCHANGED).dtype == np.uint16 for path in result
+        )
+        assert estimator.estimate_depth_batch.call_count == 2
+
 
 class TestDetermineChunkParams:
     """Test chunk parameter determination."""

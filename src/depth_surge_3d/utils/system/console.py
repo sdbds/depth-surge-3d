@@ -111,8 +111,7 @@ def completion_banner(
     # Top border
     print(f"\n{lime}{'═' * 70}{reset}")
 
-    # Success message with checkmark
-    print(f"{lime}  ✓ {bold}PROCESSING COMPLETE{reset}")
+    print(f"{lime}  [OK] {bold}PROCESSING COMPLETE{reset}")
 
     # Separator
     print(f"{lime}  {'─' * 66}{reset}")

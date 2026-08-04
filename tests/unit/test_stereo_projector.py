@@ -47,6 +47,23 @@ class TestStereoProjector:
         assert projector.depth_estimator == mock_estimator
         mock_create_v3.assert_called_once_with("large", "cpu", False)
 
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_see_through_depth_estimator")
+    def test_init_with_see_through(self, mock_create_see_through):
+        """Test initialization with the anime-focused See-Through model."""
+        mock_estimator = MagicMock()
+        mock_create_see_through.return_value = mock_estimator
+
+        projector = StereoProjector(
+            model_path="24yearsold/custom-marigold",
+            device="cuda",
+            metric=True,
+            depth_model_version="see_through",
+        )
+
+        assert projector.depth_model_version == "see_through"
+        assert projector.depth_estimator == mock_estimator
+        mock_create_see_through.assert_called_once_with("24yearsold/custom-marigold", "cuda", True)
+
     @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
     def test_init_with_none_model_path_v2(self, mock_create_v2):
         """Test initialization with None model path for V2."""
@@ -1058,6 +1075,9 @@ class TestProcessVideoSuccessPath:
         """Test successful video processing path."""
         mock_estimator = MagicMock()
         mock_estimator.load_model.return_value = True
+        mock_estimator.get_model_size.return_value = "vitl"
+        mock_estimator.device = "cpu"
+        mock_estimator.metric = False
         mock_create.return_value = mock_estimator
 
         mock_validate.return_value = True
@@ -1072,6 +1092,12 @@ class TestProcessVideoSuccessPath:
 
         assert result is True
         mock_processor.process.assert_called_once()
+        passed_settings = mock_processor.process.call_args.kwargs["settings"]
+        assert passed_settings["depth_model_version"] == "v2"
+        assert passed_settings["model_size"] == "vitl"
+        assert passed_settings["use_metric_depth"] is False
+        assert passed_settings["device"] == "cpu"
+        assert passed_settings["model_path"] is None
 
 
 class TestValidateInputsDirectoryError:

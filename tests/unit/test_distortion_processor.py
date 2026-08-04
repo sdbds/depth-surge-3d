@@ -103,10 +103,17 @@ class TestApplyDistortion:
     def test_apply_distortion_without_intermediates(
         self, temp_frames, mock_progress_tracker, tmp_path
     ):
-        """Test distortion without saving intermediates."""
+        """Distorted working frames are written even when final retention is disabled."""
         processor = DistortionProcessor()
 
-        directories = {}
+        left_distorted = tmp_path / "left_distorted"
+        right_distorted = tmp_path / "right_distorted"
+        left_distorted.mkdir()
+        right_distorted.mkdir()
+        directories = {
+            "left_distorted": left_distorted,
+            "right_distorted": right_distorted,
+        }
 
         settings = {
             "keep_intermediates": False,
@@ -124,6 +131,31 @@ class TestApplyDistortion:
                 directories,
                 settings,
                 mock_progress_tracker,
+            )
+
+        assert result is True
+        assert len(list(left_distorted.glob("*.png"))) == 3
+        assert len(list(right_distorted.glob("*.png"))) == 3
+
+    def test_apply_distortion_without_progress_tracker(self, temp_frames):
+        """CLI distortion succeeds without a web progress tracker."""
+        processor = DistortionProcessor()
+        settings = {
+            "keep_intermediates": False,
+            "fisheye_fov": 90,
+            "fisheye_projection": "equidistant",
+        }
+
+        with patch(
+            "src.depth_surge_3d.processing.frames.distortion_processor.apply_fisheye_distortion",
+            side_effect=lambda img, fov, proj: img,
+        ):
+            result = processor.apply_distortion(
+                temp_frames["left_files"],
+                temp_frames["right_files"],
+                {},
+                settings,
+                progress_tracker=None,
             )
 
         assert result is True
@@ -237,6 +269,29 @@ class TestCropFrames:
         # Check output files were created
         assert len(list(temp_frames["left_cropped"].glob("*.png"))) == 3
         assert len(list(temp_frames["right_cropped"].glob("*.png"))) == 3
+
+    def test_crop_frames_without_progress_tracker(self, temp_frames):
+        """CLI cropping succeeds without a web progress tracker."""
+        processor = DistortionProcessor()
+        settings = {
+            "apply_distortion": False,
+            "per_eye_width": 1920,
+            "per_eye_height": 1080,
+            "crop_factor": 1.0,
+        }
+
+        with patch(
+            "src.depth_surge_3d.processing.frames.distortion_processor.apply_center_crop",
+            side_effect=lambda img, factor: img,
+        ):
+            result = processor.crop_frames(
+                temp_frames,
+                settings,
+                progress_tracker=None,
+                total_frames=3,
+            )
+
+        assert result is True
 
     def test_crop_frames_with_distortion(self, temp_frames, mock_progress_tracker, tmp_path):
         """Test cropping with fisheye distortion enabled."""

@@ -14,7 +14,11 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from ..inference import create_video_depth_estimator, create_video_depth_estimator_da3
+from ..inference import (
+    create_see_through_depth_estimator,
+    create_video_depth_estimator,
+    create_video_depth_estimator_da3,
+)
 from ..utils import (
     get_resolution_dimensions,
     calculate_vr_output_dimensions,
@@ -51,12 +55,17 @@ class StereoProjector:
             model_path: Path to video depth estimation model (DA2) or model name (DA3)
             device: Processing device ('auto', 'cuda', 'cpu')
             metric: Use metric depth model (true depth values)
-            depth_model_version: Depth model version ('v2' or 'v3', default: 'v2')
+            depth_model_version: Depth model version ('v2', 'v3', or 'see_through')
             temporal_window_overlap: Frame overlap for V2 temporal windows (default: 10)
         """
         self.depth_model_version = depth_model_version
+        self.model_path = model_path
+        self.device = device
+        self.metric = metric
 
-        if depth_model_version == "v3":
+        if depth_model_version == "see_through":
+            self.depth_estimator = create_see_through_depth_estimator(model_path, device, metric)
+        elif depth_model_version == "v3":
             # Use Depth Anything V3 (model_path is used as model_name)
             model_name = model_path if model_path else None
             self.depth_estimator = create_video_depth_estimator_da3(model_name, device, metric)
@@ -105,6 +114,7 @@ class StereoProjector:
         """
         # Apply defaults for None values
         settings = self._apply_default_settings(locals())
+        settings.update(self._get_depth_settings())
 
         try:
             # Validate inputs
@@ -282,6 +292,26 @@ class StereoProjector:
                 settings[param] = params[param]
 
         return settings
+
+    def _get_depth_settings(self) -> dict[str, Any]:
+        """Describe the effective estimator inputs used to isolate depth caches."""
+        model_path = self.model_path
+        if self.depth_model_version == "see_through":
+            model_path = getattr(self.depth_estimator, "repo_id", model_path)
+        elif self.depth_model_version == "v3":
+            model_path = getattr(self.depth_estimator, "model_name", model_path)
+
+        processing_resolution = getattr(self.depth_estimator, "processing_resolution", None)
+        return {
+            "depth_model_version": self.depth_model_version,
+            "model_path": model_path,
+            "model_size": self.depth_estimator.get_model_size(),
+            "depth_resolution": processing_resolution or "auto",
+            "use_metric_depth": bool(getattr(self.depth_estimator, "metric", self.metric)),
+            "device": str(getattr(self.depth_estimator, "device", self.device)),
+            "denoising_steps": getattr(self.depth_estimator, "denoising_steps", None),
+            "seed": getattr(self.depth_estimator, "seed", None),
+        }
 
     def _validate_inputs(self, video_path: str, output_dir: str, settings: dict[str, Any]) -> bool:
         """Validate input parameters."""
@@ -646,7 +676,7 @@ def create_stereo_projector(
         model_path: Path to model file (V2) or model name (V3)
         device: Processing device
         metric: Use metric depth model (true depth values)
-        depth_model_version: Depth model version ('v2' or 'v3')
+        depth_model_version: Depth model version ('v2', 'v3', or 'see_through')
 
     Returns:
         Configured StereoProjector instance

@@ -84,7 +84,7 @@ class VRFrameAssembler:
                 )
 
                 # Update progress more frequently (every frame for slow operations)
-                if i % 1 == 0 or i == len(left_files) - 1:
+                if progress_tracker and (i % 1 == 0 or i == len(left_files) - 1):
                     progress_tracker.update_progress(
                         f"Assembling VR frame {i + 1}/{len(left_files)}",
                         phase="vr_assembly",

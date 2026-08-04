@@ -131,10 +131,14 @@ class VideoDepthEstimator:
 
     def _auto_download_model(self) -> bool:
         """Auto-download the model if missing."""
+        model_path = Path(self.model_path)
+        if model_path.exists():
+            return True
+
         print("Attempting to download video model automatically...")
 
         # Create model directory
-        model_dir = Path(self.model_path).parent
+        model_dir = model_path.parent
         model_dir.mkdir(parents=True, exist_ok=True)
 
         # Determine download URL

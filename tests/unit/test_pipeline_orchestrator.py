@@ -164,7 +164,7 @@ class TestFinalizeProcessing:
         # Check completion banner was called
         mock_banner.assert_called_once()
         args = mock_banner.call_args[1]
-        assert args["output_file"] == "/output/video_3D_side_by_side.mp4"
+        assert args["output_file"] == str(Path("/output/video_3D_side_by_side.mp4"))
         assert args["processing_time"] == "8m 20s"  # 500 seconds = 8m 20s
         assert args["num_frames"] == 300
         assert args["vr_format"] == "side_by_side"
@@ -193,6 +193,101 @@ class TestFinalizeProcessing:
         mock_update_status.assert_called_once_with(
             Path("/output/settings.json"), "failed", {"error": "Video creation failed"}
         )
+
+    @patch(
+        "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.cleanup_intermediate_files"
+    )
+    @patch("src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.completion_banner")
+    @patch(
+        "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.update_processing_status"
+    )
+    def test_finalize_success_cleans_temporary_files_when_not_retained(
+        self, _update_status, _banner, cleanup
+    ):
+        """Intermediates are deleted only after final video creation succeeds."""
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator._start_time = 0.0
+        orchestrator._settings_file = Path("/output/settings.json")
+
+        with patch(
+            "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time",
+            return_value=1.0,
+        ):
+            orchestrator._finalize_processing(
+                True,
+                Path("/output"),
+                "/input/video.mp4",
+                {
+                    "vr_format": "side_by_side",
+                    "vr_resolution": "16x9-1080p",
+                    "keep_intermediates": False,
+                },
+                3,
+            )
+
+        cleanup.assert_called_once_with(Path("/output"))
+
+
+class TestExecutePipeline:
+    def test_pipeline_uses_disk_backed_depth_and_stereo_apis(self, tmp_path):
+        """The video path never builds whole-video frame or depth arrays."""
+        frame_files = [tmp_path / "frame_000001.png"]
+        depth_files = [tmp_path / "depth_000001.png"]
+        depth_processor = Mock()
+        depth_processor.generate_depth_map_files.return_value = depth_files
+        depth_processor.generate_depth_maps.side_effect = AssertionError("array depth API used")
+        stereo_generator = Mock()
+        stereo_generator.create_stereo_pairs_from_files.return_value = True
+        stereo_generator.create_stereo_pairs.side_effect = AssertionError("array stereo API used")
+        distortion_processor = Mock()
+        distortion_processor.crop_frames.return_value = True
+        vr_assembler = Mock()
+        vr_assembler.assemble_vr_frames.return_value = True
+        video_encoder = Mock()
+        video_encoder.extract_frames.return_value = frame_files
+        video_encoder.create_video.return_value = True
+        directories = {
+            "base": tmp_path,
+            "frames": tmp_path / "frames",
+            "depth_maps": tmp_path / "depth",
+            "left_frames": tmp_path / "left",
+            "right_frames": tmp_path / "right",
+            "left_cropped": tmp_path / "left_cropped",
+            "right_cropped": tmp_path / "right_cropped",
+            "vr_frames": tmp_path / "vr",
+        }
+        settings = {
+            "apply_distortion": False,
+            "upscale_model": "none",
+            "per_eye_width": 8,
+            "per_eye_height": 8,
+            "vr_format": "side_by_side",
+            "vr_output_width": 16,
+            "vr_output_height": 8,
+            "vr_resolution": "custom",
+            "keep_intermediates": True,
+        }
+        orchestrator = ProcessingOrchestrator(
+            depth_processor,
+            stereo_generator,
+            distortion_processor,
+            Mock(),
+            vr_assembler,
+            video_encoder,
+        )
+
+        with patch.object(orchestrator, "_finalize_processing"):
+            result = orchestrator._execute_pipeline(
+                "source.mp4",
+                tmp_path,
+                directories,
+                {"fps": 30.0, "frame_count": 1},
+                settings,
+            )
+
+        assert result is True
+        depth_processor.generate_depth_map_files.assert_called_once()
+        stereo_generator.create_stereo_pairs_from_files.assert_called_once()
 
 
 class TestHandleStepError:
@@ -233,7 +328,7 @@ class TestPrintMethods:
         orchestrator._print_saved_to(Path("/output/dir"), "Test prefix")
 
         captured = capsys.readouterr()
-        assert "Test prefix: /output/dir" in captured.out
+        assert f"Test prefix: {Path('/output/dir')}" in captured.out
 
     def test_print_saved_to_with_none(self, capsys):
         """Test _print_saved_to with None directory."""

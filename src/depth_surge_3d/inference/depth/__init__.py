@@ -8,9 +8,15 @@ from .video_depth_estimator import (
     create_video_depth_estimator,
 )
 from .video_depth_estimator_da3 import create_video_depth_estimator_da3
+from .video_depth_estimator_see_through import (
+    SeeThroughDepthEstimator,
+    create_see_through_depth_estimator,
+)
 
 __all__ = [
     "VideoDepthEstimator",
     "create_video_depth_estimator",
     "create_video_depth_estimator_da3",
+    "SeeThroughDepthEstimator",
+    "create_see_through_depth_estimator",
 ]

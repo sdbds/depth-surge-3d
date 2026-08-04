@@ -217,7 +217,7 @@ class TestProcessUpscalingFrames:
     def test_process_frames_without_intermediates(
         self, mock_upscaler, mock_progress_tracker, temp_frames
     ):
-        """Test processing with keep_intermediates=False."""
+        """Upscaled working frames exist until successful pipeline cleanup."""
         processor = FrameUpscalerProcessor()
 
         settings = {"keep_intermediates": False}
@@ -234,11 +234,11 @@ class TestProcessUpscalingFrames:
         assert result is True
         assert mock_upscaler.upscale_image.call_count == 6
 
-        # Check output directories were NOT created
+        # Retention does not disable output needed by VR assembly.
         left_upscaled = temp_frames["base"] / "07_left_upscaled"
         right_upscaled = temp_frames["base"] / "07_right_upscaled"
-        assert not left_upscaled.exists()
-        assert not right_upscaled.exists()
+        assert len(list(left_upscaled.glob("*.png"))) == 3
+        assert len(list(right_upscaled.glob("*.png"))) == 3
 
     def test_process_frames_mismatched_count(
         self, mock_upscaler, mock_progress_tracker, temp_frames
@@ -379,7 +379,7 @@ class TestUpscaleFramePair:
     def test_upscale_pair_without_intermediates(
         self, mock_upscaler, mock_progress_tracker, temp_frames, tmp_path
     ):
-        """Test upscaling without saving (keep_intermediates=False)."""
+        """Temporary upscaled files are saved regardless of retention preference."""
         processor = FrameUpscalerProcessor()
 
         left_upscaled = tmp_path / "left_upscaled"
@@ -404,9 +404,8 @@ class TestUpscaleFramePair:
         # Check upscaler was called
         assert mock_upscaler.upscale_image.call_count == 2
 
-        # Check files were NOT saved
-        assert not (left_upscaled / "frame_0000.png").exists()
-        assert not (right_upscaled / "frame_0000.png").exists()
+        assert (left_upscaled / "frame_0000.png").exists()
+        assert (right_upscaled / "frame_0000.png").exists()
 
     def test_upscale_pair_with_preview_first_frame(
         self, mock_upscaler, mock_progress_tracker, temp_frames, tmp_path

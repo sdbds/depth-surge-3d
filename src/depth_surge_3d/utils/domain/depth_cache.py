@@ -9,11 +9,29 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
+
+
+DEPTH_CACHE_SETTING_KEYS = (
+    "depth_model_version",
+    "model_path",
+    "model_size",
+    "depth_resolution",
+    "use_metric_depth",
+    "device",
+    "start_time",
+    "end_time",
+    "super_sample",
+    "temporal_window_size",
+    "temporal_window_overlap",
+    "denoising_steps",
+    "seed",
+)
 
 
 def get_cache_dir() -> Path:
@@ -69,15 +87,7 @@ def compute_cache_key(video_path: str, depth_settings: dict[str, Any]) -> str:
             hasher.update(f.read(sample_size))
 
     # Hash depth-relevant settings (sorted for consistency)
-    depth_relevant_keys = [
-        "depth_model_version",
-        "model_size",
-        "depth_resolution",
-        "use_metric_depth",
-        "device",  # CPU vs GPU may produce slightly different results
-    ]
-
-    settings_for_hash = {k: depth_settings.get(k) for k in depth_relevant_keys}
+    settings_for_hash = {k: depth_settings.get(k) for k in DEPTH_CACHE_SETTING_KEYS}
     settings_json = json.dumps(settings_for_hash, sort_keys=True)
     hasher.update(settings_json.encode())
 
@@ -98,14 +108,37 @@ def get_cached_depth_maps(
     Returns:
         Cached depth maps array, or None if not found/invalid
     """
-    cache_key = compute_cache_key(video_path, depth_settings)
-    cache_dir = get_cache_dir()
-    cache_entry_dir = cache_dir / cache_key
+    try:
+        depth_files = get_cached_depth_map_files(video_path, depth_settings, num_frames)
+        if depth_files is None:
+            return None
 
-    if not cache_entry_dir.exists():
+        metadata_file = depth_files[0].parent / "metadata.json"
+        with open(metadata_file, "r") as f:
+            metadata = json.load(f)
+        depth_scale = float(metadata.get("depth_scale", 1000.0))
+
+        # Load depth maps
+        depth_maps = []
+        for depth_file in depth_files:
+            depth_img = cv2.imread(str(depth_file), cv2.IMREAD_UNCHANGED)
+            if depth_img is None:
+                return None
+            depth_float = depth_img.astype(np.float32) / depth_scale
+            depth_maps.append(depth_float)
+
+        return np.array(depth_maps)
+
+    except Exception:
+        # If anything fails, just return None (cache miss)
         return None
 
-    # Check metadata
+
+def get_cached_depth_map_files(
+    video_path: str, depth_settings: dict[str, Any], num_frames: int
+) -> list[Path] | None:
+    """Return validated cache paths without decoding the depth images."""
+    cache_entry_dir = get_cache_dir() / compute_cache_key(video_path, depth_settings)
     metadata_file = cache_entry_dir / "metadata.json"
     if not metadata_file.exists():
         return None
@@ -113,30 +146,14 @@ def get_cached_depth_maps(
     try:
         with open(metadata_file, "r") as f:
             metadata = json.load(f)
-
-        # Verify frame count matches
         if metadata.get("num_frames") != num_frames:
             return None
 
-        # Load depth maps
-        depth_maps = []
-        for i in range(num_frames):
-            depth_file = cache_entry_dir / f"depth_{i:06d}.png"
-            if not depth_file.exists():
-                return None
-
-            depth_img = cv2.imread(str(depth_file), cv2.IMREAD_GRAYSCALE)
-            if depth_img is None:
-                return None
-
-            # Convert back to float (assuming saved as uint16 scaled by 1000)
-            depth_float = depth_img.astype(np.float32) / 1000.0
-            depth_maps.append(depth_float)
-
-        return np.array(depth_maps)
-
-    except Exception:
-        # If anything fails, just return None (cache miss)
+        depth_files = [cache_entry_dir / f"depth_{i:06d}.png" for i in range(num_frames)]
+        if not all(path.is_file() for path in depth_files):
+            return None
+        return depth_files
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
 
 
@@ -166,16 +183,7 @@ def save_depth_maps_to_cache(
         metadata = {
             "num_frames": len(depth_maps),
             "video_path": str(video_path),
-            "depth_settings": {
-                k: depth_settings.get(k)
-                for k in [
-                    "depth_model_version",
-                    "model_size",
-                    "depth_resolution",
-                    "use_metric_depth",
-                    "device",
-                ]
-            },
+            "depth_settings": {k: depth_settings.get(k) for k in DEPTH_CACHE_SETTING_KEYS},
             "cache_version": "1.0",
         }
 
@@ -194,6 +202,39 @@ def save_depth_maps_to_cache(
 
     except Exception:
         # If saving fails, just return False (non-critical)
+        return False
+
+
+def save_depth_map_files_to_cache(
+    video_path: str, depth_settings: dict[str, Any], depth_files: list[Path]
+) -> bool:
+    """Copy disk-backed uint16 depth maps into the global cache with bounded memory."""
+    metadata_tmp: Path | None = None
+    try:
+        cache_entry_dir = get_cache_dir() / compute_cache_key(video_path, depth_settings)
+        cache_entry_dir.mkdir(parents=True, exist_ok=True)
+
+        for i, source in enumerate(depth_files):
+            destination = cache_entry_dir / f"depth_{i:06d}.png"
+            if source.resolve() != destination.resolve():
+                shutil.copy2(source, destination)
+
+        metadata = {
+            "num_frames": len(depth_files),
+            "video_path": str(video_path),
+            "depth_settings": {k: depth_settings.get(k) for k in DEPTH_CACHE_SETTING_KEYS},
+            "cache_version": "2.0",
+            "depth_scale": 65535.0,
+        }
+        metadata_file = cache_entry_dir / "metadata.json"
+        metadata_tmp = cache_entry_dir / "metadata.json.tmp"
+        with open(metadata_tmp, "w") as f:
+            json.dump(metadata, f, indent=2)
+        metadata_tmp.replace(metadata_file)
+        return True
+    except (OSError, TypeError, ValueError):
+        if metadata_tmp and metadata_tmp.exists():
+            metadata_tmp.unlink(missing_ok=True)
         return False
 
 

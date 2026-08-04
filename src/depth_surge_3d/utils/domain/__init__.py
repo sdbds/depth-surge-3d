@@ -7,7 +7,9 @@ from .depth_cache import (
     get_cache_dir,
     compute_cache_key,
     get_cached_depth_maps,
+    get_cached_depth_map_files,
     save_depth_maps_to_cache,
+    save_depth_map_files_to_cache,
     clear_cache,
     get_cache_size,
 )
@@ -37,7 +39,9 @@ __all__ = [
     "get_cache_dir",
     "compute_cache_key",
     "get_cached_depth_maps",
+    "get_cached_depth_map_files",
     "save_depth_maps_to_cache",
+    "save_depth_map_files_to_cache",
     "clear_cache",
     "get_cache_size",
     # Resolution

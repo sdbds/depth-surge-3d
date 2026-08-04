@@ -6,13 +6,14 @@ This is the main entry point using the new modular architecture.
 """
 
 import argparse
+import inspect
 import sys
 from pathlib import Path
 
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from depth_surge_3d.rendering import create_stereo_projector  # noqa: E402
+from depth_surge_3d.rendering import StereoProjector, create_stereo_projector  # noqa: E402
 from depth_surge_3d.core.constants import (  # noqa: E402
     DEFAULT_SETTINGS,
     VR_RESOLUTIONS,
@@ -141,13 +142,17 @@ Note: Always uses Video-Depth-Anything for temporal consistency across frames.
 
     # Model and device
     parser.add_argument(
-        "--model", help="Path to model file (V2) or model name (V3, e.g., 'large', 'base', 'small')"
+        "--model",
+        help=("Path to model file (V2), model name (V3), or Hugging Face repository (See-Through)"),
     )
     parser.add_argument(
         "--depth-model-version",
-        choices=["v2", "v3"],
+        choices=["v2", "v3", "see_through"],
         default="v2",
-        help="Depth model version: v2 (Video-Depth-Anything, default) or v3 (Depth-Anything-3, better VRAM efficiency)",
+        help=(
+            "Depth model version: v2 (temporal), v3 (efficient), or see_through "
+            "(experimental 2D animation model)"
+        ),
     )
     parser.add_argument(
         "--device",
@@ -348,34 +353,28 @@ def main():  # noqa: C901
         video_path = settings_data["metadata"]["source_video"]
         processing_settings = settings_data["processing_settings"]
 
-        # Create projector with original model settings
-        projector = create_stereo_projector(device=processing_settings.get("device", "auto"))
+        projector = create_stereo_projector(
+            model_path=processing_settings.get("model_path"),
+            device=processing_settings.get("device", "auto"),
+            metric=bool(processing_settings.get("use_metric_depth", False)),
+            depth_model_version=processing_settings.get("depth_model_version", "v2"),
+        )
 
         print("Resuming processing...")
         print(f"Input: {video_path}")
         print(f"Output: {args.resume}")
 
         # Resume processing using original settings
+        supported_settings = inspect.signature(StereoProjector.process_video).parameters
+        resume_settings = {
+            key: value
+            for key, value in processing_settings.items()
+            if key in supported_settings and key not in {"self", "video_path", "output_dir"}
+        }
         success = projector.process_video(
             video_path=video_path,
             output_dir=args.resume,
-            **{
-                k: v
-                for k, v in processing_settings.items()
-                if k
-                not in [
-                    "output_dir",
-                    "device",
-                    "per_eye_width",
-                    "video_path",
-                    "per_eye_height",
-                    "vr_output_width",
-                    "vr_output_height",
-                    "source_width",
-                    "source_height",
-                    "source_fps",
-                ]
-            },
+            **resume_settings,
         )
 
         if success:
@@ -407,9 +406,12 @@ def main():  # noqa: C901
             return 0
 
         # Process video
-        model_name = (
-            "Depth-Anything-V3" if args.depth_model_version == "v3" else "Video-Depth-Anything (V2)"
-        )
+        model_names = {
+            "v2": "Video-Depth-Anything (V2)",
+            "v3": "Depth-Anything-V3",
+            "see_through": "See-Through Marigold",
+        }
+        model_name = model_names[args.depth_model_version]
         print("Starting Depth Surge 3D processing...")
         print(f"Input: {args.input_video}")
         print(f"Output: {args.output_dir} (batch subdirectory will be created)")
@@ -431,7 +433,6 @@ def main():  # noqa: C901
         else:
             # Create new batch directory
             from datetime import datetime
-            from pathlib import Path
 
             video_name = Path(args.input_video).stem
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

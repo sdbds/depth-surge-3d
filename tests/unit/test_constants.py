@@ -4,6 +4,7 @@ from src.depth_surge_3d.core.constants import (
     DA3_MODEL_NAMES,
     DEFAULT_DA3_MODEL,
     MODEL_CONFIGS,
+    VR_HEADSET_PRESETS,
     VR_RESOLUTIONS,
     VALIDATION_RANGES,
     DEFAULT_SETTINGS,
@@ -52,6 +53,18 @@ class TestConstants:
             assert isinstance(height, int)
             assert width > 0
             assert height > 0
+
+    def test_pimax_crystal_light_headset_preset(self):
+        """Pimax Crystal Light uses its official native display dimensions and FOV."""
+        assert VR_HEADSET_PRESETS["pimax-crystal-light"] == {
+            "name": "Pimax Crystal Light",
+            "per_eye_width": 2880,
+            "per_eye_height": 2880,
+            "fisheye_fov": 110,
+            "description": (
+                "Optimized for Pimax Crystal Light (2880x2880 per eye, 110 degree FOV)"
+            ),
+        }
 
     def test_validation_ranges_valid(self):
         """Test validation ranges are sensible."""

@@ -8,6 +8,8 @@ from .depth import (
     VideoDepthEstimator,
     create_video_depth_estimator,
     create_video_depth_estimator_da3,
+    SeeThroughDepthEstimator,
+    create_see_through_depth_estimator,
 )
 
 # Upscaling inference
@@ -18,6 +20,8 @@ __all__ = [
     "VideoDepthEstimator",
     "create_video_depth_estimator",
     "create_video_depth_estimator_da3",
+    "SeeThroughDepthEstimator",
+    "create_see_through_depth_estimator",
     # Upscaling
     "create_upscaler",
 ]

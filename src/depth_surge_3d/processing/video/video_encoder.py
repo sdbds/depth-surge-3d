@@ -6,12 +6,14 @@ Handles FFmpeg-based video encoding with hardware acceleration support (NVENC).
 
 from __future__ import annotations
 
+from fractions import Fraction
 import subprocess
 from pathlib import Path
 from typing import Any
 
 from ...io.operations import (
     get_frame_files,
+    get_video_info_ffprobe,
     verify_ffmpeg_installation,
 )
 from ...utils.path_utils import (
@@ -78,9 +80,7 @@ class VideoEncoder:
         output_path = output_dir / output_filename
 
         # Build base FFmpeg command
-        base_fps = settings.get("target_fps", DEFAULT_FALLBACK_FPS)
-        if base_fps is None or str(base_fps) == "None" or base_fps == "original":
-            base_fps = 30
+        base_fps = self._resolve_output_fps(original_video, settings)
 
         cmd = [
             "ffmpeg",
@@ -118,6 +118,45 @@ class VideoEncoder:
             print(f"Error creating output video: {e}")
             return False
 
+    @staticmethod
+    def _normalize_frame_rate(value: Any) -> str | None:
+        """Return a positive FFmpeg frame-rate value, preserving exact fractions."""
+        if value is None:
+            return None
+
+        text = str(value).strip()
+        if not text or text.lower() in {"none", "original"}:
+            return None
+
+        try:
+            if Fraction(text) <= 0:
+                return None
+        except (ValueError, ZeroDivisionError):
+            return None
+
+        return text
+
+    def _resolve_output_fps(self, original_video: str, settings: dict[str, Any]) -> str:
+        """Resolve explicit FPS or preserve the source video's exact stream rate."""
+        target_fps = self._normalize_frame_rate(settings.get("target_fps"))
+        if target_fps is not None:
+            return target_fps
+
+        video_info = get_video_info_ffprobe(original_video)
+        for stream in video_info.get("streams", []):
+            if stream.get("codec_type") != "video":
+                continue
+            for rate_key in ("avg_frame_rate", "r_frame_rate"):
+                source_rate = self._normalize_frame_rate(stream.get(rate_key))
+                if source_rate is not None:
+                    return source_rate
+
+        source_fps = self._normalize_frame_rate(settings.get("source_fps"))
+        if source_fps is not None:
+            return source_fps
+
+        return str(DEFAULT_FALLBACK_FPS)
+
     def extract_frames(
         self,
         video_path: str,
@@ -153,6 +192,23 @@ class VideoEncoder:
             total_frames, fps, settings.get("start_time"), settings.get("end_time")
         )
         expected_frames = end_frame - start_frame
+
+        existing_frames = sorted(frames_dir.glob("frame_*.png"))
+        frame_count_tolerance = max(2, (expected_frames + 999) // 1000)
+        exact_count = len(existing_frames) == expected_frames
+        tolerated_vfr_drift = (
+            bool(existing_frames)
+            and abs(len(existing_frames) - expected_frames) <= frame_count_tolerance
+            and self._has_downstream_progress(directories)
+        )
+        if expected_frames > 0 and (exact_count or tolerated_vfr_drift):
+            print(f"  Reusing {len(existing_frames)} already extracted frames")
+            return existing_frames
+
+        # FFmpeg overwrites matching names but does not remove stale tail frames.
+        # Clear only this stage's exact output pattern before a full re-extraction.
+        for frame_file in existing_frames:
+            frame_file.unlink(missing_ok=True)
 
         # Convert frame numbers to timestamps for more efficient seeking
         start_time = start_frame / fps if fps > 0 else 0
@@ -212,6 +268,17 @@ class VideoEncoder:
             return []
 
         return get_frame_files(frames_dir)
+
+    @staticmethod
+    def _has_downstream_progress(directories: dict[str, Path]) -> bool:
+        """A later-stage file proves that FFmpeg completed before processing advanced."""
+        for stage_name in INTERMEDIATE_DIRS:
+            if stage_name == "frames":
+                continue
+            stage_dir = directories.get(stage_name)
+            if stage_dir is not None and next(stage_dir.glob("*.png"), None) is not None:
+                return True
+        return False
 
     def _check_nvenc_available(self) -> bool:
         """

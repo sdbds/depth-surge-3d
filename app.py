@@ -64,6 +64,9 @@ from src.depth_surge_3d.core.constants import (  # noqa: E402
     SIGNAL_SHUTDOWN_TIMEOUT,
 )
 from src.depth_surge_3d.utils.system.console import warning as console_warning  # noqa: E402
+from src.depth_surge_3d.inference.depth.video_depth_estimator_see_through import (  # noqa: E402
+    DEFAULT_SEE_THROUGH_REPO,
+)
 
 from flask import Flask, render_template, request, jsonify  # noqa: E402
 from flask_socketio import SocketIO  # noqa: E402
@@ -847,7 +850,7 @@ def process_video_async(  # noqa: C901
             print("CUDA not available, using CPU")
 
         # Initialize projector with depth model
-        # Get depth model version (v2 or v3)
+        # Get depth model version
         depth_model_version = settings.get("depth_model_version", "v3")  # Default to V3
         model_size = settings.get("model_size", "vitb")  # Default to Base for 16GB GPUs
         use_metric = settings.get("use_metric_depth", True)  # Default to metric depth
@@ -864,8 +867,7 @@ def process_video_async(  # noqa: C901
             )
             raise Exception(error_msg)
 
-        # For V2, select the appropriate model path based on size and metric/relative
-        # For V3, model_path is just the model name (e.g., "large", "base", "small")
+        # Resolve the model path or Hugging Face repository for the selected backend.
         if depth_model_version == "v2":
             if use_metric:
                 model_paths_dict = MODEL_PATHS_METRIC
@@ -881,6 +883,10 @@ def process_video_async(  # noqa: C901
             print(
                 f"Loading Video-Depth-Anything V2: {model_size.upper()} {depth_type} from: {model_path}"
             )
+        elif depth_model_version == "see_through":
+            model_path = settings.get("model_path", DEFAULT_SEE_THROUGH_REPO)
+            use_metric = False
+            print(f"Loading See-Through Marigold: {model_path} (relative anime depth)")
         else:
             # For V3, map model_size to DA3 model names
             da3_model_map = {"vits": "small", "vitb": "base", "vitl": "large"}
@@ -1275,6 +1281,22 @@ def detect_resume_settings(output_path):
         "fisheye_crop_factor": 1.0,
         "hole_fill_quality": "fast",
     }
+
+    # A resume must use the exact model and geometry from the interrupted run.
+    # Directory-shape inference is only a fallback for legacy jobs without metadata.
+    from depth_surge_3d.io.operations import load_processing_settings
+
+    settings_files = sorted(
+        output_path.glob("*-settings.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for settings_file in settings_files:
+        saved_data = load_processing_settings(settings_file)
+        saved_settings = saved_data.get("processing_settings") if saved_data else None
+        if isinstance(saved_settings, dict):
+            settings.update(saved_settings)
+            return settings
 
     # Try to detect VR format from directory structure
     if (output_path / INTERMEDIATE_DIRS["vr_frames"]).exists():
