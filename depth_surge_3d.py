@@ -18,9 +18,9 @@ from depth_surge_3d.core.constants import (  # noqa: E402
     DEFAULT_SETTINGS,
     VR_RESOLUTIONS,
     FISHEYE_PROJECTIONS,
-    HOLE_FILL_METHODS,
     VALIDATION_RANGES,
 )
+from depth_surge_3d.core.settings import validate_settings  # noqa: E402
 from depth_surge_3d.utils import (  # noqa: E402
     get_available_resolutions,
     warning as console_warning,
@@ -88,17 +88,58 @@ Note: Always uses Video-Depth-Anything for temporal consistency across frames.
 
     # Depth and stereo parameters
     parser.add_argument(
-        "-b",
-        "--baseline",
+        "--stereo-strength",
         type=float,
-        default=DEFAULT_SETTINGS["baseline"],
-        help=f'Stereo baseline distance in meters (default: {DEFAULT_SETTINGS["baseline"]} - average human IPD)',
+        default=DEFAULT_SETTINGS["stereo_strength"],
+        help="Total horizontal disparity as a percentage of frame width (default: %(default)s)",
     )
     parser.add_argument(
-        "--focal-length",
+        "--convergence",
+        type=float,
+        default=DEFAULT_SETTINGS["convergence"],
+        help="Canonical depth placed at zero parallax (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--occlusion-fill",
+        choices=["none", "background"],
+        default=DEFAULT_SETTINGS["occlusion_fill"],
+        help="Disocclusion handling mode (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--scene-detection",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_SETTINGS["scene_detection"],
+        help="Enable deterministic scene segmentation (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--scene-cut-threshold",
+        type=float,
+        default=DEFAULT_SETTINGS["scene_cut_threshold"],
+        help="Luma-histogram scene cut threshold (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--min-scene-frames",
         type=int,
-        default=DEFAULT_SETTINGS["focal_length"],
-        help=f'Camera focal length in pixels (default: {DEFAULT_SETTINGS["focal_length"]})',
+        default=DEFAULT_SETTINGS["min_scene_frames"],
+        help="Minimum candidate scene length in frames (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--raw-storage-dtype",
+        choices=["auto", "float16", "float32"],
+        default=DEFAULT_SETTINGS["raw_storage_dtype"],
+        help="Raw native depth storage type (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--stereo-io-workers",
+        type=int,
+        default=DEFAULT_SETTINGS["stereo_io_workers"],
+        help="Stereo decode and output worker count (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--migrate-legacy",
+        choices=["archive", "delete"],
+        default=DEFAULT_SETTINGS["migrate_legacy"],
+        help="How resume handles legacy generated stages (default: %(default)s)",
     )
 
     # Distortion and projection
@@ -133,13 +174,6 @@ Note: Always uses Video-Depth-Anything for temporal consistency across frames.
         default=DEFAULT_SETTINGS["fisheye_crop_factor"],
         help=f'Fisheye crop factor (default: {DEFAULT_SETTINGS["fisheye_crop_factor"]})',
     )
-    parser.add_argument(
-        "--hole-fill-quality",
-        choices=HOLE_FILL_METHODS,
-        default=DEFAULT_SETTINGS["hole_fill_quality"],
-        help=f'Hole filling quality (default: {DEFAULT_SETTINGS["hole_fill_quality"]})',
-    )
-
     # Model and device
     parser.add_argument(
         "--model",
@@ -220,23 +254,23 @@ def validate_arguments(args) -> bool:
         print(f"Error: Invalid or unsupported video file: {args.input_video}")
         return False
 
-    # Validate ranges
-    if (
-        args.baseline < VALIDATION_RANGES["baseline"][0]
-        or args.baseline > VALIDATION_RANGES["baseline"][1]
-    ):
-        print(
-            f"Error: Baseline must be between {VALIDATION_RANGES['baseline'][0]} and {VALIDATION_RANGES['baseline'][1]} meters"
+    try:
+        validate_settings(
+            {
+                "stereo_strength": args.stereo_strength,
+                "convergence": args.convergence,
+                "occlusion_fill": args.occlusion_fill,
+                "scene_detection": args.scene_detection,
+                "scene_cut_threshold": args.scene_cut_threshold,
+                "min_scene_frames": args.min_scene_frames,
+                "raw_storage_dtype": args.raw_storage_dtype,
+                "stereo_io_workers": args.stereo_io_workers,
+                "migrate_legacy": args.migrate_legacy,
+            },
+            source="explicit",
         )
-        return False
-
-    if (
-        args.focal_length < VALIDATION_RANGES["focal_length"][0]
-        or args.focal_length > VALIDATION_RANGES["focal_length"][1]
-    ):
-        print(
-            f"Error: Focal length must be between {VALIDATION_RANGES['focal_length'][0]} and {VALIDATION_RANGES['focal_length'][1]} pixels"
-        )
+    except ValueError as exc:
+        print(f"Error: {exc}")
         return False
 
     if (
@@ -443,8 +477,15 @@ def main():  # noqa: C901
             output_dir=str(batch_output_dir),
             vr_format=args.format,
             vr_resolution=args.vr_resolution,
-            baseline=args.baseline,
-            focal_length=args.focal_length,
+            stereo_strength=args.stereo_strength,
+            convergence=args.convergence,
+            occlusion_fill=args.occlusion_fill,
+            scene_detection=args.scene_detection,
+            scene_cut_threshold=args.scene_cut_threshold,
+            min_scene_frames=args.min_scene_frames,
+            raw_storage_dtype=args.raw_storage_dtype,
+            stereo_io_workers=args.stereo_io_workers,
+            migrate_legacy=args.migrate_legacy,
             start_time=args.start,
             end_time=args.end,
             apply_distortion=not args.no_distortion,
@@ -452,7 +493,6 @@ def main():  # noqa: C901
             fisheye_fov=args.fisheye_fov,
             crop_factor=args.crop_factor,
             fisheye_crop_factor=args.fisheye_crop_factor,
-            hole_fill_quality=args.hole_fill_quality,
             preserve_audio=not args.no_audio,
             keep_intermediates=not args.no_intermediates,
             target_fps=args.target_fps,

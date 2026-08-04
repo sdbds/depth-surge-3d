@@ -1,5 +1,6 @@
 """Unit tests for StereoProjector."""
 
+import inspect
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -126,16 +127,35 @@ class TestStereoProjector:
             "video_path": "test.mp4",
             "output_dir": "output",
             "vr_format": None,
-            "baseline": None,
+            "stereo_strength": 3.0,
+            "scene_detection": False,
         }
 
         settings = projector._apply_default_settings(test_locals)
 
         # Should have defaults applied
         assert "vr_format" in settings
-        assert "baseline" in settings
+        assert "baseline" not in settings
+        assert settings["stereo_strength"] == 3.0
+        assert settings["scene_detection"] is False
         assert settings["video_path"] == "test.mp4"
         assert settings["output_dir"] == "output"
+
+    def test_process_video_signature_uses_final_controls(self):
+        parameter_names = set(inspect.signature(StereoProjector.process_video).parameters)
+
+        assert {
+            "stereo_strength",
+            "convergence",
+            "occlusion_fill",
+            "scene_detection",
+            "scene_cut_threshold",
+            "min_scene_frames",
+            "raw_storage_dtype",
+            "stereo_io_workers",
+            "migrate_legacy",
+        } <= parameter_names
+        assert {"baseline", "focal_length", "hole_fill_quality"}.isdisjoint(parameter_names)
 
 
 class TestCreateStereoProjector:

@@ -32,7 +32,7 @@ from ..io.operations import (
 )
 from ..processing import VideoProcessor
 from ..processing.frames.depth_normalizer import canonicalize_single_scene
-from ..core.constants import DEFAULT_SETTINGS
+from ..core.settings import validate_settings
 from .stereo_renderer import StereoRenderer, StereoRenderSettings
 
 
@@ -87,8 +87,15 @@ class StereoProjector:
         video_path: str,
         output_dir: str,
         vr_format: str | None = None,
-        baseline: float | None = None,
-        focal_length: float | None = None,
+        stereo_strength: float | None = None,
+        convergence: float | None = None,
+        occlusion_fill: str | None = None,
+        scene_detection: bool | None = None,
+        scene_cut_threshold: float | None = None,
+        min_scene_frames: int | None = None,
+        raw_storage_dtype: str | None = None,
+        stereo_io_workers: int | None = None,
+        migrate_legacy: str | None = None,
         keep_intermediates: bool | None = None,
         start_time: str | None = None,
         end_time: str | None = None,
@@ -102,7 +109,6 @@ class StereoProjector:
         crop_factor: float | None = None,
         vr_resolution: str | None = None,
         fisheye_crop_factor: float | None = None,
-        hole_fill_quality: str | None = None,
         processing_mode: str | None = None,
         experimental_frame_interpolation: bool | None = None,
     ) -> bool:
@@ -268,25 +274,27 @@ class StereoProjector:
             return False
 
     def _apply_default_settings(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Apply default settings for None parameters."""
-        settings = {}
-        for key, default_value in DEFAULT_SETTINGS.items():
-            # Get value from params, excluding 'self' and 'video_path', 'output_dir'
-            if key in params and params[key] is not None:
-                settings[key] = params[key]
-            else:
-                settings[key] = default_value
+        """Apply and validate defaults for explicit processing parameters."""
+        special_params = {
+            "self",
+            "video_path",
+        }
+        provided = {
+            key: value
+            for key, value in params.items()
+            if key not in special_params and value is not None
+        }
+        settings = validate_settings(provided, source="explicit")
 
         # Handle special cases
-        special_params = [
+        passthrough_params = [
             "video_path",
-            "output_dir",
             "start_time",
             "end_time",
             "target_fps",
             "min_resolution",
         ]
-        for param in special_params:
+        for param in passthrough_params:
             if param in params:
                 settings[param] = params[param]
 

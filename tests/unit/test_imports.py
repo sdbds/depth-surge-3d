@@ -1,7 +1,22 @@
 """Test that all entry points can import correctly."""
 
+import importlib.util
 import sys
 from pathlib import Path
+
+import pytest
+
+
+def _load_cli_module():
+    project_root = Path(__file__).parent.parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "depth_surge_3d_cli",
+        project_root / "depth_surge_3d.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class TestEntryPointImports:
@@ -23,6 +38,52 @@ class TestEntryPointImports:
         assert callable(get_cache_size)
         assert callable(get_cache_dir)
         assert callable(clear_cache)
+
+    def test_cli_exposes_only_final_stereo_controls(self):
+        parser = _load_cli_module().create_argument_parser()
+
+        args = parser.parse_args(
+            [
+                "video.mp4",
+                "--stereo-strength",
+                "3.25",
+                "--convergence",
+                "0.4",
+                "--occlusion-fill",
+                "none",
+                "--no-scene-detection",
+                "--scene-cut-threshold",
+                "0.7",
+                "--min-scene-frames",
+                "12",
+                "--raw-storage-dtype",
+                "float32",
+                "--stereo-io-workers",
+                "3",
+                "--migrate-legacy",
+                "delete",
+            ]
+        )
+
+        assert args.stereo_strength == 3.25
+        assert args.convergence == 0.4
+        assert args.occlusion_fill == "none"
+        assert args.scene_detection is False
+        assert args.scene_cut_threshold == 0.7
+        assert args.min_scene_frames == 12
+        assert args.raw_storage_dtype == "float32"
+        assert args.stereo_io_workers == 3
+        assert args.migrate_legacy == "delete"
+
+    @pytest.mark.parametrize(
+        "removed_option",
+        ["--baseline", "--focal-length", "--hole-fill-quality"],
+    )
+    def test_cli_rejects_removed_stereo_controls(self, removed_option):
+        parser = _load_cli_module().create_argument_parser()
+
+        with pytest.raises(SystemExit):
+            parser.parse_args(["video.mp4", removed_option, "1"])
 
     def test_app_imports(self):
         """Test that web UI (app.py) imports work."""
