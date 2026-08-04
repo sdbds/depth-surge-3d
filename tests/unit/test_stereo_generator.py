@@ -1,22 +1,40 @@
-"""Tests for StereoPairGenerator module."""
+"""Tests for the bounded stereo rendering and I/O pipeline."""
 
-import pytest
-import cv2
+from __future__ import annotations
+
 import json
-import numpy as np
+import os
+import threading
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-from src.depth_surge_3d.processing.frames.stereo_generator import (
-    StereoPairGenerator,
-    _canonical_to_signed_pixel_disparity,
-    _process_single_stereo_pair,
-)
+import cv2
+import numpy as np
+import pytest
+
 from src.depth_surge_3d.processing.frames import stereo_generator
 from src.depth_surge_3d.processing.frames.depth_storage import canonical_json_hash
+from src.depth_surge_3d.processing.frames.stereo_generator import (
+    HOST_SLOT_OVERHEAD,
+    HOST_STEREO_BYTES_PER_PIXEL,
+    STEREO_HOST_BUDGET,
+    StereoPairGenerator,
+    _atomic_write_png,
+    calculate_stereo_pipeline_capacity,
+    validate_stereo_io_workers,
+)
+from src.depth_surge_3d.rendering.stereo_renderer import (
+    StereoRenderResult,
+    StereoRenderer,
+    StereoRenderSettings,
+)
 
 
-def _write_canonical_metadata(depth_dir: Path, frame_names: list[str], shape=(8, 8)) -> None:
+def _write_canonical_metadata(
+    depth_dir: Path,
+    frame_names: list[str],
+    shape: tuple[int, int] = (8, 8),
+) -> None:
     metadata = {
         "schema_version": 1,
         "algorithm_version": "scene-percentile-v1",
@@ -37,487 +55,366 @@ def _write_canonical_metadata(depth_dir: Path, frame_names: list[str], shape=(8,
     (depth_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
 
-class TestProcessSingleStereoPair:
-    """Test _process_single_stereo_pair worker function."""
+def _make_file_inputs(
+    root: Path,
+    *,
+    count: int = 3,
+    frame_shape: tuple[int, int] = (8, 8),
+    depth_shape: tuple[int, int] | None = None,
+) -> tuple[list[Path], list[Path], dict[str, Path]]:
+    depth_shape = depth_shape or frame_shape
+    frame_dir = root / "frames"
+    depth_dir = root / "canonical"
+    left_dir = root / "left"
+    right_dir = root / "right"
+    for directory in (frame_dir, depth_dir, left_dir, right_dir):
+        directory.mkdir(parents=True)
 
-    def test_canonical_disparity_uses_target_width_strength_and_convergence(self):
-        canonical = np.array([[0.0, 0.5, 1.0]], dtype=np.float32)
+    frame_files: list[Path] = []
+    depth_files: list[Path] = []
+    for index in range(count):
+        name = f"frame_{index:04d}.png"
+        frame_path = frame_dir / name
+        depth_path = depth_dir / name
+        frame = np.full((*frame_shape, 3), 20 + index, dtype=np.uint8)
+        depth = np.full(depth_shape, 32768 + index, dtype=np.uint16)
+        assert cv2.imwrite(str(frame_path), frame)
+        assert cv2.imwrite(str(depth_path), depth)
+        frame_files.append(frame_path)
+        depth_files.append(depth_path)
+    _write_canonical_metadata(depth_dir, [path.name for path in frame_files], depth_shape)
+    return frame_files, depth_files, {"left_frames": left_dir, "right_frames": right_dir}
 
-        disparity = _canonical_to_signed_pixel_disparity(
-            canonical,
-            render_width=200,
-            stereo_strength=2.0,
+
+def _settings(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "stereo_strength": 2.0,
+        "convergence": 0.5,
+        "occlusion_fill": "background",
+        "stereo_io_workers": 2,
+        "keep_intermediates": False,
+    }
+    values.update(overrides)
+    return values
+
+
+class _FakeRenderer:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[tuple[int, np.ndarray, StereoRenderSettings]] = []
+
+    def render(
+        self,
+        frame: np.ndarray,
+        canonical: np.ndarray,
+        settings: StereoRenderSettings,
+    ) -> StereoRenderResult:
+        self.calls.append((threading.get_ident(), canonical.copy(), settings))
+        if self.fail:
+            raise RuntimeError("render failed")
+        mask = np.ones(frame.shape[:2], dtype=np.bool_)
+        holes = np.zeros(frame.shape[:2], dtype=np.bool_)
+        return StereoRenderResult(
+            left_image=np.clip(frame.astype(np.int16) + 1, 0, 255).astype(np.uint8),
+            right_image=np.clip(frame.astype(np.int16) + 2, 0, 255).astype(np.uint8),
+            left_valid_mask=mask.copy(),
+            right_valid_mask=mask.copy(),
+            left_hole_mask=holes.copy(),
+            right_hole_mask=holes.copy(),
+        )
+
+
+@pytest.mark.parametrize("workers", [0, -1, 17, 100])
+def test_stereo_io_workers_reject_out_of_range_values(workers: int) -> None:
+    with pytest.raises(ValueError, match=r"1\.\.16"):
+        validate_stereo_io_workers(workers)
+
+
+@pytest.mark.parametrize("workers", [1, 4, 16])
+def test_stereo_io_workers_accept_supported_values(workers: int) -> None:
+    assert validate_stereo_io_workers(workers) == workers
+
+
+def test_4k_capacity_stays_within_host_budget_at_max_workers() -> None:
+    capacity = calculate_stereo_pipeline_capacity(3840, 2160, 16)
+    slot_bytes = 3840 * 2160 * HOST_STEREO_BYTES_PER_PIXEL + HOST_SLOT_OVERHEAD
+
+    assert HOST_STEREO_BYTES_PER_PIXEL == 16
+    assert capacity == min(32, STEREO_HOST_BUDGET // slot_bytes)
+    assert capacity * slot_bytes <= STEREO_HOST_BUDGET
+
+
+def test_frame_larger_than_one_host_slot_is_rejected() -> None:
+    with pytest.raises(MemoryError, match="required"):
+        calculate_stereo_pipeline_capacity(16384, 8192, 4)
+
+
+def test_atomic_png_write_replaces_from_same_directory(tmp_path: Path) -> None:
+    output = tmp_path / "frame.png"
+    image = np.full((4, 5, 3), 73, dtype=np.uint8)
+
+    with patch.object(os, "replace", wraps=os.replace) as replace:
+        _atomic_write_png(output, image)
+
+    assert replace.call_count == 1
+    temporary, destination = replace.call_args.args
+    assert Path(temporary).parent == output.parent
+    assert Path(destination) == output
+    assert np.array_equal(cv2.imread(str(output), cv2.IMREAD_COLOR), image)
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_file_pipeline_renders_only_on_calling_thread(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=5)
+    renderer = _FakeRenderer()
+    calling_thread = threading.get_ident()
+
+    result = StereoPairGenerator(renderer=renderer).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(stereo_io_workers=4),
+    )
+
+    assert result is True
+    assert len(renderer.calls) == 5
+    assert {thread_id for thread_id, _, _ in renderer.calls} == {calling_thread}
+    assert not any(thread.name.startswith("stereo-") for thread in threading.enumerate())
+
+
+def test_file_pipeline_uses_corrected_stereo_sign_end_to_end(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(
+        tmp_path,
+        count=1,
+        frame_shape=(5, 100),
+    )
+    frame = np.zeros((5, 100, 3), dtype=np.uint8)
+    frame[:, 50] = 255
+    assert cv2.imwrite(str(frame_files[0]), frame)
+    assert cv2.imwrite(
+        str(depth_files[0]),
+        np.full((5, 100), 65535, dtype=np.uint16),
+    )
+
+    result = StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(
+            stereo_strength=4.0,
             convergence=0.5,
+            occlusion_fill="none",
+        ),
+    )
+
+    left = cv2.imread(str(directories["left_frames"] / frame_files[0].name))
+    right = cv2.imread(str(directories["right_frames"] / frame_files[0].name))
+    assert result is True
+    assert int(np.argmax(left[2, :, 0])) > int(np.argmax(right[2, :, 0]))
+
+
+def test_file_pipeline_uses_bounded_lifecycle_permits(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=10)
+    generator = StereoPairGenerator(renderer=_FakeRenderer())
+
+    assert generator.create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(stereo_io_workers=4),
+    )
+
+    stats = generator.last_pipeline_stats
+    assert stats is not None
+    assert stats.queue_capacity == stats.permit_count
+    assert stats.permit_count == 8
+    assert stats.max_active_permits <= stats.permit_count
+    assert stats.permits_acquired == 10
+    assert stats.permits_released == 10
+    assert stats.active_permits == 0
+    assert stats.decoded_frames == 10
+    assert stats.rendered_frames == 10
+    assert stats.written_frames == 10
+
+
+def test_file_pipeline_always_writes_downstream_frames(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=2)
+
+    result = StereoPairGenerator(renderer=_FakeRenderer()).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(keep_intermediates=False),
+    )
+
+    assert result is True
+    assert len(list(directories["left_frames"].glob("*.png"))) == 2
+    assert len(list(directories["right_frames"].glob("*.png"))) == 2
+
+
+def test_resume_skips_only_complete_stereo_pairs(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=2)
+    complete_left = directories["left_frames"] / "frame_0000.png"
+    complete_right = directories["right_frames"] / "frame_0000.png"
+    singleton_left = directories["left_frames"] / "frame_0001.png"
+    assert cv2.imwrite(str(complete_left), np.full((8, 8, 3), 7, dtype=np.uint8))
+    assert cv2.imwrite(str(complete_right), np.full((8, 8, 3), 8, dtype=np.uint8))
+    assert cv2.imwrite(str(singleton_left), np.full((8, 8, 3), 9, dtype=np.uint8))
+    renderer = _FakeRenderer()
+
+    result = StereoPairGenerator(renderer=renderer).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(),
+    )
+
+    assert result is True
+    assert len(renderer.calls) == 1
+    assert np.all(cv2.imread(str(complete_left)) == 7)
+    assert np.all(cv2.imread(str(complete_right)) == 8)
+    assert np.all(cv2.imread(str(singleton_left)) == 22)
+    assert (directories["right_frames"] / "frame_0001.png").is_file()
+
+
+def test_decode_failure_releases_every_lifecycle_permit(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=3)
+    frame_files[1].write_bytes(b"not an image")
+    generator = StereoPairGenerator(renderer=_FakeRenderer())
+
+    result = generator.create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(),
+    )
+
+    assert result is False
+    stats = generator.last_pipeline_stats
+    assert stats is not None
+    assert stats.active_permits == 0
+    assert stats.permits_acquired == stats.permits_released
+
+
+def test_render_failure_releases_every_lifecycle_permit(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=3)
+    generator = StereoPairGenerator(renderer=_FakeRenderer(fail=True))
+
+    result = generator.create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(),
+    )
+
+    assert result is False
+    stats = generator.last_pipeline_stats
+    assert stats is not None
+    assert stats.active_permits == 0
+    assert stats.permits_acquired == stats.permits_released
+
+
+def test_write_failure_cleans_pair_and_releases_permit(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=2)
+    generator = StereoPairGenerator(renderer=_FakeRenderer())
+
+    with patch.object(stereo_generator, "_atomic_write_png", side_effect=OSError("disk full")):
+        result = generator.create_stereo_pairs_from_files(
+            frame_files,
+            depth_files,
+            directories,
+            _settings(),
         )
 
-        np.testing.assert_allclose(disparity, [[-2.0, 0.0, 2.0]])
+    assert result is False
+    assert list(directories["left_frames"].glob("*.png")) == []
+    assert list(directories["right_frames"].glob("*.png")) == []
+    stats = generator.last_pipeline_stats
+    assert stats is not None
+    assert stats.active_permits == 0
+    assert stats.permits_acquired == stats.permits_released
+    assert not any(thread.name.startswith("stereo-") for thread in threading.enumerate())
 
-    def test_near_marker_is_rightward_in_left_eye(self):
-        frame = np.zeros((5, 100, 3), dtype=np.uint8)
-        frame[:, 50] = 255
-        canonical = np.ones((5, 100), dtype=np.float32)
 
-        left, right, _ = _process_single_stereo_pair(
-            (
-                frame,
-                canonical,
-                "frame_0000",
-                None,
-                None,
-                {
-                    "stereo_strength": 4.0,
-                    "convergence": 0.5,
-                    "hole_fill_quality": "none",
-                },
-            )
+def test_in_memory_path_uses_shared_renderer_without_process_pool(tmp_path: Path) -> None:
+    renderer = _FakeRenderer()
+    generator = StereoPairGenerator(renderer=renderer)
+    left_dir = tmp_path / "left"
+    right_dir = tmp_path / "right"
+    left_dir.mkdir()
+    right_dir.mkdir()
+    frames = np.full((2, 4, 5, 3), 10, dtype=np.uint8)
+    canonical = np.full((2, 2, 3), 0.5, dtype=np.float32)
+    frame_files = [tmp_path / f"frame_{index:04d}.png" for index in range(2)]
+
+    result = generator.create_stereo_pairs(
+        frames,
+        canonical,
+        frame_files,
+        {"left_frames": left_dir, "right_frames": right_dir},
+        _settings(keep_intermediates=True),
+    )
+
+    assert result is True
+    assert len(renderer.calls) == 2
+    assert len(list(left_dir.glob("*.png"))) == 2
+    assert not hasattr(stereo_generator, "mp")
+
+
+def test_file_pipeline_rejects_missing_canonical_metadata(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=1)
+    (depth_files[0].parent / "metadata.json").unlink()
+
+    result = StereoPairGenerator(renderer=_FakeRenderer()).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(),
+    )
+
+    assert result is False
+
+
+def test_canonical_metadata_requires_source_fingerprints(tmp_path: Path) -> None:
+    frame_files, depth_files, _directories = _make_file_inputs(tmp_path, count=1)
+    metadata_path = depth_files[0].parent / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.pop("source_raw_fingerprint")
+    metadata.pop("fingerprint")
+    metadata["fingerprint"] = canonical_json_hash(metadata)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not match"):
+        StereoPairGenerator._get_canonical_metadata(depth_files, frame_files)
+
+
+def test_canonical_metadata_rejects_depth_from_another_directory(tmp_path: Path) -> None:
+    frame_files, depth_files, _directories = _make_file_inputs(tmp_path, count=2)
+    foreign_dir = tmp_path / "foreign"
+    foreign_dir.mkdir()
+    foreign = foreign_dir / depth_files[1].name
+    foreign.write_bytes(depth_files[1].read_bytes())
+
+    with pytest.raises(ValueError, match="path manifest"):
+        StereoPairGenerator._get_canonical_metadata(
+            [depth_files[0], foreign],
+            frame_files,
         )
 
-        left_x = int(np.argmax(left[2, :, 0]))
-        right_x = int(np.argmax(right[2, :, 0]))
-        assert left_x > right_x
 
-    def test_process_pair_basic(self, tmp_path):
-        """Test basic stereo pair processing."""
-        frame = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        depth_map = np.random.rand(100, 100)
-        frame_name = "frame_0000"
+def test_wrong_native_shape_is_rejected_before_rendering(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=1)
+    cv2.imwrite(str(depth_files[0]), np.zeros((4, 4), dtype=np.uint16))
+    renderer = _FakeRenderer()
 
-        left_path = str(tmp_path / "left.png")
-        right_path = str(tmp_path / "right.png")
+    result = StereoPairGenerator(renderer=renderer).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(),
+    )
 
-        settings = {
-            "baseline": 0.065,
-            "focal_length": 1000,
-            "hole_fill_quality": "fast",
-        }
-
-        with patch(
-            "src.depth_surge_3d.processing.frames.stereo_generator._canonical_to_signed_pixel_disparity"
-        ) as mock_disp:
-            with patch(
-                "src.depth_surge_3d.processing.frames.stereo_generator.create_shifted_image"
-            ) as mock_shift:
-                with patch(
-                    "src.depth_surge_3d.processing.frames.stereo_generator.hole_fill_image"
-                ) as mock_fill:
-                    mock_disp.return_value = np.zeros((100, 100))
-                    mock_shift.return_value = frame
-                    mock_fill.return_value = frame
-
-                    left_img, right_img, name = _process_single_stereo_pair(
-                        (frame, depth_map, frame_name, left_path, right_path, settings)
-                    )
-
-        assert name == frame_name
-        assert Path(left_path).exists()
-        assert Path(right_path).exists()
-
-    def test_process_pair_no_hole_fill(self, tmp_path):
-        """Test stereo pair processing without hole filling."""
-        frame = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        depth_map = np.random.rand(100, 100)
-
-        settings = {
-            "baseline": 0.065,
-            "focal_length": 1000,
-            "hole_fill_quality": "none",
-        }
-
-        with patch(
-            "src.depth_surge_3d.processing.frames.stereo_generator._canonical_to_signed_pixel_disparity"
-        ) as mock_disp:
-            with patch(
-                "src.depth_surge_3d.processing.frames.stereo_generator.create_shifted_image"
-            ) as mock_shift:
-                with patch(
-                    "src.depth_surge_3d.processing.frames.stereo_generator.hole_fill_image"
-                ) as mock_fill:
-                    mock_disp.return_value = np.zeros((100, 100))
-                    mock_shift.return_value = frame
-
-                    _process_single_stereo_pair(
-                        (frame, depth_map, "frame_0000", None, None, settings)
-                    )
-
-                    # Hole fill should not be called
-                    mock_fill.assert_not_called()
-
-    def test_process_pair_resizes_depth_map_to_frame_dimensions(self):
-        """Depth inferred at a supersampled resolution still aligns to the source frame."""
-        frame = np.random.randint(0, 255, (12, 16, 3), dtype=np.uint8)
-        depth_map = np.ones((24, 32), dtype=np.float32)
-        settings = {
-            "baseline": 0.01,
-            "focal_length": 10,
-            "hole_fill_quality": "none",
-        }
-
-        left_img, right_img, name = _process_single_stereo_pair(
-            (frame, depth_map, "frame_0000", None, None, settings)
-        )
-
-        assert left_img.shape == frame.shape
-        assert right_img.shape == frame.shape
-        assert name == "frame_0000"
-
-    def test_process_pair_from_files_returns_only_frame_name(self, tmp_path):
-        """A worker loads one pair, writes it, and does not return image arrays."""
-        frame_path = tmp_path / "frame_0000.png"
-        depth_path = tmp_path / "depth_0000.png"
-        left_path = tmp_path / "left.png"
-        right_path = tmp_path / "right.png"
-        cv2.imwrite(
-            str(frame_path),
-            np.full((8, 8, 3), 127, dtype=np.uint8),
-        )
-        cv2.imwrite(
-            str(depth_path),
-            np.full((8, 8), 32768, dtype=np.uint16),
-        )
-        settings = {
-            "baseline": 0.01,
-            "focal_length": 10,
-            "hole_fill_quality": "none",
-        }
-
-        result = stereo_generator._process_single_stereo_pair_from_files(
-            (
-                str(frame_path),
-                str(depth_path),
-                "frame_0000",
-                str(left_path),
-                str(right_path),
-                settings,
-                65535.0,
-            )
-        )
-
-        assert result == "frame_0000"
-        assert left_path.exists()
-        assert right_path.exists()
-
-
-class TestStereoPairGeneratorInit:
-    """Test StereoPairGenerator initialization."""
-
-    def test_init_default(self):
-        """Test default initialization."""
-        generator = StereoPairGenerator()
-        assert generator.verbose is False
-
-    def test_init_verbose(self):
-        """Test initialization with verbose."""
-        generator = StereoPairGenerator(verbose=True)
-        assert generator.verbose is True
-
-
-class TestCreateStereoPairs:
-    """Test create_stereo_pairs method."""
-
-    @pytest.fixture
-    def mock_progress_tracker(self):
-        """Create mock progress tracker."""
-        tracker = Mock()
-        tracker.update_progress = Mock()
-        tracker.send_preview_frame = Mock()
-        return tracker
-
-    @pytest.fixture
-    def temp_frames(self, tmp_path):
-        """Create temporary frame data."""
-        left_dir = tmp_path / "left_frames"
-        right_dir = tmp_path / "right_frames"
-        left_dir.mkdir()
-        right_dir.mkdir()
-
-        frames = np.random.randint(0, 255, (3, 100, 100, 3), dtype=np.uint8)
-        depth_maps = np.random.rand(3, 100, 100)
-        frame_files = [tmp_path / f"frame_{i:04d}.png" for i in range(3)]
-
-        directories = {
-            "left_frames": left_dir,
-            "right_frames": right_dir,
-        }
-
-        return {
-            "frames": frames,
-            "depth_maps": depth_maps,
-            "frame_files": frame_files,
-            "directories": directories,
-        }
-
-    def test_create_stereo_pairs_success(self, temp_frames, mock_progress_tracker):
-        """Test successful stereo pair creation."""
-        generator = StereoPairGenerator()
-
-        settings = {
-            "baseline": 0.065,
-            "focal_length": 1000,
-            "hole_fill_quality": "fast",
-            "keep_intermediates": True,
-        }
-
-        # Mock the multiprocessing Pool
-        mock_pool = Mock()
-        mock_imap_result = [
-            (temp_frames["frames"][i], temp_frames["frames"][i], f"frame_{i:04d}") for i in range(3)
-        ]
-        mock_pool.__enter__ = Mock(return_value=mock_pool)
-        mock_pool.__exit__ = Mock(return_value=False)
-        mock_pool.imap = Mock(return_value=iter(mock_imap_result))
-
-        with patch("multiprocessing.Pool", return_value=mock_pool):
-            result = generator.create_stereo_pairs(
-                temp_frames["frames"],
-                temp_frames["depth_maps"],
-                temp_frames["frame_files"],
-                temp_frames["directories"],
-                settings,
-                mock_progress_tracker,
-            )
-
-        assert result is True
-        mock_pool.imap.assert_called_once()
-
-    def test_create_stereo_pairs_without_intermediates(self, temp_frames, mock_progress_tracker):
-        """Test stereo pair creation without saving intermediates."""
-        generator = StereoPairGenerator()
-
-        settings = {
-            "baseline": 0.065,
-            "focal_length": 1000,
-            "hole_fill_quality": "fast",
-            "keep_intermediates": False,
-        }
-
-        # Mock the multiprocessing Pool
-        mock_pool = Mock()
-        mock_imap_result = [
-            (temp_frames["frames"][i], temp_frames["frames"][i], f"frame_{i:04d}") for i in range(3)
-        ]
-        mock_pool.__enter__ = Mock(return_value=mock_pool)
-        mock_pool.__exit__ = Mock(return_value=False)
-        mock_pool.imap = Mock(return_value=iter(mock_imap_result))
-
-        with patch("multiprocessing.Pool", return_value=mock_pool):
-            result = generator.create_stereo_pairs(
-                temp_frames["frames"],
-                temp_frames["depth_maps"],
-                temp_frames["frame_files"],
-                temp_frames["directories"],
-                settings,
-                mock_progress_tracker,
-            )
-
-        assert result is True
-
-    def test_create_stereo_pairs_without_progress_tracker(self, temp_frames):
-        """CLI processing does not require a web progress tracker."""
-        generator = StereoPairGenerator()
-        settings = {
-            "baseline": 0.065,
-            "focal_length": 1000,
-            "hole_fill_quality": "fast",
-            "keep_intermediates": False,
-        }
-        mock_pool = Mock()
-        mock_pool.__enter__ = Mock(return_value=mock_pool)
-        mock_pool.__exit__ = Mock(return_value=False)
-        mock_pool.imap = Mock(
-            return_value=iter(
-                [
-                    (temp_frames["frames"][i], temp_frames["frames"][i], f"frame_{i:04d}")
-                    for i in range(3)
-                ]
-            )
-        )
-
-        with patch("multiprocessing.Pool", return_value=mock_pool):
-            result = generator.create_stereo_pairs(
-                temp_frames["frames"],
-                temp_frames["depth_maps"],
-                temp_frames["frame_files"],
-                temp_frames["directories"],
-                settings,
-                progress_tracker=None,
-            )
-
-        assert result is True
-
-    def test_create_stereo_pairs_caps_worker_count(self, temp_frames, mock_progress_tracker):
-        """High-core Windows hosts do not spawn enough workers to exhaust virtual memory."""
-        generator = StereoPairGenerator()
-        settings = {
-            "baseline": 0.065,
-            "focal_length": 1000,
-            "hole_fill_quality": "fast",
-            "keep_intermediates": False,
-        }
-        mock_pool = Mock()
-        mock_pool.__enter__ = Mock(return_value=mock_pool)
-        mock_pool.__exit__ = Mock(return_value=False)
-        mock_pool.imap = Mock(return_value=iter([]))
-
-        with (
-            patch("multiprocessing.cpu_count", return_value=32),
-            patch("multiprocessing.Pool", return_value=mock_pool) as pool_factory,
-        ):
-            result = generator.create_stereo_pairs(
-                temp_frames["frames"],
-                temp_frames["depth_maps"],
-                temp_frames["frame_files"],
-                temp_frames["directories"],
-                settings,
-                mock_progress_tracker,
-            )
-
-        assert result is True
-        pool_factory.assert_called_once_with(processes=4)
-
-    def test_create_stereo_pairs_exception_handling(self, temp_frames, mock_progress_tracker):
-        """Test exception handling during stereo pair creation."""
-        generator = StereoPairGenerator()
-
-        settings = {
-            "baseline": 0.065,
-            "focal_length": 1000,
-            "hole_fill_quality": "fast",
-            "keep_intermediates": True,
-        }
-
-        with patch(
-            "src.depth_surge_3d.processing.frames.stereo_generator._process_single_stereo_pair",
-            side_effect=RuntimeError("Test error"),
-        ):
-            result = generator.create_stereo_pairs(
-                temp_frames["frames"],
-                temp_frames["depth_maps"],
-                temp_frames["frame_files"],
-                temp_frames["directories"],
-                settings,
-                mock_progress_tracker,
-            )
-
-        assert result is False
-
-    def test_create_stereo_pairs_from_files_saves_when_retention_is_disabled(
-        self, tmp_path, mock_progress_tracker
-    ):
-        """Temporary stereo files are always written for downstream stages."""
-        frame_dir = tmp_path / "frames"
-        depth_dir = tmp_path / "depth"
-        left_dir = tmp_path / "left"
-        right_dir = tmp_path / "right"
-        for directory in (frame_dir, depth_dir, left_dir, right_dir):
-            directory.mkdir()
-        frame_files = []
-        depth_files = []
-        for i in range(2):
-            frame_path = frame_dir / f"frame_{i:04d}.png"
-            depth_path = depth_dir / f"frame_{i:04d}.png"
-            cv2.imwrite(str(frame_path), np.full((8, 8, 3), 127, dtype=np.uint8))
-            cv2.imwrite(str(depth_path), np.full((8, 8), 32768, dtype=np.uint16))
-            frame_files.append(frame_path)
-            depth_files.append(depth_path)
-        _write_canonical_metadata(depth_dir, [path.name for path in frame_files])
-        settings = {
-            "baseline": 0.01,
-            "focal_length": 10,
-            "hole_fill_quality": "none",
-            "keep_intermediates": False,
-        }
-        pool = Mock()
-        pool.__enter__ = Mock(return_value=pool)
-        pool.__exit__ = Mock(return_value=False)
-        pool.imap.side_effect = lambda function, args: map(function, args)
-
-        with patch("multiprocessing.Pool", return_value=pool):
-            result = StereoPairGenerator().create_stereo_pairs_from_files(
-                frame_files,
-                depth_files,
-                {"left_frames": left_dir, "right_frames": right_dir},
-                settings,
-                mock_progress_tracker,
-            )
-
-        assert result is True
-        assert len(list(left_dir.glob("*.png"))) == 2
-        assert len(list(right_dir.glob("*.png"))) == 2
-
-    def test_create_stereo_pairs_from_files_rejects_missing_canonical_metadata(self, tmp_path):
-        frame_dir = tmp_path / "frames"
-        depth_dir = tmp_path / "depth"
-        left_dir = tmp_path / "left"
-        right_dir = tmp_path / "right"
-        for directory in (frame_dir, depth_dir, left_dir, right_dir):
-            directory.mkdir()
-        frame_path = frame_dir / "frame_0000.png"
-        depth_path = depth_dir / "frame_0000.png"
-        cv2.imwrite(str(frame_path), np.zeros((8, 8, 3), dtype=np.uint8))
-        cv2.imwrite(str(depth_path), np.full((8, 8), 32768, dtype=np.uint16))
-
-        result = StereoPairGenerator().create_stereo_pairs_from_files(
-            [frame_path],
-            [depth_path],
-            {"left_frames": left_dir, "right_frames": right_dir},
-            {"stereo_strength": 2.0, "convergence": 0.5},
-        )
-
-        assert result is False
-
-    def test_canonical_metadata_requires_source_fingerprints(self, tmp_path):
-        frame_path = tmp_path / "frame_0000.png"
-        depth_path = tmp_path / "depth_0000.png"
-        frame_path.write_bytes(b"frame")
-        depth_path.write_bytes(b"depth")
-        _write_canonical_metadata(tmp_path, [frame_path.name])
-        metadata_path = tmp_path / "metadata.json"
-        metadata = json.loads(metadata_path.read_text())
-        metadata.pop("source_raw_fingerprint")
-        metadata.pop("fingerprint")
-        metadata["fingerprint"] = canonical_json_hash(metadata)
-        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-
-        with pytest.raises(ValueError, match="does not match"):
-            StereoPairGenerator._get_canonical_metadata([depth_path], [frame_path])
-
-    def test_canonical_metadata_rejects_depth_file_from_another_directory(self, tmp_path):
-        canonical_dir = tmp_path / "canonical"
-        foreign_dir = tmp_path / "foreign"
-        canonical_dir.mkdir()
-        foreign_dir.mkdir()
-        frame_files = [tmp_path / "frame_0000.png", tmp_path / "frame_0001.png"]
-        depth_files = [
-            canonical_dir / "frame_0000.png",
-            foreign_dir / "frame_0001.png",
-        ]
-        for path in depth_files:
-            cv2.imwrite(str(path), np.zeros((8, 8), dtype=np.uint16))
-        _write_canonical_metadata(canonical_dir, [path.name for path in frame_files])
-
-        with pytest.raises(ValueError, match="path manifest"):
-            StereoPairGenerator._get_canonical_metadata(depth_files, frame_files)
-
-    def test_wrong_native_shape_is_rejected_before_workers_start(self, tmp_path):
-        frame_dir = tmp_path / "frames"
-        depth_dir = tmp_path / "depth"
-        left_dir = tmp_path / "left"
-        right_dir = tmp_path / "right"
-        for directory in (frame_dir, depth_dir, left_dir, right_dir):
-            directory.mkdir()
-        frame_path = frame_dir / "frame_0000.png"
-        depth_path = depth_dir / "frame_0000.png"
-        cv2.imwrite(str(frame_path), np.zeros((8, 8, 3), dtype=np.uint8))
-        cv2.imwrite(str(depth_path), np.zeros((4, 4), dtype=np.uint16))
-        _write_canonical_metadata(depth_dir, [frame_path.name], shape=(8, 8))
-
-        with patch("multiprocessing.Pool") as pool:
-            result = StereoPairGenerator().create_stereo_pairs_from_files(
-                [frame_path],
-                [depth_path],
-                {"left_frames": left_dir, "right_frames": right_dir},
-                {"stereo_strength": 2.0, "convergence": 0.5},
-            )
-
-        assert result is False
-        pool.assert_not_called()
+    assert result is False
+    assert renderer.calls == []
