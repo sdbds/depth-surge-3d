@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import threading
 import time
 import traceback
@@ -33,11 +34,22 @@ CANONICAL_METADATA_REQUIRED_FIELDS = {
     "depth_bounds_fingerprint",
     "native_shape",
 }
+STEREO_STAGE_SCHEMA_VERSION = 1
+STEREO_STAGE_ALGORITHM_VERSION = "torch-forward-splat-v1"
 STEREO_HOST_BUDGET = 512 * 1024 * 1024
 HOST_STEREO_BYTES_PER_PIXEL = 24
 HOST_SLOT_OVERHEAD = 1024 * 1024
 MIN_STEREO_IO_WORKERS = 1
 MAX_STEREO_IO_WORKERS = 16
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
 
 
 def validate_stereo_io_workers(workers: int) -> int:
@@ -590,6 +602,17 @@ class StereoPairGenerator:
             left_dir.mkdir(parents=True, exist_ok=True)
             right_dir.mkdir(parents=True, exist_ok=True)
             metadata = self._get_canonical_metadata(depth_files, frame_files)
+            render_shape = self._read_render_shape(frame_files[0])
+            render_settings = self._render_settings(settings)
+            stage_metadata = self._stereo_stage_metadata(
+                metadata,
+                frame_files,
+                render_shape,
+                render_settings,
+            )
+            stage_changed = self._prepare_stereo_stage(left_dir, right_dir, stage_metadata)
+            if stage_changed:
+                self._reset_downstream_stages(directories)
             work_items, completed = self._build_file_work_items(
                 frame_files,
                 depth_files,
@@ -600,7 +623,6 @@ class StereoPairGenerator:
                 print(f"  Reusing {completed} existing stereo pairs")
                 return True
 
-            render_shape = self._read_render_shape(frame_files[0])
             workers = validate_stereo_io_workers(
                 settings.get("stereo_io_workers", _default_stereo_io_workers())
             )
@@ -609,7 +631,6 @@ class StereoPairGenerator:
                 render_shape[0],
                 workers,
             )
-            render_settings = self._render_settings(settings)
             print(
                 f"  Using {workers} stereo I/O workers with " f"{capacity} bounded frame slots..."
             )
@@ -629,6 +650,80 @@ class StereoPairGenerator:
             print(f"Error creating stereo pairs: {error}")
             traceback.print_exc()
             return False
+
+    def _stereo_stage_metadata(
+        self,
+        canonical_metadata: dict[str, Any],
+        frame_files: list[Path],
+        render_shape: tuple[int, int],
+        render_settings: StereoRenderSettings,
+    ) -> dict[str, Any]:
+        device = getattr(self.renderer, "device", None)
+        device_type = getattr(device, "type", None) or "custom"
+        metadata = {
+            "schema_version": STEREO_STAGE_SCHEMA_VERSION,
+            "algorithm_version": STEREO_STAGE_ALGORITHM_VERSION,
+            "source_canonical_fingerprint": canonical_metadata["fingerprint"],
+            "frame_names": [path.name for path in frame_files],
+            "render_shape": [int(render_shape[0]), int(render_shape[1])],
+            "render_settings": {
+                "stereo_strength": render_settings.stereo_strength,
+                "convergence": render_settings.convergence,
+                "occlusion_fill": render_settings.occlusion_fill,
+            },
+            "renderer_device_type": str(device_type),
+            "encoding": "uint8_png",
+        }
+        metadata["fingerprint"] = canonical_json_hash(metadata)
+        return metadata
+
+    @staticmethod
+    def _prepare_stereo_stage(
+        left_dir: Path,
+        right_dir: Path,
+        expected_metadata: dict[str, Any],
+    ) -> bool:
+        metadata_path = left_dir / "metadata.json"
+        existing_metadata = None
+        try:
+            existing_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        has_outputs = any(left_dir.glob("*.png")) or any(right_dir.glob("*.png"))
+        stage_changed = existing_metadata is not None or has_outputs
+        stage_changed = stage_changed and existing_metadata != expected_metadata
+        if stage_changed:
+            for directory in (left_dir, right_dir):
+                for path in directory.iterdir():
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+            existing_metadata = None
+        if existing_metadata != expected_metadata:
+            _atomic_write_json(metadata_path, expected_metadata)
+        return stage_changed
+
+    @staticmethod
+    def _reset_downstream_stages(directories: dict[str, Path]) -> None:
+        for name in (
+            "left_distorted",
+            "right_distorted",
+            "left_cropped",
+            "right_cropped",
+            "left_upscaled",
+            "right_upscaled",
+            "vr_frames",
+        ):
+            directory = directories.get(name)
+            if directory is None or not directory.is_dir():
+                continue
+            for path in directory.iterdir():
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
 
     def _run_file_pipeline(
         self,

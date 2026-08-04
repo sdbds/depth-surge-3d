@@ -29,6 +29,7 @@ from .operations import (
     # FFmpeg
     verify_ffmpeg_installation,
 )
+from .resume import ResumeReport, ResumeStage, apply_legacy_migration, build_resume_report
 
 __all__ = [
     # Video operations
@@ -51,4 +52,8 @@ __all__ = [
     "analyze_processing_progress",
     # FFmpeg
     "verify_ffmpeg_installation",
+    "ResumeReport",
+    "ResumeStage",
+    "build_resume_report",
+    "apply_legacy_migration",
 ]

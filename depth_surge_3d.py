@@ -30,6 +30,21 @@ from depth_surge_3d.io.operations import (  # noqa: E402
     can_resume_processing,
     load_processing_settings,
 )
+from depth_surge_3d.io.resume import (  # noqa: E402
+    apply_legacy_migration,
+    build_resume_report,
+)
+
+
+def _print_resume_report(report) -> None:
+    """Print the deterministic stage decisions before migration."""
+    print("Resume stage report:")
+    for stage in report.stages:
+        print(
+            f"  - {stage.name}: {stage.disposition} " f"({stage.size_bytes} bytes) - {stage.reason}"
+        )
+    if report.removed_settings:
+        print("  - Removed legacy settings: " + ", ".join(report.removed_settings))
 
 
 def create_argument_parser() -> argparse.ArgumentParser:
@@ -385,7 +400,20 @@ def main():  # noqa: C901
 
         # Extract video path and settings
         video_path = settings_data["metadata"]["source_video"]
-        processing_settings = settings_data["processing_settings"]
+        processing_settings = validate_settings(
+            settings_data["processing_settings"],
+            source="legacy_disk",
+        )
+        processing_settings["migrate_legacy"] = args.migrate_legacy
+
+        try:
+            resume_report = build_resume_report(args.resume, processing_settings)
+            _print_resume_report(resume_report)
+            apply_legacy_migration(resume_report, args.migrate_legacy)
+            processing_settings = resume_report.migrated_settings
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"Cannot migrate resume data: {exc}")
+            return 1
 
         projector = create_stereo_projector(
             model_path=processing_settings.get("model_path"),

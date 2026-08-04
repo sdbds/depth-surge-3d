@@ -13,6 +13,7 @@ For pure functions without side effects, see utils/path_utils.py.
 from __future__ import annotations
 
 import os
+import hashlib
 import json
 import subprocess
 import time
@@ -25,6 +26,7 @@ from ..core.constants import (
     SUPPORTED_IMAGE_FORMATS,
     INTERMEDIATE_DIRS,
 )
+from ..core.settings import PROCESSING_SETTINGS_SCHEMA_VERSION
 from ..utils.path_utils import (
     generate_output_filename,
     format_time_duration,
@@ -389,6 +391,14 @@ def get_available_space(directory: Path) -> int:
             return 0
 
 
+def _hash_file_sha256(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def save_processing_settings(
     output_dir: Path,
     batch_name: str,
@@ -412,11 +422,15 @@ def save_processing_settings(
     Side Effects:
         Writes JSON file to disk
     """
+    source_path = Path(source_video_path)
+    source_video_sha256 = _hash_file_sha256(source_path) if source_path.is_file() else None
     settings_data = {
         "metadata": {
             "batch_name": batch_name,
             "source_video": str(source_video_path),
             "source_video_name": Path(source_video_path).name,
+            "source_video_sha256": source_video_sha256,
+            "settings_schema_version": PROCESSING_SETTINGS_SCHEMA_VERSION,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "created_timestamp": time.time(),
             "project_version": "0.9.0",
@@ -651,7 +665,9 @@ def can_resume_processing(output_dir: Path) -> dict[str, Any]:
         return result
 
 
-def analyze_processing_progress(output_dir: Path, settings_data: dict[str, Any]) -> dict[str, Any]:
+def analyze_processing_progress(  # noqa: C901
+    output_dir: Path, settings_data: dict[str, Any]
+) -> dict[str, Any]:
     """
     Analyze how much processing has been completed.
 

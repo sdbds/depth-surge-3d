@@ -11,6 +11,7 @@ from .constants import DEFAULT_SETTINGS, VALIDATION_RANGES
 
 
 SettingsSource = Literal["explicit", "legacy_disk"]
+PROCESSING_SETTINGS_SCHEMA_VERSION = 2
 REMOVED_SETTING_NAMES = {
     "baseline",
     "focal_length",
@@ -30,6 +31,7 @@ _OPTIONAL_SETTING_NAMES = {
     "seed",
     "processing_mode",
     "video_encoder",
+    "video_path",
     "per_eye_width",
     "per_eye_height",
     "vr_output_width",
@@ -116,7 +118,9 @@ def _validate_dibr_setting(name: str, value: object) -> Any:
     raise ValueError(f"unknown setting: {name}")
 
 
-def _validate_target_fps(value: object) -> int | str:
+def _validate_target_fps(value: object) -> int | str | None:
+    if value is None:
+        return None
     if isinstance(value, str):
         if value == "original" or value.isdigit() and 1 <= int(value) <= 120:
             return value
@@ -190,7 +194,7 @@ def _validate_optional_setting(name: str, value: object) -> Any:
         return _validate_optional_integer(name, value)
     if name in {"source_fps", "preview_update_interval"}:
         return _number(name, value, 0.0, 1_000_000.0)
-    if name in {"start_time", "end_time", "model_path", "model_size"}:
+    if name in {"start_time", "end_time", "model_path", "model_size", "video_path"}:
         return _validate_optional_text(name, value)
     if name == "depth_model_version":
         return _choice(name, value, {"v2", "v3", "see_through"})

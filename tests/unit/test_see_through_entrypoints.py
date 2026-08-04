@@ -194,6 +194,41 @@ def test_web_process_rejects_removed_explicit_settings(tmp_path):
     start.assert_not_called()
 
 
+def test_web_resume_requires_current_request_to_authorize_legacy_delete(tmp_path):
+    import app as web_app
+
+    output_dir = tmp_path / "job"
+    output_dir.mkdir()
+    source_video = output_dir / "source.mp4"
+    source_video.touch()
+    web_app.current_processing.update(
+        {"active": False, "session_id": None, "thread": None, "stop_requested": False}
+    )
+    report = MagicMock()
+    report.migrated_settings = {"migrate_legacy": "archive"}
+    report.to_dict.return_value = {"preserved_stages": ["frames"]}
+
+    with (
+        patch.object(web_app, "find_source_video", return_value=source_video),
+        patch.object(
+            web_app,
+            "detect_resume_settings",
+            return_value={"migrate_legacy": "delete"},
+        ),
+        patch.object(web_app, "build_resume_report", return_value=report) as build,
+        patch.object(web_app, "apply_legacy_migration") as migrate,
+        patch.object(web_app.socketio, "start_background_task", return_value=MagicMock()),
+    ):
+        response = web_app.app.test_client().post(
+            "/resume",
+            json={"output_dir": str(output_dir)},
+        )
+
+    assert response.status_code == 200
+    assert build.call_args.args[1]["migrate_legacy"] == "archive"
+    migrate.assert_called_once_with(report, "archive")
+
+
 def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp_path, monkeypatch):
     """CLI resume must rebuild the saved estimator and pass only process-video options."""
     cli = _load_cli_module()

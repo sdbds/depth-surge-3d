@@ -263,12 +263,19 @@ def test_file_pipeline_always_writes_downstream_frames(tmp_path: Path) -> None:
 
 def test_resume_skips_only_complete_stereo_pairs(tmp_path: Path) -> None:
     frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=2)
+    assert StereoPairGenerator(renderer=_FakeRenderer()).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(),
+    )
     complete_left = directories["left_frames"] / "frame_0000.png"
     complete_right = directories["right_frames"] / "frame_0000.png"
     singleton_left = directories["left_frames"] / "frame_0001.png"
     assert cv2.imwrite(str(complete_left), np.full((8, 8, 3), 7, dtype=np.uint8))
     assert cv2.imwrite(str(complete_right), np.full((8, 8, 3), 8, dtype=np.uint8))
     assert cv2.imwrite(str(singleton_left), np.full((8, 8, 3), 9, dtype=np.uint8))
+    (directories["right_frames"] / "frame_0001.png").unlink()
     renderer = _FakeRenderer()
 
     result = StereoPairGenerator(renderer=renderer).create_stereo_pairs_from_files(
@@ -284,6 +291,42 @@ def test_resume_skips_only_complete_stereo_pairs(tmp_path: Path) -> None:
     assert np.all(cv2.imread(str(complete_right)) == 8)
     assert np.all(cv2.imread(str(singleton_left)) == 22)
     assert (directories["right_frames"] / "frame_0001.png").is_file()
+
+
+def test_canonical_fingerprint_change_invalidates_existing_stereo_pairs(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=2)
+    directories["vr_frames"] = tmp_path / "vr"
+    directories["vr_frames"].mkdir()
+    assert StereoPairGenerator(renderer=_FakeRenderer()).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(),
+    )
+    canonical_metadata_path = depth_files[0].parent / "metadata.json"
+    canonical_metadata = json.loads(canonical_metadata_path.read_text(encoding="utf-8"))
+    canonical_metadata["source_raw_fingerprint"] = "different-model-and-source"
+    canonical_metadata.pop("fingerprint")
+    canonical_metadata["fingerprint"] = canonical_json_hash(canonical_metadata)
+    canonical_metadata_path.write_text(json.dumps(canonical_metadata), encoding="utf-8")
+    stale_vr_frame = directories["vr_frames"] / "frame_0000.png"
+    stale_vr_frame.write_bytes(b"stale downstream output")
+    renderer = _FakeRenderer()
+
+    result = StereoPairGenerator(renderer=renderer).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(),
+    )
+
+    assert result is True
+    assert len(renderer.calls) == 2
+    stage_metadata = json.loads(
+        (directories["left_frames"] / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert stage_metadata["source_canonical_fingerprint"] == canonical_metadata["fingerprint"]
+    assert not stale_vr_frame.exists()
 
 
 def test_decode_failure_releases_every_lifecycle_permit(tmp_path: Path) -> None:

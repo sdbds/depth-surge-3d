@@ -79,6 +79,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from depth_surge_3d.rendering import create_stereo_projector  # noqa: E402
 from depth_surge_3d.processing import VideoProcessor  # noqa: E402
+from depth_surge_3d.io.resume import apply_legacy_migration, build_resume_report  # noqa: E402
 
 # Global flags and state
 VERBOSE = False
@@ -88,6 +89,8 @@ ACTIVE_PROCESSES = set()
 
 def _validate_web_settings(settings: dict[str, Any], *, source: str) -> dict[str, Any]:
     """Validate Web settings while preserving null as source-frame FPS."""
+    if not isinstance(settings, dict):
+        raise TypeError("settings values must be a dictionary")
     preserve_source_fps = settings.get("target_fps", object()) is None
     values = dict(settings)
     if preserve_source_fps:
@@ -1249,6 +1252,16 @@ def resume_processing():
 
     data = request.json
     output_dir = data.get("output_dir")
+    migrate_legacy = data.get("migrate_legacy", "archive")
+
+    try:
+        validated_migration = validate_settings(
+            {"migrate_legacy": migrate_legacy},
+            source="explicit",
+        )
+        migrate_legacy = validated_migration["migrate_legacy"]
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
 
     if not output_dir:
         return jsonify({"error": "No output directory provided"}), 400
@@ -1268,6 +1281,14 @@ def resume_processing():
 
     # Try to detect settings from existing files/directories
     settings = detect_resume_settings(output_path)
+    settings["migrate_legacy"] = migrate_legacy
+
+    try:
+        resume_report = build_resume_report(output_path, settings)
+        apply_legacy_migration(resume_report, migrate_legacy)
+        settings = resume_report.migrated_settings
+    except (OSError, TypeError, ValueError) as exc:
+        return jsonify({"error": f"Could not migrate resume data: {exc}"}), 409
 
     # Generate session ID
     session_id = str(uuid.uuid4())
@@ -1278,7 +1299,14 @@ def resume_processing():
     )
     current_processing["thread"] = thread
 
-    return jsonify({"success": True, "session_id": session_id, "output_dir": str(output_path)})
+    return jsonify(
+        {
+            "success": True,
+            "session_id": session_id,
+            "output_dir": str(output_path),
+            "resume_report": resume_report.to_dict(),
+        }
+    )
 
 
 def detect_resume_settings(output_path):

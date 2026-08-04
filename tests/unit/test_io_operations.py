@@ -758,6 +758,27 @@ class TestSaveProcessingSettings:
         # Should still return the path despite both failures
         assert result == Path("/tmp/batch1-settings.json")
 
+    def test_saved_settings_include_current_schema_and_source_fingerprint(self, tmp_path):
+        """New settings files identify both the schema and exact source bytes."""
+        import hashlib
+        import json
+
+        from src.depth_surge_3d.core.settings import PROCESSING_SETTINGS_SCHEMA_VERSION
+        from src.depth_surge_3d.io.operations import save_processing_settings
+
+        source = tmp_path / "source.mp4"
+        source.write_bytes(b"source-video")
+        settings = {"vr_format": "side_by_side", "vr_resolution": "auto"}
+
+        path = save_processing_settings(tmp_path, "job", settings, {}, str(source))
+        saved = json.loads(path.read_text(encoding="utf-8"))
+
+        assert saved["metadata"]["settings_schema_version"] == PROCESSING_SETTINGS_SCHEMA_VERSION
+        assert (
+            saved["metadata"]["source_video_sha256"]
+            == hashlib.sha256(source.read_bytes()).hexdigest()
+        )
+
 
 class TestLoadProcessingSettings:
     """Test load_processing_settings function."""
