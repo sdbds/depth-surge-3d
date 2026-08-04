@@ -2,7 +2,7 @@
 
 ## Status
 
-Revision 4, updated after external review on 2026-08-04. The user approved a
+Revision 5, updated after external review on 2026-08-04. The user approved a
 Torch/CUDA-first renderer and explicitly rejected backward compatibility in the
 final state. Implementation is split into three independently verifiable
 commits so contract, geometry, and persistence failures can be isolated.
@@ -34,8 +34,8 @@ which can modify legitimate source content while missing actual occlusions.
 - Fill horizontal DIBR disocclusions on the GPU without a CPU inpainting
   bottleneck.
 - Give preview and full processing one renderer and one setting schema.
-- Bound temporary GPU memory for 4K rendering and bound the legacy in-memory
-  depth API on host memory.
+- Bound temporary GPU memory for 4K rendering and host memory for both the
+  file-backed stereo pipeline and the legacy in-memory depth API.
 
 ## Non-goals
 
@@ -173,14 +173,35 @@ Each native-resolution map is then written atomically as a zlib-compressed
 `.npz` file in `02_depth_raw`. Float16 is a storage encoding only: canonical
 conversion reads it into float32 before reciprocal, negation, sampling,
 percentile, or arithmetic. The directory's `metadata.json` records
-representation, model fingerprint, frame count, native dimensions, selected
-storage dtype, compression, and schema version.
+representation, model fingerprint, frame count, native dimensions, requested
+and selected storage dtype, storage provenance, compression, schema version,
+and `storage_status: ready | promoting`.
 
-Later finite values outside the selected dtype's representable range fail with
-the offending frame and instructions to restart the raw stage with
-`raw_storage_dtype=float32`; they are never silently clipped. Original frames
-and scene analysis remain reusable. Non-finite model values remain permitted and
-canonicalize as invalid.
+A later finite value outside float16 range is never clipped and does not force
+completed frames through model inference again. The only permitted in-place
+fingerprint transition is float16-to-float32 storage promotion while every
+semantic model, source, preprocessing, representation, and shape field remains
+identical:
+
+1. Stop before committing the offending frame and preflight the final float32
+   directory size plus one atomic-rewrite payload.
+2. Atomically set `storage_status: promoting`, preserve the prior fingerprint,
+   and set the target dtype and provenance to
+   `promoted_float16_to_float32`.
+3. In frame-name order, load each completed float16 file and atomically rewrite
+   it as float32. This conversion is exact with respect to the already stored
+   float16 value and invokes no estimator.
+4. Validate that every completed file is float32, atomically publish the new
+   ready fingerprint, then write the held offending chunk as float32 and
+   continue inference.
+
+A crash during promotion leaves a resumable `promoting` directory; resume scans
+file dtypes and rewrites only remaining float16 files before inference can
+continue. Mixed dtypes are valid only inside this transaction and are never
+accepted by sampling or canonicalization. `auto` promotes automatically. An
+explicit float16 request stops with instructions to resume using float32, which
+enters the same promotion path rather than deleting completed raw files.
+Non-finite model values remain permitted and canonicalize as invalid.
 
 Bounds are deterministic and bounded-memory:
 
@@ -224,7 +245,11 @@ representation-specific score rules, maps persisted scene bounds to `[0,1]`,
 clips outliers, and sets invalid pixels to the neutral midpoint `0.5`. Output is
 float32 with `0=far`, `0.5=neutral`, and `1=near`.
 
-Canonical maps are encoded as uint16 PNG in `03_disparity_maps`.
+Canonical maps are encoded deterministically as
+`np.rint(np.clip(r, 0, 1) * 65535).astype(np.uint16)` in
+`03_disparity_maps`; decoding converts to float32 and divides by `65535.0`.
+Thus canonical float32 midpoint is exactly `0.5`, while its encoded round trip
+is `32768 / 65535` and is compared with one-quantum tolerance.
 `DepthProcessor`, not the global cache, owns and atomically writes
 `03_disparity_maps/metadata.json`. It contains:
 
@@ -253,10 +278,12 @@ free space covers the expected peak:
   write overlap.
 
 `storage_bytes` is 2 or 4 for an explicit dtype; the initial `auto` check assumes
-4. The estimate intentionally assumes no compression benefit. After the first
-chunk reveals actual native dimensions and selected dtype, repeat the check
-before writing that chunk or processing remaining frames. Failure reports
-required, available, and output-path bytes before more model work is performed.
+4 so a later promotion is budgeted conservatively. The estimate intentionally
+assumes no compression benefit. After the first chunk reveals actual native
+dimensions and selected dtype, repeat the check before writing that chunk or
+processing remaining frames. Promotion performs its own four-byte preflight
+before mutating metadata. Failure reports required, available, and output-path
+bytes before more model work is performed.
 
 When `keep_intermediates=false`, each raw `.npz` is deleted only after its
 canonical PNG has been atomically written, read back, and validated against
@@ -283,8 +310,10 @@ Add:
 - `occlusion_fill`: `none` or `background`. Default `background`.
 - Scene-analysis settings described above in the advanced settings section.
 - `raw_storage_dtype`: `auto`, `float16`, or `float32`. Default `auto`.
-- `stereo_io_workers`: positive integer. Default is
+- `stereo_io_workers`: integer in `1..16`. Default is
   `min(4, max(1, cpu_count - 2))`.
+- `migrate_legacy`: `archive` or `delete`. Default `archive`; deletion must be
+  supplied explicitly in the current CLI, Web, or configuration request.
 
 For canonical disparity `r`, frame width `w`, strength `s`, and convergence
 `c`, total binocular disparity is:
@@ -315,15 +344,17 @@ bilinear forward projection:
 1. Project each source pixel to the two neighboring integer target columns.
 2. Discard out-of-frame contributions instead of clipping or reflecting them.
 3. Let only bilinear contributions with weight greater than or equal to `0.5`
-   vote in the target z-buffer. This is the nearest target column for each
-   source pixel and prevents a tiny foreground tail from owning the background
-   side of a depth edge.
-4. Build the target z-buffer for those voters with `scatter_reduce(amax)` over
-   total signed pixel disparity `d`, where larger `d` represents a nearer
-   surface.
-5. Keep all contributions, including low-weight antialiasing tails, only when
-   their total signed pixel disparity is within `0.25` pixel of the winning
-   target contribution.
+   cast the primary target-depth vote. This is the nearest target column for
+   each source pixel and prevents a tiny foreground tail from becoming a
+   full-coverage z-buffer owner.
+4. For each target pixel, define `z_win` as the voters' `scatter_reduce(amax)`
+   over total signed pixel disparity `d`, where larger `d` is nearer. If that
+   target has contributions but no voter, fall back to the `amax` over all its
+   contributions. A target with no contribution remains invalid.
+5. Apply one-sided visibility to every contribution, including low-weight
+   antialiasing tails: keep it when `d >= z_win - 0.25`. Nearer fractional
+   coverage may blend over a farther voter; farther surfaces cannot bleed
+   through a nearer winner.
 6. Accumulate visible colour and bilinear weights with `scatter_add`.
 7. Divide colour by accumulated weight and mark zero-weight pixels invalid.
 
@@ -331,8 +362,10 @@ Both eyes use the same z-key `d`. The eye sign affects only target coordinate:
 left uses `+d/2` and right uses `-d/2`. The right eye must never use `-d` as its
 z-key.
 
-The visibility tolerance is defined in projected pixel units, not canonical
-depth units, so its meaning is stable across scenes and uint16 round trips.
+The one-sided visibility tolerance is defined in projected pixel units, not
+canonical depth units, so its meaning is stable across scenes and uint16 round
+trips. The no-voter fallback keeps stretched sloped surfaces inside projected
+support valid instead of misclassifying their antialiasing tails as holes.
 When `stereo_strength=0`, all samples have zero disparity and no depth-based
 occlusion is applied.
 
@@ -354,15 +387,22 @@ one-eye logical live-set estimate per source pixel is:
 | Logical subtotal | 118 |
 
 The implementation constant is `SPLAT_BYTES_PER_PIXEL=192`, reserving 74 bytes
-per pixel for Torch scatter temporaries, allocator alignment, and bookkeeping.
+per pixel for Torch scatter temporaries, horizontal-fill propagation/gather
+buffers, allocator alignment, and bookkeeping. Splat contribution buffers are
+released or reused before fill, so these phases contribute their maximum rather
+than their sum.
 Band rows are
 `max(1, floor(256 MiB / (render_width * SPLAT_BYTES_PER_PIXEL)))`, capped at
 render height. The result does not depend on runtime free-memory queries. CUDA
 out-of-memory retries the frame once with half the calculated band height.
 
-`StereoRenderResult` contains left image, right image, left/right valid masks,
-left/right hole masks, and internal projected-disparity buffers. Masks derive
-from accumulated splat weight, never image colour.
+Background fill runs before each completed row band leaves the device. Each
+band's colour and masks are copied into preallocated host arrays, then its
+z-buffer, projected disparity, propagation indexes, and fill temporaries are
+released or reused for the next band. There are no full-frame GPU-resident
+buffers. `StereoRenderResult` contains only host-resident left/right images and
+left/right valid and hole masks; projected disparity is an internal band-scoped
+buffer. Masks derive from accumulated visible splat weight, never image colour.
 
 ## GPU Background Fill
 
@@ -391,11 +431,33 @@ mask, and OpenCV stereo inpainting helpers after all callers migrate.
 
 CUDA rendering stays in the main process. No worker process imports or touches
 CUDA. A bounded producer/consumer pipeline overlaps CPU frame decoding,
-main-process GPU rendering, and CPU PNG writing. `stereo_io_workers` controls the
-OpenCV I/O thread count and queue capacity is `2 * stereo_io_workers`, not a
-fixed slot count. Worker threads handle only OpenCV I/O and numpy arrays. GPU
-background fill removes the former serial CPU inpainting stage. Queue wait time
-is measured so I/O backpressure is visible.
+main-process GPU rendering, and CPU PNG writing. Worker threads handle only
+OpenCV I/O and numpy arrays. GPU background fill removes the former serial CPU
+inpainting stage.
+
+The production pipeline has a fixed `STEREO_HOST_BUDGET=512 MiB` and a
+conservative `HOST_STEREO_BYTES_PER_PIXEL=16`. One permit covers a source RGB
+frame, two uint8 eye outputs, four boolean masks, PNG encoding overlap, and
+array/task overhead for the frame's complete lifetime. The 16-byte estimate is
+`3 source + 6 eye output + 4 mask + 3 reserve` bytes per pixel. Source and mask
+payloads are released before writer encoding, freeing seven bytes per pixel for
+encoded payloads; each slot also reserves 1 MiB of fixed task/codec overhead.
+Define:
+
+`slot_bytes = render_width * render_height * HOST_STEREO_BYTES_PER_PIXEL + 1 MiB`
+
+Permit count is:
+
+`min(2 * stereo_io_workers, floor(STEREO_HOST_BUDGET /
+      slot_bytes))`
+
+It must be at least one or the frame is rejected with required bytes. Queue
+capacity equals this count, and all decode and write queues additionally share
+the same lifecycle semaphore. One permit is acquired before decode and released
+only after both eye writes complete, so queued and actively decoded, rendered,
+or encoded frames share the same bound. More workers cannot increase resident
+frame payload beyond this permit count. Queue wait and permit wait are measured
+so I/O and memory backpressure are visible.
 
 CPU mode invokes the same Torch renderer on `torch.device("cpu")` and is the
 reference path for exact tests. CUDA parity tests use numerical tolerances.
@@ -415,12 +477,17 @@ Raw metadata contains and resume validates one canonical model fingerprint over:
 - weight-file SHA-256 or immutable hub artifact digest;
 - model size, metric flag, and declared `DepthRepresentation`;
 - native depth resolution and preprocessing algorithm version;
-- inference precision settings and selected `raw_storage_dtype`.
+- inference precision settings, requested and selected `raw_storage_dtype`, and
+  storage provenance (`native_float16`, `native_float32`, or
+  `promoted_float16_to_float32`).
 
 Partial raw files are reusable by frame name only when the complete fingerprint,
 source-frame fingerprint, schema, and expected native shape match. Any mismatch
-invalidates all of `02_depth_raw`; mixing raw maps from different fingerprints
-inside one scene is forbidden. The same fingerprint participates in global
+invalidates all of `02_depth_raw` except the explicitly transactional,
+storage-only float16-to-float32 promotion defined above. A promoted fingerprint
+is deliberately distinct from native float32 because widening does not recover
+precision already quantized by float16. A ready directory never mixes raw maps
+from different fingerprints. The same final fingerprint participates in global
 depth-cache keys and local canonical-metadata fingerprints.
 
 ## Cache and Resume
@@ -433,9 +500,11 @@ Increment stage and depth-cache schemas. Resume validation operates per stage:
 - Old or missing scene metadata invalidates `01_scene_data` and every later
   stage. A schema-valid `status: candidate` manifest resumes scene finalization
   but is never accepted by canonicalization.
-- Missing or old raw-depth metadata, or any model/source/shape/storage
-  fingerprint mismatch, invalidates all of `02_depth_raw` and every later
-  stage. A partial directory is resumed only after that complete validation.
+- Missing or old raw-depth metadata, or any model/source/shape fingerprint
+  mismatch, invalidates all of `02_depth_raw` and every later stage. A storage
+  mismatch is reusable only when it qualifies for the explicit
+  float16-to-float32 promotion; every other storage mismatch invalidates it. A
+  partial directory is resumed only after this complete validation.
 - Old or missing canonical metadata invalidates `03_disparity_maps` and every
   later stage.
 - Stereo setting changes invalidate only stereo and later stages.
@@ -451,12 +520,16 @@ Removed settings have two distinct validation paths:
 
 Legacy `02_depth_maps` is an explicitly known invalid stage, as are its old
 stereo and downstream directories. The resume report lists each directory and
-size before mutation. With `keep_intermediates=true`, invalid generated
-directories move under `legacy_v1/<original-directory-name>` and are excluded
-from stage discovery. With `keep_intermediates=false`, they are deleted after
-the report is accepted. A pre-existing archive destination is an error rather
-than an overwrite. `00_original_frames` is never archived or deleted by this
-migration when its source fingerprint and frame manifest remain valid.
+size before mutation. Legacy migration never prompts or waits for acceptance.
+The default `migrate_legacy=archive`, including every non-interactive run, moves
+invalid generated directories under `legacy_v1/<original-directory-name>` and
+excludes them from stage discovery. Deletion occurs only when
+`migrate_legacy=delete` is supplied explicitly in the current invocation. A
+value inherited from legacy disk settings cannot authorize deletion. A
+pre-existing archive destination is an error rather than an overwrite.
+`keep_intermediates` controls current-schema raw retention only and does not
+authorize legacy deletion. `00_original_frames` is never archived or deleted by
+this migration when its source fingerprint and frame manifest remain valid.
 
 The user-facing resume message lists preserved and invalidated stages. No
 heuristic migration of old depth PNGs is permitted because they do not record
@@ -484,6 +557,12 @@ fingerprinted final bounds.
 - Metadata writes use a temporary file followed by atomic replacement.
 
 ## Three Verifiable Implementation Slices
+
+New settings land with the slice that owns their behavior. Slice 1 implements
+scene controls and `raw_storage_dtype`; Slice 2 implements stereo controls and
+`stereo_io_workers`; Slice 3 implements `migrate_legacy` and removes obsolete
+names from every entry point. Slice 3 does not defer settings required to verify
+Slices 1 and 2.
 
 ### Slice 1: Depth Contract and Canonical Disparity
 
@@ -526,7 +605,8 @@ Tests are written before their production changes and cover:
 - candidate manifests cannot canonicalize, including a simulated crash after
   final bounds are written but before the final manifest replacement;
 - clean, chunked, and resumed canonical output identity;
-- empty and flat scenes canonicalize to constant `0.5`;
+- empty and flat scenes produce exact float32 canonical `0.5`; uint16 PNG
+  round-trip tests expect `32768 / 65535` within one encoding quantum;
 - native-resolution float16 compressed raw round trips through float32
   canonicalization without source-frame upsampling;
 - disk-budget refusal before inference and raw retention/cleanup after validated
@@ -536,8 +616,11 @@ Tests are written before their production changes and cover:
 - a non-symmetric sign test asserting a near foreground centroid has
   `x_left > x_right`;
 - bilinear weights, out-of-frame holes, and a near-surface z-buffer victory;
-- a vertical near/far step where the background-side boundary column remains
-  background colour despite a low-weight foreground splat tail;
+- a vertical near/far step where a low-weight foreground tail produces the
+  weighted result `(w_bg*C_bg + w_fg*C_fg) / (w_bg + w_fg)` over the background
+  voter rather than replacing the column with pure foreground;
+- a full-range disparity ramp spanning 20 source pixels whose interior projected
+  support contains no hole, including target columns with no primary voter;
 - left and right eyes independently choose the near surface with shared `d` as
   z-key;
 - pixel-unit visibility tolerance across different scene bounds and uint16
@@ -549,18 +632,24 @@ Tests are written before their production changes and cover:
 - GPU background fill respects its derived run-width limit and documents the
   constant-strip limitation;
 - CPU/CUDA parity when CUDA is available;
-- row-band equivalence, deterministic band calculation, and OOM retry;
+- row-band equivalence, in-band background fill, absence of full-frame GPU
+  intermediates, deterministic band calculation, and OOM retry;
 - the documented int64 scatter-index allocation is included in the 192-byte
   row-band budget;
-- 512 MiB in-memory depth rejection;
-- first-chunk raw dtype selection, explicit float16 rejection, and later-frame
-  overflow guidance;
+- 512 MiB stereo-pipeline permit accounting under default and maximum worker
+  counts, plus 512 MiB legacy in-memory depth rejection;
+- first-chunk raw dtype selection, explicit float16 rejection, atomic
+  float16-to-float32 promotion without reinference, and crash-resume during
+  promotion;
+- uninterrupted and crash-resumed promotion produce byte-identical canonical
+  output, and completed frame names never re-enter the estimator;
 - raw resume rejection on model, weight, preprocessing, representation, shape,
-  or storage-dtype fingerprint mismatch;
+  or any non-promotable storage fingerprint mismatch;
 - resume preserves `00_original_frames` while invalidating incompatible depth
   and downstream stages;
 - legacy disk settings are migrated while explicitly supplied removed settings
-  fail, and legacy `02_depth_maps` follows the reported archive/delete policy;
+  fail; unattended legacy migration archives by default, and deletion requires
+  an explicit current-invocation setting;
 - projector, file-backed processing, preview, CLI, Web, cache, and resume all
   use the final setting schema;
 - removed settings and old render helpers are absent from production code,
@@ -579,11 +668,13 @@ thresholds.
   a relative-depth near value of exactly zero remains valid.
 - No estimator performs per-frame min/max normalization.
 - Canonical output is identical across a resume boundary and a clean run.
-- Canonicalization cannot start until all raw frames exist and the scene
-  manifest has `status: final` with matching final-bounds fingerprint.
+- Canonicalization cannot start until all raw frames exist, raw metadata has
+  `storage_status: ready`, and the scene manifest has `status: final` with a
+  matching final-bounds fingerprint.
 - Scene merging is deterministic at zero and nonzero span, and every final
   bound is recomputed from the fixed-point union of persisted samples.
-- Empty and flat scenes produce constant canonical `0.5`.
+- Empty and flat scenes produce exact float32 canonical `0.5`; encoded maps use
+  the documented uint16 midpoint and quantization tolerance.
 - No production stereo path calls inverse remap or colour-derived hole masking.
 - Canonical disparity is bilinearly resized to render dimensions before `d` is
   calculated with render target width.
@@ -591,6 +682,8 @@ thresholds.
   both eyes using common z-key `d`.
 - A low-weight foreground tail cannot overwrite the background-side pixel of a
   depth edge.
+- A stretched 20-pixel full-range disparity ramp has no holes inside its
+  projected support, including columns without a primary depth voter.
 - Valid black source content is unchanged unless its explicit splat mask is
   invalid.
 - Background fill never crosses its derived maximum gap width; wider gaps stay
@@ -599,12 +692,16 @@ thresholds.
 - Raw depth is stored compressed at native model resolution, and insufficient
   disk space fails before long-running inference begins.
 - Partial raw resume requires an exact model/source/shape/storage fingerprint;
-  raw dtype is selected and persisted before the first raw file is committed.
+  the sole storage-only exception atomically promotes completed float16 files
+  to a distinct float32 provenance without rerunning their estimator frames.
 - Resume with the previous schema preserves valid original frames and rebuilds
   only scene/depth/downstream stages; removed legacy settings and
   `02_depth_maps` follow the reported migration policy.
-- The row-band budget includes int64 scatter indexes, and I/O capacity derives
-  from `stereo_io_workers` rather than a fixed two-slot queue.
+- Unattended legacy migration archives by default and never deletes generated
+  data without an explicit current-invocation `migrate_legacy=delete`.
+- The row-band budget includes int64 scatter indexes and in-band fill, with no
+  full-frame GPU intermediate. Total queued and active stereo frame payload is
+  bounded by the 512 MiB host permit budget regardless of worker count.
 - The 1080p/4K benchmark reports both GPU render measurements and end-to-end
   wall-clock throughput, including writer utilization and queue stalls.
 - CPU tests pass and CUDA-specific tests pass on the available NVIDIA GPU.
