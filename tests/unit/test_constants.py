@@ -68,16 +68,17 @@ class TestConstants:
 
     def test_validation_ranges_valid(self):
         """Test validation ranges are sensible."""
-        assert VALIDATION_RANGES["baseline"][0] < VALIDATION_RANGES["baseline"][1]
-        assert VALIDATION_RANGES["focal_length"][0] < VALIDATION_RANGES["focal_length"][1]
+        assert VALIDATION_RANGES["stereo_strength"][0] < VALIDATION_RANGES["stereo_strength"][1]
+        assert VALIDATION_RANGES["convergence"][0] < VALIDATION_RANGES["convergence"][1]
         assert VALIDATION_RANGES["fisheye_fov"][0] < VALIDATION_RANGES["fisheye_fov"][1]
         assert VALIDATION_RANGES["target_fps"][0] < VALIDATION_RANGES["target_fps"][1]
 
     def test_default_settings_complete(self):
         """Test default settings contain all required keys."""
         required_keys = [
-            "baseline",
-            "focal_length",
+            "stereo_strength",
+            "convergence",
+            "occlusion_fill",
             "vr_format",
             "vr_resolution",
             "preserve_audio",

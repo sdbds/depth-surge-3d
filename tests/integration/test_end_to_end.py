@@ -60,7 +60,7 @@ class TestEndToEnd:
             assert height > 0
 
         # Check default settings completeness
-        required_keys = ["baseline", "focal_length", "vr_format"]
+        required_keys = ["stereo_strength", "convergence", "occlusion_fill", "vr_format"]
         for key in required_keys:
             assert key in DEFAULT_SETTINGS
 

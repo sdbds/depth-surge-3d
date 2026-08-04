@@ -7,6 +7,8 @@ values used throughout the application.
 
 from __future__ import annotations
 
+import os
+
 # Version and project info
 PROJECT_NAME = "Depth Surge 3D"
 DEFAULT_OUTPUT_DIR = "./output"
@@ -45,15 +47,21 @@ MODEL_CONFIGS = {
 
 # Default processing settings
 DEFAULT_SETTINGS = {
-    "baseline": 0.065,  # meters - average human IPD
-    "focal_length": 1000,
+    "stereo_strength": 2.0,
+    "convergence": 0.5,
+    "occlusion_fill": "background",
+    "scene_detection": True,
+    "scene_cut_threshold": 0.55,
+    "min_scene_frames": 8,
+    "raw_storage_dtype": "auto",
+    "stereo_io_workers": min(4, max(1, (os.cpu_count() or 1) - 2)),
+    "migrate_legacy": "archive",
     "vr_format": "side_by_side",
     "vr_resolution": "auto",
     "fisheye_projection": "stereographic",
     "fisheye_fov": 180,  # degrees - full 180° dome view
     "crop_factor": 1.0,  # default: 1.0 (no crop)
     "fisheye_crop_factor": 0.7,  # default: 0.7 (zoom into center ~70%, crops ~20% each edge to hide distortion)
-    "hole_fill_quality": "fast",
     "super_sample": "auto",
     "target_fps": 60,
     "min_resolution": "1080p",
@@ -367,8 +375,11 @@ ERROR_MESSAGES = {
 
 # Validation ranges
 VALIDATION_RANGES = {
-    "baseline": (0.01, 0.5),  # meters
-    "focal_length": (100, 5000),  # pixels
+    "stereo_strength": (0.0, 5.0),
+    "convergence": (0.0, 1.0),
+    "scene_cut_threshold": (0.0, 1.0),
+    "min_scene_frames": (1, 1_000_000),
+    "stereo_io_workers": (1, 16),
     "fisheye_fov": (MIN_FOV, MAX_FOV),  # degrees (75-180)
     "crop_factor": (0.5, 1.0),  # ratio for non-fisheye crop
     "fisheye_crop_factor": (
