@@ -3,10 +3,11 @@
 import numpy as np
 import pytest
 
-from src.depth_surge_3d.inference.depth.types import DepthRepresentation
+from src.depth_surge_3d.inference.depth.types import DepthBatch, DepthRepresentation
 from src.depth_surge_3d.processing.frames.depth_normalizer import (
     SceneDepthBounds,
     canonicalize_depth,
+    canonicalize_single_scene,
     decode_canonical_png,
     depth_to_score,
     encode_canonical_png,
@@ -61,6 +62,31 @@ def test_flat_bounds_produce_exact_neutral_midpoint() -> None:
     )
 
     np.testing.assert_array_equal(canonical, np.full_like(values, 0.5))
+
+
+def test_single_scene_canonicalization_uses_explicit_representation() -> None:
+    batch = DepthBatch(
+        values=np.array([[[0.0, 0.25, 0.75, 1.0]]], dtype=np.float32),
+        representation=DepthRepresentation.RELATIVE_DEPTH,
+    )
+
+    canonical = canonicalize_single_scene(batch)
+
+    assert canonical.shape == batch.values.shape
+    assert canonical.dtype == np.float32
+    assert canonical[0, 0, 0] == 1.0
+    assert canonical[0, 0, -1] == 0.0
+
+
+def test_single_scene_flat_depth_is_neutral() -> None:
+    batch = DepthBatch(
+        values=np.full((1, 3, 4), 7.0, dtype=np.float32),
+        representation=DepthRepresentation.INVERSE_DEPTH,
+    )
+
+    canonical = canonicalize_single_scene(batch)
+
+    np.testing.assert_array_equal(canonical, np.full(batch.values.shape, 0.5, np.float32))
 
 
 def test_scene_bounds_reject_reversed_or_nonfinite_ranges() -> None:

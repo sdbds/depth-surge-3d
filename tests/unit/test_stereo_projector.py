@@ -3,10 +3,28 @@
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import numpy as np
+
+from src.depth_surge_3d.inference.depth.types import DepthBatch, DepthRepresentation
 from src.depth_surge_3d.rendering import (
+    StereoRenderResult,
+    StereoRenderSettings,
     StereoProjector,
     create_stereo_projector,
 )
+
+
+def _stereo_result(image: np.ndarray) -> StereoRenderResult:
+    valid = np.ones(image.shape[:2], dtype=np.bool_)
+    holes = np.zeros(image.shape[:2], dtype=np.bool_)
+    return StereoRenderResult(
+        left_image=image.copy(),
+        right_image=image.copy(),
+        left_valid_mask=valid.copy(),
+        right_valid_mask=valid.copy(),
+        left_hole_mask=holes.copy(),
+        right_hole_mask=holes.copy(),
+    )
 
 
 class TestStereoProjector:
@@ -947,23 +965,33 @@ class TestProcessImage:
     @patch("pathlib.Path.mkdir")
     def test_process_image_success(self, mock_mkdir, mock_imwrite, mock_imread, mock_create):
         """Test successful image processing."""
-        import numpy as np
-
         mock_estimator = MagicMock()
         mock_estimator.load_model.return_value = True
-        mock_estimator.estimate_depth_batch.return_value = np.array([np.random.rand(480, 640)])
+        mock_estimator.estimate_depth_batch.return_value = DepthBatch(
+            np.linspace(0.0, 1.0, 480 * 640, dtype=np.float32).reshape(1, 480, 640),
+            DepthRepresentation.INVERSE_DEPTH,
+        )
         mock_create.return_value = mock_estimator
 
         # Mock imread to return a valid image
-        mock_imread.return_value = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        mock_imread.return_value = image
         mock_imwrite.return_value = True
+        renderer = MagicMock()
+        renderer.render.return_value = _stereo_result(image)
 
-        projector = StereoProjector(device="cpu")
+        projector = StereoProjector(device="cpu", stereo_renderer=renderer)
         result = projector.process_image("test.jpg", "/tmp/output")
 
         assert result is True
         mock_estimator.load_model.assert_called_once()
         mock_estimator.estimate_depth_batch.assert_called_once()
+        render_image, canonical, render_settings = renderer.render.call_args.args
+        assert render_image is image
+        assert canonical.dtype == np.float32
+        assert canonical[0, 0] == 0.0
+        assert canonical[-1, -1] == 1.0
+        assert isinstance(render_settings, StereoRenderSettings)
         # Should save 4 images: left, right, vr, depth
         assert mock_imwrite.call_count == 4
 
@@ -1017,30 +1045,44 @@ class TestProcessImage:
     @patch("cv2.imread")
     def test_process_image_with_custom_settings(self, mock_imread, mock_create):
         """Test process_image with custom settings."""
-        import numpy as np
-
         mock_estimator = MagicMock()
         mock_estimator.load_model.return_value = True
-        mock_estimator.estimate_depth_batch.return_value = np.array([np.random.rand(480, 640)])
+        mock_estimator.estimate_depth_batch.return_value = DepthBatch(
+            np.linspace(0.0, 1.0, 480 * 640, dtype=np.float32).reshape(1, 480, 640),
+            DepthRepresentation.RELATIVE_DEPTH,
+        )
         mock_create.return_value = mock_estimator
 
-        mock_imread.return_value = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        mock_imread.return_value = image
+        renderer = MagicMock()
+        renderer.render.return_value = _stereo_result(image)
 
-        projector = StereoProjector(device="cpu")
+        projector = StereoProjector(device="cpu", stereo_renderer=renderer)
 
         with patch("cv2.imwrite", return_value=True):
             with patch("pathlib.Path.mkdir"):
                 result = projector.process_image(
                     "test.jpg",
                     "/tmp/output",
-                    baseline=0.065,
-                    focal_length=800,
+                    stereo_strength=4.0,
+                    convergence=0.25,
+                    occlusion_fill="none",
                     depth_resolution="720",
                 )
 
         assert result is True
         # Verify custom depth resolution was used (batch estimation called)
         mock_estimator.estimate_depth_batch.assert_called_once()
+        canonical = renderer.render.call_args.args[1]
+        render_settings = renderer.render.call_args.args[2]
+        assert canonical[0, 0] == 1.0
+        assert canonical[-1, -1] == 0.0
+        assert render_settings == StereoRenderSettings(
+            stereo_strength=4.0,
+            convergence=0.25,
+            occlusion_fill="none",
+        )
 
     @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
     @patch("cv2.imread")

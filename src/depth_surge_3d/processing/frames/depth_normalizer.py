@@ -7,7 +7,7 @@ import math
 
 import numpy as np
 
-from ...inference.depth.types import DepthRepresentation
+from ...inference.depth.types import DepthBatch, DepthRepresentation
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,23 @@ def canonicalize_depth(
     scaled = (score[valid] - np.float32(bounds.low)) / np.float32(bounds.high - bounds.low)
     canonical[valid] = np.clip(scaled, 0.0, 1.0).astype(np.float32, copy=False)
     return canonical
+
+
+def canonicalize_single_scene(batch: DepthBatch) -> np.ndarray:
+    """Canonicalize one estimator batch as a single immutable scene."""
+
+    if not isinstance(batch, DepthBatch):
+        raise TypeError("Single-scene canonicalization requires a DepthBatch")
+    score, valid = depth_to_score(batch.values, batch.representation)
+    samples = score[valid]
+    if samples.size == 0:
+        bounds = SceneDepthBounds(0.0, 0.0)
+    else:
+        bounds = SceneDepthBounds(
+            float(np.percentile(samples, 2)),
+            float(np.percentile(samples, 98)),
+        )
+    return canonicalize_depth(batch.values, batch.representation, bounds)
 
 
 def encode_canonical_png(values: np.ndarray) -> np.ndarray:

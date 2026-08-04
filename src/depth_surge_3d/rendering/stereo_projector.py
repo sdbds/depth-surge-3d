@@ -19,6 +19,7 @@ from ..inference import (
     create_video_depth_estimator,
     create_video_depth_estimator_da3,
 )
+from ..inference.depth.types import DepthBatch
 from ..utils import (
     get_resolution_dimensions,
     calculate_vr_output_dimensions,
@@ -30,7 +31,9 @@ from ..io.operations import (
     get_video_properties,
 )
 from ..processing import VideoProcessor
+from ..processing.frames.depth_normalizer import canonicalize_single_scene
 from ..core.constants import DEFAULT_SETTINGS
+from .stereo_renderer import StereoRenderer, StereoRenderSettings
 
 
 class StereoProjector:
@@ -47,6 +50,7 @@ class StereoProjector:
         metric: bool = False,
         depth_model_version: str = "v2",
         temporal_window_overlap: int = 10,
+        stereo_renderer: StereoRenderer | None = None,
     ):
         """
         Initialize StereoProjector.
@@ -62,6 +66,7 @@ class StereoProjector:
         self.model_path = model_path
         self.device = device
         self.metric = metric
+        self.stereo_renderer = stereo_renderer
 
         if depth_model_version == "see_through":
             self.depth_estimator = create_see_through_depth_estimator(model_path, device, metric)
@@ -171,6 +176,9 @@ class StereoProjector:
         print("This feature will process the image as a single-frame video.")
 
         settings = self._apply_default_settings(kwargs)
+        for key in ("stereo_strength", "convergence", "occlusion_fill"):
+            if kwargs.get(key) is not None:
+                settings[key] = kwargs[key]
 
         try:
             # Ensure model is loaded
@@ -193,51 +201,42 @@ class StereoProjector:
             # Get depth map using video model
             # Higher input_size = better quality but more VRAM
             # Auto-detect or use user-specified depth resolution
-            depth_resolution = settings.get("depth_resolution", "auto")
-            if depth_resolution == "auto":
-                # Auto: match image size (never exceed source resolution)
-                input_size = max(image.shape[0], image.shape[1])
-            else:
-                try:
-                    input_size = int(depth_resolution)
-                except (ValueError, TypeError):
-                    input_size = 1080  # fallback to common resolution
+            input_size = self._resolve_image_depth_input_size(
+                image,
+                settings.get("depth_resolution", "auto"),
+            )
 
-            depth_maps = self.depth_estimator.estimate_depth_batch(
+            depth_batch = self.depth_estimator.estimate_depth_batch(
                 frames, target_fps=30, input_size=input_size, fp32=False
             )
 
-            if depth_maps is None or len(depth_maps) == 0:
-                print("Error: Failed to generate depth map")
+            if not isinstance(depth_batch, DepthBatch) or depth_batch.values.shape[0] != 1:
+                print("Error: Depth estimator did not return one explicit DepthBatch")
                 return False
-
-            depth_map = depth_maps[0]
+            canonical = canonicalize_single_scene(depth_batch)[0]
 
             # Process using simplified pipeline
             from ..utils import (
                 resize_image,
-                depth_to_disparity,
-                create_shifted_image,
                 apply_center_crop,
                 create_vr_frame,
-                hole_fill_image,
             )
 
             per_eye_width = settings.get("per_eye_width", 1920)
             per_eye_height = settings.get("per_eye_height", 1080)
 
-            # Create stereo pair
-            disparity_map = depth_to_disparity(
-                depth_map, settings["baseline"], settings["focal_length"]
+            render_settings = StereoRenderSettings(
+                stereo_strength=float(settings.get("stereo_strength", 2.0)),
+                convergence=float(settings.get("convergence", 0.5)),
+                occlusion_fill=str(settings.get("occlusion_fill", "background")),
             )
-
-            left_img = create_shifted_image(image, disparity_map, "left")
-            right_img = create_shifted_image(image, disparity_map, "right")
-
-            # Apply hole filling
-            if settings["hole_fill_quality"] in ["fast", "advanced"]:
-                left_img = hole_fill_image(left_img, method=settings["hole_fill_quality"])
-                right_img = hole_fill_image(right_img, method=settings["hole_fill_quality"])
+            stereo = self._get_stereo_renderer().render(
+                image,
+                canonical,
+                render_settings,
+            )
+            left_img = stereo.left_image
+            right_img = stereo.right_image
 
             # Apply center cropping
             left_cropped = apply_center_crop(left_img, settings["crop_factor"])
@@ -257,7 +256,7 @@ class StereoProjector:
             cv2.imwrite(str(output_path / f"{base_name}_vr.png"), vr_frame)
             cv2.imwrite(
                 str(output_path / f"{base_name}_depth.png"),
-                (depth_map * 255).astype("uint8"),
+                np.rint(canonical * np.float32(255.0)).astype(np.uint8),
             )
 
             print(f"Image processing complete. Output saved to: {output_path}")
@@ -337,6 +336,25 @@ class StereoProjector:
             else:
                 return False
         return True
+
+    def _get_stereo_renderer(self) -> StereoRenderer:
+        if self.stereo_renderer is None:
+            estimator_device = str(getattr(self.depth_estimator, "device", self.device))
+            render_device = None if estimator_device == "auto" else estimator_device
+            self.stereo_renderer = StereoRenderer(device=render_device)
+        return self.stereo_renderer
+
+    @staticmethod
+    def _resolve_image_depth_input_size(
+        image: np.ndarray,
+        depth_resolution: object,
+    ) -> int:
+        if depth_resolution == "auto":
+            return max(image.shape[0], image.shape[1])
+        try:
+            return int(depth_resolution)
+        except (ValueError, TypeError):
+            return 1080
 
     def _resolve_settings(
         self, settings: dict[str, Any], video_props: dict[str, Any]
