@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from .attention_backend import install_diffusers_flash_attention
+from .types import DepthBatch, DepthRepresentation
 
 
 DEFAULT_SEE_THROUGH_REPO = "24yearsold/seethroughv0.0.1_marigold"
@@ -191,7 +192,7 @@ class SeeThroughDepthEstimator:
         target_fps: int = 30,
         input_size: int = DEFAULT_PROCESSING_RESOLUTION,
         fp32: bool = False,
-    ) -> np.ndarray:
+    ) -> DepthBatch:
         """Estimate relative depth sequentially with deterministic diffusion noise."""
         del target_fps, fp32
         if self.model is None:
@@ -236,17 +237,11 @@ class SeeThroughDepthEstimator:
             depth = np.squeeze(depth)
             if depth.ndim != 2:
                 raise RuntimeError(f"Unexpected See-Through depth shape: {depth.shape}")
-            if depth.shape != frame.shape[:2]:
-                depth = cv2.resize(
-                    depth,
-                    (frame.shape[1], frame.shape[0]),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-            depth_maps.append(np.clip(depth, 0.0, 1.0).astype(np.float32, copy=False))
+            depth_maps.append(depth.astype(np.float32, copy=False))
             if self.verbose:
                 print(f"  See-Through depth frame {index + 1}/{len(frames)}")
 
-        return np.stack(depth_maps)
+        return DepthBatch(np.stack(depth_maps), DepthRepresentation.RELATIVE_DEPTH)
 
     def get_model_size(self) -> str:
         return "large"

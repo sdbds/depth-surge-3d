@@ -8,6 +8,7 @@ from src.depth_surge_3d.inference.depth.video_depth_estimator import (
     VideoDepthEstimator,
     create_video_depth_estimator,
 )
+from src.depth_surge_3d.inference.depth.types import DepthRepresentation
 from src.depth_surge_3d.core.constants import DEFAULT_MODEL_PATH
 
 
@@ -68,43 +69,10 @@ class TestVideoDepthEstimator:
         estimator = VideoDepthEstimator("models/unknown_model.pth")
         assert estimator._get_model_type(estimator.model_path) == "vitl"
 
-    def test_normalize_depths(self):
-        """Test depth map normalization."""
+    def test_estimator_has_no_per_frame_normalizer(self):
+        """Estimator adapters must preserve raw model scale."""
         estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
-
-        # Create test depth maps
-        depths = np.array(
-            [
-                [[0.0, 0.5, 1.0], [0.2, 0.8, 0.6]],
-                [[1.0, 2.0, 3.0], [0.5, 1.5, 2.5]],
-            ]
-        )
-
-        normalized = estimator._normalize_depths(depths)
-
-        # Check shape is preserved
-        assert normalized.shape == depths.shape
-
-        # Check all values are in [0, 1]
-        assert np.all(normalized >= 0.0)
-        assert np.all(normalized <= 1.0)
-
-        # Check each depth map is normalized independently
-        assert np.isclose(normalized[0].min(), 0.0)
-        assert np.isclose(normalized[0].max(), 1.0)
-
-    def test_normalize_depths_flat_depth(self):
-        """Test normalization of flat depth map."""
-        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
-
-        depths = np.array(
-            [
-                [[5.0, 5.0, 5.0], [5.0, 5.0, 5.0]],
-            ]
-        )
-
-        normalized = estimator._normalize_depths(depths)
-        assert np.all(normalized == 0.0)
+        assert not hasattr(estimator, "_normalize_depths")
 
     def test_get_model_info_not_loaded(self):
         """Test model info when model is not loaded."""
@@ -374,7 +342,8 @@ class TestEstimateDepthBatchDecisionLogic:
             result = estimator.estimate_depth_batch(frames)
 
             mock_chunked.assert_called_once()
-            assert result.shape == (70, 480, 640)
+            assert result.values.shape == (70, 480, 640)
+            assert result.representation is DepthRepresentation.INVERSE_DEPTH
 
     @patch("torch.cuda.is_available", return_value=True)
     def test_estimate_depth_batch_uses_chunking_for_high_res(self, mock_cuda):

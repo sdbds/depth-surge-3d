@@ -12,6 +12,7 @@ from .video_depth_estimator_see_through import (
     SeeThroughDepthEstimator,
     create_see_through_depth_estimator,
 )
+from .types import DepthBatch, DepthRepresentation
 
 __all__ = [
     "VideoDepthEstimator",
@@ -19,4 +20,6 @@ __all__ = [
     "create_video_depth_estimator_da3",
     "SeeThroughDepthEstimator",
     "create_see_through_depth_estimator",
+    "DepthBatch",
+    "DepthRepresentation",
 ]

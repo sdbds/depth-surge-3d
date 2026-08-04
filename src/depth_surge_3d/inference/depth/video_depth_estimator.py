@@ -16,6 +16,7 @@ import torch
 import numpy as np
 
 from ...utils.system.console import success as console_success, error as console_error
+from .types import DepthBatch, DepthRepresentation
 from ...core.constants import (
     DEFAULT_MODEL_PATH,
     VIDEO_DEPTH_ANYTHING_REPO_DIR,
@@ -179,7 +180,7 @@ class VideoDepthEstimator:
         target_fps: int = DEPTH_MODEL_DEFAULT_FPS,
         input_size: int = DEPTH_MODEL_INPUT_SIZE,
         fp32: bool = False,
-    ) -> np.ndarray:
+    ) -> DepthBatch:
         """
         Estimate depth for a batch of video frames with temporal consistency.
 
@@ -192,7 +193,7 @@ class VideoDepthEstimator:
             fp32: Use FP32 instead of FP16 (slower but more accurate)
 
         Returns:
-            Depth maps array (shape: [N, H, W], normalized 0-1 range)
+            Native-resolution float32 depth values with explicit representation
         """
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
@@ -212,10 +213,16 @@ class VideoDepthEstimator:
         if needs_chunking and num_frames > DEPTH_MODEL_CHUNK_SIZE:
             # Process in overlapping chunks to maintain temporal consistency
             print(f"Using memory-efficient chunked processing for {num_frames} frames")
-            return self._estimate_depth_chunked(frames, target_fps, input_size, fp32)
+            values = self._estimate_depth_chunked(frames, target_fps, input_size, fp32)
         else:
             # Process all at once (original behavior)
-            return self._estimate_depth_single_batch(frames, target_fps, input_size, fp32)
+            values = self._estimate_depth_single_batch(frames, target_fps, input_size, fp32)
+        representation = (
+            DepthRepresentation.METRIC_DEPTH
+            if self.metric
+            else DepthRepresentation.INVERSE_DEPTH
+        )
+        return DepthBatch(np.asarray(values, dtype=np.float32), representation)
 
     def _estimate_depth_single_batch(
         self, frames: np.ndarray, target_fps: int, input_size: int, fp32: bool
@@ -249,8 +256,7 @@ class VideoDepthEstimator:
                 sys.stdout = old_stdout
                 sys.stderr = old_stderr
 
-            # Normalize depth maps
-            return self._normalize_depths(depths)
+            return np.asarray(depths, dtype=np.float32)
 
         except Exception as e:
             raise RuntimeError(f"Video depth estimation failed: {e}")
@@ -297,8 +303,7 @@ class VideoDepthEstimator:
             if self.device == "cuda" and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # Normalize all depth maps
-        return self._normalize_depths(np.array(all_depths))
+        return np.asarray(all_depths, dtype=np.float32)
 
     def _suppress_model_output(self):
         """Context manager to suppress model output streams."""
@@ -363,17 +368,6 @@ class VideoDepthEstimator:
                 fp32=fp32,
             )
         return depths
-
-    def _normalize_depths(self, depths: np.ndarray) -> np.ndarray:
-        """Normalize depth maps to 0-1 range."""
-        normalized_depths = []
-        for depth in depths:
-            if depth.max() == depth.min():
-                normalized = np.zeros_like(depth)
-            else:
-                normalized = (depth - depth.min()) / (depth.max() - depth.min())
-            normalized_depths.append(np.clip(normalized, 0.0, 1.0))
-        return np.array(normalized_depths)
 
     def get_model_info(self) -> dict[str, Any]:
         """Get information about the loaded model."""

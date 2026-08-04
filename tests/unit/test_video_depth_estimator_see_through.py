@@ -111,12 +111,12 @@ class TestSeeThroughDepthEstimator:
             ]
         )
 
-        depths = estimator.estimate_depth_batch(frames, input_size=1080)
+        batch = estimator.estimate_depth_batch(frames, input_size=1080)
 
-        assert depths.shape == (2, 2, 3)
-        assert depths.dtype == np.float32
-        assert depths[0, 0, 0] == pytest.approx(30 / 255.0)
-        assert depths[1, 0, 0] == pytest.approx(60 / 255.0)
+        assert batch.values.shape == (2, 768, 768)
+        assert batch.values.dtype == np.float32
+        assert batch.values[0, 0, 0] == pytest.approx(30 / 255.0)
+        assert batch.values[1, 0, 0] == pytest.approx(60 / 255.0)
         assert [call["img_list"][0].shape for call in calls] == [(768, 768, 4)] * 2
         assert [call["img_list"][0][0, 0].tolist() for call in calls] == [
             [30, 20, 10, 255],

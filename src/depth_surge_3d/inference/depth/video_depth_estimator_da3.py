@@ -18,6 +18,7 @@ from typing import Any
 
 from ...core.constants import DA3_MODEL_NAMES, DEFAULT_DA3_MODEL
 from .attention_backend import install_da3_flash_attention
+from .types import DepthBatch, DepthRepresentation
 
 
 @contextmanager
@@ -187,7 +188,7 @@ class VideoDepthEstimatorDA3:
         target_fps: int = 30,
         input_size: int = 518,
         fp32: bool = False,
-    ) -> np.ndarray:
+    ) -> DepthBatch:
         """
         Estimate depth for a batch of video frames.
 
@@ -200,7 +201,7 @@ class VideoDepthEstimatorDA3:
             fp32: Use FP32 instead of FP16 (unused in DA3)
 
         Returns:
-            Depth maps array (shape: [N, H, W], normalized 0-1 range)
+            Native-resolution float32 depth values with explicit representation
         """
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
@@ -233,46 +234,21 @@ class VideoDepthEstimatorDA3:
             # Extract depth maps
             depth_maps = prediction.depth  # [N, H, W] float32
 
-            # Resize depth maps to match original frame resolution if needed
-            import cv2
-
-            resized_depth_maps = []
+            native_depth_maps = []
             for depth_map in depth_maps:
-                # Convert to numpy if tensor
                 if torch.is_tensor(depth_map):
                     depth_map = depth_map.cpu().numpy()
+                native_depth_maps.append(np.asarray(depth_map, dtype=np.float32))
 
-                # Resize to original dimensions if different
-                if depth_map.shape[0] != original_height or depth_map.shape[1] != original_width:
-                    resized = cv2.resize(
-                        depth_map,
-                        (original_width, original_height),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                    resized_depth_maps.append(resized)
-                else:
-                    resized_depth_maps.append(depth_map)
-
-            # Normalize depth maps to 0-1 range
-            return self._normalize_depths(np.array(resized_depth_maps))
+            representation = (
+                DepthRepresentation.METRIC_DEPTH
+                if self.metric
+                else DepthRepresentation.RELATIVE_DEPTH
+            )
+            return DepthBatch(np.stack(native_depth_maps), representation)
 
         except Exception as e:
             raise RuntimeError(f"DA3 depth estimation failed: {e}")
-
-    def _normalize_depths(self, depths: np.ndarray) -> np.ndarray:
-        """Normalize depth maps to 0-1 range."""
-        # Convert to numpy if torch tensor
-        if torch.is_tensor(depths):
-            depths = depths.cpu().numpy()
-
-        normalized_depths = []
-        for depth in depths:
-            if depth.max() == depth.min():
-                normalized = np.zeros_like(depth)
-            else:
-                normalized = (depth - depth.min()) / (depth.max() - depth.min())
-            normalized_depths.append(np.clip(normalized, 0.0, 1.0))
-        return np.array(normalized_depths)
 
     def get_model_info(self) -> dict[str, Any]:
         """Get information about the loaded model."""

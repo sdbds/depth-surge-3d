@@ -8,6 +8,7 @@ from src.depth_surge_3d.inference.depth.video_depth_estimator_da3 import (
     VideoDepthEstimatorDA3,
     create_video_depth_estimator_da3,
 )
+from src.depth_surge_3d.inference.depth.types import DepthRepresentation
 from src.depth_surge_3d.core.constants import DA3_MODEL_NAMES, DEFAULT_DA3_MODEL
 
 
@@ -239,69 +240,10 @@ class TestVideoDepthEstimatorDA3:
             # Restore the modules
             sys.modules.update(saved_modules)
 
-    def test_normalize_depths_with_numpy_array(self):
-        """Test depth normalization with numpy array."""
+    def test_estimator_has_no_per_frame_normalizer(self):
+        """DA3 must preserve raw model scale."""
         estimator = VideoDepthEstimatorDA3(device="cpu")
-
-        # Create test depth maps with known values
-        depths = np.array(
-            [
-                [[0.0, 0.5, 1.0], [0.2, 0.8, 0.6]],
-                [[1.0, 2.0, 3.0], [0.5, 1.5, 2.5]],
-            ]
-        )
-
-        normalized = estimator._normalize_depths(depths)
-
-        # Check shape is preserved
-        assert normalized.shape == depths.shape
-
-        # Check all values are in [0, 1]
-        assert np.all(normalized >= 0.0)
-        assert np.all(normalized <= 1.0)
-
-        # Check each depth map is normalized independently
-        assert np.isclose(normalized[0].min(), 0.0)
-        assert np.isclose(normalized[0].max(), 1.0)
-        assert np.isclose(normalized[1].min(), 0.0)
-        assert np.isclose(normalized[1].max(), 1.0)
-
-    def test_normalize_depths_with_torch_tensor(self):
-        """Test depth normalization with torch tensor."""
-        estimator = VideoDepthEstimatorDA3(device="cpu")
-
-        # Create test depth maps as torch tensor
-        depths = torch.tensor(
-            [
-                [[0.0, 0.5, 1.0], [0.2, 0.8, 0.6]],
-                [[1.0, 2.0, 3.0], [0.5, 1.5, 2.5]],
-            ]
-        )
-
-        normalized = estimator._normalize_depths(depths)
-
-        # Check result is numpy array
-        assert isinstance(normalized, np.ndarray)
-
-        # Check all values are in [0, 1]
-        assert np.all(normalized >= 0.0)
-        assert np.all(normalized <= 1.0)
-
-    def test_normalize_depths_flat_depth(self):
-        """Test normalization of flat depth map (all same values)."""
-        estimator = VideoDepthEstimatorDA3(device="cpu")
-
-        # All values the same
-        depths = np.array(
-            [
-                [[5.0, 5.0, 5.0], [5.0, 5.0, 5.0]],
-            ]
-        )
-
-        normalized = estimator._normalize_depths(depths)
-
-        # Should result in all zeros
-        assert np.all(normalized == 0.0)
+        assert not hasattr(estimator, "_normalize_depths")
 
     def test_get_model_info_not_loaded(self):
         """Test model info when model is not loaded."""
@@ -414,11 +356,12 @@ class TestEstimateDepthBatch:
         with patch("torch.no_grad"):
             result = estimator.estimate_depth_batch(frames, input_size=518)
 
-        assert result.shape == (5, 480, 640)
+        assert result.values.shape == (5, 480, 640)
+        assert result.representation is DepthRepresentation.RELATIVE_DEPTH
         estimator.model.inference.assert_called_once()
 
-    def test_estimate_depth_batch_with_resize(self):
-        """Test depth estimation with resizing."""
+    def test_estimate_depth_batch_preserves_native_resolution(self):
+        """DA3 output stays at the model's native resolution."""
         import torch
 
         estimator = VideoDepthEstimatorDA3(device="cpu", verbose=False)
@@ -434,12 +377,9 @@ class TestEstimateDepthBatch:
         estimator.model.inference.return_value = mock_prediction
 
         with patch("torch.no_grad"):
-            with patch("cv2.resize") as mock_resize:
-                mock_resize.return_value = np.random.rand(240, 320)
-                estimator.estimate_depth_batch(frames)
+            result = estimator.estimate_depth_batch(frames)
 
-        # Should resize depth maps to match input
-        assert mock_resize.call_count == 3
+        assert result.values.shape == (3, 480, 640)
 
     def test_estimate_depth_batch_exception_handling(self):
         """Test exception handling during inference."""
