@@ -1,20 +1,36 @@
 """Unit tests for image processing utilities."""
 
 import numpy as np
+from src.depth_surge_3d import utils
+from src.depth_surge_3d.utils import imaging
+from src.depth_surge_3d.utils.imaging import image_processing
 from src.depth_surge_3d.utils.imaging.image_processing import (
     normalize_depth_map,
-    depth_to_disparity,
     resize_image,
     apply_center_crop,
     create_vr_frame,
     validate_image_array,
     calculate_image_statistics,
-    create_shifted_image,
     calculate_fisheye_coordinates,
     apply_fisheye_distortion,
     apply_fisheye_square_crop,
-    hole_fill_image,
 )
+
+
+def test_legacy_inverse_remap_and_colour_hole_helpers_are_absent():
+    removed = {
+        "depth_to_disparity",
+        "create_shifted_image",
+        "hole_fill_image",
+        "_create_hole_mask",
+        "_calculate_adaptive_radius",
+        "_apply_high_quality_inpaint",
+    }
+
+    for name in removed:
+        assert not hasattr(image_processing, name)
+        assert name not in imaging.__all__
+        assert name not in utils.__all__
 
 
 class TestNormalizeDepthMap:
@@ -87,108 +103,6 @@ class TestNormalizeDepthMap:
         # Each channel should be normalized independently
         assert normalized.min() == 0.0
         assert normalized.max() == 1.0
-
-
-class TestDepthToDisparity:
-    """Test depth to disparity conversion function."""
-
-    def test_depth_to_disparity_basic(self):
-        """Test basic depth to disparity conversion."""
-        depth_map = np.array([[0.5, 0.75], [0.25, 1.0]])
-        baseline = 0.1  # 10cm
-        focal_length = 1000.0  # pixels
-
-        disparity = depth_to_disparity(depth_map, baseline, focal_length)
-
-        # Disparity should be inversely proportional to depth
-        # Closer objects (lower depth values) should have higher disparity
-        assert disparity.shape == depth_map.shape
-        assert np.all(disparity > 0)
-
-        # Check inverse relationship: lower depth = higher disparity
-        assert disparity[1, 0] > disparity[0, 0]  # 0.25 depth > 0.5 depth disparity
-
-    def test_depth_to_disparity_zero_depth_handling(self):
-        """Test that zero depth values are handled safely."""
-        depth_map = np.array([[0.0, 0.5], [1.0, 0.0]])
-        baseline = 0.1
-        focal_length = 1000.0
-
-        # Should not raise division by zero error
-        disparity = depth_to_disparity(depth_map, baseline, focal_length)
-
-        assert not np.isnan(disparity).any()
-        assert not np.isinf(disparity).any()
-
-    def test_depth_to_disparity_very_small_depth(self):
-        """Test handling of very small depth values."""
-        depth_map = np.array([[0.0001, 0.0005], [0.001, 0.01]])
-        baseline = 0.1
-        focal_length = 1000.0
-
-        disparity = depth_to_disparity(depth_map, baseline, focal_length)
-
-        # Very small depths should produce high disparity values
-        assert np.all(disparity > 0)
-        assert not np.isnan(disparity).any()
-
-    def test_depth_to_disparity_uniform_depth(self):
-        """Test disparity conversion with uniform depth."""
-        depth_map = np.full((50, 50), 0.5)
-        baseline = 0.1
-        focal_length = 1000.0
-
-        disparity = depth_to_disparity(depth_map, baseline, focal_length)
-
-        # All values should be equal for uniform depth
-        assert np.allclose(disparity, disparity[0, 0])
-
-    def test_depth_to_disparity_baseline_scaling(self):
-        """Test that disparity scales with baseline."""
-        depth_map = np.array([[0.5, 0.75]])
-        focal_length = 1000.0
-
-        disparity_1 = depth_to_disparity(depth_map, baseline=0.1, focal_length=focal_length)
-        disparity_2 = depth_to_disparity(depth_map, baseline=0.2, focal_length=focal_length)
-
-        # Doubling baseline should double disparity
-        assert np.allclose(disparity_2, disparity_1 * 2)
-
-    def test_depth_to_disparity_focal_length_scaling(self):
-        """Test that disparity scales with focal length."""
-        depth_map = np.array([[0.5, 0.75]])
-        baseline = 0.1
-
-        disparity_1 = depth_to_disparity(depth_map, baseline, focal_length=1000.0)
-        disparity_2 = depth_to_disparity(depth_map, baseline, focal_length=2000.0)
-
-        # Doubling focal length should double disparity
-        assert np.allclose(disparity_2, disparity_1 * 2)
-
-    def test_depth_to_disparity_preserves_shape(self):
-        """Test that conversion preserves array shape."""
-        shapes = [(100, 100), (50, 200), (1920, 1080)]
-
-        for shape in shapes:
-            depth_map = np.random.rand(*shape)
-            disparity = depth_to_disparity(depth_map, baseline=0.1, focal_length=1000.0)
-            assert disparity.shape == shape
-
-    def test_depth_to_disparity_zero_baseline(self):
-        """Test with zero baseline (edge case)."""
-        depth_map = np.array([[0.5, 1.0]])
-        disparity = depth_to_disparity(depth_map, baseline=0.0, focal_length=1000.0)
-
-        # Zero baseline should produce zero disparity
-        assert np.allclose(disparity, 0.0)
-
-    def test_depth_to_disparity_zero_focal_length(self):
-        """Test with zero focal length (edge case)."""
-        depth_map = np.array([[0.5, 1.0]])
-        disparity = depth_to_disparity(depth_map, baseline=0.1, focal_length=0.0)
-
-        # Zero focal length should produce zero disparity
-        assert np.allclose(disparity, 0.0)
 
 
 class TestResizeImage:
@@ -396,50 +310,6 @@ class TestCalculateImageStatistics:
         assert "alpha_mean" in stats
 
 
-class TestCreateShiftedImage:
-    """Test create_shifted_image function."""
-
-    def test_shift_left(self):
-        """Test left shift direction."""
-        image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        disparity_map = np.full((100, 100), 5.0)
-
-        shifted = create_shifted_image(image, disparity_map, direction="left")
-
-        assert shifted.shape == image.shape
-        assert shifted.dtype == image.dtype
-
-    def test_shift_right(self):
-        """Test right shift direction."""
-        image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        disparity_map = np.full((100, 100), 5.0)
-
-        shifted = create_shifted_image(image, disparity_map, direction="right")
-
-        assert shifted.shape == image.shape
-        assert shifted.dtype == image.dtype
-
-    def test_shift_grayscale(self):
-        """Test shifting grayscale image."""
-        image = np.random.randint(0, 255, (100, 100), dtype=np.uint8)
-        disparity_map = np.full((100, 100), 5.0)
-
-        shifted = create_shifted_image(image, disparity_map, direction="left")
-
-        assert shifted.shape == image.shape
-        assert len(shifted.shape) == 2
-
-    def test_shift_varying_disparity(self):
-        """Test with varying disparity values."""
-        image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        # Create gradient disparity map
-        disparity_map = np.linspace(0, 10, 10000).reshape(100, 100)
-
-        shifted = create_shifted_image(image, disparity_map, direction="left")
-
-        assert shifted.shape == image.shape
-
-
 class TestCalculateFisheyeCoordinates:
     """Test calculate_fisheye_coordinates function."""
 
@@ -553,168 +423,3 @@ class TestApplyFisheyeSquareCrop:
 
         # Should fallback to direct resize of original image
         assert result.shape == (50, 50, 3)
-
-
-class TestHoleFillImage:
-    """Test hole_fill_image function."""
-
-    def test_no_holes(self):
-        """Test image with no holes returns unchanged."""
-        image = np.random.randint(1, 255, (100, 100, 3), dtype=np.uint8)
-
-        filled = hole_fill_image(image)
-
-        # Should return original image if no holes
-        np.testing.assert_array_equal(filled, image)
-
-    def test_fill_with_fast_method(self):
-        """Test hole filling with fast method."""
-        image = np.random.randint(1, 255, (100, 100, 3), dtype=np.uint8)
-        # Create some holes (black pixels)
-        image[40:60, 40:60] = 0
-
-        filled = hole_fill_image(image, method="fast")
-
-        assert filled.shape == image.shape
-        # Holes should be filled (no longer all black)
-        assert not np.all(filled[40:60, 40:60] == 0)
-
-    def test_fill_with_advanced_method(self):
-        """Test hole filling with advanced method."""
-        image = np.random.randint(1, 255, (100, 100, 3), dtype=np.uint8)
-        # Create some holes
-        image[40:60, 40:60] = 0
-
-        filled = hole_fill_image(image, method="advanced")
-
-        assert filled.shape == image.shape
-        assert not np.all(filled[40:60, 40:60] == 0)
-
-    def test_fill_grayscale(self):
-        """Test hole filling on grayscale image."""
-        image = np.random.randint(1, 255, (100, 100), dtype=np.uint8)
-        image[40:60, 40:60] = 0
-
-        filled = hole_fill_image(image, method="fast")
-
-        assert filled.shape == image.shape
-        assert len(filled.shape) == 2
-
-    def test_fill_with_custom_mask(self):
-        """Test hole filling with custom mask."""
-        image = np.random.randint(1, 255, (100, 100, 3), dtype=np.uint8)
-        mask = np.zeros((100, 100), dtype=np.uint8)
-        mask[40:60, 40:60] = 1  # Mark region as hole
-
-        filled = hole_fill_image(image, mask=mask, method="fast")
-
-        assert filled.shape == image.shape
-
-    def test_fill_with_high_method(self):
-        """Test hole filling with high quality method."""
-        image = np.random.randint(1, 255, (100, 100, 3), dtype=np.uint8)
-        # Create some holes
-        image[40:60, 40:60] = 0
-
-        filled = hole_fill_image(image, method="high")
-
-        assert filled.shape == image.shape
-        # Holes should be filled (no longer all black)
-        assert not np.all(filled[40:60, 40:60] == 0)
-
-    def test_fill_high_method_multipass(self):
-        """Test high quality method with multiple holes to trigger multi-pass."""
-        image = np.random.randint(1, 255, (200, 200, 3), dtype=np.uint8)
-        # Create multiple scattered holes to trigger residual mask
-        image[20:40, 20:40] = 0
-        image[80:100, 80:100] = 0
-        image[140:160, 140:160] = 0
-
-        filled = hole_fill_image(image, method="high")
-
-        assert filled.shape == image.shape
-        # All holes should be filled
-        assert not np.all(filled[20:40, 20:40] == 0)
-        assert not np.all(filled[80:100, 80:100] == 0)
-        assert not np.all(filled[140:160, 140:160] == 0)
-
-    def test_empty_mask_handling(self):
-        """Test that empty mask is handled correctly."""
-        from src.depth_surge_3d.utils.imaging.image_processing import _create_hole_mask
-
-        # Create image with no black pixels
-        image = np.random.randint(1, 255, (50, 50, 3), dtype=np.uint8)
-        mask = _create_hole_mask(image)
-
-        # Mask should be all zeros
-        assert not np.any(mask)
-
-    def test_adaptive_radius_calculation(self):
-        """Test adaptive radius calculation with various hole sizes."""
-        from src.depth_surge_3d.utils.imaging.image_processing import (
-            _create_hole_mask,
-            _calculate_adaptive_radius,
-        )
-
-        # Small hole
-        image_small = np.ones((100, 100, 3), dtype=np.uint8) * 128
-        image_small[45:55, 45:55] = 0  # 10x10 hole
-        mask_small = _create_hole_mask(image_small)
-        radius_small = _calculate_adaptive_radius(mask_small)
-        assert 3 <= radius_small <= 15
-
-        # Large hole
-        image_large = np.ones((100, 100, 3), dtype=np.uint8) * 128
-        image_large[20:80, 20:80] = 0  # 60x60 hole
-        mask_large = _create_hole_mask(image_large)
-        radius_large = _calculate_adaptive_radius(mask_large)
-        assert 3 <= radius_large <= 15
-        assert radius_large > radius_small  # Larger hole should have larger radius
-
-    def test_adaptive_radius_empty_mask(self):
-        """Test adaptive radius with empty mask (no holes)."""
-        from src.depth_surge_3d.utils.imaging.image_processing import _calculate_adaptive_radius
-
-        # Empty mask (all zeros, only background)
-        empty_mask = np.zeros((100, 100), dtype=np.uint8)
-        radius = _calculate_adaptive_radius(empty_mask)
-
-        # Should return minimum radius of 3
-        assert radius == 3
-
-    def test_high_quality_inpaint_with_residuals(self):
-        """Test high quality inpainting that triggers second pass."""
-        import cv2
-        from unittest.mock import patch
-        from src.depth_surge_3d.utils.imaging.image_processing import (
-            _create_hole_mask,
-            _apply_high_quality_inpaint,
-        )
-
-        # Create image with holes
-        image = np.random.randint(50, 200, (100, 100, 3), dtype=np.uint8)
-        image[40:60, 40:60] = 0
-
-        mask = _create_hole_mask(image)
-
-        # Mock cv2.inpaint to simulate first pass leaving residuals
-        original_inpaint = cv2.inpaint
-
-        def mock_inpaint(img, mask, radius, method):
-            # First call (INPAINT_NS): Leave some black pixels (residuals)
-            if method == cv2.INPAINT_NS:
-                result = original_inpaint(img, mask, radius, method)
-                # Add some black pixels to simulate residuals
-                result[45:47, 45:47] = 0
-                return result
-            # Second call (INPAINT_TELEA): Fill properly
-            else:
-                return original_inpaint(img, mask, radius, method)
-
-        with patch("cv2.inpaint", side_effect=mock_inpaint):
-            filled = _apply_high_quality_inpaint(image, mask, radius=10)
-
-            assert filled.shape == image.shape
-            # Should have filled the holes including residuals
-            # Note: bilateral filter is applied, so values won't be exactly zero
-            # but should be filled

@@ -10,10 +10,6 @@ from .image_processing import (
     calculate_image_statistics,
     # Depth operations
     normalize_depth_map,
-    depth_to_disparity,
-    # Stereo operations
-    create_shifted_image,
-    hole_fill_image,
     # VR operations
     apply_center_crop,
     calculate_fisheye_coordinates,
@@ -33,10 +29,6 @@ __all__ = [
     "calculate_image_statistics",
     # Depth operations
     "normalize_depth_map",
-    "depth_to_disparity",
-    # Stereo operations
-    "create_shifted_image",
-    "hole_fill_image",
     # VR operations
     "apply_center_crop",
     "calculate_fisheye_coordinates",
