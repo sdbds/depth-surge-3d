@@ -217,6 +217,7 @@ simple_test_data/
 test_data/
 cache/
 .cache/
+.worktrees/
 *.lock
 uv.lock
 
