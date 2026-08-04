@@ -34,7 +34,7 @@ CANONICAL_METADATA_REQUIRED_FIELDS = {
     "native_shape",
 }
 STEREO_HOST_BUDGET = 512 * 1024 * 1024
-HOST_STEREO_BYTES_PER_PIXEL = 16
+HOST_STEREO_BYTES_PER_PIXEL = 24
 HOST_SLOT_OVERHEAD = 1024 * 1024
 MIN_STEREO_IO_WORKERS = 1
 MAX_STEREO_IO_WORKERS = 16
@@ -90,6 +90,8 @@ class StereoPipelineStats:
     max_active_permits: int
     permit_wait_seconds: float
     queue_wait_seconds: float
+    pipeline_wall_seconds: float
+    writer_busy_seconds: float
     decoded_frames: int
     rendered_frames: int
     written_frames: int
@@ -105,6 +107,8 @@ class _PipelineMetrics:
         self.max_active_permits = 0
         self.permit_wait_seconds = 0.0
         self.queue_wait_seconds = 0.0
+        self.pipeline_wall_seconds = 0.0
+        self.writer_busy_seconds = 0.0
         self.decoded_frames = 0
         self.rendered_frames = 0
         self.written_frames = 0
@@ -128,6 +132,14 @@ class _PipelineMetrics:
         with self.lock:
             self.queue_wait_seconds += waited
 
+    def writer_busy(self, elapsed: float) -> None:
+        with self.lock:
+            self.writer_busy_seconds += elapsed
+
+    def pipeline_finished(self, elapsed: float) -> None:
+        with self.lock:
+            self.pipeline_wall_seconds = elapsed
+
     def increment(self, field: str) -> None:
         with self.lock:
             setattr(self, field, getattr(self, field) + 1)
@@ -143,6 +155,8 @@ class _PipelineMetrics:
                 max_active_permits=self.max_active_permits,
                 permit_wait_seconds=self.permit_wait_seconds,
                 queue_wait_seconds=self.queue_wait_seconds,
+                pipeline_wall_seconds=self.pipeline_wall_seconds,
+                writer_busy_seconds=self.writer_busy_seconds,
                 decoded_frames=self.decoded_frames,
                 rendered_frames=self.rendered_frames,
                 written_frames=self.written_frames,
@@ -316,6 +330,7 @@ class _StereoFilePipeline:
         ]
 
     def run(self) -> StereoPipelineStats:
+        started = time.perf_counter()
         for thread in self.decoder_threads + self.writer_threads:
             thread.start()
         self.feeder.start()
@@ -340,6 +355,7 @@ class _StereoFilePipeline:
         for thread in self.decoder_threads + self.writer_threads:
             thread.join()
 
+        self.metrics.pipeline_finished(time.perf_counter() - started)
         stats = self.metrics.snapshot()
         if self.first_error is not None:
             stage, work, error = self.first_error
@@ -421,6 +437,7 @@ class _StereoFilePipeline:
 
     def _write(self, item: _WriteItem) -> _WriteCompletion:
         error = None
+        started = time.perf_counter()
         try:
             _write_pair(item)
         except Exception as write_error:
@@ -428,6 +445,7 @@ class _StereoFilePipeline:
         else:
             self.metrics.increment("written_frames")
         finally:
+            self.metrics.writer_busy(time.perf_counter() - started)
             self.permits.release()
         return _WriteCompletion(work=item.work, error=error)
 

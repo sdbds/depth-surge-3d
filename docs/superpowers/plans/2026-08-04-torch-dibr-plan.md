@@ -14,7 +14,7 @@
 - Primary z votes require bilinear weight `>=0.5`; no-voter targets fall back to all-contribution `amax`.
 - Visibility is `d >= z_win - 0.25` in pixel-disparity units.
 - GPU temporary budget is 256 MiB with `SPLAT_BYTES_PER_PIXEL=192`; no full-frame GPU intermediate exists.
-- Host stereo payload budget is 512 MiB with 16 bytes per pixel plus 1 MiB per slot.
+- Host stereo payload budget is 512 MiB with 24 bytes per pixel plus 1 MiB per slot.
 
 ---
 
@@ -96,4 +96,3 @@
 - [ ] **Step 3: Add a non-gating 1080p/4K benchmark reporting GPU render time, peak CUDA memory, wall time, FPS, writer utilization, and queue stalls**
 - [ ] **Step 4: Run the complete suite and benchmark smoke mode**
 - [ ] **Step 5: Commit with `refactor: remove inverse-remap stereo path`**
-

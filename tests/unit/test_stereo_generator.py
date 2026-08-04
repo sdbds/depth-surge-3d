@@ -139,7 +139,7 @@ def test_4k_capacity_stays_within_host_budget_at_max_workers() -> None:
     capacity = calculate_stereo_pipeline_capacity(3840, 2160, 16)
     slot_bytes = 3840 * 2160 * HOST_STEREO_BYTES_PER_PIXEL + HOST_SLOT_OVERHEAD
 
-    assert HOST_STEREO_BYTES_PER_PIXEL == 16
+    assert HOST_STEREO_BYTES_PER_PIXEL == 24
     assert capacity == min(32, STEREO_HOST_BUDGET // slot_bytes)
     assert capacity * slot_bytes <= STEREO_HOST_BUDGET
 
@@ -147,6 +147,11 @@ def test_4k_capacity_stays_within_host_budget_at_max_workers() -> None:
 def test_frame_larger_than_one_host_slot_is_rejected() -> None:
     with pytest.raises(MemoryError, match="required"):
         calculate_stereo_pipeline_capacity(16384, 8192, 4)
+
+
+def test_supported_8k_frame_is_rejected_before_decode() -> None:
+    with pytest.raises(MemoryError, match=r"7680x4320.*required"):
+        calculate_stereo_pipeline_capacity(7680, 4320, 4)
 
 
 def test_atomic_png_write_replaces_from_same_directory(tmp_path: Path) -> None:
@@ -237,6 +242,8 @@ def test_file_pipeline_uses_bounded_lifecycle_permits(tmp_path: Path) -> None:
     assert stats.decoded_frames == 10
     assert stats.rendered_frames == 10
     assert stats.written_frames == 10
+    assert stats.pipeline_wall_seconds > 0.0
+    assert stats.writer_busy_seconds >= 0.0
 
 
 def test_file_pipeline_always_writes_downstream_frames(tmp_path: Path) -> None:

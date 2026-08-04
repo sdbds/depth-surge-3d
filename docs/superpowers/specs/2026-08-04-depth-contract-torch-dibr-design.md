@@ -2,7 +2,7 @@
 
 ## Status
 
-Revision 5, updated after external review on 2026-08-04. The user approved a
+Revision 6, updated after implementation review on 2026-08-04. The user approved a
 Torch/CUDA-first renderer and explicitly rejected backward compatibility in the
 final state. Implementation is split into three independently verifiable
 commits so contract, geometry, and persistence failures can be isolated.
@@ -436,11 +436,14 @@ OpenCV I/O and numpy arrays. GPU background fill removes the former serial CPU
 inpainting stage.
 
 The production pipeline has a fixed `STEREO_HOST_BUDGET=512 MiB` and a
-conservative `HOST_STEREO_BYTES_PER_PIXEL=16`. One permit covers a source RGB
-frame, two uint8 eye outputs, four boolean masks, PNG encoding overlap, and
-array/task overhead for the frame's complete lifetime. The 16-byte estimate is
-`3 source + 6 eye output + 4 mask + 3 reserve` bytes per pixel. Source and mask
-payloads are released before writer encoding, freeing seven bytes per pixel for
+conservative `HOST_STEREO_BYTES_PER_PIXEL=24`. One permit covers a source RGB
+frame, native and resized canonical float32 fields, two uint8 eye outputs, four
+boolean masks, PNG encoding overlap, and array/task overhead for the frame's
+complete lifetime. The 24-byte estimate is `3 source + 8 canonical + 6 eye
+output + 4 mask + 3 reserve` bytes per render-target pixel. The eight canonical
+bytes cover the worst shape-mismatch point where both the caller-owned native
+field and the renderer's resized field are live. Source, canonical, and mask
+payloads are released before writer encoding, leaving sufficient space for
 encoded payloads; each slot also reserves 1 MiB of fixed task/codec overhead.
 Define:
 
