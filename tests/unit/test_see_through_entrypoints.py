@@ -70,6 +70,7 @@ def test_web_runner_uses_relative_see_through_repo(tmp_path):
 
     with (
         patch("torch.cuda.is_available", return_value=True),
+        patch("torch.cuda.get_device_name", return_value="Test CUDA device"),
         patch.object(
             web_app, "create_stereo_projector", return_value=projector
         ) as create_projector,

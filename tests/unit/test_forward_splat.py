@@ -97,6 +97,18 @@ def test_twenty_pixel_full_range_ramp_has_no_internal_holes() -> None:
     assert result.valid_mask[0].all()
 
 
+def test_two_pixel_stretch_exposes_only_zero_support_columns() -> None:
+    width = 16
+    image = torch.ones((1, width, 3), dtype=torch.float32)
+    disparity = torch.full((1, width), 100.0, dtype=torch.float32)
+    disparity[0, :6] = torch.arange(6, dtype=torch.float32) * 2.0
+    disparity[0, 6:11] = 10.0
+
+    result = forward_splat_band(image, disparity, eye_sign=1)
+
+    assert torch.where(~result.valid_mask[0])[0].tolist() == [1, 3, 5, 7, 9]
+
+
 def test_batched_input_preserves_batch_shape_and_independence() -> None:
     image = torch.zeros((2, 1, 5, 3), dtype=torch.float32)
     image[0, 0, 2] = 1.0

@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from src.depth_surge_3d.inference.depth.types import DepthRepresentation
+from src.depth_surge_3d.processing.frames import depth_storage as depth_storage_module
 from src.depth_surge_3d.processing.frames.depth_storage import (
     RawDepthFingerprintError,
     RawDepthOverflowError,
@@ -77,6 +78,56 @@ def test_model_fingerprint_uses_loaded_remote_artifact_identity() -> None:
     assert first != second
 
 
+def test_model_fingerprint_ignores_loaded_runtime_state() -> None:
+    class StatefulEstimator:
+        def __init__(self) -> None:
+            self.loaded = False
+
+        def get_model_info(self) -> dict:
+            return {
+                "model_name": "owner/model",
+                "revision": "immutable-revision",
+                "device": "cuda",
+                "loaded": self.loaded,
+                "memory_efficient": True,
+            }
+
+    estimator = StatefulEstimator()
+    before_load = build_model_fingerprint(estimator, {"device": "cuda"})
+    estimator.loaded = True
+    after_load = build_model_fingerprint(estimator, {"device": "cuda"})
+
+    assert before_load == after_load
+    assert before_load["model_info"] == {
+        "model_name": "owner/model",
+        "revision": "immutable-revision",
+        "device": "cuda",
+    }
+
+
+def test_model_fingerprint_rejects_unclassified_model_info_fields() -> None:
+    class FutureEstimator:
+        def get_model_info(self) -> dict:
+            return {
+                "model_name": "owner/model",
+                "tile_size": 512,
+            }
+
+    with pytest.raises(ValueError, match=r"Unclassified model info fields: tile_size"):
+        build_model_fingerprint(FutureEstimator(), {})
+
+
+def test_previous_raw_schema_reports_schema_mismatch(tmp_path: Path) -> None:
+    values = np.array([[[0.1, 0.2]]], dtype=np.float32)
+    store = _open(tmp_path / "raw", values)
+    assert store.metadata["schema_version"] == 2
+    store.metadata["schema_version"] = 1
+    store.metadata_path.write_text(json.dumps(store.metadata), encoding="utf-8")
+
+    with pytest.raises(RawDepthFingerprintError, match="schema version"):
+        _open(tmp_path / "raw", values)
+
+
 def test_auto_store_selects_float16_and_writes_atomic_compressed_files(tmp_path: Path) -> None:
     first = np.array([[[0.0, 0.5], [1.0, np.nan]]], dtype=np.float32)
     store = _open(tmp_path / "raw", first)
@@ -113,6 +164,7 @@ def test_auto_store_promotes_completed_files_without_reinference(tmp_path: Path)
 
     assert store.metadata["selected_dtype"] == "float32"
     assert store.metadata["storage_provenance"] == "promoted_float16_to_float32"
+    assert store.metadata["promoted_frame_count"] == 1
     with np.load(first_path, allow_pickle=False) as payload:
         assert payload["values"].dtype == np.float32
         np.testing.assert_array_equal(
@@ -180,6 +232,65 @@ def test_existing_corrupt_raw_payload_is_rejected_before_resume(tmp_path: Path) 
 
     with pytest.raises(RawDepthFingerprintError, match="payload"):
         _open(tmp_path / "raw", values)
+
+
+def test_payload_validation_reads_npz_headers_without_materializing_arrays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    values = np.array([[[0.1, 0.2]]], dtype=np.float32)
+    store = _open(tmp_path / "raw", values)
+    store.write_batch(["frame_000000.png"], values)
+
+    def reject_materialization(*_args, **_kwargs):
+        raise AssertionError("payload data was materialized")
+
+    monkeypatch.setattr(depth_storage_module.np, "asarray", reject_materialization)
+
+    assert store.validate_payloads() == 1
+
+
+def test_payload_validation_compares_names_without_resolving_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    values = np.array([[[0.1, 0.2]]], dtype=np.float32)
+    store = _open(tmp_path / "raw", values)
+    store.write_batch(["frame_000000.png"], values)
+    original_resolve = Path.resolve
+    resolve_calls = 0
+
+    def counted_resolve(path: Path, *args, **kwargs) -> Path:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", counted_resolve)
+
+    assert store.validate_payloads() == 1
+    assert resolve_calls == 0
+
+
+def test_write_batch_defers_metadata_rewrite_until_stage_flush(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    values = np.array([[[0.1, 0.2]]], dtype=np.float32)
+    store = _open(tmp_path / "raw", values)
+    writes: list[dict] = []
+
+    monkeypatch.setattr(
+        depth_storage_module,
+        "_atomic_write_json",
+        lambda _path, payload: writes.append(dict(payload)),
+    )
+
+    store.write_batch(["frame_000000.png"], values)
+
+    assert store.metadata["completed_count"] == 1
+    assert writes == []
+
+    store.flush_metadata()
+
+    assert len(writes) == 1
+    assert writes[0]["completed_count"] == 1
 
 
 def test_requested_dtype_change_is_rejected_unless_it_promotes_float16(

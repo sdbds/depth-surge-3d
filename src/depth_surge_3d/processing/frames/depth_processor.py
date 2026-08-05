@@ -64,8 +64,8 @@ from .source_frame_manifest import frame_sequence_fingerprint
 LEGACY_DEPTH_ARRAY_LIMIT_BYTES = 512 * 1024 * 1024
 CANONICAL_DEPTH_SCHEMA_VERSION = 1
 CANONICAL_DEPTH_ALGORITHM_VERSION = "scene-percentile-v1"
-DEPTH_BOUNDS_SCHEMA_VERSION = 1
-DEPTH_SAMPLES_SCHEMA_VERSION = 1
+DEPTH_BOUNDS_SCHEMA_VERSION = 2
+DEPTH_SAMPLES_SCHEMA_VERSION = 2
 
 
 class DepthMapProcessor:
@@ -186,7 +186,11 @@ class DepthMapProcessor:
             self._reset_stage_directory(raw_dir)
             self._reset_stage_directory(canonical_dir)
             raw_store = None
-        final_state = self._load_final_scene_state(scene_dir, manifest)
+        final_state = self._load_final_scene_state(
+            scene_dir,
+            manifest,
+            raw_store.metadata["fingerprint"] if raw_store is not None else None,
+        )
         existing = self._try_reuse_local_canonical_stage(
             raw_store,
             final_state,
@@ -321,7 +325,12 @@ class DepthMapProcessor:
         raw_store: RawDepthStore,
         raw_files: list[Path],
     ) -> tuple[dict[str, Any], dict[int, SceneDepthBounds], dict[str, Any]]:
-        final_state = self._load_final_scene_state(scene_dir, manifest)
+        source_raw_fingerprint = str(raw_store.metadata["fingerprint"])
+        final_state = self._load_final_scene_state(
+            scene_dir,
+            manifest,
+            source_raw_fingerprint,
+        )
         if final_state is not None:
             return final_state
         candidate_manifest = self._candidate_manifest(manifest)
@@ -330,12 +339,14 @@ class DepthMapProcessor:
             raw_files,
             candidate_manifest,
             DepthRepresentation(raw_store.metadata["representation"]),
+            source_raw_fingerprint,
         )
         final_manifest, bounds = finalize_scenes(candidate_manifest, samples)
         bounds_payload = self._write_depth_bounds(
             scene_dir,
             bounds,
             sample_fingerprint,
+            source_raw_fingerprint,
         )
         final_manifest["sample_fingerprint"] = sample_fingerprint
         final_manifest["bounds_fingerprint"] = bounds_payload["fingerprint"]
@@ -441,10 +452,23 @@ class DepthMapProcessor:
             requested_dtype=requested_dtype,
         )
 
-    @staticmethod
     def _estimate_native_shape(
-        frame_width: int, frame_height: int, input_size: int
+        self, frame_width: int, frame_height: int, input_size: int
     ) -> tuple[int, int]:
+        estimator_method = getattr(type(self.depth_estimator), "estimate_output_shape", None)
+        if callable(estimator_method):
+            shape = self.depth_estimator.estimate_output_shape(
+                frame_width,
+                frame_height,
+                input_size,
+            )
+            if (
+                not isinstance(shape, tuple)
+                or len(shape) != 2
+                or any(not isinstance(value, int) or value < 1 for value in shape)
+            ):
+                raise ValueError("Estimator output shape must be two positive integers")
+            return shape
         longest = max(frame_width, frame_height)
         scale = min(1.0, input_size / longest)
         return (
@@ -500,6 +524,7 @@ class DepthMapProcessor:
 
         if raw_store is None:
             raise RuntimeError("Depth estimator produced no raw depth")
+        raw_store.flush_metadata()
         return raw_store
 
     def _prepare_raw_depth_stage(
@@ -683,6 +708,7 @@ class DepthMapProcessor:
         raw_files: list[Path],
         candidate_manifest: dict[str, Any],
         representation: DepthRepresentation,
+        source_raw_fingerprint: str,
     ) -> tuple[dict[int, np.ndarray], str]:
         sample_path = scene_dir / "depth_samples.npz"
         manifest_fingerprint = canonical_json_hash(candidate_manifest)
@@ -695,6 +721,8 @@ class DepthMapProcessor:
                     int(cached_arrays["schema_version"].item()) == DEPTH_SAMPLES_SCHEMA_VERSION
                     and str(cached_arrays["algorithm_version"].item()) == SCENE_ALGORITHM_VERSION
                     and str(cached_arrays["manifest_fingerprint"].item()) == manifest_fingerprint
+                    and str(cached_arrays["source_raw_fingerprint"].item())
+                    == source_raw_fingerprint
                     and self._array_payload_fingerprint(cached_arrays) == stored_fingerprint
                 ):
                     scene_ids = list(
@@ -714,6 +742,7 @@ class DepthMapProcessor:
             "schema_version": np.asarray(DEPTH_SAMPLES_SCHEMA_VERSION, dtype=np.int64),
             "algorithm_version": np.asarray(SCENE_ALGORITHM_VERSION, dtype=np.str_),
             "manifest_fingerprint": np.asarray(manifest_fingerprint, dtype=np.str_),
+            "source_raw_fingerprint": np.asarray(source_raw_fingerprint, dtype=np.str_),
             "frame_names": np.asarray(candidate_manifest["frame_names"], dtype=np.str_),
             "scene_ids": np.asarray(scene_ids, dtype=np.int64),
         }
@@ -732,10 +761,12 @@ class DepthMapProcessor:
         scene_dir: Path,
         bounds: dict[int, SceneDepthBounds],
         sample_fingerprint: str,
+        source_raw_fingerprint: str,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "schema_version": DEPTH_BOUNDS_SCHEMA_VERSION,
             "algorithm_version": CANONICAL_DEPTH_ALGORITHM_VERSION,
+            "source_raw_fingerprint": source_raw_fingerprint,
             "sample_fingerprint": sample_fingerprint,
             "scenes": {
                 str(scene_id): {"low": value.low, "high": value.high}
@@ -750,8 +781,9 @@ class DepthMapProcessor:
         self,
         scene_dir: Path,
         manifest: dict[str, Any],
+        source_raw_fingerprint: str | None,
     ) -> tuple[dict[str, Any], dict[int, SceneDepthBounds], dict[str, Any]] | None:
-        if manifest.get("status") != "final":
+        if manifest.get("status") != "final" or source_raw_fingerprint is None:
             return None
         bounds_path = scene_dir / "depth_bounds.json"
         if not bounds_path.is_file():
@@ -764,6 +796,7 @@ class DepthMapProcessor:
             if (
                 payload.get("schema_version") != DEPTH_BOUNDS_SCHEMA_VERSION
                 or payload.get("algorithm_version") != CANONICAL_DEPTH_ALGORITHM_VERSION
+                or payload.get("source_raw_fingerprint") != source_raw_fingerprint
                 or fingerprint != canonical_json_hash(unhashed)
                 or manifest.get("bounds_fingerprint") != fingerprint
             ):

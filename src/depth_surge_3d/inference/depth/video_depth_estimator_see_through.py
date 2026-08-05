@@ -152,6 +152,18 @@ class SeeThroughDepthEstimator:
             return torch.float16
         return torch.float32
 
+    def estimate_output_shape(
+        self,
+        frame_width: int,
+        frame_height: int,
+        input_size: int,
+    ) -> tuple[int, int]:
+        """Return the square native map shape produced by model preprocessing."""
+
+        del frame_width, frame_height
+        processing_res = min(max(int(input_size), 1), self.processing_resolution)
+        return processing_res, processing_res
+
     def load_model(self) -> bool:
         """Load the specialized Marigold pipeline and its frame-conditioned UNet."""
         try:

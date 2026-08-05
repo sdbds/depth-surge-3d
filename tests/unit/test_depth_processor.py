@@ -123,6 +123,20 @@ class TestGenerateDepthMaps:
         assert estimator.estimate_depth_batch.call_count == 2
 
 
+def test_native_shape_estimate_uses_estimator_output_contract():
+    class SquareEstimator:
+        @staticmethod
+        def estimate_output_shape(
+            frame_width: int, frame_height: int, input_size: int
+        ) -> tuple[int, int]:
+            del frame_width, frame_height
+            return input_size, input_size
+
+    processor = DepthMapProcessor(SquareEstimator())
+
+    assert processor._estimate_native_shape(1920, 1080, 768) == (768, 768)
+
+
 class TestDetermineChunkParams:
     """Test chunk parameter determination."""
 

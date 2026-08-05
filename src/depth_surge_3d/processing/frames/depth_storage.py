@@ -7,13 +7,14 @@ import json
 from pathlib import Path
 import shutil
 from typing import Any
+import zipfile
 
 import numpy as np
 
 from ...inference.depth.types import DepthRepresentation
 
 
-RAW_DEPTH_SCHEMA_VERSION = 1
+RAW_DEPTH_SCHEMA_VERSION = 2
 RAW_STORAGE_DTYPES = {"auto", "float16", "float32"}
 DEPTH_MODEL_SETTING_KEYS = (
     "depth_model_version",
@@ -27,6 +28,32 @@ DEPTH_MODEL_SETTING_KEYS = (
     "temporal_window_overlap",
     "denoising_steps",
     "seed",
+)
+MODEL_IDENTITY_INFO_KEYS = (
+    "family",
+    "model_name",
+    "model_version",
+    "model_path",
+    "encoder",
+    "features",
+    "out_channels",
+    "num_frames",
+    "metric",
+    "device",
+    "processing_resolution",
+    "denoising_steps",
+    "seed",
+    "revision",
+    "artifact_identity",
+    "weight_sha256",
+    "precision",
+    "dtype",
+)
+MODEL_PRESENTATION_INFO_KEYS = (
+    "loaded",
+    "memory_efficient",
+    "source",
+    "temporal_consistency",
 )
 
 
@@ -70,8 +97,15 @@ def _hash_file(path: Path) -> str:
 def build_model_fingerprint(estimator: Any, settings: dict[str, Any]) -> dict[str, Any]:
     """Build a stable semantic fingerprint for one estimator configuration."""
 
+    reported_info = estimator.get_model_info() if hasattr(estimator, "get_model_info") else {}
+    if not isinstance(reported_info, dict):
+        reported_info = {}
+    classified_keys = set(MODEL_IDENTITY_INFO_KEYS) | set(MODEL_PRESENTATION_INFO_KEYS)
+    unclassified_keys = sorted(str(key) for key in reported_info if key not in classified_keys)
+    if unclassified_keys:
+        raise ValueError(f"Unclassified model info fields: {', '.join(unclassified_keys)}")
     model_info = _jsonable(
-        estimator.get_model_info() if hasattr(estimator, "get_model_info") else {}
+        {key: reported_info[key] for key in MODEL_IDENTITY_INFO_KEYS if key in reported_info}
     )
     model_path_value = getattr(estimator, "model_path", None)
     model_path = Path(model_path_value) if model_path_value else None
@@ -232,6 +266,7 @@ class RawDepthStore:
             "compression": "npz_deflate",
             "semantic_fingerprint": semantic,
             "completed_count": 0,
+            "promoted_frame_count": 0,
         }
         metadata["fingerprint"] = cls._fingerprint(metadata)
         _atomic_write_json(metadata_path, metadata)
@@ -249,6 +284,7 @@ class RawDepthStore:
             "storage_provenance",
             "compression",
             "semantic_fingerprint",
+            "promoted_frame_count",
         )
         return canonical_json_hash({key: metadata.get(key) for key in keys})
 
@@ -326,33 +362,44 @@ class RawDepthStore:
         return frame_names, native_shape, allowed_dtypes
 
     @staticmethod
-    def _load_validated_payload(
+    def _validate_payload_header(
         path: Path,
         native_shape: list[int],
         allowed_dtypes: set[np.dtype],
     ) -> None:
         try:
-            with np.load(path, allow_pickle=False) as payload:
-                if set(payload.files) != {"values"}:
+            with zipfile.ZipFile(path) as payload:
+                if payload.namelist() != ["values.npy"]:
                     raise ValueError("expected exactly one values array")
-                values = np.asarray(payload["values"])
+                with payload.open("values.npy") as values_file:
+                    version = np.lib.format.read_magic(values_file)
+                    if version == (1, 0):
+                        shape, _fortran_order, dtype = np.lib.format.read_array_header_1_0(
+                            values_file
+                        )
+                    elif version == (2, 0):
+                        shape, _fortran_order, dtype = np.lib.format.read_array_header_2_0(
+                            values_file
+                        )
+                    else:
+                        raise ValueError(f"unsupported npy header version: {version}")
         except Exception as error:
             raise RawDepthFingerprintError(f"Raw-depth payload is unreadable: {path}") from error
-        if values.ndim != 2 or list(values.shape) != native_shape:
+        if len(shape) != 2 or list(shape) != native_shape:
             raise RawDepthFingerprintError(f"Raw-depth payload shape mismatch: {path}")
-        if values.dtype not in allowed_dtypes:
+        if np.dtype(dtype) not in allowed_dtypes:
             raise RawDepthFingerprintError(f"Raw-depth payload dtype mismatch: {path}")
 
     def validate_payloads(self) -> int:
-        """Validate every persisted map and return the actual completed count."""
+        """Validate every persisted NPZ header and return the completed count."""
 
         frame_names, native_shape, allowed_dtypes = self._payload_contract()
 
-        expected_paths = {self.path_for(name).resolve() for name in frame_names}
-        actual_paths = {path.resolve() for path in self.directory.glob("*.npz")}
-        unexpected = actual_paths.difference(expected_paths)
+        expected_names = {self.path_for(name).name for name in frame_names}
+        actual_names = {path.name for path in self.directory.glob("*.npz")}
+        unexpected = actual_names.difference(expected_names)
         if unexpected:
-            names = ", ".join(sorted(path.name for path in unexpected))
+            names = ", ".join(sorted(unexpected))
             raise RawDepthFingerprintError(f"Unexpected raw-depth payload files: {names}")
 
         completed = 0
@@ -360,7 +407,7 @@ class RawDepthStore:
             path = self.path_for(frame_name)
             if not path.is_file():
                 continue
-            self._load_validated_payload(path, native_shape, allowed_dtypes)
+            self._validate_payload_header(path, native_shape, allowed_dtypes)
             completed += 1
         return completed
 
@@ -395,14 +442,23 @@ class RawDepthStore:
 
         dtype = np.float16 if self.metadata["selected_dtype"] == "float16" else np.float32
         paths: list[Path] = []
+        newly_written = 0
         for frame_name, frame_values in zip(frame_names, batch):
             path = self.path_for(frame_name)
             if not path.is_file():
                 _atomic_save_npz(path, frame_values.astype(dtype))
+                newly_written += 1
             paths.append(path)
-        self.metadata["completed_count"] = len(self.complete_files)
-        _atomic_write_json(self.metadata_path, self.metadata)
+        self.metadata["completed_count"] = min(
+            len(self.metadata["frame_names"]),
+            int(self.metadata.get("completed_count", 0)) + newly_written,
+        )
         return paths
+
+    def flush_metadata(self) -> None:
+        """Persist in-memory progress once at a stage or transaction boundary."""
+
+        _atomic_write_json(self.metadata_path, self.metadata)
 
     def load(self, path: Path) -> np.ndarray:
         with np.load(path, allow_pickle=False) as payload:
@@ -438,23 +494,29 @@ class RawDepthStore:
             return
 
         if self.metadata.get("storage_status") != "promoting":
+            complete_paths = self.complete_files
             frame_pixels = int(np.prod(self.metadata["native_shape"]))
-            extra_bytes = len(self.complete_files) * frame_pixels * 2 + frame_pixels * 4
+            extra_bytes = len(complete_paths) * frame_pixels * 2 + frame_pixels * 4
             require_disk_space(self.directory, extra_bytes)
             self.metadata["storage_status"] = "promoting"
             self.metadata["previous_fingerprint"] = self.metadata.get("fingerprint")
             self.metadata["target_dtype"] = "float32"
             self.metadata["target_provenance"] = "promoted_float16_to_float32"
+            self.metadata["promoted_frame_count"] = len(complete_paths)
             self.metadata["requested_dtype"] = requested_dtype
             _atomic_write_json(self.metadata_path, self.metadata)
+        else:
+            complete_paths = self.complete_files
 
-        for path in self.complete_files:
+        for path in complete_paths:
             self._rewrite_file_as_float32(path)
 
-        for path in self.complete_files:
-            with np.load(path, allow_pickle=False) as payload:
-                if payload["values"].dtype != np.float32:
-                    raise RawDepthFingerprintError(f"Raw-depth promotion incomplete at {path}")
+        for path in complete_paths:
+            self._validate_payload_header(
+                path,
+                list(self.metadata["native_shape"]),
+                {np.dtype("float32")},
+            )
 
         self.metadata.update(
             {

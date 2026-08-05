@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.depth_surge_3d.rendering.forward_splat import SplatBandResult
+from src.depth_surge_3d.rendering.forward_splat import SplatBandResult, forward_splat_band
 from src.depth_surge_3d.rendering.stereo_renderer import (
     GPU_TEMP_BUDGET,
     SPLAT_BYTES_PER_PIXEL,
@@ -213,6 +213,19 @@ def test_background_fill_leaves_wide_and_fully_invalid_runs_as_holes() -> None:
     assert torch.equal(filled, image)
     assert hole_mask[0, 1:4].all()
     assert hole_mask[1].all()
+
+
+def test_background_fill_closes_isolated_zero_support_columns() -> None:
+    width = 16
+    image = torch.arange(width, dtype=torch.float32).view(1, width, 1).expand(-1, -1, 3)
+    disparity = torch.full((1, width), 100.0, dtype=torch.float32)
+    disparity[0, :6] = torch.arange(6, dtype=torch.float32) * 2.0
+    disparity[0, 6:11] = 10.0
+    splat = forward_splat_band(image, disparity, eye_sign=1)
+
+    _filled, hole_mask = _fill_background_band(splat, max_gap_width=1)
+
+    assert not hole_mask.any()
 
 
 def test_valid_black_pixels_are_not_holes_and_output_restores_input_dtype() -> None:

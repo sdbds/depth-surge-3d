@@ -110,12 +110,13 @@ class ResumeReport:
     def migration_paths(self) -> tuple[Path, ...]:
         paths: list[Path] = []
         seen: set[Path] = set()
+        protected = {(self.output_dir / "00_original_frames").resolve()}
         for stage in self.stages:
             if stage.disposition != "invalidate":
                 continue
             for path in stage.paths:
                 resolved = path.resolve()
-                if resolved not in seen and _has_payload(path):
+                if resolved not in protected and resolved not in seen and _has_payload(path):
                     paths.append(path)
                     seen.add(resolved)
         return tuple(paths)
@@ -262,17 +263,12 @@ def _validate_frame_stage(
     output_dir: Path,
     settings_data: dict[str, Any] | None,
     saved_settings: dict[str, Any],
-    source_video: Path | str | None,
 ) -> tuple[ResumeStage, list[Path], str | None]:
     frames_dir = output_dir / "00_original_frames"
     paths = (frames_dir,)
     frame_files = sorted(frames_dir.glob("frame_*.png")) if frames_dir.is_dir() else []
     if not frame_files:
         return _stage("frames", paths, "missing", "no extracted source frames"), [], None
-
-    reason = _source_video_mismatch_reason(settings_data, source_video)
-    if reason is not None:
-        return _stage("frames", paths, "invalidate", reason), frame_files, None
 
     expected_count = _expected_frame_count(settings_data, saved_settings)
     if expected_count is not None and len(frame_files) != expected_count:
@@ -285,9 +281,11 @@ def _validate_frame_stage(
         reason = "source frame manifest is not contiguous"
         return _stage("frames", paths, "invalidate", reason), frame_files, None
 
-    reason = _frame_payload_mismatch_reason(frame_files, _expected_frame_shape(settings_data))
-    if reason is not None:
-        return _stage("frames", paths, "invalidate", reason), frame_files, None
+    payload_reason = _frame_payload_mismatch_reason(
+        frame_files, _expected_frame_shape(settings_data)
+    )
+    if payload_reason is not None:
+        return _stage("frames", paths, "invalidate", payload_reason), frame_files, None
 
     settings_metadata = (settings_data or {}).get("metadata", {})
     source_video_sha256 = (
@@ -301,13 +299,13 @@ def _validate_frame_stage(
             frame_files,
             None,
         )
-    reason = source_frame_manifest_mismatch_reason(
+    manifest_reason = source_frame_manifest_mismatch_reason(
         read_source_frame_manifest(frames_dir),
         frame_files,
         source_video_sha256,
     )
-    if reason is not None:
-        return _stage("frames", paths, "invalidate", reason), frame_files, None
+    if manifest_reason is not None:
+        return _stage("frames", paths, "invalidate", manifest_reason), frame_files, None
 
     fingerprint = _frame_fingerprint(frame_files)
     return (
@@ -392,12 +390,34 @@ def _validate_final_bounds(scene_dir: Path, manifest: dict[str, Any]) -> dict[st
     valid = (
         bounds.get("schema_version") == DEPTH_BOUNDS_SCHEMA_VERSION
         and bounds.get("algorithm_version") == CANONICAL_DEPTH_ALGORITHM_VERSION
+        and isinstance(bounds.get("source_raw_fingerprint"), str)
+        and bool(bounds["source_raw_fingerprint"])
         and isinstance(fingerprint, str)
         and fingerprint == canonical_json_hash(unhashed)
         and manifest.get("bounds_fingerprint") == fingerprint
         and bounds_scene_ids == manifest_scene_ids
     )
     return bounds if valid else None
+
+
+def _bind_final_scene_to_raw_depth(
+    scene: ResumeStage,
+    manifest: dict[str, Any] | None,
+    bounds: dict[str, Any] | None,
+    raw: ResumeStage,
+    raw_metadata: dict[str, Any] | None,
+) -> tuple[ResumeStage, dict[str, Any] | None]:
+    if scene.disposition != "preserve" or manifest is None or bounds is None:
+        return scene, bounds
+    raw_fingerprint = raw_metadata.get("fingerprint") if raw_metadata is not None else None
+    if (
+        raw.disposition not in {"preserve", "resume"}
+        or not isinstance(raw_fingerprint, str)
+        or bounds.get("source_raw_fingerprint") != raw_fingerprint
+    ):
+        reason = "depth-derived scene bounds will be recomputed for current raw depth"
+        return _stage("scene_data", scene.paths, "resume", reason), None
+    return scene, bounds
 
 
 def _validate_scene_stage(
@@ -907,6 +927,9 @@ def build_resume_report(
     settings_data = (
         _read_json(selected_settings_file) if selected_settings_file is not None else None
     )
+    source_reason = _source_video_mismatch_reason(settings_data, source_video)
+    if source_reason is not None:
+        raise ValueError(f"Cannot resume: {source_reason}")
     raw_saved = (settings_data or {}).get("processing_settings", {})
     if not isinstance(raw_saved, dict):
         raw_saved = {}
@@ -919,11 +942,9 @@ def build_resume_report(
         and settings_metadata.get("settings_schema_version") == PROCESSING_SETTINGS_SCHEMA_VERSION
     )
 
-    stages: list[ResumeStage] = []
     frames, frame_files, source_fingerprint = _validate_frame_stage(
-        root, settings_data, saved_settings, source_video
+        root, settings_data, saved_settings
     )
-    stages.append(frames)
     frames_reusable = frames.disposition == "preserve"
 
     scene, manifest, bounds = _validate_scene_stage(
@@ -933,7 +954,6 @@ def build_resume_report(
         frames_reusable,
         migrated_settings,
     )
-    stages.append(scene)
     scene_reusable = scene.disposition in {"preserve", "resume"}
     raw, raw_metadata = _validate_raw_stage(
         root,
@@ -943,7 +963,15 @@ def build_resume_report(
         scene_reusable,
         model_fingerprint,
     )
-    stages.append(raw)
+    scene, bounds = _bind_final_scene_to_raw_depth(
+        scene,
+        manifest,
+        bounds,
+        raw,
+        raw_metadata,
+    )
+
+    stages: list[ResumeStage] = [frames, scene, raw]
 
     canonical, canonical_metadata = _validate_canonical_stage(
         root,

@@ -131,11 +131,11 @@ def _fill_background_band(
 def _convert_image_band(image: torch.Tensor, dtype: np.dtype) -> np.ndarray:
     values = image.detach().cpu().numpy()
     if np.issubdtype(dtype, np.integer):
-        limits = np.iinfo(dtype)
-        values = np.clip(np.rint(values), limits.min, limits.max)
+        integer_limits = np.iinfo(dtype)
+        values = np.clip(np.rint(values), integer_limits.min, integer_limits.max)
     elif np.issubdtype(dtype, np.floating):
-        limits = np.finfo(dtype)
-        values = np.clip(values, limits.min, limits.max)
+        floating_limits = np.finfo(dtype)
+        values = np.clip(values, floating_limits.min, floating_limits.max)
     else:
         raise TypeError(f"Unsupported frame dtype: {dtype}")
     return values.astype(dtype, copy=False)
@@ -170,8 +170,8 @@ class StereoRenderer:
         settings = settings or StereoRenderSettings()
         self._validate_inputs(source, canonical_values, settings)
         source = np.ascontiguousarray(source)
-        resized_canonical = self._resize_canonical(canonical_values, source.shape[:2])
-        height, width = source.shape[:2]
+        height, width = int(source.shape[0]), int(source.shape[1])
+        resized_canonical = self._resize_canonical(canonical_values, (height, width))
         first_band_height = calculate_band_height(
             width,
             height,
@@ -292,7 +292,7 @@ class StereoRenderer:
         output = np.empty_like(source)
         valid_output = np.empty((height, width), dtype=np.bool_)
         hole_output = np.empty((height, width), dtype=np.bool_)
-        disparity_scale = np.float32(width * (settings.stereo_strength / 100.0))
+        disparity_scale = float(np.float32(width * (settings.stereo_strength / 100.0)))
         max_gap_width = math.ceil(width * settings.stereo_strength / 200.0) + 2
 
         with torch.inference_mode():
@@ -302,9 +302,7 @@ class StereoRenderer:
                     self.device
                 )
                 canonical_band = resized_canonical[start_row:end_row].to(self.device)
-                disparity_band = (
-                    canonical_band - np.float32(settings.convergence)
-                ) * disparity_scale
+                disparity_band = (canonical_band - float(settings.convergence)) * disparity_scale
                 splat = forward_splat_band(source_band, disparity_band, eye_sign)
                 if settings.occlusion_fill == "background":
                     rendered, hole_mask = _fill_background_band(

@@ -254,6 +254,9 @@ def test_model_fingerprint_change_rebuilds_raw_stage_instead_of_aborting(
         pipeline_settings,
         monkeypatch,
     )
+    raw_metadata_path = stage_directories["depth_raw"] / "metadata.json"
+    first_raw_metadata = json.loads(raw_metadata_path.read_text())
+    first_raw_fingerprint = first_raw_metadata["fingerprint"]
     estimator.revision = "test-revision-2"
     estimator.calls = 0
     estimator.batch_lengths.clear()
@@ -267,6 +270,15 @@ def test_model_fingerprint_change_rebuilds_raw_stage_instead_of_aborting(
     )
 
     assert estimator.calls == 2
+    second_raw_metadata = json.loads(raw_metadata_path.read_text())
+    second_raw_fingerprint = second_raw_metadata["fingerprint"]
+    assert second_raw_fingerprint != first_raw_fingerprint
+
+    scene_dir = stage_directories["scene_data"]
+    bounds = json.loads((scene_dir / "depth_bounds.json").read_text())
+    assert bounds["source_raw_fingerprint"] == second_raw_fingerprint
+    with np.load(scene_dir / "depth_samples.npz", allow_pickle=False) as payload:
+        assert str(payload["source_raw_fingerprint"].item()) == second_raw_fingerprint
 
 
 def test_partial_temporal_chunk_replays_original_context_without_overwriting_completed_raw(

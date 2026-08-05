@@ -1271,42 +1271,57 @@ def stop_processing() -> dict[str, Any]:
     return jsonify({"success": True, "message": "Stop request sent"})
 
 
+class _ResumeRequestError(ValueError):
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _prepare_resume_request(data: Any) -> tuple[Path, str, str | None]:
+    """Validate resume overrides and constrain the requested output directory."""
+
+    if not isinstance(data, dict):
+        raise _ResumeRequestError("Request body must be a JSON object", 400)
+
+    output_dir = data.get("output_dir")
+    migrate_legacy = data.get("migrate_legacy", "archive")
+    raw_storage_dtype = data.get("raw_storage_dtype")
+    resume_overrides = {"migrate_legacy": migrate_legacy}
+    if raw_storage_dtype is not None:
+        resume_overrides["raw_storage_dtype"] = raw_storage_dtype
+    try:
+        validated = validate_settings(resume_overrides, source="explicit")
+    except (TypeError, ValueError) as exc:
+        raise _ResumeRequestError(str(exc), 400) from exc
+
+    if not output_dir:
+        raise _ResumeRequestError("No output directory provided", 400)
+    output_path = Path(output_dir).resolve()
+    allowed_base = Path(app.config["OUTPUT_FOLDER"]).resolve()
+    try:
+        output_path.relative_to(allowed_base)
+    except ValueError as exc:
+        raise _ResumeRequestError(
+            "Output directory must be within the managed output folder",
+            403,
+        ) from exc
+    if not output_path.exists():
+        raise _ResumeRequestError("Output directory does not exist", 404)
+
+    selected_dtype = validated.get("raw_storage_dtype") if raw_storage_dtype is not None else None
+    return output_path, validated["migrate_legacy"], selected_dtype
+
+
 @app.route("/resume", methods=["POST"])
 def resume_processing():
     """Resume processing from a previous interrupted batch"""
     if current_processing["active"]:
         return jsonify({"error": "Processing already in progress"}), 400
 
-    data = request.json
-    output_dir = data.get("output_dir")
-    migrate_legacy = data.get("migrate_legacy", "archive")
-    raw_storage_dtype = data.get("raw_storage_dtype")
-
     try:
-        resume_overrides = {"migrate_legacy": migrate_legacy}
-        if raw_storage_dtype is not None:
-            resume_overrides["raw_storage_dtype"] = raw_storage_dtype
-        validated_migration = validate_settings(
-            resume_overrides,
-            source="explicit",
-        )
-        migrate_legacy = validated_migration["migrate_legacy"]
-        if raw_storage_dtype is not None:
-            raw_storage_dtype = validated_migration["raw_storage_dtype"]
-    except (TypeError, ValueError) as exc:
-        return jsonify({"error": str(exc)}), 400
-
-    if not output_dir:
-        return jsonify({"error": "No output directory provided"}), 400
-
-    output_path = Path(output_dir).resolve()
-    allowed_base = Path(app.config["OUTPUT_FOLDER"]).resolve()
-    try:
-        output_path.relative_to(allowed_base)
-    except ValueError:
-        return jsonify({"error": "Output directory must be within the managed output folder"}), 403
-    if not output_path.exists():
-        return jsonify({"error": "Output directory does not exist"}), 404
+        output_path, migrate_legacy, raw_storage_dtype = _prepare_resume_request(request.json)
+    except _ResumeRequestError as exc:
+        return jsonify({"error": str(exc)}), exc.status_code
 
     from depth_surge_3d.io.operations import find_settings_file
 

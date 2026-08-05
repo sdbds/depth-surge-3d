@@ -12,6 +12,7 @@ import pytest
 
 from src.depth_surge_3d.core.settings import validate_settings
 from src.depth_surge_3d.processing.frames.depth_storage import (
+    RAW_DEPTH_SCHEMA_VERSION,
     RawDepthStore,
     canonical_json_hash,
     select_depth_model_settings,
@@ -128,7 +129,7 @@ def _write_raw_metadata(
         "preprocessing_algorithm": "native-depth-adapter-v2",
     }
     metadata = {
-        "schema_version": 1,
+        "schema_version": RAW_DEPTH_SCHEMA_VERSION,
         "storage_status": "ready",
         "representation": "relative_depth",
         "frame_names": [path.name for path in frame_files],
@@ -139,6 +140,7 @@ def _write_raw_metadata(
         "compression": "npz_deflate",
         "semantic_fingerprint": semantic,
         "completed_count": 0,
+        "promoted_frame_count": 0,
     }
     metadata["fingerprint"] = RawDepthStore._fingerprint(metadata)
     (raw_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
@@ -150,12 +152,17 @@ def _write_current_depth_pipeline(
     source_fingerprint: str,
 ) -> tuple[dict, dict, dict]:
     _write_candidate_manifest(output_dir, frame_files, source_fingerprint)
+    _write_raw_metadata(output_dir, frame_files, source_fingerprint, model_size="large")
+    raw_dir = output_dir / "02_depth_raw"
+    raw_metadata_path = raw_dir / "metadata.json"
+    raw_metadata = json.loads(raw_metadata_path.read_text(encoding="utf-8"))
     scene_dir = output_dir / "01_scene_data"
     manifest_path = scene_dir / "scene_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     bounds = {
         "schema_version": DEPTH_BOUNDS_SCHEMA_VERSION,
         "algorithm_version": CANONICAL_DEPTH_ALGORITHM_VERSION,
+        "source_raw_fingerprint": raw_metadata["fingerprint"],
         "sample_fingerprint": "samples",
         "scenes": {"0": {"low": 0.0, "high": 1.0}},
     }
@@ -170,15 +177,12 @@ def _write_current_depth_pipeline(
     )
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    _write_raw_metadata(output_dir, frame_files, source_fingerprint, model_size="large")
-    raw_dir = output_dir / "02_depth_raw"
     for index, frame in enumerate(frame_files):
         with (raw_dir / f"{frame.stem}.npz").open("wb") as handle:
             np.savez_compressed(
                 handle,
                 values=np.full((4, 6), index, dtype=np.float16),
             )
-    raw_metadata_path = raw_dir / "metadata.json"
     raw_metadata = json.loads(raw_metadata_path.read_text(encoding="utf-8"))
     raw_metadata["completed_count"] = len(frame_files)
     raw_metadata_path.write_text(json.dumps(raw_metadata), encoding="utf-8")
@@ -310,6 +314,21 @@ def test_raw_model_fingerprint_mismatch_invalidates_raw_and_downstream(tmp_path)
     assert "model_size" in report.stage("depth_raw").reason
 
 
+def test_raw_model_fingerprint_mismatch_recomputes_depth_derived_scene_data(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    _write_settings(tmp_path, _current_settings(), current_schema=True)
+    _write_current_depth_pipeline(tmp_path, frame_files, fingerprint)
+
+    report = build_resume_report(tmp_path, _current_settings(model_size="base"))
+
+    assert report.stage("depth_raw").disposition == "invalidate"
+    assert report.stage("scene_data").disposition == "resume"
+    assert "raw depth" in report.stage("scene_data").reason
+    assert report.stage("disparity_maps").disposition == "invalidate"
+
+
 def test_default_migration_archives_invalid_generated_data_and_keeps_frames(tmp_path):
     from src.depth_surge_3d.io.resume import apply_legacy_migration, build_resume_report
 
@@ -375,7 +394,7 @@ def test_legacy_settings_are_backed_up_and_rewritten_without_removed_names(tmp_p
     assert "hole_fill_quality" not in migrated["processing_settings"]
 
 
-def test_source_video_fingerprint_mismatch_invalidates_original_frames(tmp_path):
+def test_source_video_fingerprint_mismatch_aborts_resume(tmp_path):
     from src.depth_surge_3d.io.resume import build_resume_report
 
     _write_frames(tmp_path)
@@ -389,10 +408,8 @@ def test_source_video_fingerprint_mismatch_invalidates_original_frames(tmp_path)
     settings_file.write_text(json.dumps(settings_data), encoding="utf-8")
     source_video.write_bytes(b"different source payload")
 
-    report = build_resume_report(tmp_path, _current_settings())
-
-    assert report.stage("frames").disposition == "invalidate"
-    assert "source video fingerprint" in report.stage("frames").reason
+    with pytest.raises(ValueError, match="source video fingerprint mismatch"):
+        build_resume_report(tmp_path, _current_settings())
 
 
 def test_same_shape_frame_tampering_invalidates_original_frames(tmp_path):
@@ -407,6 +424,22 @@ def test_same_shape_frame_tampering_invalidates_original_frames(tmp_path):
 
     assert report.stage("frames").disposition == "invalidate"
     assert "frame fingerprint" in report.stage("frames").reason
+
+
+def test_invalid_original_frames_never_enter_migration_set(tmp_path):
+    from src.depth_surge_3d.io.resume import apply_legacy_migration, build_resume_report
+
+    frame_files, _ = _write_frames(tmp_path)
+    _write_settings(tmp_path, _current_settings(), current_schema=True)
+    replacement = np.full((4, 6, 3), 255, dtype=np.uint8)
+    assert cv2.imwrite(str(frame_files[0]), replacement)
+
+    report = build_resume_report(tmp_path, _current_settings(migrate_legacy="delete"))
+
+    assert report.stage("frames").disposition == "invalidate"
+    assert (tmp_path / "00_original_frames") not in report.migration_paths
+    apply_legacy_migration(report, "delete")
+    assert frame_files[0].is_file()
 
 
 def test_matching_settings_backup_allows_crash_resume(tmp_path):
@@ -443,7 +476,7 @@ def test_settings_rewrite_failure_rolls_back_archived_stages(tmp_path, monkeypat
     assert settings_file.read_bytes() == original_settings
 
 
-def test_missing_source_hash_invalidates_original_frames(tmp_path):
+def test_missing_source_hash_aborts_resume(tmp_path):
     from src.depth_surge_3d.io.resume import build_resume_report
 
     _write_frames(tmp_path)
@@ -454,10 +487,8 @@ def test_missing_source_hash_invalidates_original_frames(tmp_path):
         include_source_hash=False,
     )
 
-    report = build_resume_report(tmp_path, _current_settings())
-
-    assert report.stage("frames").disposition == "invalidate"
-    assert "fingerprint" in report.stage("frames").reason
+    with pytest.raises(ValueError, match="source video fingerprint is missing"):
+        build_resume_report(tmp_path, _current_settings())
 
 
 def test_actual_resume_source_must_match_saved_source(tmp_path):
@@ -468,14 +499,12 @@ def test_actual_resume_source_must_match_saved_source(tmp_path):
     other_source = tmp_path / "other.mp4"
     other_source.write_bytes(b"different-source")
 
-    report = build_resume_report(
-        tmp_path,
-        _current_settings(),
-        source_video=other_source,
-    )
-
-    assert report.stage("frames").disposition == "invalidate"
-    assert "source video" in report.stage("frames").reason
+    with pytest.raises(ValueError, match="source video fingerprint mismatch"):
+        build_resume_report(
+            tmp_path,
+            _current_settings(),
+            source_video=other_source,
+        )
 
 
 def test_noncontiguous_frame_manifest_is_invalid(tmp_path):

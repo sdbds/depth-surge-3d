@@ -46,6 +46,16 @@ class TestSeeThroughDepthEstimator:
         assert estimator.max_batch_size == 1
         assert estimator.model is None
 
+    def test_native_output_shape_matches_square_model_preprocessing(self):
+        module = _module()
+        estimator = module.SeeThroughDepthEstimator(
+            device="cpu",
+            processing_resolution=768,
+        )
+
+        assert estimator.estimate_output_shape(1920, 1080, 768) == (768, 768)
+        assert estimator.estimate_output_shape(3840, 2160, 512) == (512, 512)
+
     def test_resolve_source_root_prefers_explicit_path(self, tmp_path):
         module = _module()
         explicit_root = _make_vendor_tree(tmp_path / "qinglong-captions")

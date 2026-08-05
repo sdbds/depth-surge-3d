@@ -2,7 +2,7 @@
 
 ## Status
 
-Revision 6, updated after implementation review on 2026-08-04. The user approved a
+Revision 8, updated after implementation review on 2026-08-05. The user approved a
 Torch/CUDA-first renderer and explicitly rejected backward compatibility in the
 final state. Implementation is split into three independently verifiable
 commits so contract, geometry, and persistence failures can be isolated.
@@ -113,6 +113,14 @@ near/far direction through canonical conversion. These tests do not load large
 models: they feed a two-region synthetic estimator result through the adapter
 boundary and assert `canonical_near > canonical_far`.
 
+Those synthetic tests verify adapter wiring, not the upstream model's real
+polarity. Release verification therefore runs one annotated real clip through
+each non-physical output family independently: Video Depth Anything relative,
+Depth Anything 3 non-metric, and See-Through Marigold. For each model, fixed
+near and far ROIs are selected before inference and the native raw medians must
+match the declared representation before canonical output is inspected. A pass
+from one model cannot stand in for either of the other two.
+
 ## Scene Pre-pass
 
 Create `processing/frames/scene_analyzer.py`. It runs once after frame extraction
@@ -126,6 +134,9 @@ atomic `01_scene_data/scene_manifest.json` containing:
 - `scene_detection`, `scene_cut_threshold`, and `min_scene_frames` settings.
 
 The detector uses normalized 32-bin luma histograms and Bhattacharyya distance.
+Frame decode and histogram calculation run through an ordered bounded thread
+pool; only the adjacent-histogram comparison and cut decisions remain serial.
+The ordered result makes worker scheduling irrelevant to the manifest bytes.
 Defaults are `scene_detection=true`, `scene_cut_threshold=0.55`, and
 `min_scene_frames=8`. They are typed processing settings and persisted rather
 than hidden constants. Disabling detection assigns every frame to scene zero.
@@ -141,10 +152,13 @@ When combined span is zero, equal low/high bounds are mergeable; unequal bounds
 are not. No division by zero is performed.
 
 1. Preserve candidate scenes and their sample arrays in source-frame order.
-2. Scan left to right. When two neighbors merge, concatenate their original
-   sample arrays in that order, recompute 2nd/98th percentile bounds, replace
-   the pair at the lower index, and compare that merged scene with its new right
-   neighbor. When a pair does not merge, advance the cursor by one.
+   Concatenate those arrays once into one immutable pooled buffer. Each mutable
+   block stores a contiguous `[start, stop)` span and its cached bounds.
+2. Scan left to right. Comparisons use cached block bounds. When two neighbors
+   merge, extend the lower block's span, recompute 2nd/98th percentile bounds
+   once from that pooled-buffer view, replace the pair at the lower index, and
+   compare that merged scene with its new right neighbor. When a pair does not
+   merge, advance the cursor by one.
 3. Finish the pass, then repeat complete left-to-right passes until a pass makes
    no merge. Every successful merge reduces scene count, so termination occurs
    in at most `candidate_scene_count - 1` passes.
@@ -175,7 +189,18 @@ conversion reads it into float32 before reciprocal, negation, sampling,
 percentile, or arithmetic. The directory's `metadata.json` records
 representation, model fingerprint, frame count, native dimensions, requested
 and selected storage dtype, storage provenance, compression, schema version,
-and `storage_status: ready | promoting`.
+`promoted_frame_count`, and `storage_status: ready | promoting`. Raw-depth
+schema version 2 owns the `promoted_frame_count` fingerprint field; version 1
+directories fail explicitly as a schema mismatch.
+
+Each chunk atomically commits only its new frame payloads and increments an
+in-memory completed counter. The complete metadata document is flushed once at
+the raw-stage boundary, not rewritten for every chunk. After a crash, resume
+reconstructs the counter once from expected frame filenames. Resume validates
+NPZ membership plus the embedded NPY shape and dtype from array headers without
+inflating payload data; full data decoding and the same shape/dtype checks occur
+when a raw map is actually consumed. Membership compares basenames inside the
+single raw directory and never resolves every expected and actual path.
 
 A later finite value outside float16 range is never clipped and does not force
 completed frames through model inference again. The only permitted in-place
@@ -187,7 +212,8 @@ identical:
    directory size plus one atomic-rewrite payload.
 2. Atomically set `storage_status: promoting`, preserve the prior fingerprint,
    and set the target dtype and provenance to
-   `promoted_float16_to_float32`.
+   `promoted_float16_to_float32`. Persist `promoted_frame_count` as the number
+   of already completed maps that were originally quantized to float16.
 3. In frame-name order, load each completed float16 file and atomically rewrite
    it as float32. This conversion is exact with respect to the already stored
    float16 value and invokes no estimator.
@@ -265,9 +291,12 @@ stereo stage reads only the local `03_disparity_maps/metadata.json`.
 
 ## Raw-depth Disk Budget and Retention
 
-Before raw inference, estimate native output dimensions from the selected depth
-resolution while preserving source aspect ratio. Refuse to start unless current
-free space covers the expected peak:
+Before raw inference, ask the estimator for its native output shape when it
+declares one; otherwise estimate dimensions from the selected depth resolution
+while preserving source aspect ratio. See-Through explicitly declares its
+square `processing_resolution x processing_resolution` output, matching its
+square input preprocessing rather than the generic aspect-ratio estimate.
+Refuse to start unless current free space covers the expected peak:
 
 - raw allowance:
   `frames * native_width * native_height * storage_bytes * 1.25`;
@@ -332,7 +361,10 @@ The renderer first resizes canonical `r` to the exact render target height and
 width with bilinear interpolation. It then calculates `d` from that resized
 field. In the formula, `w` is always render target width, never source-video
 width or native model-output width. Pixel disparity is never resized after it is
-calculated.
+calculated. For See-Through, this single anisotropic resize reverses the model's
+intentional square preprocessing transform and restores alignment with the
+rectangular source frame; the square raw and canonical maps remain recorded as
+their true native shape.
 
 ## Torch Forward Splat
 
@@ -365,7 +397,14 @@ z-key.
 The one-sided visibility tolerance is defined in projected pixel units, not
 canonical depth units, so its meaning is stable across scenes and uint16 round
 trips. The no-voter fallback keeps stretched sloped surfaces inside projected
-support valid instead of misclassifying their antialiasing tails as holes.
+support valid instead of misclassifying their antialiasing tails as holes. The
+two-tap bilinear kernel cannot cover every target column when local per-eye
+stretch reaches `2x` or more. For a full-range canonical ramp spanning `N`
+source pixels, this begins at `N <= render_width * stereo_strength / 200`.
+Such columns have no positive-weight contribution, remain invalid after splat,
+and are intentionally handled as isolated gaps by bounded background fill. A
+zero-weight neighbor is not a contribution: changing `weights > 0` to
+`weights >= 0` would create false coverage rather than extend kernel support.
 When `stereo_strength=0`, all samples have zero disparity and no depth-based
 occlusion is applied.
 
@@ -375,20 +414,18 @@ converted back to its input dtype.
 
 Rendering is split into complete row bands. A fixed 256 MiB temporary-memory
 budget determines band height from frame width. Eyes render sequentially. The
-one-eye logical live-set estimate per source pixel is:
+one-eye logical live-set estimate is phase-specific because projection buffers
+are released before deterministic sorted reduction:
 
-| Allocation | Bytes |
-| --- | ---: |
-| Source RGB, canonical disparity, source x, total `d` (`float32`) | 24 |
-| Floor plus two scatter indexes (`int64`) | 24 |
-| Two weights, two z candidates, bounds/visibility masks | 20 |
-| Two weighted RGB contributions (`float32`) | 24 |
-| Target z, weight, RGB, projected disparity, and masks | 26 |
-| Logical subtotal | 118 |
+| Phase | Dominant live allocations | Approx. bytes/source pixel |
+| --- | --- | ---: |
+| Projection and z voting | Source RGB/disparity, projected coordinates, two `int64` target indexes, bilinear weights/z values, vote/visibility masks, target z buffers | 132 |
+| Stable sorted reduction | `int64` safe indexes, `order`, sorted indexes, unique indexes and counts; sorted weights/values; target colour, weight, and disparity accumulators | 112 |
 
-The implementation constant is `SPLAT_BYTES_PER_PIXEL=192`, reserving 74 bytes
-per pixel for Torch scatter temporaries, horizontal-fill propagation/gather
-buffers, allocator alignment, and bookkeeping. Splat contribution buffers are
+The implementation constant is `SPLAT_BYTES_PER_PIXEL=192`, reserving at least
+60 bytes per pixel above the larger explicit live set for `argsort` workspace,
+Torch reduction temporaries, horizontal-fill propagation/gather buffers,
+allocator alignment, and bookkeeping. Splat contribution buffers are
 released or reused before fill, so these phases contribute their maximum rather
 than their sum.
 Band rows are
@@ -484,6 +521,16 @@ Raw metadata contains and resume validates one canonical model fingerprint over:
   storage provenance (`native_float16`, `native_float32`, or
   `promoted_float16_to_float32`).
 
+`get_model_info()` is a UI/reporting surface and is never hashed wholesale.
+Fingerprint construction allowlists immutable identity and output-affecting
+fields such as model name/version, revision or artifact digest, architecture,
+metric mode, device/precision, and native processing settings. Mutable runtime
+state such as `loaded`, plus presentation-only capability flags, is excluded.
+Device remains part of the identity because changing numerical backends can
+change output bytes. Every reported key must be classified in either the
+identity allowlist or an explicit presentation-only list; an unknown key is a
+hard error so a newly added output-affecting field cannot be silently omitted.
+
 Partial raw files are reusable by frame name only when the complete fingerprint,
 source-frame fingerprint, schema, and expected native shape match. Any mismatch
 invalidates all of `02_depth_raw` except the explicitly transactional,
@@ -532,7 +579,9 @@ value inherited from legacy disk settings cannot authorize deletion. A
 pre-existing archive destination is an error rather than an overwrite.
 `keep_intermediates` controls current-schema raw retention only and does not
 authorize legacy deletion. `00_original_frames` is never archived or deleted by
-this migration when its source fingerprint and frame manifest remain valid.
+this migration, including when its manifest is invalid. A missing or mismatched
+source-video fingerprint aborts resume before migration instead of authorizing
+replacement or deletion of extracted frames.
 
 The user-facing resume message lists preserved and invalidated stages. No
 heuristic migration of old depth PNGs is permitted because they do not record
@@ -596,13 +645,35 @@ bisected to representation/scaling, projection/fill, or persistence/settings.
 
 ## Verification
 
+### Real-model polarity record
+
+On 2026-08-05, all three non-physical model families were run independently on
+four consecutive frames beginning at 2.0 seconds in the official Video Depth
+Anything `Tokyo-Walk_rgb.mp4` example. The fixed normalized near ROI covered the
+foreground pedestrian (`x=.405..475`, `y=.30..68`); the far ROI covered the
+distant street (`x=.66..76`, `y=.40..56`). Processing resolution was 384.
+
+| Model artifact | Declared representation | Near ROI medians | Far ROI medians | Result |
+| --- | --- | ---: | ---: | --- |
+| VDA Large, weight SHA-256 `43df27c6...d0e6fa`, repository `4f5ae231` | `INVERSE_DEPTH` | `906.34..907.99` | `86.84..88.47` | near is larger |
+| DA3-SMALL non-metric, snapshot `e08cab65` | `RELATIVE_DEPTH` | `0.6183..0.6197` | `1.6520..1.7039` | near is smaller |
+| See-Through Marigold, snapshot `aa7a892f` | `RELATIVE_DEPTH` | `0.7109..0.8125` | `0.9922` | near is smaller |
+
+Thus the three adapter declarations match real upstream output polarity. This
+record does not replace the synthetic contract tests; it verifies the fact that
+those tests deliberately cannot establish.
+
 Tests are written before their production changes and cover:
 
 - every estimator's declared representation and near/far direction through the
   canonical adapter, including a relative-depth near value of exactly zero;
+- annotated real-clip polarity checks for Video Depth Anything relative, Depth
+  Anything 3 non-metric, and See-Through Marigold independently;
 - no estimator performs per-frame min/max normalization;
 - deterministic scene IDs, false-cut merge guard, robust bounds, outliers, flat
   maps, and non-finite values;
+- ordered parallel histogram extraction plus cached scene-block bounds and one
+  pooled sample allocation during fixed-point merging;
 - left-to-right fixed-point merge order, pooled-sample union, and final bounds
   recomputation after every merge;
 - candidate manifests cannot canonicalize, including a simulated crash after
@@ -624,6 +695,8 @@ Tests are written before their production changes and cover:
   voter rather than replacing the column with pure foreground;
 - a full-range disparity ramp spanning 20 source pixels whose interior projected
   support contains no hole, including target columns with no primary voter;
+- a local `2x` stretch whose alternating zero-support columns remain explicitly
+  invalid after splat and are closed by one-pixel bounded background fill;
 - left and right eyes independently choose the near surface with shared `d` as
   z-key;
 - pixel-unit visibility tolerance across different scene bounds and uint16
@@ -644,6 +717,8 @@ Tests are written before their production changes and cover:
 - first-chunk raw dtype selection, explicit float16 rejection, atomic
   float16-to-float32 promotion without reinference, and crash-resume during
   promotion;
+- NPZ header-only resume validation, stage-boundary metadata flush, and an exact
+  count of frames whose values were quantized before float32 promotion;
 - uninterrupted and crash-resumed promotion produce byte-identical canonical
   output, and completed frame names never re-enter the estimator;
 - raw resume rejection on model, weight, preprocessing, representation, shape,
@@ -669,13 +744,17 @@ thresholds.
 - For a synthetic near foreground, `u_left - u_right > 0`.
 - All five estimator mode declarations produce `canonical_near > canonical_far`;
   a relative-depth near value of exactly zero remains valid.
+- Real-model ROI checks independently confirm the declared raw polarity of Video
+  Depth Anything relative, Depth Anything 3 non-metric, and See-Through
+  Marigold; this release gate cannot be satisfied by synthetic adapter stubs.
 - No estimator performs per-frame min/max normalization.
 - Canonical output is identical across a resume boundary and a clean run.
 - Canonicalization cannot start until all raw frames exist, raw metadata has
   `storage_status: ready`, and the scene manifest has `status: final` with a
   matching final-bounds fingerprint.
 - Scene merging is deterministic at zero and nonzero span, and every final
-  bound is recomputed from the fixed-point union of persisted samples.
+  bound is recomputed from the fixed-point union of persisted samples using
+  cached block bounds and one source-ordered pooled sample allocation.
 - Empty and flat scenes produce exact float32 canonical `0.5`; encoded maps use
   the documented uint16 midpoint and quantization tolerance.
 - No production stereo path calls inverse remap or colour-derived hole masking.
@@ -687,6 +766,8 @@ thresholds.
   depth edge.
 - A stretched 20-pixel full-range disparity ramp has no holes inside its
   projected support, including columns without a primary depth voter.
+- A local stretch of at least `2x` leaves only genuine zero-support columns
+  invalid after splat, and bounded background fill closes the isolated gaps.
 - Valid black source content is unchanged unless its explicit splat mask is
   invalid.
 - Background fill never crosses its derived maximum gap width; wider gaps stay

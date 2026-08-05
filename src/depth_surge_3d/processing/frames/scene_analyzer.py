@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +19,16 @@ from .depth_normalizer import SceneDepthBounds, depth_to_score
 SCENE_SCHEMA_VERSION = 1
 SCENE_ALGORITHM_VERSION = "luma-bhattacharyya-v1"
 SCENE_MERGE_RATIO = 0.10
+MAX_SCENE_HISTOGRAM_WORKERS = 8
+
+
+@dataclass
+class _SceneBlock:
+    source_ids: list[int]
+    start: int
+    stop: int
+    sample_count: int
+    bounds: SceneDepthBounds
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -30,7 +43,21 @@ def _luma_histogram(path: Path) -> np.ndarray:
     if frame is None:
         raise OSError(f"Could not read source frame for scene analysis: {path}")
     histogram = cv2.calcHist([frame], [0], None, [32], [0, 256]).astype(np.float32)
-    return cv2.normalize(histogram, None, alpha=1.0, norm_type=cv2.NORM_L1).reshape(-1)
+    normalized = np.empty_like(histogram)
+    cv2.normalize(histogram, normalized, alpha=1.0, norm_type=cv2.NORM_L1)
+    return normalized.reshape(-1)
+
+
+def _load_luma_histograms(frame_files: list[Path]) -> list[np.ndarray]:
+    worker_count = min(
+        len(frame_files),
+        MAX_SCENE_HISTOGRAM_WORKERS,
+        max(1, (os.cpu_count() or 1) - 2),
+    )
+    if worker_count == 1:
+        return [_luma_histogram(path) for path in frame_files]
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        return list(executor.map(_luma_histogram, frame_files))
 
 
 def analyze_scenes(
@@ -52,10 +79,10 @@ def analyze_scenes(
 
     cuts: list[int] = []
     if enabled:
-        previous = _luma_histogram(frame_files[0])
+        histograms = _load_luma_histograms(frame_files)
+        previous = histograms[0]
         last_cut = 0
-        for index, frame_file in enumerate(frame_files[1:], start=1):
-            current = _luma_histogram(frame_file)
+        for index, current in enumerate(histograms[1:], start=1):
             distance = float(cv2.compareHist(previous, current, cv2.HISTCMP_BHATTACHARYYA))
             if distance >= threshold and index - last_cut >= min_frames:
                 cuts.append(index)
@@ -152,17 +179,15 @@ def _bounds(samples: np.ndarray) -> SceneDepthBounds:
     )
 
 
-def _can_merge(left: np.ndarray, right: np.ndarray) -> bool:
-    if left.size == 0 or right.size == 0:
-        return left.size == right.size
-    left_bounds = _bounds(left)
-    right_bounds = _bounds(right)
-    combined_span = max(left_bounds.high, right_bounds.high) - min(
-        left_bounds.low, right_bounds.low
+def _can_merge(left: _SceneBlock, right: _SceneBlock) -> bool:
+    if left.sample_count == 0 or right.sample_count == 0:
+        return left.sample_count == right.sample_count
+    combined_span = max(left.bounds.high, right.bounds.high) - min(
+        left.bounds.low, right.bounds.low
     )
     bound_difference = max(
-        abs(left_bounds.low - right_bounds.low),
-        abs(left_bounds.high - right_bounds.high),
+        abs(left.bounds.low - right.bounds.low),
+        abs(left.bounds.high - right.bounds.high),
     )
     if combined_span == 0.0:
         return bound_difference == 0.0
@@ -182,13 +207,26 @@ def finalize_scenes(
     if set(ordered_ids) != set(samples):
         raise ValueError("Candidate samples must cover every manifest scene")
 
-    blocks = [
-        {
-            "source_ids": [scene_id],
-            "samples": np.asarray(samples[scene_id], dtype=np.float32),
-        }
-        for scene_id in ordered_ids
+    ordered_samples = [
+        np.asarray(samples[scene_id], dtype=np.float32).reshape(-1) for scene_id in ordered_ids
     ]
+    pooled_samples = (
+        np.concatenate(ordered_samples) if ordered_samples else np.empty(0, dtype=np.float32)
+    )
+    blocks: list[_SceneBlock] = []
+    offset = 0
+    for scene_id, values in zip(ordered_ids, ordered_samples):
+        stop = offset + values.size
+        blocks.append(
+            _SceneBlock(
+                source_ids=[scene_id],
+                start=offset,
+                stop=stop,
+                sample_count=values.size,
+                bounds=_bounds(values),
+            )
+        )
+        offset = stop
 
     while len(blocks) > 1:
         changed = False
@@ -196,9 +234,11 @@ def finalize_scenes(
         while index < len(blocks) - 1:
             left = blocks[index]
             right = blocks[index + 1]
-            if _can_merge(left["samples"], right["samples"]):
-                left["source_ids"].extend(right["source_ids"])
-                left["samples"] = np.concatenate([left["samples"], right["samples"]])
+            if _can_merge(left, right):
+                left.source_ids.extend(right.source_ids)
+                left.stop = right.stop
+                left.sample_count += right.sample_count
+                left.bounds = _bounds(pooled_samples[left.start : left.stop])
                 del blocks[index + 1]
                 changed = True
             else:
@@ -209,8 +249,8 @@ def finalize_scenes(
     old_to_new: dict[int, int] = {}
     final_bounds: dict[int, SceneDepthBounds] = {}
     for final_id, block in enumerate(blocks):
-        final_bounds[final_id] = _bounds(block["samples"])
-        for source_id in block["source_ids"]:
+        final_bounds[final_id] = block.bounds
+        for source_id in block.source_ids:
             old_to_new[int(source_id)] = final_id
 
     final_scene_ids = [old_to_new[scene_id] for scene_id in source_scene_ids]

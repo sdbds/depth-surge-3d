@@ -1,13 +1,17 @@
 """Deterministic scene pre-pass and finalization tests."""
 
 import json
+import os
 from pathlib import Path
+import threading
+import time
 
 import cv2
 import numpy as np
 import pytest
 
 from src.depth_surge_3d.inference.depth.types import DepthRepresentation
+from src.depth_surge_3d.processing.frames import scene_analyzer as scene_analyzer_module
 from src.depth_surge_3d.processing.frames.scene_analyzer import (
     analyze_scenes,
     finalize_scenes,
@@ -65,6 +69,35 @@ def test_scene_prepass_can_be_disabled_and_drops_too_short_final_scene(tmp_path:
     assert disabled["candidate_cuts"] == []
     assert guarded["scene_ids"] == [0] * 6
     assert guarded["candidate_cuts"] == []
+
+
+def test_scene_prepass_decodes_histograms_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frame_files = _write_frames(tmp_path / "frames", list(range(8)))
+    original = scene_analyzer_module._luma_histogram
+    lock = threading.Lock()
+    active = 0
+    peak_active = 0
+
+    def delayed_histogram(path: Path) -> np.ndarray:
+        nonlocal active, peak_active
+        with lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        time.sleep(0.02)
+        try:
+            return original(path)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(scene_analyzer_module, "_luma_histogram", delayed_histogram)
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+
+    analyze_scenes(frame_files, tmp_path / "scene")
+
+    assert peak_active > 1
 
 
 def test_scene_sampling_uses_representation_score_and_ignores_invalid_values(
@@ -132,6 +165,57 @@ def test_dissimilar_candidate_scenes_remain_separate() -> None:
 
     assert final_manifest["scene_ids"] == [0, 0, 1, 1]
     assert list(bounds) == [0, 1]
+
+
+def test_finalization_caches_bounds_for_unchanged_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _candidate_manifest([0, 1, 2])
+    samples = {
+        0: np.linspace(0.0, 1.0, 101, dtype=np.float32),
+        1: np.linspace(10.0, 11.0, 101, dtype=np.float32),
+        2: np.linspace(20.0, 21.0, 101, dtype=np.float32),
+    }
+    original_bounds = scene_analyzer_module._bounds
+    calls = 0
+
+    def counted_bounds(values: np.ndarray):
+        nonlocal calls
+        calls += 1
+        return original_bounds(values)
+
+    monkeypatch.setattr(scene_analyzer_module, "_bounds", counted_bounds)
+
+    finalize_scenes(manifest, samples)
+
+    assert calls == 3
+
+
+def test_finalization_pools_ordered_samples_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = _candidate_manifest([0, 1, 2])
+    samples = {
+        0: np.linspace(0.0, 10.0, 101, dtype=np.float32),
+        1: np.linspace(0.5, 10.5, 101, dtype=np.float32),
+        2: np.linspace(1.0, 11.0, 101, dtype=np.float32),
+    }
+    original_concatenate = np.concatenate
+    calls = 0
+
+    def counted_concatenate(values, *args, **kwargs):
+        nonlocal calls
+        if (
+            isinstance(values, list)
+            and len(values) == len(samples)
+            and all(isinstance(value, np.ndarray) and value.shape == (101,) for value in values)
+        ):
+            calls += 1
+        return original_concatenate(values, *args, **kwargs)
+
+    monkeypatch.setattr(scene_analyzer_module.np, "concatenate", counted_concatenate)
+
+    finalize_scenes(manifest, samples)
+
+    assert calls == 1
 
 
 def test_finalization_rejects_non_candidate_manifest() -> None:

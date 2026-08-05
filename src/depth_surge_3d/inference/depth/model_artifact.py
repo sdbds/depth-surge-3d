@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Any
 
 
 def _hash_directory(directory: Path) -> str:
@@ -26,7 +27,7 @@ def resolve_hf_snapshot(repo_id: str, *, cache_dir: Path | str | None = None) ->
 
     from huggingface_hub import snapshot_download
 
-    kwargs = {"repo_id": repo_id}
+    kwargs: dict[str, Any] = {"repo_id": repo_id}
     if cache_dir is not None:
         kwargs["cache_dir"] = str(cache_dir)
     try:
