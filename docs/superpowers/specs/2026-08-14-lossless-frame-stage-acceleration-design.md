@@ -4,8 +4,10 @@
 
 The user selected the conservative optimization approach on 2026-08-14:
 accelerate only work whose decoded output can remain pixel-identical to the
-current implementation. This written specification is awaiting final user
-review before an implementation plan is produced.
+current implementation. An independent context-free review found two blockers
+in source-size memory accounting and failed-worker shutdown. Both contracts
+were revised, and the independent follow-up review returned PASS before
+implementation began.
 
 ## Problem
 
@@ -91,7 +93,8 @@ The following invariants are hard requirements rather than best-effort goals:
 5. A worker exception, unreadable input, failed write, or failed link/copy must
    make the stage return failure and must not write completion metadata.
 6. Concurrent workers may only write distinct output paths. Shared arrays are
-   read-only after construction.
+   read-only after construction. A failed stage must wait for every running
+   worker to exit before returning control to a caller that may retry it.
 7. The main thread alone calls progress and preview APIs. This avoids relying on
    thread safety in UI or websocket code.
 8. Existing completed stages remain reusable. No algorithm-version bump is
@@ -124,13 +127,17 @@ concurrent-item budget, not a claim about total process memory. One item is
 still allowed when its conservative estimate alone exceeds the budget because
 the stage must be able to make progress.
 
-Each processor supplies a stage-specific estimate:
+Each processor supplies a stage-specific estimate. Pair stages first read all
+source PNG headers and use the largest decoded source-eye pixel count, so a
+large input downscaled to a smaller target cannot bypass the memory cap:
 
 - Canonicalization: native map pixels multiplied by 32 bytes.
-- Distortion or transformed crop: per-eye source pixels multiplied by 48 bytes
-  for a pair.
-- VR assembly: target per-eye pixels multiplied by 48 bytes for both decoded
-  inputs, optional resized arrays, the combined image, and encoder buffers.
+- Distortion: largest source-eye pixel count multiplied by 48 bytes.
+- Transformed crop: the larger of the largest source-eye pixel count and target
+  per-eye pixel count, multiplied by 48 bytes.
+- VR assembly: the larger of the largest source-eye pixel count and target
+  per-eye pixel count, multiplied by 48 bytes. This covers both decoded source
+  arrays, optional resized arrays, the combined image, and encoder buffers.
 
 The eight-worker ceiling follows measured scaling and prevents OpenCV calls
 from consuming every logical CPU. At 1920x1080, VR assembly receives eight
@@ -140,8 +147,9 @@ reduces concurrency automatically.
 Use `ThreadPoolExecutor`, not process workers. OpenCV and NumPy release the GIL
 for the expensive operations, threads avoid serializing large arrays, and each
 task already has independent file paths. Futures are consumed in source order
-for deterministic callbacks. On failure, pending futures are cancelled;
-already-running tasks may finish their distinct writes, but no completion
+for deterministic callbacks. On failure, pending futures are cancelled and the
+executor is shut down with `wait=True` and `cancel_futures=True`. The processor
+may return or raise only after already-running tasks have exited. No completion
 manifest is emitted.
 
 This helper chooses worker counts only. Stage-specific workers remain local to
@@ -220,7 +228,11 @@ bounds, and representation values are read-only during this phase.
 ### Parallel VR assembly
 
 `VRFrameAssembler` validates and fingerprints the source manifest exactly as it
-does now. A bounded worker then handles one pair:
+does now. Before scheduling, it reads every source IHDR, rejects an unreadable
+header, and finds the largest left/right source-eye pixel count for the worker
+memory estimate. Source dimensions need not be uniform because the existing
+resize boundary produces one configured output shape. A bounded worker then
+handles one pair:
 
 1. Decode the two source PNGs.
 2. Compare each decoded shape with `per_eye_width` and `per_eye_height`.
@@ -270,10 +282,12 @@ selection continues to bypass that stage in the same way it does today.
 - Convert worker exceptions into the processor's current `False` return or the
   canonical stage's current exception contract. Include the failing frame path
   in the diagnostic.
-- Cancel futures that have not started after the first failure.
+- Cancel futures that have not started after the first failure, then call
+  `shutdown(wait=True, cancel_futures=True)` before returning or raising.
 - Do not delete partial outputs in the failure handler. The existing
-  non-reusable-stage path clears them at the start of the next attempt, avoiding
-  races with workers that were already finishing.
+  non-reusable-stage path clears them at the start of the next attempt. Waiting
+  for running workers first guarantees that retry cleanup cannot race with an
+  old worker still writing.
 - Do not write metadata early or mark a stage complete from a worker.
 - Preserve atomic temporary-file replacement for canonical PNGs. The other
   stages retain their current distinct final-path writes.
@@ -295,7 +309,8 @@ selection continues to bypass that stage in the same way it does today.
 - Force `os.link` to raise `OSError`; verify `copy2` fallback and byte identity.
 - Verify deleting one hard-link path leaves the other readable.
 - Compare factors below `1.0` against the serial reference pixel for pixel.
-- Verify failure leaves no completion manifest and a retry clears partial work.
+- Verify failure leaves no completion manifest, does not return while a worker
+  is still active, and allows a retry to clear partial work without a late write.
 
 ### Distortion
 
@@ -312,7 +327,8 @@ selection continues to bypass that stage in the same way it does today.
   equality across all depth representations and more than one scene.
 - Verify output names and preview frame numbers remain in source order even when
   workers finish out of order.
-- Inject a worker failure and verify metadata is not written.
+- Inject a worker failure and verify metadata is not written and the method
+  waits for every already-running worker to exit before raising.
 - Verify a completed existing canonical stage is still reused without work.
 
 ### VR assembly
@@ -322,6 +338,8 @@ selection continues to bypass that stage in the same way it does today.
 - Verify the same-size path does not call resize.
 - Verify progress and preview ordering under deliberately out-of-order worker
   completion.
+- Verify a large source resized to a small target lowers the worker count based
+  on the source IHDR dimensions, not only the target settings.
 - Verify one failed decode/write prevents `complete_stage`.
 - Verify existing completed VR stages remain reusable.
 
@@ -346,7 +364,8 @@ The implementation is accepted when all of the following hold:
 - Worker count is bounded by frame count, CPU reserve, the eight-worker ceiling,
   and the memory-derived cap, with an unavoidable floor of one active item.
 - Progress and preview callbacks occur on the caller thread in source order.
-- A worker failure cannot produce a reusable stage.
+- A worker failure cannot produce a reusable stage or return while an old
+  worker can still write into that stage.
 - The full test suite passes.
 - On the measured 1080p workload class, no-op crop completes in seconds rather
   than minutes, canonicalization is materially faster than 20.8 fps, and VR
