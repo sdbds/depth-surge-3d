@@ -164,6 +164,38 @@ def test_web_resume_infers_see_through_for_legacy_settings(tmp_path):
     assert result["depth_model_version"] == "see_through"
 
 
+def test_web_resume_preserves_direct_vr_setting_and_defaults_older_jobs_off(tmp_path):
+    import app as web_app
+
+    direct_dir = tmp_path / "direct"
+    legacy_dir = tmp_path / "legacy"
+    direct_dir.mkdir()
+    legacy_dir.mkdir()
+    direct_settings = direct_dir / "job-settings.json"
+    legacy_settings = legacy_dir / "job-settings.json"
+    direct_settings.write_text(
+        json.dumps({"processing_settings": {"direct_vr_encode": True}}),
+        encoding="utf-8",
+    )
+    legacy_settings.write_text(
+        json.dumps({"processing_settings": {}}),
+        encoding="utf-8",
+    )
+
+    assert (
+        web_app.detect_resume_settings(direct_dir, settings_file=direct_settings)[
+            "direct_vr_encode"
+        ]
+        is True
+    )
+    assert (
+        web_app.detect_resume_settings(legacy_dir, settings_file=legacy_settings)[
+            "direct_vr_encode"
+        ]
+        is False
+    )
+
+
 def test_resume_depth_model_inference_uses_raw_metadata_and_preserves_explicit_value(tmp_path):
     from src.depth_surge_3d.io.resume import resolve_resume_depth_model_version
 

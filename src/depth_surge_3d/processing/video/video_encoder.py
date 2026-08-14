@@ -385,6 +385,7 @@ class VideoEncoder:
                 self._consume_direct_ffmpeg_line(
                     raw_line, total_frames, progress_tracker, diagnostics
                 )
+            self._print_direct_ffmpeg_diagnostics(tuple(diagnostics))
             raise
 
     @staticmethod
@@ -417,18 +418,36 @@ class VideoEncoder:
                     step_progress=frame,
                     step_total=total_frames,
                 )
+        except InterruptedError:
+            raise
         except Exception as error:
             print(f"Warning: Direct encoding progress update failed: {error}")
+
+    @staticmethod
+    def _print_direct_ffmpeg_diagnostics(diagnostics: tuple[str, ...]) -> None:
+        """Print a bounded FFmpeg diagnostic tail when one is available."""
+
+        if diagnostics:
+            print("FFmpeg diagnostic tail:")
+            for line in diagnostics:
+                print(f"  {line}")
 
     @staticmethod
     def _print_direct_ffmpeg_failure(returncode: int, diagnostics: tuple[str, ...]) -> None:
         """Print FFmpeg's bounded diagnostic tail for a failed direct encode."""
 
         print(f"Error: Direct FFmpeg encoding failed with return code {returncode}.")
-        if diagnostics:
-            print("FFmpeg diagnostic tail:")
-            for line in diagnostics:
-                print(f"  {line}")
+        VideoEncoder._print_direct_ffmpeg_diagnostics(diagnostics)
+
+    @staticmethod
+    def _print_direct_ffmpeg_output_validation_failure(diagnostics: tuple[str, ...]) -> None:
+        """Report a zero-exit encode that did not produce a publishable file."""
+
+        print(
+            "Error: Direct FFmpeg output validation failed: "
+            "temporary output is missing or empty."
+        )
+        VideoEncoder._print_direct_ffmpeg_diagnostics(diagnostics)
 
     def create_video_from_stereo_sequences(
         self,
@@ -464,11 +483,16 @@ class VideoEncoder:
             returncode, diagnostics = self._run_ffmpeg_with_progress(
                 command, sequence.frame_count, progress_tracker
             )
-            if returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+            if returncode != 0:
                 self._print_direct_ffmpeg_failure(returncode, diagnostics)
+                return False
+            if not temporary.is_file() or temporary.stat().st_size == 0:
+                self._print_direct_ffmpeg_output_validation_failure(diagnostics)
                 return False
             temporary.replace(output_path)
             return True
+        except InterruptedError:
+            raise
         except Exception as error:
             print(f"Error creating direct VR output video: {error}")
             return False

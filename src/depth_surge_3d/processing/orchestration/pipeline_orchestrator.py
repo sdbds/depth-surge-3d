@@ -117,6 +117,8 @@ class ProcessingOrchestrator:
 
             return success
 
+        except InterruptedError:
+            raise
         except Exception as e:
             print(f"Error in video processing: {e}")
             if self._settings_file:

@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import pytest
+
 from src.depth_surge_3d.processing.orchestration.pipeline_orchestrator import (
     ProcessingOrchestrator,
 )
@@ -602,3 +604,31 @@ class TestProcessMethod:
             )
 
             assert result is False
+
+    def test_process_propagates_interrupted_error(self, tmp_path):
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+
+        with (
+            patch.object(
+                orchestrator,
+                "_setup_processing",
+                return_value=(tmp_path, {"base": tmp_path}, tmp_path / "settings.json"),
+            ),
+            patch.object(
+                orchestrator,
+                "_execute_pipeline",
+                side_effect=InterruptedError("Processing stopped by user request"),
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.update_processing_status"
+            ) as update_status,
+        ):
+            with pytest.raises(InterruptedError, match="stopped by user request"):
+                orchestrator.process(
+                    video_path=tmp_path / "source.mp4",
+                    output_dir=tmp_path,
+                    video_properties={"fps": 30, "frame_count": 1},
+                    settings={"keep_intermediates": True, "direct_vr_encode": True},
+                )
+
+        update_status.assert_not_called()

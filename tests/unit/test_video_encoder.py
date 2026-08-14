@@ -26,7 +26,7 @@ class _FakeProcess:
         self.waited = False
         self.terminated = False
         self.killed = False
-        self.communicate_timeouts = []
+        self.communicate_timeouts: list[float | None] = []
 
     def wait(self, timeout=None):
         self.waited = True
@@ -403,6 +403,22 @@ def test_direct_runner_terminates_drains_and_reaps_after_read_error():
     assert process.waited is True
 
 
+def test_direct_runner_surfaces_diagnostic_tail_after_read_error(capsys):
+    process = _FakeProcess("")
+    process.stdout = _BrokenProgressStream()
+
+    with patch(
+        "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
+        return_value=process,
+    ):
+        with pytest.raises(OSError, match="progress pipe failed"):
+            VideoEncoder()._run_ffmpeg_with_progress(["ffmpeg"], 1, None)
+
+    output = capsys.readouterr().out
+    assert "FFmpeg diagnostic tail:" in output
+    assert "diagnostic before read failure" in output
+
+
 def test_direct_runner_kills_and_reaps_when_bounded_drain_times_out():
     process = _TimeoutProcess("")
     process.stdout = _BrokenProgressStream()
@@ -513,6 +529,60 @@ def test_direct_create_video_failure_preserves_old_final_and_removes_temp(tmp_pa
     assert right[0].read_bytes() == right_before
 
 
+def test_direct_cancellation_reaps_ffmpeg_and_preserves_inputs_and_old_final(tmp_path):
+    import app as web_app
+
+    left = _write_eye_sequence(tmp_path / "left", [1])
+    right = _write_eye_sequence(tmp_path / "right", [1])
+    settings = _direct_settings()
+    final = tmp_path / generate_output_filename(
+        "source.mp4", settings["vr_format"], settings["vr_resolution"]
+    )
+    temporary = tmp_path / f".{final.stem}.direct.tmp.mp4"
+    final.write_bytes(b"old-valid-video")
+    left_before = left[0].read_bytes()
+    right_before = right[0].read_bytes()
+    process = _FakeProcess("frame=1\n")
+
+    def launch(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"partial")
+        return process
+
+    callback = web_app.ProgressCallback("test-session", total_frames=1)
+    web_app.current_processing["stop_requested"] = True
+    try:
+        with (
+            patch(
+                "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+                return_value=True,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
+                side_effect=launch,
+            ),
+        ):
+            with pytest.raises(InterruptedError, match="stopped by user request"):
+                VideoEncoder().create_video_from_stereo_sequences(
+                    left,
+                    right,
+                    tmp_path,
+                    "source.mp4",
+                    settings,
+                    total_frames=1,
+                    progress_tracker=callback,
+                )
+    finally:
+        web_app.current_processing["stop_requested"] = False
+
+    assert process.terminated is True
+    assert process.communicate_timeouts == [5]
+    assert process.waited is True
+    assert final.read_bytes() == b"old-valid-video"
+    assert not temporary.exists()
+    assert left[0].read_bytes() == left_before
+    assert right[0].read_bytes() == right_before
+
+
 def test_direct_create_video_validates_before_launch_and_cleans_stale_temp(tmp_path):
     settings = _direct_settings()
     final = tmp_path / generate_output_filename(
@@ -615,7 +685,8 @@ def test_direct_create_video_cleans_temp_after_launch_exception(tmp_path):
     assert not temporary.exists()
 
 
-def test_direct_create_video_rejects_zero_byte_temporary_output(tmp_path):
+@pytest.mark.parametrize("output_state", ["missing", "empty"])
+def test_direct_create_video_reports_output_validation_failure(tmp_path, capsys, output_state):
     left = _write_eye_sequence(tmp_path / "left", [1])
     right = _write_eye_sequence(tmp_path / "right", [1])
     settings = _direct_settings()
@@ -626,8 +697,9 @@ def test_direct_create_video_rejects_zero_byte_temporary_output(tmp_path):
     final.write_bytes(b"old-valid-video")
 
     def launch(command, **_kwargs):
-        Path(command[-1]).touch()
-        return _FakeProcess("frame=1\n")
+        if output_state == "empty":
+            Path(command[-1]).touch()
+        return _FakeProcess("frame=1\ndiagnostic from zero exit\n")
 
     with (
         patch(
@@ -650,6 +722,11 @@ def test_direct_create_video_rejects_zero_byte_temporary_output(tmp_path):
 
     assert final.read_bytes() == b"old-valid-video"
     assert not temporary.exists()
+    output = capsys.readouterr().out
+    assert "Direct FFmpeg output validation failed" in output
+    assert "temporary output is missing or empty" in output
+    assert "return code 0" not in output
+    assert "diagnostic from zero exit" in output
 
 
 def test_direct_create_video_cleans_temp_when_atomic_replace_fails(tmp_path):
