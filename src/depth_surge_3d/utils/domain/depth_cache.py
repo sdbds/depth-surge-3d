@@ -13,6 +13,14 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from ...core.depth_contract import (
+    CANONICAL_DEPTH_ALGORITHM_VERSION,
+    CANONICAL_DEPTH_SCHEMA_VERSION,
+    CANONICAL_METADATA_REQUIRED_FIELDS,
+    canonical_json_hash,
+)
+from ...core.file_identity import file_sample_fingerprint
+
 DEPTH_CACHE_SETTING_KEYS = (
     "depth_model_version",
     "model_path",
@@ -34,39 +42,13 @@ DEPTH_CACHE_SETTING_KEYS = (
     "model_fingerprint",
 )
 
-CANONICAL_CACHE_SCHEMA_VERSION = 1
-CANONICAL_CACHE_ALGORITHM_VERSION = "scene-percentile-v1"
-CANONICAL_CACHE_REQUIRED_FIELDS = {
-    "algorithm_version",
-    "representation",
-    "near_value",
-    "far_value",
-    "encoding",
-    "encoding_scale",
-    "num_frames",
-    "frame_names",
-    "native_shape",
-    "source_raw_fingerprint",
-    "source_model_fingerprint",
-    "scene_manifest_fingerprint",
-    "depth_bounds_fingerprint",
-    "fingerprint",
-}
-
-
-def _canonical_json_hash(payload: Any) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(
-        "ascii"
-    )
-    return hashlib.sha256(encoded).hexdigest()
-
 
 def _is_valid_canonical_metadata(metadata: dict[str, Any], num_frames: int) -> bool:
-    if metadata.get("schema_version") != CANONICAL_CACHE_SCHEMA_VERSION:
+    if metadata.get("schema_version") != CANONICAL_DEPTH_SCHEMA_VERSION:
         return False
-    if metadata.get("algorithm_version") != CANONICAL_CACHE_ALGORITHM_VERSION:
+    if metadata.get("algorithm_version") != CANONICAL_DEPTH_ALGORITHM_VERSION:
         return False
-    if not CANONICAL_CACHE_REQUIRED_FIELDS.issubset(metadata):
+    if not CANONICAL_METADATA_REQUIRED_FIELDS.issubset(metadata):
         return False
     if metadata.get("representation") != "relative_disparity":
         return False
@@ -80,7 +62,7 @@ def _is_valid_canonical_metadata(metadata: dict[str, Any], num_frames: int) -> b
         return False
     fingerprint = metadata.get("fingerprint")
     unhashed = {key: value for key, value in metadata.items() if key != "fingerprint"}
-    return isinstance(fingerprint, str) and fingerprint == _canonical_json_hash(unhashed)
+    return isinstance(fingerprint, str) and fingerprint == canonical_json_hash(unhashed)
 
 
 def get_cache_dir() -> Path:
@@ -103,7 +85,7 @@ def compute_cache_key(video_path: str, depth_settings: dict[str, Any]) -> str:
     Compute cache key for depth maps.
 
     The cache key is based on:
-    - Video file content hash (first 1MB + last 1MB + size + mtime)
+    - The shared bounded-cost source video content fingerprint
     - Settings that affect depth: model version, model size, depth resolution,
       metric vs relative
 
@@ -116,24 +98,7 @@ def compute_cache_key(video_path: str, depth_settings: dict[str, Any]) -> str:
     """
     hasher = hashlib.blake2b(digest_size=16)  # 16 bytes = 32 hex chars
 
-    # Hash video file (fast approximation: first 1MB + last 1MB + metadata)
-    video_path_obj = Path(video_path)
-    file_size = video_path_obj.stat().st_size
-    mtime = video_path_obj.stat().st_mtime
-
-    # Add file metadata
-    hasher.update(str(file_size).encode())
-    hasher.update(str(mtime).encode())
-
-    # Sample first and last 1MB for content hash
-    sample_size = min(1024 * 1024, file_size // 2)  # 1MB or half file
-    with open(video_path, "rb") as f:
-        # First chunk
-        hasher.update(f.read(sample_size))
-        # Last chunk (if file is big enough)
-        if file_size > sample_size * 2:
-            f.seek(-sample_size, 2)  # Seek from end
-            hasher.update(f.read(sample_size))
+    hasher.update(file_sample_fingerprint(video_path).encode("ascii"))
 
     # Hash depth-relevant settings (sorted for consistency)
     settings_for_hash = {k: depth_settings.get(k) for k in DEPTH_CACHE_SETTING_KEYS}

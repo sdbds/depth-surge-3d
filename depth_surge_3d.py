@@ -6,17 +6,15 @@ This is the main entry point using the new modular architecture.
 """
 
 import argparse
-import inspect
 import sys
 from pathlib import Path
 
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from depth_surge_3d.rendering import StereoProjector, create_stereo_projector  # noqa: E402
+from depth_surge_3d.rendering import create_stereo_projector  # noqa: E402
 from depth_surge_3d.core.constants import (  # noqa: E402
     DEFAULT_SETTINGS,
-    VR_RESOLUTIONS,
     FISHEYE_PROJECTIONS,
     VALIDATION_RANGES,
 )
@@ -25,6 +23,7 @@ from depth_surge_3d.utils import (  # noqa: E402
     get_available_resolutions,
     warning as console_warning,
 )
+from depth_surge_3d.utils.domain.resolution import get_resolution_dimensions  # noqa: E402
 from depth_surge_3d.io.operations import (  # noqa: E402
     validate_video_file,
     can_resume_processing,
@@ -33,6 +32,7 @@ from depth_surge_3d.io.operations import (  # noqa: E402
 from depth_surge_3d.io.resume import (  # noqa: E402
     apply_legacy_migration,
     build_resume_report,
+    resolve_resume_depth_model_version,
 )
 from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
     build_current_model_fingerprint,
@@ -48,6 +48,49 @@ def _print_resume_report(report) -> None:
         )
     if report.removed_settings:
         print("  - Removed legacy settings: " + ", ".join(report.removed_settings))
+
+
+def _parse_vr_resolution(value: str) -> str:
+    if value == "auto":
+        return value
+    try:
+        get_resolution_dimensions(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
+
+
+def _build_processing_settings(args: argparse.Namespace) -> dict[str, object]:
+    """Translate CLI names once, then hand one validated object to the pipeline."""
+    return validate_settings(
+        {
+            "vr_format": args.format,
+            "vr_resolution": args.vr_resolution,
+            "stereo_strength": args.stereo_strength,
+            "convergence": args.convergence,
+            "occlusion_fill": args.occlusion_fill,
+            "scene_detection": args.scene_detection,
+            "scene_cut_threshold": args.scene_cut_threshold,
+            "min_scene_frames": args.min_scene_frames,
+            "raw_storage_dtype": args.raw_storage_dtype,
+            "stereo_io_workers": args.stereo_io_workers,
+            "migrate_legacy": args.migrate_legacy,
+            "start_time": args.start,
+            "end_time": args.end,
+            "apply_distortion": not args.no_distortion,
+            "fisheye_projection": args.fisheye_projection,
+            "fisheye_fov": args.fisheye_fov,
+            "crop_factor": args.crop_factor,
+            "fisheye_crop_factor": args.fisheye_crop_factor,
+            "preserve_audio": not args.no_audio,
+            "keep_intermediates": not args.no_intermediates,
+            "target_fps": args.target_fps,
+            "experimental_frame_interpolation": args.experimental_frame_interpolation,
+            "upscale_model": args.upscale_model,
+            "verbose": args.verbose,
+        },
+        source="explicit",
+    )
 
 
 def create_argument_parser() -> argparse.ArgumentParser:
@@ -83,10 +126,9 @@ Note: Always uses Video-Depth-Anything for temporal consistency across frames.
     )
 
     # VR settings
-    available_resolutions = list(VR_RESOLUTIONS.keys()) + ["auto", "custom"]
     parser.add_argument(
         "--vr-resolution",
-        choices=available_resolutions,
+        type=_parse_vr_resolution,
         default=DEFAULT_SETTINGS["vr_resolution"],
         help="VR output resolution per eye (default: %(default)s)",
     )
@@ -252,44 +294,31 @@ Note: Always uses Video-Depth-Anything for temporal consistency across frames.
     return parser
 
 
-def validate_arguments(args) -> bool:
-    """Validate command line arguments."""
+def validate_arguments(args) -> dict[str, object] | None:
+    """Validate CLI arguments and return the normalized processing settings."""
 
     # Handle resume mode
     if args.resume:
         if not Path(args.resume).exists():
             print(f"Error: Resume directory does not exist: {args.resume}")
-            return False
-        return True  # Skip other validations for resume mode
+            return None
+        return {}  # Resume settings come from the persisted job metadata.
 
     # Regular mode validations
     if not args.input_video:
         print("Error: Input video is required when not resuming")
-        return False
+        return None
 
     # Validate input video
     if not validate_video_file(args.input_video):
         print(f"Error: Invalid or unsupported video file: {args.input_video}")
-        return False
+        return None
 
     try:
-        validate_settings(
-            {
-                "stereo_strength": args.stereo_strength,
-                "convergence": args.convergence,
-                "occlusion_fill": args.occlusion_fill,
-                "scene_detection": args.scene_detection,
-                "scene_cut_threshold": args.scene_cut_threshold,
-                "min_scene_frames": args.min_scene_frames,
-                "raw_storage_dtype": args.raw_storage_dtype,
-                "stereo_io_workers": args.stereo_io_workers,
-                "migrate_legacy": args.migrate_legacy,
-            },
-            source="explicit",
-        )
+        processing_settings = _build_processing_settings(args)
     except ValueError as exc:
         print(f"Error: {exc}")
-        return False
+        return None
 
     if (
         args.fisheye_fov < VALIDATION_RANGES["fisheye_fov"][0]
@@ -298,7 +327,7 @@ def validate_arguments(args) -> bool:
         print(
             f"Error: FOV must be between {VALIDATION_RANGES['fisheye_fov'][0]} and {VALIDATION_RANGES['fisheye_fov'][1]} degrees"
         )
-        return False
+        return None
 
     if (
         args.crop_factor < VALIDATION_RANGES["crop_factor"][0]
@@ -307,7 +336,7 @@ def validate_arguments(args) -> bool:
         print(
             f"Error: Crop factor must be between {VALIDATION_RANGES['crop_factor'][0]} and {VALIDATION_RANGES['crop_factor'][1]}"
         )
-        return False
+        return None
 
     if args.target_fps and (
         args.target_fps < VALIDATION_RANGES["target_fps"][0]
@@ -316,9 +345,9 @@ def validate_arguments(args) -> bool:
         print(
             f"Error: Target FPS must be between {VALIDATION_RANGES['target_fps'][0]} and {VALIDATION_RANGES['target_fps'][1]}"
         )
-        return False
+        return None
 
-    return True
+    return processing_settings
 
 
 def list_available_resolutions():
@@ -408,11 +437,17 @@ def main():  # noqa: C901
             source="legacy_disk",
         )
         processing_settings["migrate_legacy"] = args.migrate_legacy
+        processing_settings["verbose"] = args.verbose
         if any(
             value == "--raw-storage-dtype" or value.startswith("--raw-storage-dtype=")
             for value in sys.argv[1:]
         ):
             processing_settings["raw_storage_dtype"] = args.raw_storage_dtype
+        processing_settings["depth_model_version"] = resolve_resume_depth_model_version(
+            processing_settings,
+            Path(args.resume),
+            default="v2",
+        )
 
         projector = create_stereo_projector(
             model_path=processing_settings.get("model_path"),
@@ -447,17 +482,10 @@ def main():  # noqa: C901
         print(f"Input: {video_path}")
         print(f"Output: {args.resume}")
 
-        # Resume processing using original settings
-        supported_settings = inspect.signature(StereoProjector.process_video).parameters
-        resume_settings = {
-            key: value
-            for key, value in processing_settings.items()
-            if key in supported_settings and key not in {"self", "video_path", "output_dir"}
-        }
         success = projector.process_video(
             video_path=video_path,
             output_dir=args.resume,
-            **resume_settings,
+            settings=processing_settings,
         )
 
         if success:
@@ -468,7 +496,8 @@ def main():  # noqa: C901
             return 1
 
     # Validate arguments for normal processing
-    if not validate_arguments(args):
+    processing_settings = validate_arguments(args)
+    if processing_settings is None:
         return 1
 
     # Create stereo projector
@@ -524,28 +553,7 @@ def main():  # noqa: C901
         success = projector.process_video(
             video_path=args.input_video,
             output_dir=str(batch_output_dir),
-            vr_format=args.format,
-            vr_resolution=args.vr_resolution,
-            stereo_strength=args.stereo_strength,
-            convergence=args.convergence,
-            occlusion_fill=args.occlusion_fill,
-            scene_detection=args.scene_detection,
-            scene_cut_threshold=args.scene_cut_threshold,
-            min_scene_frames=args.min_scene_frames,
-            raw_storage_dtype=args.raw_storage_dtype,
-            stereo_io_workers=args.stereo_io_workers,
-            migrate_legacy=args.migrate_legacy,
-            start_time=args.start,
-            end_time=args.end,
-            apply_distortion=not args.no_distortion,
-            fisheye_projection=args.fisheye_projection,
-            fisheye_fov=args.fisheye_fov,
-            crop_factor=args.crop_factor,
-            fisheye_crop_factor=args.fisheye_crop_factor,
-            preserve_audio=not args.no_audio,
-            keep_intermediates=not args.no_intermediates,
-            target_fps=args.target_fps,
-            experimental_frame_interpolation=args.experimental_frame_interpolation,
+            settings=processing_settings,
         )
 
         if success:

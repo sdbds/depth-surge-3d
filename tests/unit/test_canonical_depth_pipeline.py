@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -85,6 +87,7 @@ def _run_pipeline(
     stage_directories: dict[str, Path],
     settings: dict[str, object],
     monkeypatch: pytest.MonkeyPatch,
+    progress_tracker=None,
 ) -> list[Path]:
     processor = DepthMapProcessor(estimator)
     monkeypatch.setattr(processor, "_determine_chunk_params", lambda *_args: (2, 6))
@@ -93,7 +96,7 @@ def _run_pipeline(
         source_frames,
         settings,
         stage_directories,
-        progress_tracker=None,
+        progress_tracker=progress_tracker,
     )
     assert result is not None
     return result
@@ -108,6 +111,18 @@ def test_native_frame_preprocessing_has_a_new_fingerprint_version(
     fingerprint = processor._raw_semantic_fingerprint(source_frames, pipeline_settings)
 
     assert fingerprint["preprocessing_algorithm"] == "native-depth-adapter-v2"
+
+
+def test_see_through_aspect_geometry_has_a_distinct_fingerprint(
+    source_frames: list[Path],
+    pipeline_settings: dict[str, object],
+) -> None:
+    processor = DepthMapProcessor(FakeRelativeDepthEstimator())
+    settings = dict(pipeline_settings, depth_model_version="see_through")
+
+    fingerprint = processor._raw_semantic_fingerprint(source_frames, settings)
+
+    assert fingerprint["preprocessing_algorithm"] == "see-through-native-768-square-v2"
 
 
 def test_file_pipeline_persists_native_raw_before_canonicalization(
@@ -165,6 +180,249 @@ def test_file_pipeline_persists_native_raw_before_canonicalization(
     assert metadata["source_raw_fingerprint"]
     assert metadata["scene_manifest_fingerprint"]
     assert metadata["depth_bounds_fingerprint"]
+
+
+def test_canonical_stage_processes_independent_maps_concurrently(
+    source_frames: list[Path],
+    stage_directories: dict[str, Path],
+    pipeline_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_canonicalize = canonicalize_depth
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def observed_canonicalize(*args, **kwargs):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.03)
+            return real_canonicalize(*args, **kwargs)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(
+        depth_processor_module,
+        "calculate_frame_stage_workers",
+        lambda *_args, **_kwargs: 2,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        depth_processor_module,
+        "canonicalize_depth",
+        observed_canonicalize,
+    )
+
+    output_files = _run_pipeline(
+        FakeRelativeDepthEstimator(),
+        source_frames,
+        stage_directories,
+        pipeline_settings,
+        monkeypatch,
+    )
+
+    assert len(output_files) == len(source_frames)
+    assert max_active >= 2
+
+
+def test_parallel_canonical_stage_is_pixel_identical_to_serial(
+    source_frames: list[Path],
+    stage_directories: dict[str, Path],
+    pipeline_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    estimator = FakeRelativeDepthEstimator()
+    monkeypatch.setattr(
+        depth_processor_module,
+        "calculate_frame_stage_workers",
+        lambda *_args, **_kwargs: 1,
+    )
+    serial_files = _run_pipeline(
+        estimator,
+        source_frames,
+        stage_directories,
+        pipeline_settings,
+        monkeypatch,
+    )
+    serial_arrays = [cv2.imread(str(path), cv2.IMREAD_UNCHANGED).copy() for path in serial_files]
+
+    canonical_dir = stage_directories["disparity_maps"]
+    for path in canonical_dir.glob("*.png"):
+        path.unlink()
+    (canonical_dir / "metadata.json").unlink()
+    estimator.fail_on_inference = True
+    monkeypatch.setattr(
+        depth_processor_module,
+        "calculate_frame_stage_workers",
+        lambda *_args, **_kwargs: 4,
+    )
+
+    parallel_files = _run_pipeline(
+        estimator,
+        source_frames,
+        stage_directories,
+        pipeline_settings,
+        monkeypatch,
+    )
+
+    assert [path.name for path in parallel_files] == [path.name for path in serial_files]
+    for expected, path in zip(serial_arrays, parallel_files):
+        actual = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        assert actual.dtype == expected.dtype == np.uint16
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_canonical_previews_stay_ordered_on_the_caller_thread(
+    source_frames: list[Path],
+    stage_directories: dict[str, Path],
+    pipeline_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller_thread = threading.get_ident()
+
+    class ProgressTracker:
+        def __init__(self):
+            self.previews = []
+            self.updates = []
+
+        def update_progress(self, stage, **values):
+            self.updates.append((stage, values, threading.get_ident()))
+
+        def send_preview_frame(self, path, phase, frame_num):
+            self.previews.append((path.name, phase, frame_num, threading.get_ident()))
+
+    real_write = DepthMapProcessor._atomic_write_png
+
+    def delayed_write(path, values):
+        index = int(path.stem.rsplit("_", 1)[1])
+        time.sleep((len(source_frames) - index) * 0.01)
+        real_write(path, values)
+
+    monkeypatch.setattr(
+        depth_processor_module,
+        "calculate_frame_stage_workers",
+        lambda *_args, **_kwargs: 2,
+    )
+    monkeypatch.setattr(
+        DepthMapProcessor,
+        "_atomic_write_png",
+        staticmethod(delayed_write),
+    )
+    tracker = ProgressTracker()
+
+    _run_pipeline(
+        FakeRelativeDepthEstimator(),
+        source_frames,
+        stage_directories,
+        pipeline_settings,
+        monkeypatch,
+        progress_tracker=tracker,
+    )
+
+    assert [(phase, frame_num) for _, phase, frame_num, _ in tracker.previews] == [
+        ("depth_map", 1),
+        ("depth_map", len(source_frames)),
+    ]
+    assert {thread_id for *_, thread_id in tracker.previews} == {caller_thread}
+    canonical_updates = [
+        update for update in tracker.updates if update[0].startswith("Canonicalizing depth map")
+    ]
+    assert [stage for stage, _, _ in canonical_updates] == [
+        f"Canonicalizing depth map {index}/{len(source_frames)}"
+        for index in range(1, len(source_frames) + 1)
+    ]
+    assert {thread_id for _, _, thread_id in canonical_updates} == {caller_thread}
+
+
+def test_canonical_later_failure_stops_submission_and_waits_for_running_work(
+    source_frames: list[Path],
+    stage_directories: dict[str, Path],
+    pipeline_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    estimator = FakeRelativeDepthEstimator()
+    monkeypatch.setattr(
+        depth_processor_module,
+        "calculate_frame_stage_workers",
+        lambda *_args, **_kwargs: 1,
+    )
+    _run_pipeline(
+        estimator,
+        source_frames,
+        stage_directories,
+        pipeline_settings,
+        monkeypatch,
+    )
+
+    canonical_dir = stage_directories["disparity_maps"]
+    for path in canonical_dir.glob("*.png"):
+        path.unlink()
+    (canonical_dir / "metadata.json").unlink()
+    estimator.fail_on_inference = True
+
+    first_started = threading.Event()
+    failure_raised = threading.Event()
+    release_first = threading.Event()
+    executed = []
+    outcome = {}
+    real_write = DepthMapProcessor._atomic_write_png
+
+    def controlled_write(path: Path, values: np.ndarray) -> None:
+        index = int(path.stem.rsplit("_", 1)[1])
+        executed.append(index)
+        if index == 0:
+            first_started.set()
+            assert release_first.wait(5)
+            real_write(path, values)
+            return
+        if index == 1:
+            assert first_started.wait(2)
+            failure_raised.set()
+            raise RuntimeError("planned canonical write failure")
+        real_write(path, values)
+
+    monkeypatch.setattr(
+        depth_processor_module,
+        "calculate_frame_stage_workers",
+        lambda *_args, **_kwargs: 2,
+    )
+    monkeypatch.setattr(
+        DepthMapProcessor,
+        "_atomic_write_png",
+        staticmethod(controlled_write),
+    )
+
+    def run_stage() -> None:
+        try:
+            _run_pipeline(
+                estimator,
+                source_frames,
+                stage_directories,
+                pipeline_settings,
+                monkeypatch,
+            )
+        except Exception as error:  # noqa: BLE001 - captures the planned worker failure
+            outcome["error"] = error
+
+    stage_thread = threading.Thread(target=run_stage)
+    stage_thread.start()
+    try:
+        assert failure_raised.wait(2)
+        time.sleep(0.05)
+        assert stage_thread.is_alive()
+        assert len(executed) == 2
+        assert set(executed) == {0, 1}
+    finally:
+        release_first.set()
+        stage_thread.join(timeout=5)
+
+    assert not stage_thread.is_alive()
+    assert isinstance(outcome["error"], RuntimeError)
+    assert not (canonical_dir / "metadata.json").exists()
 
 
 def test_resume_from_candidate_manifest_reuses_raw_and_is_byte_identical(
@@ -401,25 +659,3 @@ def test_global_cache_restore_copies_metadata_into_local_canonical_stage(
     assert all(path.parent == local_dir for path in restored)
     assert json.loads((local_dir / "metadata.json").read_text()) == metadata
     assert [cv2.imread(str(path), cv2.IMREAD_UNCHANGED)[0, 0] for path in restored] == [0, 1, 2, 3]
-
-
-def test_legacy_array_api_rejects_more_than_512_mib_before_inference(
-    tmp_path: Path,
-) -> None:
-    frame_path = tmp_path / "large.png"
-    assert cv2.imwrite(str(frame_path), np.zeros((1024, 1024, 3), dtype=np.uint8))
-    estimator = FakeRelativeDepthEstimator()
-    estimator.fail_on_inference = True
-    processor = DepthMapProcessor(estimator)
-
-    with pytest.raises(MemoryError, match="file-backed"):
-        processor.generate_depth_maps(
-            [frame_path] * 129,
-            {
-                "depth_resolution": "1024",
-                "super_sample": "none",
-                "target_fps": 30,
-            },
-            {},
-            progress_tracker=None,
-        )

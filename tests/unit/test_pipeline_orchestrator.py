@@ -32,6 +32,9 @@ class TestProcessingOrchestratorInit:
         assert orchestrator.video_encoder == video_encoder
         assert orchestrator.verbose is False
         assert orchestrator._start_time == 0.0
+        assert not hasattr(orchestrator, "_total_steps")
+        assert "_get_total_steps" not in vars(ProcessingOrchestrator)
+        assert "_print_step_complete" not in vars(ProcessingOrchestrator)
 
     def test_init_with_verbose(self):
         """Test initialization with verbose flag."""
@@ -39,30 +42,6 @@ class TestProcessingOrchestratorInit:
             Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), verbose=True
         )
         assert orchestrator.verbose is True
-
-
-class TestGetTotalSteps:
-    """Test _get_total_steps pure function."""
-
-    def test_base_steps_no_optional(self):
-        """Test base steps without optional processing."""
-        settings = {"apply_distortion": False, "upscale_model": "none"}
-        assert ProcessingOrchestrator._get_total_steps(settings) == 6
-
-    def test_with_distortion(self):
-        """Test steps with distortion enabled."""
-        settings = {"apply_distortion": True, "upscale_model": "none"}
-        assert ProcessingOrchestrator._get_total_steps(settings) == 7
-
-    def test_with_upscaling(self):
-        """Test steps with upscaling enabled."""
-        settings = {"apply_distortion": False, "upscale_model": "realesrgan-x4"}
-        assert ProcessingOrchestrator._get_total_steps(settings) == 7
-
-    def test_with_all_optional(self):
-        """Test steps with all optional processing enabled."""
-        settings = {"apply_distortion": True, "upscale_model": "realesrgan-x4"}
-        assert ProcessingOrchestrator._get_total_steps(settings) == 8
 
 
 class TestFormatProcessingTime:
@@ -229,6 +208,35 @@ class TestFinalizeProcessing:
 
 
 class TestExecutePipeline:
+    def test_required_distortion_stage_fails_when_stereo_outputs_are_missing(self, tmp_path):
+        stereo_generator = Mock()
+        stereo_generator.create_stereo_pairs_from_files.return_value = True
+        distortion_processor = Mock()
+        orchestrator = ProcessingOrchestrator(
+            Mock(), stereo_generator, distortion_processor, Mock(), Mock(), Mock()
+        )
+        left_dir = tmp_path / "left"
+        right_dir = tmp_path / "right"
+        left_dir.mkdir()
+        right_dir.mkdir()
+
+        result = orchestrator._execute_remaining_steps(
+            {
+                "base": tmp_path,
+                "left_frames": left_dir,
+                "right_frames": right_dir,
+            },
+            {"apply_distortion": True},
+            [tmp_path / "frame_000001.png"],
+            [tmp_path / "depth_000001.png"],
+            30.0,
+            "source.mp4",
+            tmp_path,
+        )
+
+        assert result is False
+        distortion_processor.apply_distortion.assert_not_called()
+
     def test_pipeline_uses_disk_backed_depth_and_stereo_apis(self, tmp_path):
         """The video path never builds whole-video frame or depth arrays."""
         frame_files = [tmp_path / "frame_000001.png"]

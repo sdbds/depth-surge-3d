@@ -19,17 +19,18 @@ from ...io.operations import (
 from ...utils.path_utils import (
     calculate_frame_range,
     generate_output_filename,
+    parse_time_string,
 )
 from ...core.constants import (
     INTERMEDIATE_DIRS,
     DEFAULT_FALLBACK_FPS,
 )
 from ..frames.source_frame_manifest import (
-    file_sha256,
     read_source_frame_manifest,
     source_frame_manifest_mismatch_reason,
     write_source_frame_manifest,
 )
+from ...core.file_identity import file_sample_fingerprint
 
 
 class VideoEncoder:
@@ -103,11 +104,13 @@ class VideoEncoder:
             print(f"Looking for pre-extracted audio at: {audio_file}")
             if audio_file.exists():
                 print(f"Using pre-extracted audio: {audio_file}")
-                cmd.extend(["-i", str(audio_file), "-c:a", "aac", "-shortest"])
+                audio_source: str | Path = audio_file
             else:
                 print(f"Warning: Pre-extracted audio not found at {audio_file}")
                 print(f"Extracting audio from original video: {original_video}")
-                cmd.extend(["-i", original_video, "-c:a", "aac", "-shortest"])
+                audio_source = original_video
+            cmd.extend(self._build_audio_input_args(audio_source, settings))
+            cmd.extend(["-c:a", "aac", "-shortest"])
 
         # Add video encoding settings
         encoder = settings.get("video_encoder", "auto")
@@ -123,6 +126,27 @@ class VideoEncoder:
         except Exception as e:
             print(f"Error creating output video: {e}")
             return False
+
+    @staticmethod
+    def _build_audio_input_args(
+        audio_source: str | Path,
+        settings: dict[str, Any],
+    ) -> list[str]:
+        """Build an audio input whose local timeline matches the selected video clip."""
+
+        start_value = settings.get("start_time")
+        end_value = settings.get("end_time")
+        start_seconds = parse_time_string(start_value) if start_value else None
+        end_seconds = parse_time_string(end_value) if end_value else None
+        clip_start = max(start_seconds or 0.0, 0.0)
+
+        args: list[str] = []
+        if clip_start > 0:
+            args.extend(["-ss", f"{clip_start:g}"])
+        if end_seconds is not None and end_seconds > clip_start:
+            args.extend(["-t", f"{end_seconds - clip_start:g}"])
+        args.extend(["-i", str(audio_source)])
+        return args
 
     @staticmethod
     def _normalize_frame_rate(value: Any) -> str | None:
@@ -210,12 +234,12 @@ class VideoEncoder:
         source_path = Path(video_path)
         reusable_manifest = False
         if source_path.is_file():
-            source_hash = file_sha256(source_path)
+            source_fingerprint = file_sample_fingerprint(source_path)
             reusable_manifest = (
                 source_frame_manifest_mismatch_reason(
                     read_source_frame_manifest(frames_dir),
                     existing_frames,
-                    source_hash,
+                    source_fingerprint,
                 )
                 is None
             )
@@ -239,16 +263,12 @@ class VideoEncoder:
             "-y",
             "-hwaccel",
             "cuda",
-            "-hwaccel_output_format",
-            "cuda",
             "-ss",
             str(start_time),  # Seek before decoding (much faster)
             "-i",
             video_path,
             "-t",
             str(duration),  # Duration limit (more efficient than select filter)
-            "-vf",
-            "hwdownload,format=nv12,format=rgb24",
             "-pix_fmt",
             "rgb24",
             "-vsync",

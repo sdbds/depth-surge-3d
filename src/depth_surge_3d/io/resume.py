@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import warnings
@@ -10,24 +9,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-import cv2
-import numpy as np
 
 from ..core.settings import (
     PROCESSING_SETTINGS_SCHEMA_VERSION,
     REMOVED_SETTING_NAMES,
     validate_settings,
 )
-from ..processing.frames.depth_processor import (
+from ..core.file_identity import (
+    FILE_IDENTITY_ALGORITHM_VERSION,
+    file_sample_fingerprint,
+)
+from ..core.depth_contract import (
     CANONICAL_DEPTH_ALGORITHM_VERSION,
     CANONICAL_DEPTH_SCHEMA_VERSION,
+    canonical_json_hash,
+)
+from ..processing.frames.depth_processor import (
     DEPTH_BOUNDS_SCHEMA_VERSION,
 )
 from ..processing.frames.depth_storage import (
     RAW_DEPTH_SCHEMA_VERSION,
     RawDepthFingerprintError,
     RawDepthStore,
-    canonical_json_hash,
+    depth_preprocessing_algorithm,
     select_depth_model_settings,
 )
 from ..processing.frames.scene_analyzer import (
@@ -35,10 +39,11 @@ from ..processing.frames.scene_analyzer import (
     SCENE_SCHEMA_VERSION,
 )
 from ..processing.frames.source_frame_manifest import (
-    frame_sequence_fingerprint,
     read_source_frame_manifest,
     source_frame_manifest_mismatch_reason,
 )
+from ..processing.frames.stage_manifest import FRAME_STAGE_SCHEMA_VERSION
+from ..utils.imaging.png_header import png_header_matches, read_png_header
 from ..processing.frames.stereo_generator import (
     STEREO_STAGE_ALGORITHM_VERSION,
     STEREO_STAGE_SCHEMA_VERSION,
@@ -58,6 +63,8 @@ _DISTORTION_SETTING_KEYS = (
 _CROP_SETTING_KEYS = ("crop_factor", "fisheye_crop_factor")
 _UPSCALE_SETTING_KEYS = ("upscale_model",)
 _VR_SETTING_KEYS = ("vr_format", "vr_resolution", "target_fps")
+_DEPTH_MODEL_VERSIONS = frozenset({"v2", "v3", "see_through"})
+_SEE_THROUGH_MARKERS = ("see_through", "seethrough")
 
 
 @dataclass(frozen=True)
@@ -168,6 +175,57 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _contains_see_through_marker(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.casefold().replace("-", "_").replace(" ", "_")
+    return any(marker in normalized for marker in _SEE_THROUGH_MARKERS)
+
+
+def _raw_depth_uses_see_through(output_dir: Path) -> bool:
+    metadata = _read_json(output_dir / "02_depth_raw" / "metadata.json")
+    semantic = metadata.get("semantic_fingerprint") if metadata else None
+    if not isinstance(semantic, dict):
+        return False
+
+    values: list[object] = [semantic.get("backend"), semantic.get("source")]
+    for section_name in ("model_info", "depth_settings"):
+        section = semantic.get(section_name)
+        if isinstance(section, dict):
+            values.extend(
+                section.get(key)
+                for key in (
+                    "model_name",
+                    "model_version",
+                    "model_path",
+                    "source",
+                    "depth_model_version",
+                )
+            )
+    return any(_contains_see_through_marker(value) for value in values)
+
+
+def resolve_resume_depth_model_version(
+    settings: dict[str, Any],
+    output_dir: Path | str | None = None,
+    *,
+    default: str,
+) -> str:
+    """Recover the depth backend for a job whose legacy settings lack it."""
+    if default not in _DEPTH_MODEL_VERSIONS:
+        raise ValueError(f"Unsupported resume depth model default: {default}")
+
+    explicit = settings.get("depth_model_version")
+    if explicit in _DEPTH_MODEL_VERSIONS:
+        return explicit
+
+    if output_dir is not None and _raw_depth_uses_see_through(Path(output_dir)):
+        return "see_through"
+    if _contains_see_through_marker(settings.get("model_path")):
+        return "see_through"
+    return default
+
+
 def _find_settings_file(output_dir: Path) -> Path | None:
     candidates = sorted(
         output_dir.glob("*-settings.json"),
@@ -188,10 +246,6 @@ def _resolve_settings_file(output_dir: Path, settings_file: Path | str | None) -
     ):
         raise ValueError("Resume settings file must be a job settings file in the output directory")
     return candidate
-
-
-def _frame_fingerprint(frame_files: list[Path]) -> str:
-    return frame_sequence_fingerprint(frame_files)
 
 
 def _expected_frame_count(
@@ -220,15 +274,15 @@ def _source_video_mismatch_reason(
     source_video: Path | str | None,
 ) -> str | None:
     metadata = (settings_data or {}).get("metadata", {})
-    saved_hash = metadata.get("source_video_sha256") if isinstance(metadata, dict) else None
     saved_source = metadata.get("source_video") if isinstance(metadata, dict) else None
-    if not isinstance(saved_hash, str) or not saved_hash:
-        return "source video fingerprint is missing"
     source_value = source_video if source_video is not None else saved_source
     if not isinstance(source_value, (str, Path)):
         return "source video path is missing"
     source_path = Path(source_value)
-    if not source_path.is_file() or _hash_file(source_path) != saved_hash:
+    if not source_path.is_file():
+        return "source video path is missing"
+    saved_fingerprint = _current_source_fingerprint(metadata)
+    if saved_fingerprint is not None and file_sample_fingerprint(source_path) != saved_fingerprint:
         return "source video fingerprint mismatch"
     return None
 
@@ -248,13 +302,13 @@ def _frame_payload_mismatch_reason(
     frame_files: list[Path], expected_shape: tuple[int, int] | None
 ) -> str | None:
     for frame_file in frame_files:
-        frame = cv2.imread(str(frame_file), cv2.IMREAD_UNCHANGED)
-        if frame is None:
-            return f"unreadable frame: {frame_file.name}"
-        if expected_shape is not None and frame.shape[:2] != expected_shape:
+        header = read_png_header(frame_file)
+        if header is None:
+            return f"invalid PNG header: {frame_file.name}"
+        if expected_shape is not None and (header.height, header.width) != expected_shape:
             return (
                 f"frame dimensions mismatch: {frame_file.name} is "
-                f"{frame.shape[1]}x{frame.shape[0]}"
+                f"{header.width}x{header.height}"
             )
     return None
 
@@ -288,39 +342,49 @@ def _validate_frame_stage(
         return _stage("frames", paths, "invalidate", payload_reason), frame_files, None
 
     settings_metadata = (settings_data or {}).get("metadata", {})
-    source_video_sha256 = (
-        settings_metadata.get("source_video_sha256")
+    source_video_fingerprint = (
+        settings_metadata.get("source_video_fingerprint")
         if isinstance(settings_metadata, dict)
         else None
     )
-    if not isinstance(source_video_sha256, str):
+    if not isinstance(source_video_fingerprint, str):
         return (
             _stage("frames", paths, "invalidate", "source video fingerprint is missing"),
             frame_files,
             None,
         )
+    source_frame_metadata = read_source_frame_manifest(frames_dir)
     manifest_reason = source_frame_manifest_mismatch_reason(
-        read_source_frame_manifest(frames_dir),
+        source_frame_metadata,
         frame_files,
-        source_video_sha256,
+        source_video_fingerprint,
     )
     if manifest_reason is not None:
         return _stage("frames", paths, "invalidate", manifest_reason), frame_files, None
 
-    fingerprint = _frame_fingerprint(frame_files)
+    if not isinstance(source_frame_metadata, dict):
+        return (
+            _stage("frames", paths, "invalidate", "source frame manifest is malformed"),
+            frame_files,
+            None,
+        )
+    fingerprint = source_frame_metadata.get("source_frame_fingerprint")
+    if not isinstance(fingerprint, str):
+        return (
+            _stage(
+                "frames",
+                paths,
+                "invalidate",
+                "source frame manifest fingerprint is malformed",
+            ),
+            frame_files,
+            None,
+        )
     return (
         _stage("frames", paths, "preserve", "source frame manifest is reusable"),
         frame_files,
         fingerprint,
     )
-
-
-def _hash_file(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            hasher.update(chunk)
-    return hasher.hexdigest()
 
 
 def _resume_source_candidates(root: Path, metadata: dict[str, Any]) -> list[Path]:
@@ -337,18 +401,33 @@ def _resume_source_candidates(root: Path, metadata: dict[str, Any]) -> list[Path
     return candidates
 
 
-def _resume_source_matches(candidate: Path, root: Path, saved_hash: str) -> bool:
+def _current_source_fingerprint(metadata: Any) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    fingerprint = metadata.get("source_video_fingerprint")
+    if (
+        metadata.get("source_video_fingerprint_algorithm") == FILE_IDENTITY_ALGORITHM_VERSION
+        and isinstance(fingerprint, str)
+        and fingerprint
+    ):
+        return fingerprint
+    return None
+
+
+def _resume_source_matches(candidate: Path, root: Path, saved_fingerprint: str | None) -> bool:
     try:
         candidate.relative_to(root)
     except ValueError:
         return False
-    return candidate.is_file() and _hash_file(candidate) == saved_hash
+    if not candidate.is_file():
+        return False
+    return saved_fingerprint is None or file_sample_fingerprint(candidate) == saved_fingerprint
 
 
 def resolve_resume_source_video(
     output_dir: Path | str, *, settings_file: Path | str | None = None
 ) -> Path:
-    """Resolve the exact source recorded by one job settings file."""
+    """Resolve the source recorded by one job, checking its fingerprint when available."""
 
     root = Path(output_dir).resolve()
     selected_settings = _resolve_settings_file(root, settings_file)
@@ -358,17 +437,17 @@ def resolve_resume_source_video(
     metadata = (settings_data or {}).get("metadata", {})
     if not isinstance(metadata, dict):
         raise ValueError("Resume source video metadata is invalid")
-    saved_hash = metadata.get("source_video_sha256")
-    if not isinstance(saved_hash, str) or not saved_hash:
-        raise ValueError("Resume source video fingerprint is missing")
+    saved_fingerprint = _current_source_fingerprint(metadata)
 
     checked: set[Path] = set()
     for candidate in _resume_source_candidates(root, metadata):
         if candidate in checked:
             continue
         checked.add(candidate)
-        if _resume_source_matches(candidate, root, saved_hash):
+        if _resume_source_matches(candidate, root, saved_fingerprint):
             return candidate
+    if saved_fingerprint is None:
+        raise ValueError("Recorded source video is missing")
     raise ValueError("Recorded source video is missing or its fingerprint does not match")
 
 
@@ -529,7 +608,7 @@ def _raw_semantic_mismatch_reason(
             "unknown",
         )
         return f"raw-depth model setting mismatch: {key}"
-    if semantic.get("preprocessing_algorithm") != "native-depth-adapter-v2":
+    if semantic.get("preprocessing_algorithm") != depth_preprocessing_algorithm(current_settings):
         return "raw-depth preprocessing fingerprint mismatch"
     persisted_model = {
         key: semantic.get(key)
@@ -679,14 +758,7 @@ def _canonical_payload_state(
         if not path.is_file():
             missing = True
             continue
-        payload = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-        valid = (
-            payload is not None
-            and payload.dtype == np.uint16
-            and payload.ndim == 2
-            and payload.shape == native_shape
-        )
-        if not valid:
+        if not png_header_matches(path, shape=native_shape, bit_depth=16):
             return "resume", f"canonical payload will be regenerated: {path.name}"
     if missing:
         return "resume", "canonical stage is partially complete"
@@ -768,6 +840,17 @@ def _validate_generated_stage(
         return _stage(name, paths, "invalidate", "an upstream stage is invalid")
     if changed_setting is not None:
         return _stage(name, paths, "invalidate", f"setting changed: {changed_setting}")
+    metadata = _read_json(paths[0] / "metadata.json")
+    if metadata is None:
+        return _stage(name, paths, "invalidate", "completion manifest is missing")
+    fingerprint = metadata.get("fingerprint")
+    unhashed = {key: value for key, value in metadata.items() if key != "fingerprint"}
+    if (
+        metadata.get("schema_version") != FRAME_STAGE_SCHEMA_VERSION
+        or not isinstance(fingerprint, str)
+        or fingerprint != canonical_json_hash(unhashed)
+    ):
+        return _stage(name, paths, "invalidate", "completion manifest is invalid")
     return _stage(name, paths, "preserve", reusable_reason)
 
 
@@ -808,14 +891,7 @@ def _stereo_payload_state(
             if not path.is_file():
                 missing = True
                 continue
-            payload = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-            valid = (
-                payload is not None
-                and payload.dtype == np.uint8
-                and payload.ndim == 3
-                and payload.shape == (*render_shape, 3)
-            )
-            if not valid:
+            if not png_header_matches(path, shape=(*render_shape, 3), bit_depth=8):
                 return "resume", f"stereo payload will be regenerated: {path.name}"
     if missing:
         return "resume", "stereo stage is partially complete"

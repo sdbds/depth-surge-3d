@@ -1,5 +1,6 @@
 """Unit tests for file operations utilities."""
 
+import inspect
 import tempfile
 import os
 from src.depth_surge_3d.utils.path_utils import (
@@ -243,15 +244,8 @@ class TestGenerateOutputFilename:
         assert "over-under" in filename
         assert "over_under" not in filename
 
-    def test_generate_output_filename_with_deprecated_mode(self):
-        """Test backward compatibility with deprecated processing_mode parameter."""
-        # Should ignore processing_mode parameter
-        filename1 = generate_output_filename("test", "side_by_side", "1080p", "3d")
-        filename2 = generate_output_filename("test", "side_by_side", "1080p", None)
-
-        # Both should produce same result (mode is deprecated/ignored)
-        assert "test" in filename1
-        assert "test" in filename2
+    def test_generate_output_filename_has_no_removed_processing_mode(self):
+        assert "processing_mode" not in inspect.signature(generate_output_filename).parameters
 
     def test_generate_output_filename_special_characters(self):
         """Test handling of special characters in base name."""

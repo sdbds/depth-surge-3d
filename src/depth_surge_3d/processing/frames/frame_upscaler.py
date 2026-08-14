@@ -12,6 +12,16 @@ from pathlib import Path
 from typing import Any
 
 from ...core.constants import INTERMEDIATE_DIRS, PREVIEW_FRAME_SAMPLE_RATE
+from ...utils.imaging.png_header import read_png_header
+from .stage_manifest import (
+    build_stage_identity,
+    clear_stage_outputs,
+    complete_stage,
+    stage_is_reusable,
+)
+
+
+UPSCALE_STAGE_ALGORITHM_VERSION = "realesrgan-upscale-v1"
 
 
 class FrameUpscalerProcessor:
@@ -58,12 +68,29 @@ class FrameUpscalerProcessor:
             - Modifies GPU memory state
         """
         try:
+            if settings.get("upscale_model", "none") == "none":
+                return True
             from ...inference import create_upscaler
 
             # Get source directories (cropped frames)
             source_left, source_right = self._get_upscaling_source_dirs(directories, settings)  # type: ignore[misc]
             if source_left is None or source_right is None:
                 return False
+
+            left_files = sorted(source_left.glob("*.png"))
+            right_files = sorted(source_right.glob("*.png"))
+            if (
+                not left_files
+                or len(left_files) != len(right_files)
+                or [path.stem for path in left_files] != [path.stem for path in right_files]
+            ):
+                return False
+            left_upscaled, right_upscaled = self._get_output_directories(directories)
+            identity = self._build_stage_identity(left_files, right_files, settings)
+            output_directories = (left_upscaled, right_upscaled)
+            if stage_is_reusable(identity, output_directories):
+                return True
+            clear_stage_outputs(output_directories)
 
             # Create upscaler
             upscaler = create_upscaler(
@@ -80,7 +107,13 @@ class FrameUpscalerProcessor:
 
             try:
                 return self._process_upscaling_frames(
-                    upscaler, source_left, source_right, directories, settings, progress_tracker
+                    upscaler,
+                    source_left,
+                    source_right,
+                    directories,
+                    settings,
+                    progress_tracker,
+                    stage_identity=identity,
                 )
             finally:
                 upscaler.unload_model()
@@ -92,7 +125,15 @@ class FrameUpscalerProcessor:
             return False
 
     def _process_upscaling_frames(
-        self, upscaler, left_dir, right_dir, directories, settings, progress_tracker
+        self,
+        upscaler,
+        left_dir,
+        right_dir,
+        directories,
+        settings,
+        progress_tracker,
+        *,
+        stage_identity: dict[str, Any],
     ) -> bool:
         """
         Process frames in batches with model management.
@@ -116,23 +157,22 @@ class FrameUpscalerProcessor:
         left_files = sorted(list(left_dir.glob("*.png")))
         right_files = sorted(list(right_dir.glob("*.png")))
 
-        if len(left_files) != len(right_files):
+        if (
+            not left_files
+            or len(left_files) != len(right_files)
+            or [path.stem for path in left_files] != [path.stem for path in right_files]
+        ):
             print(f"Frame count mismatch: {len(left_files)} left, {len(right_files)} right")
             return False
 
         # Upscaled files feed VR assembly, so they are always working state.
-        left_upscaled = directories.get("left_upscaled") or (
-            directories["base"] / INTERMEDIATE_DIRS["left_upscaled"]
-        )
-        right_upscaled = directories.get("right_upscaled") or (
-            directories["base"] / INTERMEDIATE_DIRS["right_upscaled"]
-        )
-        left_upscaled.mkdir(exist_ok=True)
-        right_upscaled.mkdir(exist_ok=True)
+        left_upscaled, right_upscaled = self._get_output_directories(directories)
+        identity = stage_identity
+        output_directories = (left_upscaled, right_upscaled)
 
         # Process frames
         for i, (left_file, right_file) in enumerate(zip(left_files, right_files)):
-            self._upscale_frame_pair(
+            if not self._upscale_frame_pair(
                 upscaler,
                 left_file,
                 right_file,
@@ -142,9 +182,41 @@ class FrameUpscalerProcessor:
                 i,
                 len(left_files),
                 progress_tracker,
-            )
+            ):
+                return False
 
-        return True
+        header = read_png_header(left_upscaled / left_files[0].name)
+        return bool(
+            header
+            and complete_stage(
+                identity,
+                output_directories,
+                shape=(header.height, header.width, header.channels),
+                bit_depth=header.bit_depth,
+            )
+        )
+
+    @staticmethod
+    def _build_stage_identity(left_files, right_files, settings):
+        return build_stage_identity(
+            stage="upscale",
+            algorithm_version=UPSCALE_STAGE_ALGORITHM_VERSION,
+            frame_names=[path.name for path in left_files],
+            source_files=[*left_files, *right_files],
+            settings={"upscale_model": settings.get("upscale_model", "unspecified")},
+        )
+
+    @staticmethod
+    def _get_output_directories(directories):
+        left_upscaled = directories.get("left_upscaled") or (
+            directories["base"] / INTERMEDIATE_DIRS["left_upscaled"]
+        )
+        right_upscaled = directories.get("right_upscaled") or (
+            directories["base"] / INTERMEDIATE_DIRS["right_upscaled"]
+        )
+        left_upscaled.mkdir(parents=True, exist_ok=True)
+        right_upscaled.mkdir(parents=True, exist_ok=True)
+        return left_upscaled, right_upscaled
 
     def _upscale_frame_pair(
         self,
@@ -181,7 +253,7 @@ class FrameUpscalerProcessor:
 
         if left_img is None or right_img is None:
             print(f"Warning: Could not load {left_file} or {right_file}")
-            return
+            return False
 
         # Upscale
         left_upscaled_img = upscaler.upscale_image(left_img)
@@ -202,9 +274,10 @@ class FrameUpscalerProcessor:
                 left_upscaled_img, "upscaled_left", frame_idx + 1
             )
 
+        writes_succeeded = True
         if left_upscaled:
             left_upscaled_path = left_upscaled / f"{frame_name}.png"
-            cv2.imwrite(str(left_upscaled_path), left_upscaled_img)
+            writes_succeeded = cv2.imwrite(str(left_upscaled_path), left_upscaled_img)
 
             if (
                 settings["keep_intermediates"]
@@ -216,10 +289,13 @@ class FrameUpscalerProcessor:
                 )
 
         if right_upscaled:
-            cv2.imwrite(str(right_upscaled / f"{frame_name}.png"), right_upscaled_img)
+            writes_succeeded = bool(
+                cv2.imwrite(str(right_upscaled / f"{frame_name}.png"), right_upscaled_img)
+                and writes_succeeded
+            )
 
-        # Progress update (every frame since upscaling is slow)
-        if frame_idx % 1 == 0 or frame_idx == total_frames - 1:
+        # Upscaling is slow enough that every completed frame is useful progress.
+        if progress_tracker:
             progress_tracker.update_progress(
                 f"Upscaling frame {frame_idx+1}/{total_frames}",
                 phase="upscaling",
@@ -228,6 +304,7 @@ class FrameUpscalerProcessor:
                 step_progress=frame_idx + 1,
                 step_total=total_frames,
             )
+        return writes_succeeded
 
     @staticmethod
     def _get_upscaling_source_dirs(

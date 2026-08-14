@@ -46,7 +46,19 @@ class TestSeeThroughDepthEstimator:
         assert estimator.max_batch_size == 1
         assert estimator.model is None
 
-    def test_native_output_shape_matches_square_model_preprocessing(self):
+    def test_cuda_uses_bounded_independent_frame_batches(self):
+        module = _module()
+
+        with patch.object(
+            torch.cuda,
+            "get_device_properties",
+            return_value=SimpleNamespace(total_memory=24 * 1024**3),
+        ):
+            estimator = module.SeeThroughDepthEstimator(device="cuda")
+
+        assert estimator.max_batch_size == 4
+
+    def test_native_output_shape_preserves_768_square_and_other_aspect_ratios(self):
         module = _module()
         estimator = module.SeeThroughDepthEstimator(
             device="cpu",
@@ -54,7 +66,9 @@ class TestSeeThroughDepthEstimator:
         )
 
         assert estimator.estimate_output_shape(1920, 1080, 768) == (768, 768)
-        assert estimator.estimate_output_shape(3840, 2160, 512) == (512, 512)
+        assert estimator.estimate_output_shape(3840, 2160, 512) == (288, 512)
+        assert estimator.estimate_output_shape(1920, 1080, 1080) == (608, 1080)
+        assert estimator.estimate_output_shape(1080, 1920, 1080) == (1080, 608)
 
     def test_resolve_source_root_prefers_explicit_path(self, tmp_path):
         module = _module()
@@ -88,11 +102,15 @@ class TestSeeThroughDepthEstimator:
             pipeline_loader=loader,
         )
 
-        with patch.object(module, "install_diffusers_flash_attention", return_value=1) as install:
+        with patch(
+            "src.depth_surge_3d.inference.depth.attention_backend."
+            "install_diffusers_flash_attention",
+            return_value=1,
+        ) as install:
             assert estimator.load_model() is True
 
         assert estimator.model is pipeline
-        install.assert_called_once_with()
+        install.assert_not_called()
         loader.assert_called_once_with(
             repo_id="24yearsold/seethroughv0.0.1_marigold",
             source_root=source_root.resolve(),
@@ -101,6 +119,43 @@ class TestSeeThroughDepthEstimator:
             dtype=torch.float32,
         )
         assert estimator.get_model_info()["artifact_identity"] == ("hf:owner/model@resolved")
+
+    def test_cuda_estimation_batches_independent_frames_without_changing_the_seed_contract(self):
+        module = _module()
+        batch_calls = []
+
+        def batch_runner(*, pipeline, rgb_frames, denoising_steps, seed):
+            del pipeline
+            batch_calls.append((len(rgb_frames), denoising_steps, seed))
+            return np.stack(
+                [
+                    np.full(rgb.shape[:2], rgb[0, 0, 0] / 255.0, dtype=np.float32)
+                    for rgb in rgb_frames
+                ]
+            )
+
+        class SequentialPipeline:
+            def __call__(self, **kwargs):
+                image = kwargs["img_list"][0]
+                return SimpleNamespace(depth_np=np.zeros(image.shape[:2], dtype=np.float32))
+
+        estimator = module.SeeThroughDepthEstimator(device="cuda")
+        estimator.max_batch_size = 2
+        estimator.batch_runner = batch_runner
+        estimator.model = SequentialPipeline()
+        frames = np.array(
+            [
+                np.full((2, 3, 3), [10, 20, 30], dtype=np.uint8),
+                np.full((2, 3, 3), [40, 50, 60], dtype=np.uint8),
+                np.full((2, 3, 3), [70, 80, 90], dtype=np.uint8),
+            ]
+        )
+
+        batch = estimator.estimate_depth_batch(frames, input_size=24)
+
+        assert batch_calls == [(2, 4, 1026), (1, 4, 1026)]
+        assert batch.values.shape == (3, 16, 24)
+        np.testing.assert_allclose(batch.values[:, 0, 0], [30 / 255, 60 / 255, 90 / 255])
 
     def test_default_loader_pins_both_components_to_one_snapshot(self, tmp_path, monkeypatch):
         module = _module()
@@ -171,11 +226,11 @@ class TestSeeThroughDepthEstimator:
 
         batch = estimator.estimate_depth_batch(frames, input_size=1080)
 
-        assert batch.values.shape == (2, 768, 768)
+        assert batch.values.shape == (2, 720, 1080)
         assert batch.values.dtype == np.float32
         assert batch.values[0, 0, 0] == pytest.approx(30 / 255.0)
         assert batch.values[1, 0, 0] == pytest.approx(60 / 255.0)
-        assert [call["img_list"][0].shape for call in calls] == [(768, 768, 4)] * 2
+        assert [call["img_list"][0].shape for call in calls] == [(720, 1080, 4)] * 2
         assert [call["img_list"][0][0, 0].tolist() for call in calls] == [
             [30, 20, 10, 255],
             [60, 50, 40, 255],
@@ -186,6 +241,23 @@ class TestSeeThroughDepthEstimator:
         assert all(call["match_input_res"] is True for call in calls)
         assert all(call["color_map"] is None for call in calls)
         assert all(call["show_progress_bar"] is False for call in calls)
+
+    def test_estimate_depth_batch_keeps_native_768_square_mode(self):
+        module = _module()
+
+        class FakePipeline:
+            def __call__(self, **kwargs):
+                image = kwargs["img_list"][0]
+                depth = np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
+                return SimpleNamespace(depth_np=depth)
+
+        estimator = module.SeeThroughDepthEstimator(device="cpu")
+        estimator.model = FakePipeline()
+        frames = np.zeros((1, 360, 640, 3), dtype=np.uint8)
+
+        batch = estimator.estimate_depth_batch(frames, input_size=768)
+
+        assert batch.values.shape == (1, 768, 768)
 
     def test_estimate_depth_batch_requires_loaded_model(self):
         module = _module()

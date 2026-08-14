@@ -1,5 +1,8 @@
 """Tests for VRFrameAssembler module."""
 
+import threading
+import time
+
 import pytest
 import numpy as np
 import cv2
@@ -74,8 +77,10 @@ class TestAssembleVRFrames:
             mock_create.return_value = np.zeros((100, 400, 3), dtype=np.uint8)
 
             result = assembler.assemble_vr_frames(temp_frames, settings, mock_progress_tracker)
+            resumed = assembler.assemble_vr_frames(temp_frames, settings, mock_progress_tracker)
 
         assert result is True
+        assert resumed is True
         assert mock_create.call_count == 3
 
         # Check output files
@@ -145,6 +150,245 @@ class TestAssembleVRFrames:
 
         assert result is True
 
+    def test_matching_source_dimensions_skip_resize(self, temp_frames):
+        assembler = VRFrameAssembler()
+        settings = {
+            "vr_format": "side_by_side",
+            "keep_intermediates": True,
+            "per_eye_width": 200,
+            "per_eye_height": 100,
+        }
+
+        with patch(
+            "src.depth_surge_3d.processing.frames.vr_assembler.resize_image",
+            side_effect=AssertionError("matching dimensions must not resize"),
+        ):
+            result = assembler.assemble_vr_frames(
+                temp_frames,
+                settings,
+                progress_tracker=None,
+            )
+
+        assert result is True
+
+    def test_assemble_vr_frames_processes_pairs_concurrently(self, temp_frames):
+        assembler = VRFrameAssembler()
+        real_assemble = assembler._assemble_single_vr_frame
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def observed_assemble(*args, **kwargs):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.03)
+                return real_assemble(*args, **kwargs)
+            finally:
+                with lock:
+                    active -= 1
+
+        with (
+            patch(
+                "src.depth_surge_3d.processing.frames.vr_assembler."
+                "calculate_frame_stage_workers",
+                return_value=2,
+            ),
+            patch.object(
+                assembler,
+                "_assemble_single_vr_frame",
+                side_effect=observed_assemble,
+            ),
+        ):
+            result = assembler.assemble_vr_frames(
+                temp_frames,
+                {
+                    "vr_format": "side_by_side",
+                    "per_eye_width": 200,
+                    "per_eye_height": 100,
+                },
+                progress_tracker=None,
+                total_frames=3,
+            )
+
+        assert result is True
+        assert max_active >= 2
+
+    def test_vr_worker_memory_uses_larger_source_dimensions(self, temp_frames):
+        with patch(
+            "src.depth_surge_3d.processing.frames.vr_assembler." "calculate_frame_stage_workers",
+            return_value=1,
+        ) as calculate:
+            result = VRFrameAssembler().assemble_vr_frames(
+                temp_frames,
+                {
+                    "vr_format": "side_by_side",
+                    "per_eye_width": 20,
+                    "per_eye_height": 10,
+                },
+                progress_tracker=None,
+                total_frames=3,
+            )
+
+        assert result is True
+        calculate.assert_called_once_with(3, 200 * 100 * 48)
+
+    @pytest.mark.parametrize(
+        ("vr_format", "expected_shape"),
+        [("side_by_side", (100, 400, 3)), ("over_under", (200, 200, 3))],
+    )
+    def test_parallel_vr_layout_preserves_exact_pixels(
+        self, temp_frames, vr_format, expected_shape
+    ):
+        result = VRFrameAssembler().assemble_vr_frames(
+            temp_frames,
+            {
+                "vr_format": vr_format,
+                "per_eye_width": 200,
+                "per_eye_height": 100,
+            },
+            progress_tracker=None,
+            total_frames=3,
+        )
+
+        assert result is True
+        left = cv2.imread(str(temp_frames["left_cropped"] / "frame_0000.png"))
+        right = cv2.imread(str(temp_frames["right_cropped"] / "frame_0000.png"))
+        expected = (
+            np.hstack((left, right)) if vr_format == "side_by_side" else np.vstack((left, right))
+        )
+        actual = cv2.imread(str(temp_frames["vr_frames"] / "frame_0000.png"))
+        assert actual.shape == expected_shape
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_vr_callbacks_remain_ordered_on_the_caller_thread(self, temp_frames):
+        caller_thread = threading.get_ident()
+        tracker = Mock()
+        tracker.previews = []
+        tracker.progress = []
+        tracker.send_preview_frame.side_effect = (
+            lambda path, phase, frame_num: tracker.previews.append(
+                (path.name, phase, frame_num, threading.get_ident())
+            )
+        )
+        tracker.update_progress.side_effect = lambda *_args, **kwargs: tracker.progress.append(
+            (kwargs["frame_num"], threading.get_ident())
+        )
+        assembler = VRFrameAssembler()
+        real_assemble = assembler._assemble_single_vr_frame
+
+        def delayed_assemble(left_file, *args, **kwargs):
+            index = int(left_file.stem.rsplit("_", 1)[1])
+            time.sleep((3 - index) * 0.02)
+            return real_assemble(left_file, *args, **kwargs)
+
+        with (
+            patch(
+                "src.depth_surge_3d.processing.frames.vr_assembler."
+                "calculate_frame_stage_workers",
+                return_value=3,
+            ),
+            patch.object(
+                assembler,
+                "_assemble_single_vr_frame",
+                side_effect=delayed_assemble,
+            ),
+        ):
+            result = assembler.assemble_vr_frames(
+                temp_frames,
+                {
+                    "vr_format": "side_by_side",
+                    "per_eye_width": 200,
+                    "per_eye_height": 100,
+                },
+                tracker,
+                total_frames=3,
+            )
+
+        assert result is True
+        assert [item[2] for item in tracker.previews] == [1, 2, 3]
+        assert [item[0] for item in tracker.progress] == [1, 2, 3]
+        assert {item[3] for item in tracker.previews} == {caller_thread}
+        assert {item[1] for item in tracker.progress} == {caller_thread}
+
+    def test_vr_failure_waits_for_running_workers_and_cancels_pending(self, tmp_path):
+        left_dir = tmp_path / "left_cropped"
+        right_dir = tmp_path / "right_cropped"
+        vr_dir = tmp_path / "vr_frames"
+        for directory in (left_dir, right_dir, vr_dir):
+            directory.mkdir()
+        for index in range(12):
+            image = np.full((8, 8, 3), index, dtype=np.uint8)
+            assert cv2.imwrite(str(left_dir / f"frame_{index:04d}.png"), image)
+            assert cv2.imwrite(str(right_dir / f"frame_{index:04d}.png"), image)
+
+        first_started = threading.Event()
+        failure_raised = threading.Event()
+        release_worker = threading.Event()
+        executed = []
+        lock = threading.Lock()
+        result = {}
+        assembler = VRFrameAssembler()
+
+        def controlled_assemble(left_file, *_args, **_kwargs):
+            index = int(left_file.stem.rsplit("_", 1)[1])
+            with lock:
+                executed.append(index)
+            if index == 0:
+                first_started.set()
+                assert release_worker.wait(5)
+                return vr_dir / left_file.name
+            if index == 1:
+                assert first_started.wait(2)
+                failure_raised.set()
+                raise RuntimeError("planned VR write failure")
+            return vr_dir / left_file.name
+
+        def run_stage():
+            result["value"] = assembler.assemble_vr_frames(
+                {
+                    "left_cropped": left_dir,
+                    "right_cropped": right_dir,
+                    "vr_frames": vr_dir,
+                },
+                {
+                    "vr_format": "side_by_side",
+                    "per_eye_width": 8,
+                    "per_eye_height": 8,
+                },
+                total_frames=12,
+            )
+
+        with (
+            patch(
+                "src.depth_surge_3d.processing.frames.vr_assembler."
+                "calculate_frame_stage_workers",
+                return_value=2,
+            ),
+            patch.object(
+                assembler,
+                "_assemble_single_vr_frame",
+                side_effect=controlled_assemble,
+            ),
+        ):
+            stage_thread = threading.Thread(target=run_stage)
+            stage_thread.start()
+            try:
+                assert failure_raised.wait(2)
+                time.sleep(0.05)
+                assert stage_thread.is_alive()
+            finally:
+                release_worker.set()
+                stage_thread.join(timeout=5)
+
+        assert not stage_thread.is_alive()
+        assert result["value"] is False
+        assert len(executed) == 2
+        assert set(executed) == {0, 1}
+        assert not (vr_dir / "metadata.json").exists()
+
     def test_assemble_vr_frames_mismatched_count(self, temp_frames, mock_progress_tracker):
         """Test VR assembly with mismatched frame counts."""
         assembler = VRFrameAssembler()
@@ -167,9 +411,8 @@ class TestAssembleVRFrames:
 
             result = assembler.assemble_vr_frames(temp_frames, settings, mock_progress_tracker)
 
-        # Should still succeed, just processes matched pairs (2 remaining)
-        assert result is True
-        assert mock_create.call_count == 2
+        assert result is False
+        assert mock_create.call_count == 0
 
     def test_assemble_vr_frames_no_source(self, mock_progress_tracker, tmp_path):
         """Test VR assembly with no source frames."""
@@ -247,6 +490,22 @@ class TestGetVRAssemblySourceDirs:
         result = VRFrameAssembler._get_vr_assembly_source_dirs(directories, settings)
 
         assert result == (left_cropped, right_cropped)
+
+    def test_get_source_does_not_fallback_when_upscaling_is_required(self, tmp_path):
+        left_cropped = tmp_path / "left_cropped"
+        right_cropped = tmp_path / "right_cropped"
+        left_cropped.mkdir()
+        right_cropped.mkdir()
+        frame = np.zeros((10, 10, 3), dtype=np.uint8)
+        cv2.imwrite(str(left_cropped / "frame_0000.png"), frame)
+        cv2.imwrite(str(right_cropped / "frame_0000.png"), frame)
+
+        result = VRFrameAssembler._get_vr_assembly_source_dirs(
+            {"left_cropped": left_cropped, "right_cropped": right_cropped},
+            {"upscale_model": "x4"},
+        )
+
+        assert result is None
 
     def test_get_source_no_directories(self):
         """Test handling when no source directories exist."""

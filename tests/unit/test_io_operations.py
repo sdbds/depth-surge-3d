@@ -760,10 +760,13 @@ class TestSaveProcessingSettings:
         assert result == Path("/tmp/batch1-settings.json")
 
     def test_saved_settings_include_current_schema_and_source_fingerprint(self, tmp_path):
-        """New settings files identify both the schema and exact source bytes."""
-        import hashlib
+        """New settings files use the lightweight source identity contract."""
         import json
 
+        from src.depth_surge_3d.core.file_identity import (
+            FILE_IDENTITY_ALGORITHM_VERSION,
+            file_sample_fingerprint,
+        )
         from src.depth_surge_3d.core.settings import PROCESSING_SETTINGS_SCHEMA_VERSION
         from src.depth_surge_3d.io.operations import save_processing_settings
 
@@ -775,10 +778,10 @@ class TestSaveProcessingSettings:
         saved = json.loads(path.read_text(encoding="utf-8"))
 
         assert saved["metadata"]["settings_schema_version"] == PROCESSING_SETTINGS_SCHEMA_VERSION
-        assert (
-            saved["metadata"]["source_video_sha256"]
-            == hashlib.sha256(source.read_bytes()).hexdigest()
+        assert saved["metadata"]["source_video_fingerprint_algorithm"] == (
+            FILE_IDENTITY_ALGORITHM_VERSION
         )
+        assert saved["metadata"]["source_video_fingerprint"] == file_sample_fingerprint(source)
 
 
 class TestLoadProcessingSettings:

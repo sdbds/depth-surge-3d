@@ -163,10 +163,22 @@ def apply_fisheye_distortion(
     # Get coordinate mappings
     x_map, y_map = calculate_fisheye_coordinates(width, height, fov_degrees, projection_type)
 
-    # Apply remapping with reflection to avoid black borders
-    distorted = cv2.remap(image, x_map, y_map, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+    return remap_fisheye(image, x_map, y_map)
 
-    return distorted
+
+def remap_fisheye(image: np.ndarray, x_map: np.ndarray, y_map: np.ndarray) -> np.ndarray:
+    """Apply precomputed fisheye coordinate maps to an image."""
+
+    height, width = image.shape[:2]
+    if x_map.shape != (height, width) or y_map.shape != (height, width):
+        raise ValueError("Fisheye maps must match image dimensions")
+    return cv2.remap(
+        image,
+        x_map,
+        y_map,
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
 
 
 def apply_fisheye_square_crop(

@@ -7,18 +7,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ...core.file_identity import (
+    FILE_IDENTITY_ALGORITHM_VERSION,
+    file_sample_fingerprint,
+)
 
-SOURCE_FRAME_SCHEMA_VERSION = 1
-SOURCE_FRAME_ALGORITHM_VERSION = "png-byte-sha256-v1"
+SOURCE_FRAME_SCHEMA_VERSION = 2
+SOURCE_FRAME_ALGORITHM_VERSION = "png-stat-v1"
 SOURCE_FRAME_METADATA_NAME = "metadata.json"
-
-
-def file_sha256(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            hasher.update(chunk)
-    return hasher.hexdigest()
 
 
 def _metadata_fingerprint(metadata: dict[str, Any]) -> str:
@@ -32,14 +28,13 @@ def _metadata_fingerprint(metadata: dict[str, Any]) -> str:
 
 
 def frame_sequence_fingerprint(frame_files: list[Path]) -> str:
-    """Hash exact frame names and encoded bytes in sequence order."""
+    """Hash frame names and cheap file metadata in sequence order."""
 
     hasher = hashlib.sha256()
     for path in frame_files:
+        stat = path.stat()
         hasher.update(path.name.encode("utf-8"))
-        with path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                hasher.update(chunk)
+        hasher.update(f"\0{stat.st_size}\0{stat.st_mtime_ns}\0".encode("ascii"))
     return hasher.hexdigest()
 
 
@@ -56,7 +51,8 @@ def build_source_frame_manifest(
     metadata: dict[str, Any] = {
         "schema_version": SOURCE_FRAME_SCHEMA_VERSION,
         "algorithm_version": SOURCE_FRAME_ALGORITHM_VERSION,
-        "source_video_sha256": file_sha256(source_path),
+        "source_video_fingerprint_algorithm": FILE_IDENTITY_ALGORITHM_VERSION,
+        "source_video_fingerprint": file_sample_fingerprint(source_path),
         "num_frames": len(frame_files),
         "frame_names": [path.name for path in frame_files],
         "source_frame_fingerprint": frame_sequence_fingerprint(frame_files),
@@ -92,7 +88,7 @@ def read_source_frame_manifest(frames_dir: Path) -> dict[str, Any] | None:
 def source_frame_manifest_mismatch_reason(
     metadata: dict[str, Any] | None,
     frame_files: list[Path],
-    source_video_sha256: str,
+    source_video_fingerprint: str,
 ) -> str | None:
     """Return why persisted source frames are not the completed extraction."""
 
@@ -103,7 +99,8 @@ def source_frame_manifest_mismatch_reason(
     checks = (
         metadata.get("schema_version") == SOURCE_FRAME_SCHEMA_VERSION,
         metadata.get("algorithm_version") == SOURCE_FRAME_ALGORITHM_VERSION,
-        metadata.get("source_video_sha256") == source_video_sha256,
+        metadata.get("source_video_fingerprint_algorithm") == FILE_IDENTITY_ALGORITHM_VERSION,
+        metadata.get("source_video_fingerprint") == source_video_fingerprint,
         metadata.get("num_frames") == len(frame_files),
         metadata.get("frame_names") == [path.name for path in frame_files],
         isinstance(fingerprint, str) and fingerprint == _metadata_fingerprint(unhashed),

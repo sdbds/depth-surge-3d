@@ -260,9 +260,6 @@ def _summarize_settings(settings: dict[str, Any]) -> str:
     if "vr_resolution" in settings:
         summary_parts.append(f"Resolution: {settings['vr_resolution']}")
 
-    if "processing_mode" in settings:
-        summary_parts.append(f"Mode: {settings['processing_mode']}")
-
     if "super_sample" in settings and settings["super_sample"] != "none":
         summary_parts.append(f"Super-sample: {settings['super_sample']}")
 

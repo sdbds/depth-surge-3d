@@ -8,6 +8,11 @@ from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from src.depth_surge_3d.core.file_identity import (
+    FILE_IDENTITY_ALGORITHM_VERSION,
+    file_sample_fingerprint,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -57,6 +62,15 @@ def test_web_ui_exposes_see_through_model_option():
     parser.feed((PROJECT_ROOT / "templates" / "index.html").read_text(encoding="utf-8"))
 
     assert "see_through" in parser.values
+
+
+def test_web_ui_does_not_force_see_through_depth_resolution():
+    html = (PROJECT_ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+
+    assert "document.getElementById('depthResolution').value = '768';" not in html
+    assert "See-Through Native - 768x768 (Square)" in html
+    assert "depthModelVersion: document.getElementById('depthModelVersion').value" in html
+    assert "depthResolution: document.getElementById('depthResolution').value" in html
 
 
 def test_web_runner_uses_relative_see_through_repo(tmp_path):
@@ -129,6 +143,60 @@ def test_web_resume_restores_saved_processing_settings(tmp_path):
     assert "focal_length" not in result
 
 
+def test_web_resume_infers_see_through_for_legacy_settings(tmp_path):
+    """Legacy settings without a backend field must recover See-Through from its repo."""
+    import app as web_app
+
+    (tmp_path / "job-settings.json").write_text(
+        json.dumps(
+            {
+                "processing_settings": {
+                    "model_path": "24yearsold/seethroughv0.0.1_marigold",
+                    "model_size": "large",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = web_app.detect_resume_settings(tmp_path)
+
+    assert result["depth_model_version"] == "see_through"
+
+
+def test_resume_depth_model_inference_uses_raw_metadata_and_preserves_explicit_value(tmp_path):
+    from src.depth_surge_3d.io.resume import resolve_resume_depth_model_version
+
+    assert resolve_resume_depth_model_version({}, tmp_path, default="v2") == "v2"
+
+    raw_dir = tmp_path / "02_depth_raw"
+    raw_dir.mkdir()
+    (raw_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "semantic_fingerprint": {
+                    "backend": (
+                        "depth_surge_3d.inference.depth."
+                        "video_depth_estimator_see_through.SeeThroughDepthEstimator"
+                    ),
+                    "model_info": {"model_version": "See-Through Marigold"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert resolve_resume_depth_model_version({}, tmp_path, default="v3") == "see_through"
+    assert (
+        resolve_resume_depth_model_version(
+            {"depth_model_version": "v2"},
+            tmp_path,
+            default="v3",
+        )
+        == "v2"
+    )
+
+
 def test_web_process_validates_final_settings_before_starting(tmp_path):
     import app as web_app
 
@@ -196,8 +264,6 @@ def test_web_process_rejects_removed_explicit_settings(tmp_path):
 
 
 def test_web_resume_requires_current_request_to_authorize_legacy_delete(tmp_path, monkeypatch):
-    import hashlib
-
     import app as web_app
 
     output_dir = tmp_path / "job"
@@ -211,7 +277,8 @@ def test_web_resume_requires_current_request_to_authorize_legacy_delete(tmp_path
                 "metadata": {
                     "source_video": str(source_video),
                     "source_video_name": source_video.name,
-                    "source_video_sha256": hashlib.sha256(source_video.read_bytes()).hexdigest(),
+                    "source_video_fingerprint_algorithm": FILE_IDENTITY_ALGORITHM_VERSION,
+                    "source_video_fingerprint": file_sample_fingerprint(source_video),
                 }
             }
         ),
@@ -339,8 +406,7 @@ def test_web_resume_rejects_output_directory_outside_managed_root(tmp_path, monk
     start.assert_not_called()
 
 
-def test_web_resume_uses_source_recorded_by_exact_settings_file(tmp_path, monkeypatch):
-    import hashlib
+def test_web_resume_accepts_legacy_settings_without_source_fingerprint(tmp_path, monkeypatch):
     import json
 
     import app as web_app
@@ -358,7 +424,6 @@ def test_web_resume_uses_source_recorded_by_exact_settings_file(tmp_path, monkey
                 "metadata": {
                     "source_video": str(correct_source),
                     "source_video_name": correct_source.name,
-                    "source_video_sha256": hashlib.sha256(correct_source.read_bytes()).hexdigest(),
                     "settings_schema_version": 2,
                 },
                 "processing_settings": {},
@@ -387,7 +452,7 @@ def test_web_resume_uses_source_recorded_by_exact_settings_file(tmp_path, monkey
     assert start.call_args.args[2] == correct_source.resolve()
 
 
-def test_web_resume_rejects_saved_source_hash_mismatch(tmp_path, monkeypatch):
+def test_web_resume_rejects_saved_source_fingerprint_mismatch(tmp_path, monkeypatch):
     import json
 
     import app as web_app
@@ -404,7 +469,8 @@ def test_web_resume_rejects_saved_source_hash_mismatch(tmp_path, monkeypatch):
                 "metadata": {
                     "source_video": str(source_video),
                     "source_video_name": source_video.name,
-                    "source_video_sha256": "0" * 64,
+                    "source_video_fingerprint_algorithm": FILE_IDENTITY_ALGORITHM_VERSION,
+                    "source_video_fingerprint": "0" * 64,
                     "settings_schema_version": 2,
                 },
                 "processing_settings": {},
@@ -491,10 +557,11 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
         depth_model_version="see_through",
     )
     projector.load_model.assert_called_once_with()
-    build_fingerprint.assert_called_once_with(projector.depth_estimator, report.migrated_settings)
+    preflight_settings = {**report.migrated_settings, "verbose": False}
+    build_fingerprint.assert_called_once_with(projector.depth_estimator, preflight_settings)
     build_report.assert_called_once_with(
         tmp_path,
-        report.migrated_settings,
+        preflight_settings,
         source_video="source.mkv",
         model_fingerprint=model_fingerprint,
         settings_file=resume_info["settings_file"],
@@ -503,8 +570,8 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
     resume_kwargs = projector.process_video.call_args.kwargs
     assert resume_kwargs["video_path"] == "source.mkv"
     assert resume_kwargs["output_dir"] == str(tmp_path)
-    assert resume_kwargs["stereo_strength"] == 3.0
-    assert resume_kwargs["keep_intermediates"] is False
+    assert resume_kwargs["settings"]["stereo_strength"] == 3.0
+    assert resume_kwargs["settings"]["keep_intermediates"] is False
     for metadata_key in (
         "depth_model_version",
         "model_path",
@@ -516,3 +583,60 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
         "seed",
     ):
         assert metadata_key not in resume_kwargs
+
+
+def test_cli_resume_infers_see_through_for_legacy_settings(tmp_path, monkeypatch):
+    """CLI resume must select See-Through when old settings only contain its repo."""
+    cli = _load_cli_module()
+    projector = MagicMock()
+    projector.load_model.return_value = True
+    projector.process_video.return_value = True
+    saved_settings = {
+        "model_path": "24yearsold/seethroughv0.0.1_marigold",
+        "model_size": "large",
+        "use_metric_depth": False,
+        "device": "cuda",
+        "stereo_strength": 3.0,
+        "keep_intermediates": False,
+    }
+    resume_info = {
+        "can_resume": True,
+        "batch_name": "anime",
+        "status": "in_progress",
+        "progress_info": None,
+        "recommendations": [],
+        "settings_file": tmp_path / "job-settings.json",
+    }
+    report = MagicMock()
+    report.stages = ()
+    report.removed_settings = ()
+    report.migrated_settings = cli.validate_settings(
+        {**saved_settings, "depth_model_version": "see_through"},
+        source="legacy_disk",
+    )
+    monkeypatch.setattr(cli.sys, "argv", ["depth_surge_3d.py", "--resume", str(tmp_path)])
+
+    with (
+        patch.object(cli, "can_resume_processing", return_value=resume_info),
+        patch.object(
+            cli,
+            "load_processing_settings",
+            return_value={
+                "metadata": {"source_video": "source.mkv"},
+                "processing_settings": saved_settings,
+            },
+        ),
+        patch.object(cli, "create_stereo_projector", return_value=projector) as create_projector,
+        patch.object(cli, "build_current_model_fingerprint", return_value={"backend": "loaded"}),
+        patch.object(cli, "build_resume_report", return_value=report),
+        patch.object(cli, "apply_legacy_migration"),
+    ):
+        result = cli.main()
+
+    assert result == 0
+    create_projector.assert_called_once_with(
+        model_path="24yearsold/seethroughv0.0.1_marigold",
+        device="cuda",
+        metric=False,
+        depth_model_version="see_through",
+    )

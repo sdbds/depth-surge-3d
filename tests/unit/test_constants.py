@@ -8,6 +8,7 @@ from src.depth_surge_3d.core.constants import (
     VR_RESOLUTIONS,
     VALIDATION_RANGES,
     DEFAULT_SETTINGS,
+    PROGRESS_UPDATE_INTERVAL,
 )
 
 
@@ -86,3 +87,7 @@ class TestConstants:
         ]
         for key in required_keys:
             assert key in DEFAULT_SETTINGS
+
+    def test_progress_update_interval_is_a_time_throttle(self):
+        """Progress updates remain responsive instead of waiting ten seconds."""
+        assert PROGRESS_UPDATE_INTERVAL == 0.1

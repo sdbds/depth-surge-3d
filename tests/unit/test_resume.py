@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -10,6 +9,10 @@ import cv2
 import numpy as np
 import pytest
 
+from src.depth_surge_3d.core.file_identity import (
+    FILE_IDENTITY_ALGORITHM_VERSION,
+    file_sample_fingerprint,
+)
 from src.depth_surge_3d.core.settings import validate_settings
 from src.depth_surge_3d.processing.frames.depth_storage import (
     RAW_DEPTH_SCHEMA_VERSION,
@@ -31,6 +34,7 @@ from src.depth_surge_3d.processing.frames.stereo_generator import (
     STEREO_STAGE_SCHEMA_VERSION,
 )
 from src.depth_surge_3d.processing.frames.source_frame_manifest import (
+    frame_sequence_fingerprint,
     write_source_frame_manifest,
 )
 
@@ -39,15 +43,12 @@ def _write_frames(output_dir: Path, count: int = 2) -> tuple[list[Path], str]:
     frames_dir = output_dir / "00_original_frames"
     frames_dir.mkdir(parents=True)
     frame_files = []
-    hasher = hashlib.sha256()
     for index in range(count):
         path = frames_dir / f"frame_{index + 1:06d}.png"
         image = np.full((4, 6, 3), index * 40, dtype=np.uint8)
         assert cv2.imwrite(str(path), image)
         frame_files.append(path)
-        hasher.update(path.name.encode("utf-8"))
-        hasher.update(path.read_bytes())
-    return frame_files, hasher.hexdigest()
+    return frame_files, frame_sequence_fingerprint(frame_files)
 
 
 def _write_settings(
@@ -55,7 +56,7 @@ def _write_settings(
     processing_settings: dict,
     *,
     current_schema: bool = False,
-    include_source_hash: bool = True,
+    include_source_fingerprint: bool = True,
 ) -> Path:
     source_video = output_dir / "source.mp4"
     if not source_video.exists():
@@ -65,8 +66,9 @@ def _write_settings(
         "source_video": str(source_video),
         "processing_status": "in_progress",
     }
-    if include_source_hash:
-        metadata["source_video_sha256"] = hashlib.sha256(source_video.read_bytes()).hexdigest()
+    if include_source_fingerprint:
+        metadata["source_video_fingerprint_algorithm"] = FILE_IDENTITY_ALGORITHM_VERSION
+        metadata["source_video_fingerprint"] = file_sample_fingerprint(source_video)
     if current_schema:
         metadata["settings_schema_version"] = 2
     payload = {
@@ -400,12 +402,7 @@ def test_source_video_fingerprint_mismatch_aborts_resume(tmp_path):
     _write_frames(tmp_path)
     source_video = tmp_path / "source.mp4"
     source_video.write_bytes(b"first source payload")
-    settings_file = _write_settings(tmp_path, _current_settings(), current_schema=True)
-    settings_data = json.loads(settings_file.read_text(encoding="utf-8"))
-    settings_data["metadata"]["source_video_sha256"] = hashlib.sha256(
-        source_video.read_bytes()
-    ).hexdigest()
-    settings_file.write_text(json.dumps(settings_data), encoding="utf-8")
+    _write_settings(tmp_path, _current_settings(), current_schema=True)
     source_video.write_bytes(b"different source payload")
 
     with pytest.raises(ValueError, match="source video fingerprint mismatch"):
@@ -476,7 +473,7 @@ def test_settings_rewrite_failure_rolls_back_archived_stages(tmp_path, monkeypat
     assert settings_file.read_bytes() == original_settings
 
 
-def test_missing_source_hash_aborts_resume(tmp_path):
+def test_missing_source_fingerprint_invalidates_frames_instead_of_aborting(tmp_path):
     from src.depth_surge_3d.io.resume import build_resume_report
 
     _write_frames(tmp_path)
@@ -484,11 +481,41 @@ def test_missing_source_hash_aborts_resume(tmp_path):
         tmp_path,
         _current_settings(),
         current_schema=True,
-        include_source_hash=False,
+        include_source_fingerprint=False,
     )
 
-    with pytest.raises(ValueError, match="source video fingerprint is missing"):
-        build_resume_report(tmp_path, _current_settings())
+    report = build_resume_report(tmp_path, _current_settings())
+
+    assert report.stage("frames").disposition == "invalidate"
+    assert "source video fingerprint is missing" in report.stage("frames").reason
+
+
+def test_resume_source_resolver_accepts_legacy_metadata_without_fingerprint(tmp_path):
+    from src.depth_surge_3d.io.resume import resolve_resume_source_video
+
+    source_video = tmp_path / "source.mp4"
+    source_video.write_bytes(b"legacy-source")
+    settings_file = tmp_path / "job-settings.json"
+    settings_file.write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "source_video": str(source_video),
+                    "source_video_name": source_video.name,
+                },
+                "processing_settings": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        resolve_resume_source_video(
+            tmp_path,
+            settings_file=settings_file,
+        )
+        == source_video.resolve()
+    )
 
 
 def test_actual_resume_source_must_match_saved_source(tmp_path):
@@ -697,3 +724,53 @@ def test_delete_cleanup_failure_does_not_roll_back_committed_migration(tmp_path,
     assert (tmp_path / ".resume_delete_staging").is_dir()
     migrated = json.loads(settings_file.read_text(encoding="utf-8"))
     assert "baseline" not in migrated["processing_settings"]
+
+
+def test_generated_stage_without_completion_manifest_is_invalidated(tmp_path):
+    from src.depth_surge_3d.io.resume import _validate_generated_stage
+
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    payload = np.zeros((4, 6, 3), dtype=np.uint8)
+    assert cv2.imwrite(str(left / "frame_000001.png"), payload)
+    assert cv2.imwrite(str(right / "frame_000001.png"), payload)
+
+    stage = _validate_generated_stage(
+        "crop",
+        (left, right),
+        upstream_reusable=True,
+        changed_setting=None,
+        reusable_reason="crop settings match",
+    )
+
+    assert stage.disposition == "invalidate"
+    assert "manifest" in stage.reason
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [None, {"source_frame_fingerprint": 7}],
+)
+def test_frame_stage_explicitly_invalidates_malformed_manifest(tmp_path, monkeypatch, manifest):
+    import src.depth_surge_3d.io.resume as resume
+
+    _write_frames(tmp_path)
+    settings_data = {"metadata": {"source_video_fingerprint": "source-fingerprint"}}
+    monkeypatch.setattr(resume, "read_source_frame_manifest", lambda _directory: manifest)
+    monkeypatch.setattr(
+        resume,
+        "source_frame_manifest_mismatch_reason",
+        lambda *_arguments: None,
+    )
+
+    stage, _frame_files, fingerprint = resume._validate_frame_stage(
+        tmp_path,
+        settings_data,
+        {},
+    )
+
+    assert stage.disposition == "invalidate"
+    assert "manifest" in stage.reason
+    assert fingerprint is None

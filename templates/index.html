@@ -974,7 +974,7 @@
                                 <option value="auto" selected>Auto (Match Source Resolution)</option>
                                 <option value="518">SD - 518px (Fast, Low VRAM)</option>
                                 <option value="720">HD - 720px (Balanced)</option>
-                                <option value="768">See-Through Native - 768px</option>
+                                <option value="768">See-Through Native - 768x768 (Square)</option>
                                 <option value="1080">Full HD - 1080px (High Quality)</option>
                                 <option value="1440">2K - 1440px (Only if upscaling frames)</option>
                                 <option value="2160">4K - 2160px (Only for 4K source)</option>
@@ -3003,6 +3003,8 @@
                 superSample: document.getElementById('superSample').value,
                 device: document.getElementById('device').value,
                 modelSize: document.getElementById('modelSize').value,
+                depthModelVersion: document.getElementById('depthModelVersion').value,
+                depthResolution: document.getElementById('depthResolution').value,
                 depthModelType: document.getElementById('depthModelType').value,
 
                 // Audio and intermediates
@@ -3090,8 +3092,9 @@
                 superSample: 'auto',
                 device: 'auto',
                 modelSize: 'vitb',
+                depthModelVersion: 'v3',
+                depthResolution: 'auto',
                 depthModelType: 'metric',
-                processingMode: 'serial',
                 preserveAudio: true,
                 keepIntermediates: true,
                 videoEncoder: 'auto',
@@ -3133,7 +3136,7 @@
             const settingsElements = [
                 'startTime', 'endTime', 'vrFormat', 'vrResolution', 'stereoStrength', 'convergence', 'occlusionFill',
                 'sceneDetection', 'sceneCutThreshold', 'minSceneFrames', 'rawStorageDtype', 'stereoIoWorkers', 'migrateLegacy',
-                'resolution', 'targetFps', 'superSample', 'device', 'modelSize', 'depthModelType', 'depthResolution', 'videoEncoder',
+                'resolution', 'targetFps', 'superSample', 'device', 'modelSize', 'depthModelVersion', 'depthModelType', 'depthResolution', 'videoEncoder',
                 'preserveAudio', 'keepIntermediates', 'applyDistortion', 'fisheyeProjection', 'fisheyeFov', 'cropFactor',
                 'fisheyeCropFactor', 'applyUpscaling', 'upscaleModel', 'experimentalFrameInterpolation'
             ];
@@ -3265,9 +3268,6 @@
             document.getElementById('temporalWindowSettings').style.display = isV2 ? 'block' : 'none';
             document.getElementById('modelSizeSettings').style.display = isSeeThrough ? 'none' : 'block';
             document.getElementById('depthModelTypeSettings').style.display = isSeeThrough ? 'none' : 'block';
-            if (isSeeThrough) {
-                document.getElementById('depthResolution').value = '768';
-            }
         }
 
         // Toggle model-specific settings based on depth backend.

@@ -115,7 +115,6 @@ def generate_output_filename(
     base_name: str,
     vr_format: str = "side_by_side",
     resolution: str | None = None,
-    processing_mode: str | None = None,  # Deprecated, kept for backwards compatibility
 ) -> str:
     """
     Generate output video filename from components.
@@ -126,8 +125,6 @@ def generate_output_filename(
         base_name: Base name for the output file
         vr_format: VR format ('side_by_side', 'over_under')
         resolution: Resolution string (e.g., '1080p', '4k')
-        processing_mode: Deprecated parameter, ignored
-
     Returns:
         Output filename string
 

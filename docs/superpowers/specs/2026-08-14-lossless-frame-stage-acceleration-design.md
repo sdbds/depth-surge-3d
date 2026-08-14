@@ -7,7 +7,9 @@ accelerate only work whose decoded output can remain pixel-identical to the
 current implementation. An independent context-free review found two blockers
 in source-size memory accounting and failed-worker shutdown. Both contracts
 were revised, and the independent follow-up review returned PASS before
-implementation began.
+implementation began. A later implementation review found delayed observation
+of non-leading worker failures; the shared scheduler and tests were revised to
+detect completion independently from ordered callbacks.
 
 ## Problem
 
@@ -110,8 +112,9 @@ same-backend reproducibility boundary.
 ### Bounded worker selection
 
 Add one small frame-stage parallelism helper rather than duplicating worker
-math across processors. It accepts a frame count and a conservative estimate of
-peak bytes held by one active item.
+math and executor lifecycle across processors. It selects a worker count from a
+frame count and a conservative estimate of peak bytes held by one active item,
+then runs at most that many items concurrently for callers that need scheduling.
 
 The worker count is:
 
@@ -146,15 +149,18 @@ reduces concurrency automatically.
 
 Use `ThreadPoolExecutor`, not process workers. OpenCV and NumPy release the GIL
 for the expensive operations, threads avoid serializing large arrays, and each
-task already has independent file paths. Futures are consumed in source order
-for deterministic callbacks. On failure, pending futures are cancelled and the
-executor is shut down with `wait=True` and `cancel_futures=True`. The processor
+task already has independent file paths. The scheduler keeps at most the worker
+count in flight and observes completion with `FIRST_COMPLETED`. Successful
+results are buffered by source index so callbacks remain deterministic, while a
+later-frame failure is detected without waiting for an earlier slow frame. On
+the first observed failure it stops submission, cancels pending futures, and
+shuts the executor down with `wait=True` and `cancel_futures=True`. The processor
 may return or raise only after already-running tasks have exited. No completion
 manifest is emitted.
 
-This helper chooses worker counts only. Stage-specific workers remain local to
-their processors so file handling, result types, and failure messages stay
-clear.
+Stage-specific workers remain local to their processors so file handling,
+result types, and failure messages stay clear. The helper owns only the common
+worker-count and ordered scheduling contracts.
 
 ### No-op crop materialization
 
@@ -282,7 +288,8 @@ selection continues to bypass that stage in the same way it does today.
 - Convert worker exceptions into the processor's current `False` return or the
   canonical stage's current exception contract. Include the failing frame path
   in the diagnostic.
-- Cancel futures that have not started after the first failure, then call
+- Observe futures independently of callback order. After the first failure,
+  stop submitting new items, cancel futures that have not started, then call
   `shutdown(wait=True, cancel_futures=True)` before returning or raising.
 - Do not delete partial outputs in the failure handler. The existing
   non-reusable-stage path clears them at the start of the next attempt. Waiting
@@ -329,6 +336,8 @@ selection continues to bypass that stage in the same way it does today.
   workers finish out of order.
 - Inject a worker failure and verify metadata is not written and the method
   waits for every already-running worker to exit before raising.
+- Make a non-leading frame fail while frame zero is blocked; verify no work
+  beyond the initial bounded window starts and no ordered callback is emitted.
 - Verify a completed existing canonical stage is still reused without work.
 
 ### VR assembly
@@ -341,6 +350,8 @@ selection continues to bypass that stage in the same way it does today.
 - Verify a large source resized to a small target lowers the worker count based
   on the source IHDR dimensions, not only the target settings.
 - Verify one failed decode/write prevents `complete_stage`.
+- Make a non-leading frame fail while frame zero is blocked; verify failure is
+  observed immediately, submission stops, and running work is joined.
 - Verify existing completed VR stages remain reusable.
 
 ### Regression and benchmark verification

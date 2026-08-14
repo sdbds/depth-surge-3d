@@ -68,7 +68,6 @@ class ProcessingOrchestrator:
         self.video_encoder = video_encoder
         self.verbose = verbose
         self._settings_file: Path | None = None  # Track settings file for error handling
-        self._total_steps = 7  # Updated dynamically based on settings
         self._start_time: float = 0.0  # Track processing start time
 
     def process(
@@ -152,9 +151,6 @@ class ProcessingOrchestrator:
             - Progress updates
             - Console output
         """
-        # Calculate total steps based on settings
-        self._total_steps = self._get_total_steps(settings)
-
         # Step 1: Extract frames (delegated to video_encoder)
         frame_files = self.video_encoder.extract_frames(
             video_path, directories, video_properties, settings
@@ -199,7 +195,6 @@ class ProcessingOrchestrator:
         video_path: str,
         output_path: Path,
         progress_tracker=None,
-        current_step: int = 3,
     ) -> bool:
         """
         Execute remaining pipeline steps after depth map generation.
@@ -213,7 +208,6 @@ class ProcessingOrchestrator:
             video_path: Input video path
             output_path: Output directory path
             progress_tracker: Optional progress tracker
-            current_step: Current step number
 
         Returns:
             True if successful, False otherwise
@@ -237,33 +231,33 @@ class ProcessingOrchestrator:
         self._print_saved_to(directories.get("left_frames"), "Left frames")
         self._print_saved_to(directories.get("right_frames"), "Right frames")
         print()  # Blank line after left/right pair
-        current_step += 1
 
         # Step 4: Apply fisheye distortion (optional - delegated to distortion_processor)
         if settings.get("apply_distortion", True):
-            # Get left/right frame files
             left_dir = directories.get("left_frames")
             right_dir = directories.get("right_frames")
-            if left_dir and right_dir:
-                left_files = sorted(left_dir.glob("*.png"))
-                right_files = sorted(right_dir.glob("*.png"))
-
-                if left_files and right_files:
-                    if not self.distortion_processor.apply_distortion(
-                        left_files, right_files, directories, settings, progress_tracker
-                    ):
-                        return self._handle_step_error("Distortion failed")
-                    print(
-                        step_complete(
-                            f"Step 4: Applied {settings['fisheye_projection']} fisheye distortion"
-                        )
-                    )
-                    self._print_saved_to(directories.get("left_distorted"), "Distorted left frames")
-                    self._print_saved_to(
-                        directories.get("right_distorted"), "Distorted right frames"
-                    )
-                    print()  # Blank line after left/right pair
-            current_step += 1
+            if left_dir is None or right_dir is None:
+                return self._handle_step_error("Distortion source directories are missing")
+            left_files = sorted(left_dir.glob("*.png"))
+            right_files = sorted(right_dir.glob("*.png"))
+            if (
+                len(left_files) != num_frames
+                or len(right_files) != num_frames
+                or [path.stem for path in left_files] != [path.stem for path in right_files]
+            ):
+                return self._handle_step_error("Distortion source frame manifest is incomplete")
+            if not self.distortion_processor.apply_distortion(
+                left_files, right_files, directories, settings, progress_tracker
+            ):
+                return self._handle_step_error("Distortion failed")
+            print(
+                step_complete(
+                    f"Step 4: Applied {settings['fisheye_projection']} fisheye distortion"
+                )
+            )
+            self._print_saved_to(directories.get("left_distorted"), "Distorted left frames")
+            self._print_saved_to(directories.get("right_distorted"), "Distorted right frames")
+            print()  # Blank line after left/right pair
 
         # Step 5: Crop frames (delegated to distortion_processor)
         if not self.distortion_processor.crop_frames(
@@ -278,7 +272,6 @@ class ProcessingOrchestrator:
         self._print_saved_to(directories.get("left_cropped"), "Cropped left frames")
         self._print_saved_to(directories.get("right_cropped"), "Cropped right frames")
         print()  # Blank line after left/right pair
-        current_step += 1
 
         # Step 6: Apply AI upscaling (optional - delegated to upscaler)
         if settings.get("upscale_model", "none") != "none":
@@ -292,7 +285,6 @@ class ProcessingOrchestrator:
             self._print_saved_to(directories.get("left_upscaled"), "Upscaled left frames")
             self._print_saved_to(directories.get("right_upscaled"), "Upscaled right frames")
             print()  # Blank line after left/right pair
-            current_step += 1
 
         # Step 7: Assemble VR frames (delegated to vr_assembler)
         if not self.vr_assembler.assemble_vr_frames(
@@ -306,7 +298,6 @@ class ProcessingOrchestrator:
         )
         self._print_saved_to(directories.get("vr_frames"), "VR frames")
         print()  # Blank line after step
-        current_step += 1
 
         # Step 8: Create final video (delegated to video_encoder)
         vr_frames_dir = directories.get("vr_frames")
@@ -437,24 +428,6 @@ class ProcessingOrchestrator:
             )
 
     @staticmethod
-    def _get_total_steps(settings: dict[str, Any]) -> int:
-        """
-        PURE: Calculate total steps based on settings.
-
-        Args:
-            settings: Processing settings
-
-        Returns:
-            Total number of pipeline steps (6-8)
-        """
-        total = 6  # Base: Extract, Depth, Stereo, Crop, Assemble, Video
-        if settings.get("apply_distortion", True):
-            total += 1  # Add Step 4: Distortion
-        if settings.get("upscale_model", "none") != "none":
-            total += 1  # Add Step 6: Upscaling
-        return total  # 6-8 steps total
-
-    @staticmethod
     def _format_processing_time(seconds: float) -> str:
         """
         PURE: Format processing time as human-readable string.
@@ -509,22 +482,6 @@ class ProcessingOrchestrator:
                 step_progress=progress,
                 step_total=total,
             )
-
-    def _print_step_complete(
-        self, num_items: int, duration: float, item_type: str = "frames"
-    ) -> None:
-        """
-        Print step completion message.
-
-        Args:
-            num_items: Number of items processed
-            duration: Processing duration in seconds
-            item_type: Type of items processed
-
-        Side effects:
-            - Console output
-        """
-        print(step_complete(f"Processed {num_items:04d} {item_type} in {duration:.2f}s"))
 
     def _print_saved_to(self, directory: Path | None, message_prefix: str = "Saved to") -> None:
         """

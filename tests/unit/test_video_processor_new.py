@@ -21,6 +21,19 @@ class TestVideoProcessorInit:
         assert processor.vr_assembler is not None
         assert processor.video_encoder is not None
         assert processor.orchestrator is not None
+        removed_delegates = {
+            "_get_total_steps",
+            "_update_step_progress",
+            "_handle_step_error",
+            "_setup_processing",
+            "_finalize_processing",
+            "_crop_frames",
+            "_apply_upscaling",
+            "_process_upscaling_frames",
+            "_upscale_frame_pair",
+        }
+        assert removed_delegates.isdisjoint(vars(VideoProcessor))
+        assert not hasattr(processor, "_settings_file")
 
     def test_init_with_verbose(self):
         """Test initialization with verbose enabled."""

@@ -346,7 +346,6 @@ class TestSummarizeSettings:
         settings = {
             "vr_format": "side_by_side",
             "vr_resolution": "3840x1080",
-            "processing_mode": "batch",
             "super_sample": "2x",
             "fisheye_enabled": True,
         }
@@ -355,9 +354,11 @@ class TestSummarizeSettings:
 
         assert "side_by_side" in result
         assert "3840x1080" in result
-        assert "batch" in result
         assert "2x" in result
         assert "Fisheye: enabled" in result
+
+    def test_removed_processing_mode_is_not_summarized(self):
+        assert _summarize_settings({"processing_mode": "batch"}) == "Standard processing"
 
     def test_summarize_settings_minimal(self):
         """Test summary with minimal settings."""

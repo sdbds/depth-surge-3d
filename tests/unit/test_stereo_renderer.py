@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import numpy as np
 import pytest
 import torch
@@ -307,7 +308,7 @@ def test_cuda_oom_retries_once_with_half_band_height(
         del resized_canonical, settings
         attempts.append(band_height)
         if len(attempts) == 1:
-            raise torch.OutOfMemoryError("simulated")
+            raise torch.cuda.OutOfMemoryError("simulated")
         return _empty_render_result(source)
 
     monkeypatch.setattr(renderer, "_render_with_band_height", fake_render)
@@ -333,7 +334,7 @@ def test_second_cuda_oom_reports_frame_and_both_attempted_heights(
         band_height: int,
     ) -> StereoRenderResult:
         del source, resized_canonical, settings, band_height
-        raise torch.OutOfMemoryError("simulated")
+        raise torch.cuda.OutOfMemoryError("simulated")
 
     monkeypatch.setattr(renderer, "_render_with_band_height", always_oom)
 
@@ -342,6 +343,13 @@ def test_second_cuda_oom_reports_frame_and_both_attempted_heights(
         match=r"4x5.*band heights 4 and 2",
     ):
         renderer.render(frame, np.full((1, 1), 0.5, dtype=np.float32))
+
+
+def test_renderer_catches_the_cuda_oom_type_supported_by_torch_2_0() -> None:
+    text = inspect.getsource(StereoRenderer.render)
+
+    assert "except torch.cuda.OutOfMemoryError" in text
+    assert "except torch.OutOfMemoryError" not in text
 
 
 @pytest.mark.parametrize("strength", [0.0, 5.0])

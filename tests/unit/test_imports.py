@@ -1,5 +1,6 @@
 """Test that all entry points can import correctly."""
 
+import ast
 import importlib.util
 import sys
 from pathlib import Path
@@ -75,6 +76,48 @@ class TestEntryPointImports:
         assert args.stereo_io_workers == 3
         assert args.migrate_legacy == "delete"
 
+    def test_cli_accepts_custom_vr_resolution(self):
+        parser = _load_cli_module().create_argument_parser()
+
+        args = parser.parse_args(["video.mp4", "--vr-resolution", "custom:2560x1080"])
+
+        assert args.vr_resolution == "custom:2560x1080"
+
+    def test_cli_builds_one_complete_settings_object(self):
+        module = _load_cli_module()
+        args = module.create_argument_parser().parse_args(
+            ["video.mp4", "--upscale-model", "x4", "--verbose"]
+        )
+
+        settings = module._build_processing_settings(args)
+
+        assert settings["upscale_model"] == "x4"
+        assert settings["verbose"] is True
+        assert settings["target_fps"] is None
+
+    def test_cli_validation_returns_the_settings_it_builds(self, monkeypatch):
+        module = _load_cli_module()
+        args = module.create_argument_parser().parse_args(
+            ["video.mp4", "--upscale-model", "x4", "--verbose"]
+        )
+        monkeypatch.setattr(module, "validate_video_file", lambda _path: True)
+
+        settings = module.validate_arguments(args)
+
+        assert isinstance(settings, dict)
+        assert settings["upscale_model"] == "x4"
+        assert settings["verbose"] is True
+
+    @pytest.mark.parametrize(
+        "resolution",
+        ["custom", "custom:0x1080", "custom:2560", "custom:axb"],
+    )
+    def test_cli_rejects_invalid_custom_vr_resolution(self, resolution):
+        parser = _load_cli_module().create_argument_parser()
+
+        with pytest.raises(SystemExit):
+            parser.parse_args(["video.mp4", "--vr-resolution", resolution])
+
     @pytest.mark.parametrize(
         "removed_option",
         ["--baseline", "--focal-length", "--hole-fill-quality"],
@@ -110,6 +153,18 @@ class TestEntryPointImports:
         assert callable(auto_detect_resolution)
         assert callable(sanitize_filename)
 
+    def test_app_uses_only_the_canonical_package_namespace(self):
+        project_root = Path(__file__).parent.parent.parent
+        tree = ast.parse((project_root / "app.py").read_text(encoding="utf-8"))
+        imported_modules = {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module
+        }
+
+        assert not any(module.startswith("src.depth_surge_3d") for module in imported_modules)
+        assert "depth_surge_3d.processing.batch_processor" not in imported_modules
+
     def test_all_public_modules_importable(self):
         """Test that all public modules can be imported."""
         # Add project root to path
@@ -142,7 +197,6 @@ class TestEntryPointImports:
         )
         from depth_surge_3d.utils.domain import (  # noqa: F401
             depth_cache,
-            progress,
             resolution,
         )
         from depth_surge_3d.utils.imaging import image_processing  # noqa: F401
@@ -183,6 +237,17 @@ class TestNoOrphanedImports:
                 bad_imports.append(str(py_file.relative_to(project_root)))
 
         assert bad_imports == [], f"Found old console imports in: {bad_imports}"
+
+    def test_dead_progress_module_is_removed(self):
+        project_root = Path(__file__).parent.parent.parent
+
+        assert not (project_root / "src/depth_surge_3d/utils/domain/progress.py").exists()
+        assert "from .progress import" not in (
+            project_root / "src/depth_surge_3d/utils/domain/__init__.py"
+        ).read_text(encoding="utf-8")
+        assert "ProgressTracker" not in (
+            project_root / "src/depth_surge_3d/utils/__init__.py"
+        ).read_text(encoding="utf-8")
 
     def test_no_old_resolution_imports(self):
         """Verify no code uses old utils.resolution path."""

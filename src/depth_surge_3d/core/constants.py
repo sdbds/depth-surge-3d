@@ -193,16 +193,6 @@ PROGRESS_STEP_WEIGHTS = [
     0.08,  # Step 7: VR Assembly (moderate - side-by-side combining)
     0.07,  # Step 8: Video Creation (moderate - FFmpeg encoding)
 ]  # Weighted progress distribution (sums to 1.00)
-PROCESSING_STEPS = [
-    "Frame Extraction",
-    "Super Sampling",
-    "Depth Map Generation",
-    "Stereo Pair Creation",
-    "Fisheye Distortion",
-    "Final Processing",
-    "Video Creation",
-]
-
 # Threading configuration
 MAX_WORKERS_DEFAULT = 4
 MAX_WORKERS_GPU = 2  # Limited for GPU memory
@@ -255,9 +245,6 @@ DEPTH_MAP_SCALE_FLOAT = 255.0  # Float version for division operations
 DEPTH_MAP_STORAGE_SCALE = 65535.0  # Preserve depth precision in disk-backed uint16 PNGs
 MIN_DEPTH_VALUE = 0.0
 MAX_DEPTH_VALUE = 1.0
-
-# Progress reporting
-PROGRESS_UPDATE_INTERVAL = 10  # Update progress every N frames processed
 
 # Fisheye projection constants
 FISHEYE_PROJECTIONS = ["equidistant", "stereographic", "equisolid", "orthogonal"]

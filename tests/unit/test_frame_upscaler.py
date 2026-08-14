@@ -1,5 +1,7 @@
 """Tests for FrameUpscalerProcessor module."""
 
+import inspect
+
 import pytest
 import numpy as np
 import cv2
@@ -24,6 +26,13 @@ class TestFrameUpscalerInit:
         processor = FrameUpscalerProcessor(verbose=True)
 
         assert processor.verbose is True
+
+    def test_processing_helper_requires_prevalidated_stage_identity(self):
+        parameter = inspect.signature(FrameUpscalerProcessor._process_upscaling_frames).parameters[
+            "stage_identity"
+        ]
+
+        assert parameter.default is inspect.Parameter.empty
 
 
 class TestApplyUpscaling:
@@ -107,10 +116,13 @@ class TestApplyUpscaling:
         with patch(
             "src.depth_surge_3d.inference.create_upscaler",
             return_value=mock_upscaler,
-        ):
+        ) as create_upscaler:
             result = processor.apply_upscaling(temp_frames, settings, mock_progress_tracker)
+            resumed = processor.apply_upscaling(temp_frames, settings, mock_progress_tracker)
 
         assert result is True
+        assert resumed is True
+        create_upscaler.assert_called_once()
         mock_upscaler.load_model.assert_called_once()
         mock_upscaler.unload_model.assert_called_once()
 
@@ -184,8 +196,16 @@ class TestProcessUpscalingFrames:
             "right_cropped": right_dir,
         }
 
+    @pytest.fixture
+    def stage_identity(self, temp_frames):
+        return FrameUpscalerProcessor._build_stage_identity(
+            sorted(temp_frames["left_cropped"].glob("*.png")),
+            sorted(temp_frames["right_cropped"].glob("*.png")),
+            {"upscale_model": "x4"},
+        )
+
     def test_process_frames_with_intermediates(
-        self, mock_upscaler, mock_progress_tracker, temp_frames
+        self, mock_upscaler, mock_progress_tracker, temp_frames, stage_identity
     ):
         """Test processing with keep_intermediates=True."""
         processor = FrameUpscalerProcessor()
@@ -199,6 +219,7 @@ class TestProcessUpscalingFrames:
             temp_frames,
             settings,
             mock_progress_tracker,
+            stage_identity=stage_identity,
         )
 
         assert result is True
@@ -215,7 +236,7 @@ class TestProcessUpscalingFrames:
         assert len(list(right_upscaled.glob("*.png"))) == 3
 
     def test_process_frames_without_intermediates(
-        self, mock_upscaler, mock_progress_tracker, temp_frames
+        self, mock_upscaler, mock_progress_tracker, temp_frames, stage_identity
     ):
         """Upscaled working frames exist until successful pipeline cleanup."""
         processor = FrameUpscalerProcessor()
@@ -229,6 +250,7 @@ class TestProcessUpscalingFrames:
             temp_frames,
             settings,
             mock_progress_tracker,
+            stage_identity=stage_identity,
         )
 
         assert result is True
@@ -241,7 +263,7 @@ class TestProcessUpscalingFrames:
         assert len(list(right_upscaled.glob("*.png"))) == 3
 
     def test_process_frames_mismatched_count(
-        self, mock_upscaler, mock_progress_tracker, temp_frames
+        self, mock_upscaler, mock_progress_tracker, temp_frames, stage_identity
     ):
         """Test processing with mismatched frame counts."""
         processor = FrameUpscalerProcessor()
@@ -259,12 +281,13 @@ class TestProcessUpscalingFrames:
             temp_frames,
             settings,
             mock_progress_tracker,
+            stage_identity=stage_identity,
         )
 
         assert result is False
 
     def test_process_frames_with_existing_output_dirs(
-        self, mock_upscaler, mock_progress_tracker, temp_frames
+        self, mock_upscaler, mock_progress_tracker, temp_frames, stage_identity
     ):
         """Test processing when output directories already exist."""
         processor = FrameUpscalerProcessor()
@@ -289,6 +312,7 @@ class TestProcessUpscalingFrames:
             directories,
             settings,
             mock_progress_tracker,
+            stage_identity=stage_identity,
         )
 
         assert result is True
@@ -403,6 +427,30 @@ class TestUpscaleFramePair:
 
         # Check upscaler was called
         assert mock_upscaler.upscale_image.call_count == 2
+
+        assert (left_upscaled / "frame_0000.png").exists()
+        assert (right_upscaled / "frame_0000.png").exists()
+
+    def test_upscale_pair_allows_missing_progress_tracker(
+        self, mock_upscaler, temp_frames, tmp_path
+    ):
+        processor = FrameUpscalerProcessor()
+        left_upscaled = tmp_path / "left_upscaled"
+        right_upscaled = tmp_path / "right_upscaled"
+        left_upscaled.mkdir()
+        right_upscaled.mkdir()
+
+        processor._upscale_frame_pair(
+            mock_upscaler,
+            temp_frames["left_path"],
+            temp_frames["right_path"],
+            left_upscaled,
+            right_upscaled,
+            {"keep_intermediates": False},
+            frame_idx=0,
+            total_frames=1,
+            progress_tracker=None,
+        )
 
         assert (left_upscaled / "frame_0000.png").exists()
         assert (right_upscaled / "frame_0000.png").exists()

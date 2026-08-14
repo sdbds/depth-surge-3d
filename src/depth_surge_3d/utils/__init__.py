@@ -35,13 +35,6 @@ from .domain import (
     get_format_recommendation,
     validate_resolution_settings,
     get_available_resolutions,
-    ProgressReporter,
-    ConsoleProgressReporter,
-    ProgressTracker,
-    ProgressCallback,
-    create_progress_tracker,
-    calculate_eta,
-    format_time_duration,
 )
 
 # Imaging utilities
@@ -53,6 +46,7 @@ from .imaging import (
     apply_center_crop,
     calculate_fisheye_coordinates,
     apply_fisheye_distortion,
+    remap_fisheye,
     apply_fisheye_square_crop,
     create_vr_frame,
 )
@@ -89,13 +83,6 @@ __all__ = [
     "get_format_recommendation",
     "validate_resolution_settings",
     "get_available_resolutions",
-    "ProgressReporter",
-    "ConsoleProgressReporter",
-    "ProgressTracker",
-    "ProgressCallback",
-    "create_progress_tracker",
-    "calculate_eta",
-    "format_time_duration",
     # Imaging utilities
     "resize_image",
     "validate_image_array",
@@ -104,6 +91,7 @@ __all__ = [
     "apply_center_crop",
     "calculate_fisheye_coordinates",
     "apply_fisheye_distortion",
+    "remap_fisheye",
     "apply_fisheye_square_crop",
     "create_vr_frame",
 ]

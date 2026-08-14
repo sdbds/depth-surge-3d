@@ -185,7 +185,7 @@ class StereoRenderer:
                 settings,
                 first_band_height,
             )
-        except torch.OutOfMemoryError:
+        except torch.cuda.OutOfMemoryError:
             self._release_after_oom()
 
         retry_band_height = max(1, first_band_height // 2)
@@ -196,7 +196,7 @@ class StereoRenderer:
                 settings,
                 retry_band_height,
             )
-        except torch.OutOfMemoryError as error:
+        except torch.cuda.OutOfMemoryError as error:
             self._release_after_oom()
             raise RuntimeError(
                 "CUDA stereo rendering ran out of memory for frame "

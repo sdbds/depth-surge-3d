@@ -21,6 +21,9 @@ from typing import Any
 import cv2
 import numpy as np
 
+# Use one package namespace so module globals and caches are never duplicated.
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+
 # Set PyTorch memory allocator config BEFORE importing torch
 # This helps prevent memory fragmentation on GPU
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -31,7 +34,7 @@ import warnings  # noqa: E402
 warnings.filterwarnings("ignore", category=SyntaxWarning)  # moviepy old regex patterns
 
 # Import our constants and utilities
-from src.depth_surge_3d.core.constants import (  # noqa: E402
+from depth_surge_3d.core.constants import (  # noqa: E402
     INTERMEDIATE_DIRS,
     MODEL_PATHS,
     MODEL_PATHS_METRIC,
@@ -63,25 +66,23 @@ from src.depth_surge_3d.core.constants import (  # noqa: E402
     DEFAULT_SERVER_HOST,
     SIGNAL_SHUTDOWN_TIMEOUT,
 )
-from src.depth_surge_3d.utils.system.console import warning as console_warning  # noqa: E402
-from src.depth_surge_3d.inference.depth.video_depth_estimator_see_through import (  # noqa: E402
+from depth_surge_3d.utils.system.console import warning as console_warning  # noqa: E402
+from depth_surge_3d.inference.depth.video_depth_estimator_see_through import (  # noqa: E402
     DEFAULT_SEE_THROUGH_REPO,
 )
-from src.depth_surge_3d.core.settings import validate_settings  # noqa: E402
+from depth_surge_3d.core.settings import validate_settings  # noqa: E402
 
 from flask import Flask, render_template, request, jsonify  # noqa: E402
 from flask_socketio import SocketIO  # noqa: E402
 
 # NOTE: torch is imported later (line ~960) to avoid CUDA initialization issues
 
-# Add src to path for package imports
-sys.path.insert(0, str(Path(__file__).parent / "src"))
-
 from depth_surge_3d.rendering import create_stereo_projector  # noqa: E402
 from depth_surge_3d.processing import VideoProcessor  # noqa: E402
 from depth_surge_3d.io.resume import (  # noqa: E402
     apply_legacy_migration,
     build_resume_report,
+    resolve_resume_depth_model_version,
     resolve_resume_source_video,
 )
 from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
@@ -420,19 +421,17 @@ def get_system_info() -> dict[str, Any]:
 
 
 class ProgressCallback:
-    """Enhanced callback class to track processing progress for both serial and batch modes"""
+    """Enhanced callback class for frame and stage progress."""
 
     def __init__(
         self,
         session_id: str,
         total_frames: int,
-        processing_mode: str = "serial",
         enable_live_preview: bool = True,
         preview_update_interval: float = PREVIEW_UPDATE_INTERVAL,
     ) -> None:
         self.session_id = session_id
         self.total_frames = total_frames
-        self.processing_mode = processing_mode
         self.current_frame = 0
         self.last_update_time = 0
         self.current_phase = "extraction"  # extraction, processing, video
@@ -783,7 +782,6 @@ class ProgressCallback:
 
         current_processing["progress"] = round(progress, PROGRESS_DECIMAL_PLACES)
         current_processing["phase"] = self.current_phase
-        current_processing["processing_mode"] = self.processing_mode
         current_processing["step_name"] = step_name or self.current_step_name
         current_processing["step_progress"] = self.step_progress
         current_processing["step_total"] = self.step_total
@@ -799,7 +797,6 @@ class ProgressCallback:
             "current_frame": self.current_frame,
             "total_frames": self.total_frames,
             "phase": self.current_phase,
-            "processing_mode": self.processing_mode,
             "step_name": self.current_step_name or "",
             "step_progress": self.step_progress,
             "step_total": self.step_total,
@@ -840,7 +837,7 @@ class ProgressCallback:
         return 0
 
     def finish(self, message: str = "Processing complete"):
-        """Finish progress tracking (compatibility with ProgressTracker interface)."""
+        """Finish progress tracking and notify the active web session."""
         print(f"{message}")
         try:
             socketio.emit(
@@ -877,7 +874,13 @@ def process_video_async(  # noqa: C901
             print("CUDA not available, using CPU")
 
         # Initialize projector with depth model
-        # Get depth model version
+        if resume_context is not None:
+            settings = dict(settings)
+            settings["depth_model_version"] = resolve_resume_depth_model_version(
+                settings,
+                output_dir,
+                default="v3",
+            )
         depth_model_version = settings.get("depth_model_version", "v3")  # Default to V3
         model_size = settings.get("model_size", "vitb")  # Default to Base for 16GB GPUs
         use_metric = settings.get("use_metric_depth", True)  # Default to metric depth
@@ -969,13 +972,11 @@ def process_video_async(  # noqa: C901
         )
         expected_frames = end_frame - start_frame
 
-        processing_mode = settings.get("processing_mode", "serial")
         enable_live_preview = settings.get("enable_live_preview", True)
         preview_update_interval = settings.get("preview_update_interval", PREVIEW_UPDATE_INTERVAL)
         callback = ProgressCallback(
             session_id,
             expected_frames,
-            processing_mode,
             enable_live_preview,
             preview_update_interval,
         )
@@ -983,13 +984,7 @@ def process_video_async(  # noqa: C901
         # Give client time to join the session room before starting processing
         socketio.sleep(INITIAL_PROCESSING_DELAY)
 
-        # Use the appropriate processor based on processing mode
-        if processing_mode == "batch":
-            from depth_surge_3d.processing.batch_processor import BatchProcessor
-
-            processor = BatchProcessor(projector.depth_estimator)
-        else:
-            processor = VideoProcessor(projector.depth_estimator)
+        processor = VideoProcessor(projector.depth_estimator)
 
         # Calculate resolution settings that VideoProcessor expects
         from depth_surge_3d.utils.domain.resolution import (
@@ -1091,7 +1086,7 @@ def index():
 @app.route("/upload", methods=["POST"])
 def upload_video() -> tuple[dict[str, Any], int] | tuple[Any, int]:
     """Handle video upload - saves directly to output directory with audio extraction"""
-    from src.depth_surge_3d.utils.path_utils import sanitize_filename
+    from depth_surge_3d.utils.path_utils import sanitize_filename
 
     if "video" not in request.files:
         return jsonify({"error": "No video file provided"}), 400
@@ -1335,6 +1330,11 @@ def resume_processing():
         return jsonify({"error": str(exc)}), 409
     # Try to detect settings from existing files/directories
     settings = detect_resume_settings(output_path, settings_file=settings_file)
+    settings["depth_model_version"] = resolve_resume_depth_model_version(
+        settings,
+        output_path,
+        default="v3",
+    )
     settings["migrate_legacy"] = migrate_legacy
     if raw_storage_dtype is not None:
         settings["raw_storage_dtype"] = raw_storage_dtype
@@ -1391,7 +1391,13 @@ def detect_resume_settings(output_path, *, settings_file=None):
         saved_data = load_processing_settings(settings_file)
         saved_settings = saved_data.get("processing_settings") if saved_data else None
         if isinstance(saved_settings, dict):
-            return _validate_web_settings(saved_settings, source="legacy_disk")
+            settings = _validate_web_settings(saved_settings, source="legacy_disk")
+            settings["depth_model_version"] = resolve_resume_depth_model_version(
+                settings,
+                output_path,
+                default="v3",
+            )
+            return settings
 
     # Try to detect VR format from directory structure
     if (output_path / INTERMEDIATE_DIRS["vr_frames"]).exists():
@@ -1406,6 +1412,11 @@ def detect_resume_settings(output_path, *, settings_file=None):
                 elif height > width * ASPECT_RATIO_OU_THRESHOLD:  # Likely over-under
                     settings["vr_format"] = "over_under"
 
+    settings["depth_model_version"] = resolve_resume_depth_model_version(
+        settings,
+        output_path,
+        default="v3",
+    )
     return settings
 
 

@@ -18,22 +18,19 @@ import cv2
 import numpy as np
 
 from ...core.constants import PREVIEW_FRAME_SAMPLE_RATE
+from ...core.depth_contract import (
+    CANONICAL_DEPTH_ALGORITHM_VERSION,
+    CANONICAL_DEPTH_SCHEMA_VERSION,
+    CANONICAL_METADATA_REQUIRED_FIELDS,
+    canonical_json_hash,
+)
+from ...utils.imaging.png_header import png_header_matches, read_png_header
 from ...rendering.stereo_renderer import (
     StereoRenderer,
     StereoRenderSettings,
 )
-from .depth_storage import canonical_json_hash
+from .frame_stage_parallelism import png_headers_match
 
-
-CANONICAL_DEPTH_SCHEMA_VERSION = 1
-CANONICAL_DEPTH_ALGORITHM_VERSION = "scene-percentile-v1"
-CANONICAL_METADATA_REQUIRED_FIELDS = {
-    "source_raw_fingerprint",
-    "source_model_fingerprint",
-    "scene_manifest_fingerprint",
-    "depth_bounds_fingerprint",
-    "native_shape",
-}
 STEREO_STAGE_SCHEMA_VERSION = 1
 STEREO_STAGE_ALGORITHM_VERSION = "torch-forward-splat-v1"
 STEREO_HOST_BUDGET = 512 * 1024 * 1024
@@ -532,56 +529,6 @@ class StereoPairGenerator:
             ),
         )
 
-    def create_stereo_pairs(
-        self,
-        frames: np.ndarray,
-        depth_maps: np.ndarray,
-        frame_files: list[Path],
-        directories: dict[str, Path],
-        settings: dict[str, Any],
-        progress_tracker=None,
-    ) -> bool:
-        """Render a caller-owned in-memory batch without spawning CUDA processes."""
-
-        try:
-            if not (len(frames) == len(depth_maps) == len(frame_files)):
-                raise ValueError("Frame, canonical disparity, and name counts must match")
-            render_settings = self._render_settings(settings)
-            keep = bool(settings.get("keep_intermediates", False))
-            for index, (frame, canonical, frame_file) in enumerate(
-                zip(frames, depth_maps, frame_files)
-            ):
-                result = self.renderer.render(frame, canonical, render_settings)
-                left_path = directories.get("left_frames", Path()) / f"{frame_file.stem}.png"
-                right_path = directories.get("right_frames", Path()) / f"{frame_file.stem}.png"
-                if keep:
-                    _write_pair(
-                        _WriteItem(
-                            work=_FileWorkItem(
-                                index=index,
-                                frame_path=frame_file,
-                                depth_path=frame_file,
-                                frame_name=frame_file.stem,
-                                left_path=left_path,
-                                right_path=right_path,
-                            ),
-                            left_image=result.left_image,
-                            right_image=result.right_image,
-                        )
-                    )
-                self._report_progress(
-                    progress_tracker,
-                    processed=index + 1,
-                    total=len(frame_files),
-                    work_index=index,
-                    left_path=left_path if keep else None,
-                )
-            return True
-        except Exception as error:
-            print(f"Error creating stereo pairs: {error}")
-            traceback.print_exc()
-            return False
-
     def create_stereo_pairs_from_files(
         self,
         frame_files: list[Path],
@@ -792,10 +739,10 @@ class StereoPairGenerator:
 
     @staticmethod
     def _read_render_shape(frame_path: Path) -> tuple[int, int]:
-        frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
-        if frame is None:
-            raise OSError(f"Could not load frame: {frame_path}")
-        return int(frame.shape[0]), int(frame.shape[1])
+        header = read_png_header(frame_path)
+        if header is None:
+            raise OSError(f"Could not read PNG header: {frame_path}")
+        return header.height, header.width
 
     @staticmethod
     def _build_file_work_items(
@@ -814,13 +761,7 @@ class StereoPairGenerator:
             right_path = right_dir / f"{frame_name}.png"
             pair_is_valid = True
             for path in (left_path, right_path):
-                payload = cv2.imread(str(path), cv2.IMREAD_UNCHANGED) if path.is_file() else None
-                if (
-                    payload is None
-                    or payload.dtype != np.uint8
-                    or payload.ndim != 3
-                    or payload.shape != (*render_shape, 3)
-                ):
+                if not png_header_matches(path, shape=(*render_shape, 3), bit_depth=8):
                     pair_is_valid = False
                     break
             if pair_is_valid:
@@ -887,13 +828,14 @@ class StereoPairGenerator:
         native_shape = tuple(int(value) for value in metadata["native_shape"])
         if len(native_shape) != 2 or any(value < 1 for value in native_shape):
             raise ValueError("Canonical disparity metadata has an invalid native shape")
-        for path in depth_files:
-            payload = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-            if (
-                payload is None
-                or payload.dtype != np.uint16
-                or payload.ndim != 2
-                or payload.shape != native_shape
-            ):
-                raise ValueError(f"Canonical disparity payload does not match metadata: {path}")
+        if not png_headers_match(depth_files, shape=native_shape, bit_depth=16):
+            invalid_path = next(
+                (
+                    path
+                    for path in depth_files
+                    if not png_header_matches(path, shape=native_shape, bit_depth=16)
+                ),
+                depth_files[0],
+            )
+            raise ValueError(f"Canonical disparity payload does not match metadata: {invalid_path}")
         return metadata

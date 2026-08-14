@@ -1,6 +1,7 @@
 """Unit tests for canonical depth cache utilities."""
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -94,6 +95,18 @@ class TestComputeCacheKey:
         assert compute_cache_key(str(video1), canonical_settings()) != compute_cache_key(
             str(video2), canonical_settings()
         )
+
+    def test_cache_key_ignores_path_and_timestamp_for_identical_content(self, tmp_path):
+        first = tmp_path / "first.mp4"
+        second = tmp_path / "renamed.mp4"
+        payload = b"same video content" * 1000
+        first.write_bytes(payload)
+        second.write_bytes(payload)
+        stat = second.stat()
+        os.utime(second, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+        settings = canonical_settings()
+        assert compute_cache_key(str(first), settings) == compute_cache_key(str(second), settings)
 
     def test_cache_key_changes_with_inference_inputs(self, tmp_path):
         video_file = tmp_path / "test.mp4"

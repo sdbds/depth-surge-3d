@@ -32,6 +32,11 @@ from ...core.constants import (
     CHUNK_SIZE_SMALL,
     PREVIEW_FRAME_SAMPLE_RATE,
 )
+from ...core.depth_contract import (
+    CANONICAL_DEPTH_ALGORITHM_VERSION,
+    CANONICAL_DEPTH_SCHEMA_VERSION,
+    canonical_json_hash,
+)
 from ...utils import (
     get_cached_depth_map_files,
     save_depth_map_files_to_cache,
@@ -47,9 +52,14 @@ from .depth_storage import (
     RawDepthFingerprintError,
     RawDepthStore,
     build_current_model_fingerprint,
-    canonical_json_hash,
+    depth_preprocessing_algorithm,
     estimate_depth_disk_bytes,
     require_disk_space,
+)
+from .frame_stage_parallelism import (
+    calculate_frame_stage_workers,
+    png_headers_match,
+    run_ordered_frame_tasks,
 )
 from .scene_analyzer import (
     SCENE_ALGORITHM_VERSION,
@@ -61,9 +71,6 @@ from .scene_analyzer import (
 from .source_frame_manifest import frame_sequence_fingerprint
 
 
-LEGACY_DEPTH_ARRAY_LIMIT_BYTES = 512 * 1024 * 1024
-CANONICAL_DEPTH_SCHEMA_VERSION = 1
-CANONICAL_DEPTH_ALGORITHM_VERSION = "scene-percentile-v1"
 DEPTH_BOUNDS_SCHEMA_VERSION = 2
 DEPTH_SAMPLES_SCHEMA_VERSION = 2
 
@@ -90,48 +97,6 @@ class DepthMapProcessor:
         """
         self.depth_estimator = depth_estimator
         self.verbose = verbose
-
-    def generate_depth_maps(
-        self,
-        frame_files: list[Path],
-        settings: dict[str, Any],
-        directories: dict[str, Path],
-        progress_tracker,
-    ) -> np.ndarray | None:
-        """
-        Generate a bounded legacy in-memory depth array.
-
-        Args:
-            frame_files: List of frame file paths
-            settings: Processing settings with depth parameters
-            directories: Dictionary of processing directories
-            progress_tracker: Optional progress tracker
-
-        Returns:
-            Numpy array of depth maps, or None if failed
-
-        Side effects:
-            - GPU memory operations
-            - Source frame reads
-        """
-        if frame_files:
-            self._reject_large_legacy_depth_array(frame_files, settings)
-
-        print("Step 2/7: Generating depth maps (temporal consistency enabled)...")
-        print("  Using memory-efficient chunked processing...")
-        if progress_tracker:
-            progress_tracker.update_progress(
-                "Generating depth maps",
-                phase="depth_estimation",
-                frame_num=0,
-                step_name="Depth Map Generation",
-                step_progress=0,
-                step_total=len(frame_files),
-            )
-
-        return self._generate_depth_maps_chunked(
-            frame_files, settings, directories, progress_tracker
-        )
 
     def generate_depth_map_files(
         self,
@@ -428,7 +393,7 @@ class DepthMapProcessor:
     ) -> dict[str, Any]:
         fingerprint = build_current_model_fingerprint(self.depth_estimator, settings)
         fingerprint["source_frame_fingerprint"] = self._source_frame_fingerprint(frame_files)
-        fingerprint["preprocessing_algorithm"] = "native-depth-adapter-v2"
+        fingerprint["preprocessing_algorithm"] = depth_preprocessing_algorithm(settings)
         return fingerprint
 
     @staticmethod
@@ -513,7 +478,6 @@ class DepthMapProcessor:
                 input_size,
                 target_fps,
             )
-            self._clear_gpu_memory()
             self._report_raw_chunk_progress(
                 progress_tracker,
                 chunk_start // chunk_size + 1,
@@ -855,10 +819,8 @@ class DepthMapProcessor:
                 return None
             files = self._canonical_paths(canonical_dir, metadata["frame_names"])
             expected_shape = tuple(int(value) for value in metadata["native_shape"])
-            for path in files:
-                image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-                if image is None or image.dtype != np.uint16 or image.shape != expected_shape:
-                    return None
+            if not png_headers_match(files, shape=expected_shape, bit_depth=16):
+                return None
             return files
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return None
@@ -908,25 +870,68 @@ class DepthMapProcessor:
 
         representation = DepthRepresentation(raw_store.metadata["representation"])
         canonical_files = self._canonical_paths(canonical_dir, metadata["frame_names"])
-        for index, (raw_file, source_file, output_file, scene_id) in enumerate(
-            zip(raw_files, frame_files, canonical_files, manifest["scene_ids"])
-        ):
-            values = raw_store.load(raw_file)
-            canonical = canonicalize_depth(values, representation, bounds[int(scene_id)])
-            encoded = encode_canonical_png(canonical)
-            self._atomic_write_png(output_file, encoded)
-            restored = cv2.imread(str(output_file), cv2.IMREAD_UNCHANGED)
-            if restored is None or not np.array_equal(restored, encoded):
-                raise OSError(f"Canonical depth verification failed: {output_file}")
-            if progress_tracker and hasattr(progress_tracker, "send_preview_frame"):
-                if index % PREVIEW_FRAME_SAMPLE_RATE == 0 or index == len(raw_files) - 1:
-                    progress_tracker.send_preview_frame(output_file, "depth_map", index + 1)
+        native_shape = raw_store.metadata.get("native_shape")
+        if not isinstance(native_shape, list) or len(native_shape) != 2:
+            raise ValueError("Raw-depth metadata is missing native_shape")
+        estimated_item_bytes = int(native_shape[0]) * int(native_shape[1]) * 32
+        worker_count = calculate_frame_stage_workers(len(raw_files), estimated_item_bytes)
+
+        self._run_canonical_workers(
+            raw_store,
+            raw_files,
+            canonical_files,
+            manifest["scene_ids"],
+            representation,
+            bounds,
+            worker_count,
+            progress_tracker,
+        )
 
         self._atomic_write_json(canonical_dir / "metadata.json", metadata)
         validated = self._validated_canonical_files(canonical_dir, metadata)
         if validated is None:
             raise OSError("Canonical disparity stage failed final metadata validation")
         return validated
+
+    def _run_canonical_workers(
+        self,
+        raw_store: RawDepthStore,
+        raw_files: list[Path],
+        canonical_files: list[Path],
+        scene_ids: list[int],
+        representation: DepthRepresentation,
+        bounds: dict[int, SceneDepthBounds],
+        worker_count: int,
+        progress_tracker,
+    ) -> None:
+        """Write canonical maps concurrently while reporting ordered progress and previews."""
+
+        def write_one(item):
+            raw_file, output_file, scene_id = item
+            values = raw_store.load(raw_file)
+            canonical = canonicalize_depth(values, representation, bounds[int(scene_id)])
+            encoded = encode_canonical_png(canonical)
+            self._atomic_write_png(output_file, encoded)
+            return output_file
+
+        def report_result(index: int, output_file: Path) -> None:
+            if progress_tracker:
+                progress_tracker.update_progress(
+                    f"Canonicalizing depth map {index + 1}/{len(raw_files)}",
+                    phase="depth_estimation",
+                    frame_num=index + 1,
+                    step_name="Depth Map Generation",
+                )
+            if progress_tracker and hasattr(progress_tracker, "send_preview_frame"):
+                if index % PREVIEW_FRAME_SAMPLE_RATE == 0 or index == len(raw_files) - 1:
+                    progress_tracker.send_preview_frame(output_file, "depth_map", index + 1)
+
+        run_ordered_frame_tasks(
+            zip(raw_files, canonical_files, scene_ids),
+            write_one,
+            worker_count=worker_count,
+            on_ordered_result=report_result,
+        )
 
     @staticmethod
     def _remove_raw_payloads(raw_store: RawDepthStore) -> None:
@@ -957,31 +962,6 @@ class DepthMapProcessor:
         if not cv2.imwrite(str(temporary), values):
             raise OSError(f"Could not write canonical depth map: {path}")
         temporary.replace(path)
-
-    def _reject_large_legacy_depth_array(
-        self, frame_files: list[Path], settings: dict[str, Any]
-    ) -> None:
-        sample = cv2.imread(str(frame_files[0]))
-        if sample is None:
-            return
-        height, width = sample.shape[:2]
-        depth_resolution = settings.get("depth_resolution", "auto")
-        if depth_resolution == "auto":
-            input_size = self._auto_determine_input_size(
-                width, height, (width * height) / 1_000_000
-            )
-        else:
-            try:
-                input_size = int(depth_resolution)
-            except (TypeError, ValueError):
-                input_size = max(width, height)
-        native_height, native_width = self._estimate_native_shape(width, height, input_size)
-        required = len(frame_files) * native_height * native_width * 4
-        if required > LEGACY_DEPTH_ARRAY_LIMIT_BYTES:
-            raise MemoryError(
-                "Legacy in-memory depth output exceeds 512 MiB; use generate_depth_map_files() "
-                "for file-backed processing"
-            )
 
     @staticmethod
     def _report_file_cache_hit(depth_files: list[Path], progress_tracker, source: str) -> None:
@@ -1146,175 +1126,3 @@ class DepthMapProcessor:
             chunk_frames.append(frame)
 
         return chunk_frames if chunk_frames else None
-
-    def _process_chunk_depth(
-        self,
-        chunk_frames: list,
-        chunk_files: list[Path],
-        settings: dict[str, Any],
-        directories: dict[str, Path],
-        input_size: int,
-        progress_tracker=None,
-    ) -> np.ndarray | None:
-        """
-        Process chunk with depth estimation.
-
-        Args:
-            chunk_frames: List of frame images
-            chunk_files: List of frame file paths
-            settings: Processing settings
-            directories: Dictionary of processing directories
-            input_size: Depth map resolution
-            progress_tracker: Optional progress tracker
-
-        Returns:
-            Numpy array of depth maps
-
-        Side effects:
-            - GPU inference
-            - Progress updates
-        """
-        # Normalize target_fps
-        target_fps = settings.get("target_fps", DEFAULT_FALLBACK_FPS)
-        if target_fps is None or str(target_fps) == "None" or target_fps == "original":
-            target_fps = 30
-
-        # Estimate depth
-        chunk_frames_array = np.array(chunk_frames)
-        depth_result = self.depth_estimator.estimate_depth_batch(
-            chunk_frames_array, target_fps=target_fps, input_size=input_size, fp32=False
-        )
-        chunk_depth_maps = (
-            depth_result.values if isinstance(depth_result, DepthBatch) else depth_result
-        )
-
-        return chunk_depth_maps
-
-    def _generate_depth_maps_chunked(
-        self,
-        frame_files: list[Path],
-        settings: dict[str, Any],
-        directories: dict[str, Path],
-        progress_tracker,
-    ) -> np.ndarray | None:
-        """
-        Memory-efficient chunked depth generation.
-
-        Processes frames in small batches to avoid CUDA OOM errors.
-
-        Args:
-            frame_files: List of frame file paths
-            settings: Processing settings
-            directories: Dictionary of processing directories
-            progress_tracker: Optional progress tracker
-
-        Returns:
-            Numpy array of depth maps, or None if failed
-
-        Side effects:
-            - GPU memory operations
-            - Filesystem I/O
-        """
-        # Determine chunk parameters based on resolution
-        sample_frame = cv2.imread(str(frame_files[0]))
-        if sample_frame is None:
-            return None
-
-        frame_h, frame_w = sample_frame.shape[:2]
-        depth_resolution = settings.get("depth_resolution", "auto")
-        chunk_size, input_size = self._determine_chunk_params(frame_w, frame_h, depth_resolution)
-
-        print(f"  Processing in chunks of {chunk_size} frames (input_size={input_size})...")
-
-        # Clear GPU cache before processing
-        self._clear_gpu_memory()
-
-        # Process all chunks
-        all_depth_maps: list[Any] = []
-        num_frames = len(frame_files)
-        total_chunks = (num_frames + chunk_size - 1) // chunk_size
-
-        for chunk_start in range(0, num_frames, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, num_frames)
-            chunk_files = frame_files[chunk_start:chunk_end]
-            chunk_num = chunk_start // chunk_size + 1
-
-            # Load chunk frames
-            chunk_frames = self._load_chunk_frames(chunk_files, settings)
-            if not chunk_frames:
-                print("Error: No frames loaded in chunk")
-                return None
-
-            # Process chunk for depth
-            try:
-                chunk_depth_maps = self._process_chunk_depth(
-                    chunk_frames, chunk_files, settings, directories, input_size, progress_tracker
-                )
-                all_depth_maps.extend(chunk_depth_maps)  # type: ignore[arg-type]
-
-                # Clear references and GPU cache
-                del chunk_frames
-                del chunk_depth_maps
-                self._clear_gpu_memory()
-
-                # Update progress
-                if progress_tracker:
-                    progress_tracker.update_progress(
-                        f"Chunk {chunk_num}/{total_chunks}: Depth maps {chunk_end}/{num_frames}",
-                        phase="depth_estimation",
-                        frame_num=chunk_end,
-                        step_name="Depth Map Generation",
-                        step_progress=chunk_end,
-                        step_total=num_frames,
-                    )
-
-            except Exception as e:
-                print(f"Error processing chunk {chunk_start}-{chunk_end}: {e}")
-                return None
-
-        return np.array(all_depth_maps)
-
-    def _generate_depth_maps_batch(
-        self, frames: np.ndarray, settings: dict[str, Any], progress_tracker
-    ) -> np.ndarray | None:
-        """
-        Full batch depth generation (no chunking).
-
-        Generate depth maps for all frames with temporal consistency.
-
-        Args:
-            frames: Numpy array of frame images
-            settings: Processing settings
-            progress_tracker: Optional progress tracker
-
-        Returns:
-            Numpy array of depth maps, or None if failed
-
-        Side effects:
-            - GPU memory operations
-            - Filesystem I/O
-        """
-        try:
-            # Use Video-Depth-Anything for temporal consistency
-            target_fps = settings.get("target_fps", DEFAULT_FALLBACK_FPS)
-            if target_fps is None or str(target_fps) == "None" or target_fps == "original":
-                target_fps = 30
-
-            # Use depth resolution from settings (default: auto/1080px)
-            depth_resolution = settings.get("depth_resolution", "auto")
-            if depth_resolution == "auto":
-                input_size = 1080  # Match typical 1080p video resolution
-            else:
-                try:
-                    input_size = int(depth_resolution)
-                except (ValueError, TypeError):
-                    input_size = 1080
-
-            depth_result = self.depth_estimator.estimate_depth_batch(
-                frames, target_fps=target_fps, input_size=input_size, fp32=False
-            )
-            return depth_result.values if isinstance(depth_result, DepthBatch) else depth_result
-
-        except Exception as e:
-            print(f"Error generating depth maps: {e}")
-            return None

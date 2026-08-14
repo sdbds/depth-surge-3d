@@ -1,7 +1,4 @@
-"""Domain-specific utilities.
-
-Depth caching, resolution management, and progress tracking.
-"""
+"""Domain-specific depth caching and resolution utilities."""
 
 from .depth_cache import (
     get_cache_dir,
@@ -22,15 +19,6 @@ from .resolution import (
     validate_resolution_settings,
     get_available_resolutions,
 )
-from .progress import (
-    ProgressReporter,
-    ConsoleProgressReporter,
-    ProgressTracker,
-    ProgressCallback,
-    create_progress_tracker,
-    calculate_eta,
-    format_time_duration,
-)
 
 __all__ = [
     # Depth cache
@@ -50,12 +38,4 @@ __all__ = [
     "get_format_recommendation",
     "validate_resolution_settings",
     "get_available_resolutions",
-    # Progress
-    "ProgressReporter",
-    "ConsoleProgressReporter",
-    "ProgressTracker",
-    "ProgressCallback",
-    "create_progress_tracker",
-    "calculate_eta",
-    "format_time_duration",
 ]

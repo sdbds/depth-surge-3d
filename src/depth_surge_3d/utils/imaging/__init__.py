@@ -14,9 +14,11 @@ from .image_processing import (
     apply_center_crop,
     calculate_fisheye_coordinates,
     apply_fisheye_distortion,
+    remap_fisheye,
     apply_fisheye_square_crop,
     create_vr_frame,
 )
+from .png_header import PngHeader, png_header_matches, read_png_header
 
 __all__ = [
     # Image operations
@@ -29,6 +31,10 @@ __all__ = [
     "apply_center_crop",
     "calculate_fisheye_coordinates",
     "apply_fisheye_distortion",
+    "remap_fisheye",
     "apply_fisheye_square_crop",
     "create_vr_frame",
+    "PngHeader",
+    "png_header_matches",
+    "read_png_header",
 ]

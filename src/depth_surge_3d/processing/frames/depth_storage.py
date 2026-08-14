@@ -11,11 +11,14 @@ import zipfile
 
 import numpy as np
 
+from ...core.depth_contract import canonical_json_hash, jsonable as _jsonable
 from ...inference.depth.types import DepthRepresentation
 
 
 RAW_DEPTH_SCHEMA_VERSION = 2
 RAW_STORAGE_DTYPES = {"auto", "float16", "float32"}
+DEFAULT_DEPTH_PREPROCESSING_ALGORITHM = "native-depth-adapter-v2"
+SEE_THROUGH_PREPROCESSING_ALGORITHM = "see-through-native-768-square-v2"
 DEPTH_MODEL_SETTING_KEYS = (
     "depth_model_version",
     "model_path",
@@ -48,6 +51,7 @@ MODEL_IDENTITY_INFO_KEYS = (
     "weight_sha256",
     "precision",
     "dtype",
+    "inference_batch_size",
 )
 MODEL_PRESENTATION_INFO_KEYS = (
     "loaded",
@@ -57,33 +61,20 @@ MODEL_PRESENTATION_INFO_KEYS = (
 )
 
 
+def depth_preprocessing_algorithm(settings: dict[str, Any]) -> str:
+    """Return the cache identity for the selected backend's input geometry."""
+
+    if settings.get("depth_model_version") == "see_through":
+        return SEE_THROUGH_PREPROCESSING_ALGORITHM
+    return DEFAULT_DEPTH_PREPROCESSING_ALGORITHM
+
+
 class RawDepthFingerprintError(ValueError):
     """Raised when persisted raw depth belongs to another inference contract."""
 
 
 class RawDepthOverflowError(ValueError):
     """Raised when explicit float16 storage cannot represent a finite value."""
-
-
-def _jsonable(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    return repr(value)
-
-
-def canonical_json_hash(payload: Any) -> str:
-    """Hash JSON-compatible metadata independently of dictionary insertion order."""
-
-    encoded = json.dumps(
-        _jsonable(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode("ascii")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _hash_file(path: Path) -> str:

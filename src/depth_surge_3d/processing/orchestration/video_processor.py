@@ -49,7 +49,6 @@ class VideoProcessor:
         """
         self.depth_estimator = depth_estimator
         self.verbose = verbose
-        self._settings_file = None  # Backward compatibility for tests
 
         # Initialize specialized processor modules
         self.depth_processor = DepthMapProcessor(depth_estimator, verbose=verbose)
@@ -103,52 +102,3 @@ class VideoProcessor:
             settings,
             progress_tracker=progress_callback,
         )
-
-    # Backward compatibility methods for existing tests - delegate to specialized modules
-    def _get_total_steps(self, settings):
-        """Delegate to ProcessingOrchestrator."""
-        return ProcessingOrchestrator._get_total_steps(settings)
-
-    def _update_step_progress(self, progress_tracker, message, step_name, progress, total):
-        """Delegate to orchestrator."""
-        return self.orchestrator._update_step_progress(
-            progress_tracker, message, step_name, progress, total
-        )
-
-    def _handle_step_error(self, error_msg):
-        """Delegate to orchestrator."""
-        return self.orchestrator._handle_step_error(error_msg)
-
-    def _setup_processing(self, video_path, output_dir, settings, video_properties):
-        """Delegate to orchestrator."""
-        return self.orchestrator._setup_processing(
-            video_path, output_dir, settings, video_properties
-        )
-
-    def _finalize_processing(self, success, output_path, video_path, settings, num_frames):
-        """Delegate to orchestrator."""
-        return self.orchestrator._finalize_processing(
-            success, output_path, video_path, settings, num_frames
-        )
-
-    def _crop_frames(self, directories, settings, progress_tracker, total_frames):
-        """Delegate to distortion processor."""
-        return self.distortion_processor.crop_frames(
-            directories, settings, progress_tracker, total_frames
-        )
-
-    def _apply_upscaling(self, left_dir, right_dir, directories, settings, progress_tracker):
-        """Delegate to upscaler."""
-        return self.upscaler.apply_upscaling(directories, settings, progress_tracker)
-
-    def _process_upscaling_frames(
-        self, upscaler, left_dir, right_dir, directories, settings, progress_tracker
-    ):
-        """Delegate to upscaler."""
-        return self.upscaler._process_upscaling_frames(
-            upscaler, left_dir, right_dir, directories, settings, progress_tracker
-        )
-
-    def _upscale_frame_pair(self, *args):
-        """Delegate to upscaler."""
-        return self.upscaler._upscale_frame_pair(*args)

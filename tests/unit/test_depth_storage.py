@@ -78,6 +78,26 @@ def test_model_fingerprint_uses_loaded_remote_artifact_identity() -> None:
     assert first != second
 
 
+def test_model_fingerprint_tracks_inference_batch_size() -> None:
+    class BatchedEstimator:
+        def __init__(self, batch_size: int) -> None:
+            self.batch_size = batch_size
+
+        def get_model_info(self) -> dict:
+            return {
+                "model_name": "owner/model",
+                "revision": "immutable-revision",
+                "inference_batch_size": self.batch_size,
+            }
+
+    single = build_model_fingerprint(BatchedEstimator(1), {})
+    batched = build_model_fingerprint(BatchedEstimator(4), {})
+
+    assert single["model_info"]["inference_batch_size"] == 1
+    assert batched["model_info"]["inference_batch_size"] == 4
+    assert single != batched
+
+
 def test_model_fingerprint_ignores_loaded_runtime_state() -> None:
     class StatefulEstimator:
         def __init__(self) -> None:

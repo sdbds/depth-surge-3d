@@ -28,6 +28,7 @@ def test_final_defaults_cover_depth_dibr_and_migration_controls() -> None:
         "baseline",
         "focal_length",
         "hole_fill_quality",
+        "processing_mode",
     }
     assert REMOVED_SETTING_NAMES.isdisjoint(settings)
 

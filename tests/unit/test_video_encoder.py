@@ -1,12 +1,12 @@
 """Unit tests for final video encoding."""
 
-import hashlib
 import json
 from unittest.mock import MagicMock, patch
 
 import cv2
 import numpy as np
 
+from src.depth_surge_3d.core.file_identity import file_sample_fingerprint
 from src.depth_surge_3d.processing.video.video_encoder import VideoEncoder
 from src.depth_surge_3d.processing.frames.source_frame_manifest import (
     write_source_frame_manifest,
@@ -38,9 +38,43 @@ def test_extract_frames_writes_content_bound_stage_manifest(tmp_path):
 
     metadata = json.loads((frames_dir / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["frame_names"] == [path.name for path in frame_files]
-    assert metadata["source_video_sha256"] == hashlib.sha256(source_video.read_bytes()).hexdigest()
+    assert metadata["source_video_fingerprint"] == file_sample_fingerprint(source_video)
     assert metadata["source_frame_fingerprint"]
     assert metadata["fingerprint"]
+
+
+def test_extract_frames_cuda_command_allows_ffmpeg_to_negotiate_10_bit_frames(tmp_path):
+    """CUDA decoding must not force 10-bit hardware frames through 8-bit NV12."""
+    source_video = tmp_path / "source.mkv"
+    source_video.write_bytes(b"10-bit-av1")
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    commands = []
+
+    def extract(command, **_kwargs):
+        commands.append(command)
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        assert cv2.imwrite(str(frames_dir / "frame_000001.png"), frame)
+        return MagicMock(returncode=0)
+
+    with patch(
+        "src.depth_surge_3d.processing.video.video_encoder.subprocess.run",
+        side_effect=extract,
+    ):
+        frame_files = VideoEncoder().extract_frames(
+            str(source_video),
+            {"base": tmp_path, "frames": frames_dir},
+            {"frame_count": 1, "fps": 30.0},
+            {"start_time": None, "end_time": None},
+        )
+
+    assert len(frame_files) == 1
+    assert len(commands) == 1
+    cuda_command = commands[0]
+    assert cuda_command[cuda_command.index("-hwaccel") + 1] == "cuda"
+    assert "-hwaccel_output_format" not in cuda_command
+    assert not any("hwdownload" in argument for argument in cuda_command)
+    assert "nv12" not in cuda_command
 
 
 def test_create_video_preserves_fractional_source_fps_when_target_is_original(tmp_path):
@@ -90,6 +124,52 @@ def test_create_video_preserves_fractional_source_fps_when_target_is_original(tm
     command = run.call_args.args[0]
     frame_rate_index = command.index("-framerate") + 1
     assert command[frame_rate_index] == "24000/1001"
+
+
+def test_create_video_trims_preextracted_audio_to_selected_clip(tmp_path):
+    """A clipped frame sequence must not be muxed with audio from source time zero."""
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    audio_file = tmp_path / "original_audio.flac"
+    audio_file.write_bytes(b"full-source-audio")
+    settings = {
+        "target_fps": 24,
+        "vr_format": "side_by_side",
+        "vr_resolution": "16x9-1080p",
+        "preserve_audio": True,
+        "video_encoder": "libx265",
+        "start_time": "3:16",
+        "end_time": "3:20",
+    }
+
+    with (
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+            return_value=True,
+        ),
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.subprocess.run",
+            return_value=MagicMock(returncode=0),
+        ) as run,
+    ):
+        result = VideoEncoder().create_video(
+            frames_dir,
+            tmp_path,
+            str(tmp_path / "source.mkv"),
+            settings,
+        )
+
+    assert result is True
+    command = run.call_args.args[0]
+    audio_path_index = command.index(str(audio_file))
+    assert command[audio_path_index - 5 : audio_path_index + 1] == [
+        "-ss",
+        "196",
+        "-t",
+        "4",
+        "-i",
+        str(audio_file),
+    ]
 
 
 def test_extract_frames_reuses_complete_existing_sequence(tmp_path):

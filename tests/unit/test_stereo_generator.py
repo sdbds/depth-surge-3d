@@ -413,31 +413,6 @@ def test_write_failure_cleans_pair_and_releases_permit(tmp_path: Path) -> None:
     assert not any(thread.name.startswith("stereo-") for thread in threading.enumerate())
 
 
-def test_in_memory_path_uses_shared_renderer_without_process_pool(tmp_path: Path) -> None:
-    renderer = _FakeRenderer()
-    generator = StereoPairGenerator(renderer=renderer)
-    left_dir = tmp_path / "left"
-    right_dir = tmp_path / "right"
-    left_dir.mkdir()
-    right_dir.mkdir()
-    frames = np.full((2, 4, 5, 3), 10, dtype=np.uint8)
-    canonical = np.full((2, 2, 3), 0.5, dtype=np.float32)
-    frame_files = [tmp_path / f"frame_{index:04d}.png" for index in range(2)]
-
-    result = generator.create_stereo_pairs(
-        frames,
-        canonical,
-        frame_files,
-        {"left_frames": left_dir, "right_frames": right_dir},
-        _settings(keep_intermediates=True),
-    )
-
-    assert result is True
-    assert len(renderer.calls) == 2
-    assert len(list(left_dir.glob("*.png"))) == 2
-    assert not hasattr(stereo_generator, "mp")
-
-
 def test_file_pipeline_rejects_missing_canonical_metadata(tmp_path: Path) -> None:
     frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=1)
     (depth_files[0].parent / "metadata.json").unlink()
@@ -450,6 +425,10 @@ def test_file_pipeline_rejects_missing_canonical_metadata(tmp_path: Path) -> Non
     )
 
     assert result is False
+
+
+def test_in_memory_array_api_is_removed() -> None:
+    assert "create_stereo_pairs" not in vars(StereoPairGenerator)
 
 
 def test_canonical_metadata_requires_source_fingerprints(tmp_path: Path) -> None:

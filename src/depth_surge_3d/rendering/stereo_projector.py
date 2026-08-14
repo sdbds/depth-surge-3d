@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-import subprocess
 import traceback
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -87,31 +86,7 @@ class StereoProjector:
         self,
         video_path: str,
         output_dir: str,
-        vr_format: str | None = None,
-        stereo_strength: float | None = None,
-        convergence: float | None = None,
-        occlusion_fill: str | None = None,
-        scene_detection: bool | None = None,
-        scene_cut_threshold: float | None = None,
-        min_scene_frames: int | None = None,
-        raw_storage_dtype: str | None = None,
-        stereo_io_workers: int | None = None,
-        migrate_legacy: str | None = None,
-        keep_intermediates: bool | None = None,
-        start_time: str | None = None,
-        end_time: str | None = None,
-        preserve_audio: bool | None = None,
-        target_fps: int | None = None,
-        min_resolution: str | None = None,
-        super_sample: str | None = None,
-        apply_distortion: bool | None = None,
-        fisheye_projection: str | None = None,
-        fisheye_fov: float | None = None,
-        crop_factor: float | None = None,
-        vr_resolution: str | None = None,
-        fisheye_crop_factor: float | None = None,
-        processing_mode: str | None = None,
-        experimental_frame_interpolation: bool | None = None,
+        settings: dict[str, Any],
     ) -> bool:
         """
         Process video to create 3D VR version.
@@ -119,18 +94,21 @@ class StereoProjector:
         Args:
             video_path: Path to input video
             output_dir: Output directory path
-            **kwargs: Processing parameters (defaults from DEFAULT_SETTINGS)
+            settings: User-facing processing settings
 
         Returns:
             True if processing completed successfully
         """
-        # Apply defaults for None values
-        settings = self._apply_default_settings(locals())
-        settings.update(self._get_depth_settings())
-
         try:
+            requested_settings = validate_settings(dict(settings), source="explicit")
+            requested_settings["video_path"] = video_path
+            depth_settings = self._get_depth_settings()
+            if "depth_resolution" in requested_settings:
+                depth_settings["depth_resolution"] = requested_settings["depth_resolution"]
+            requested_settings.update(depth_settings)
+
             # Validate inputs
-            if not self._validate_inputs(video_path, output_dir, settings):
+            if not self._validate_inputs(video_path, output_dir, requested_settings):
                 return False
 
             # Ensure model is loaded
@@ -144,7 +122,7 @@ class StereoProjector:
                 return False
 
             # Validate and resolve settings
-            resolved_settings = self._resolve_settings(settings, video_props)
+            resolved_settings = self._resolve_settings(requested_settings, video_props)
 
             # Create video processor (always uses temporal consistency)
             processor = VideoProcessor(
@@ -422,273 +400,6 @@ class StereoProjector:
         )
 
         return resolved
-
-    def extract_frames(
-        self,
-        video_path: str,
-        output_dir: str,
-        start_time: str | None = None,
-        end_time: str | None = None,
-        target_fps: str | None = None,
-        extraction_mode: str = "original",
-    ) -> list[Path]:
-        """
-        Extract frames from video for processing.
-
-        Args:
-            video_path: Path to input video
-            output_dir: Output directory path
-            start_time: Start time (e.g., "00:30")
-            end_time: End time (e.g., "01:30")
-            target_fps: Target FPS (currently unused, extraction uses original fps)
-            extraction_mode: Extraction mode (currently unused)
-
-        Returns:
-            List of extracted frame file paths
-        """
-        from ..io.operations import get_video_properties
-
-        # Get video properties
-        video_props = get_video_properties(video_path)
-        if not video_props:
-            raise ValueError(f"Could not read video properties from {video_path}")
-
-        # Create frames directory
-        output_path = Path(output_dir)
-        frames_dir = output_path / "00_original_frames"
-        frames_dir.mkdir(parents=True, exist_ok=True)
-
-        # Build FFmpeg command for frame extraction with CUDA acceleration
-        # Try CUDA first, fall back to CPU if unavailable
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-hwaccel",
-            "cuda",
-            "-hwaccel_output_format",
-            "cuda",
-            "-i",
-            video_path,
-        ]
-
-        # Add time range if specified
-        if start_time:
-            cmd.extend(["-ss", start_time])
-        if end_time:
-            cmd.extend(["-to", end_time])
-
-        # Extract frames as PNG
-        output_pattern = str(frames_dir / "frame_%06d.png")
-        cmd.extend(["-vsync", "0", output_pattern])
-
-        # Run FFmpeg with CUDA, fall back to CPU if it fails
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                # CUDA failed, try CPU fallback
-                print("  CUDA frame extraction failed, falling back to CPU")
-                cmd_cpu = [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    video_path,
-                ]
-                if start_time:
-                    cmd_cpu.extend(["-ss", start_time])
-                if end_time:
-                    cmd_cpu.extend(["-to", end_time])
-                cmd_cpu.extend(["-vsync", "0", output_pattern])
-                subprocess.run(cmd_cpu, capture_output=True, text=True, check=True)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"FFmpeg frame extraction failed: {e.stderr}")
-
-        # Get list of extracted frames
-        frame_files = sorted(frames_dir.glob("frame_*.png"))
-        return frame_files
-
-    def determine_super_sample_resolution(
-        self, original_width: int, original_height: int, super_sample: str = "auto"
-    ) -> tuple[int, int]:
-        """
-        Determine super sampling resolution for better quality.
-
-        Args:
-            original_width: Original video width
-            original_height: Original video height
-            super_sample: Super sampling mode ('auto', 'none', '1080p', '4k')
-
-        Returns:
-            Tuple of (width, height) for super sampling
-        """
-        if super_sample == "none":
-            return original_width, original_height
-        elif super_sample == "1080p":
-            return 1920, 1080
-        elif super_sample == "4k":
-            return 3840, 2160
-        elif super_sample == "auto":
-            # Auto: 720p->1080p, 1080p->4K, others keep original
-            if original_height <= 720:
-                return 1920, 1080
-            elif original_height <= 1080:
-                return 3840, 2160
-            else:
-                return original_width, original_height
-        else:
-            return original_width, original_height
-
-    def determine_vr_output_resolution(
-        self,
-        original_width: int,
-        original_height: int,
-        vr_resolution: str = "auto",
-        vr_format: str = "side_by_side",
-    ) -> tuple[int, int]:
-        """
-        Determine VR output resolution.
-
-        Args:
-            original_width: Original video width
-            original_height: Original video height
-            vr_resolution: VR resolution setting
-            vr_format: VR format ('side_by_side', 'over_under')
-
-        Returns:
-            Tuple of (width, height) for VR output
-        """
-        from ..utils import (
-            get_resolution_dimensions,
-            calculate_vr_output_dimensions,
-        )
-
-        if vr_resolution == "auto":
-            # Use original resolution as per-eye resolution
-            per_eye_width, per_eye_height = original_width, original_height
-        else:
-            # Get dimensions from resolution string
-            per_eye_width, per_eye_height = get_resolution_dimensions(vr_resolution)
-
-        # Calculate final VR dimensions based on format
-        return calculate_vr_output_dimensions(per_eye_width, per_eye_height, vr_format)
-
-    def _check_nvenc_available(self) -> bool:
-        """Check if NVENC hardware encoding is available."""
-        try:
-            test_result = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True
-            )
-            return "hevc_nvenc" in test_result.stdout
-        except Exception:
-            return False
-
-    def _add_video_encoder_options(self, cmd: list) -> None:
-        """Add appropriate video encoder options to FFmpeg command.
-
-        Args:
-            cmd: FFmpeg command list to append encoder options to
-        """
-        if self._check_nvenc_available():
-            print("  Using NVENC hardware encoding (H.265)")
-            cmd.extend(
-                [
-                    "-c:v",
-                    "hevc_nvenc",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-preset",
-                    "p7",
-                    "-tune",
-                    "hq",
-                ]
-            )
-        else:
-            print("  Using software encoding (H.264)")
-            cmd.extend(
-                [
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-crf",
-                    "18",
-                    "-preset",
-                    "medium",
-                ]
-            )
-
-    def create_output_video(
-        self,
-        vr_frames_dir: str,
-        output_path: str,
-        original_video_path: str,
-        vr_format: str = "side_by_side",
-        start_time: str | None = None,
-        end_time: str | None = None,
-        preserve_audio: bool = True,
-        target_fps: str | None = None,
-    ) -> bool:
-        """
-        Create final output video from VR frames.
-
-        Args:
-            vr_frames_dir: Directory containing VR frames
-            output_path: Output video file path
-            original_video_path: Path to original video (for audio extraction)
-            vr_format: VR format ('side_by_side', 'over_under')
-            start_time: Start time for audio sync
-            end_time: End time for audio sync
-            preserve_audio: Whether to include audio
-            target_fps: Target FPS for output video
-
-        Returns:
-            True if successful, False otherwise
-        """
-        vr_frames_path = Path(vr_frames_dir)
-
-        # Get list of VR frames
-        vr_frame_files = sorted(vr_frames_path.glob("*.png"))
-        if not vr_frame_files:
-            raise ValueError(f"No VR frames found in {vr_frames_dir}")
-
-        # Determine frame rate
-        if target_fps and target_fps != "original" and str(target_fps) != "None":
-            fps_value = str(target_fps)
-        else:
-            fps_value = "30"  # Default fallback
-
-        # Build base FFmpeg command with input
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-framerate",
-            fps_value,
-            "-i",
-            str(vr_frames_path / "frame_%06d.png"),
-        ]
-
-        # Add audio if requested
-        if preserve_audio:
-            cmd.extend(["-i", original_video_path])
-            if start_time:
-                cmd.extend(["-ss", start_time])
-            if end_time:
-                cmd.extend(["-to", end_time])
-            cmd.extend(["-c:a", "aac", "-shortest"])
-
-        # Add video codec options
-        self._add_video_encoder_options(cmd)
-
-        # Add output path
-        cmd.append(output_path)
-
-        # Run FFmpeg
-        try:
-            print(f"Running FFmpeg command: {' '.join(cmd)}")
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"FFmpeg video creation failed: {e.stderr}")
-            return False
 
     def get_model_info(self) -> dict[str, Any]:
         """Get information about the loaded model."""

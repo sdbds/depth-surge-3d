@@ -16,6 +16,7 @@ REMOVED_SETTING_NAMES = {
     "baseline",
     "focal_length",
     "hole_fill_quality",
+    "processing_mode",
 }
 
 _OPTIONAL_SETTING_NAMES = {
@@ -29,7 +30,6 @@ _OPTIONAL_SETTING_NAMES = {
     "device",
     "denoising_steps",
     "seed",
-    "processing_mode",
     "video_encoder",
     "video_path",
     "per_eye_width",
@@ -184,8 +184,6 @@ def _validate_depth_resolution(value: object) -> int | str:
 def _validate_optional_mode(name: str, value: object) -> str | None:
     if isinstance(value, str):
         return value
-    if value is None and name == "processing_mode":
-        return None
     raise ValueError(f"{name} must be a string")
 
 
@@ -202,7 +200,7 @@ def _validate_optional_setting(name: str, value: object) -> Any:
         return _choice(name, value, {"v2", "v3", "see_through"})
     if name == "depth_resolution":
         return _validate_depth_resolution(value)
-    if name in {"device", "processing_mode"}:
+    if name == "device":
         return _validate_optional_mode(name, value)
     if name == "video_encoder":
         return _choice(name, value, {"auto", "libx264", "nvenc"})
