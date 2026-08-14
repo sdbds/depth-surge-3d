@@ -1,4 +1,4 @@
-"""Depth-aware horizontal bilinear forward splatting with explicit coverage."""
+"""Deterministic horizontal subpixel visibility for one stereo row band."""
 
 from __future__ import annotations
 
@@ -7,223 +7,148 @@ from dataclasses import dataclass
 import torch
 
 
+HORIZONTAL_SUBPIXELS = 16
+_UINT32_MASK = 0xFFFFFFFF
+_SOURCE_INDEX_LIMIT = 2**32
+
+
 @dataclass(frozen=True)
-class SplatBandResult:
-    """One rendered row band and the geometry needed by background filling."""
+class SubpixelSplatResult:
+    """Fine-grid colour, depth, and pre-fill validity for one row band."""
 
-    image: torch.Tensor
-    valid_mask: torch.Tensor
-    projected_disparity: torch.Tensor
-    accumulated_weight: torch.Tensor
-
-
-def _as_batched(
-    image: torch.Tensor, disparity: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, bool]:
-    unbatched = image.ndim == 3
-    if unbatched:
-        image = image.unsqueeze(0)
-        disparity = disparity.unsqueeze(0)
-    if image.ndim != 4 or image.shape[-1] != 3:
-        raise ValueError("Image must have shape [H,W,3] or [N,H,W,3]")
-    if disparity.ndim != 3 or disparity.shape != image.shape[:-1]:
-        raise ValueError("Disparity must match image shape [N,H,W]")
-    if image.device != disparity.device:
-        raise ValueError("Image and disparity must use the same device")
-    return image.to(dtype=torch.float32), disparity.to(dtype=torch.float32), unbatched
+    colour: torch.Tensor
+    disparity: torch.Tensor
+    valid: torch.Tensor
 
 
-def _scatter_amax(
-    indexes: torch.Tensor,
-    values: torch.Tensor,
-    include: torch.Tensor,
-    target_count: int,
+def _validate_inputs(
+    image: torch.Tensor,
+    canonical: torch.Tensor,
+    sample_offsets: torch.Tensor,
+    source_index_offset: int,
 ) -> torch.Tensor:
-    """Take a finite max; unlike floating-point addition, order cannot change it."""
+    if image.ndim != 3 or canonical.ndim != 2 or sample_offsets.ndim != 2:
+        raise ValueError("Splat inputs must be unbatched [H,W,3], [H,W], and [H,W]")
+    if image.shape[-1] != 3:
+        raise ValueError("Image must have exactly three channels")
+    if canonical.shape != image.shape[:2] or sample_offsets.shape != canonical.shape:
+        raise ValueError("Canonical disparity and sample offsets must match the image")
+    if image.device != canonical.device or image.device != sample_offsets.device:
+        raise ValueError("Image, canonical disparity, and offsets must use the same device")
+    if canonical.dtype != torch.float32:
+        raise ValueError("Canonical disparity must use float32")
+    if sample_offsets.dtype != torch.int32:
+        raise ValueError("Sample offsets must use int32")
+    if image.is_floating_point() and not torch.isfinite(image).all():
+        raise ValueError("Image values must be finite")
+    if not torch.isfinite(canonical).all() or (canonical < 0.0).any() or (canonical > 1.0).any():
+        raise ValueError("Canonical disparity must be finite and lie within [0, 1]")
+    pixel_count = canonical.numel()
+    if source_index_offset < 0 or source_index_offset + pixel_count > _SOURCE_INDEX_LIMIT:
+        raise ValueError("Full-frame source indexes must fit in 32 bits")
+    return image.to(dtype=torch.float32)
 
-    output = torch.full(
-        (target_count,),
-        -torch.inf,
-        dtype=torch.float32,
-        device=values.device,
+
+def _pack_depth_source_key(
+    canonical: torch.Tensor,
+    source_index: torch.Tensor,
+) -> torch.Tensor:
+    """Pack nonnegative float32 depth and lowest-source tie order into int64."""
+
+    positive_zero = torch.zeros((), dtype=torch.float32, device=canonical.device)
+    normalized = torch.where(canonical == 0.0, positive_zero, canonical)
+    depth_bits = normalized.contiguous().view(torch.int32).to(torch.int64)
+    depth_bits.bitwise_and_(_UINT32_MASK)
+    indexes = source_index.to(dtype=torch.int64)
+    return (depth_bits << 32) | (_UINT32_MASK - indexes)
+
+
+def _decode_source_index(packed_key: torch.Tensor) -> torch.Tensor:
+    """Recover the full-frame source index from a valid packed winner key."""
+
+    return _UINT32_MASK - (packed_key & _UINT32_MASK)
+
+
+def _expanded_targets(sample_offsets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    height, width = sample_offsets.shape
+    device = sample_offsets.device
+    fine_width = width * HORIZONTAL_SUBPIXELS
+    source_columns = torch.arange(width, dtype=torch.int64, device=device).view(1, width)
+    first_columns = source_columns * HORIZONTAL_SUBPIXELS + sample_offsets.to(torch.int64)
+    lanes = torch.arange(HORIZONTAL_SUBPIXELS, dtype=torch.int64, device=device)
+    target_columns = first_columns.unsqueeze(-1) + lanes
+    in_bounds = (target_columns >= 0) & (target_columns < fine_width)
+    row_offsets = (
+        torch.arange(height, dtype=torch.int64, device=device).view(height, 1, 1) * fine_width
     )
-    candidates = values.masked_fill(~include, -torch.inf)
-    output.scatter_reduce_(
+    safe_columns = target_columns.clamp(0, fine_width - 1)
+    return row_offsets + safe_columns, in_bounds
+
+
+def _winner_keys(
+    canonical: torch.Tensor,
+    sample_offsets: torch.Tensor,
+    source_index_offset: int,
+) -> torch.Tensor:
+    pixel_count = canonical.numel()
+    target_count = pixel_count * HORIZONTAL_SUBPIXELS
+    source_indexes = torch.arange(
+        source_index_offset,
+        source_index_offset + pixel_count,
+        dtype=torch.int64,
+        device=canonical.device,
+    ).reshape(canonical.shape)
+    source_keys = _pack_depth_source_key(canonical, source_indexes)
+    target_indexes, in_bounds = _expanded_targets(sample_offsets)
+    candidate_keys = source_keys.unsqueeze(-1).expand_as(target_indexes)
+    candidate_keys = candidate_keys.masked_fill(~in_bounds, -1)
+    winners = torch.full(
+        (target_count,),
+        -1,
+        dtype=torch.int64,
+        device=canonical.device,
+    )
+    winners.scatter_reduce_(
         0,
-        indexes,
-        candidates,
+        target_indexes.reshape(-1),
+        candidate_keys.reshape(-1),
         reduce="amax",
         include_self=True,
     )
-    return output
+    return winners
 
 
-def _write_segment_sum(
-    output: torch.Tensor,
-    sorted_values: torch.Tensor,
-    unique_indexes: torch.Tensor,
-    counts: torch.Tensor,
-    valid_segments: torch.Tensor,
-) -> None:
-    """Write a fixed-order scalar segment sum into a preallocated target."""
-
-    reduced = torch.segment_reduce(sorted_values, "sum", lengths=counts)
-    output[unique_indexes[valid_segments]] = reduced[valid_segments]
+def _gather_winners(
+    source: torch.Tensor,
+    canonical: torch.Tensor,
+    winners: torch.Tensor,
+    source_index_offset: int,
+) -> SubpixelSplatResult:
+    height, width = canonical.shape
+    fine_width = width * HORIZONTAL_SUBPIXELS
+    valid = winners >= 0
+    local_indexes = _decode_source_index(winners) - source_index_offset
+    local_indexes.clamp_(0, canonical.numel() - 1)
+    colour = source.reshape(-1, 3)[local_indexes]
+    disparity = canonical.reshape(-1)[local_indexes]
+    colour = torch.where(valid.unsqueeze(1), colour, 0.0)
+    disparity = torch.where(valid, disparity, -torch.inf)
+    return SubpixelSplatResult(
+        colour=colour.reshape(height, fine_width, 3),
+        disparity=disparity.reshape(height, fine_width),
+        valid=valid.reshape(height, fine_width),
+    )
 
 
 def forward_splat_band(
     image: torch.Tensor,
-    disparity: torch.Tensor,
-    eye_sign: int,
-) -> SplatBandResult:
-    """Project complete rows horizontally using total disparity as a shared z-key."""
+    canonical: torch.Tensor,
+    sample_offsets: torch.Tensor,
+    *,
+    source_index_offset: int = 0,
+) -> SubpixelSplatResult:
+    """Resolve 16 horizontal samples per source pixel with one integer max."""
 
-    if eye_sign not in {-1, 1}:
-        raise ValueError("eye_sign must be +1 for left or -1 for right")
-    source, total_disparity, unbatched = _as_batched(image, disparity)
-    if not torch.isfinite(source).all() or not torch.isfinite(total_disparity).all():
-        raise ValueError("Image and disparity tensors must be finite")
-
-    batch_size, height, width, _channels = source.shape
-    device = source.device
-    source_x = torch.arange(width, dtype=torch.float32, device=device).view(1, 1, width)
-    target_x = source_x + total_disparity * (float(eye_sign) * 0.5)
-    floor_x = torch.floor(target_x).to(dtype=torch.int64)
-    fraction = target_x - floor_x.to(dtype=torch.float32)
-
-    target_columns = torch.stack((floor_x, floor_x + 1), dim=-1)
-    weights = torch.stack((1.0 - fraction, fraction), dim=-1)
-    batch_offsets = (
-        torch.arange(batch_size, dtype=torch.int64, device=device).view(batch_size, 1, 1)
-        * height
-        * width
-    )
-    row_offsets = torch.arange(height, dtype=torch.int64, device=device).view(1, height, 1) * width
-    linear_indexes = batch_offsets.unsqueeze(-1) + row_offsets.unsqueeze(-1) + target_columns
-    in_bounds = (target_columns >= 0) & (target_columns < width)
-    contributes = in_bounds & (weights > 0.0)
-    safe_indexes = linear_indexes.clamp(0, batch_size * height * width - 1).reshape(-1)
-
-    flat_weights = weights.expand(batch_size, height, width, 2).reshape(-1)
-    flat_disparity = total_disparity.unsqueeze(-1).expand(-1, -1, -1, 2).reshape(-1)
-    flat_contributes = contributes.expand(batch_size, height, width, 2).reshape(-1)
-    target_count = batch_size * height * width
-
-    all_z = _scatter_amax(
-        safe_indexes,
-        flat_disparity,
-        flat_contributes,
-        target_count,
-    )
-    primary_voters = flat_contributes & (flat_weights >= 0.5)
-    primary_z = _scatter_amax(
-        safe_indexes,
-        flat_disparity,
-        primary_voters,
-        target_count,
-    )
-    winning_z = torch.where(torch.isfinite(primary_z), primary_z, all_z)
-    visible = flat_contributes & (flat_disparity >= winning_z[safe_indexes] - 0.25)
-    visible_weights = torch.where(visible, flat_weights, 0.0)
-    del (
-        source_x,
-        target_x,
-        floor_x,
-        fraction,
-        target_columns,
-        weights,
-        batch_offsets,
-        row_offsets,
-        linear_indexes,
-        in_bounds,
-        contributes,
-        flat_weights,
-        flat_contributes,
-        all_z,
-        primary_voters,
-        primary_z,
-        winning_z,
-    )
-
-    # Reuse one stable segment layout and reduce scalar channels separately.
-    # This keeps deterministic sums inside the renderer's row-band budget.
-    safe_indexes.masked_fill_(~visible, target_count)
-    del visible
-    order = torch.argsort(safe_indexes, stable=True)
-    sorted_indexes = safe_indexes[order]
-    unique_indexes, counts = torch.unique_consecutive(
-        sorted_indexes,
-        return_counts=True,
-    )
-    valid_segments = unique_indexes < target_count
-    del sorted_indexes, safe_indexes
-
-    sorted_weights = visible_weights[order]
-    del visible_weights
-    accumulated_weight = torch.zeros(target_count, dtype=torch.float32, device=device)
-    _write_segment_sum(
-        accumulated_weight,
-        sorted_weights,
-        unique_indexes,
-        counts,
-        valid_segments,
-    )
-
-    sorted_values = flat_disparity[order]
-    sorted_values.mul_(sorted_weights)
-    accumulated_disparity = torch.zeros(
-        target_count,
-        dtype=torch.float32,
-        device=device,
-    )
-    _write_segment_sum(
-        accumulated_disparity,
-        sorted_values,
-        unique_indexes,
-        counts,
-        valid_segments,
-    )
-    del flat_disparity, sorted_values, total_disparity
-
-    accumulated_color = torch.zeros(
-        (target_count, 3),
-        dtype=torch.float32,
-        device=device,
-    )
-    for channel in range(3):
-        contribution_channel = source[..., channel].unsqueeze(-1).expand(-1, -1, -1, 2).reshape(-1)
-        sorted_values = contribution_channel[order]
-        sorted_values.mul_(sorted_weights)
-        _write_segment_sum(
-            accumulated_color[:, channel],
-            sorted_values,
-            unique_indexes,
-            counts,
-            valid_segments,
-        )
-        del contribution_channel, sorted_values
-
-    del order, unique_indexes, counts, valid_segments, sorted_weights
-
-    valid = accumulated_weight > 0.0
-    safe_denominator = torch.where(valid, accumulated_weight, 1.0)
-    rendered = accumulated_color / safe_denominator.unsqueeze(1)
-    projected = accumulated_disparity / safe_denominator
-    rendered = torch.where(valid.unsqueeze(1), rendered, 0.0)
-    projected = torch.where(valid, projected, 0.0)
-
-    rendered = rendered.reshape(batch_size, height, width, 3)
-    valid = valid.reshape(batch_size, height, width)
-    projected = projected.reshape(batch_size, height, width)
-    accumulated_weight = accumulated_weight.reshape(batch_size, height, width)
-    if unbatched:
-        rendered = rendered.squeeze(0)
-        valid = valid.squeeze(0)
-        projected = projected.squeeze(0)
-        accumulated_weight = accumulated_weight.squeeze(0)
-    return SplatBandResult(
-        image=rendered,
-        valid_mask=valid,
-        projected_disparity=projected,
-        accumulated_weight=accumulated_weight,
-    )
+    source = _validate_inputs(image, canonical, sample_offsets, source_index_offset)
+    winners = _winner_keys(canonical, sample_offsets, source_index_offset)
+    return _gather_winners(source, canonical, winners, source_index_offset)

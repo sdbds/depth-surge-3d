@@ -221,6 +221,8 @@ def _write_current_stereo_pipeline(
     output_dir: Path,
     frame_files: list[Path],
     canonical: dict,
+    *,
+    algorithm_version: str = STEREO_STAGE_ALGORITHM_VERSION,
 ) -> None:
     left_dir = output_dir / "04_left_frames"
     right_dir = output_dir / "04_right_frames"
@@ -229,7 +231,7 @@ def _write_current_stereo_pipeline(
     settings = _current_settings()
     metadata = {
         "schema_version": STEREO_STAGE_SCHEMA_VERSION,
-        "algorithm_version": STEREO_STAGE_ALGORITHM_VERSION,
+        "algorithm_version": algorithm_version,
         "source_canonical_fingerprint": canonical["fingerprint"],
         "frame_names": [path.name for path in frame_files],
         "render_shape": [4, 6],
@@ -247,6 +249,22 @@ def _write_current_stereo_pipeline(
         image = np.full((4, 6, 3), index * 20, dtype=np.uint8)
         assert cv2.imwrite(str(left_dir / f"{frame.stem}.png"), image)
         assert cv2.imwrite(str(right_dir / f"{frame.stem}.png"), image)
+
+
+def _write_downstream_placeholders(output_dir: Path, frame_name: str) -> None:
+    image = np.zeros((4, 6, 3), dtype=np.uint8)
+    for name in (
+        "05_left_distorted",
+        "05_right_distorted",
+        "06_left_cropped",
+        "06_right_cropped",
+        "07_left_upscaled",
+        "07_right_upscaled",
+        "99_vr_frames",
+    ):
+        directory = output_dir / name
+        directory.mkdir()
+        assert cv2.imwrite(str(directory / frame_name), image)
 
 
 def _legacy_job(tmp_path: Path):
@@ -677,6 +695,31 @@ def test_corrupt_stereo_payload_resumes_stereo_stage(tmp_path):
 
     assert report.stage("stereo").disposition == "resume"
     assert "payload" in report.stage("stereo").reason
+
+
+def test_v1_stereo_metadata_preserves_upstream_and_invalidates_frame_stages(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings()
+    _write_settings(tmp_path, settings, current_schema=True)
+    _, _, canonical = _write_current_depth_pipeline(tmp_path, frame_files, fingerprint)
+    _write_current_stereo_pipeline(
+        tmp_path,
+        frame_files,
+        canonical,
+        algorithm_version="torch-forward-splat-v1",
+    )
+    _write_downstream_placeholders(tmp_path, frame_files[0].name)
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("frames").disposition == "preserve"
+    assert report.stage("depth_raw").disposition == "preserve"
+    assert report.stage("disparity_maps").disposition == "preserve"
+    assert report.stage("stereo").disposition == "invalidate"
+    for stage_name in ("distortion", "crop", "upscale", "vr_frames"):
+        assert report.stage(stage_name).disposition == "invalidate"
 
 
 def test_float32_promotion_resumes_raw_and_invalidates_downstream(tmp_path):

@@ -32,7 +32,7 @@ from ...rendering.stereo_renderer import (
 from .frame_stage_parallelism import png_headers_match
 
 STEREO_STAGE_SCHEMA_VERSION = 1
-STEREO_STAGE_ALGORITHM_VERSION = "torch-forward-splat-v1"
+STEREO_STAGE_ALGORITHM_VERSION = "torch-horizontal-16x-zbuffer-v3"
 STEREO_HOST_BUDGET = 512 * 1024 * 1024
 HOST_STEREO_BYTES_PER_PIXEL = 24
 HOST_SLOT_OVERHEAD = 1024 * 1024

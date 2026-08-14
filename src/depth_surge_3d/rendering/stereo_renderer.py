@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import math
+import time
 from dataclasses import dataclass
 from typing import Literal
 
@@ -11,11 +12,15 @@ import numpy as np
 import torch
 import torch.nn.functional as functional
 
-from .forward_splat import SplatBandResult, forward_splat_band
+from .forward_splat import (
+    HORIZONTAL_SUBPIXELS,
+    SubpixelSplatResult,
+    forward_splat_band,
+)
 
 
 GPU_TEMP_BUDGET = 256 * 1024 * 1024
-SPLAT_BYTES_PER_PIXEL = 192
+SPLAT_BYTES_PER_PIXEL = 1280
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,16 @@ class StereoRenderResult:
     right_hole_mask: np.ndarray
 
 
+@dataclass(frozen=True)
+class StereoRenderProfile:
+    """Optional benchmark-only timing and transfer counters for one render."""
+
+    host_geometry_seconds: float
+    host_geometry_bytes: int
+    offset_transfer_seconds: float
+    offset_transfer_bytes: int
+
+
 def calculate_band_height(
     render_width: int,
     render_height: int,
@@ -62,70 +77,153 @@ def calculate_band_height(
     return min(render_height, max(1, rows))
 
 
-def _fill_background_band(
-    splat: SplatBandResult,
-    *,
-    max_gap_width: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fill bounded horizontal holes from the farther valid boundary."""
+def _narrow_sample_offsets(values: np.ndarray) -> np.ndarray:
+    limits = np.iinfo(np.int32)
+    if values.size and (values.min() < limits.min or values.max() > limits.max):
+        raise ValueError("Projected fine-sample offsets exceed int32 range")
+    return np.ascontiguousarray(values.astype(np.int32))
 
-    image = splat.image
-    valid = splat.valid_mask
-    projected = splat.projected_disparity
+
+def calculate_eye_sample_offsets(
+    canonical: torch.Tensor,
+    settings: StereoRenderSettings,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build deterministic full-frame fine-lane offsets once on the host."""
+
+    if canonical.device.type != "cpu" or canonical.ndim != 2:
+        raise ValueError("Canonical disparity must be a host-resident 2D tensor")
+    canonical64 = np.asarray(canonical.detach().numpy(), dtype=np.float64)
+    width = canonical.shape[1]
+    scale64 = np.float64(width) * np.float64(settings.stereo_strength)
+    scale64 = scale64 / np.float64(200.0)
+    fine_shift64 = canonical64 - np.float64(settings.convergence)
+    fine_shift64 = fine_shift64 * scale64
+    fine_shift64 = fine_shift64 * np.float64(HORIZONTAL_SUBPIXELS)
+
+    left64 = np.ceil(fine_shift64 - np.float64(0.5))
+    left = _narrow_sample_offsets(left64)
+    del left64
+    right64 = np.ceil(-fine_shift64 - np.float64(0.5))
+    right = _narrow_sample_offsets(right64)
+    return left, right
+
+
+def _nearest_valid_indexes(
+    valid: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    height, width = valid.shape
+    columns = torch.arange(width, dtype=torch.int32, device=valid.device).view(1, width)
+    columns = columns.expand(height, width)
+    left_seed = torch.where(valid, columns, -1)
+    left_index = torch.cummax(left_seed, dim=1).values
+    del left_seed
+    right_seed = torch.where(valid, columns, width)
+    reversed_seed = torch.flip(right_seed, dims=(1,))
+    del right_seed
+    reversed_index = torch.cummin(reversed_seed, dim=1).values
+    del reversed_seed
+    right_index = torch.flip(reversed_index, dims=(1,))
+    del reversed_index
+    return columns, left_index, right_index
+
+
+def _gather_columns(values: torch.Tensor, indexes: torch.Tensor) -> torch.Tensor:
+    safe = indexes.to(dtype=torch.int64)
+    safe.clamp_(0, values.shape[1] - 1)
+    if values.ndim == 2:
+        return torch.gather(values, 1, safe)
+    expanded = safe.unsqueeze(-1).expand(-1, -1, values.shape[-1])
+    return torch.gather(values, 1, expanded)
+
+
+def _select_fill_indexes(
+    projected: torch.Tensor,
+    columns: torch.Tensor,
+    left_index: torch.Tensor,
+    right_index: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    width = projected.shape[1]
+    left_exists = left_index >= 0
+    right_exists = right_index < width
+    has_candidate = left_exists | right_exists
+    both_exist = left_exists & right_exists
+    left_disparity = _gather_columns(projected, left_index)
+    right_disparity = _gather_columns(projected, right_index)
+    left_distance = columns - left_index
+    right_distance = right_index - columns
+    nearer_left = left_disparity < right_disparity
+    equal_prefers_left = (left_disparity == right_disparity) & (left_distance <= right_distance)
+    choose_left = (left_exists & ~right_exists) | (both_exist & (nearer_left | equal_prefers_left))
+    return torch.where(choose_left, left_index, right_index), has_candidate
+
+
+def _fill_background_band(
+    splat: SubpixelSplatResult,
+    *,
+    max_gap_samples: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fill bounded horizontal holes from one selected discrete boundary."""
+
+    image = splat.colour
+    valid = splat.valid
+    projected = splat.disparity
     if image.ndim != 3 or image.shape[-1] != 3:
         raise ValueError("Band image must have shape [H,W,3]")
     if valid.shape != image.shape[:2] or projected.shape != valid.shape:
         raise ValueError("Band masks and projected disparity must match the image")
-    if max_gap_width < 0:
+    if max_gap_samples < 0:
         raise ValueError("Maximum gap width must be non-negative")
 
-    height, width = valid.shape
-    columns = torch.arange(width, dtype=torch.int64, device=image.device).view(1, width)
-    columns = columns.expand(height, width)
-
-    left_seed = torch.where(valid, columns, -1)
-    left_index = torch.cummax(left_seed, dim=1).values
-    right_seed = torch.where(valid, columns, width)
-    right_index = torch.flip(
-        torch.cummin(torch.flip(right_seed, dims=(1,)), dim=1).values,
-        dims=(1,),
+    columns, left_index, right_index = _nearest_valid_indexes(valid)
+    selected, has_candidate = _select_fill_indexes(
+        projected,
+        columns,
+        left_index,
+        right_index,
     )
-
-    left_exists = left_index >= 0
-    right_exists = right_index < width
-    has_candidate = left_exists | right_exists
-    left_safe = left_index.clamp(0, width - 1)
-    right_safe = right_index.clamp(0, width - 1)
-
-    left_disparity = torch.gather(projected, 1, left_safe)
-    right_disparity = torch.gather(projected, 1, right_safe)
-    left_distance = columns - left_index
-    right_distance = right_index - columns
-    both_exist = left_exists & right_exists
-    equal_depth = left_disparity == right_disparity
-    choose_left = (left_exists & ~right_exists) | (
-        both_exist
-        & ((left_disparity < right_disparity) | (equal_depth & (left_distance <= right_distance)))
-    )
-
-    left_colour = torch.gather(
-        image,
-        1,
-        left_safe.unsqueeze(-1).expand(-1, -1, image.shape[-1]),
-    )
-    right_colour = torch.gather(
-        image,
-        1,
-        right_safe.unsqueeze(-1).expand(-1, -1, image.shape[-1]),
-    )
-    candidate_colour = torch.where(choose_left.unsqueeze(-1), left_colour, right_colour)
-
-    run_width = right_index - left_index - 1
-    fillable = (~valid) & has_candidate & (run_width <= max_gap_width)
+    del columns
+    run_width = right_index - left_index
+    run_width.sub_(1)
+    del left_index, right_index
+    fillable = (~valid) & has_candidate & (run_width <= max_gap_samples)
+    del has_candidate, run_width
     hole_mask = (~valid) & ~fillable
+    candidate_colour = _gather_columns(image, selected)
+    del selected
     filled = torch.where(fillable.unsqueeze(-1), candidate_colour, image)
+    del candidate_colour, fillable
     filled.masked_fill_(hole_mask.unsqueeze(-1), 0.0)
     return filled, hole_mask
+
+
+def _downsample_subpixel_band(colour: torch.Tensor) -> torch.Tensor:
+    if colour.ndim != 3 or colour.shape[-1] != 3:
+        raise ValueError("Fine-grid colour must have shape [H,W*S,3]")
+    if colour.shape[1] % HORIZONTAL_SUBPIXELS != 0:
+        raise ValueError("Fine-grid width must be divisible by the sample count")
+    height, fine_width, channels = colour.shape
+    lanes = colour.reshape(
+        height,
+        fine_width // HORIZONTAL_SUBPIXELS,
+        HORIZONTAL_SUBPIXELS,
+        channels,
+    )
+    pairs = lanes[:, :, 0::2] + lanes[:, :, 1::2]
+    quads = pairs[:, :, 0::2] + pairs[:, :, 1::2]
+    octets = quads[:, :, 0::2] + quads[:, :, 1::2]
+    total = octets[:, :, 0] + octets[:, :, 1]
+    return total * 0.0625
+
+
+def _downsample_masks(
+    prefill_valid: torch.Tensor,
+    postfill_hole: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    height, fine_width = prefill_valid.shape
+    width = fine_width // HORIZONTAL_SUBPIXELS
+    valid = prefill_valid.reshape(height, width, HORIZONTAL_SUBPIXELS).any(dim=2)
+    hole = postfill_hole.reshape(height, width, HORIZONTAL_SUBPIXELS).all(dim=2)
+    return valid, hole
 
 
 def _convert_image_band(image: torch.Tensor, dtype: np.dtype) -> np.ndarray:
@@ -149,6 +247,7 @@ class StereoRenderer:
         device: str | torch.device | None = None,
         *,
         temporary_budget_bytes: int = GPU_TEMP_BUDGET,
+        profile: bool = False,
     ) -> None:
         if temporary_budget_bytes <= 0:
             raise ValueError("Temporary GPU budget must be positive")
@@ -156,6 +255,10 @@ class StereoRenderer:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self.temporary_budget_bytes = temporary_budget_bytes
+        self.profile = profile
+        self.last_profile: StereoRenderProfile | None = None
+        self._offset_transfer_seconds = 0.0
+        self._offset_transfer_bytes = 0
 
     def render(
         self,
@@ -172,6 +275,12 @@ class StereoRenderer:
         source = np.ascontiguousarray(source)
         height, width = int(source.shape[0]), int(source.shape[1])
         resized_canonical = self._resize_canonical(canonical_values, (height, width))
+        geometry_started = time.perf_counter()
+        eye_offsets = calculate_eye_sample_offsets(resized_canonical, settings)
+        geometry_seconds = time.perf_counter() - geometry_started
+        geometry_bytes = sum(values.nbytes for values in eye_offsets)
+        self._offset_transfer_seconds = 0.0
+        self._offset_transfer_bytes = 0
         first_band_height = calculate_band_height(
             width,
             height,
@@ -179,30 +288,43 @@ class StereoRenderer:
         )
 
         try:
-            return self._render_with_band_height(
+            result = self._render_with_band_height(
                 source,
                 resized_canonical,
+                eye_offsets,
                 settings,
                 first_band_height,
             )
         except torch.cuda.OutOfMemoryError:
             self._release_after_oom()
+            retry_band_height = max(1, first_band_height // 2)
+            try:
+                result = self._render_with_band_height(
+                    source,
+                    resized_canonical,
+                    eye_offsets,
+                    settings,
+                    retry_band_height,
+                )
+            except torch.cuda.OutOfMemoryError as error:
+                self._release_after_oom()
+                raise RuntimeError(
+                    "CUDA stereo rendering ran out of memory for frame "
+                    f"{width}x{height}; attempted band heights "
+                    f"{first_band_height} and {retry_band_height}"
+                ) from error
 
-        retry_band_height = max(1, first_band_height // 2)
-        try:
-            return self._render_with_band_height(
-                source,
-                resized_canonical,
-                settings,
-                retry_band_height,
+        self.last_profile = (
+            StereoRenderProfile(
+                host_geometry_seconds=geometry_seconds,
+                host_geometry_bytes=geometry_bytes,
+                offset_transfer_seconds=self._offset_transfer_seconds,
+                offset_transfer_bytes=self._offset_transfer_bytes,
             )
-        except torch.cuda.OutOfMemoryError as error:
-            self._release_after_oom()
-            raise RuntimeError(
-                "CUDA stereo rendering ran out of memory for frame "
-                f"{width}x{height}; attempted band heights "
-                f"{first_band_height} and {retry_band_height}"
-            ) from error
+            if self.profile
+            else None
+        )
+        return result
 
     @staticmethod
     def _validate_inputs(
@@ -216,6 +338,8 @@ class StereoRenderer:
             raise ValueError("Frame must have shape [H,W,3]")
         if source.shape[0] <= 0 or source.shape[1] <= 0:
             raise ValueError("Frame dimensions must be positive")
+        if int(source.shape[0]) * int(source.shape[1]) >= 2**32:
+            raise ValueError("Full-frame source indexes must fit in 32 bits")
         if not (
             np.issubdtype(source.dtype, np.integer) or np.issubdtype(source.dtype, np.floating)
         ):
@@ -253,22 +377,23 @@ class StereoRenderer:
         self,
         source: np.ndarray,
         resized_canonical: torch.Tensor,
+        eye_offsets: tuple[np.ndarray, np.ndarray],
         settings: StereoRenderSettings,
         band_height: int,
     ) -> StereoRenderResult:
         left_image, left_valid, left_hole = self._render_eye(
             source,
             resized_canonical,
+            eye_offsets[0],
             settings,
             band_height,
-            eye_sign=1,
         )
         right_image, right_valid, right_hole = self._render_eye(
             source,
             resized_canonical,
+            eye_offsets[1],
             settings,
             band_height,
-            eye_sign=-1,
         )
         return StereoRenderResult(
             left_image=left_image,
@@ -283,17 +408,16 @@ class StereoRenderer:
         self,
         source: np.ndarray,
         resized_canonical: torch.Tensor,
+        sample_offsets: np.ndarray,
         settings: StereoRenderSettings,
         band_height: int,
-        *,
-        eye_sign: int,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         height, width = source.shape[:2]
         output = np.empty_like(source)
         valid_output = np.empty((height, width), dtype=np.bool_)
         hole_output = np.empty((height, width), dtype=np.bool_)
-        disparity_scale = float(np.float32(width * (settings.stereo_strength / 100.0)))
         max_gap_width = math.ceil(width * settings.stereo_strength / 200.0) + 2
+        max_gap_samples = HORIZONTAL_SUBPIXELS * max_gap_width
 
         with torch.inference_mode():
             for start_row in range(0, height, band_height):
@@ -302,26 +426,55 @@ class StereoRenderer:
                     self.device
                 )
                 canonical_band = resized_canonical[start_row:end_row].to(self.device)
-                disparity_band = (canonical_band - float(settings.convergence)) * disparity_scale
-                splat = forward_splat_band(source_band, disparity_band, eye_sign)
+                offset_band = self._transfer_offset_band(sample_offsets[start_row:end_row])
+                splat = forward_splat_band(
+                    source_band,
+                    canonical_band,
+                    offset_band,
+                    source_index_offset=start_row * width,
+                )
                 if settings.occlusion_fill == "background":
                     rendered, hole_mask = _fill_background_band(
                         splat,
-                        max_gap_width=max_gap_width,
+                        max_gap_samples=max_gap_samples,
                     )
                 else:
-                    rendered = splat.image
-                    hole_mask = ~splat.valid_mask
+                    rendered = splat.colour
+                    hole_mask = ~splat.valid
                 if not torch.isfinite(rendered).all():
                     raise ValueError("Rendered image contains non-finite values")
 
-                output[start_row:end_row] = _convert_image_band(rendered, source.dtype)
-                valid_output[start_row:end_row] = splat.valid_mask.detach().cpu().numpy()
-                hole_output[start_row:end_row] = hole_mask.detach().cpu().numpy()
+                downsampled = _downsample_subpixel_band(rendered)
+                pixel_valid, pixel_hole = _downsample_masks(splat.valid, hole_mask)
+                output[start_row:end_row] = _convert_image_band(downsampled, source.dtype)
+                valid_output[start_row:end_row] = pixel_valid.detach().cpu().numpy()
+                hole_output[start_row:end_row] = pixel_hole.detach().cpu().numpy()
 
-                del source_band, canonical_band, disparity_band, splat, rendered, hole_mask
+                del (
+                    source_band,
+                    canonical_band,
+                    offset_band,
+                    splat,
+                    rendered,
+                    hole_mask,
+                    downsampled,
+                    pixel_valid,
+                    pixel_hole,
+                )
 
         return output, valid_output, hole_output
+
+    def _transfer_offset_band(self, values: np.ndarray) -> torch.Tensor:
+        if self.profile and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        started = time.perf_counter()
+        result = torch.from_numpy(values).to(self.device)
+        if self.profile and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        if self.profile:
+            self._offset_transfer_seconds += time.perf_counter() - started
+            self._offset_transfer_bytes += values.nbytes
+        return result
 
     def _release_after_oom(self) -> None:
         gc.collect()

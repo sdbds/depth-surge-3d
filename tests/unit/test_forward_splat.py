@@ -1,181 +1,231 @@
-"""CPU reference tests for depth-aware horizontal forward splatting."""
+"""Exact tests for the sixteen-sample packed-key horizontal z-buffer."""
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
-from src.depth_surge_3d.rendering.forward_splat import forward_splat_band
+from src.depth_surge_3d.rendering.forward_splat import (
+    HORIZONTAL_SUBPIXELS,
+    _decode_source_index,
+    _pack_depth_source_key,
+    forward_splat_band,
+)
 
 
-def test_constant_disparity_uses_correct_left_and_right_sign() -> None:
-    image = torch.zeros((1, 7, 3), dtype=torch.float32)
-    image[0, 3] = 1.0
-    disparity = torch.full((1, 7), 2.0, dtype=torch.float32)
-
-    left = forward_splat_band(image, disparity, eye_sign=1)
-    right = forward_splat_band(image, disparity, eye_sign=-1)
-
-    assert int(torch.argmax(left.image[0, :, 0])) == 4
-    assert int(torch.argmax(right.image[0, :, 0])) == 2
+def _offsets(values: list[list[int]], *, device: str = "cpu") -> torch.Tensor:
+    return torch.tensor(values, dtype=torch.int32, device=device)
 
 
-def test_fractional_projection_preserves_bilinear_coverage() -> None:
-    image = torch.zeros((1, 5, 3), dtype=torch.float32)
-    image[0, 2] = 1.0
-    disparity = torch.ones((1, 5), dtype=torch.float32)
+def test_zero_offsets_tile_each_source_pixel_into_sixteen_fine_samples() -> None:
+    image = torch.tensor([[[10.0, 11.0, 12.0], [20.0, 21.0, 22.0], [30.0, 31.0, 32.0]]])
+    canonical = torch.full((1, 3), 0.5, dtype=torch.float32)
 
-    result = forward_splat_band(image, disparity, eye_sign=1)
+    result = forward_splat_band(image, canonical, _offsets([[0, 0, 0]]))
 
-    assert result.image[0, 2, 0].item() == pytest.approx(0.5)
-    assert result.image[0, 3, 0].item() == pytest.approx(0.5)
+    assert HORIZONTAL_SUBPIXELS == 16
+    expected = image.repeat_interleave(HORIZONTAL_SUBPIXELS, dim=1)
+    torch.testing.assert_close(result.colour, expected)
+    torch.testing.assert_close(
+        result.disparity,
+        canonical.repeat_interleave(HORIZONTAL_SUBPIXELS, dim=1),
+    )
+    assert result.valid.all()
 
 
-def test_out_of_frame_contributions_become_explicit_holes() -> None:
-    image = torch.ones((1, 4, 3), dtype=torch.float32)
-    disparity = torch.full((1, 4), 100.0, dtype=torch.float32)
+def test_positive_offset_discards_only_out_of_frame_fine_samples() -> None:
+    image = torch.tensor([[[7.0, 8.0, 9.0]]])
+    canonical = torch.tensor([[0.75]], dtype=torch.float32)
 
-    result = forward_splat_band(image, disparity, eye_sign=1)
+    result = forward_splat_band(image, canonical, _offsets([[1]]))
 
-    assert not result.valid_mask.any()
-    assert torch.count_nonzero(result.image) == 0
+    assert result.valid.tolist() == [[False] + [True] * (HORIZONTAL_SUBPIXELS - 1)]
+    torch.testing.assert_close(
+        result.colour[0, 1:],
+        image[0, 0].expand(HORIZONTAL_SUBPIXELS - 1, 3),
+    )
+    assert torch.count_nonzero(result.colour[0, 0]) == 0
+    assert torch.isneginf(result.disparity[0, 0])
+
+
+def test_nearer_depth_wins_every_colliding_fine_sample() -> None:
+    image = torch.tensor([[[255.0, 0.0, 0.0], [0.0, 0.0, 255.0]]])
+    canonical = torch.tensor([[0.9, 0.1]], dtype=torch.float32)
+
+    full = HORIZONTAL_SUBPIXELS
+    result = forward_splat_band(image, canonical, _offsets([[full, 0]]))
+
+    assert not result.valid[0, :full].any()
+    assert result.valid[0, full:].all()
+    torch.testing.assert_close(result.colour[0, full:], image[0, 0].expand(full, 3))
+    torch.testing.assert_close(result.disparity[0, full:], torch.full((full,), 0.9))
+
+
+def test_equal_depth_collision_uses_lowest_full_frame_source_index() -> None:
+    image = torch.tensor([[[1.0, 2.0, 3.0], [9.0, 8.0, 7.0]]])
+    canonical = torch.full((1, 2), 0.5, dtype=torch.float32)
+
+    result = forward_splat_band(
+        image,
+        canonical,
+        _offsets([[HORIZONTAL_SUBPIXELS, 0]]),
+        source_index_offset=10,
+    )
+
+    torch.testing.assert_close(
+        result.colour[0, HORIZONTAL_SUBPIXELS:],
+        image[0, 0].expand(HORIZONTAL_SUBPIXELS, 3),
+    )
+
+
+def test_three_colliding_layers_use_one_uniform_depth_rule() -> None:
+    image = torch.tensor([[[90.0, 0.0, 0.0], [0.0, 50.0, 0.0], [0.0, 0.0, 10.0]]])
+    canonical = torch.tensor([[0.9, 0.5, 0.1]], dtype=torch.float32)
+
+    full = HORIZONTAL_SUBPIXELS
+    result = forward_splat_band(image, canonical, _offsets([[full, 0, -full]]))
+
+    torch.testing.assert_close(result.colour[0, full : 2 * full], image[0, 0].expand(full, 3))
+
+
+def test_complementary_and_overlapping_half_coverage_remain_distinguishable() -> None:
+    image = torch.tensor([[[100.0, 0.0, 0.0], [0.0, 0.0, 100.0]]])
+    canonical = torch.tensor([[0.9, 0.1]], dtype=torch.float32)
+
+    full = HORIZONTAL_SUBPIXELS
+    half = full // 2
+    complementary = forward_splat_band(image, canonical, _offsets([[-half, -half]]))
+    overlapping = forward_splat_band(image, canonical, _offsets([[-half, -(full + half)]]))
+
+    complementary_pixel = complementary.colour[0, :full].sum(dim=0) / full
+    overlapping_pixel = overlapping.colour[0, :full].sum(dim=0) / full
+    torch.testing.assert_close(complementary_pixel, torch.tensor([50.0, 0.0, 50.0]))
+    torch.testing.assert_close(overlapping_pixel, torch.tensor([50.0, 0.0, 0.0]))
+
+
+def test_fully_covering_near_surface_wins_without_depth_epsilon() -> None:
+    image = torch.tensor([[[200.0, 0.0, 0.0], [0.0, 0.0, 200.0]]])
+    canonical = torch.tensor([[0.5, 0.49]], dtype=torch.float32)
+
+    full = HORIZONTAL_SUBPIXELS
+    result = forward_splat_band(image, canonical, _offsets([[full, 0]]))
+
+    torch.testing.assert_close(result.colour[0, full:], image[0, 0].expand(full, 3))
+
+
+def test_packed_key_orders_depth_then_inverted_source_index() -> None:
+    next_positive = np.nextafter(np.float32(0.0), np.float32(1.0))
+    depth = torch.tensor(
+        [0.0, -0.0, next_positive, 0.5, 0.5, 1.0],
+        dtype=torch.float32,
+    )
+    source = torch.tensor([7, 7, 7, 9, 2, 7], dtype=torch.int64)
+
+    keys = _pack_depth_source_key(depth, source)
+
+    assert keys[0] == keys[1]
+    assert keys[2] > keys[1]
+    assert keys[4] > keys[3]
+    assert keys[5] > keys[4]
+    assert (keys >= 0).all()
+    assert _decode_source_index(keys[3:5]).tolist() == [9, 2]
+
+
+def test_rank_four_batch_input_is_rejected_explicitly() -> None:
+    image = torch.zeros((2, 1, 3, 3), dtype=torch.float32)
+    canonical = torch.zeros((2, 1, 3), dtype=torch.float32)
+    offsets = torch.zeros((2, 1, 3), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="unbatched"):
+        forward_splat_band(image, canonical, offsets)
 
 
 @pytest.mark.parametrize(
-    ("eye_sign", "near_x", "far_x"),
-    [(1, 0, 2), (-1, 2, 0)],
+    ("image", "canonical", "offsets", "message"),
+    [
+        (
+            torch.zeros((1, 2, 4)),
+            torch.zeros((1, 2)),
+            torch.zeros((1, 2), dtype=torch.int32),
+            "three channels",
+        ),
+        (
+            torch.zeros((1, 2, 3)),
+            torch.zeros((1, 3)),
+            torch.zeros((1, 2), dtype=torch.int32),
+            "match",
+        ),
+        (
+            torch.zeros((1, 2, 3)),
+            torch.zeros((1, 2)),
+            torch.zeros((1, 2), dtype=torch.int64),
+            "int32",
+        ),
+    ],
 )
-def test_both_eyes_use_total_disparity_as_the_near_z_key(
-    eye_sign: int, near_x: int, far_x: int
+def test_invalid_shapes_and_offset_dtype_are_rejected(
+    image: torch.Tensor,
+    canonical: torch.Tensor,
+    offsets: torch.Tensor,
+    message: str,
 ) -> None:
-    image = torch.zeros((1, 3, 3), dtype=torch.float32)
-    image[0, near_x] = torch.tensor([1.0, 0.0, 0.0])
-    image[0, far_x] = torch.tensor([0.0, 0.0, 1.0])
-    disparity = torch.full((1, 3), 100.0, dtype=torch.float32)
-    disparity[0, near_x] = 4.0
-    disparity[0, far_x] = 0.0
-
-    result = forward_splat_band(image, disparity, eye_sign=eye_sign)
-
-    target_x = 2 if eye_sign == 1 else 0
-    assert result.image[0, target_x, 0].item() == pytest.approx(1.0)
-    assert result.image[0, target_x, 2].item() == pytest.approx(0.0)
+    with pytest.raises(ValueError, match=message):
+        forward_splat_band(image, canonical, offsets)
 
 
-def test_low_weight_foreground_tail_antialiases_instead_of_owning_z_buffer() -> None:
-    image = torch.zeros((1, 12, 3), dtype=torch.float32)
-    image[0, 0] = torch.tensor([1.0, 0.0, 0.0])
-    image[0, 11] = torch.tensor([0.0, 0.0, 1.0])
-    disparity = torch.full((1, 12), 100.0, dtype=torch.float32)
-    disparity[0, 0] = 20.02
-    disparity[0, 11] = 0.0
-
-    result = forward_splat_band(image, disparity, eye_sign=1)
-
-    assert result.valid_mask[0, 11]
-    assert result.image[0, 11, 0].item() == pytest.approx(0.01 / 1.01, abs=1e-4)
-    assert result.image[0, 11, 2].item() == pytest.approx(1.0 / 1.01, abs=1e-4)
-
-
-def test_target_without_primary_voter_falls_back_to_all_contributions() -> None:
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -0.1, 1.1])
+def test_nonfinite_or_out_of_range_canonical_is_rejected(bad_value: float) -> None:
     image = torch.zeros((1, 2, 3), dtype=torch.float32)
-    image[0, 0] = torch.tensor([0.2, 0.4, 0.6])
-    disparity = torch.tensor([[1.2, 100.0]], dtype=torch.float32)
+    canonical = torch.tensor([[0.0, bad_value]], dtype=torch.float32)
 
-    result = forward_splat_band(image, disparity, eye_sign=1)
-
-    assert result.valid_mask[0, 0]
-    torch.testing.assert_close(result.image[0, 0], image[0, 0])
+    with pytest.raises(ValueError, match="Canonical"):
+        forward_splat_band(image, canonical, _offsets([[0, 0]]))
 
 
-def test_twenty_pixel_full_range_ramp_has_no_internal_holes() -> None:
-    image = torch.ones((1, 20, 3), dtype=torch.float32)
-    disparity = torch.linspace(0.0, 36.48, 20, dtype=torch.float32).unsqueeze(0)
-
-    result = forward_splat_band(image, disparity, eye_sign=1)
-
-    assert result.valid_mask[0].all()
-
-
-def test_two_pixel_stretch_exposes_only_zero_support_columns() -> None:
-    width = 16
-    image = torch.ones((1, width, 3), dtype=torch.float32)
-    disparity = torch.full((1, width), 100.0, dtype=torch.float32)
-    disparity[0, :6] = torch.arange(6, dtype=torch.float32) * 2.0
-    disparity[0, 6:11] = 10.0
-
-    result = forward_splat_band(image, disparity, eye_sign=1)
-
-    assert torch.where(~result.valid_mask[0])[0].tolist() == [1, 3, 5, 7, 9]
-
-
-def test_batched_input_preserves_batch_shape_and_independence() -> None:
-    image = torch.zeros((2, 1, 5, 3), dtype=torch.float32)
-    image[0, 0, 2] = 1.0
-    image[1, 0, 3] = 2.0
-    disparity = torch.zeros((2, 1, 5), dtype=torch.float32)
-
-    result = forward_splat_band(image, disparity, eye_sign=1)
-
-    assert result.image.shape == image.shape
-    assert result.valid_mask.shape == disparity.shape
-    torch.testing.assert_close(result.image, image)
-
-
-def test_nonfinite_disparity_is_rejected() -> None:
+def test_source_index_must_fit_in_low_32_bits() -> None:
     image = torch.zeros((1, 2, 3), dtype=torch.float32)
-    disparity = torch.tensor([[0.0, float("nan")]], dtype=torch.float32)
+    canonical = torch.zeros((1, 2), dtype=torch.float32)
 
-    with pytest.raises(ValueError, match="finite"):
-        forward_splat_band(image, disparity, eye_sign=1)
+    with pytest.raises(ValueError, match="32 bits"):
+        forward_splat_band(
+            image,
+            canonical,
+            _offsets([[0, 0]]),
+            source_index_offset=2**32 - 1,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_matches_cpu_reference() -> None:
+def test_cuda_matches_cpu_byte_exactly() -> None:
     generator = torch.Generator().manual_seed(7)
-    image = torch.rand((2, 5, 11, 3), generator=generator)
-    disparity = torch.rand((2, 5, 11), generator=generator) * 6.0 - 3.0
+    image = torch.randint(0, 256, (5, 11, 3), generator=generator, dtype=torch.uint8)
+    canonical = torch.rand((5, 11), generator=generator, dtype=torch.float32)
+    offsets = torch.randint(-5, 6, (5, 11), generator=generator, dtype=torch.int32)
 
-    cpu = forward_splat_band(image, disparity, eye_sign=-1)
-    cuda = forward_splat_band(image.cuda(), disparity.cuda(), eye_sign=-1)
-
-    torch.testing.assert_close(cuda.image.cpu(), cpu.image, atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(cuda.projected_disparity.cpu(), cpu.projected_disparity)
-    assert torch.equal(cuda.valid_mask.cpu(), cpu.valid_mask)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_collisions_are_byte_deterministic() -> None:
-    generator = torch.Generator().manual_seed(11)
-    image = torch.rand((4, 64, 129, 3), generator=generator).cuda()
-    disparity = (torch.rand((4, 64, 129), generator=generator) * 20.0 - 10.0).cuda()
-
-    first = forward_splat_band(image, disparity, eye_sign=1)
-    second = forward_splat_band(image, disparity, eye_sign=1)
-
-    assert torch.equal(first.image, second.image)
-    assert torch.equal(first.projected_disparity, second.projected_disparity)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_peak_memory_fits_splat_budget() -> None:
-    height, width = 128, 1024
-    forward_splat_band(
-        torch.zeros((1, 8, 3), device="cuda"),
-        torch.zeros((1, 8), device="cuda"),
-        eye_sign=1,
+    cpu = forward_splat_band(image, canonical, offsets, source_index_offset=121)
+    cuda = forward_splat_band(
+        image.cuda(),
+        canonical.cuda(),
+        offsets.cuda(),
+        source_index_offset=121,
     )
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    initial_bytes = torch.cuda.memory_allocated()
 
-    image = torch.rand((height, width, 3), device="cuda")
-    disparity = torch.rand((height, width), device="cuda")
-    disparity.mul_(20.0).sub_(10.0)
-    result = forward_splat_band(image, disparity, eye_sign=1)
-    torch.cuda.synchronize()
-    peak_bytes = torch.cuda.max_memory_allocated() - initial_bytes
+    assert torch.equal(cuda.colour.cpu(), cpu.colour)
+    assert torch.equal(cuda.disparity.cpu(), cpu.disparity)
+    assert torch.equal(cuda.valid.cpu(), cpu.valid)
 
-    assert result.image.shape == image.shape
-    assert peak_bytes <= height * width * 192
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_packed_collisions_are_repeatable() -> None:
+    generator = torch.Generator().manual_seed(11)
+    image = torch.randint(0, 256, (64, 129, 3), generator=generator, dtype=torch.uint8).cuda()
+    canonical = torch.rand((64, 129), generator=generator).cuda()
+    offsets = torch.randint(-12, 13, (64, 129), generator=generator, dtype=torch.int32).cuda()
+
+    first = forward_splat_band(image, canonical, offsets)
+    second = forward_splat_band(image, canonical, offsets)
+
+    assert torch.equal(first.colour, second.colour)
+    assert torch.equal(first.disparity, second.disparity)
+    assert torch.equal(first.valid, second.valid)

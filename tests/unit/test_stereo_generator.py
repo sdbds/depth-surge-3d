@@ -30,6 +30,10 @@ from src.depth_surge_3d.rendering.stereo_renderer import (
 )
 
 
+def test_stereo_algorithm_version_identifies_production_sixteen_sample_zbuffer() -> None:
+    assert stereo_generator.STEREO_STAGE_ALGORITHM_VERSION == "torch-horizontal-16x-zbuffer-v3"
+
+
 def _write_canonical_metadata(
     depth_dir: Path,
     frame_names: list[str],
@@ -316,6 +320,39 @@ def test_resume_regenerates_a_corrupt_stereo_pair(tmp_path: Path) -> None:
     assert len(renderer.calls) == 1
     restored = cv2.imread(str(corrupt_right), cv2.IMREAD_UNCHANGED)
     assert restored is not None and restored.shape == (8, 8, 3)
+
+
+def test_v3_clean_and_resumed_runs_write_byte_identical_eye_pngs(tmp_path: Path) -> None:
+    clean_inputs = _make_file_inputs(tmp_path / "clean", count=3, frame_shape=(8, 16))
+    resumed_inputs = _make_file_inputs(tmp_path / "resumed", count=3, frame_shape=(8, 16))
+    settings = _settings(stereo_strength=3.0, stereo_io_workers=1)
+    renderer = StereoRenderer(device="cpu")
+
+    assert StereoPairGenerator(renderer=renderer).create_stereo_pairs_from_files(
+        *clean_inputs,
+        settings,
+    )
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_files(
+        *resumed_inputs,
+        settings,
+    )
+    resumed_frame = resumed_inputs[0][1].name
+    (resumed_inputs[2]["right_frames"] / resumed_frame).unlink()
+
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_files(
+        *resumed_inputs,
+        settings,
+    )
+
+    for eye in ("left_frames", "right_frames"):
+        for frame_file in clean_inputs[0]:
+            clean_png = clean_inputs[2][eye] / frame_file.name
+            resumed_png = resumed_inputs[2][eye] / frame_file.name
+            assert resumed_png.read_bytes() == clean_png.read_bytes()
 
 
 def test_canonical_fingerprint_change_invalidates_existing_stereo_pairs(tmp_path: Path) -> None:

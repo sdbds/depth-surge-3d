@@ -62,32 +62,57 @@ store exact upstream fingerprints in `metadata.json`.
 ## Stereo Renderer
 
 Canonical relative disparity is resized to the render target with bilinear
-interpolation before pixel disparity is computed:
+interpolation. The host then computes both full-frame eye offset maps once in
+float64 and narrows them to signed int32 fine-lane offsets:
 
 ```text
-d = (r - convergence) * target_width * stereo_strength / 100
-left_target_x  = source_x + d / 2
-right_target_x = source_x - d / 2
+q = (r - convergence) * target_width * stereo_strength / 200
+left_offset  = ceil(16 * q - 0.5)
+right_offset = ceil(-16 * q - 0.5)
 ```
 
-Both eyes use the same signed `d` as the depth key. A banded CUDA forward splat
-performs bilinear horizontal scattering. Each target column first elects a
-near-surface winner from contributions with weight at least `0.5`; when no such
-vote exists, all contributions participate. Visibility is the one-sided test
-`d >= winner - 0.25 px`, preserving low-weight antialiasing tails without
-letting them control the depth vote.
+Each source pixel represents one projected horizontal unit footprint. The
+renderer preserves its occupancy with 16 fixed samples: source column `x`
+writes lanes `16*x + offset + {0,...,15}`. Every fine lane has one strict
+z-buffer winner. The ordering key packs nonnegative float32 disparity bits and
+the inverted full-frame source index into one int64 value:
+
+```text
+key = (float32_bits(r) << 32) | (0xffffffff - source_index)
+```
+
+One integer `amax` therefore selects the largest disparity and, for exact depth
+ties, the lowest source index. There is no epsilon visibility window,
+floating-point atomic sum, or fixed layer count. CPU and CUDA reduction order
+cannot change the winner.
 
 Invalid splat pixels are represented by explicit masks, never inferred from
-color. `background` occlusion fill propagates farther visible pixels
-horizontally within each row and band. It cannot reconstruct unseen texture;
-wide gaps can become a constant-color run from the selected background edge.
+color. `background` occlusion fill runs on the fine grid and extends the farther
+of the two discrete boundary winners across bounded horizontal gaps. Equal
+depth uses distance and then the left boundary as tie-breaks. `none` leaves
+unresolved lanes black. Sixteen lanes are combined with a fixed balanced
+addition tree, multiplied by `0.0625`, and converted with ties-to-even rounding.
+The public valid mask means at least one lane was covered before fill; the
+public hole mask means all 16 lanes remain unresolved after fill.
 
 ## Memory And I/O
 
-CUDA scatter bands use a deterministic byte budget. The per-source-pixel budget
-includes color/value tensors, weights, projected disparity, and int64 scatter
-indices. Background fill executes inside each full-row band, so no full-frame
-GPU buffer remains except the final uint8 eye outputs.
+CUDA scatter bands use a deterministic byte budget. The measured live set
+includes source color and canonical depth, transferred int32 offsets, expanded
+target/source indexes and in-bounds masks, packed candidates and winners,
+gathered fine-grid color/depth/validity, fill indexes and selected color, and
+scatter workspace. On an RTX 4090, the 16-sample renderer measured at most
+`854.931` allocated bytes per source pixel during a complete 4K render. The
+configured `1280 B/source-pixel` exceeds that measurement plus 25 percent
+headroom. At 4K this permits 54 complete rows, or 40 bands per eye, under the
+256 MiB temporary budget.
+
+The two full-frame int32 eye maps remain host-resident and are sliced for each
+band. They are built from host float64 geometry; all float64 temporaries are
+released when map construction returns, before row-band device rendering
+begins. Background fill and downsampling complete before the next band, and
+final uint8 eye outputs are host arrays. No full-frame image, index, or 16-lane
+buffer is retained on the device.
 
 Stereo decode and output work is bounded by both `stereo_io_workers` and a host
 byte budget. End-to-end throughput measurements include decode, render, image
@@ -113,6 +138,11 @@ downstream stage. Canonical changes invalidate canonical disparity and
 downstream stages. Render-setting changes invalidate stereo output and
 downstream stages.
 
+The 16-sample renderer changes the stereo algorithm identity from v1 to v3.
+Resuming v1 metadata preserves source, scene, raw-depth, and canonical stages,
+then regenerates stereo and every tracked downstream frame stage. Encoded video
+files are outside that frame-stage invalidation and are not implicitly deleted.
+
 Old generated directories are archived under `legacy_v1/` by default.
 Non-interactive runs never delete them implicitly; deletion requires
 `--migrate-legacy delete`. Removed keys found in an on-disk settings file are
@@ -133,5 +163,7 @@ rollback.
 - `processing/frames/depth_normalizer.py`: representation conversion and pure
   scene canonicalization.
 - `processing/frames/stereo_generator.py`: bounded stereo I/O pipeline.
-- `rendering/stereo_projector.py`: banded CUDA forward splat and occlusion fill.
+- `rendering/forward_splat.py`: packed 16-lane z-buffer for one row band.
+- `rendering/stereo_renderer.py`: host geometry, fine-grid fill, downsampling,
+  and bounded eye rendering.
 - `io/resume.py`: stage validation, reports, and legacy migration.

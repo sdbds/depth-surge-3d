@@ -23,7 +23,7 @@ and stereo output.
 - `--convergence`: canonical relative disparity placed at zero parallax.
   Default: `0.5`; valid range: `0.0` to `1.0`.
 - `--occlusion-fill`: `background` fills horizontal disocclusion gaps from
-  farther visible pixels; `none` leaves gaps invalid.
+  farther visible pixels; `none` leaves unresolved subpixel lanes black.
 - `--stereo-io-workers`: bounded decode/encode worker count. Default is derived
   from the host CPU count; valid range: `1` to `8`.
 
@@ -38,6 +38,14 @@ right_target_x = source_x - d / 2
 
 Near surfaces therefore move right in the left eye and left in the right eye.
 Both eyes share the same depth key; only the target-coordinate sign changes.
+Stereo strength scales this geometry only. Antialiasing quality is fixed at 16
+horizontal samples per output pixel and is not reduced or increased by the
+strength value.
+
+With `--occlusion-fill none`, a partially covered silhouette pixel averages its
+valid lanes with black unresolved lanes because the renderer exposes RGB rather
+than alpha. A dark contour at a disocclusion is therefore intentional in this
+mode. Use `background` when the bounded farther-surface extension is preferred.
 
 ## Scene Scaling
 

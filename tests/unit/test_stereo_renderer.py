@@ -1,33 +1,35 @@
 from __future__ import annotations
 
 import inspect
+
 import numpy as np
 import pytest
 import torch
 
-from src.depth_surge_3d.rendering.forward_splat import SplatBandResult, forward_splat_band
+from src.depth_surge_3d.rendering.forward_splat import (
+    HORIZONTAL_SUBPIXELS,
+    SubpixelSplatResult,
+)
 from src.depth_surge_3d.rendering.stereo_renderer import (
     GPU_TEMP_BUDGET,
     SPLAT_BYTES_PER_PIXEL,
     StereoRenderResult,
     StereoRenderer,
     StereoRenderSettings,
+    _convert_image_band,
+    _downsample_subpixel_band,
     _fill_background_band,
     calculate_band_height,
+    calculate_eye_sample_offsets,
 )
 
 
-def _splat_result(
-    image: torch.Tensor,
+def _subpixel_result(
+    colour: torch.Tensor,
     valid: torch.Tensor,
-    projected: torch.Tensor,
-) -> SplatBandResult:
-    return SplatBandResult(
-        image=image,
-        valid_mask=valid,
-        projected_disparity=projected,
-        accumulated_weight=valid.to(dtype=torch.float32),
-    )
+    disparity: torch.Tensor,
+) -> SubpixelSplatResult:
+    return SubpixelSplatResult(colour=colour, disparity=disparity, valid=valid)
 
 
 def _empty_render_result(frame: np.ndarray) -> StereoRenderResult:
@@ -44,233 +46,320 @@ def _empty_render_result(frame: np.ndarray) -> StereoRenderResult:
     )
 
 
-def test_band_height_uses_fixed_budget_and_int64_aware_estimate() -> None:
+def test_band_height_uses_measured_sixteen_sample_bound() -> None:
     expected = GPU_TEMP_BUDGET // (3840 * SPLAT_BYTES_PER_PIXEL)
 
-    assert SPLAT_BYTES_PER_PIXEL == 192
+    assert SPLAT_BYTES_PER_PIXEL == 1280
     assert calculate_band_height(3840, 2160) == expected
     assert calculate_band_height(16, 3) == 3
 
 
-def test_renderer_resizes_canonical_before_target_width_disparity(
+def test_renderer_rejects_full_frame_source_indexes_that_do_not_fit_uint32() -> None:
+    source = np.broadcast_to(
+        np.zeros((1, 1, 3), dtype=np.uint8),
+        (65536, 65536, 3),
+    )
+    canonical = np.broadcast_to(
+        np.zeros((1, 1), dtype=np.float32),
+        (65536, 65536),
+    )
+
+    with pytest.raises(ValueError, match="source indexes must fit in 32 bits"):
+        StereoRenderer(device="cpu").render(source, canonical)
+
+
+def test_full_frame_eye_offsets_use_host_float64_and_int32_storage() -> None:
+    canonical = torch.full((1, 100), 0.5, dtype=torch.float32)
+    canonical[0, 0] = 0.0
+    canonical[0, 1] = 1.0
+
+    left, right = calculate_eye_sample_offsets(
+        canonical,
+        StereoRenderSettings(stereo_strength=5.0, convergence=0.5),
+    )
+
+    assert left.dtype == np.int32
+    assert right.dtype == np.int32
+    assert left.flags.c_contiguous and right.flags.c_contiguous
+    extreme_offset = HORIZONTAL_SUBPIXELS * 5 // 4
+    assert left[0, :3].tolist() == [-extreme_offset, extreme_offset, 0]
+    assert right[0, :3].tolist() == [extreme_offset, -extreme_offset, 0]
+
+
+def test_half_lane_boundaries_obey_ceil_without_epsilon() -> None:
+    boundary = np.float32(2.0 / HORIZONTAL_SUBPIXELS)
+    below = np.nextafter(boundary, np.float32(0.0))
+    above = np.nextafter(boundary, np.float32(1.0))
+    canonical = torch.full((1, 100), 0.5, dtype=torch.float32)
+    canonical[0, :3] = torch.tensor([below, boundary, above], dtype=torch.float32)
+
+    left, _right = calculate_eye_sample_offsets(
+        canonical,
+        StereoRenderSettings(stereo_strength=0.5, convergence=0.0),
+    )
+
+    assert left[0, :3].tolist() == [0, 0, 1]
+
+
+def test_geometry_maps_are_built_once_and_reused_after_oom(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: list[torch.Tensor] = []
+    frame = np.zeros((5, 4, 3), dtype=np.uint8)
+    renderer = StereoRenderer(
+        device="cpu",
+        temporary_budget_bytes=4 * SPLAT_BYTES_PER_PIXEL * 4,
+    )
+    geometry_calls = 0
+    attempts: list[tuple[int, int]] = []
 
-    def fake_splat(
-        image: torch.Tensor,
-        disparity: torch.Tensor,
-        eye_sign: int,
-    ) -> SplatBandResult:
-        del eye_sign
-        captured.append(disparity.detach().cpu())
-        valid = torch.ones(disparity.shape, dtype=torch.bool, device=image.device)
-        return _splat_result(image.to(torch.float32), valid, disparity)
+    def fake_geometry(
+        canonical: torch.Tensor,
+        settings: StereoRenderSettings,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        nonlocal geometry_calls
+        del settings
+        geometry_calls += 1
+        offsets = np.zeros(canonical.shape, dtype=np.int32)
+        return offsets, offsets.copy()
+
+    def fake_render(
+        source: np.ndarray,
+        resized_canonical: torch.Tensor,
+        eye_offsets: tuple[np.ndarray, np.ndarray],
+        settings: StereoRenderSettings,
+        band_height: int,
+    ) -> StereoRenderResult:
+        del resized_canonical, settings
+        attempts.append((band_height, id(eye_offsets)))
+        if len(attempts) == 1:
+            raise torch.cuda.OutOfMemoryError("simulated")
+        return _empty_render_result(source)
 
     monkeypatch.setattr(
-        "src.depth_surge_3d.rendering.stereo_renderer.forward_splat_band",
-        fake_splat,
+        "src.depth_surge_3d.rendering.stereo_renderer.calculate_eye_sample_offsets",
+        fake_geometry,
     )
-    frame = np.zeros((2, 8, 3), dtype=np.uint8)
-    native_canonical = np.ones((1, 1), dtype=np.float32)
-    renderer = StereoRenderer(device="cpu")
+    monkeypatch.setattr(renderer, "_render_with_band_height", fake_render)
 
-    renderer.render(
-        frame,
-        native_canonical,
-        StereoRenderSettings(stereo_strength=2.0, convergence=0.5),
-    )
+    renderer.render(frame, np.full((1, 1), 0.5, dtype=np.float32))
 
-    expected_disparity = torch.full((2, 8), 0.08, dtype=torch.float32)
-    assert len(captured) == 2
-    torch.testing.assert_close(captured[0], expected_disparity)
-    torch.testing.assert_close(captured[1], expected_disparity)
+    assert geometry_calls == 1
+    assert [height for height, _identity in attempts] == [4, 2]
+    assert attempts[0][1] == attempts[1][1]
 
 
-def test_renderer_uses_bilinear_canonical_resize(
+def test_real_oom_retry_is_byte_identical_to_direct_retry_band(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: list[torch.Tensor] = []
+    generator = np.random.default_rng(29)
+    frame = generator.integers(0, 256, size=(5, 11, 3), dtype=np.uint8)
+    canonical = generator.random((5, 11), dtype=np.float32)
+    settings = StereoRenderSettings(stereo_strength=3.0, occlusion_fill="background")
+    retry_budget = 11 * SPLAT_BYTES_PER_PIXEL * 2
+    expected = StereoRenderer(
+        device="cpu",
+        temporary_budget_bytes=retry_budget,
+    ).render(frame, canonical, settings)
+    renderer = StereoRenderer(
+        device="cpu",
+        temporary_budget_bytes=11 * SPLAT_BYTES_PER_PIXEL * 4,
+    )
+    original = renderer._render_with_band_height
+    attempted_heights: list[int] = []
+
+    def fail_first_attempt(
+        source: np.ndarray,
+        resized_canonical: torch.Tensor,
+        eye_offsets: tuple[np.ndarray, np.ndarray],
+        render_settings: StereoRenderSettings,
+        band_height: int,
+    ) -> StereoRenderResult:
+        attempted_heights.append(band_height)
+        if len(attempted_heights) == 1:
+            raise torch.cuda.OutOfMemoryError("simulated")
+        return original(
+            source,
+            resized_canonical,
+            eye_offsets,
+            render_settings,
+            band_height,
+        )
+
+    monkeypatch.setattr(renderer, "_render_with_band_height", fail_first_attempt)
+
+    actual = renderer.render(frame, canonical, settings)
+
+    assert attempted_heights == [4, 2]
+    for field in StereoRenderResult.__dataclass_fields__:
+        assert np.array_equal(getattr(actual, field), getattr(expected, field))
+
+
+def test_renderer_slices_full_frame_offsets_and_uses_global_source_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[torch.Tensor, int]] = []
 
     def fake_splat(
         image: torch.Tensor,
-        disparity: torch.Tensor,
-        eye_sign: int,
-    ) -> SplatBandResult:
-        del eye_sign
-        captured.append(disparity.detach().cpu())
+        canonical: torch.Tensor,
+        sample_offsets: torch.Tensor,
+        *,
+        source_index_offset: int,
+    ) -> SubpixelSplatResult:
+        calls.append((sample_offsets.detach().cpu(), source_index_offset))
+        colour = image.to(torch.float32).repeat_interleave(HORIZONTAL_SUBPIXELS, dim=1)
+        disparity = canonical.repeat_interleave(HORIZONTAL_SUBPIXELS, dim=1)
         valid = torch.ones(disparity.shape, dtype=torch.bool, device=image.device)
-        return _splat_result(image.to(torch.float32), valid, disparity)
-
-    monkeypatch.setattr(
-        "src.depth_surge_3d.rendering.stereo_renderer.forward_splat_band",
-        fake_splat,
-    )
-
-    StereoRenderer(device="cpu").render(
-        np.zeros((1, 4, 3), dtype=np.uint8),
-        np.array([[0.0, 1.0]], dtype=np.float32),
-        StereoRenderSettings(stereo_strength=5.0, convergence=0.0),
-    )
-
-    expected = torch.tensor([[0.0, 0.05, 0.15, 0.2]], dtype=torch.float32)
-    torch.testing.assert_close(captured[0], expected)
-
-
-def test_renderer_processes_complete_bands_and_eyes_sequentially(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[int, int, str]] = []
-
-    def fake_splat(
-        image: torch.Tensor,
-        disparity: torch.Tensor,
-        eye_sign: int,
-    ) -> SplatBandResult:
-        calls.append((eye_sign, image.shape[0], image.device.type))
-        valid = torch.ones(disparity.shape, dtype=torch.bool, device=image.device)
-        return _splat_result(image.to(torch.float32), valid, disparity)
+        return _subpixel_result(colour, valid, disparity)
 
     monkeypatch.setattr(
         "src.depth_surge_3d.rendering.stereo_renderer.forward_splat_band",
         fake_splat,
     )
     width = 5
-    budget = width * SPLAT_BYTES_PER_PIXEL * 2
-    renderer = StereoRenderer(device="cpu", temporary_budget_bytes=budget)
+    renderer = StereoRenderer(
+        device="cpu",
+        temporary_budget_bytes=width * SPLAT_BYTES_PER_PIXEL * 2,
+    )
+    frame = np.arange(5 * width * 3, dtype=np.uint8).reshape(5, width, 3)
 
     result = renderer.render(
-        np.zeros((5, width, 3), dtype=np.uint8),
-        np.full((5, width), 0.5, dtype=np.float32),
-        StereoRenderSettings(occlusion_fill="none"),
-    )
-
-    assert calls == [
-        (1, 2, "cpu"),
-        (1, 2, "cpu"),
-        (1, 1, "cpu"),
-        (-1, 2, "cpu"),
-        (-1, 2, "cpu"),
-        (-1, 1, "cpu"),
-    ]
-    assert isinstance(result.left_image, np.ndarray)
-    assert isinstance(result.right_image, np.ndarray)
-    assert not hasattr(result, "projected_disparity")
-
-
-def test_background_fill_prefers_farther_candidate_over_nearer_distance() -> None:
-    image = torch.tensor([[[200.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]])
-    valid = torch.tensor([[True, False, False, True]])
-    projected = torch.tensor([[1.0, 0.0, 0.0, -1.0]])
-
-    filled, hole_mask = _fill_background_band(
-        _splat_result(image, valid, projected),
-        max_gap_width=2,
-    )
-
-    torch.testing.assert_close(filled[0, 1], image[0, 3])
-    torch.testing.assert_close(filled[0, 2], image[0, 3])
-    assert not hole_mask.any()
-
-
-def test_background_fill_uses_distance_only_when_depths_tie() -> None:
-    image = torch.tensor(
-        [
-            [
-                [10.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0],
-                [0.0, 20.0, 0.0],
-            ]
-        ]
-    )
-    valid = torch.tensor([[True, False, False, False, True]])
-    projected = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0]])
-
-    filled, hole_mask = _fill_background_band(
-        _splat_result(image, valid, projected),
-        max_gap_width=3,
-    )
-
-    torch.testing.assert_close(filled[0, 1], image[0, 0])
-    torch.testing.assert_close(filled[0, 2], image[0, 0])
-    torch.testing.assert_close(filled[0, 3], image[0, 4])
-    assert not hole_mask.any()
-
-
-def test_background_fill_leaves_wide_and_fully_invalid_runs_as_holes() -> None:
-    image = torch.zeros((2, 5, 3), dtype=torch.float32)
-    image[0, 0] = torch.tensor([10.0, 0.0, 0.0])
-    image[0, 4] = torch.tensor([0.0, 20.0, 0.0])
-    valid = torch.tensor([[True, False, False, False, True], [False, False, False, False, False]])
-    projected = torch.zeros((2, 5), dtype=torch.float32)
-
-    filled, hole_mask = _fill_background_band(
-        _splat_result(image, valid, projected),
-        max_gap_width=2,
-    )
-
-    assert torch.equal(filled, image)
-    assert hole_mask[0, 1:4].all()
-    assert hole_mask[1].all()
-
-
-def test_background_fill_closes_isolated_zero_support_columns() -> None:
-    width = 16
-    image = torch.arange(width, dtype=torch.float32).view(1, width, 1).expand(-1, -1, 3)
-    disparity = torch.full((1, width), 100.0, dtype=torch.float32)
-    disparity[0, :6] = torch.arange(6, dtype=torch.float32) * 2.0
-    disparity[0, 6:11] = 10.0
-    splat = forward_splat_band(image, disparity, eye_sign=1)
-
-    _filled, hole_mask = _fill_background_band(splat, max_gap_width=1)
-
-    assert not hole_mask.any()
-
-
-def test_valid_black_pixels_are_not_holes_and_output_restores_input_dtype() -> None:
-    frame = np.zeros((3, 7, 3), dtype=np.uint8)
-    canonical = np.full((3, 7), 0.5, dtype=np.float32)
-
-    result = StereoRenderer(device="cpu").render(
         frame,
-        canonical,
-        StereoRenderSettings(occlusion_fill="background"),
+        np.full((5, width), 0.5, dtype=np.float32),
+        StereoRenderSettings(stereo_strength=0.0, occlusion_fill="none"),
     )
 
-    assert result.left_image.dtype == np.uint8
-    assert result.right_image.dtype == np.uint8
+    assert [(value.shape[0], offset) for value, offset in calls] == [
+        (2, 0),
+        (2, 10),
+        (1, 20),
+        (2, 0),
+        (2, 10),
+        (1, 20),
+    ]
+    assert all(value.dtype == torch.int32 for value, _offset in calls)
     assert np.array_equal(result.left_image, frame)
     assert np.array_equal(result.right_image, frame)
-    assert result.left_valid_mask.all()
-    assert result.right_valid_mask.all()
-    assert not result.left_hole_mask.any()
-    assert not result.right_hole_mask.any()
 
 
-def test_occlusion_fill_none_preserves_explicit_black_holes() -> None:
-    frame = np.full((1, 100, 3), 127, dtype=np.uint8)
-    canonical = np.ones((1, 100), dtype=np.float32)
+def test_background_fill_prefers_farther_discrete_candidate() -> None:
+    colour = torch.tensor(
+        [[[200.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]]
+    )
+    valid = torch.tensor([[True, False, False, True]])
+    disparity = torch.tensor([[1.0, -torch.inf, -torch.inf, 0.0]])
 
-    result = StereoRenderer(device="cpu").render(
+    filled, hole_mask = _fill_background_band(
+        _subpixel_result(colour, valid, disparity),
+        max_gap_samples=2,
+    )
+
+    torch.testing.assert_close(filled[0, 1], colour[0, 3])
+    torch.testing.assert_close(filled[0, 2], colour[0, 3])
+    assert not hole_mask.any()
+
+
+def test_background_fill_uses_distance_then_left_for_equal_depth() -> None:
+    colour = torch.tensor(
+        [[[10.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 20.0, 0.0]]]
+    )
+    valid = torch.tensor([[True, False, False, False, True]])
+    disparity = torch.tensor([[0.5, -torch.inf, -torch.inf, -torch.inf, 0.5]])
+
+    filled, hole_mask = _fill_background_band(
+        _subpixel_result(colour, valid, disparity),
+        max_gap_samples=3,
+    )
+
+    torch.testing.assert_close(filled[0, 1], colour[0, 0])
+    torch.testing.assert_close(filled[0, 2], colour[0, 0])
+    torch.testing.assert_close(filled[0, 3], colour[0, 4])
+    assert not hole_mask.any()
+
+
+def test_background_fill_extends_only_bounded_frame_edge_runs() -> None:
+    colour = torch.zeros((2, 6, 3), dtype=torch.float32)
+    colour[0, 2] = torch.tensor([10.0, 20.0, 30.0])
+    colour[1, 3] = torch.tensor([40.0, 50.0, 60.0])
+    valid = torch.tensor(
+        [
+            [False, False, True, False, False, False],
+            [False, False, False, True, False, False],
+        ]
+    )
+    disparity = torch.where(valid, torch.tensor(0.25), torch.tensor(-torch.inf))
+
+    filled, holes = _fill_background_band(
+        _subpixel_result(colour, valid, disparity),
+        max_gap_samples=2,
+    )
+
+    assert torch.equal(filled[0, :2], colour[0, 2].expand(2, 3))
+    assert holes[0, 3:].all()
+    assert holes[1, :3].all()
+    assert torch.equal(filled[1, 4:], colour[1, 3].expand(2, 3))
+
+
+def test_downsampling_uses_fixed_lane_average_and_ties_to_even() -> None:
+    zero = [[0.0, 0.0, 0.0]] * 8
+    first = zero + [[255.0, 255.0, 255.0]] * 8
+    second = zero + [[253.0, 253.0, 253.0]] * 8
+    fine = torch.tensor([[*first, *second]])
+
+    averaged = _downsample_subpixel_band(fine)
+    converted = _convert_image_band(averaged, np.dtype(np.uint8))
+
+    assert converted[0, :, 0].tolist() == [128, 126]
+
+
+def test_none_darkens_partial_coverage_while_background_fills_it() -> None:
+    frame = np.full((1, 20, 3), 100, dtype=np.uint8)
+    canonical = np.ones((1, 20), dtype=np.float32)
+    renderer = StereoRenderer(device="cpu")
+
+    none = renderer.render(
+        frame,
+        canonical,
+        StereoRenderSettings(stereo_strength=5.0, convergence=0.0, occlusion_fill="none"),
+    )
+    background = renderer.render(
         frame,
         canonical,
         StereoRenderSettings(
             stereo_strength=5.0,
             convergence=0.0,
-            occlusion_fill="none",
+            occlusion_fill="background",
         ),
     )
 
-    assert result.left_hole_mask.any()
-    assert np.all(result.left_image[result.left_hole_mask] == 0)
+    assert none.left_image[0, 0, 0] == 50
+    assert none.left_valid_mask[0, 0]
+    assert not none.left_hole_mask[0, 0]
+    assert background.left_image[0, 0, 0] == 100
+    assert not background.left_hole_mask.any()
 
 
-def test_row_band_height_does_not_change_rendered_bytes() -> None:
+def test_uint8_strength_zero_is_byte_exact_for_both_eyes() -> None:
+    generator = np.random.default_rng(3)
+    frame = generator.integers(0, 256, size=(4, 13, 3), dtype=np.uint8)
+    canonical = generator.random((2, 7), dtype=np.float32)
+
+    result = StereoRenderer(device="cpu").render(
+        frame,
+        canonical,
+        StereoRenderSettings(stereo_strength=0.0, occlusion_fill="none"),
+    )
+
+    assert np.array_equal(result.left_image, frame)
+    assert np.array_equal(result.right_image, frame)
+    assert result.left_valid_mask.all() and result.right_valid_mask.all()
+    assert not result.left_hole_mask.any() and not result.right_hole_mask.any()
+
+
+def test_row_band_height_does_not_change_any_output_byte_or_mask() -> None:
     generator = np.random.default_rng(13)
     frame = generator.integers(0, 256, size=(6, 17, 3), dtype=np.uint8)
-    canonical = np.linspace(0.0, 1.0, 17, dtype=np.float32)[None, :]
+    canonical = generator.random((6, 17), dtype=np.float32)
     settings = StereoRenderSettings(stereo_strength=5.0, occlusion_fill="background")
     full_band = StereoRenderer(device="cpu")
     one_row = StereoRenderer(
@@ -281,41 +370,8 @@ def test_row_band_height_does_not_change_rendered_bytes() -> None:
     expected = full_band.render(frame, canonical, settings)
     actual = one_row.render(frame, canonical, settings)
 
-    assert np.array_equal(actual.left_image, expected.left_image)
-    assert np.array_equal(actual.right_image, expected.right_image)
-    assert np.array_equal(actual.left_valid_mask, expected.left_valid_mask)
-    assert np.array_equal(actual.right_valid_mask, expected.right_valid_mask)
-    assert np.array_equal(actual.left_hole_mask, expected.left_hole_mask)
-    assert np.array_equal(actual.right_hole_mask, expected.right_hole_mask)
-
-
-def test_cuda_oom_retries_once_with_half_band_height(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    frame = np.zeros((5, 4, 3), dtype=np.uint8)
-    renderer = StereoRenderer(
-        device="cpu",
-        temporary_budget_bytes=4 * SPLAT_BYTES_PER_PIXEL * 4,
-    )
-    attempts: list[int] = []
-
-    def fake_render(
-        source: np.ndarray,
-        resized_canonical: torch.Tensor,
-        settings: StereoRenderSettings,
-        band_height: int,
-    ) -> StereoRenderResult:
-        del resized_canonical, settings
-        attempts.append(band_height)
-        if len(attempts) == 1:
-            raise torch.cuda.OutOfMemoryError("simulated")
-        return _empty_render_result(source)
-
-    monkeypatch.setattr(renderer, "_render_with_band_height", fake_render)
-
-    renderer.render(frame, np.full((1, 1), 0.5, dtype=np.float32))
-
-    assert attempts == [4, 2]
+    for field in StereoRenderResult.__dataclass_fields__:
+        assert np.array_equal(getattr(actual, field), getattr(expected, field))
 
 
 def test_second_cuda_oom_reports_frame_and_both_attempted_heights(
@@ -327,21 +383,12 @@ def test_second_cuda_oom_reports_frame_and_both_attempted_heights(
         temporary_budget_bytes=4 * SPLAT_BYTES_PER_PIXEL * 4,
     )
 
-    def always_oom(
-        source: np.ndarray,
-        resized_canonical: torch.Tensor,
-        settings: StereoRenderSettings,
-        band_height: int,
-    ) -> StereoRenderResult:
-        del source, resized_canonical, settings, band_height
+    def always_oom(*_args, **_kwargs) -> StereoRenderResult:
         raise torch.cuda.OutOfMemoryError("simulated")
 
     monkeypatch.setattr(renderer, "_render_with_band_height", always_oom)
 
-    with pytest.raises(
-        RuntimeError,
-        match=r"4x5.*band heights 4 and 2",
-    ):
+    with pytest.raises(RuntimeError, match=r"4x5.*band heights 4 and 2"):
         renderer.render(frame, np.full((1, 1), 0.5, dtype=np.float32))
 
 
@@ -385,24 +432,21 @@ def test_renderer_rejects_nonfinite_or_out_of_range_canonical() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_renderer_cpu_cuda_parity() -> None:
-    frame = np.arange(5 * 11 * 3, dtype=np.uint8).reshape(5, 11, 3)
-    canonical = np.linspace(0.0, 1.0, 11, dtype=np.float32)[None, :]
+def test_renderer_cpu_cuda_parity_is_byte_exact() -> None:
+    generator = np.random.default_rng(17)
+    frame = generator.integers(0, 256, size=(5, 17, 3), dtype=np.uint8)
+    canonical = generator.random((5, 17), dtype=np.float32)
     settings = StereoRenderSettings(stereo_strength=4.0, occlusion_fill="background")
 
     cpu = StereoRenderer(device="cpu").render(frame, canonical, settings)
     cuda = StereoRenderer(device="cuda").render(frame, canonical, settings)
 
-    assert np.array_equal(cuda.left_image, cpu.left_image)
-    assert np.array_equal(cuda.right_image, cpu.right_image)
-    assert np.array_equal(cuda.left_valid_mask, cpu.left_valid_mask)
-    assert np.array_equal(cuda.right_valid_mask, cpu.right_valid_mask)
-    assert np.array_equal(cuda.left_hole_mask, cpu.left_hole_mask)
-    assert np.array_equal(cuda.right_hole_mask, cpu.right_hole_mask)
+    for field in StereoRenderResult.__dataclass_fields__:
+        assert np.array_equal(getattr(cuda, field), getattr(cpu, field))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_renderer_peak_cuda_memory_fits_fixed_band_budget() -> None:
+def test_renderer_peak_cuda_live_set_fits_configured_bytes_with_headroom() -> None:
     height, width = 128, 1024
     renderer = StereoRenderer(
         device="cuda",
@@ -429,4 +473,4 @@ def test_renderer_peak_cuda_memory_fits_fixed_band_budget() -> None:
     peak_bytes = torch.cuda.max_memory_allocated() - initial_bytes
 
     assert result.left_image.shape == frame.shape
-    assert peak_bytes <= height * width * SPLAT_BYTES_PER_PIXEL
+    assert peak_bytes * 1.25 <= height * width * SPLAT_BYTES_PER_PIXEL

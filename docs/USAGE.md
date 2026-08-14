@@ -115,6 +115,12 @@ The resume report lists every preserved, resumed, invalidated, archived, or
 deleted stage. Destructive migration starts only after the configured estimator
 loads and its exact fingerprint has been checked.
 
+Stereo renderer v3 invalidates v1 left/right metadata and all tracked
+downstream frame stages while preserving valid source, scene, raw-depth, and
+canonical data. An existing encoded video is not a tracked frame stage and is
+not implicitly deleted; the resumed run encodes its new result through the
+normal output path.
+
 ## Viewing
 
 The final video can be opened in a player or headset that supports side-by-side

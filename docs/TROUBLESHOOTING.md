@@ -75,6 +75,25 @@ Rapid camera movements or quick object motion may cause:
 - Warping artifacts
 - Ghosting effects
 
+#### Jagged or misplaced depth edges
+
+Inspect the persisted `04_left_frames` and `04_right_frames` PNGs before the
+final projection and encode. A staircase already present there is a stereo
+rendering artifact; the renderer uses 16 fixed horizontal samples to retain
+one-sixteenth-pixel contour coverage. Raising or lowering stereo strength
+changes the displacement, not that sampling quality.
+
+If the contour is smooth but displaced from the visible object, or a halo
+follows the wrong side of hair, hands, or an instrument, inspect the matching
+`03_disparity_maps` PNG. A canonical depth transition that does not align with
+the source edge is a model-boundary error. The z-buffer can resolve visibility
+at the supplied boundary but cannot infer a better boundary; reduce stereo
+strength or use a better depth estimate rather than adding blur.
+
+With `--occlusion-fill none`, partially unresolved pixels are composited over
+black by design and may form a dark one-pixel contour. This is distinct from a
+wide light/dark halo in `background` mode.
+
 #### Processing time
 Can be significant for long/high-resolution videos:
 - Typical speed: ~2-4 seconds per output frame on modern GPU (RTX 4070+)
