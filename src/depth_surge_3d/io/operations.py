@@ -17,6 +17,7 @@ import json
 import shutil
 import subprocess
 import time
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 import cv2
@@ -165,7 +166,11 @@ def get_video_info_ffprobe(video_path: str) -> dict[str, Any]:
     return {}
 
 
-def create_output_directories(base_path: Path, keep_intermediates: bool = True) -> dict[str, Path]:
+def create_output_directories(
+    base_path: Path,
+    keep_intermediates: bool = True,
+    omitted_intermediates: Collection[str] | None = None,
+) -> dict[str, Path]:
     """
     Create output directory structure on filesystem.
 
@@ -173,6 +178,7 @@ def create_output_directories(base_path: Path, keep_intermediates: bool = True) 
         base_path: Base output directory path
         keep_intermediates: Retention preference used after successful processing. All
             stage directories are created because they are required pipeline storage.
+        omitted_intermediates: Directory keys to omit from creation and the returned map.
 
     Returns:
         Dictionary mapping directory names to paths
@@ -180,6 +186,7 @@ def create_output_directories(base_path: Path, keep_intermediates: bool = True) 
     Side Effects:
         Creates directories on filesystem
     """
+    omitted = frozenset(omitted_intermediates or ())
     directories = {"base": base_path}
 
     # Always create base directory
@@ -188,6 +195,8 @@ def create_output_directories(base_path: Path, keep_intermediates: bool = True) 
     # Intermediates are working state, not optional output. The retention flag is
     # applied only after the final video has been encoded successfully.
     for dir_name, dir_path in INTERMEDIATE_DIRS.items():
+        if dir_name in omitted:
+            continue
         full_path = base_path / dir_path
         full_path.mkdir(exist_ok=True)
         directories[dir_name] = full_path
