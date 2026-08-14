@@ -272,6 +272,7 @@ def test_direct_command_maps_audio_from_third_input(tmp_path):
         _direct_settings(per_eye_width=0),
         _direct_settings(per_eye_height=-1),
         _direct_settings(vr_format="anaglyph"),
+        _direct_settings(vr_format=None),
     ],
 )
 def test_direct_command_rejects_invalid_settings(tmp_path, settings):
@@ -474,6 +475,8 @@ def test_direct_create_video_failure_preserves_old_final_and_removes_temp(tmp_pa
     )
     temporary = tmp_path / f".{final.stem}.direct.tmp.mp4"
     final.write_bytes(b"old-valid-video")
+    left_before = left[0].read_bytes()
+    right_before = right[0].read_bytes()
 
     def launch(command, **_kwargs):
         Path(command[-1]).write_bytes(b"partial")
@@ -506,6 +509,8 @@ def test_direct_create_video_failure_preserves_old_final_and_removes_temp(tmp_pa
     assert "line-24" not in output
     assert final.read_bytes() == b"old-valid-video"
     assert not temporary.exists()
+    assert left[0].read_bytes() == left_before
+    assert right[0].read_bytes() == right_before
 
 
 def test_direct_create_video_validates_before_launch_and_cleans_stale_temp(tmp_path):

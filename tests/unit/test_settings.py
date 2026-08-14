@@ -27,9 +27,10 @@ def test_direct_vr_encode_rejects_non_booleans(value: object) -> None:
 
 @pytest.mark.parametrize("value", [False, True])
 def test_direct_vr_encode_accepts_booleans(value: bool) -> None:
-    assert validate_settings(
-        {"direct_vr_encode": value}, source="explicit"
-    )["direct_vr_encode"] is value
+    assert (
+        validate_settings({"direct_vr_encode": value}, source="explicit")["direct_vr_encode"]
+        is value
+    )
 
 
 def test_direct_vr_encode_does_not_bump_settings_schema() -> None:

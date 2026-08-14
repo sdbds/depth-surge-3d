@@ -40,11 +40,14 @@ class TestResolveVRSourceFiles:
         cropped_right.mkdir()
         _write_source_pair(cropped_left, cropped_right, 1)
 
-        assert VRFrameAssembler().resolve_vr_source_files(
-            {"left_cropped": cropped_left, "right_cropped": cropped_right},
-            {"upscale_model": "x2"},
-            total_frames=1,
-        ) is None
+        assert (
+            VRFrameAssembler().resolve_vr_source_files(
+                {"left_cropped": cropped_left, "right_cropped": cropped_right},
+                {"upscale_model": "x2"},
+                total_frames=1,
+            )
+            is None
+        )
 
     def test_resolve_vr_source_files_rejects_unequal_counts(self, tmp_path):
         left = tmp_path / "left_cropped"
@@ -55,11 +58,14 @@ class TestResolveVRSourceFiles:
         image = np.zeros((4, 6, 3), dtype=np.uint8)
         assert cv2.imwrite(str(left / "frame_000002.png"), image)
 
-        assert VRFrameAssembler().resolve_vr_source_files(
-            {"left_cropped": left, "right_cropped": right},
-            {},
-            total_frames=0,
-        ) is None
+        assert (
+            VRFrameAssembler().resolve_vr_source_files(
+                {"left_cropped": left, "right_cropped": right},
+                {},
+                total_frames=0,
+            )
+            is None
+        )
 
     def test_resolve_vr_source_files_requires_total_frame_count(self, tmp_path):
         left = tmp_path / "left_cropped"
@@ -68,11 +74,14 @@ class TestResolveVRSourceFiles:
         right.mkdir()
         _write_source_pair(left, right, 1)
 
-        assert VRFrameAssembler().resolve_vr_source_files(
-            {"left_cropped": left, "right_cropped": right},
-            {},
-            total_frames=2,
-        ) is None
+        assert (
+            VRFrameAssembler().resolve_vr_source_files(
+                {"left_cropped": left, "right_cropped": right},
+                {},
+                total_frames=2,
+            )
+            is None
+        )
 
     def test_resolve_vr_source_files_requires_matching_stems(self, tmp_path):
         left = tmp_path / "left_cropped"
@@ -82,11 +91,14 @@ class TestResolveVRSourceFiles:
         _write_source_pair(left, right, 1)
         (right / "frame_000001.png").rename(right / "other_000001.png")
 
-        assert VRFrameAssembler().resolve_vr_source_files(
-            {"left_cropped": left, "right_cropped": right},
-            {},
-            total_frames=1,
-        ) is None
+        assert (
+            VRFrameAssembler().resolve_vr_source_files(
+                {"left_cropped": left, "right_cropped": right},
+                {},
+                total_frames=1,
+            )
+            is None
+        )
 
 
 class TestVRFrameAssemblerInit:

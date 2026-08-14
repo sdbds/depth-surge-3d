@@ -335,9 +335,7 @@ class TestExecutePipeline:
             )
 
         vr_assembler.assemble_vr_frames.assert_not_called()
-        vr_assembler.resolve_vr_source_files.assert_called_once_with(
-            directories, settings, 1
-        )
+        vr_assembler.resolve_vr_source_files.assert_called_once_with(directories, settings, 1)
         video_encoder.create_video.assert_not_called()
         video_encoder.create_video_from_stereo_sequences.assert_called_once_with(
             [left],

@@ -283,6 +283,8 @@ class VideoEncoder:
             raise ValueError("Direct stereo per-eye dimensions must be positive")
 
         vr_format = settings.get("vr_format")
+        if not isinstance(vr_format, str):
+            raise ValueError(f"Unsupported direct VR format: {vr_format}")
         stack_filter = {
             "side_by_side": "hstack",
             "over_under": "vstack",
