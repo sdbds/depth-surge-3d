@@ -48,6 +48,7 @@ _KNOWN_SETTING_NAMES = set(DEFAULT_SETTINGS) | _OPTIONAL_SETTING_NAMES
 _EXISTING_BOOLEAN_SETTINGS = {
     "preserve_audio",
     "keep_intermediates",
+    "direct_vr_encode",
     "apply_distortion",
     "experimental_frame_interpolation",
 }

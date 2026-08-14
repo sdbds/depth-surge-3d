@@ -67,6 +67,7 @@ DEFAULT_SETTINGS = {
     "min_resolution": "1080p",
     "preserve_audio": True,
     "keep_intermediates": True,
+    "direct_vr_encode": False,
     "apply_distortion": True,
     "output_dir": "./output",
     "experimental_frame_interpolation": False,  # Experimental feature with quality warnings
