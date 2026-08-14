@@ -1,8 +1,10 @@
 """Unit tests for final video encoding."""
 
+import io
 import json
+import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import cv2
 import numpy as np
@@ -14,6 +16,47 @@ from src.depth_surge_3d.processing.frames.source_frame_manifest import (
     write_source_frame_manifest,
 )
 from src.depth_surge_3d.utils.imaging.png_header import PngHeader
+from src.depth_surge_3d.utils.path_utils import generate_output_filename
+
+
+class _FakeProcess:
+    def __init__(self, output: str, returncode: int = 0):
+        self.stdout = io.StringIO(output)
+        self.returncode = returncode
+        self.waited = False
+        self.terminated = False
+        self.killed = False
+        self.communicate_timeouts = []
+
+    def wait(self, timeout=None):
+        self.waited = True
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def communicate(self, timeout=None):
+        self.communicate_timeouts.append(timeout)
+        self.waited = True
+        return ("", None)
+
+
+class _BrokenProgressStream:
+    def __iter__(self):
+        yield "diagnostic before read failure\n"
+        raise OSError("progress pipe failed")
+
+
+class _TimeoutProcess(_FakeProcess):
+    def communicate(self, timeout=None):
+        self.communicate_timeouts.append(timeout)
+        if timeout is not None:
+            raise subprocess.TimeoutExpired(["ffmpeg"], timeout)
+        self.waited = True
+        return ("diagnostic after kill\n", None)
 
 
 def _write_eye_sequence(
@@ -286,6 +329,322 @@ def test_direct_command_reuses_nvenc_arguments_unchanged(tmp_path):
         "hq",
         str(tmp_path / ".output.direct.tmp.mp4"),
     ]
+
+
+def test_direct_runner_merges_stderr_tracks_frames_and_waits():
+    process = _FakeProcess("frame=1\nnoise\nframe=2\n")
+    tracker = Mock()
+
+    with patch(
+        "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
+        return_value=process,
+    ) as popen:
+        returncode, diagnostics = VideoEncoder()._run_ffmpeg_with_progress(["ffmpeg"], 2, tracker)
+
+    assert returncode == 0
+    assert diagnostics == ("noise",)
+    assert process.waited is True
+    assert [call.kwargs["frame_num"] for call in tracker.update_progress.call_args_list] == [1, 2]
+    assert popen.call_args.kwargs == {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,
+    }
+
+
+def test_direct_runner_retains_only_last_fifty_diagnostic_lines():
+    process = _FakeProcess("".join(f"line-{index}\n" for index in range(75)), 1)
+
+    with patch(
+        "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
+        return_value=process,
+    ):
+        returncode, diagnostics = VideoEncoder()._run_ffmpeg_with_progress(["ffmpeg"], 1, None)
+
+    assert returncode == 1
+    assert len(diagnostics) == 50
+    assert diagnostics[0] == "line-25"
+    assert diagnostics[-1] == "line-74"
+
+
+def test_direct_runner_ignores_tracker_errors_and_uses_wait_returncode():
+    process = _FakeProcess("frame=4\n", returncode=7)
+    tracker = Mock()
+    tracker.update_progress.side_effect = RuntimeError("tracker unavailable")
+
+    with patch(
+        "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
+        return_value=process,
+    ):
+        returncode, diagnostics = VideoEncoder()._run_ffmpeg_with_progress(["ffmpeg"], 4, tracker)
+
+    assert returncode == 7
+    assert diagnostics == ()
+    assert process.waited is True
+
+
+def test_direct_runner_terminates_drains_and_reaps_after_read_error():
+    process = _FakeProcess("")
+    process.stdout = _BrokenProgressStream()
+
+    with patch(
+        "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
+        return_value=process,
+    ):
+        with pytest.raises(OSError, match="progress pipe failed"):
+            VideoEncoder()._run_ffmpeg_with_progress(["ffmpeg"], 1, None)
+
+    assert process.terminated is True
+    assert process.communicate_timeouts == [5]
+    assert process.waited is True
+
+
+def test_direct_runner_kills_and_reaps_when_bounded_drain_times_out():
+    process = _TimeoutProcess("")
+    process.stdout = _BrokenProgressStream()
+
+    with patch(
+        "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
+        return_value=process,
+    ):
+        with pytest.raises(OSError, match="progress pipe failed"):
+            VideoEncoder()._run_ffmpeg_with_progress(["ffmpeg"], 1, None)
+
+    assert process.terminated is True
+    assert process.killed is True
+    assert process.communicate_timeouts == [5, None]
+    assert process.waited is True
+
+
+def test_direct_create_video_atomically_replaces_final_output(tmp_path):
+    left = _write_eye_sequence(tmp_path / "left", [1])
+    right = _write_eye_sequence(tmp_path / "right", [1])
+    settings = _direct_settings()
+    final = tmp_path / generate_output_filename(
+        "source.mp4", settings["vr_format"], settings["vr_resolution"]
+    )
+    temporary = tmp_path / f".{final.stem}.direct.tmp.mp4"
+    unrelated = tmp_path / f".{final.stem}.direct.tmp.mp4.backup"
+    final.write_bytes(b"old-valid-video")
+    temporary.write_bytes(b"stale-partial-video")
+    unrelated.write_bytes(b"keep-me")
+    left_before = left[0].read_bytes()
+    right_before = right[0].read_bytes()
+
+    def launch(command, **_kwargs):
+        assert Path(command[-1]) == temporary
+        Path(command[-1]).write_bytes(b"new-valid-video")
+        return _FakeProcess("frame=1\nprogress=end\n")
+
+    with (
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+            return_value=True,
+        ),
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
+            side_effect=launch,
+        ),
+    ):
+        assert VideoEncoder().create_video_from_stereo_sequences(
+            left,
+            right,
+            tmp_path,
+            "source.mp4",
+            settings,
+            total_frames=1,
+        )
+
+    assert final.read_bytes() == b"new-valid-video"
+    assert not temporary.exists()
+    assert unrelated.read_bytes() == b"keep-me"
+    assert left[0].read_bytes() == left_before
+    assert right[0].read_bytes() == right_before
+
+
+def test_direct_create_video_failure_preserves_old_final_and_removes_temp(tmp_path, capsys):
+    left = _write_eye_sequence(tmp_path / "left", [1])
+    right = _write_eye_sequence(tmp_path / "right", [1])
+    settings = _direct_settings()
+    final = tmp_path / generate_output_filename(
+        "source.mp4", settings["vr_format"], settings["vr_resolution"]
+    )
+    temporary = tmp_path / f".{final.stem}.direct.tmp.mp4"
+    final.write_bytes(b"old-valid-video")
+
+    def launch(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"partial")
+        output = "".join(f"line-{index}\n" for index in range(75))
+        return _FakeProcess(output, returncode=1)
+
+    with (
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+            return_value=True,
+        ),
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
+            side_effect=launch,
+        ),
+    ):
+        assert not VideoEncoder().create_video_from_stereo_sequences(
+            left,
+            right,
+            tmp_path,
+            "source.mp4",
+            settings,
+            total_frames=1,
+        )
+
+    output = capsys.readouterr().out
+    assert "return code 1" in output
+    assert "line-25" in output
+    assert "line-74" in output
+    assert "line-24" not in output
+    assert final.read_bytes() == b"old-valid-video"
+    assert not temporary.exists()
+
+
+def test_direct_create_video_validates_before_launch_and_cleans_stale_temp(tmp_path):
+    settings = _direct_settings()
+    final = tmp_path / generate_output_filename(
+        "source.mp4", settings["vr_format"], settings["vr_resolution"]
+    )
+    temporary = tmp_path / f".{final.stem}.direct.tmp.mp4"
+    final.write_bytes(b"old-valid-video")
+    temporary.write_bytes(b"stale-partial-video")
+
+    with (
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+            return_value=True,
+        ),
+        patch("src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen") as popen,
+    ):
+        assert not VideoEncoder().create_video_from_stereo_sequences(
+            [],
+            [],
+            tmp_path,
+            "source.mp4",
+            settings,
+            total_frames=0,
+        )
+
+    popen.assert_not_called()
+    assert final.read_bytes() == b"old-valid-video"
+    assert not temporary.exists()
+
+
+def test_direct_create_video_cleans_temp_after_launch_exception(tmp_path):
+    left = _write_eye_sequence(tmp_path / "left", [1])
+    right = _write_eye_sequence(tmp_path / "right", [1])
+    settings = _direct_settings()
+    final = tmp_path / generate_output_filename(
+        "source.mp4", settings["vr_format"], settings["vr_resolution"]
+    )
+    temporary = tmp_path / f".{final.stem}.direct.tmp.mp4"
+    final.write_bytes(b"old-valid-video")
+
+    with (
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+            return_value=True,
+        ),
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
+            side_effect=OSError("launch failed"),
+        ),
+    ):
+        assert not VideoEncoder().create_video_from_stereo_sequences(
+            left,
+            right,
+            tmp_path,
+            "source.mp4",
+            settings,
+            total_frames=1,
+        )
+
+    assert final.read_bytes() == b"old-valid-video"
+    assert not temporary.exists()
+
+
+def test_direct_create_video_rejects_zero_byte_temporary_output(tmp_path):
+    left = _write_eye_sequence(tmp_path / "left", [1])
+    right = _write_eye_sequence(tmp_path / "right", [1])
+    settings = _direct_settings()
+    final = tmp_path / generate_output_filename(
+        "source.mp4", settings["vr_format"], settings["vr_resolution"]
+    )
+    temporary = tmp_path / f".{final.stem}.direct.tmp.mp4"
+    final.write_bytes(b"old-valid-video")
+
+    def launch(command, **_kwargs):
+        Path(command[-1]).touch()
+        return _FakeProcess("frame=1\n")
+
+    with (
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+            return_value=True,
+        ),
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
+            side_effect=launch,
+        ),
+    ):
+        assert not VideoEncoder().create_video_from_stereo_sequences(
+            left,
+            right,
+            tmp_path,
+            "source.mp4",
+            settings,
+            total_frames=1,
+        )
+
+    assert final.read_bytes() == b"old-valid-video"
+    assert not temporary.exists()
+
+
+def test_direct_create_video_cleans_temp_when_atomic_replace_fails(tmp_path):
+    left = _write_eye_sequence(tmp_path / "left", [1])
+    right = _write_eye_sequence(tmp_path / "right", [1])
+    settings = _direct_settings()
+    final = tmp_path / generate_output_filename(
+        "source.mp4", settings["vr_format"], settings["vr_resolution"]
+    )
+    temporary = tmp_path / f".{final.stem}.direct.tmp.mp4"
+    final.write_bytes(b"old-valid-video")
+
+    def launch(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"new-valid-video")
+        return _FakeProcess("frame=1\n")
+
+    with (
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+            return_value=True,
+        ),
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
+            side_effect=launch,
+        ),
+        patch.object(Path, "replace", side_effect=OSError("replace failed")) as replace,
+    ):
+        assert not VideoEncoder().create_video_from_stereo_sequences(
+            left,
+            right,
+            tmp_path,
+            "source.mp4",
+            settings,
+            total_frames=1,
+        )
+
+    replace.assert_called_once_with(final)
+    assert final.read_bytes() == b"old-valid-video"
+    assert not temporary.exists()
 
 
 def test_extract_frames_writes_content_bound_stage_manifest(tmp_path):

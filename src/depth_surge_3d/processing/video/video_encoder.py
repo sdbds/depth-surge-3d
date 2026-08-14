@@ -6,6 +6,8 @@ Handles FFmpeg-based video encoding with hardware acceleration support (NVENC).
 
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 import re
@@ -342,6 +344,138 @@ class VideoEncoder:
         )
         command.extend(encoder_args)
         return command
+
+    def _run_ffmpeg_with_progress(
+        self,
+        command: list[str],
+        total_frames: int,
+        progress_tracker,
+    ) -> tuple[int, tuple[str, ...]]:
+        """Run FFmpeg with one merged progress stream and bounded diagnostics."""
+
+        diagnostics: deque[str] = deque(maxlen=50)
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+        try:
+            if process.stdout is None:
+                raise OSError("FFmpeg progress stream is unavailable")
+            for raw_line in process.stdout:
+                self._consume_direct_ffmpeg_line(
+                    raw_line, total_frames, progress_tracker, diagnostics
+                )
+            return process.wait(), tuple(diagnostics)
+        except Exception:
+            process.terminate()
+            try:
+                remaining, _ = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                remaining, _ = process.communicate()
+            for raw_line in (remaining or "").splitlines():
+                self._consume_direct_ffmpeg_line(
+                    raw_line, total_frames, progress_tracker, diagnostics
+                )
+            raise
+
+    @staticmethod
+    def _consume_direct_ffmpeg_line(
+        raw_line: str,
+        total_frames: int,
+        progress_tracker,
+        diagnostics: deque[str],
+    ) -> None:
+        """Parse one progress line without allowing tracker failures to escape."""
+
+        line = raw_line.strip()
+        if not line:
+            return
+        if not line.startswith("frame="):
+            diagnostics.append(line)
+            return
+        try:
+            frame = min(max(int(line.partition("=")[2]), 0), total_frames)
+        except ValueError:
+            diagnostics.append(line)
+            return
+        try:
+            if progress_tracker is not None:
+                progress_tracker.update_progress(
+                    f"Encoding VR frame {frame}/{total_frames}",
+                    phase="video_encoding",
+                    frame_num=frame,
+                    step_name="Direct VR Encoding",
+                    step_progress=frame,
+                    step_total=total_frames,
+                )
+        except Exception as error:
+            print(f"Warning: Direct encoding progress update failed: {error}")
+
+    @staticmethod
+    def _print_direct_ffmpeg_failure(returncode: int, diagnostics: tuple[str, ...]) -> None:
+        """Print FFmpeg's bounded diagnostic tail for a failed direct encode."""
+
+        print(f"Error: Direct FFmpeg encoding failed with return code {returncode}.")
+        if diagnostics:
+            print("FFmpeg diagnostic tail:")
+            for line in diagnostics:
+                print(f"  {line}")
+
+    def create_video_from_stereo_sequences(
+        self,
+        left_files: Sequence[Path],
+        right_files: Sequence[Path],
+        output_dir: Path,
+        original_video: str,
+        settings: dict[str, Any],
+        *,
+        total_frames: int,
+        progress_tracker=None,
+    ) -> bool:
+        """Encode validated eye sequences and atomically publish the final video."""
+
+        if not verify_ffmpeg_installation():
+            print("Error: FFmpeg not found. Cannot create output video.")
+            return False
+
+        output_filename = generate_output_filename(
+            Path(original_video).name,
+            settings["vr_format"],
+            settings["vr_resolution"],
+        )
+        output_path = output_dir / output_filename
+        temporary = output_path.with_name(f".{output_path.stem}.direct.tmp.mp4")
+        try:
+            temporary.unlink(missing_ok=True)
+            sequence = self._validate_direct_stereo_sequence(
+                list(left_files), list(right_files), total_frames
+            )
+            command = self._build_direct_stereo_command(
+                sequence, temporary, original_video, settings
+            )
+            returncode, diagnostics = self._run_ffmpeg_with_progress(
+                command, sequence.frame_count, progress_tracker
+            )
+            if returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+                self._print_direct_ffmpeg_failure(returncode, diagnostics)
+                return False
+            temporary.replace(output_path)
+            return True
+        except Exception as error:
+            print(f"Error creating direct VR output video: {error}")
+            return False
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as error:
+                print(f"Warning: Could not clean direct VR temporary output: {error}")
 
     def extract_frames(
         self,
