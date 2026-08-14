@@ -117,6 +117,8 @@ class ProcessingOrchestrator:
 
             return success
 
+        except InterruptedError:
+            raise
         except Exception as e:
             print(f"Error in video processing: {e}")
             if self._settings_file:
@@ -286,30 +288,48 @@ class ProcessingOrchestrator:
             self._print_saved_to(directories.get("right_upscaled"), "Upscaled right frames")
             print()  # Blank line after left/right pair
 
-        # Step 7: Assemble VR frames (delegated to vr_assembler)
-        if not self.vr_assembler.assemble_vr_frames(
-            directories, settings, progress_tracker, num_frames
-        ):
-            return self._handle_step_error("VR frame assembly failed")
-        print(
-            step_complete(
-                f"Step 7: Assembled {num_frames} {settings['vr_format']} VR frames at {settings['vr_output_width']}x{settings['vr_output_height']}"
+        if settings.get("direct_vr_encode", False):
+            source_files = self.vr_assembler.resolve_vr_source_files(
+                directories, settings, num_frames
             )
-        )
-        self._print_saved_to(directories.get("vr_frames"), "VR frames")
-        print()  # Blank line after step
+            if source_files is None:
+                return self._handle_step_error("Direct VR source validation failed")
+            left_files, right_files = source_files
+            print(step_complete("Step 7: Deferred VR assembly to direct FFmpeg encoding"))
+            success = self.video_encoder.create_video_from_stereo_sequences(
+                left_files,
+                right_files,
+                directories["base"],
+                video_path,
+                settings,
+                total_frames=num_frames,
+                progress_tracker=progress_tracker,
+            )
+        else:
+            # Step 7: Assemble VR frames (delegated to vr_assembler)
+            if not self.vr_assembler.assemble_vr_frames(
+                directories, settings, progress_tracker, num_frames
+            ):
+                return self._handle_step_error("VR frame assembly failed")
+            print(
+                step_complete(
+                    f"Step 7: Assembled {num_frames} {settings['vr_format']} VR frames at {settings['vr_output_width']}x{settings['vr_output_height']}"
+                )
+            )
+            self._print_saved_to(directories.get("vr_frames"), "VR frames")
+            print()  # Blank line after step
 
-        # Step 8: Create final video (delegated to video_encoder)
-        vr_frames_dir = directories.get("vr_frames")
-        if not vr_frames_dir:
-            return self._handle_step_error("VR frames directory not found")
+            # Step 8: Create final video (delegated to video_encoder)
+            vr_frames_dir = directories.get("vr_frames")
+            if not vr_frames_dir:
+                return self._handle_step_error("VR frames directory not found")
 
-        success = self.video_encoder.create_video(
-            vr_frames_dir,
-            directories["base"],
-            video_path,
-            settings,
-        )
+            success = self.video_encoder.create_video(
+                vr_frames_dir,
+                directories["base"],
+                video_path,
+                settings,
+            )
 
         if success:
             output_filename = generate_output_filename(
@@ -351,7 +371,14 @@ class ProcessingOrchestrator:
             - Console output
         """
         output_path = Path(output_dir)
-        directories = create_output_directories(output_path, settings["keep_intermediates"])
+        if settings.get("direct_vr_encode", False):
+            directories = create_output_directories(
+                output_path,
+                settings["keep_intermediates"],
+                omitted_intermediates={"vr_frames"},
+            )
+        else:
+            directories = create_output_directories(output_path, settings["keep_intermediates"])
         batch_name = f"{Path(video_path).stem}_{int(time.time())}"
         settings_file = save_processing_settings(
             output_path, batch_name, settings, video_properties, video_path

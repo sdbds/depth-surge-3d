@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import pytest
+
 from src.depth_surge_3d.processing.orchestration.pipeline_orchestrator import (
     ProcessingOrchestrator,
 )
@@ -107,6 +109,52 @@ class TestSetupProcessing:
         assert settings_file == Path("/output/dir/settings.json")
         mock_create_dirs.assert_called_once_with(Path("/output/dir"), True)
 
+    def test_setup_processing_omits_vr_directory_in_direct_mode(self):
+        """Direct encoding does not create the unused assembled-frame directory."""
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        with (
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.create_output_directories",
+                return_value={"base": Path("/output/dir")},
+            ) as create_dirs,
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.save_processing_settings"
+            ),
+        ):
+            orchestrator._setup_processing(
+                "/input/video.mp4",
+                "/output/dir",
+                {"keep_intermediates": True, "direct_vr_encode": True},
+                {"fps": 30, "frame_count": 1},
+            )
+
+        create_dirs.assert_called_once_with(
+            Path("/output/dir"),
+            True,
+            omitted_intermediates={"vr_frames"},
+        )
+
+    def test_setup_processing_keeps_legacy_directory_call_when_direct_mode_is_false(self):
+        """Explicitly disabling direct mode preserves the legacy directory setup."""
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        with (
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.create_output_directories",
+                return_value={"base": Path("/output/dir")},
+            ) as create_dirs,
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.save_processing_settings"
+            ),
+        ):
+            orchestrator._setup_processing(
+                "/input/video.mp4",
+                "/output/dir",
+                {"keep_intermediates": True, "direct_vr_encode": False},
+                {"fps": 30, "frame_count": 1},
+            )
+
+        create_dirs.assert_called_once_with(Path("/output/dir"), True)
+
 
 class TestFinalizeProcessing:
     """Test _finalize_processing method."""
@@ -208,6 +256,178 @@ class TestFinalizeProcessing:
 
 
 class TestExecutePipeline:
+    @staticmethod
+    def _direct_encoding_dependencies(tmp_path):
+        frame = tmp_path / "frame_000001.png"
+        depth = tmp_path / "depth_000001.png"
+        left = tmp_path / "left_cropped" / "frame_000001.png"
+        right = tmp_path / "right_cropped" / "frame_000001.png"
+        directories = {
+            "base": tmp_path,
+            "left_frames": tmp_path / "left",
+            "right_frames": tmp_path / "right",
+            "left_cropped": tmp_path / "left_cropped",
+            "right_cropped": tmp_path / "right_cropped",
+        }
+        settings = {
+            "apply_distortion": False,
+            "upscale_model": "none",
+            "per_eye_width": 8,
+            "per_eye_height": 8,
+            "vr_format": "side_by_side",
+            "vr_output_width": 16,
+            "vr_output_height": 8,
+            "vr_resolution": "custom",
+            "keep_intermediates": True,
+            "direct_vr_encode": True,
+        }
+        stereo_generator = Mock()
+        stereo_generator.create_stereo_pairs_from_files.return_value = True
+        distortion_processor = Mock()
+        distortion_processor.crop_frames.return_value = True
+        vr_assembler = Mock()
+        video_encoder = Mock()
+        orchestrator = ProcessingOrchestrator(
+            Mock(),
+            stereo_generator,
+            distortion_processor,
+            Mock(),
+            vr_assembler,
+            video_encoder,
+        )
+        return (
+            orchestrator,
+            directories,
+            settings,
+            frame,
+            depth,
+            left,
+            right,
+            vr_assembler,
+            video_encoder,
+        )
+
+    def test_direct_encoding_uses_resolved_stereo_sources(self, tmp_path, capsys):
+        """Direct mode sends resolved pairs to FFmpeg without assembling VR frames."""
+        (
+            orchestrator,
+            directories,
+            settings,
+            frame,
+            depth,
+            left,
+            right,
+            vr_assembler,
+            video_encoder,
+        ) = self._direct_encoding_dependencies(tmp_path)
+        progress_tracker = Mock()
+        vr_assembler.resolve_vr_source_files.return_value = ([left], [right])
+        video_encoder.create_video_from_stereo_sequences.return_value = True
+
+        with patch.object(orchestrator, "_finalize_processing"):
+            assert orchestrator._execute_remaining_steps(
+                directories,
+                settings,
+                [frame],
+                [depth],
+                24.0,
+                "source.mp4",
+                directories["base"],
+                progress_tracker,
+            )
+
+        vr_assembler.assemble_vr_frames.assert_not_called()
+        vr_assembler.resolve_vr_source_files.assert_called_once_with(directories, settings, 1)
+        video_encoder.create_video.assert_not_called()
+        video_encoder.create_video_from_stereo_sequences.assert_called_once_with(
+            [left],
+            [right],
+            directories["base"],
+            "source.mp4",
+            settings,
+            total_frames=1,
+            progress_tracker=progress_tracker,
+        )
+        assert "VR frames" not in capsys.readouterr().out
+
+    def test_direct_encoding_stops_when_stereo_sources_are_invalid(self, tmp_path):
+        """Direct source validation failure never starts either video encoder path."""
+        (
+            orchestrator,
+            directories,
+            settings,
+            frame,
+            depth,
+            _left,
+            _right,
+            vr_assembler,
+            video_encoder,
+        ) = self._direct_encoding_dependencies(tmp_path)
+        vr_assembler.resolve_vr_source_files.return_value = None
+
+        assert not orchestrator._execute_remaining_steps(
+            directories,
+            settings,
+            [frame],
+            [depth],
+            24.0,
+            "source.mp4",
+            directories["base"],
+        )
+
+        vr_assembler.assemble_vr_frames.assert_not_called()
+        video_encoder.create_video.assert_not_called()
+        video_encoder.create_video_from_stereo_sequences.assert_not_called()
+
+    def test_direct_encoding_failure_finalizes_without_cleanup(self, tmp_path):
+        """A failed direct FFmpeg encode uses failure finalization and keeps intermediates."""
+        (
+            orchestrator,
+            directories,
+            settings,
+            frame,
+            depth,
+            left,
+            right,
+            vr_assembler,
+            video_encoder,
+        ) = self._direct_encoding_dependencies(tmp_path)
+        settings["keep_intermediates"] = False
+        progress_tracker = Mock()
+        vr_assembler.resolve_vr_source_files.return_value = ([left], [right])
+        video_encoder.create_video_from_stereo_sequences.return_value = False
+
+        with (
+            patch.object(
+                orchestrator,
+                "_finalize_processing",
+                wraps=orchestrator._finalize_processing,
+            ) as finalize,
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.cleanup_intermediate_files"
+            ) as cleanup,
+        ):
+            assert not orchestrator._execute_remaining_steps(
+                directories,
+                settings,
+                [frame],
+                [depth],
+                24.0,
+                "source.mp4",
+                directories["base"],
+                progress_tracker,
+            )
+
+        finalize.assert_called_once_with(
+            False,
+            directories["base"],
+            "source.mp4",
+            settings,
+            1,
+        )
+        progress_tracker.finish.assert_called_once_with("Video processing complete")
+        cleanup.assert_not_called()
+
     def test_required_distortion_stage_fails_when_stereo_outputs_are_missing(self, tmp_path):
         stereo_generator = Mock()
         stereo_generator.create_stereo_pairs_from_files.return_value = True
@@ -299,6 +519,7 @@ class TestExecutePipeline:
         assert result is True
         depth_processor.generate_depth_map_files.assert_called_once()
         stereo_generator.create_stereo_pairs_from_files.assert_called_once()
+        video_encoder.create_video_from_stereo_sequences.assert_not_called()
         saved_to.assert_any_call(directories["disparity_maps"], "Canonical disparity maps")
 
 
@@ -383,3 +604,31 @@ class TestProcessMethod:
             )
 
             assert result is False
+
+    def test_process_propagates_interrupted_error(self, tmp_path):
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+
+        with (
+            patch.object(
+                orchestrator,
+                "_setup_processing",
+                return_value=(tmp_path, {"base": tmp_path}, tmp_path / "settings.json"),
+            ),
+            patch.object(
+                orchestrator,
+                "_execute_pipeline",
+                side_effect=InterruptedError("Processing stopped by user request"),
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.update_processing_status"
+            ) as update_status,
+        ):
+            with pytest.raises(InterruptedError, match="stopped by user request"):
+                orchestrator.process(
+                    video_path=tmp_path / "source.mp4",
+                    output_dir=tmp_path,
+                    video_properties={"fps": 30, "frame_count": 1},
+                    settings={"keep_intermediates": True, "direct_vr_encode": True},
+                )
+
+        update_status.assert_not_called()

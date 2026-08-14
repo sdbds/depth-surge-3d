@@ -459,6 +459,7 @@ class ProgressCallback:
             "VR Assembly",  # Step 7: Assemble final VR frames
             "Video Creation",  # Step 8: FFmpeg creates video
         ]
+        self.step_aliases = {"Direct VR Encoding": "Video Creation"}
         # Weighted progress based on actual timing measurements
         # [2%, 35%, 20%, 8%, 2%, 18%, 8%, 7%] = 100%
         self.step_weights = PROGRESS_STEP_WEIGHTS
@@ -751,8 +752,9 @@ class ProgressCallback:
             self.step_start_progress = 0  # Reset progress for new step
 
             # Update step index
-            if step_name in self.steps:
-                self.current_step_index = self.steps.index(step_name)
+            weighted_step_name = self.step_aliases.get(step_name, step_name)
+            if weighted_step_name in self.steps:
+                self.current_step_index = self.steps.index(weighted_step_name)
 
         # Update step progress
         if step_progress is not None:

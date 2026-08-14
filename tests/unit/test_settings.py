@@ -7,9 +7,34 @@ import os
 import pytest
 
 from src.depth_surge_3d.core.settings import (
+    PROCESSING_SETTINGS_SCHEMA_VERSION,
     REMOVED_SETTING_NAMES,
     validate_settings,
 )
+from src.depth_surge_3d.core.constants import DEFAULT_SETTINGS
+
+
+def test_direct_vr_encode_defaults_off() -> None:
+    assert DEFAULT_SETTINGS["direct_vr_encode"] is False
+    assert validate_settings({}, source="legacy_disk")["direct_vr_encode"] is False
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", "true", None])
+def test_direct_vr_encode_rejects_non_booleans(value: object) -> None:
+    with pytest.raises(ValueError, match="direct_vr_encode"):
+        validate_settings({"direct_vr_encode": value}, source="explicit")
+
+
+@pytest.mark.parametrize("value", [False, True])
+def test_direct_vr_encode_accepts_booleans(value: bool) -> None:
+    assert (
+        validate_settings({"direct_vr_encode": value}, source="explicit")["direct_vr_encode"]
+        is value
+    )
+
+
+def test_direct_vr_encode_does_not_bump_settings_schema() -> None:
+    assert PROCESSING_SETTINGS_SCHEMA_VERSION == 2
 
 
 def test_final_defaults_cover_depth_dibr_and_migration_controls() -> None:

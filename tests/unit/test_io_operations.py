@@ -10,6 +10,7 @@ from src.depth_surge_3d.io.operations import (
     get_frame_files,
     create_output_directories,
 )
+from src.depth_surge_3d.core.constants import INTERMEDIATE_DIRS
 
 
 class TestShouldKeepFile:
@@ -270,6 +271,33 @@ class TestCreateOutputDirectories:
         assert "disparity_maps" in result
         assert "depth_maps" not in result
         assert "vr_frames" in result
+
+    def test_create_output_directories_can_omit_vr_stage(self, tmp_path):
+        result = create_output_directories(
+            tmp_path,
+            keep_intermediates=True,
+            omitted_intermediates={"vr_frames"},
+        )
+
+        assert "vr_frames" not in result
+        assert not (tmp_path / INTERMEDIATE_DIRS["vr_frames"]).exists()
+        assert result["left_cropped"].is_dir()
+        assert result["right_cropped"].is_dir()
+
+    def test_omission_never_deletes_preexisting_vr_stage(self, tmp_path):
+        vr_dir = tmp_path / INTERMEDIATE_DIRS["vr_frames"]
+        vr_dir.mkdir(parents=True)
+        marker = vr_dir / "frame_000001.png"
+        marker.write_bytes(b"existing")
+
+        result = create_output_directories(
+            tmp_path,
+            keep_intermediates=False,
+            omitted_intermediates={"vr_frames"},
+        )
+
+        assert "vr_frames" not in result
+        assert marker.read_bytes() == b"existing"
 
 
 class TestValidateVideoFile:

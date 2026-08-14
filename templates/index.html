@@ -1299,6 +1299,13 @@
                                 <i class="fas fa-exclamation-triangle"></i> May use significant disk space (~10-50GB for long videos)
                             </small>
                         </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="directVrEncode">
+                            <label class="form-check-label" for="directVrEncode">
+                                Direct FFmpeg VR Encoding
+                                <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Advanced: encode directly from left/right frames and skip assembled VR-frame files."></i>
+                            </label>
+                        </div>
                         <div class="mb-3">
                             <label class="form-label">Video Encoder <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Auto detects NVENC (NVIDIA GPU) and falls back to software. Software encoding is slower but works on all systems."></i></label>
                             <select class="form-select" id="videoEncoder">
@@ -2174,6 +2181,7 @@
                 migrate_legacy: document.getElementById('migrateLegacy').value,
                 preserve_audio: document.getElementById('preserveAudio').checked,
                 keep_intermediates: document.getElementById('keepIntermediates').checked,
+                direct_vr_encode: document.getElementById('directVrEncode').checked,
                 video_encoder: document.getElementById('videoEncoder').value,
                 device: document.getElementById('device').value,
                 model_size: document.getElementById('modelSize').value,
@@ -3010,6 +3018,7 @@
                 // Audio and intermediates
                 preserveAudio: document.getElementById('preserveAudio').checked,
                 keepIntermediates: document.getElementById('keepIntermediates').checked,
+                directVrEncode: document.getElementById('directVrEncode').checked,
                 videoEncoder: document.getElementById('videoEncoder').value,
 
                 // Fisheye and cropping
@@ -3097,6 +3106,7 @@
                 depthModelType: 'metric',
                 preserveAudio: true,
                 keepIntermediates: true,
+                directVrEncode: false,
                 videoEncoder: 'auto',
                 applyDistortion: true,
                 fisheyeProjection: 'stereographic',
@@ -3137,7 +3147,7 @@
                 'startTime', 'endTime', 'vrFormat', 'vrResolution', 'stereoStrength', 'convergence', 'occlusionFill',
                 'sceneDetection', 'sceneCutThreshold', 'minSceneFrames', 'rawStorageDtype', 'stereoIoWorkers', 'migrateLegacy',
                 'resolution', 'targetFps', 'superSample', 'device', 'modelSize', 'depthModelVersion', 'depthModelType', 'depthResolution', 'videoEncoder',
-                'preserveAudio', 'keepIntermediates', 'applyDistortion', 'fisheyeProjection', 'fisheyeFov', 'cropFactor',
+                'preserveAudio', 'keepIntermediates', 'directVrEncode', 'applyDistortion', 'fisheyeProjection', 'fisheyeFov', 'cropFactor',
                 'fisheyeCropFactor', 'applyUpscaling', 'upscaleModel', 'experimentalFrameInterpolation'
             ];
             
