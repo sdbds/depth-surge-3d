@@ -43,6 +43,8 @@ def test_benchmark_smoke_reports_review_schema_and_pipeline_metrics(tmp_path) ->
     assert result["torch_version"]
     assert result["renderer_latency_median_seconds"] > 0.0
     assert result["renderer_latency_p95_seconds"] > 0.0
+    assert result["renderer_mean_ms_per_frame"] > 0.0
+    assert "gpu_render_ms_per_frame" not in result
     assert result["renderer_fps"] > 0.0
     assert result["host_geometry_seconds_median"] >= 0.0
     assert result["host_geometry_bytes_per_frame"] == 2 * 32 * 18 * 4

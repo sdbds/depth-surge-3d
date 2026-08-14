@@ -280,7 +280,7 @@ def _measure_renderer(
         "host_geometry_bytes_per_frame": int(np.median(geometry_bytes)),
         "offset_transfer_seconds_median": float(np.median(transfer)),
         "offset_transfer_bytes_per_frame": int(np.median(transfer_bytes)),
-        "gpu_render_ms_per_frame": (1000.0 * wall_seconds / frame_count if is_cuda else None),
+        "renderer_mean_ms_per_frame": 1000.0 * wall_seconds / frame_count,
         "peak_cuda_allocated_bytes": allocated,
         "peak_cuda_reserved_bytes": reserved,
         "peak_cuda_bytes": allocated,

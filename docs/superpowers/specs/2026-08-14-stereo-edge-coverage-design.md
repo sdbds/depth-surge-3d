@@ -2,15 +2,16 @@
 
 ## Status
 
-Revision 3, updated on 2026-08-14 after a second independent review of Revision
-2. Revision 1's two-layer coverage-budget model remains rejected. Revision 3
-keeps the four-sample geometry but removes avoidable reduction passes, makes the
-local copyrighted-sample check an explicit manual gate, and closes the
-determinism, memory, batching, rounding, and fill-semantics gaps found in the
-second review.
+Revision 4, updated on 2026-08-14 after executing the hash-pinned production
+sample gate from approved Revision 3. Revision 1's two-layer coverage-budget
+model remains rejected. Revision 3's data structure, packed visibility key,
+host geometry, fill semantics, determinism rules, and manual-gate isolation
+remain selected, but its fixed four-sample resolution failed its own production
+quality threshold.
 
-The document is pending user review. It authorizes no implementation until the
-user approves it.
+Revision 4 changes the fixed horizontal sample count from four to eight without
+weakening the approved thresholds. The user approved implementation on
+2026-08-14 after the experimental `S=4` audit trail below was made explicit.
 
 ## Review Disposition
 
@@ -19,9 +20,41 @@ occupied the target pixel. The same `0.5 foreground + 0.5 background` data can
 mean complementary half-pixel coverage or complete overlap. Those cases require
 different output but were indistinguishable in the proposed data structure.
 
-This revision resolves the review findings as follows:
+Revision 3's prototype matched its independent `S=4` oracle exactly on all six
+production ROIs. Its p95, non-edge regression, structural, procedural,
+determinism, and memory checks passed, and the intended contour visibly became
+smoother. It nevertheless failed the required edge-MAE ratio in four of six
+ROI/eye combinations. The ratios below use the same resized canonical map,
+strict z-buffer, fill policy, edge mask, v1 files, and independent `S=64`
+oracle. Only the candidate sample count changes:
 
-- Preserve horizontal occupancy as four explicit target samples per output
+| ROI | Eye | `S=4` / v1 MAE | `S=8` / v1 MAE | Required |
+|---|---|---:|---:|---:|
+| left sleeve/hand | left | 0.567 | 0.324 | <= 0.700 |
+| left sleeve/hand | right | 0.802 | 0.433 | <= 0.700 |
+| right sleeve | left | 0.747 | 0.413 | <= 0.700 |
+| right sleeve | right | 0.518 | 0.300 | <= 0.700 |
+| guitar/dress boundary | left | 1.229 | 0.617 | <= 0.700 |
+| guitar/dress boundary | right | 0.914 | 0.531 | <= 0.700 |
+
+The `S=8` numbers are design-selection diagnostics from the independent CPU
+oracle, not substitute release evidence. Production `S=8` must still match its
+discrete oracle and rerun every gate. This sensitivity test disproves Revision
+3's claim that a real-sample failure after procedural success necessarily means
+the depth boundary must be reconstructed: increasing only horizontal sampling
+resolution crosses every existing threshold.
+
+After Revision 3 was approved, its fixed `S=4` design was implemented as a
+bounded experimental prototype in this isolated worktree to validate the
+four-sample assumption and generate the sensitivity evidence above. It matched
+its independent discrete oracle and passed the procedural gates, but failed four
+of six production edge-MAE ratios. It was never merged to the main branch and
+creates no production contract. Revision 4 supersedes it with `S=8` before any
+v2 renderer reaches production.
+
+Revision 4 resolves the findings as follows:
+
+- Preserve horizontal occupancy as eight explicit target samples per output
   pixel instead of one scalar coverage value.
 - Resolve every source contribution at every covered target sample, so there is
   no fixed two-layer limit.
@@ -59,10 +92,11 @@ visibility and sampling defect, not merely an encoder or hole-fill defect.
 
 ### Is there a simpler solution?
 
-Yes. Use a fixed four-sample horizontal z-buffer. Projection is horizontal, so
-two-dimensional supersampling is unnecessary. Four horizontal samples preserve
-quarter-pixel occupancy, handle any number of overlapping depths with one
-uniform rule, and remove the binary winner special cases.
+Yes. Use a fixed eight-sample horizontal z-buffer. Projection is horizontal, so
+two-dimensional supersampling is unnecessary. Eight horizontal samples are the
+smallest tested uniform grid that passes all six hash-pinned production
+comparisons without changing thresholds. The same uniform z-buffer handles any
+number of overlapping depths and removes the binary winner special cases.
 
 An exact one-dimensional interval envelope is mathematically cleaner but
 requires dynamic endpoint collection and a variable-length depth sweep per
@@ -78,7 +112,7 @@ low-level batched `[N,H,W,3]` splat input is removed; the production renderer ha
 never used it and accepts one eye band at a time.
 
 `occlusion_fill=none` also changes visibly at partially covered silhouettes. For
-example, one valid foreground lane plus three unresolved lanes produces 25
+example, one valid foreground lane plus seven unresolved lanes produces 12.5
 percent foreground over black, whereas v1 normalized any positive accumulated
 weight to an opaque foreground colour. A dark contour in this mode is therefore
 an intentional consequence of returning RGB without an alpha channel or
@@ -92,28 +126,28 @@ all stages upstream of stereo.
 
 ## Decision
 
-Replace bilinear point splatting plus binary visibility with a fixed `4x`
+Replace bilinear point splatting plus binary visibility with a fixed `8x`
 horizontal subpixel z-buffer inside the existing Torch renderer.
 
 ```python
-HORIZONTAL_SUBPIXELS = 4
+HORIZONTAL_SUBPIXELS = 8
 ```
 
 This is an algorithm constant, not a setting. It is encoded in the stereo
 algorithm version. Changing it requires another algorithm-version bump.
 
-Do not change canonical disparity generation or resizing in this work. If the
-reported-sample gate still fails after correct subpixel visibility, the
-remaining error belongs to disparity-boundary reconstruction and requires a
-separate design.
+Do not change canonical disparity generation or resizing in this work. A
+reported-sample failure does not by itself authorize disparity-boundary
+reconstruction. Apply the sample-count sensitivity procedure in the Failure
+Policy before assigning the error to geometry or to the model boundary.
 
 ## Alternatives Considered
 
-### Fixed 4x Horizontal Subpixel Z-buffer: Selected
+### Fixed 8x Horizontal Subpixel Z-buffer: Selected
 
-Each source pixel projects an opaque unit-width horizontal footprint. Four
+Each source pixel projects an opaque unit-width horizontal footprint. Eight
 target sample points per output pixel retain occupancy position. Every covered
-sample performs an ordinary nearest-depth selection, then the four winning
+sample performs an ordinary nearest-depth selection, then the eight winning
 colours are averaged.
 
 The work grows horizontally only. It naturally handles complementary coverage,
@@ -155,7 +189,7 @@ Lowering strength hides the symptom; it does not correct occupancy.
 
 ## Goals
 
-- Preserve quarter-pixel horizontal occupancy through visibility resolution.
+- Preserve one-eighth-pixel horizontal occupancy through visibility resolution.
 - Resolve arbitrary overlapping depth layers without a fixed layer count.
 - Keep fully covered near surfaces fully occlusive.
 - Preserve one-pixel source objects when they remain visible at a target sample.
@@ -201,7 +235,7 @@ computed. Pixel disparity is never resized after calculation.
 
 ## Subpixel Geometry
 
-Let `S = HORIZONTAL_SUBPIXELS = 4`.
+Let `S = HORIZONTAL_SUBPIXELS = 8`.
 
 Source pixel centre `x` owns the half-open unit interval:
 
@@ -356,21 +390,34 @@ With `occlusion_fill=none`, skip all fill steps. Invalid fine samples stay black
 ## Downsampling and Public Masks
 
 After optional fill, reshape fine-grid colour from `[H,W*S,3]` to `[H,W,S,3]`.
-For production `uint8` input, sum lanes in the fixed order
-`((lane0 + lane1) + lane2) + lane3`, multiply by `0.25`, round once to nearest
-with ties to even (`np.rint` semantics), and convert to source dtype. Invalid
-lanes contribute black and are never divided away. For example, `127.5` rounds
-to `128`, while `126.5` rounds to `126`.
+For production `uint8` input, use this fixed balanced addition tree:
 
-This is the critical semantic correction: one known foreground lane plus three
-unknown lanes remains 25 percent foreground over black when fill is disabled or
-impossible. It never becomes opaque foreground through normalization.
+```text
+p01 = lane0 + lane1
+p23 = lane2 + lane3
+p45 = lane4 + lane5
+p67 = lane6 + lane7
+q03 = p01 + p23
+q47 = p45 + p67
+total = q03 + q47
+output = total * 0.125
+```
+
+Round once to nearest with ties to even (`np.rint` semantics), then convert to
+source dtype. Invalid lanes contribute black and are never divided away. Test
+lane sets whose totals are `1020` and `1012`, so their averages `127.5` and
+`126.5` round to `128` and `126`. Every `uint8` intermediate is an integer no
+larger than `2040` and is exactly representable in float32.
+
+This is the critical semantic correction: one known foreground lane plus seven
+unknown lanes remains 12.5 percent foreground over black when fill is disabled
+or impossible. It never becomes opaque foreground through normalization.
 
 `StereoRenderResult` retains its current six public arrays and shapes. Pixel
 masks are derived as follows:
 
-- `valid_mask[p]` is true when any of the four samples was valid before fill.
-- `hole_mask[p]` is true when all four samples remain invalid after fill.
+- `valid_mask[p]` is true when any of the eight samples was valid before fill.
+- `hole_mask[p]` is true when all eight samples remain invalid after fill.
 
 Partial occupancy is represented in output colour, not exposed as a new public
 alpha array. This preserves the existing meaning that every `hole_mask` pixel is
@@ -421,17 +468,38 @@ a peak live-set table containing at least:
 - background-fill cumulative indexes and candidate colours;
 - framework sort or scatter workspace if allocated.
 
-The review-time planning estimate is roughly `230 B/source-pixel` before
-headroom. Use `300-400 B/source-pixel` for capacity planning until measurement
-replaces it; this range is not permission to hard-code an unmeasured value. At
-width `3840` under the `256 MiB` budget, `300 B` permits about 233 complete rows
-and `400 B` about 174, or roughly 10-13 bands for a 2160-row frame. The current
-`192 B` assumption permits about 364 rows and six bands, so launch and per-band
-transfer overhead are a material part of the latency gate.
+The rejected `S=4` prototype measured this complete renderer live set with
+background fill enabled on an RTX 4090:
 
-The final constant is measured per source pixel at `S=4`, rounded upward, and
-includes at least 25 percent headroom over the largest observed live set. A test
-that retains the old `192` without this accounting is a failure.
+| Source band | Peak bytes | Bytes/source pixel | With 25% headroom |
+|---|---:|---:|---:|
+| `1024x128` | 29,245,440 | 223.125 | 278.906 |
+| `1920x128` | 55,425,024 | 225.525 | 281.906 |
+| `3840x64` | 55,455,744 | 225.650 | 282.062 |
+
+The measured live set covers source colour and canonical depth, transferred
+`int32` offsets, expanded fine-grid indexes and masks, packed candidates and
+winners, gathered colour/depth/validity, fill cumulative indexes and selected
+colour, and framework scatter workspace. Most of those allocations scale
+linearly with `S`; full-frame host geometry and source-band tensors do not.
+
+Doubling the complete `S=4` peak gave an upper-biased linear planning estimate
+of `451.3 B/source-pixel` for `S=8`; it was not treated as a measured bound. The
+approved `S=8` implementation was then measured with background fill enabled on
+the same RTX 4090, Torch `2.13.0+cu130`, and CUDA `13.0` runtime:
+
+| Source band | Peak allocated | Peak reserved | Allocated/source pixel | With 25% headroom |
+|---|---:|---:|---:|---:|
+| `1024x128` | 56,000,512 | 67,108,864 | 427.250 | 534.063 |
+| `1920x128` | 109,457,408 | 178,257,920 | 445.383 | 556.729 |
+| `3840x64` | 109,518,848 | 178,257,920 | 445.633 | 557.042 |
+
+Set final `SPLAT_BYTES_PER_PIXEL = 640`. It exceeds the largest measured live
+allocation by more than the required 25 percent headroom. At width `3840` it
+permits 109 complete rows under `256 MiB`, or 20 bands for a 2160-row frame. The
+budget applies to incremental live allocated bytes for the renderer band. Peak
+reserved bytes are reported above, but allocator cache rounding is not itself a
+live-set budget failure.
 
 A 4K full-frame `int32` offset map is about `31.6 MiB` per eye; retaining both is
 about `63.3 MiB` of host memory. A temporary full-frame float64 geometry array is
@@ -455,7 +523,7 @@ STEREO_STAGE_SCHEMA_VERSION = 1
 Change only the renderer identity:
 
 ```python
-STEREO_STAGE_ALGORITHM_VERSION = "torch-horizontal-4x-zbuffer-v2"
+STEREO_STAGE_ALGORITHM_VERSION = "torch-horizontal-8x-zbuffer-v2"
 ```
 
 The existing fingerprint comparison then produces this behavior:
@@ -486,7 +554,7 @@ their human colour names are descriptive only.
 Tests use two implementations that import no production scatter, fill, or
 reduction helper.
 
-The discrete oracle applies the exact `S=4` sample positions, half-open interval
+The discrete oracle applies the exact `S=8` sample positions, half-open interval
 rule, strict z-buffer, source-index tie-break, fill policy, and ties-to-even lane
 average with plain scalar CPU loops. It selects winners directly and must not
 copy the production packed-key implementation. Production output and masks must
@@ -504,7 +572,7 @@ each target pixel it:
 
 This oracle distinguishes overlap from complementary coverage and handles any
 number of layers. It defines geometric truth for measuring the approximation
-introduced by four samples.
+introduced by eight samples.
 
 ### Exact Unit Tests
 
@@ -532,8 +600,9 @@ Required tests include:
     never copies a pre-mixed colour.
 11. Single-sided fill occurs only for a bounded run touching a frame boundary.
 12. A run over the maximum remains invalid; full-hole pixels are black.
-13. Lane values that average to `127.5` and `126.5` round to `128` and `126`
-    respectively, proving ties-to-even rather than half-away-from-zero.
+13. Eight-lane totals `1020` and `1012` average to `127.5` and `126.5`, then
+    round to `128` and `126` respectively, proving ties-to-even rather than
+    half-away-from-zero and the required addition tree.
 14. Public `valid_mask` uses pre-fill `any`, and `hole_mask` uses post-fill
     `all-invalid`, including partial-coverage cases.
 15. `uint8` strength zero is byte-identical to the source for both eyes.
@@ -561,7 +630,7 @@ Generate a license-free fixture with these exact parameters:
 
 For every mode, strength, and eye:
 
-- production output and masks equal the independent discrete `S=4` oracle;
+- production output and masks equal the independent discrete `S=8` oracle;
 - the one-pixel line remains represented wherever the discrete oracle sees it.
 
 For `occlusion_fill=none`:
@@ -633,6 +702,10 @@ For each ROI, construct an independent `S=64` horizontal sample oracle with a
 Create an edge mask where the resized canonical `3x3` local range is at least
 `0.02`, then dilate it by Chebyshev radius four.
 
+Revision 4 changes none of these files, ROIs, masks, oracle rules, or numeric
+thresholds. The candidate under test is the production `S=8` renderer; the
+design-selection table above cannot be reused as its release report.
+
 For both eyes, require:
 
 - candidate edge-mask MAE versus the `S=64` oracle is no greater than 70 percent
@@ -648,9 +721,12 @@ The human check rejects a light/dark halo wider than one output pixel or loss of
 the one-pixel guitar and hand details. It supplements the numeric gate and
 cannot override a numeric failure.
 
-The JSON report records the candidate commit and algorithm version, input
-hashes, runtime versions, settings, every ROI metric, threshold result, overall
-status, and crop paths. Attach the JSON and crops to implementation review. A
+The JSON report records the candidate commit, worktree dirty state, dirty-diff
+SHA-256 when applicable, algorithm version, input hashes, runtime versions,
+settings, every ROI metric, threshold result, overall status, and crop paths.
+Release evidence is accepted only from the clean committed candidate
+(`git_dirty=false`); a dirty report remains diagnostic evidence tied to its
+recorded diff hash. Attach the JSON and crops to implementation review. A
 passing CI run without this attachment does not satisfy the manual gate; after
 this v2 renderer decision is merged, the copyrighted sample is not treated as a
 permanent reproducible regression test.
@@ -678,8 +754,12 @@ ramp benchmark is insufficient.
 
 The benchmark must:
 
-- record baseline and candidate git commit IDs, algorithm versions, GPU model,
-  driver, Torch, CUDA, Python, resolution, settings, and sample count;
+- record baseline and candidate git commit IDs, worktree dirty states and dirty
+  diff hashes, algorithm versions, GPU model, driver, Torch, CUDA, Python,
+  resolution, settings, and sample count;
+- record the benchmark-harness SHA-256 in both reports. The committed candidate
+  harness may execute against an explicitly selected clean baseline worktree so
+  both revisions use byte-identical benchmark orchestration;
 - run in separate fresh processes on the same machine;
 - use five warmup frames and 30 measured frames;
 - synchronize CUDA before and after every measured render;
@@ -692,6 +772,10 @@ The benchmark must:
   fixture at 1920x1080 and 3840x2160;
 - measure the exact commit immediately preceding renderer implementation as the
   baseline and attach both JSON outputs to implementation review.
+
+Both attached reports must identify clean subject worktrees
+(`git_dirty=false`). A dirty run is diagnostic only, even when every latency and
+memory threshold passes.
 
 The candidate passes only when:
 
@@ -706,27 +790,33 @@ The candidate passes only when:
 - host geometry calculation remains vectorized and adds no per-pixel Python
   loop.
 
-Failure stops release. Do not silently reduce samples to two, add a quality
-mode, or retain v1 behind a flag. Optimize the fixed algorithm or return for a
-new design decision.
+Failure stops release. Do not silently reduce samples to four or two, add a
+quality mode, or retain v1 behind a flag. Optimize the fixed algorithm or return
+for a new design decision.
 
 ## Failure Policy
 
 - If discrete-oracle tests fail, the implementation is wrong.
-- If the continuous procedural gate fails, four samples are insufficient or
-  visibility is wrong; do not tune the real-sample threshold.
-- If procedural gates pass but the manual local reported-sample gate fails, the
-  remaining defect is evidence for disparity-boundary reconstruction. Stop and
-  write that separate design.
+- If the continuous procedural gate fails, visibility is wrong or eight samples
+  are still insufficient; do not tune the real-sample threshold.
+- If procedural gates pass but the manual local gate fails, run independent
+  `S=16` and `S=32` sensitivity diagnostics against the same `S=64` oracle. If a
+  higher fixed sample count crosses the unchanged threshold, the failure is
+  sampling resolution and requires a new renderer revision, not disparity
+  reconstruction.
+- Attribute a remaining visual defect to disparity-boundary reconstruction only
+  when `S=8`, `S=16`, `S=32`, and `S=64` agree on rendered visibility while the
+  canonical contour is demonstrably misplaced relative to the source RGB.
 - If the local sample is unavailable or has a wrong hash, report that the manual
   release evidence is absent. Do not turn it into either a passing skip or a CI
   failure.
 - If quality passes but performance or memory fails, optimize data layout before
-  reconsidering the algorithm. Do not expose internal sample count to users.
+  reconsidering the algorithm. Do not expose internal sample count to users or
+  reduce it without another reviewed design.
 
 ## Required Documentation Changes After Implementation
 
-- `docs/ARCHITECTURE.md`: document projected unit footprints, four horizontal
+- `docs/ARCHITECTURE.md`: document projected unit footprints, eight horizontal
   samples, strict z-buffer, fill, and downsampling.
 - `docs/PARAMETERS.md`: state that stereo strength scales geometry, not
   antialiasing quality, and that `occlusion_fill=none` composites unresolved
@@ -760,15 +850,26 @@ creates intermediate geometry and halos.
 ### 2x Horizontal Sampling
 
 Rejected for the fixed algorithm because it represents only half-pixel
-occupancy and leaves one binary transition inside every output pixel. The
-quarter-pixel grid is the smallest selected quality target; the procedural gate
-is allowed to reject it if that assumption is wrong.
+occupancy and leaves one binary transition inside every output pixel.
 
-### 8x Horizontal or 2D Sampling
+### 4x Horizontal Sampling
 
-Rejected as the first production path. Eight horizontal samples double the
-selected candidate cost; 4x two-dimensional sampling processes 16 samples per
-pixel despite vertical coordinates never changing.
+Rejected by evidence, not taste. It matches its own discrete oracle and visibly
+improves the reported contour, but fails four of six unchanged production
+edge-MAE ratios against `S=64`. Threshold tuning would hide that result rather
+than fix the approximation.
+
+### 16x or 32x Horizontal Sampling
+
+Rejected for this revision because `S=8` is the smallest tested uniform grid
+that crosses every current production threshold. Larger fixed grids remain
+diagnostic tools and are not justified until `S=8` fails a reviewed gate.
+
+### Two-dimensional Sampling
+
+Rejected. Vertical coordinates never change, so even `4x` sampling in both axes
+processes 16 samples per pixel without increasing resolution along the only
+projected axis as efficiently as fixed `8x` horizontal sampling.
 
 ### Adaptive Edge-only Sampling
 
@@ -811,9 +912,9 @@ exceptionally complex function or weaken either gate.
 
 ## Approval Criteria
 
-Approve Revision 3 only if these decisions are acceptable:
+Approve Revision 4 only if these decisions are acceptable:
 
-1. Replace scalar two-layer coverage with a fixed four-sample horizontal
+1. Replace scalar two-layer coverage with a fixed eight-sample horizontal
    z-buffer.
 2. Encode strict canonical depth plus the lowest-source-index tie-break in one
    packed int64 key and perform one integer max reduction; no surface epsilon or
@@ -828,5 +929,9 @@ Approve Revision 3 only if these decisions are acceptable:
    frame stages through the algorithm version only.
 7. Keep the copyrighted production sample out of CI and require its standalone
    JSON/crop report as one-time manual review evidence.
-8. Treat failure on that sample as a reason to stop and design disparity-boundary
-   reconstruction, not as permission to add blur.
+8. Keep the Revision 3 real-sample thresholds unchanged and require a new
+   production `S=8` JSON/crop report; the design-selection oracle table is not a
+   release artifact.
+9. Before blaming a failed local gate on disparity reconstruction, use higher
+   fixed-sample oracles to distinguish sampling error from a genuinely misplaced
+   canonical boundary.

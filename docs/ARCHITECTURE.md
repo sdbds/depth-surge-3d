@@ -116,7 +116,8 @@ buffer is retained on the device.
 
 Stereo decode and output work is bounded by both `stereo_io_workers` and a host
 byte budget. End-to-end throughput measurements include decode, render, image
-encoding, and writes; GPU kernel time is reported separately.
+encoding, and writes; renderer median, p95, mean, host geometry, and offset-transfer
+costs are reported explicitly.
 
 The legacy in-memory depth API rejects projected outputs over 512 MiB. The main
 video pipeline remains file-backed.
