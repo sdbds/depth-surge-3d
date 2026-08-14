@@ -6,7 +6,9 @@ Handles FFmpeg-based video encoding with hardware acceleration support (NVENC).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from fractions import Fraction
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,24 @@ from ..frames.source_frame_manifest import (
     write_source_frame_manifest,
 )
 from ...core.file_identity import file_sample_fingerprint
+from ...utils.imaging.png_header import PngHeader, read_png_header
+
+
+_DIRECT_FRAME_NAME = re.compile(r"^frame_(\d{6,})\.png$")
+
+
+@dataclass(frozen=True)
+class _DirectStereoSequence:
+    """Validated image2 manifests and the only headers needed for direct encoding."""
+
+    left_files: tuple[Path, ...]
+    right_files: tuple[Path, ...]
+    left_pattern: Path
+    right_pattern: Path
+    start_number: int
+    frame_count: int
+    left_header: PngHeader
+    right_header: PngHeader
 
 
 class VideoEncoder:
@@ -186,6 +206,142 @@ class VideoEncoder:
             return source_fps
 
         return str(DEFAULT_FALLBACK_FPS)
+
+    @staticmethod
+    def _direct_frame_index(path: Path) -> int:
+        """Return a canonical image2 frame index or reject a non-image2 filename."""
+
+        match = _DIRECT_FRAME_NAME.fullmatch(path.name)
+        if match is None:
+            raise ValueError(f"Noncanonical direct frame name: {path.name}")
+        index = int(match.group(1))
+        if path.name != f"frame_{index:06d}.png":
+            raise ValueError(f"Noncanonical direct frame padding: {path.name}")
+        return index
+
+    def _validate_direct_stereo_sequence(
+        self,
+        left_files: list[Path],
+        right_files: list[Path],
+        total_frames: int,
+    ) -> _DirectStereoSequence:
+        """Validate corresponding image2 eye sequences before FFmpeg can start."""
+
+        if not left_files or not right_files:
+            raise ValueError("Direct stereo sequences must contain frames for both eyes")
+        if len({path.parent for path in left_files}) != 1:
+            raise ValueError("Direct left-eye frames must have one parent directory")
+        if len({path.parent for path in right_files}) != 1:
+            raise ValueError("Direct right-eye frames must have one parent directory")
+
+        sorted_left = tuple(sorted(left_files, key=self._direct_frame_index))
+        sorted_right = tuple(sorted(right_files, key=self._direct_frame_index))
+        left_names = tuple(path.name for path in sorted_left)
+        right_names = tuple(path.name for path in sorted_right)
+        if left_names != right_names:
+            raise ValueError("Direct stereo sequences must have identical frame names")
+        if total_frames > 0 and len(sorted_left) != total_frames:
+            raise ValueError("Direct stereo sequence count does not match total frames")
+
+        indices = tuple(self._direct_frame_index(path) for path in sorted_left)
+        if any(current != previous + 1 for previous, current in zip(indices, indices[1:])):
+            raise ValueError("Direct stereo sequence frame indices must be gap-free")
+
+        left_header = read_png_header(sorted_left[0])
+        right_header = read_png_header(sorted_right[0])
+        if left_header is None or right_header is None:
+            raise ValueError("Direct stereo sequence has an unreadable first PNG")
+
+        return _DirectStereoSequence(
+            left_files=sorted_left,
+            right_files=sorted_right,
+            left_pattern=sorted_left[0].parent / "frame_%06d.png",
+            right_pattern=sorted_right[0].parent / "frame_%06d.png",
+            start_number=indices[0],
+            frame_count=len(sorted_left),
+            left_header=left_header,
+            right_header=right_header,
+        )
+
+    def _build_direct_stereo_command(
+        self,
+        sequence: _DirectStereoSequence,
+        temporary_output: Path,
+        original_video: str,
+        settings: dict[str, Any],
+    ) -> list[str]:
+        """Build an FFmpeg command that stacks validated left and right image2 inputs."""
+
+        try:
+            per_eye_width = int(settings["per_eye_width"])
+            per_eye_height = int(settings["per_eye_height"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("Direct stereo encoding requires per-eye dimensions") from error
+        if per_eye_width <= 0 or per_eye_height <= 0:
+            raise ValueError("Direct stereo per-eye dimensions must be positive")
+
+        vr_format = settings.get("vr_format")
+        stack_filter = {
+            "side_by_side": "hstack",
+            "over_under": "vstack",
+        }.get(vr_format)
+        if stack_filter is None:
+            raise ValueError(f"Unsupported direct VR format: {vr_format}")
+
+        fps = self._resolve_output_fps(original_video, settings)
+        start_number = str(sequence.start_number)
+        command = [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-framerate",
+            fps,
+            "-start_number",
+            start_number,
+            "-i",
+            str(sequence.left_pattern),
+            "-framerate",
+            fps,
+            "-start_number",
+            start_number,
+            "-i",
+            str(sequence.right_pattern),
+        ]
+
+        preserve_audio = settings.get("preserve_audio", True)
+        if preserve_audio:
+            audio_file = temporary_output.parent / "original_audio.flac"
+            audio_source: str | Path = audio_file if audio_file.exists() else original_video
+            command.extend(self._build_audio_input_args(audio_source, settings))
+
+        left_matches_target = (
+            sequence.left_header.width == per_eye_width
+            and sequence.left_header.height == per_eye_height
+        )
+        right_matches_target = (
+            sequence.right_header.width == per_eye_width
+            and sequence.right_header.height == per_eye_height
+        )
+        if left_matches_target and right_matches_target:
+            filter_graph = f"[0:v][1:v]{stack_filter}=inputs=2:shortest=1[vr]"
+        else:
+            filter_graph = (
+                f"[0:v]scale={per_eye_width}:{per_eye_height}:flags=bicubic+accurate_rnd[left];"
+                f"[1:v]scale={per_eye_width}:{per_eye_height}:flags=bicubic+accurate_rnd[right];"
+                f"[left][right]{stack_filter}=inputs=2:shortest=1[vr]"
+            )
+
+        command.extend(["-filter_complex", filter_graph, "-map", "[vr]"])
+        if preserve_audio:
+            command.extend(["-map", "2:a:0?", "-c:a", "aac", "-shortest"])
+        command.extend(["-frames:v", str(sequence.frame_count), "-progress", "pipe:1"])
+        encoder_args, _ = self._build_encoder_cmd(
+            settings.get("video_encoder", "auto"), temporary_output
+        )
+        command.extend(encoder_args)
+        return command
 
     def extract_frames(
         self,
