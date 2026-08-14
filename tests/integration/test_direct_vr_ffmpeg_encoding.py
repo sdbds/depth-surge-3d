@@ -5,7 +5,9 @@ import math
 import shutil
 import subprocess
 import warnings
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -115,6 +117,75 @@ def _assert_no_direct_intermediates(root: Path, output: Path) -> None:
     assert list(root.glob(".*.direct.tmp.mp4")) == []
 
 
+def _decoded_audio_peak_hz(path: Path, sample_rate: int = 48_000) -> float:
+    pcm = subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(sample_rate),
+            "-f",
+            "s16le",
+            "pipe:1",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
+    assert samples.size >= sample_rate // 20
+    samples -= samples.mean()
+    assert np.max(np.abs(samples)) > 100
+    spectrum = np.abs(np.fft.rfft(samples * np.hanning(samples.size)))
+    frequencies = np.fft.rfftfreq(samples.size, d=1.0 / sample_rate)
+    peak_index = int(np.argmax(spectrum[1:]) + 1)
+    return float(frequencies[peak_index])
+
+
+@contextmanager
+def _observe_atomic_publication(root: Path, output: Path):
+    old_final = b"preexisting-final-must-survive-until-publication"
+    output.write_bytes(old_final)
+    temporary = output.with_name(f".{output.stem}.direct.tmp.mp4")
+    forbidden_stage = root / "99_vr_frames"
+    path_type = type(output)
+    real_replace = path_type.replace
+    real_mkdir = path_type.mkdir
+    publications = []
+
+    def observed_replace(source, target):
+        source_path = Path(source)
+        target_path = Path(target)
+        assert source_path == temporary
+        assert source_path.is_file()
+        assert source_path.stat().st_size > 0
+        assert target_path == output
+        assert output.read_bytes() == old_final
+        publications.append((source_path, target_path))
+        return real_replace(source, target)
+
+    def guarded_mkdir(path, *args, **kwargs):
+        candidate = Path(path)
+        if candidate == forbidden_stage or forbidden_stage in candidate.parents:
+            pytest.fail(f"Python attempted to create forbidden direct stage: {candidate}")
+        return real_mkdir(path, *args, **kwargs)
+
+    with (
+        patch.object(path_type, "replace", new=observed_replace),
+        patch.object(path_type, "mkdir", new=guarded_mkdir),
+    ):
+        yield
+
+    assert publications == [(temporary, output)]
+
+
 @pytest.mark.parametrize(
     ("vr_format", "expected_name", "expected_width", "expected_height"),
     [
@@ -129,14 +200,15 @@ def test_libx264_direct_encode_preserves_layout_rate_and_count(
     left_files, right_files = _write_stereo_fixture(tmp_path)
     output = tmp_path / expected_name
 
-    assert VideoEncoder().create_video_from_stereo_sequences(
-        left_files,
-        right_files,
-        tmp_path,
-        str(tmp_path / "source.mp4"),
-        _direct_settings(vr_format),
-        total_frames=_FRAME_COUNT,
-    )
+    with _observe_atomic_publication(tmp_path, output):
+        assert VideoEncoder().create_video_from_stereo_sequences(
+            left_files,
+            right_files,
+            tmp_path,
+            str(tmp_path / "source.mp4"),
+            _direct_settings(vr_format),
+            total_frames=_FRAME_COUNT,
+        )
 
     _assert_no_direct_intermediates(tmp_path, output)
     streams = _probe(output, count_frames=True)["streams"]
@@ -180,14 +252,15 @@ def test_direct_encode_maps_generated_flac_to_one_aac_stream(tmp_path):
     )
     output = tmp_path / "source_3D_side-by-side_custom.mp4"
 
-    assert VideoEncoder().create_video_from_stereo_sequences(
-        left_files,
-        right_files,
-        tmp_path,
-        str(tmp_path / "source.mp4"),
-        _direct_settings("side_by_side", preserve_audio=True),
-        total_frames=_FRAME_COUNT,
-    )
+    with _observe_atomic_publication(tmp_path, output):
+        assert VideoEncoder().create_video_from_stereo_sequences(
+            left_files,
+            right_files,
+            tmp_path,
+            str(tmp_path / "source.mp4"),
+            _direct_settings("side_by_side", preserve_audio=True),
+            total_frames=_FRAME_COUNT,
+        )
 
     _assert_no_direct_intermediates(tmp_path, output)
     streams = _probe(output)["streams"]
@@ -197,6 +270,9 @@ def test_direct_encode_maps_generated_flac_to_one_aac_stream(tmp_path):
     assert video_streams[0]["codec_name"] == "h264"
     assert len(audio_streams) == 1
     assert audio_streams[0]["codec_name"] == "aac"
+    peak_hz = _decoded_audio_peak_hz(output)
+    print(f"Decoded AAC spectral peak: {peak_hz:.3f} Hz")
+    assert peak_hz == pytest.approx(440.0, abs=10.0)
 
 
 def _write_structured_resize_fixture(path: Path) -> np.ndarray:
@@ -208,15 +284,30 @@ def _write_structured_resize_fixture(path: Path) -> np.ndarray:
     image[:, :, 2] = ((5 * x + y) % 256).astype(np.uint8)
     cv2.rectangle(image, (5, 6), (31, 25), (12, 238, 61), -1)
     cv2.rectangle(image, (39, 9), (68, 31), (241, 31, 183), 2)
-    image[34:49, 7:37] = np.where(
-        ((x[34:49, 7:37] + y[34:49, 7:37]) % 2)[..., None] == 0,
-        np.array((230, 35, 210), np.uint8),
-        np.array((20, 220, 45), np.uint8),
-    )
+    texture_x = x[34:49, 7:37].astype(np.float64)
+    texture_y = y[34:49, 7:37].astype(np.float64)
+    coarse = 34.0 * np.sin(2.0 * np.pi * texture_x / 19.0)
+    medium = 22.0 * np.cos(2.0 * np.pi * texture_y / 9.0)
+    fine = 12.0 * np.sin(2.0 * np.pi * (texture_x + texture_y) / 5.0)
+    image[34:49, 7:37, 0] = np.clip(112.0 + coarse + medium + fine, 0, 255).astype(np.uint8)
+    image[34:49, 7:37, 1] = np.clip(126.0 - coarse + medium, 0, 255).astype(np.uint8)
+    image[34:49, 7:37, 2] = np.clip(138.0 + coarse - medium + fine, 0, 255).astype(np.uint8)
     cv2.line(image, (42, 38), (68, 38), (255, 255, 255), 2)
     cv2.line(image, (42, 38), (42, 50), (255, 255, 255), 2)
     cv2.line(image, (48, 44), (68, 44), (8, 8, 8), 1)
     cv2.line(image, (48, 50), (64, 50), (8, 8, 8), 1)
+    assert cv2.imwrite(str(path), image)
+    return image
+
+
+def _write_checkerboard_stress_fixture(path: Path) -> np.ndarray:
+    y, x = np.indices((55, 73), dtype=np.uint16)
+    checkerboard = ((x + y) % 2)[..., None]
+    image = np.where(
+        checkerboard == 0,
+        np.array((230, 35, 210), np.uint8),
+        np.array((20, 220, 45), np.uint8),
+    ).astype(np.uint8)
     assert cv2.imwrite(str(path), image)
     return image
 
@@ -242,14 +333,8 @@ def _ssim(reference: np.ndarray, candidate: np.ndarray) -> float:
     return float(np.mean(values))
 
 
-def test_ffmpeg_bicubic_resize_reports_precompression_quality(tmp_path):
-    _require_ffmpeg()
-    source_path = tmp_path / "structured_source.png"
-    ffmpeg_path = tmp_path / "ffmpeg_bicubic.png"
-    source = _write_structured_resize_fixture(source_path)
-    target_width, target_height = 64, 48
-    legacy = cv2.resize(source, (target_width, target_height), interpolation=cv2.INTER_CUBIC)
-    scale_filter = f"scale={target_width}:{target_height}:flags={_SCALE_FLAGS}"
+def _resize_with_ffmpeg(source_path: Path, output_path: Path) -> np.ndarray:
+    scale_filter = f"scale=64:48:flags={_SCALE_FLAGS}"
     command = [
         "ffmpeg",
         "-y",
@@ -263,19 +348,40 @@ def test_ffmpeg_bicubic_resize_reports_precompression_quality(tmp_path):
         "1",
         "-c:v",
         "png",
-        str(ffmpeg_path),
+        str(output_path),
     ]
-
     assert scale_filter == "scale=64:48:flags=bicubic+accurate_rnd"
     subprocess.run(command, check=True)
-    candidate = cv2.imread(str(ffmpeg_path), cv2.IMREAD_COLOR)
+    candidate = cv2.imread(str(output_path), cv2.IMREAD_COLOR)
     assert candidate is not None
-    assert candidate.shape == (target_height, target_width, 3)
+    assert candidate.shape == (48, 64, 3)
+    return candidate
 
-    psnr = _psnr(legacy, candidate)
-    ssim = _ssim(legacy, candidate)
-    print(f"Resize diagnostic: PSNR={psnr:.4f} dB, SSIM={ssim:.6f}")
-    if psnr < 30.0:
-        warnings.warn(f"Resize PSNR {psnr:.4f} dB is below 30 dB", stacklevel=2)
-    if ssim < 0.95:
-        warnings.warn(f"Resize SSIM {ssim:.6f} is below 0.95", stacklevel=2)
+
+def test_ffmpeg_bicubic_resize_reports_precompression_quality(tmp_path):
+    _require_ffmpeg()
+    primary_source_path = tmp_path / "structured_source.png"
+    primary_output_path = tmp_path / "ffmpeg_bicubic.png"
+    primary_source = _write_structured_resize_fixture(primary_source_path)
+    primary_reference = cv2.resize(primary_source, (64, 48), interpolation=cv2.INTER_CUBIC)
+    primary_candidate = _resize_with_ffmpeg(primary_source_path, primary_output_path)
+
+    primary_psnr = _psnr(primary_reference, primary_candidate)
+    primary_ssim = _ssim(primary_reference, primary_candidate)
+    print(f"Primary resize diagnostic: PSNR={primary_psnr:.4f} dB, SSIM={primary_ssim:.6f}")
+    if primary_psnr < 30.0:
+        warnings.warn(f"Primary resize PSNR {primary_psnr:.4f} dB is below 30 dB", stacklevel=2)
+    if primary_ssim < 0.95:
+        warnings.warn(f"Primary resize SSIM {primary_ssim:.6f} is below 0.95", stacklevel=2)
+
+    stress_source_path = tmp_path / "checkerboard_stress_source.png"
+    stress_output_path = tmp_path / "checkerboard_stress_ffmpeg.png"
+    stress_source = _write_checkerboard_stress_fixture(stress_source_path)
+    stress_reference = cv2.resize(stress_source, (64, 48), interpolation=cv2.INTER_CUBIC)
+    stress_candidate = _resize_with_ffmpeg(stress_source_path, stress_output_path)
+    stress_psnr = _psnr(stress_reference, stress_candidate)
+    stress_ssim = _ssim(stress_reference, stress_candidate)
+    print(
+        "Checkerboard stress diagnostic: "
+        f"PSNR={stress_psnr:.4f} dB, SSIM={stress_ssim:.6f} (diagnostic only)"
+    )
