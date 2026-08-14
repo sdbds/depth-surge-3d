@@ -75,7 +75,7 @@ class VRFrameAssembler:
             - Writes assembled VR frames to disk
         """
         try:
-            source_files = self._vr_source_files(directories, settings, total_frames)
+            source_files = self.resolve_vr_source_files(directories, settings, total_frames)
             if source_files is None:
                 return False
             left_files, right_files = source_files
@@ -126,7 +126,7 @@ class VRFrameAssembler:
             traceback.print_exc()
             return False
 
-    def _vr_source_files(
+    def resolve_vr_source_files(
         self,
         directories: dict[str, Path],
         settings: dict[str, Any],

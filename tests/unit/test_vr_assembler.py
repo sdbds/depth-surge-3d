@@ -11,6 +11,84 @@ from unittest.mock import Mock, patch
 from src.depth_surge_3d.processing.frames.vr_assembler import VRFrameAssembler
 
 
+def _write_source_pair(left_dir, right_dir, index):
+    image = np.full((4, 6, 3), index, dtype=np.uint8)
+    assert cv2.imwrite(str(left_dir / f"frame_{index:06d}.png"), image)
+    assert cv2.imwrite(str(right_dir / f"frame_{index:06d}.png"), image)
+
+
+class TestResolveVRSourceFiles:
+    def test_resolve_vr_source_files_uses_cropped_sources(self, tmp_path):
+        left = tmp_path / "left_cropped"
+        right = tmp_path / "right_cropped"
+        left.mkdir()
+        right.mkdir()
+        _write_source_pair(left, right, 1)
+
+        result = VRFrameAssembler().resolve_vr_source_files(
+            {"left_cropped": left, "right_cropped": right},
+            {"upscale_model": "none"},
+            total_frames=1,
+        )
+
+        assert result == ([left / "frame_000001.png"], [right / "frame_000001.png"])
+
+    def test_resolve_vr_source_files_requires_upscaled_sources(self, tmp_path):
+        cropped_left = tmp_path / "left_cropped"
+        cropped_right = tmp_path / "right_cropped"
+        cropped_left.mkdir()
+        cropped_right.mkdir()
+        _write_source_pair(cropped_left, cropped_right, 1)
+
+        assert VRFrameAssembler().resolve_vr_source_files(
+            {"left_cropped": cropped_left, "right_cropped": cropped_right},
+            {"upscale_model": "x2"},
+            total_frames=1,
+        ) is None
+
+    def test_resolve_vr_source_files_rejects_unequal_counts(self, tmp_path):
+        left = tmp_path / "left_cropped"
+        right = tmp_path / "right_cropped"
+        left.mkdir()
+        right.mkdir()
+        _write_source_pair(left, right, 1)
+        image = np.zeros((4, 6, 3), dtype=np.uint8)
+        assert cv2.imwrite(str(left / "frame_000002.png"), image)
+
+        assert VRFrameAssembler().resolve_vr_source_files(
+            {"left_cropped": left, "right_cropped": right},
+            {},
+            total_frames=0,
+        ) is None
+
+    def test_resolve_vr_source_files_requires_total_frame_count(self, tmp_path):
+        left = tmp_path / "left_cropped"
+        right = tmp_path / "right_cropped"
+        left.mkdir()
+        right.mkdir()
+        _write_source_pair(left, right, 1)
+
+        assert VRFrameAssembler().resolve_vr_source_files(
+            {"left_cropped": left, "right_cropped": right},
+            {},
+            total_frames=2,
+        ) is None
+
+    def test_resolve_vr_source_files_requires_matching_stems(self, tmp_path):
+        left = tmp_path / "left_cropped"
+        right = tmp_path / "right_cropped"
+        left.mkdir()
+        right.mkdir()
+        _write_source_pair(left, right, 1)
+        (right / "frame_000001.png").rename(right / "other_000001.png")
+
+        assert VRFrameAssembler().resolve_vr_source_files(
+            {"left_cropped": left, "right_cropped": right},
+            {},
+            total_frames=1,
+        ) is None
+
+
 class TestVRFrameAssemblerInit:
     """Test VRFrameAssembler initialization."""
 
