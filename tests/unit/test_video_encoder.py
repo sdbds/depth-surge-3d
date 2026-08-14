@@ -538,6 +538,45 @@ def test_direct_create_video_validates_before_launch_and_cleans_stale_temp(tmp_p
     assert not temporary.exists()
 
 
+def test_direct_create_video_preflight_failure_cleans_only_exact_stale_temp(tmp_path):
+    left = _write_eye_sequence(tmp_path / "left", [1])
+    right = _write_eye_sequence(tmp_path / "right", [1])
+    settings = _direct_settings()
+    final = tmp_path / generate_output_filename(
+        "source.mp4", settings["vr_format"], settings["vr_resolution"]
+    )
+    temporary = tmp_path / f".{final.stem}.direct.tmp.mp4"
+    unrelated = tmp_path / f".{final.stem}.direct.tmp.mp4.backup"
+    final.write_bytes(b"old-valid-video")
+    temporary.write_bytes(b"stale-partial-video")
+    unrelated.write_bytes(b"keep-me")
+    left_before = left[0].read_bytes()
+    right_before = right[0].read_bytes()
+
+    with (
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+            return_value=False,
+        ),
+        patch("src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen") as popen,
+    ):
+        assert not VideoEncoder().create_video_from_stereo_sequences(
+            left,
+            right,
+            tmp_path,
+            "source.mp4",
+            settings,
+            total_frames=1,
+        )
+
+    popen.assert_not_called()
+    assert final.read_bytes() == b"old-valid-video"
+    assert not temporary.exists()
+    assert unrelated.read_bytes() == b"keep-me"
+    assert left[0].read_bytes() == left_before
+    assert right[0].read_bytes() == right_before
+
+
 def test_direct_create_video_cleans_temp_after_launch_exception(tmp_path):
     left = _write_eye_sequence(tmp_path / "left", [1])
     right = _write_eye_sequence(tmp_path / "right", [1])

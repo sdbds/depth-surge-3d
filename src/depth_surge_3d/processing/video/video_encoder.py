@@ -441,10 +441,6 @@ class VideoEncoder:
     ) -> bool:
         """Encode validated eye sequences and atomically publish the final video."""
 
-        if not verify_ffmpeg_installation():
-            print("Error: FFmpeg not found. Cannot create output video.")
-            return False
-
         output_filename = generate_output_filename(
             Path(original_video).name,
             settings["vr_format"],
@@ -454,6 +450,9 @@ class VideoEncoder:
         temporary = output_path.with_name(f".{output_path.stem}.direct.tmp.mp4")
         try:
             temporary.unlink(missing_ok=True)
+            if not verify_ffmpeg_installation():
+                print("Error: FFmpeg not found. Cannot create output video.")
+                return False
             sequence = self._validate_direct_stereo_sequence(
                 list(left_files), list(right_files), total_frames
             )
