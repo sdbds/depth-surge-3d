@@ -40,6 +40,15 @@ output resizes.
 - Keep existing preview dimensions, throttling, PNG encoding, payload limits,
   and Socket.IO behavior unchanged.
 
+### Resume and stage-cache invalidation
+
+- Change `CROP_STAGE_ALGORITHM_VERSION` from `vr-crop-v1` to `vr-crop-v2`
+  because fisheye-aware crop output is resized through `resize_image`.
+- Change `VR_STAGE_ALGORITHM_VERSION` from `vr-layout-v1` to `vr-layout-v2`
+  because VR assembly resizes mismatched eye images through `resize_image`.
+- These version changes prevent completed manifests from reusing Bicubic PNGs
+  after the production resize policy changes to Pillow Lanczos.
+
 ### Canonical depth
 
 - Keep `StereoRenderer._resize_canonical` unchanged: Torch bilinear with
@@ -69,6 +78,8 @@ dimensions.
   Pillow Lanczos for a structured `uint8` fixture.
 - Retain and run the existing RGB, grayscale, upscale, and aspect-ratio tests.
 - Add preview tests that observe `cv2.INTER_AREA` in both preview entry points.
+- Add version-contract tests for the crop and VR assembly stages so old v1
+  manifests cannot remain valid after the resize algorithm changes.
 - Add a depth-contract regression test proving canonical resize output remains
   the existing Torch bilinear result.
 - Run focused tests first, then the complete unit-test suite and configured
