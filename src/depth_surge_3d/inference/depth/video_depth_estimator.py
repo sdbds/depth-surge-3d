@@ -681,7 +681,7 @@ class VideoDepthEstimator:
     def get_model_info(self) -> dict[str, Any]:
         """Get information about the loaded model."""
         if not self.model_config:
-            return {}
+            return {"inference_algorithm": VDA_INFERENCE_ALGORITHM}
 
         return {
             "encoder": self.model_config["encoder"],
@@ -693,6 +693,7 @@ class VideoDepthEstimator:
             "model_path": self.model_path,
             "loaded": self.model is not None,
             "temporal_consistency": True,  # Key feature of video model
+            "inference_algorithm": VDA_INFERENCE_ALGORITHM,
         }
 
     def unload_model(self) -> None:

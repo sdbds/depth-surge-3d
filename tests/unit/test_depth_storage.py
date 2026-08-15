@@ -12,6 +12,7 @@ from src.depth_surge_3d.processing.frames.depth_storage import (
     RawDepthFingerprintError,
     RawDepthOverflowError,
     RawDepthStore,
+    build_current_model_fingerprint,
     build_model_fingerprint,
     estimate_depth_disk_bytes,
     require_disk_space,
@@ -137,6 +138,80 @@ def test_model_fingerprint_rejects_unclassified_model_info_fields() -> None:
         build_model_fingerprint(FutureEstimator(), {})
 
 
+def test_model_fingerprint_classifies_inference_algorithm() -> None:
+    class AlgorithmEstimator:
+        @staticmethod
+        def get_model_info() -> dict:
+            return {
+                "model_name": "owner/model",
+                "revision": "immutable-revision",
+                "inference_algorithm": "vda-offline-shot-v1",
+            }
+
+    fingerprint = build_model_fingerprint(AlgorithmEstimator(), {})
+
+    assert fingerprint["model_info"]["inference_algorithm"] == "vda-offline-shot-v1"
+
+
+def test_scene_settings_change_only_sequence_estimator_raw_identity() -> None:
+    class FramewiseEstimator:
+        model_path = None
+
+        @staticmethod
+        def get_model_info() -> dict:
+            return {"family": "framewise", "revision": "immutable"}
+
+    class SequenceEstimator(FramewiseEstimator):
+        def iter_sequence_depth(self, *_args, **_kwargs):
+            raise AssertionError("identity selection must not run inference")
+
+    base = {
+        "depth_model_version": "v3",
+        "depth_resolution": "518",
+        "temporal_window_size": 32,
+        "temporal_window_overlap": 10,
+        "scene_detection": True,
+        "scene_cut_threshold": 0.55,
+        "min_scene_frames": 8,
+    }
+    changed = dict(base, scene_cut_threshold=0.7)
+
+    framewise_before = build_current_model_fingerprint(FramewiseEstimator(), base)
+    framewise_after = build_current_model_fingerprint(FramewiseEstimator(), changed)
+    sequence_before = build_current_model_fingerprint(SequenceEstimator(), base)
+    sequence_after = build_current_model_fingerprint(SequenceEstimator(), changed)
+
+    assert framewise_before == framewise_after
+    assert sequence_before != sequence_after
+    assert sequence_after["depth_settings"]["scene_cut_threshold"] == 0.7
+
+
+@pytest.mark.parametrize("backend", ["v2", "v3", "see_through"])
+def test_temporal_compatibility_fields_remain_in_all_raw_identities(backend) -> None:
+    class Estimator:
+        model_path = None
+
+        @staticmethod
+        def get_model_info() -> dict:
+            return {"family": "fixture", "revision": "1"}
+
+    class SequenceEstimator(Estimator):
+        def iter_sequence_depth(self, *_args, **_kwargs):
+            raise AssertionError("identity selection must not run inference")
+
+    estimator = SequenceEstimator() if backend == "v2" else Estimator()
+    base = {
+        "depth_model_version": backend,
+        "temporal_window_size": 32,
+        "temporal_window_overlap": 10,
+    }
+
+    before = build_current_model_fingerprint(estimator, base)
+    after = build_current_model_fingerprint(estimator, dict(base, temporal_window_size=64))
+
+    assert before != after
+
+
 def test_previous_raw_schema_reports_schema_mismatch(tmp_path: Path) -> None:
     values = np.array([[[0.1, 0.2]]], dtype=np.float32)
     store = _open(tmp_path / "raw", values)
@@ -161,6 +236,30 @@ def test_auto_store_selects_float16_and_writes_atomic_compressed_files(tmp_path:
         assert payload["values"].dtype == np.float16
     assert store.load(paths[0]).dtype == np.float32
     assert not list((tmp_path / "raw").glob("*.tmp"))
+
+
+def test_discard_frames_removes_only_one_shot_and_flushes_progress(tmp_path: Path) -> None:
+    names = ["frame_000000.png", "frame_000001.png", "frame_000002.png"]
+    values = np.asarray([[[0.1]], [[0.2]], [[0.3]]], dtype=np.float32)
+    store = RawDepthStore.open_or_create(
+        tmp_path / "raw",
+        frame_names=names,
+        representation=DepthRepresentation.RELATIVE_DEPTH,
+        semantic_fingerprint={"model": "fixture"},
+        requested_dtype="float32",
+        first_values=values,
+    )
+    store.write_batch(names, values)
+    store.flush_metadata()
+
+    store.discard_frames(names[1:])
+
+    assert store.path_for(names[0]).is_file()
+    assert not store.path_for(names[1]).exists()
+    assert not store.path_for(names[2]).exists()
+    persisted = json.loads(store.metadata_path.read_text(encoding="utf-8"))
+    assert persisted["completed_count"] == 1
+    assert store.metadata["completed_count"] == 1
 
 
 def test_explicit_float16_rejects_unrepresentable_first_chunk_before_metadata(

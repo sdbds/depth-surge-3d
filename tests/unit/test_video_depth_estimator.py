@@ -80,7 +80,7 @@ class TestVideoDepthEstimator:
         estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
         info = estimator.get_model_info()
 
-        assert info == {}
+        assert info == {"inference_algorithm": "vda-offline-shot-v1"}
 
     @patch("torch.cuda.is_available", return_value=True)
     @patch("torch.cuda.empty_cache")
@@ -284,6 +284,7 @@ class TestGetModelInfo:
         assert info["features"] == 256
         assert "temporal_consistency" in info
         assert info["temporal_consistency"] is True
+        assert info["inference_algorithm"] == "vda-offline-shot-v1"
 
 
 class TestEstimateDepthBatchCompatibility:
