@@ -7,6 +7,16 @@ design adds MoGe-2 as an optional depth backend and adds an experimental
 metric-camera projection for flat, rectified side-by-side video. Spherical,
 VR180, and point-map rendering are deliberately separate future work.
 
+`Experimental` describes output-quality maturity, not permission for silent
+breakage. The mode is explicit opt-in and non-default; settings or cache
+semantics may change only through normal versioning, invalidation, migration,
+and changelog rules. CLI, Web, and documentation display this limitation:
+"MoGe-2 performs per-frame depth and focal estimation. Temporal stability on
+video is not guaranteed; depth or focal drift may be visible across frames."
+Removing the label requires a separate release decision that reviews the
+three-variant fixed-corpus evidence and explicitly accepts the observed
+temporal behavior and compatibility contract.
+
 ## Linus Three-Question Check
 
 ### Is this a real problem?
@@ -290,12 +300,19 @@ crop before enforcing the final-output disparity cap.
 The source probe reads the first video stream's `sample_aspect_ratio` and
 `video_properties` stores its canonical numerator and denominator. Missing or
 `N/A` metadata follows the decoder's square-pixel default and normalizes to
-`1:1`; malformed or non-positive explicit values are invalid. The normalized
-ratio enters metric validation and the metric stereo fingerprint, but not the
-source-frame fingerprint because it does not change the extracted pixels. A
-legacy resume without this field re-probes the original video; if that source
-is unavailable, metric mode fails without invalidating reusable frames and
-relative mode remains available.
+`1:1`. An explicit value must match unsigned base-10 `numerator:denominator`
+syntax, with both components in `1..2147483647`. The parser reduces the pair by
+its greatest common divisor and `metric_camera` accepts only canonical `1:1`.
+Zero components, signs, overflow, trailing data, and every other reduced ratio
+are validation errors. Thus `0:0`, `1:0`, and `10000:1` all fail explicitly;
+anamorphic values up to `2:1` are not accepted merely because they are common
+container metadata.
+
+The normalized ratio enters metric validation and the metric stereo
+fingerprint, but not the source-frame fingerprint because it does not change
+the extracted pixels. A legacy resume without this field re-probes the
+original video; if that source is unavailable, metric mode fails without
+invalidating reusable frames and relative mode remains available.
 
 An explicitly non-square ratio is rejected for `metric_camera` before model
 loading because MoGe's normalized focal length does not encode anamorphic
@@ -521,12 +538,34 @@ directories may coexist. Only the selected geometry mode's stage is required;
 the pipeline does not eagerly generate both. An existing inactive stage is
 preserved when its fingerprint remains valid.
 
-The conservative disk preflight budgets metric geometry without assuming
-compression: four bytes per inverse-depth pixel plus one byte per valid-mask
-pixel, a 25 percent payload allowance, metadata, and one atomic frame overlap.
-With `keep_intermediates=true`, raw and selected derived-stage allowances are
-summed. With it false, raw payloads are removed only after the selected stage-3
-payload and metadata validate.
+The conservative disk preflight budgets metric geometry without assuming any
+compression benefit. For frame dimensions `H_i` by `W_i`, define:
+
+```text
+A                 = max(4096, target-filesystem allocation unit in bytes)
+payload_bound     = sum_i(5 * H_i * W_i)
+metadata_bound    = max(16 MiB, A * frame_count)
+atomic_overlap    = ceil(1.25 * max_i(5 * H_i * W_i)) + A
+required_bytes    = ceil(1.25 * payload_bound) + metadata_bound
+                    + atomic_overlap
+```
+
+The five bytes are four bytes of inverse depth plus one byte of validity. The
+25 percent term covers NPZ/ZIP headers, possible compressor expansion, and
+implementation drift; `metadata_bound` covers allocation rounding and small
+manifests. This is not a guessed compression ratio. If the target allocation
+unit cannot be queried, `A` uses a conservative 64 KiB fallback. Measuring one
+compressed frame and extrapolating it is rejected because a smooth first frame
+does not bound later noisy frames. An already existing inactive stage consumes
+real free space and therefore is not added again as prospective output.
+
+With `keep_intermediates=true`, raw and selected derived-stage prospective
+allowances are summed. With it false, raw payloads are removed only after the
+selected stage-3 payload and metadata validate. Preflight cannot reserve disk
+against concurrent writers. If a write still fails with `ENOSPC`, the stage
+deletes only the current temporary file, leaves previously committed frames and
+metadata resumable, does not publish completion metadata, and reports the
+preflight estimate plus current free space and failing path.
 
 ## Cache, Resume, and Invalidation
 
@@ -557,7 +596,11 @@ focal length.
 
 Switching from one geometry mode to the other does not delete the previous
 stage 3. Once both have been generated, future switches can reuse them while
-their upstream fingerprints remain valid.
+their upstream fingerprints remain valid. This is switch-time behavior, not a
+retention override: after final output validates, the existing
+`keep_intermediates=false` cleanup removes every intermediate directory,
+including both stage-3 directories. Cleanup does not run after an interrupted
+or failed job, so committed checkpoints remain available for resume.
 
 ## Web and CLI Behavior
 
@@ -574,6 +617,10 @@ The Web depth-backend selector adds `MoGe-2`. When selected:
 - relative mode shows existing strength and normalized convergence controls;
 - metric mode shows virtual baseline, metric convergence, and maximum total
   disparity controls, selects SBS, and disables fisheye distortion explicitly.
+
+When `metric_camera` is active, Web shows the Experimental badge and temporal
+stability warning beside the geometry selector. CLI prints the same warning
+once during validated startup, before model download or frame mutation.
 
 Web resume restores the persisted backend, size, geometry mode, and active
 settings. Server validation rejects a forged `metric_camera` request for a
@@ -603,6 +650,7 @@ Fail explicitly in these cases:
 - raw version-3 payload membership or focal data is invalid;
 - metric geometry does not match its raw fingerprint;
 - disk preflight fails;
+- an atomic metric-geometry write encounters `ENOSPC` after preflight;
 - CUDA inference or rendering remains out of memory after existing renderer
   band retry behavior.
 
@@ -630,11 +678,15 @@ Add tests for:
 - raw version-2 reuse, version-3 exact membership, atomic camera payload,
   corrupt focal rejection, and clean/chunk/resume identity;
 - metric-geometry conversion, invalid mask, automatic convergence sampling,
-  metadata, disk preflight, and retention;
+  metadata, exact uncompressed disk-bound calculation, allocation-unit probe
+  and fallback, and retention;
+- injected `ENOSPC` removing only the current temporary file, withholding
+  completion metadata, and preserving committed resume state;
 - metric-mode rejection of fisheye output while preserving relative-mode
   packing and distortion behavior;
-- source sample-aspect-ratio normalization, square-pixel acceptance,
-  non-square rejection, and single-scale MoGe preprocessing;
+- source sample-aspect-ratio parsing for missing, `N/A`, reducible `1:1`, zero,
+  sign, overflow, trailing-data, and non-square cases, plus single-scale MoGe
+  preprocessing;
 - zero disparity at `Z0`;
 - positive near and negative far disparity with `u_left-u_right > 0` for a
   foreground point;
@@ -649,12 +701,16 @@ Add tests for:
 - relative projection offsets, packed keys, masks, fill, and final CPU pixels
   byte-identical to the pre-change fixture;
 - mode-specific settings and invalidation boundaries;
+- mode switches preserving a valid inactive stage with retained intermediates,
+  successful no-retention cleanup removing both stage-3 directories, and
+  failed jobs retaining committed checkpoints;
 - crop changes rebuilding metric stereo but retaining the existing relative
   crop-only invalidation boundary;
 - preview disable and endpoint validation before automatic convergence resolves,
   explicit-convergence preview, and parity after convergence resolves;
 - Web model controls, payload validation, resume restoration, unavailable-extra
-  disabled state, and CLI missing-extra error behavior.
+  disabled state, CLI missing-extra error behavior, and the Experimental
+  temporal-stability warning on both product surfaces.
 
 ### Integration tests
 
@@ -709,8 +765,9 @@ stable merely because the formula and smoke tests pass.
 - `metric_camera` accepts only side-by-side packing on the rectilinear output
   path and rejects `apply_distortion=true`; relative packing and distortion
   behavior is unchanged.
-- `metric_camera` accepts square-pixel or unspecified-default source sample
-  aspect ratios, rejects explicit non-square ratios before model loading, and
+- `metric_camera` normalizes missing or `N/A` source sample aspect ratio to
+  `1:1`, accepts only bounded explicit rationals that reduce to `1:1`, rejects
+  malformed, zero, overflow, and non-square values before model loading, and
   never stretches MoGe inference input independently by axis.
 - The exact center-crop width is included in metric projection, so arbitrary
   identical final per-eye resize preserves horizontal rectification and the
@@ -727,10 +784,19 @@ stable merely because the formula and smoke tests pass.
 - Metric stereo-setting changes reuse valid metric geometry and do not invoke
   MoGe.
 - Resume never interprets relative canonical maps as metric geometry.
+- Mode switching is non-destructive during processing and completed jobs may
+  retain both validated stages; successful `keep_intermediates=false` cleanup
+  removes both stage-3 directories, while failed jobs retain committed resume
+  checkpoints.
+- Metric-geometry preflight is an uncompressed upper-bound calculation rather
+  than a sampled compression estimate; an injected post-preflight `ENOSPC`
+  leaves no partial committed frame and remains resumable.
 - Clean, chunked, and resumed processing produce identical selected stage-3
   values and stereo output on the same backend.
-- Real release checks run all three pinned variants and produce an A/B report
-  before `metric_camera` can lose its `Experimental` label.
+- CLI, Web, and documentation state that per-frame depth and focal estimation
+  may drift temporally. Real release checks run all three pinned variants and
+  produce an A/B report, but only a separate compatibility decision may remove
+  the `Experimental` label.
 - The complete existing and new CPU test suite passes; CUDA-specific tests pass
   on the available NVIDIA system.
 - README, installation, parameters, architecture, example settings, changelog,
