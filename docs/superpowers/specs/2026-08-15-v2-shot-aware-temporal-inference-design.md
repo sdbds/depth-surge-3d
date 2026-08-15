@@ -81,11 +81,11 @@ Both values currently participate in two identity layers for every backend:
 | V2 inference | `VideoDepthEstimator` | Window size unused; overlap remains constructor default 10 in the main path |
 | DA3 / See-Through inference | Their adapters | Both values unused |
 
-This revision deliberately preserves the two existing cache fields for one
-compatibility release. It does not claim they affect output. Removing them now
-would change every backend's cache key, including unaffected DA3 and
-See-Through entries. Their eventual removal requires an explicit settings and
-cache migration, outside this change.
+This revision deliberately preserves the two existing cache fields for at least
+this release. It does not claim they affect output. Removing them now would
+change every backend's cache key, including unaffected DA3 and See-Through
+entries. Their removal is a future breaking change that requires an explicit
+settings and cache migration; this specification commits to no removal date.
 
 The existing `_retry_chunk_with_reduced_resolution` is not graceful fallback in
 the main file-backed path. It is reachable only from the adapter's internal
@@ -146,11 +146,10 @@ shot**, not one temporal state across unrelated cuts.
 5. `DepthBatch` representation and native raw storage contracts do not change.
 6. A resumed V2 shot is either reused completely or recomputed completely.
 7. DA3 and See-Through retain their existing memory-batch behavior.
-8. One V2 raw stage uses one effective input resolution and precision from
-   start to finish.
-9. An effective size is fixed before any payload under that execution plan is
-   committed. A later plan change invalidates prior V2 raw payloads before new
-   writes, is visible to the user, and changes the raw-depth identity.
+8. One V2 raw stage uses one effective input resolution and precision, selected
+   before the first payload under that execution plan is committed. A later plan
+   change invalidates all prior V2 raw payloads before new writes, is visible to
+   the user, and changes the raw-depth identity.
 
 ## Ownership
 
@@ -211,9 +210,11 @@ The callback contract is strict:
 - the estimator validates returned count, dtype, rank, channel count, and
   common geometry before transformation, then propagates callback exceptions.
 
-Pixel content cannot prove semantic ordering. The processor guarantees order by
-constructing the callback directly from the requested index list; tests verify
-that mapping. The estimator does not reread files or duplicate processor I/O.
+Pixel content cannot prove semantic ordering. The estimator explicitly trusts
+the processor's shot-local index-to-path mapping and does not semantically
+validate frame content. The processor guarantees order by constructing the
+callback directly from the requested index list; tests verify that mapping. The
+estimator does not reread files or duplicate processor I/O.
 
 `DepthMapProcessor` uses this optional method when present and retains the
 existing `estimate_depth_batch` loop otherwise. Do not add a strategy class,
@@ -270,6 +271,16 @@ For each shot:
 8. Tail padding predictions are discarded so the yielded count equals the
    original shot length.
 
+Cropping follows source identity, not a generic `shot_length - window_start`
+count, because the first ten positions of later VDA windows are carried state.
+For a shot of length `L`, first-window position `p` represents a visible source
+frame only when `0 <= p < min(32, L)`, with source index `p`. For every later
+window starting at `s`, positions 0 and 1 are alignment-only; each position `p`
+from 2 through 31 represents source index `s + p` only when `s + p < L`.
+Positions failing those tests are padding and are never yielded. Before building
+each finalized `DepthBatch`, the orchestrator clips its arithmetic source-index
+range to `[0, L)`; it does not add index metadata to `DepthBatch`.
+
 The implementation must factor one `_infer_fixed_window` path around the VDA
 model's direct `forward` operation. It must not call `infer_video_depth` once per
 32-frame outer window, because that method performs its own segmentation and
@@ -317,7 +328,7 @@ condition `window_start < shot_length`.
 Let source geometry be `Hs x Ws`, transformed model geometry be `Hi x Wi`, and
 returned depth geometry be `Hd x Wd`. Excluding model weights, allocator
 bookkeeping, and the framework workspace for one model forward, the sequence
-orchestrator must not retain more than:
+orchestrator's conservative live-set ceiling is:
 
 ```text
 host decoded RGB       <= 32 * Hs * Ws * 3 bytes
@@ -335,9 +346,10 @@ Later source loads request at most 22 new decoded frames, but the first-window
 32-frame bound is used for the invariant.
 
 Model activations and CUDA workspace are additionally bounded by exactly one
-32-frame `_infer_fixed_window` call at the chosen effective resolution. Tests
-must measure the live orchestration objects, and an optional CUDA integration
-test records allocator peak; neither bound may scale with shot or video length.
+32-frame `_infer_fixed_window` call at the chosen effective resolution. Unit
+tests instrument retained arrays and tensors to assert these bounds; an optional
+CUDA integration test records allocator peak. Neither bound may scale with shot
+or video length.
 
 ## V2 Resolution Execution Plan
 
@@ -461,7 +473,7 @@ therefore explicitly backend-dependent:
 | Identity field group | V2 | DA3 | See-Through |
 | --- | --- | --- | --- |
 | Existing model, resolution, dtype, and preprocessing identity | Yes | Yes | Yes |
-| Compatibility `temporal_window_*` fields | Yes, unchanged for one release | Yes, unchanged for one release | Yes, unchanged for one release |
+| Compatibility `temporal_window_*` fields | Yes, unchanged for at least this release | Yes, unchanged for at least this release | Yes, unchanged for at least this release |
 | Candidate-scene settings and scene algorithm version | Yes | No | No |
 | `vda-offline-shot-v1` algorithm identity | Yes | No | No |
 | V2 requested/effective resolution execution plan | Yes | No | No |
@@ -482,7 +494,7 @@ claiming that larger arbitrary windows improve consistency. Active README and
 performance documentation describe fixed VDA windows and shot-aware resets.
 Archived historical documents are not rewritten.
 
-For one compatibility release:
+For at least this release:
 
 - keep `temporal_window_size` and `temporal_window_overlap` in validated saved
   settings with their existing defaults,
@@ -495,14 +507,15 @@ For one compatibility release:
   32/10.
 
 The compatibility keys are not shown in the Web UI and are not described as
-effective. Removing them from the settings schema is a later migration, not
-part of this change.
+effective. Removing them from the settings schema and cache identities is a
+future breaking migration with no date committed by this specification.
 
-The compatibility warning does not block processing. CLI writes it once to
-stderr. Web sends it once through the existing progress-message channel so it
-is visible in the active job. The message includes both supplied values and
-states that VDA uses fixed window 32 and overlap 10. Default 32/10 values emit
-no warning.
+The compatibility warning does not block processing. It fires once at V2
+raw-stage entry, before cache reuse, the capacity probe, or the first temporal
+window. CLI writes it once to stderr. Web sends it once through the existing
+progress-message channel so it is visible in the active job. The message
+includes both supplied values and states that VDA uses fixed window 32 and
+overlap 10. Default 32/10 values emit no warning.
 
 ## Error Handling
 
@@ -585,6 +598,9 @@ It may be offered later as a separate explicit backend mode.
 - Test that the processor callback maps indexes in requested order. Separately
   test estimator rejection of short count, wrong dtype, rank, channel count,
   geometry, decode failure, and callback exception propagation.
+- In a multi-shot video whose second shot starts at global frame 100, test that
+  its estimator callback receives shot-local indexes `[0, 1, 2, ...]`, while
+  the processor alone maps them to global source paths.
 - Assert the 25-, 31-, and 33-frame worked examples exactly.
 - Instrument retained arrays and tensors to enforce the documented 32/50/42
   orchestration bounds independently of sequence length.
