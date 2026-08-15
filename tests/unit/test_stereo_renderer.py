@@ -101,6 +101,22 @@ def test_half_lane_boundaries_obey_ceil_without_epsilon() -> None:
     assert left[0, :3].tolist() == [0, 0, 1]
 
 
+def test_canonical_resize_remains_bilinear_and_bounded() -> None:
+    canonical = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+    expected = torch.nn.functional.interpolate(
+        torch.from_numpy(canonical).view(1, 1, 2, 2),
+        size=(7, 9),
+        mode="bilinear",
+        align_corners=False,
+    )[0, 0]
+
+    actual = StereoRenderer._resize_canonical(canonical, (7, 9))
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    assert actual.min().item() >= 0.0
+    assert actual.max().item() <= 1.0
+
+
 def test_geometry_maps_are_built_once_and_reused_after_oom(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
