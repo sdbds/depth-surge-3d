@@ -517,7 +517,11 @@ class ProgressCallback:
             scale = self.preview_downscale_width / width
             new_width = self.preview_downscale_width
             new_height = int(height * scale)
-            frame_small = cv2.resize(frame, (new_width, new_height))
+            frame_small = cv2.resize(
+                frame,
+                (new_width, new_height),
+                interpolation=cv2.INTER_AREA,
+            )
 
             # Encode to base64
             _, buffer = cv2.imencode(".png", frame_small)
@@ -596,7 +600,11 @@ class ProgressCallback:
             scale = self.preview_downscale_width / width
             new_width = self.preview_downscale_width
             new_height = int(height * scale)
-            frame_small = cv2.resize(frame_array, (new_width, new_height))
+            frame_small = cv2.resize(
+                frame_array,
+                (new_width, new_height),
+                interpolation=cv2.INTER_AREA,
+            )
 
             # Encode to base64
             _, buffer = cv2.imencode(".png", frame_small)

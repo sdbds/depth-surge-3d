@@ -2,6 +2,9 @@
 
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import pytest
+
 import app as web_app
 
 
@@ -37,6 +40,32 @@ def test_direct_vr_progress_aliases_to_final_weighted_step_without_regressing():
     assert callback.current_step_index == callback.steps.index("Video Creation") == 7
     assert web_app.current_processing["step_name"] == "Direct VR Encoding"
     assert web_app.current_processing["progress"] >= crop_progress
+
+
+@pytest.mark.parametrize("source_kind", ["file", "array"])
+def test_preview_downsampling_uses_inter_area(tmp_path, source_kind):
+    callback = web_app.ProgressCallback(
+        "test-session",
+        total_frames=1,
+        preview_update_interval=0,
+    )
+    callback.preview_downscale_width = 6
+    frame = np.arange(8 * 12 * 3, dtype=np.uint8).reshape(8, 12, 3)
+    original_resize = web_app.cv2.resize
+
+    with (
+        patch.object(web_app.cv2, "resize", wraps=original_resize) as resize_spy,
+        patch.object(web_app.socketio, "emit"),
+    ):
+        if source_kind == "file":
+            frame_path = tmp_path / "frame.png"
+            assert web_app.cv2.imwrite(str(frame_path), frame)
+            callback.send_preview_frame(frame_path, "stereo_left", 1)
+        else:
+            callback.send_preview_frame_from_array(frame, "stereo_left", 1)
+
+    assert resize_spy.called
+    assert resize_spy.call_args.kwargs.get("interpolation") == web_app.cv2.INTER_AREA
 
 
 def test_app_stop_handler_emits_stopped_instead_of_error(tmp_path):
