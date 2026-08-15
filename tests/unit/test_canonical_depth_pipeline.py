@@ -111,6 +111,7 @@ def test_native_frame_preprocessing_has_a_new_fingerprint_version(
     fingerprint = processor._raw_semantic_fingerprint(source_frames, pipeline_settings)
 
     assert fingerprint["preprocessing_algorithm"] == "native-depth-adapter-v2"
+    assert "execution_plan" not in fingerprint
 
 
 def test_see_through_aspect_geometry_has_a_distinct_fingerprint(
@@ -123,6 +124,31 @@ def test_see_through_aspect_geometry_has_a_distinct_fingerprint(
     fingerprint = processor._raw_semantic_fingerprint(source_frames, settings)
 
     assert fingerprint["preprocessing_algorithm"] == "see-through-native-768-square-v2"
+
+
+def test_framewise_backend_does_not_warn_about_temporal_compatibility_settings(
+    source_frames: list[Path],
+    stage_directories: dict[str, Path],
+    pipeline_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = dict(
+        pipeline_settings,
+        depth_model_version="v3",
+        temporal_window_size=64,
+        temporal_window_overlap=20,
+    )
+
+    _run_pipeline(
+        FakeRelativeDepthEstimator(),
+        source_frames,
+        stage_directories,
+        settings,
+        monkeypatch,
+    )
+
+    assert "temporal_window" not in capsys.readouterr().err
 
 
 def test_file_pipeline_persists_native_raw_before_canonicalization(

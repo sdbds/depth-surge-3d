@@ -943,14 +943,14 @@
                             <h6 class="step-title">Depth Analysis</h6>
                         </div>
                         <div class="mb-3">
-                            <label class="form-label">Depth Model Version <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="V3: General-purpose default. V2: Better temporal consistency. See-Through: Experimental relative depth for 2D animation."></i></label>
+                            <label class="form-label">Depth Model Version <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="V3: General-purpose default. V2: Shot-aware model-native temporal inference. See-Through: Experimental relative depth for 2D animation."></i></label>
                             <select class="form-select" id="depthModelVersion">
                                 <option value="v3" selected>Depth-Anything V3 (Default, Lower VRAM, Faster)</option>
-                                <option value="v2">Video-Depth-Anything V2 (Temporal Consistency)</option>
+                                <option value="v2">Video-Depth-Anything V2 (Shot-Aware Temporal)</option>
                                 <option value="see_through">See-Through Marigold (Experimental, 2D Animation)</option>
                             </select>
                             <small class="form-text text-muted">
-                                <i class="fas fa-film"></i> V2: 32-frame temporal windows for smooth depth<br>
+                                <i class="fas fa-film"></i> V2: fixed 32-frame windows with 10-frame overlap within detected shots; state resets at cuts<br>
                                 <i class="fas fa-bolt"></i> V3: Frame-by-frame, ~50% less VRAM, optional xformers optimization<br>
                                 <i class="fas fa-palette"></i> See-Through: Relative depth specialized for anime artwork<br>
                                 <i class="fas fa-link"></i> <a href="https://github.com/ByteDance-Seed/Depth-Anything-3" target="_blank" style="color: var(--accent-lime);">V3 Info</a> | <a href="https://github.com/DepthAnything/Depth-Anything-V2" target="_blank" style="color: var(--accent-lime);">V2 Info</a>
@@ -993,33 +993,6 @@
                             <small class="form-text text-muted">
                                 <i class="fas fa-ruler"></i> Metric depth recommended for better 3D quality<br>
                                 <i class="fas fa-brain"></i> Trained on Virtual KITTI and IRS datasets
-                            </small>
-                        </div>
-                        <!-- Experimental: Temporal Window Settings (V2 only) -->
-                        <div class="mb-3" id="temporalWindowSettings" style="display: none;">
-                            <div class="alert alert-warning" style="background-color: rgba(255, 193, 7, 0.1); border-color: var(--accent-yellow); color: var(--accent-yellow);">
-                                <i class="fas fa-flask"></i> <strong>Experimental:</strong> Temporal Window Tuning
-                            </div>
-                            <label class="form-label">Window Size (frames) <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Number of frames processed together for temporal consistency. Default: 32. Higher = more context but more VRAM. Lower = less VRAM but may reduce smoothness."></i></label>
-                            <input type="range" class="form-range" id="temporalWindowSize" min="16" max="64" step="8" value="32">
-                            <div class="d-flex justify-content-between">
-                                <small class="text-muted">16 (Low VRAM)</small>
-                                <small><strong id="temporalWindowSizeValue">32</strong> frames</small>
-                                <small class="text-muted">64 (High VRAM)</small>
-                            </div>
-                            <small class="form-text text-muted" style="margin-top: 0.5rem; display: block;">
-                                <i class="fas fa-memory"></i> Default (32): Balanced temporal consistency & VRAM<br>
-                                <i class="fas fa-exclamation-triangle"></i> Changing from 32 may affect quality (model trained on 32)
-                            </small>
-                            <label class="form-label" style="margin-top: 1rem;">Overlap (frames) <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Number of frames shared between consecutive windows. Default: 10. Higher = smoother transitions but slower."></i></label>
-                            <input type="range" class="form-range" id="temporalWindowOverlap" min="4" max="20" step="2" value="10">
-                            <div class="d-flex justify-content-between">
-                                <small class="text-muted">4 (Fast)</small>
-                                <small><strong id="temporalWindowOverlapValue">10</strong> frames</small>
-                                <small class="text-muted">20 (Smooth)</small>
-                            </div>
-                            <small class="form-text text-muted" style="margin-top: 0.5rem; display: block;">
-                                <i class="fas fa-arrows-alt-h"></i> Default (10): Good balance of speed & smoothness
                             </small>
                         </div>
                         <div class="mb-3">
@@ -2188,8 +2161,6 @@
                 depth_model_version: document.getElementById('depthModelVersion').value,
                 depth_resolution: document.getElementById('depthResolution').value,
                 use_metric_depth: document.getElementById('depthModelType').value === 'metric',
-                temporal_window_size: parseInt(document.getElementById('temporalWindowSize').value),
-                temporal_window_overlap: parseInt(document.getElementById('temporalWindowOverlap').value),
                 super_sample: document.getElementById('superSample').value,
                 apply_distortion: document.getElementById('applyDistortion').checked,
                 fisheye_projection: document.getElementById('fisheyeProjection').value,
@@ -3273,9 +3244,7 @@
 
         function updateDepthModelControls() {
             const modelVersion = document.getElementById('depthModelVersion').value;
-            const isV2 = modelVersion === 'v2';
             const isSeeThrough = modelVersion === 'see_through';
-            document.getElementById('temporalWindowSettings').style.display = isV2 ? 'block' : 'none';
             document.getElementById('modelSizeSettings').style.display = isSeeThrough ? 'none' : 'block';
             document.getElementById('depthModelTypeSettings').style.display = isSeeThrough ? 'none' : 'block';
         }
@@ -3283,16 +3252,6 @@
         // Toggle model-specific settings based on depth backend.
         document.getElementById('depthModelVersion').addEventListener('change', function() {
             updateDepthModelControls();
-        });
-
-        // Update temporal window size value display
-        document.getElementById('temporalWindowSize').addEventListener('input', function() {
-            document.getElementById('temporalWindowSizeValue').textContent = this.value;
-        });
-
-        // Update temporal window overlap value display
-        document.getElementById('temporalWindowOverlap').addEventListener('input', function() {
-            document.getElementById('temporalWindowOverlapValue').textContent = this.value;
         });
 
         // Update preview update interval value display

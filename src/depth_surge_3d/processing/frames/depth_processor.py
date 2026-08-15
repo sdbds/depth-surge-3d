@@ -132,6 +132,7 @@ class DepthMapProcessor:
         execution_plan = None
         requested_plan_fingerprint = None
         if self._supports_sequence_depth():
+            self._warn_ignored_v2_temporal_settings(settings, progress_tracker)
             requested_plan = self._requested_v2_execution_plan(frame_files, settings)
             requested_semantic = self._raw_semantic_fingerprint(
                 frame_files,
@@ -623,13 +624,37 @@ class DepthMapProcessor:
             f"{effective_size} instead of requested size {requested_size}; "
             "the lower size applies to the whole V2 raw stage."
         )
-        print(message, file=sys.stderr)
         if progress_tracker:
             progress_tracker.update_progress(
                 message,
                 phase="depth_estimation",
                 step_name="Depth Map Generation",
             )
+        else:
+            print(message, file=sys.stderr)
+
+    @staticmethod
+    def _warn_ignored_v2_temporal_settings(
+        settings: dict[str, Any],
+        progress_tracker,
+    ) -> None:
+        window_size = settings.get("temporal_window_size", 32)
+        overlap = settings.get("temporal_window_overlap", 10)
+        if window_size == 32 and overlap == 10:
+            return
+        message = (
+            f"Warning: temporal_window_size={window_size} and "
+            f"temporal_window_overlap={overlap} are retained for compatibility but ignored; "
+            "VDA uses fixed window 32 and overlap 10 within each detected shot."
+        )
+        if progress_tracker:
+            progress_tracker.update_progress(
+                message,
+                phase="depth_estimation",
+                step_name="Depth Map Generation",
+            )
+        else:
+            print(message, file=sys.stderr)
 
     @staticmethod
     def _open_raw_store_if_present(

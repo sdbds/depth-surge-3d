@@ -106,7 +106,7 @@ Examples:
   %(prog)s --resume ./output/my_video_output/          # Resume previous job
   %(prog)s --list-resolutions                          # Show available resolutions
 
-Note: Always uses Video-Depth-Anything for temporal consistency across frames.
+Note: V2 uses fixed shot-aware temporal inference; V3 and See-Through infer frames independently.
         """,
     )
 

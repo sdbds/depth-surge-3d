@@ -11,12 +11,14 @@ import numpy as np
 import pytest
 import torch
 
+from src.depth_surge_3d.core.depth_contract import canonical_json_hash
 from src.depth_surge_3d.inference.depth.types import DepthBatch, DepthRepresentation
 from src.depth_surge_3d.processing.frames.depth_processor import DepthMapProcessor
 from src.depth_surge_3d.processing.frames.scene_analyzer import (
     SCENE_ALGORITHM_VERSION,
     SCENE_SCHEMA_VERSION,
 )
+from src.depth_surge_3d.utils.domain.depth_cache import compute_cache_key
 
 
 class FakeSequenceEstimator:
@@ -123,6 +125,24 @@ class RetryableCapacityEstimator(FakeSequenceEstimator):
         return RetryableIterator()
 
 
+class EventSequenceEstimator(FakeSequenceEstimator):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self.events = events
+
+    def iter_sequence_depth(self, *args, **kwargs):
+        self.events.append("inference")
+        return super().iter_sequence_depth(*args, **kwargs)
+
+
+class RecordingProgress:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def update_progress(self, stage: str, **_values) -> None:
+        self.events.append(stage)
+
+
 @pytest.fixture
 def v2_frames(tmp_path: Path) -> list[Path]:
     frame_dir = tmp_path / "00_original_frames"
@@ -182,6 +202,7 @@ def _run_v2_pipeline(
     settings: dict[str, object],
     directories: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
+    progress_tracker=None,
 ) -> list[Path]:
     processor = DepthMapProcessor(estimator)
     manifest = _candidate_manifest(frame_files)
@@ -197,7 +218,7 @@ def _run_v2_pipeline(
         frame_files,
         settings,
         directories,
-        progress_tracker=None,
+        progress_tracker=progress_tracker,
     )
     assert result is not None
     return result
@@ -439,3 +460,163 @@ def test_v2_resume_adopts_a_compatible_persisted_fallback_plan(
 
     assert {size for size, _marker in resumed.attempts} == {384}
     assert resumed.attempts[:3] == [(384, 1), (384, 2), (384, 3)]
+
+
+def test_v2_resume_rejects_a_fallback_plan_from_different_source_frames(
+    v2_frames: list[Path],
+    v2_directories: dict[str, Path],
+    v2_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = RetryableCapacityEstimator(
+        oom_failures={(518, 1): 1},
+        runtime_failures={(384, 2): 1},
+    )
+    with pytest.raises(RuntimeError, match="failed at 384 for frame 2"):
+        _run_v2_pipeline(
+            first,
+            v2_frames,
+            v2_settings,
+            v2_directories,
+            monkeypatch,
+        )
+    changed = np.full((2, 3, 3), 10, dtype=np.uint8)
+    assert cv2.imwrite(str(v2_frames[0]), changed)
+    resumed = RetryableCapacityEstimator()
+
+    _run_v2_pipeline(
+        resumed,
+        v2_frames,
+        v2_settings,
+        v2_directories,
+        monkeypatch,
+    )
+
+    assert resumed.attempts[0] == (518, 10)
+
+
+def test_v2_nondefault_compatibility_windows_warn_once_before_cache_or_inference(
+    v2_frames: list[Path],
+    v2_directories: dict[str, Path],
+    v2_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    v2_settings["temporal_window_size"] = 64
+    events: list[str] = []
+    estimator = EventSequenceEstimator(events)
+    restore_cache = DepthMapProcessor._try_restore_global_canonical_cache
+
+    def record_cache_lookup(processor, *args, **kwargs):
+        events.append("cache lookup")
+        return restore_cache(processor, *args, **kwargs)
+
+    monkeypatch.setattr(
+        DepthMapProcessor,
+        "_try_restore_global_canonical_cache",
+        record_cache_lookup,
+    )
+
+    _run_v2_pipeline(
+        estimator,
+        v2_frames,
+        v2_settings,
+        v2_directories,
+        monkeypatch,
+        RecordingProgress(events),
+    )
+
+    warnings = [event for event in events if "fixed window 32" in event]
+    assert len(warnings) == 1
+    assert events.index(warnings[0]) < events.index("cache lookup")
+    assert events.index(warnings[0]) < events.index("inference")
+    assert capsys.readouterr().err == ""
+
+
+def test_v2_cli_compatibility_warning_is_written_once_to_stderr(
+    v2_frames: list[Path],
+    v2_directories: dict[str, Path],
+    v2_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    v2_settings["temporal_window_overlap"] = 20
+
+    _run_v2_pipeline(
+        FakeSequenceEstimator(),
+        v2_frames,
+        v2_settings,
+        v2_directories,
+        monkeypatch,
+    )
+
+    stderr = capsys.readouterr().err
+    assert stderr.count("temporal_window_size=32") == 1
+    assert "temporal_window_overlap=20" in stderr
+    assert "fixed window 32 and overlap 10" in stderr
+
+
+def test_v2_default_compatibility_windows_do_not_warn(
+    v2_settings: dict[str, object],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[str] = []
+
+    DepthMapProcessor._warn_ignored_v2_temporal_settings(
+        v2_settings,
+        RecordingProgress(events),
+    )
+
+    assert events == []
+    assert capsys.readouterr().err == ""
+
+
+def test_v2_effective_resolution_changes_the_raw_and_global_model_identity(
+    v2_frames: list[Path],
+    v2_settings: dict[str, object],
+) -> None:
+    processor = DepthMapProcessor(FakeSequenceEstimator())
+    requested = processor._raw_semantic_fingerprint(
+        v2_frames,
+        v2_settings,
+        processor._v2_execution_plan(518, 518),
+    )
+    fallback = processor._raw_semantic_fingerprint(
+        v2_frames,
+        v2_settings,
+        processor._v2_execution_plan(518, 384),
+    )
+
+    assert requested["execution_plan"]["effective_input_size"] == 518
+    assert fallback["execution_plan"]["effective_input_size"] == 384
+    requested_hash = canonical_json_hash(requested)
+    fallback_hash = canonical_json_hash(fallback)
+    assert requested_hash != fallback_hash
+    video_path = v2_frames[0].parents[1] / "source.mp4"
+    video_path.write_bytes(b"source video")
+    assert compute_cache_key(
+        str(video_path),
+        dict(v2_settings, model_fingerprint=requested_hash),
+    ) != compute_cache_key(
+        str(video_path),
+        dict(v2_settings, model_fingerprint=fallback_hash),
+    )
+
+
+def test_v2_persisted_execution_plan_requires_exact_compatible_structure() -> None:
+    requested = DepthMapProcessor._v2_execution_plan(518, 518)
+    fallback = DepthMapProcessor._v2_execution_plan(518, 384)
+
+    assert DepthMapProcessor._is_compatible_v2_execution_plan(fallback, requested)
+    assert not DepthMapProcessor._is_compatible_v2_execution_plan(
+        {**fallback, "effective_input_size": 500},
+        requested,
+    )
+    assert not DepthMapProcessor._is_compatible_v2_execution_plan(
+        {**fallback, "fallback_policy": "unknown"},
+        requested,
+    )
+    assert not DepthMapProcessor._is_compatible_v2_execution_plan(
+        {key: value for key, value in fallback.items() if key != "precision"},
+        requested,
+    )
