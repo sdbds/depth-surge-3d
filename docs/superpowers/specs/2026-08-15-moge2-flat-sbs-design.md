@@ -2,10 +2,10 @@
 
 ## Status
 
-Approved on 2026-08-15. This design adds MoGe-2 as an optional depth backend
-and adds an experimental metric-camera projection for flat, rectified
-side-by-side video. Spherical, VR180, and point-map rendering are deliberately
-separate future work.
+Approved on 2026-08-15 and revised on 2026-08-16 after external review. This
+design adds MoGe-2 as an optional depth backend and adds an experimental
+metric-camera projection for flat, rectified side-by-side video. Spherical,
+VR180, and point-map rendering are deliberately separate future work.
 
 ## Linus Three-Question Check
 
@@ -84,6 +84,8 @@ MoGe point maps or normal maps.
 - Making metric-camera mode available to a backend that does not emit a
   validated pinhole focal length.
 - Applying the metric pinhole claim to fisheye-distorted source or output.
+- Supporting anamorphic samples or automatically detecting and removing
+  baked-in letterbox bars in metric mode.
 - Shipping metric-camera mode in over-under or another stereo packing before a
   separate compatibility check.
 - Optimizing MoGe batch size before real VRAM measurements exist.
@@ -132,9 +134,11 @@ Pip-oriented documentation and a pinned `requirements-moge2.txt` provide the
 same commit URL. The normal install does not pull MoGe's Gradio, trimesh, and
 other optional-backend dependencies.
 
-The Web option remains visible when the extra is absent, but selection fails
-before model download or frame mutation and reports the exact installation
-command. The application never substitutes DA3, V2, or See-Through.
+The backend registry exposes an availability probe. When the extra is absent,
+Web renders MoGe-2 as disabled with an unavailable status rather than allowing
+a broken selection. CLI validation fails before model download or frame
+mutation and reports the exact installation command. The application never
+substitutes DA3, V2, or See-Through.
 
 MoGe code is MIT licensed. Its bundled DINOv2 code is Apache 2.0 licensed. The
 installation and attribution documentation must retain both notices. No
@@ -226,7 +230,7 @@ Add a dedicated MoGe-2 estimator beside the existing depth adapters. It must:
 7. Use OpenCV area resampling for this output-affecting model preprocessing and
    fingerprint it as `moge2-rgb-area-max-edge-v1`.
 8. Invoke `infer(force_projection=False, apply_mask=True,
-   resolution_level=moge_resolution_level, use_fp16=...)`.
+   resolution_level=MOGE_RESOLUTION_LEVEL, use_fp16=...)`.
 9. Extract metric depth and normalized `intrinsics[...,0,0]`; discard points,
    normal, and the remaining intrinsics immediately.
 10. Validate keys, ranks, batch counts, spatial shape, depth dtype, and focal
@@ -238,7 +242,15 @@ not consume. It does not change the upstream depth or recovered intrinsics.
 CUDA uses FP16 autocast unless the caller explicitly requests FP32. CPU uses
 FP32. The adapter never silently changes device or precision. Device,
 precision, source commit, weight revision, model size, depth resolution,
-preprocessing identity, and resolution level all enter the model fingerprint.
+preprocessing identity, and the fixed resolution level all enter the model
+fingerprint.
+
+`MOGE_RESOLUTION_LEVEL` is an internal adapter constant fixed at `9`, matching
+the pinned upstream default. It is reported as effective model metadata but is
+not a setting, Web control, or CLI flag. Users choose the measured model-size
+variants and `depth_resolution`; exposing a second, poorly characterized
+quality integer would create overlapping controls. Any future quality preset
+requires measured memory, speed, and output evidence in a separate change.
 
 The official API can accept a batch, but the first integration declares
 `max_batch_size=1`. Existing DA3/V2 VRAM heuristics must not be applied to
@@ -255,7 +267,6 @@ Add these typed settings:
 | `virtual_baseline_mm` | `63.0` | finite `0..100` | stereo |
 | `metric_convergence_distance` | `auto` | `auto` or finite `0.1..1000` metres | stereo |
 | `max_disparity_percent` | `2.0` | finite `0..5` | stereo |
-| `moge_resolution_level` | `9` | integer `0..9` | raw model output |
 
 `stereo_strength` and normalized `convergence` remain the relative-mode
 controls. They are inactive in `metric_camera`. The metric settings remain
@@ -272,8 +283,29 @@ pinhole camera described by MoGe's focal length. Web selects SBS, turns the
 distortion control off when the user selects metric mode, and keeps both states
 visible; server-side validation rejects forged or resumed metric requests that
 use another packing or still enable distortion. Identical center crop and
-uniform resize remain permitted because they transform both eye images
-consistently.
+axis-aligned resize remain permitted because they transform both eye images
+consistently. Metric projection accounts for the exact retained horizontal
+crop before enforcing the final-output disparity cap.
+
+The source probe reads the first video stream's `sample_aspect_ratio` and
+`video_properties` stores its canonical numerator and denominator. Missing or
+`N/A` metadata follows the decoder's square-pixel default and normalizes to
+`1:1`; malformed or non-positive explicit values are invalid. The normalized
+ratio enters metric validation and the metric stereo fingerprint, but not the
+source-frame fingerprint because it does not change the extracted pixels. A
+legacy resume without this field re-probes the original video; if that source
+is unavailable, metric mode fails without invalidating reusable frames and
+relative mode remains available.
+
+An explicitly non-square ratio is rejected for `metric_camera` before model
+loading because MoGe's normalized focal length does not encode anamorphic
+sample expansion. The MoGe preprocessor derives both target dimensions from
+one scale factor and validates the resulting dimensions, so it never stretches
+width and height independently. A different final raster aspect ratio alone is
+not an error: identical horizontal and vertical scaling preserves horizontal
+rectification, and the projection uses the transformed horizontal focal scale.
+Automatic detection or removal of baked-in letterbox bars is out of scope and
+documentation warns that bars can bias inferred depth and focal length.
 
 The CLI adds:
 
@@ -282,8 +314,7 @@ The CLI adds:
 - `--stereo-geometry-mode`;
 - `--virtual-baseline-mm`;
 - `--metric-convergence-distance`;
-- `--max-disparity-percent`;
-- `--moge-resolution-level`.
+- `--max-disparity-percent`.
 
 An explicitly supplied `--model-size` and `--model` are mutually exclusive at
 the CLI boundary. Normalized effective settings persist the resolved
@@ -292,38 +323,61 @@ the CLI boundary. Normalized effective settings persist the resolved
 
 ## Flat-SBS Metric Projection
 
-For one valid pixel, define:
+For one valid pixel, define the projection in final per-eye coordinates, then
+convert it to the existing pre-crop renderer coordinates:
 
 ```text
 Z       = metric depth in metres
 q       = 1 / Z
-fx_n    = horizontal focal length normalized by input image width
+fx_n    = horizontal focal length normalized by source render width
 b       = virtual_baseline_mm / 1000
 Z0      = resolved metric convergence distance in metres
-W       = per-eye render width in pixels
+W_s     = source width at the stereo render boundary
+W_c     = exact retained width after integer center-crop sizing
+c_x     = W_c / W_s
+W_f     = final per-eye output width
 m       = max_disparity_percent / 100
 
-p_raw   = fx_n * b * (q - 1 / Z0)
-p       = clamp(p_raw, -m, +m)
-D_px    = p * W
+p_out_raw = (fx_n / c_x) * b * (q - 1 / Z0)
+p_out     = clamp(p_out_raw, -m, +m)
+p_render  = p_out * c_x
+D_source  = p_render * W_s = p_out * W_c
+D_final   = p_out * W_f
 
-left_shift_px  = +D_px / 2
-right_shift_px = -D_px / 2
+left_source_shift  = +D_source / 2
+right_source_shift = -D_source / 2
 ```
 
-`p_raw` and `p` are total binocular disparity as a fraction of one per-eye
-frame width. For `Z < Z0`, `p` is positive and `u_left - u_right > 0`, so the
-point appears in front of the zero-parallax plane. For `Z > Z0`, the sign is
-negative and the point appears behind it.
+`p_out_raw` and `p_out` are total binocular disparity as a fraction of final
+per-eye output width. `p_render` is the fraction consumed by the existing
+renderer before center crop. `W_c` uses the same integer sizing helper as the
+crop stage, not the unrounded `crop_factor`, so subsequent horizontal resize
+produces `D_final` and cannot exceed the configured cap. With no crop,
+`c_x=1`. For `Z < Z0`, disparity is positive and
+`u_left - u_right > 0`, so the point appears in front of the zero-parallax
+plane. For `Z > Z0`, the sign is negative and the point appears behind it.
 
-The z-buffer near score is the unclamped `q`, never `p`. Clamping changes only
-eye displacement. This prevents multiple close surfaces that hit the safety
-limit from becoming false depth ties.
+The metric stereo fingerprint records the projection algorithm identity,
+`W_s`, `W_c`, and the crop-sizing algorithm identity. This makes an
+integer crop-rounding change an explicit stereo invalidation rather than a
+silent output drift. `W_f` is deliberately absent because final resize scales
+both images and their disparity together; changing only final resolution
+reuses valid stereo pairs and rebuilds the existing downstream resize stage.
+
+The z-buffer near score is the unclamped `q`, never `p_out` or `p_render`.
+Clamping changes only eye displacement. This prevents multiple close surfaces
+that hit the safety limit from becoming false depth ties.
 
 `max_disparity_percent=2.0` is a conservative project default derived from the
 existing default total relative-disparity span. It is not described as a
 universal comfort standard. Stereo metadata records the valid-pixel fraction
 whose raw disparity was clamped, both per frame and for the complete stage.
+The first frame in a job where more than 5 percent of valid pixels are clamped
+emits one rate-limited warning; later frames do not repeat it. The final job
+summary reports affected-frame count plus the mean and maximum per-frame
+clamped fraction. The threshold is diagnostic, not a processing failure, and
+the first release does not persist a disparity histogram. Frames with no valid
+metric pixels have a clamped fraction of zero and do not count as affected.
 
 ## Automatic Convergence
 
@@ -344,12 +398,14 @@ resolved clip-global median. No valid sample is a hard error before stereo
 rendering. A single clip-global value avoids scene-cut convergence pumping. It
 does not claim to handle optical zoom or per-frame focal drift.
 
-A pre-processing preview cannot know clip-global `auto` convergence. The
-preview endpoint returns an explicit `convergence_unresolved` state until
-metric geometry exists. The user may supply an explicit metric convergence for
-an immediate preview. Once resolved metadata exists, preview and production
-invoke the same geometry builder with the same `Z0`; there is no provisional
-frame-median preview presented as final output.
+A pre-processing preview cannot know clip-global `auto` convergence. When
+`auto` is selected and metric geometry does not yet exist, Web disables metric
+preview and the endpoint rejects a forged request with the normal validation
+error that requires an explicit metric convergence. Supplying an explicit
+convergence enables immediate preview. Once resolved metric metadata exists,
+preview and production invoke the same geometry builder with the same `Z0`.
+There is no new preview protocol state and no provisional frame-median preview
+presented as final output.
 
 ## Common Renderer Geometry
 
@@ -370,8 +426,8 @@ Two small builders produce it:
   `total_disparity_fraction` is the existing relative formula, and every
   canonical source pixel is valid;
 - metric builder: `near_score` is inverse metric depth,
-  `total_disparity_fraction` is the clamped metric formula, and validity is
-  explicit.
+  `total_disparity_fraction` is `p_render` from the clamped metric formula,
+  and validity is explicit.
 
 The renderer receives no backend ID and contains no MoGe branch. It uses
 `near_score` for packed z-order keys, the signed disparity fraction for the two
@@ -402,10 +458,12 @@ the render boundary. Resize inverse depth without bleeding invalid zero values:
 
 Use `align_corners=False`, matching the existing canonical resize geometry.
 Normalized `fx` does not change under aspect-preserving inference resize or
-render resize. Any later fisheye transform, crop, or SBS assembly remains
-downstream and unchanged for relative mode. Metric mode forbids the fisheye
-transform; identical center crop, uniform resize, and SBS assembly remain
-downstream and unchanged.
+the resize from native metric geometry back to the source render raster. Any
+later fisheye transform, crop, or SBS assembly remains downstream and unchanged
+for relative mode. Metric mode forbids the fisheye transform. Its metric
+builder converts final-output disparity to the renderer's source coordinates
+with the exact horizontal crop fraction; later identical center crop,
+axis-aligned resize, and SBS assembly then remain shared downstream operations.
 
 ## Raw-Depth Schema Compatibility
 
@@ -430,10 +488,10 @@ focal value, frame manifest, native shape, representation, model fingerprint,
 and camera model before reuse.
 
 The raw semantic fingerprint includes source commit, weight artifact, model
-size, precision, device, resolution level, depth resolution, preprocessing
-algorithm, metric representation, and camera model. A missing or corrupt focal
-field is a hard raw-stage validation failure, not an invitation to infer a
-default focal length.
+size, precision, device, fixed adapter resolution level, depth resolution,
+preprocessing algorithm, metric representation, and camera model. A missing
+or corrupt focal field is a hard raw-stage validation failure, not an
+invitation to infer a default focal length.
 
 ## Stage 3 Metric Geometry
 
@@ -475,15 +533,18 @@ payload and metadata validate.
 Resume remains stage-specific:
 
 - a valid source frame stage is never invalidated solely by adding MoGe-2;
-- backend, size, repository, revision, precision, device, resolution level,
-  depth resolution, preprocessing, or camera-model changes invalidate raw
-  depth and every downstream stage;
+- backend, size, repository, revision, precision, device, fixed adapter
+  resolution level, depth resolution, preprocessing, or camera-model changes
+  invalidate raw depth and every downstream stage;
 - changing `stereo_geometry_mode` selects the required stage 3 and invalidates
   stereo and downstream output, but preserves any compatible raw and inactive
   stage-3 data;
 - baseline, metric convergence, disparity cap, relative strength, relative
   convergence, or occlusion-fill changes invalidate stereo and downstream
   output only as appropriate to the selected mode;
+- changing center crop invalidates stereo and downstream output in
+  `metric_camera`, because the exact retained width participates in cap
+  enforcement; relative mode keeps its existing crop-only invalidation;
 - the metric geometry fingerprint must match raw depth exactly;
 - clean, chunked, and resumed derivation of a given stage must produce the same
   payload values and metadata.
@@ -502,11 +563,12 @@ their upstream fingerprints remain valid.
 
 The Web depth-backend selector adds `MoGe-2`. When selected:
 
+- if the optional extra is unavailable, the entry is disabled and displays
+  the supported installation command without accepting selection;
 - the model-size control shows Small, Base, and Large with the exact upstream
   checkpoint family;
 - the model-type control is hidden and effective depth type is metric;
 - V2 temporal controls remain hidden;
-- a numeric `moge_resolution_level` control appears;
 - the flat-SBS geometry selector offers `relative` and experimental
   `metric_camera`;
 - relative mode shows existing strength and normalized convergence controls;
@@ -518,8 +580,9 @@ settings. Server validation rejects a forged `metric_camera` request for a
 backend without `pinhole_fx`, regardless of client state.
 
 CLI and Web report the effective repository, immutable revision, model size,
-device, precision, depth resolution, resolution level, camera capability,
-geometry mode, and active projection settings before expensive processing.
+device, precision, depth resolution, fixed adapter resolution level, camera
+capability, geometry mode, and active projection settings before expensive
+processing.
 
 ## Failure Behavior
 
@@ -535,15 +598,17 @@ Fail explicitly in these cases:
 - `metric_camera` is requested from a backend without pinhole focal output;
 - `metric_camera` is requested with a packing other than `side_by_side`;
 - `metric_camera` is requested while fisheye distortion is enabled;
+- `metric_camera` is requested for an explicitly non-square or invalid source
+  sample aspect ratio;
 - raw version-3 payload membership or focal data is invalid;
 - metric geometry does not match its raw fingerprint;
 - disk preflight fails;
 - CUDA inference or rendering remains out of memory after existing renderer
   band retry behavior.
 
-MoGe inference OOM reports model size, input dimensions, resolution level,
-precision, and device. It does not reduce resolution, change model, switch to
-CPU, or fall back to relative geometry automatically.
+MoGe inference OOM reports model size, input dimensions, fixed adapter
+resolution level, precision, and device. It does not reduce resolution, change
+model, switch to CPU, or fall back to relative geometry automatically.
 
 ## Verification
 
@@ -556,7 +621,8 @@ Add tests for:
 - CLI model-size/model-override mutual exclusion and normalized effective
   settings;
 - BGR-to-RGB conversion, no-upscale behavior, aspect-preserving area resize,
-  and resolution-level forwarding;
+  fixed internal resolution-level forwarding, and absence of a public
+  resolution-level setting or flag;
 - CUDA FP16 versus CPU FP32 selection without silent fallback;
 - required MoGe output keys, shapes, metric representation, mask-to-invalid
   conversion, and normalized focal extraction;
@@ -567,20 +633,28 @@ Add tests for:
   metadata, disk preflight, and retention;
 - metric-mode rejection of fisheye output while preserving relative-mode
   packing and distortion behavior;
+- source sample-aspect-ratio normalization, square-pixel acceptance,
+  non-square rejection, and single-scale MoGe preprocessing;
 - zero disparity at `Z0`;
 - positive near and negative far disparity with `u_left-u_right > 0` for a
   foreground point;
 - proportional scaling with focal length and virtual baseline;
-- total-disparity clamping at both signs;
+- total-disparity clamping at both signs, exact integer crop-width coordinate
+  conversion, and cap preservation after final horizontal resize;
+- one-per-job warning after the first frame above 5 percent clamping and final
+  affected-count/mean/maximum summary;
 - unclamped inverse-depth z-order when two surfaces share a clamped offset;
 - invalid source exclusion from z-buffer, fill, and output coverage;
 - mask-aware metric resize without invalid-zero bleeding;
 - relative projection offsets, packed keys, masks, fill, and final CPU pixels
   byte-identical to the pre-change fixture;
 - mode-specific settings and invalidation boundaries;
-- preview unresolved-auto behavior and parity after convergence resolves;
-- Web model controls, payload validation, resume restoration, and missing-extra
-  error behavior.
+- crop changes rebuilding metric stereo but retaining the existing relative
+  crop-only invalidation boundary;
+- preview disable and endpoint validation before automatic convergence resolves,
+  explicit-convergence preview, and parity after convergence resolves;
+- Web model controls, payload validation, resume restoration, unavailable-extra
+  disabled state, and CLI missing-extra error behavior.
 
 ### Integration tests
 
@@ -598,7 +672,8 @@ while preserving source frames.
 These checks are explicit release verification, not ordinary CI downloads:
 
 1. Load each pinned Small, Base, and Large model.
-2. Infer one fixed image at a documented depth resolution and resolution level.
+2. Infer one fixed image at a documented depth resolution and the fixed adapter
+   resolution level.
 3. Verify a positive finite focal length and a nonempty set of finite positive
    metric-depth pixels.
 4. Run fixed indoor-near, outdoor-far, and scene-cut clips through both
@@ -616,8 +691,12 @@ stable merely because the formula and smoke tests pass.
 
 ## Acceptance Criteria
 
-- `moge2` is selectable through CLI and Web with Small, Base, and Large.
+- `moge2` is selectable through CLI and Web with Small, Base, and Large when
+  the optional extra is installed; Web exposes an unavailable disabled state
+  and CLI gives the exact install command when it is not.
 - Default source code and weight identities are immutable and fingerprinted.
+- MoGe's fixed internal resolution level is fingerprinted and reported but is
+  absent from public settings, Web controls, and CLI flags.
 - Missing dependencies or artifacts fail before frame-stage mutation and never
   select another backend.
 - MoGe returns typed metric depth plus validated normalized horizontal focal
@@ -630,14 +709,21 @@ stable merely because the formula and smoke tests pass.
 - `metric_camera` accepts only side-by-side packing on the rectilinear output
   path and rejects `apply_distortion=true`; relative packing and distortion
   behavior is unchanged.
+- `metric_camera` accepts square-pixel or unspecified-default source sample
+  aspect ratios, rejects explicit non-square ratios before model loading, and
+  never stretches MoGe inference input independently by axis.
+- The exact center-crop width is included in metric projection, so arbitrary
+  identical final per-eye resize preserves horizontal rectification and the
+  final-output disparity cap.
 - z-buffer ordering uses unclamped inverse depth; safety clamping changes only
   eye displacement.
 - Invalid metric pixels never contribute to splat winners, fill sources, or
   valid output coverage.
 - Automatic convergence is one deterministic clip-global value and is never
   silently approximated by a pre-processing preview.
-- Configured total disparity is never exceeded, and clamped-pixel fractions
-  are persisted.
+- Configured total disparity is never exceeded; clamped-pixel fractions are
+  persisted, a threshold warning is emitted at most once per job, and the
+  final summary reports affected count plus mean and maximum fractions.
 - Metric stereo-setting changes reuse valid metric geometry and do not invoke
   MoGe.
 - Resume never interprets relative canonical maps as metric geometry.
@@ -671,7 +757,7 @@ before continuing.
 
 ### Slice 3: Product Surface and Release Evidence
 
-Complete preview states, Web controls, CLI reporting, documentation,
+Complete preview gating, Web controls, CLI reporting, documentation,
 attribution, end-to-end tests, three-variant smoke checks, A/B sample renders,
 and performance/stability reporting. Keep `metric_camera` experimental.
 
