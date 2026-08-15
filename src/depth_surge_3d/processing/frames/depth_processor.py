@@ -7,10 +7,12 @@ Handles depth map generation with canonical caching, memory management, and chun
 from __future__ import annotations
 
 import cv2
+import gc
 import hashlib
 import json
 import numpy as np
 import shutil
+import sys
 import torch
 from collections.abc import Sequence
 from pathlib import Path
@@ -74,6 +76,17 @@ from .source_frame_manifest import frame_sequence_fingerprint
 
 DEPTH_BOUNDS_SCHEMA_VERSION = 2
 DEPTH_SAMPLES_SCHEMA_VERSION = 2
+V2_FALLBACK_POLICY = "v2-uniform-halving-v1"
+V2_MINIMUM_INPUT_SIZE = 384
+_V2_SEQUENCE_END = object()
+
+
+class _V2ResolutionFallback(RuntimeError):
+    """Request a whole-stage retry at a lower uniform input size."""
+
+    def __init__(self, effective_input_size: int) -> None:
+        super().__init__(f"V2 CUDA OOM at input size {effective_input_size}")
+        self.effective_input_size = effective_input_size
 
 
 class DepthMapProcessor:
@@ -116,19 +129,105 @@ class DepthMapProcessor:
         for directory in (scene_dir, raw_dir, canonical_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        semantic_fingerprint = self._raw_semantic_fingerprint(frame_files, settings)
+        execution_plan = None
+        requested_plan_fingerprint = None
+        if self._supports_sequence_depth():
+            requested_plan = self._requested_v2_execution_plan(frame_files, settings)
+            requested_semantic = self._raw_semantic_fingerprint(
+                frame_files,
+                settings,
+                requested_plan,
+            )
+            requested_plan_fingerprint = canonical_json_hash(requested_semantic)
+            requested_cache_settings = dict(
+                settings,
+                model_fingerprint=requested_plan_fingerprint,
+            )
+            restored = self._try_restore_global_canonical_cache(
+                settings.get("video_path"),
+                frame_files,
+                requested_cache_settings,
+                canonical_dir,
+                progress_tracker,
+            )
+            if restored is not None:
+                return restored
+            execution_plan = self._adopt_persisted_v2_execution_plan(
+                raw_dir,
+                requested_plan,
+                requested_semantic,
+            )
+
+        while True:
+            semantic_fingerprint = self._raw_semantic_fingerprint(
+                frame_files,
+                settings,
+                execution_plan,
+            )
+            model_fingerprint = canonical_json_hash(semantic_fingerprint)
+            try:
+                return self._generate_depth_map_files_for_identity(
+                    frame_files,
+                    settings,
+                    scene_dir,
+                    raw_dir,
+                    canonical_dir,
+                    semantic_fingerprint,
+                    progress_tracker,
+                    skip_global_cache=model_fingerprint == requested_plan_fingerprint,
+                )
+            except _V2ResolutionFallback as error:
+                if execution_plan is None:
+                    raise RuntimeError(
+                        "V2 resolution fallback requires an execution plan"
+                    ) from error
+                current_size = error.effective_input_size
+                error.__traceback__ = None
+                error.__cause__ = None
+                self._clear_cuda_oom_state()
+                next_size = self._next_v2_input_size(current_size)
+                requested_size = int(execution_plan["requested_input_size"])
+                if next_size is None:
+                    raise RuntimeError(
+                        "V2 CUDA OOM with requested input size "
+                        f"{requested_size} and effective input size "
+                        f"{current_size}; no lower resolution candidate remains"
+                    ) from None
+                self._reset_stage_directory(raw_dir)
+                self._reset_stage_directory(canonical_dir)
+                execution_plan = self._v2_execution_plan(requested_size, next_size)
+                self._report_v2_resolution_fallback(
+                    requested_size,
+                    next_size,
+                    progress_tracker,
+                )
+
+    def _generate_depth_map_files_for_identity(
+        self,
+        frame_files: list[Path],
+        settings: dict[str, Any],
+        scene_dir: Path,
+        raw_dir: Path,
+        canonical_dir: Path,
+        semantic_fingerprint: dict[str, Any],
+        progress_tracker,
+        *,
+        skip_global_cache: bool,
+    ) -> list[Path]:
+        """Run one immutable raw-depth identity through the canonical barrier."""
         model_fingerprint = canonical_json_hash(semantic_fingerprint)
         cache_settings = dict(settings, model_fingerprint=model_fingerprint)
         video_path = settings.get("video_path")
-        restored = self._try_restore_global_canonical_cache(
-            video_path,
-            frame_files,
-            cache_settings,
-            canonical_dir,
-            progress_tracker,
-        )
-        if restored is not None:
-            return restored
+        if not skip_global_cache:
+            restored = self._try_restore_global_canonical_cache(
+                video_path,
+                frame_files,
+                cache_settings,
+                canonical_dir,
+                progress_tracker,
+            )
+            if restored is not None:
+                return restored
 
         manifest = self._load_or_analyze_scenes(
             frame_files,
@@ -391,17 +490,146 @@ class DepthMapProcessor:
         return frame_sequence_fingerprint(frame_files)
 
     def _raw_semantic_fingerprint(
-        self, frame_files: list[Path], settings: dict[str, Any]
+        self,
+        frame_files: list[Path],
+        settings: dict[str, Any],
+        execution_plan: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         fingerprint = build_current_model_fingerprint(self.depth_estimator, settings)
         fingerprint["source_frame_fingerprint"] = self._source_frame_fingerprint(frame_files)
         fingerprint["preprocessing_algorithm"] = depth_preprocessing_algorithm(settings)
         if self._supports_sequence_depth():
             fingerprint["scene_algorithm_version"] = SCENE_ALGORITHM_VERSION
+            if execution_plan is not None:
+                fingerprint["execution_plan"] = dict(execution_plan)
         return fingerprint
 
     def _supports_sequence_depth(self) -> bool:
         return callable(getattr(type(self.depth_estimator), "iter_sequence_depth", None))
+
+    def _requested_v2_execution_plan(
+        self,
+        frame_files: list[Path],
+        settings: dict[str, Any],
+    ) -> dict[str, Any]:
+        sample_frame = cv2.imread(str(frame_files[0]))
+        if sample_frame is None:
+            raise OSError(f"Could not load source frame: {frame_files[0]}")
+        frame_height, frame_width = sample_frame.shape[:2]
+        _chunk_size, requested_size = self._determine_chunk_params(
+            frame_width,
+            frame_height,
+            settings.get("depth_resolution", "auto"),
+        )
+        return self._v2_execution_plan(requested_size, requested_size)
+
+    @staticmethod
+    def _v2_execution_plan(
+        requested_input_size: int,
+        effective_input_size: int,
+    ) -> dict[str, Any]:
+        if requested_input_size < 1 or effective_input_size < 1:
+            raise ValueError("V2 execution-plan input sizes must be positive")
+        return {
+            "requested_input_size": int(requested_input_size),
+            "effective_input_size": int(effective_input_size),
+            "precision": "fp16",
+            "fallback_policy": V2_FALLBACK_POLICY,
+        }
+
+    @staticmethod
+    def _next_v2_input_size(current_size: int) -> int | None:
+        if current_size <= V2_MINIMUM_INPUT_SIZE:
+            return None
+        return max(V2_MINIMUM_INPUT_SIZE, current_size // 2)
+
+    @classmethod
+    def _valid_v2_input_sizes(cls, requested_size: int) -> set[int]:
+        sizes = {requested_size}
+        current = requested_size
+        while (next_size := cls._next_v2_input_size(current)) is not None:
+            sizes.add(next_size)
+            current = next_size
+        return sizes
+
+    def _adopt_persisted_v2_execution_plan(
+        self,
+        raw_dir: Path,
+        requested_plan: dict[str, Any],
+        requested_semantic: dict[str, Any],
+    ) -> dict[str, Any]:
+        metadata_path = raw_dir / "metadata.json"
+        if not metadata_path.is_file():
+            return requested_plan
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            persisted_semantic = metadata["semantic_fingerprint"]
+            persisted_plan = persisted_semantic["execution_plan"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return requested_plan
+        if not self._is_compatible_v2_execution_plan(persisted_plan, requested_plan):
+            return requested_plan
+        persisted_base = dict(persisted_semantic)
+        persisted_base.pop("execution_plan", None)
+        requested_base = dict(requested_semantic)
+        requested_base.pop("execution_plan", None)
+        if persisted_base != requested_base:
+            return requested_plan
+        effective_size = int(persisted_plan["effective_input_size"])
+        return self._v2_execution_plan(
+            int(requested_plan["requested_input_size"]),
+            effective_size,
+        )
+
+    @classmethod
+    def _is_compatible_v2_execution_plan(
+        cls,
+        persisted_plan: Any,
+        requested_plan: dict[str, Any],
+    ) -> bool:
+        expected_keys = {
+            "requested_input_size",
+            "effective_input_size",
+            "precision",
+            "fallback_policy",
+        }
+        if not isinstance(persisted_plan, dict) or set(persisted_plan) != expected_keys:
+            return False
+        requested_size = persisted_plan.get("requested_input_size")
+        effective_size = persisted_plan.get("effective_input_size")
+        if (
+            isinstance(requested_size, bool)
+            or not isinstance(requested_size, int)
+            or isinstance(effective_size, bool)
+            or not isinstance(effective_size, int)
+        ):
+            return False
+        if requested_size != requested_plan["requested_input_size"]:
+            return False
+        if persisted_plan.get("precision") != requested_plan["precision"]:
+            return False
+        if persisted_plan.get("fallback_policy") != requested_plan["fallback_policy"]:
+            return False
+        return effective_size in cls._valid_v2_input_sizes(requested_size)
+
+    @staticmethod
+    def _report_v2_resolution_fallback(
+        requested_size: int,
+        effective_size: int,
+        progress_tracker,
+    ) -> None:
+        message = (
+            "Warning: V2 CUDA memory fallback selected input size "
+            f"{effective_size} instead of requested size {requested_size}; "
+            "the lower size applies to the whole V2 raw stage."
+        )
+        print(message, file=sys.stderr)
+        if progress_tracker:
+            progress_tracker.update_progress(
+                message,
+                phase="depth_estimation",
+                step_name="Depth Map Generation",
+            )
 
     @staticmethod
     def _open_raw_store_if_present(
@@ -463,6 +691,7 @@ class DepthMapProcessor:
             settings,
             raw_dir,
             raw_store,
+            semantic_fingerprint.get("execution_plan"),
         )
         frame_names = [path.name for path in frame_files]
         if self._supports_sequence_depth():
@@ -544,11 +773,14 @@ class DepthMapProcessor:
         progress_tracker,
     ) -> RawDepthStore:
         shot_ranges = self._candidate_shot_ranges(manifest, len(frame_files))
+        has_successful_window = False
         for shot_number, (shot_start, shot_end) in enumerate(shot_ranges, start=1):
             shot_names = frame_names[shot_start:shot_end]
             if not self._prepare_v2_shot_resume(raw_store, shot_names):
                 continue
-            raw_store = self._infer_v2_shot(
+            if raw_store is not None and int(raw_store.metadata["completed_count"]) > 0:
+                has_successful_window = True
+            raw_store, has_successful_window = self._infer_v2_shot(
                 frame_files,
                 frame_names,
                 shot_start,
@@ -563,6 +795,7 @@ class DepthMapProcessor:
                 shot_number,
                 len(shot_ranges),
                 progress_tracker,
+                has_successful_window,
             )
             raw_store.flush_metadata()
         if raw_store is None:
@@ -597,7 +830,8 @@ class DepthMapProcessor:
         shot_number: int,
         shot_count: int,
         progress_tracker,
-    ) -> RawDepthStore:
+        has_successful_window: bool,
+    ) -> tuple[RawDepthStore, bool]:
         sequence_method = getattr(type(self.depth_estimator), "iter_sequence_depth")
 
         def load_frames(local_indexes: Sequence[int]) -> np.ndarray:
@@ -617,7 +851,15 @@ class DepthMapProcessor:
             fp32=False,
         )
         expected_start = 0
-        for item in iterator:
+        while True:
+            item = self._next_v2_sequence_item(
+                iterator,
+                input_size,
+                has_successful_window,
+            )
+            if item is _V2_SEQUENCE_END:
+                break
+            has_successful_window = True
             local_start, result = self._validate_v2_sequence_item(
                 item,
                 expected_start,
@@ -648,7 +890,44 @@ class DepthMapProcessor:
             raise ValueError("V2 sequence iterator did not yield the complete shot")
         if raw_store is None:
             raise RuntimeError("V2 sequence iterator produced no raw depth")
-        return raw_store
+        return raw_store, has_successful_window
+
+    def _next_v2_sequence_item(
+        self,
+        iterator,
+        input_size: int,
+        has_successful_window: bool,
+    ) -> Any:
+        try:
+            return next(iterator)
+        except StopIteration:
+            return _V2_SEQUENCE_END
+        except Exception as error:
+            if not self._is_cuda_oom(error):
+                raise
+            self._clear_cuda_oom_state()
+            if not has_successful_window:
+                raise _V2ResolutionFallback(input_size) from error
+            try:
+                return next(iterator)
+            except Exception as retry_error:
+                if not self._is_cuda_oom(retry_error):
+                    raise
+                self._clear_cuda_oom_state()
+                raise _V2ResolutionFallback(input_size) from retry_error
+
+    @staticmethod
+    def _is_cuda_oom(error: Exception) -> bool:
+        if isinstance(error, torch.cuda.OutOfMemoryError):
+            return True
+        message = str(error).lower()
+        return "cuda" in message and "out of memory" in message
+
+    @staticmethod
+    def _clear_cuda_oom_state() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @staticmethod
     def _validate_v2_sequence_item(
@@ -755,16 +1034,31 @@ class DepthMapProcessor:
         settings: dict[str, Any],
         raw_dir: Path,
         raw_store: RawDepthStore | None,
+        execution_plan: Any,
     ) -> tuple[int, int, Any, str]:
         sample_frame = cv2.imread(str(frame_files[0]))
         if sample_frame is None:
             raise OSError(f"Could not load source frame: {frame_files[0]}")
         frame_height, frame_width = sample_frame.shape[:2]
-        chunk_size, input_size = self._determine_chunk_params(
-            frame_width,
-            frame_height,
-            settings.get("depth_resolution", "auto"),
-        )
+        if self._supports_sequence_depth():
+            requested_size = (
+                execution_plan.get("requested_input_size")
+                if isinstance(execution_plan, dict)
+                else None
+            )
+            if isinstance(requested_size, bool) or not isinstance(requested_size, int):
+                raise ValueError("V2 raw-depth identity requires a valid execution plan")
+            requested_plan = self._v2_execution_plan(requested_size, requested_size)
+            if not self._is_compatible_v2_execution_plan(execution_plan, requested_plan):
+                raise ValueError("V2 raw-depth identity requires a valid execution plan")
+            chunk_size = 1
+            input_size = int(execution_plan["effective_input_size"])
+        else:
+            chunk_size, input_size = self._determine_chunk_params(
+                frame_width,
+                frame_height,
+                settings.get("depth_resolution", "auto"),
+            )
         requested_dtype = str(settings.get("raw_storage_dtype", "auto"))
         storage_bytes = 2 if requested_dtype == "float16" else 4
         estimated_height, estimated_width = self._estimate_native_shape(
