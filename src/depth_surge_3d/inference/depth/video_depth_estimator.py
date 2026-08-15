@@ -9,9 +9,12 @@ from __future__ import annotations
 import os
 import sys
 import urllib.request
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
+import cv2
 import torch
+import torch.nn.functional as F
 import numpy as np
 
 from ...utils.system.console import success as console_success, error as console_error
@@ -22,9 +25,219 @@ from ...core.constants import (
     MODEL_CONFIGS,
     MODEL_DOWNLOAD_URLS,
     DEPTH_MODEL_INPUT_SIZE,
-    DEPTH_MODEL_CHUNK_SIZE,
     DEPTH_MODEL_DEFAULT_FPS,
 )
+
+
+VDA_INFER_LEN = 32
+VDA_OVERLAP = 10
+VDA_KEYFRAMES = (0, 12, 24, 25, 26, 27, 28, 29, 30, 31)
+VDA_INTERP_LEN = 8
+VDA_FRAME_STEP = VDA_INFER_LEN - VDA_OVERLAP
+VDA_INFERENCE_ALGORITHM = "vda-offline-shot-v1"
+
+
+class _VDASequenceDepthIterator(Iterator[tuple[int, DepthBatch]]):
+    """One retryable, bounded implementation of VDA's offline window loop."""
+
+    def __init__(
+        self,
+        estimator: "VideoDepthEstimator",
+        frame_count: int,
+        load_frames: Callable[[Sequence[int]], np.ndarray],
+        *,
+        target_fps: int,
+        input_size: int,
+        fp32: bool,
+    ) -> None:
+        if isinstance(frame_count, bool) or not isinstance(frame_count, int) or frame_count < 0:
+            raise ValueError("frame_count must be a non-negative integer")
+        if not callable(load_frames):
+            raise TypeError("load_frames must be callable")
+        self._estimator = estimator
+        self._frame_count = frame_count
+        self._load_frames = load_frames
+        self._target_fps = target_fps
+        self._input_size = input_size
+        self._fp32 = fp32
+        self._representation = (
+            DepthRepresentation.METRIC_DEPTH
+            if estimator.metric
+            else DepthRepresentation.INVERSE_DEPTH
+        )
+        self._source_geometry: tuple[int, int] | None = None
+        self._transform: Any = None
+        self._retained_input: torch.Tensor | None = None
+        self._alignment_refs: np.ndarray | None = None
+        self._pending_depth: np.ndarray | None = None
+        self._pending_start = 0
+        self._next_window_start = 0
+        self._initialized = False
+        self._pending_emitted = False
+        self._finished = False
+
+    def __iter__(self) -> "_VDASequenceDepthIterator":
+        return self
+
+    def __next__(self) -> tuple[int, DepthBatch]:
+        if self._finished or self._frame_count == 0:
+            self._finished = True
+            raise StopIteration
+
+        while True:
+            if not self._initialized:
+                return self._advance_first_window()
+            if self._next_window_start < self._frame_count:
+                finalized = self._advance_later_window(self._next_window_start)
+                if finalized is not None:
+                    return finalized
+                continue
+            if not self._pending_emitted:
+                self._pending_emitted = True
+                visible_count = max(
+                    0,
+                    min(VDA_INTERP_LEN, self._frame_count - self._pending_start),
+                )
+                if visible_count:
+                    assert self._pending_depth is not None
+                    return self._batch(
+                        self._pending_start,
+                        self._pending_depth[:visible_count],
+                    )
+            self._finished = True
+            self._release_state()
+            raise StopIteration
+
+    def _load(self, indexes: Sequence[int]) -> np.ndarray:
+        values = self._load_frames(indexes)
+        if not isinstance(values, np.ndarray):
+            raise TypeError("Loader must return a numpy array")
+        if len(values) != len(indexes):
+            raise ValueError("Loader returned an unexpected frame count")
+        if values.dtype != np.uint8:
+            raise TypeError("Loader must return uint8 BGR frames")
+        if values.ndim != 4:
+            raise ValueError("Loader must return a rank-4 frame array")
+        if values.shape[-1] != 3:
+            raise ValueError("Loader frames must have exactly 3 channels")
+        geometry = (int(values.shape[1]), int(values.shape[2]))
+        if self._source_geometry is None:
+            self._source_geometry = geometry
+        elif geometry != self._source_geometry:
+            raise ValueError("Loader frame geometry changed within one shot")
+        return values
+
+    def _empty_frames(self) -> np.ndarray:
+        assert self._source_geometry is not None
+        height, width = self._source_geometry
+        return np.empty((0, height, width, 3), dtype=np.uint8)
+
+    def _run_window(
+        self,
+        frames: np.ndarray,
+        *,
+        carried_input: torch.Tensor | None,
+        padding_input: torch.Tensor | None,
+    ) -> tuple[np.ndarray, torch.Tensor, Any]:
+        assert self._source_geometry is not None
+        result = self._estimator._infer_fixed_window(
+            frames,
+            input_size=self._input_size,
+            fp32=self._fp32,
+            carried_input=carried_input,
+            padding_input=padding_input,
+            transform=self._transform,
+            output_shape=self._source_geometry,
+        )
+        if not isinstance(result, tuple) or len(result) != 3:
+            raise TypeError("Fixed VDA window must return depth, input state, and transform")
+        depths, current_input, transform = result
+        values = np.asarray(depths, dtype=np.float32)
+        expected_shape = (VDA_INFER_LEN, *self._source_geometry)
+        if values.shape != expected_shape:
+            raise ValueError(
+                f"Fixed VDA window returned shape {values.shape}, expected {expected_shape}"
+            )
+        if not isinstance(current_input, torch.Tensor) or current_input.ndim != 5:
+            raise TypeError("Fixed VDA window input state must be a rank-5 tensor")
+        if current_input.shape[0] != 1 or current_input.shape[1] != VDA_INFER_LEN:
+            raise ValueError("Fixed VDA window input state must have shape [1,32,C,H,W]")
+        return values, current_input, transform
+
+    @staticmethod
+    def _select_retained_input(current_input: torch.Tensor) -> torch.Tensor:
+        return current_input[:, list(VDA_KEYFRAMES), ...].detach()
+
+    def _advance_first_window(self) -> tuple[int, DepthBatch]:
+        indexes = list(range(min(VDA_INFER_LEN, self._frame_count)))
+        frames = self._load(indexes)
+        depths, current_input, transform = self._run_window(
+            frames,
+            carried_input=None,
+            padding_input=None,
+        )
+
+        retained = self._select_retained_input(current_input)
+        references = depths[[VDA_KEYFRAMES[0], VDA_KEYFRAMES[1]]].copy()
+        pending = depths[VDA_INFER_LEN - VDA_INTERP_LEN :].copy()
+        self._transform = transform
+        self._retained_input = retained
+        self._alignment_refs = references
+        self._pending_depth = pending
+        self._pending_start = VDA_INFER_LEN - VDA_INTERP_LEN
+        self._next_window_start = VDA_FRAME_STEP
+        self._initialized = True
+
+        visible_count = min(VDA_INFER_LEN - VDA_INTERP_LEN, self._frame_count)
+        return self._batch(0, depths[:visible_count])
+
+    def _advance_later_window(self, window_start: int) -> tuple[int, DepthBatch] | None:
+        new_start = window_start + VDA_OVERLAP
+        indexes = list(range(new_start, min(window_start + VDA_INFER_LEN, self._frame_count)))
+        frames = self._load(indexes) if indexes else self._empty_frames()
+        assert self._retained_input is not None
+        carried_input = self._retained_input
+        padding_input = carried_input[:, -1:, ...]
+        depths, current_input, transform = self._run_window(
+            frames,
+            carried_input=carried_input,
+            padding_input=padding_input,
+        )
+        assert self._pending_depth is not None
+        assert self._alignment_refs is not None
+        finalized, next_pending, next_references = self._estimator._finalize_window(
+            self._pending_depth,
+            depths,
+            self._alignment_refs,
+        )
+
+        self._retained_input = None
+        del carried_input
+        retained = self._select_retained_input(current_input)
+        self._transform = transform
+        self._retained_input = retained
+        self._alignment_refs = next_references
+        self._pending_depth = next_pending
+        self._pending_start = window_start + VDA_INFER_LEN - VDA_INTERP_LEN
+        self._next_window_start = window_start + VDA_FRAME_STEP
+
+        finalized_start = window_start + (VDA_OVERLAP - VDA_INTERP_LEN)
+        visible_count = max(
+            0,
+            min(len(finalized), self._frame_count - finalized_start),
+        )
+        if not visible_count:
+            return None
+        return self._batch(finalized_start, finalized[:visible_count])
+
+    def _batch(self, start: int, values: np.ndarray) -> tuple[int, DepthBatch]:
+        return start, DepthBatch(np.asarray(values, dtype=np.float32).copy(), self._representation)
+
+    def _release_state(self) -> None:
+        self._transform = None
+        self._retained_input = None
+        self._alignment_refs = None
+        self._pending_depth = None
 
 
 class VideoDepthEstimator:
@@ -182,9 +395,7 @@ class VideoDepthEstimator:
         fp32: bool = False,
     ) -> DepthBatch:
         """
-        Estimate depth for a batch of video frames with temporal consistency.
-
-        Automatically chunks large videos to avoid OOM errors.
+        Estimate depth for one complete in-memory array supplied by the caller.
 
         Args:
             frames: Input frames array (shape: [N, H, W, 3], BGR format)
@@ -198,29 +409,33 @@ class VideoDepthEstimator:
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
-        # Check available memory and determine if we need to chunk
-        num_frames = len(frames)
-        frame_h, frame_w = frames[0].shape[:2]
-
-        # Estimate memory usage per frame (rough heuristic)
-        # High-res videos (>2K) need chunking on GPUs with <16GB VRAM
-        needs_chunking = (
-            self.device == "cuda"
-            and torch.cuda.is_available()
-            and (frame_h * frame_w > 2000 * 2000 or num_frames > 60)
-        )
-
-        if needs_chunking and num_frames > DEPTH_MODEL_CHUNK_SIZE:
-            # Process in overlapping chunks to maintain temporal consistency
-            print(f"Using memory-efficient chunked processing for {num_frames} frames")
-            values = self._estimate_depth_chunked(frames, target_fps, input_size, fp32)
-        else:
-            # Process all at once (original behavior)
-            values = self._estimate_depth_single_batch(frames, target_fps, input_size, fp32)
+        values = self._estimate_depth_single_batch(frames, target_fps, input_size, fp32)
         representation = (
             DepthRepresentation.METRIC_DEPTH if self.metric else DepthRepresentation.INVERSE_DEPTH
         )
         return DepthBatch(np.asarray(values, dtype=np.float32), representation)
+
+    def iter_sequence_depth(
+        self,
+        frame_count: int,
+        load_frames: Callable[[Sequence[int]], np.ndarray],
+        *,
+        target_fps: int,
+        input_size: int,
+        fp32: bool,
+    ) -> Iterator[tuple[int, DepthBatch]]:
+        """Return bounded VDA offline inference for one shot-local frame sequence."""
+
+        if self.model is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        return _VDASequenceDepthIterator(
+            self,
+            frame_count,
+            load_frames,
+            target_fps=target_fps,
+            input_size=input_size,
+            fp32=fp32,
+        )
 
     def _estimate_depth_single_batch(
         self, frames: np.ndarray, target_fps: int, input_size: int, fp32: bool
@@ -259,50 +474,6 @@ class VideoDepthEstimator:
         except Exception as e:
             raise RuntimeError(f"Video depth estimation failed: {e}")
 
-    def _estimate_depth_chunked(
-        self, frames: np.ndarray, target_fps: int, input_size: int, fp32: bool
-    ) -> np.ndarray:
-        """Process frames in overlapping chunks to save memory."""
-        chunk_size = DEPTH_MODEL_CHUNK_SIZE
-        overlap = self.temporal_window_overlap  # Overlap frames for smooth transitions
-
-        all_depths: list[Any] = []
-        num_frames = len(frames)
-
-        for chunk_start in range(0, num_frames, chunk_size - overlap):
-            chunk_end = min(chunk_start + chunk_size, num_frames)
-            chunk_frames = frames[chunk_start:chunk_end]
-
-            print(f"  Processing frames {chunk_start + 1}-{chunk_end}/{num_frames}")
-
-            # Convert BGR to RGB
-            frames_rgb = chunk_frames[..., ::-1].copy()
-
-            try:
-                # Process chunk with output suppression
-                depths = self._process_depth_chunk(frames_rgb, target_fps, input_size, fp32)
-
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    # Retry with reduced resolution
-                    depths = self._retry_chunk_with_reduced_resolution(
-                        frames_rgb, target_fps, input_size, fp32
-                    )
-                else:
-                    raise
-
-            # Determine which frames to keep (handle overlap)
-            keep_depths = self._determine_chunk_overlap(
-                chunk_start, chunk_end, num_frames, overlap, depths
-            )
-            all_depths.extend(keep_depths)
-
-            # Clear CUDA cache between chunks
-            if self.device == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        return np.asarray(all_depths, dtype=np.float32)
-
     def _suppress_model_output(self):
         """Context manager to suppress model output streams."""
         import sys
@@ -325,47 +496,187 @@ class VideoDepthEstimator:
 
         return suppress()
 
-    def _determine_chunk_overlap(
-        self, chunk_start: int, chunk_end: int, num_frames: int, overlap: int, depths
-    ) -> np.ndarray:
-        """Determine which frames to keep from chunk based on overlap."""
-        if chunk_start == 0:
-            return depths  # First chunk: keep all
-        elif chunk_end == num_frames:
-            return depths[overlap:]  # Last chunk: skip overlap frames
+    @staticmethod
+    def _build_vda_transform(frame_height: int, frame_width: int, input_size: int):
+        from torchvision.transforms import Compose  # type: ignore[import-untyped]
+        from video_depth_anything.util.transform import (  # type: ignore[import-not-found]
+            Resize,
+            NormalizeImage,
+            PrepareForNet,
+        )
+
+        ratio = max(frame_height, frame_width) / min(frame_height, frame_width)
+        if ratio > 1.78:
+            input_size = int(input_size * 1.777 / ratio)
+        input_size = round(input_size / 14) * 14
+        return Compose(
+            [
+                Resize(
+                    width=input_size,
+                    height=input_size,
+                    resize_target=False,
+                    keep_aspect_ratio=True,
+                    ensure_multiple_of=14,
+                    resize_method="lower_bound",
+                    image_interpolation_method=cv2.INTER_CUBIC,
+                ),
+                NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                PrepareForNet(),
+            ]
+        )
+
+    @staticmethod
+    def _transform_vda_frame(frame_bgr: np.ndarray, transform) -> torch.Tensor:
+        frame_rgb = frame_bgr[..., ::-1]
+        transformed = transform({"image": frame_rgb.astype(np.float32) / 255.0})["image"]
+        return torch.from_numpy(np.asarray(transformed, dtype=np.float32)).unsqueeze(0).unsqueeze(0)
+
+    def _assemble_vda_input(
+        self,
+        frames: np.ndarray,
+        transform,
+        carried_input: torch.Tensor | None,
+        padding_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        first_transformed = self._transform_vda_frame(frames[0], transform) if len(frames) else None
+        template = carried_input[:, :1] if carried_input is not None else first_transformed
+        if template is None:
+            raise ValueError("A VDA window requires source or carried input")
+        current_input = torch.empty(
+            (1, VDA_INFER_LEN, *template.shape[2:]),
+            dtype=template.dtype,
+            device=self.device,
+        )
+
+        write_index = 0
+        if carried_input is not None:
+            if carried_input.shape[:2] != (1, VDA_OVERLAP):
+                raise ValueError("Carried VDA input must have shape [1,10,C,H,W]")
+            current_input[:, :VDA_OVERLAP].copy_(carried_input)
+            write_index = VDA_OVERLAP
+
+        for frame_index, frame in enumerate(frames):
+            transformed = (
+                first_transformed
+                if frame_index == 0 and first_transformed is not None
+                else self._transform_vda_frame(frame, transform)
+            )
+            current_input[:, write_index].copy_(transformed[:, 0])
+            write_index += 1
+
+        if write_index == VDA_INFER_LEN:
+            return current_input
+        if len(frames):
+            pad_value = current_input[:, write_index - 1 : write_index]
+        elif padding_input is not None:
+            pad_value = padding_input
         else:
-            return depths[overlap:]  # Middle chunks: skip overlap frames
+            raise ValueError("Cannot pad an empty VDA input window")
+        repeated = pad_value.clone().expand(-1, VDA_INFER_LEN - write_index, -1, -1, -1)
+        current_input[:, write_index:].copy_(repeated)
+        return current_input
 
-    def _process_depth_chunk(
-        self, frames_rgb: np.ndarray, target_fps: int, input_size: int, fp32: bool
-    ) -> np.ndarray:
-        """Process a single chunk for depth estimation with output suppression."""
-        with self._suppress_model_output():
-            depths, _ = self.model.infer_video_depth(  # type: ignore[attr-defined]
-                frames_rgb,
-                target_fps,
-                input_size=input_size,
-                device=self.device,
-                fp32=fp32,
-            )
-        return depths
+    def _infer_fixed_window(
+        self,
+        frames: np.ndarray,
+        *,
+        input_size: int,
+        fp32: bool,
+        carried_input: torch.Tensor | None,
+        padding_input: torch.Tensor | None,
+        transform,
+        output_shape: tuple[int, int],
+    ) -> tuple[np.ndarray, torch.Tensor, Any]:
+        """Run exactly one 32-frame VDA forward without nested segmentation."""
 
-    def _retry_chunk_with_reduced_resolution(
-        self, frames_rgb: np.ndarray, target_fps: int, input_size: int, fp32: bool
-    ) -> np.ndarray:
-        """Retry depth processing with reduced input size on OOM error."""
-        print("  OOM error, retrying with reduced resolution...")
-        torch.cuda.empty_cache()
+        if self.model is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        if transform is None:
+            if not len(frames):
+                raise ValueError("The first VDA window requires at least one source frame")
+            transform = self._build_vda_transform(*output_shape, input_size)
 
-        with self._suppress_model_output():
-            depths, _ = self.model.infer_video_depth(  # type: ignore[attr-defined]
-                frames_rgb,
-                target_fps,
-                input_size=max(384, input_size // 2),
-                device=self.device,
-                fp32=fp32,
-            )
-        return depths
+        current_input = self._assemble_vda_input(
+            frames,
+            transform,
+            carried_input,
+            padding_input,
+        )
+
+        device_type = self.device.split(":", maxsplit=1)[0]
+        with torch.no_grad():
+            with torch.autocast(device_type=device_type, enabled=not fp32):
+                depth = self.model.forward(current_input)  # type: ignore[union-attr]
+        if not isinstance(depth, torch.Tensor) or depth.shape[:2] != (1, VDA_INFER_LEN):
+            raise ValueError("VDA forward must return a tensor with shape [1,32,H,W]")
+        depth = depth.to(current_input.dtype)
+        depth = F.interpolate(
+            depth.flatten(0, 1).unsqueeze(1),
+            size=output_shape,
+            mode="bilinear",
+            align_corners=True,
+        )
+        values = depth[:, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+        return values, current_input, transform
+
+    @staticmethod
+    def _compute_scale_and_shift(
+        current_references: np.ndarray,
+        retained_references: np.ndarray,
+    ) -> tuple[float, float]:
+        from utils.util import compute_scale_and_shift  # type: ignore[import-not-found]
+
+        current = np.concatenate(list(current_references), axis=0)
+        retained = np.concatenate(list(retained_references), axis=0)
+        mask = np.ones_like(retained, dtype=bool)
+        scale, shift = compute_scale_and_shift(current, retained, mask)
+        return float(scale), float(shift)
+
+    @staticmethod
+    def _interpolate_depths(previous: np.ndarray, current: np.ndarray) -> np.ndarray:
+        from utils.util import get_interpolate_frames  # type: ignore[import-not-found]
+
+        return np.asarray(
+            get_interpolate_frames(list(previous.copy()), list(current.copy())),
+            dtype=np.float32,
+        )
+
+    def _finalize_window(
+        self,
+        previous_pending: np.ndarray,
+        current_depth: np.ndarray,
+        retained_references: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Align one later window, blend its overlap, and split finalized state."""
+
+        previous = np.asarray(previous_pending, dtype=np.float32)
+        current = np.asarray(current_depth, dtype=np.float32)
+        references = np.asarray(retained_references, dtype=np.float32)
+        if previous.shape[0] != VDA_INTERP_LEN or current.shape[0] != VDA_INFER_LEN:
+            raise ValueError("VDA finalization requires 8 pending and 32 current depth maps")
+        if references.shape[0] != VDA_OVERLAP - VDA_INTERP_LEN:
+            raise ValueError("VDA finalization requires two alignment references")
+
+        if self.metric:
+            scale, shift = 1.0, 0.0
+        else:
+            scale, shift = self._compute_scale_and_shift(current[:2], references)
+        aligned = current[2:].copy()
+        aligned *= scale
+        aligned += shift
+        np.maximum(aligned, 0, out=aligned)
+
+        blended = self._interpolate_depths(previous, aligned[:VDA_INTERP_LEN])
+        if blended.shape != previous.shape:
+            raise ValueError("VDA overlap interpolation returned an unexpected shape")
+        finalized = np.concatenate(
+            [blended, aligned[VDA_INTERP_LEN:VDA_FRAME_STEP]],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        next_pending = aligned[VDA_FRAME_STEP:].copy()
+        next_reference = aligned[VDA_KEYFRAMES[1] - (VDA_OVERLAP - VDA_INTERP_LEN)].copy()
+        next_references = np.stack([references[0], next_reference]).astype(np.float32, copy=False)
+        return finalized, next_pending, next_references
 
     def get_model_info(self) -> dict[str, Any]:
         """Get information about the loaded model."""
