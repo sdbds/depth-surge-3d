@@ -12,6 +12,7 @@ import json
 import numpy as np
 import shutil
 import torch
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -174,6 +175,7 @@ class DepthMapProcessor:
             settings,
             raw_dir,
             semantic_fingerprint,
+            manifest,
             raw_store,
             progress_tracker,
         )
@@ -394,7 +396,12 @@ class DepthMapProcessor:
         fingerprint = build_current_model_fingerprint(self.depth_estimator, settings)
         fingerprint["source_frame_fingerprint"] = self._source_frame_fingerprint(frame_files)
         fingerprint["preprocessing_algorithm"] = depth_preprocessing_algorithm(settings)
+        if self._supports_sequence_depth():
+            fingerprint["scene_algorithm_version"] = SCENE_ALGORITHM_VERSION
         return fingerprint
+
+    def _supports_sequence_depth(self) -> bool:
+        return callable(getattr(type(self.depth_estimator), "iter_sequence_depth", None))
 
     @staticmethod
     def _open_raw_store_if_present(
@@ -447,6 +454,7 @@ class DepthMapProcessor:
         settings: dict[str, Any],
         raw_dir: Path,
         semantic_fingerprint: dict[str, Any],
+        manifest: dict[str, Any],
         raw_store: RawDepthStore | None,
         progress_tracker,
     ) -> RawDepthStore:
@@ -457,6 +465,21 @@ class DepthMapProcessor:
             raw_store,
         )
         frame_names = [path.name for path in frame_files]
+        if self._supports_sequence_depth():
+            return self._complete_v2_raw_depth_stage(
+                frame_files,
+                frame_names,
+                manifest,
+                settings,
+                raw_dir,
+                semantic_fingerprint,
+                raw_store,
+                requested_dtype,
+                input_size,
+                target_fps,
+                progress_tracker,
+            )
+
         total_chunks = (len(frame_files) + chunk_size - 1) // chunk_size
         for chunk_start in range(0, len(frame_files), chunk_size):
             chunk_end = min(chunk_start + chunk_size, len(frame_files))
@@ -490,6 +513,241 @@ class DepthMapProcessor:
             raise RuntimeError("Depth estimator produced no raw depth")
         raw_store.flush_metadata()
         return raw_store
+
+    @staticmethod
+    def _candidate_shot_ranges(manifest: dict[str, Any], frame_count: int) -> list[tuple[int, int]]:
+        raw_cuts = manifest.get("candidate_cuts", [])
+        if not isinstance(raw_cuts, list):
+            raise ValueError("candidate_cuts must be a list")
+        cuts: list[int] = []
+        for value in raw_cuts:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("candidate_cuts must contain integer frame indexes")
+            if not 0 < value < frame_count:
+                raise ValueError("candidate cut is outside the source-frame range")
+            cuts.append(value)
+        boundaries = [0, *sorted(set(cuts)), frame_count]
+        return list(zip(boundaries, boundaries[1:]))
+
+    def _complete_v2_raw_depth_stage(
+        self,
+        frame_files: list[Path],
+        frame_names: list[str],
+        manifest: dict[str, Any],
+        settings: dict[str, Any],
+        raw_dir: Path,
+        semantic_fingerprint: dict[str, Any],
+        raw_store: RawDepthStore | None,
+        requested_dtype: str,
+        input_size: int,
+        target_fps: Any,
+        progress_tracker,
+    ) -> RawDepthStore:
+        shot_ranges = self._candidate_shot_ranges(manifest, len(frame_files))
+        for shot_number, (shot_start, shot_end) in enumerate(shot_ranges, start=1):
+            shot_names = frame_names[shot_start:shot_end]
+            if not self._prepare_v2_shot_resume(raw_store, shot_names):
+                continue
+            raw_store = self._infer_v2_shot(
+                frame_files,
+                frame_names,
+                shot_start,
+                shot_end,
+                settings,
+                raw_dir,
+                semantic_fingerprint,
+                raw_store,
+                requested_dtype,
+                input_size,
+                target_fps,
+                shot_number,
+                len(shot_ranges),
+                progress_tracker,
+            )
+            raw_store.flush_metadata()
+        if raw_store is None:
+            raise RuntimeError("Depth estimator produced no raw depth")
+        raw_store.flush_metadata()
+        return raw_store
+
+    @staticmethod
+    def _prepare_v2_shot_resume(raw_store: RawDepthStore | None, shot_names: list[str]) -> bool:
+        if raw_store is None:
+            return True
+        existing = [raw_store.path_for(name).is_file() for name in shot_names]
+        if all(existing):
+            return False
+        if any(existing):
+            raw_store.discard_frames(shot_names)
+        return True
+
+    def _infer_v2_shot(
+        self,
+        frame_files: list[Path],
+        frame_names: list[str],
+        shot_start: int,
+        shot_end: int,
+        settings: dict[str, Any],
+        raw_dir: Path,
+        semantic_fingerprint: dict[str, Any],
+        raw_store: RawDepthStore | None,
+        requested_dtype: str,
+        input_size: int,
+        target_fps: Any,
+        shot_number: int,
+        shot_count: int,
+        progress_tracker,
+    ) -> RawDepthStore:
+        sequence_method = getattr(type(self.depth_estimator), "iter_sequence_depth")
+
+        def load_frames(local_indexes: Sequence[int]) -> np.ndarray:
+            return self._load_shot_frame_indexes(
+                frame_files,
+                shot_start,
+                shot_end,
+                local_indexes,
+            )
+
+        iterator = sequence_method(
+            self.depth_estimator,
+            shot_end - shot_start,
+            load_frames,
+            target_fps=target_fps,
+            input_size=input_size,
+            fp32=False,
+        )
+        expected_start = 0
+        for item in iterator:
+            local_start, result = self._validate_v2_sequence_item(
+                item,
+                expected_start,
+                shot_end - shot_start,
+            )
+            batch_length = len(result.values)
+            global_start = shot_start + local_start
+            batch_names = frame_names[global_start : global_start + batch_length]
+            raw_store = self._write_v2_raw_batch(
+                result,
+                batch_names,
+                frame_names,
+                settings,
+                raw_dir,
+                semantic_fingerprint,
+                raw_store,
+                requested_dtype,
+            )
+            expected_start += batch_length
+            self._report_raw_sequence_progress(
+                progress_tracker,
+                shot_number,
+                shot_count,
+                shot_start + expected_start,
+                len(frame_files),
+            )
+        if expected_start != shot_end - shot_start:
+            raise ValueError("V2 sequence iterator did not yield the complete shot")
+        if raw_store is None:
+            raise RuntimeError("V2 sequence iterator produced no raw depth")
+        return raw_store
+
+    @staticmethod
+    def _validate_v2_sequence_item(
+        item: Any,
+        expected_start: int,
+        shot_length: int,
+    ) -> tuple[int, DepthBatch]:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise TypeError("V2 sequence iterator must yield (local_start, DepthBatch)")
+        local_start, result = item
+        if isinstance(local_start, bool) or not isinstance(local_start, int):
+            raise TypeError("V2 sequence local start must be an integer")
+        if local_start != expected_start:
+            raise ValueError("V2 sequence batches must be ordered, gap-free, and non-overlapping")
+        if not isinstance(result, DepthBatch):
+            raise TypeError("File-backed V2 inference requires a DepthBatch result")
+        if len(result.values) < 1 or local_start + len(result.values) > shot_length:
+            raise ValueError("V2 sequence batch lies outside the current shot")
+        return local_start, result
+
+    def _write_v2_raw_batch(
+        self,
+        result: DepthBatch,
+        batch_names: list[str],
+        frame_names: list[str],
+        settings: dict[str, Any],
+        raw_dir: Path,
+        semantic_fingerprint: dict[str, Any],
+        raw_store: RawDepthStore | None,
+        requested_dtype: str,
+    ) -> RawDepthStore:
+        if raw_store is None:
+            raw_store = RawDepthStore.open_or_create(
+                raw_dir,
+                frame_names=frame_names,
+                representation=result.representation,
+                semantic_fingerprint=semantic_fingerprint,
+                requested_dtype=requested_dtype,
+                first_values=result.values,
+            )
+            native_height, native_width = result.values.shape[1:]
+            selected_bytes = 2 if raw_store.metadata["selected_dtype"] == "float16" else 4
+            self._require_depth_disk_space(
+                raw_dir,
+                len(frame_names),
+                int(native_height),
+                int(native_width),
+                selected_bytes,
+                bool(settings.get("keep_intermediates", False)),
+            )
+        elif result.representation.value != raw_store.metadata["representation"]:
+            raise ValueError("Depth representation changed during V2 inference")
+        raw_store.write_batch(batch_names, result.values)
+        return raw_store
+
+    @staticmethod
+    def _load_shot_frame_indexes(
+        frame_files: list[Path],
+        shot_start: int,
+        shot_end: int,
+        local_indexes: Sequence[int],
+    ) -> np.ndarray:
+        indexes = list(local_indexes)
+        if indexes != sorted(set(indexes)):
+            raise ValueError("V2 loader indexes must be unique and ascending")
+        shot_length = shot_end - shot_start
+        if any(
+            isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < shot_length
+            for index in indexes
+        ):
+            raise ValueError("V2 loader index lies outside the current shot")
+        frames = []
+        for index in indexes:
+            path = frame_files[shot_start + index]
+            frame = cv2.imread(str(path))
+            if frame is None:
+                raise OSError(f"Could not load source frame: {path}")
+            frames.append(frame)
+        if not frames:
+            raise ValueError("V2 loader requires at least one source index")
+        return np.stack(frames, axis=0)
+
+    @staticmethod
+    def _report_raw_sequence_progress(
+        progress_tracker,
+        shot_number: int,
+        shot_count: int,
+        completed_frames: int,
+        frame_count: int,
+    ) -> None:
+        if progress_tracker:
+            progress_tracker.update_progress(
+                f"Shot {shot_number}/{shot_count}: raw depth {completed_frames}/{frame_count}",
+                phase="depth_estimation",
+                frame_num=completed_frames,
+                step_name="Depth Map Generation",
+                step_progress=completed_frames,
+                step_total=frame_count,
+            )
 
     def _prepare_raw_depth_stage(
         self,
