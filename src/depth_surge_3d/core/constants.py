@@ -240,7 +240,6 @@ DEFAULT_SERVER_HOST = "0.0.0.0"  # Default host binding (all interfaces)
 SIGNAL_SHUTDOWN_TIMEOUT = 5  # seconds - timeout for graceful shutdown
 
 # Image processing constants
-DEFAULT_INTERPOLATION = "cv2.INTER_CUBIC"
 DEPTH_MAP_SCALE = 255  # Scale factor for converting float depth [0-1] to uint8 [0-255]
 DEPTH_MAP_SCALE_FLOAT = 255.0  # Float version for division operations
 DEPTH_MAP_STORAGE_SCALE = 65535.0  # Preserve depth precision in disk-backed uint16 PNGs

@@ -1,6 +1,8 @@
 """Unit tests for image processing utilities."""
 
 import numpy as np
+from PIL import Image
+
 from src.depth_surge_3d import utils
 from src.depth_surge_3d.utils import imaging
 from src.depth_surge_3d.utils.imaging import image_processing
@@ -135,6 +137,20 @@ class TestResizeImage:
         resized = resize_image(image, 150, 100)
 
         assert resized.shape == (100, 150, 3)
+
+    def test_resize_matches_pillow_lanczos_and_returns_owned_array(self):
+        image = np.arange(7 * 9 * 3, dtype=np.uint8).reshape(7, 9, 3)
+        expected = np.array(
+            Image.fromarray(image).resize((13, 11), Image.Resampling.LANCZOS),
+            copy=True,
+        )
+
+        resized = resize_image(image, 13, 11)
+
+        np.testing.assert_array_equal(resized, expected)
+        assert resized.dtype == image.dtype
+        assert resized.flags.c_contiguous
+        assert resized.flags.writeable
 
 
 class TestApplyCenterCrop:

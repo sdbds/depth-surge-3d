@@ -28,7 +28,7 @@ from .stage_manifest import (
 )
 
 
-VR_STAGE_ALGORITHM_VERSION = "vr-layout-v1"
+VR_STAGE_ALGORITHM_VERSION = "vr-layout-v2"
 
 
 class VRFrameAssembler:

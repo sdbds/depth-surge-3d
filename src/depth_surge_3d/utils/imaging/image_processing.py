@@ -7,9 +7,11 @@ and geometric transformations without side effects.
 
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
-import math
+from PIL import Image
 
 from ...core.constants import MIN_DEPTH_VALUE, MAX_DEPTH_VALUE
 
@@ -18,21 +20,23 @@ def resize_image(
     image: np.ndarray,
     target_width: int,
     target_height: int,
-    interpolation: int = cv2.INTER_CUBIC,
 ) -> np.ndarray:
-    """
-    Resize image to target dimensions.
+    """Resize a uint8 image with Pillow Lanczos resampling.
 
     Args:
         image: Input image array
         target_width: Target width
         target_height: Target height
-        interpolation: OpenCV interpolation method
 
     Returns:
         Resized image array
     """
-    return cv2.resize(image, (target_width, target_height), interpolation=interpolation)
+    pil_image = Image.fromarray(np.ascontiguousarray(image))
+    resized = pil_image.resize(
+        (target_width, target_height),
+        resample=Image.Resampling.LANCZOS,
+    )
+    return np.array(resized, dtype=image.dtype, copy=True, order="C")
 
 
 def normalize_depth_map(depth_map: np.ndarray) -> np.ndarray:

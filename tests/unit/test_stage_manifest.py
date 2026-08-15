@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import pytest
 
+from src.depth_surge_3d.processing.frames import distortion_processor, vr_assembler
 from src.depth_surge_3d.processing.frames.stage_manifest import (
     build_stage_identity,
     complete_stage,
@@ -86,3 +88,40 @@ def test_structurally_invalid_output_is_not_reusable(tmp_path) -> None:
     output_file.write_bytes(b"corrupt")
 
     assert not stage_is_reusable(identity, (output,))
+
+
+@pytest.mark.parametrize(
+    ("stage", "legacy_version", "current_version"),
+    [
+        ("crop", "vr-crop-v1", distortion_processor.CROP_STAGE_ALGORITHM_VERSION),
+        ("vr_assembly", "vr-layout-v1", vr_assembler.VR_STAGE_ALGORITHM_VERSION),
+    ],
+)
+def test_resize_policy_versions_invalidate_v1_manifests(
+    tmp_path,
+    stage,
+    legacy_version,
+    current_version,
+) -> None:
+    source = tmp_path / "source.png"
+    output = tmp_path / "output"
+    output.mkdir()
+    _write_rgb(source)
+    _write_rgb(output / source.name)
+    legacy_identity = build_stage_identity(
+        stage=stage,
+        algorithm_version=legacy_version,
+        frame_names=[source.name],
+        source_files=[source],
+        settings={},
+    )
+    assert complete_stage(legacy_identity, (output,), shape=(4, 6, 3))
+    current_identity = build_stage_identity(
+        stage=stage,
+        algorithm_version=current_version,
+        frame_names=[source.name],
+        source_files=[source],
+        settings={},
+    )
+
+    assert not stage_is_reusable(current_identity, (output,))

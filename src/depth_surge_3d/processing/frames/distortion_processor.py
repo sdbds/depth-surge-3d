@@ -35,7 +35,7 @@ from .stage_manifest import (
 
 
 DISTORTION_STAGE_ALGORITHM_VERSION = "fisheye-distortion-v1"
-CROP_STAGE_ALGORITHM_VERSION = "vr-crop-v1"
+CROP_STAGE_ALGORITHM_VERSION = "vr-crop-v2"
 
 
 class DistortionProcessor:
