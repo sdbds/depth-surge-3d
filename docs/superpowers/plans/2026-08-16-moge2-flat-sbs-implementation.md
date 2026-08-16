@@ -471,9 +471,12 @@ Run: `uv run pytest tests/unit/test_model_artifact.py -v`
 
 Expected: PASS.
 
-Run: `uv tree --no-dev --package depth-surge-3d`
+Run: `uv sync --no-dev`
 
-Expected: the default dependency tree does not contain `moge`.
+Run: `uv pip show moge`
+
+Expected: `uv pip show moge` exits nonzero and reports `Package(s) not found for: moge`,
+confirming that the default installation state excludes the optional dependency.
 
 - [ ] **Step 6: Commit dependency and resolver changes**
 
