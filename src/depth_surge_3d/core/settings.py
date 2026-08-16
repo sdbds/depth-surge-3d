@@ -198,7 +198,7 @@ def _validate_optional_setting(name: str, value: object) -> Any:
     if name in {"start_time", "end_time", "model_path", "model_size", "video_path"}:
         return _validate_optional_text(name, value)
     if name == "depth_model_version":
-        return _choice(name, value, {"v2", "v3", "see_through"})
+        return _choice(name, value, {"v2", "v3", "see_through", "moge2"})
     if name == "depth_resolution":
         return _validate_depth_resolution(value)
     if name == "device":

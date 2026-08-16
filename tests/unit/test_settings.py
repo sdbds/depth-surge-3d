@@ -128,3 +128,18 @@ def test_boolean_fields_do_not_accept_integer_surrogates() -> None:
 def test_invalid_source_is_rejected() -> None:
     with pytest.raises(ValueError, match="source"):
         validate_settings({}, source="resume")
+
+
+def test_moge2_is_a_valid_persisted_depth_backend() -> None:
+    settings = validate_settings(
+        {
+            "depth_model_version": "moge2",
+            "model_size": "vitb",
+            "model_path": None,
+            "depth_resolution": "auto",
+            "use_metric_depth": True,
+        },
+        source="explicit",
+    )
+
+    assert settings["depth_model_version"] == "moge2"

@@ -39,6 +39,22 @@ def test_projector_rejects_unknown_backend_without_constructing_an_estimator(mon
     factory.assert_not_called()
 
 
+def test_projector_preserves_four_positional_arguments_and_forwards_model_size(monkeypatch) -> None:
+    factory = Mock(return_value=MagicMock())
+    monkeypatch.setattr(stereo_projector, "create_registered_depth_estimator", factory)
+
+    projector = create_stereo_projector(
+        None,
+        "cpu",
+        True,
+        "moge2",
+        model_size="vitb",
+    )
+
+    assert projector.model_size == "vitb"
+    factory.assert_called_once_with("moge2", EstimatorRequest(None, "vitb", "cpu", True, 10))
+
+
 class TestStereoProjector:
     """Test StereoProjector class."""
 

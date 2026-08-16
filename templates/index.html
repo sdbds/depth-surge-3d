@@ -943,11 +943,11 @@
                             <h6 class="step-title">Depth Analysis</h6>
                         </div>
                         <div class="mb-3">
-                            <label class="form-label">Depth Model Version <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="V3: General-purpose default. V2: Better temporal consistency. See-Through: Experimental relative depth for 2D animation."></i></label>
+                            <label class="form-label" for="depthModelVersion">Depth Model Version <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Select an available registered depth backend."></i></label>
                             <select class="form-select" id="depthModelVersion">
-                                <option value="v3" selected>Depth-Anything V3 (Default, Lower VRAM, Faster)</option>
-                                <option value="v2">Video-Depth-Anything V2 (Temporal Consistency)</option>
-                                <option value="see_through">See-Through Marigold (Experimental, 2D Animation)</option>
+                                {% for backend in depth_backends %}
+                                <option value="{{ backend.id }}"{% if not backend.availability.available %} disabled{% endif %}{% if backend.id == "v3" %} selected{% endif %}>{{ backend.label }}{% if not backend.availability.available %} (Unavailable{% if backend.availability.install_command %}: {{ backend.availability.install_command }}{% endif %}){% elif backend.id == "v3" %} (Default){% endif %}</option>
+                                {% endfor %}
                             </select>
                             <small class="form-text text-muted">
                                 <i class="fas fa-film"></i> V2: 32-frame temporal windows for smooth depth<br>
@@ -957,11 +957,13 @@
                             </small>
                         </div>
                         <div class="mb-3" id="modelSizeSettings">
-                            <label class="form-label">Depth Model Size <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Smaller models use less VRAM but may be slightly less accurate. Use Small if you have OOM errors."></i></label>
+                            <label class="form-label" for="modelSize">Depth Model Size <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Smaller models use less VRAM but may be slightly less accurate. Use Small if you have OOM errors."></i></label>
                             <select class="form-select" id="modelSize">
-                                <option value="vitb" selected>Base (Balanced, ~8GB VRAM) - Recommended</option>
-                                <option value="vits">Small (Fast, ~4GB VRAM)</option>
-                                <option value="vitl">Large (Best Quality, ~12GB VRAM)</option>
+                                {% for backend in depth_backends %}
+                                {% for variant in backend.variants %}
+                                <option value="{{ variant.setting }}" data-backend="{{ backend.id }}" data-model-size="{{ variant.setting }}"{% if backend.id != "v3" %} hidden disabled{% endif %}{% if backend.id == "v3" and variant.setting == backend.default_model_size %} selected{% endif %}>{{ variant.display_name }}</option>
+                                {% endfor %}
+                                {% endfor %}
                             </select>
                             <small class="form-text text-muted">
                                 <i class="fas fa-memory"></i> Base model recommended for 16GB GPUs<br>
@@ -969,7 +971,7 @@
                             </small>
                         </div>
                         <div class="mb-3">
-                            <label class="form-label">Depth Map Resolution <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Higher resolution = better quality depth maps but slower processing and more VRAM. Auto matches your video resolution (recommended)."></i></label>
+                            <label class="form-label" for="depthResolution">Depth Map Resolution <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Higher resolution = better quality depth maps but slower processing and more VRAM. Auto matches your video resolution (recommended)."></i></label>
                             <select class="form-select" id="depthResolution">
                                 <option value="auto" selected>Auto (Match Source Resolution)</option>
                                 <option value="518">SD - 518px (Fast, Low VRAM)</option>
@@ -985,7 +987,7 @@
                             </small>
                         </div>
                         <div class="mb-3" id="depthModelTypeSettings">
-                            <label class="form-label">Depth Model Type <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Metric models provide actual depth in meters (better for VR). Relative models only provide depth ordering."></i></label>
+                            <label class="form-label" for="depthModelType">Depth Model Type <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Metric models provide actual depth in meters (better for VR). Relative models only provide depth ordering."></i></label>
                             <select class="form-select" id="depthModelType">
                                 <option value="metric" selected>Metric Depth (Accurate meters, best for VR)</option>
                                 <option value="relative">Relative Depth (Ordering only, faster)</option>
@@ -1780,6 +1782,12 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
     <script>
+        const depthBackends = {{ depth_backends | tojson }};
+
+        function selectedDepthBackend() {
+            const backendId = document.getElementById('depthModelVersion').value;
+            return depthBackends.find(backend => backend.id === backendId);
+        }
         // Global variables
         let socket;
         let currentSessionId = null;
@@ -2187,7 +2195,7 @@
                 model_size: document.getElementById('modelSize').value,
                 depth_model_version: document.getElementById('depthModelVersion').value,
                 depth_resolution: document.getElementById('depthResolution').value,
-                use_metric_depth: document.getElementById('depthModelType').value === 'metric',
+                use_metric_depth: document.getElementById('depthModelVersion').value === 'moge2' || document.getElementById('depthModelType').value === 'metric',
                 temporal_window_size: parseInt(document.getElementById('temporalWindowSize').value),
                 temporal_window_overlap: parseInt(document.getElementById('temporalWindowOverlap').value),
                 super_sample: document.getElementById('superSample').value,
@@ -3272,12 +3280,35 @@
         }
 
         function updateDepthModelControls() {
-            const modelVersion = document.getElementById('depthModelVersion').value;
-            const isV2 = modelVersion === 'v2';
-            const isSeeThrough = modelVersion === 'see_through';
-            document.getElementById('temporalWindowSettings').style.display = isV2 ? 'block' : 'none';
-            document.getElementById('modelSizeSettings').style.display = isSeeThrough ? 'none' : 'block';
-            document.getElementById('depthModelTypeSettings').style.display = isSeeThrough ? 'none' : 'block';
+            const backend = selectedDepthBackend();
+            if (!backend) return;
+
+            const modelSize = document.getElementById('modelSize');
+            const preferredSize = modelSize.value;
+            let selectedOption = null;
+            modelSize.querySelectorAll('option[data-backend]').forEach(option => {
+                const applies = option.dataset.backend === backend.id;
+                option.hidden = !applies;
+                option.disabled = !applies;
+                option.selected = false;
+                if (applies && option.dataset.modelSize === preferredSize) {
+                    selectedOption = option;
+                }
+            });
+            selectedOption = selectedOption || modelSize.querySelector(
+                `option[data-backend="${backend.id}"][data-model-size="${backend.default_model_size}"]`
+            );
+            if (selectedOption) selectedOption.selected = true;
+
+            const metricControlApplies = backend.capabilities.metric_depth && backend.id !== 'moge2';
+            document.getElementById('temporalWindowSettings').style.display = backend.id === 'v2' ? 'block' : 'none';
+            document.getElementById('modelSizeSettings').style.display = backend.variants.length > 1 ? 'block' : 'none';
+            document.getElementById('depthModelTypeSettings').style.display = metricControlApplies ? 'block' : 'none';
+            if (backend.id === 'moge2') {
+                document.getElementById('depthModelType').value = 'metric';
+            } else if (!backend.capabilities.metric_depth) {
+                document.getElementById('depthModelType').value = 'relative';
+            }
         }
 
         // Toggle model-specific settings based on depth backend.

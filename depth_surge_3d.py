@@ -37,6 +37,12 @@ from depth_surge_3d.io.resume import (  # noqa: E402
 from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
     build_current_model_fingerprint,
 )
+from depth_surge_3d.inference.depth.backend_registry import (  # noqa: E402
+    backend_availability,
+    get_backend_spec,
+    list_backend_specs,
+    normalize_model_size,
+)
 
 
 def _print_resume_report(report) -> None:
@@ -62,6 +68,17 @@ def _parse_vr_resolution(value: str) -> str:
 
 def _build_processing_settings(args: argparse.Namespace) -> dict[str, object]:
     """Translate CLI names once, then hand one validated object to the pipeline."""
+    spec = get_backend_spec(args.depth_model_version)
+    model_size = normalize_model_size(
+        args.depth_model_version,
+        model_path=args.model,
+        model_size=args.model_size,
+    )
+    use_metric = (
+        True
+        if args.depth_model_version == "moge2"
+        else bool(args.metric) and spec.capabilities.metric_depth
+    )
     return validate_settings(
         {
             "vr_format": args.format,
@@ -88,9 +105,25 @@ def _build_processing_settings(args: argparse.Namespace) -> dict[str, object]:
             "experimental_frame_interpolation": args.experimental_frame_interpolation,
             "upscale_model": args.upscale_model,
             "verbose": args.verbose,
+            "depth_model_version": args.depth_model_version,
+            "model_size": model_size,
+            "model_path": args.model,
+            "depth_resolution": args.depth_resolution,
+            "use_metric_depth": use_metric,
+            "device": args.device,
         },
         source="explicit",
     )
+
+
+def _backend_is_available(backend_id: str) -> bool:
+    availability = backend_availability(backend_id)
+    if availability.available:
+        return True
+    print(f"Error: {availability.reason}")
+    if availability.install_command:
+        print(f"Install with: {availability.install_command}")
+    return False
 
 
 def create_argument_parser() -> argparse.ArgumentParser:
@@ -235,19 +268,23 @@ Note: Always uses Video-Depth-Anything for temporal consistency across frames.
         help=f'Fisheye crop factor (default: {DEFAULT_SETTINGS["fisheye_crop_factor"]})',
     )
     # Model and device
-    parser.add_argument(
+    model_group = parser.add_mutually_exclusive_group()
+    model_group.add_argument(
         "--model",
         help=("Path to model file (V2), model name (V3), or Hugging Face repository (See-Through)"),
     )
+    model_group.add_argument(
+        "--model-size",
+        choices=["vits", "vitb", "vitl"],
+        default=None,
+    )
     parser.add_argument(
         "--depth-model-version",
-        choices=["v2", "v3", "see_through"],
+        choices=[spec.backend_id for spec in list_backend_specs()],
         default="v2",
-        help=(
-            "Depth model version: v2 (temporal), v3 (efficient), or see_through "
-            "(experimental 2D animation model)"
-        ),
+        help="Registered depth model backend (default: %(default)s)",
     )
+    parser.add_argument("--depth-resolution", default="auto")
     parser.add_argument(
         "--device",
         choices=["auto", "cuda", "cpu"],
@@ -294,7 +331,7 @@ Note: Always uses Video-Depth-Anything for temporal consistency across frames.
     return parser
 
 
-def validate_arguments(args) -> dict[str, object] | None:
+def validate_arguments(args) -> dict[str, object] | None:  # noqa: C901
     """Validate CLI arguments and return the normalized processing settings."""
 
     # Handle resume mode
@@ -312,6 +349,9 @@ def validate_arguments(args) -> dict[str, object] | None:
     # Validate input video
     if not validate_video_file(args.input_video):
         print(f"Error: Invalid or unsupported video file: {args.input_video}")
+        return None
+
+    if not _backend_is_available(args.depth_model_version):
         return None
 
     try:
@@ -448,12 +488,31 @@ def main():  # noqa: C901
             Path(args.resume),
             default="v2",
         )
+        resume_spec = get_backend_spec(processing_settings["depth_model_version"])
+        processing_settings["model_size"] = normalize_model_size(
+            processing_settings["depth_model_version"],
+            model_path=processing_settings.get("model_path"),
+            model_size=processing_settings.get("model_size"),
+        )
+        processing_settings["depth_resolution"] = processing_settings.get(
+            "depth_resolution", "auto"
+        )
+        processing_settings["use_metric_depth"] = (
+            True
+            if processing_settings["depth_model_version"] == "moge2"
+            else bool(processing_settings.get("use_metric_depth", False))
+            and resume_spec.capabilities.metric_depth
+        )
+
+        if not _backend_is_available(processing_settings["depth_model_version"]):
+            return 1
 
         projector = create_stereo_projector(
             model_path=processing_settings.get("model_path"),
             device=processing_settings.get("device", "auto"),
             metric=bool(processing_settings.get("use_metric_depth", False)),
             depth_model_version=processing_settings.get("depth_model_version", "v2"),
+            model_size=processing_settings.get("model_size"),
         )
         if not projector.load_model():
             print("Could not load depth estimation model")
@@ -503,10 +562,11 @@ def main():  # noqa: C901
     # Create stereo projector
     try:
         projector = create_stereo_projector(
-            args.model,
-            args.device,
-            args.metric if hasattr(args, "metric") else False,
-            args.depth_model_version,
+            processing_settings.get("model_path"),
+            processing_settings.get("device", "auto"),
+            bool(processing_settings.get("use_metric_depth", False)),
+            processing_settings.get("depth_model_version", "v2"),
+            model_size=processing_settings.get("model_size"),
         )
 
         if args.model_info:
@@ -518,12 +578,7 @@ def main():  # noqa: C901
             return 0
 
         # Process video
-        model_names = {
-            "v2": "Video-Depth-Anything (V2)",
-            "v3": "Depth-Anything-V3",
-            "see_through": "See-Through Marigold",
-        }
-        model_name = model_names[args.depth_model_version]
+        model_name = get_backend_spec(args.depth_model_version).display_name
         print("Starting Depth Surge 3D processing...")
         print(f"Input: {args.input_video}")
         print(f"Output: {args.output_dir} (batch subdirectory will be created)")

@@ -89,9 +89,11 @@ def _variants(*variants: ModelVariantSpec) -> Mapping[str, ModelVariantSpec]:
 
 
 def _create_v2(request: EstimatorRequest) -> Any:
-    variant = resolve_model_variant("v2", request.model_size)
-    paths = MODEL_PATHS_METRIC if request.metric else MODEL_PATHS
-    model_path = request.model_path or paths[variant.setting]
+    model_path = request.model_path
+    if model_path is None:
+        variant = resolve_model_variant("v2", request.model_size)
+        paths = MODEL_PATHS_METRIC if request.metric else MODEL_PATHS
+        model_path = paths[variant.setting]
     return create_video_depth_estimator(
         model_path,
         request.device,
@@ -101,8 +103,10 @@ def _create_v2(request: EstimatorRequest) -> Any:
 
 
 def _create_v3(request: EstimatorRequest) -> Any:
-    variant = resolve_model_variant("v3", request.model_size)
-    model_name = request.model_path or cast(str, variant.backend_value)
+    model_name = request.model_path
+    if model_name is None:
+        variant = resolve_model_variant("v3", request.model_size)
+        model_name = cast(str, variant.backend_value)
     return create_video_depth_estimator_da3(model_name, request.device, request.metric)
 
 
@@ -119,9 +123,17 @@ def _create_moge2(request: EstimatorRequest) -> Any:
     availability = _moge_availability()
     if not availability.available:
         raise RuntimeError(f"{availability.reason}. Install with: {availability.install_command}")
-    variant = resolve_model_variant("moge2", request.model_size)
     from .video_depth_estimator_moge2 import create_video_depth_estimator_moge2
 
+    if request.model_path is not None:
+        return create_video_depth_estimator_moge2(
+            model_size=request.model_size or "custom",
+            model_path=request.model_path,
+            repo_id=None,
+            revision=None,
+            device=request.device,
+        )
+    variant = resolve_model_variant("moge2", request.model_size)
     return create_video_depth_estimator_moge2(
         model_size=variant.setting,
         model_path=request.model_path,
@@ -204,6 +216,7 @@ _BACKEND_SPECS = (
     ),
 )
 _BACKEND_SPECS_BY_ID = MappingProxyType({spec.backend_id: spec for spec in _BACKEND_SPECS})
+_LEGACY_MODEL_SIZE_ALIASES = MappingProxyType({"small": "vits", "base": "vitb", "large": "vitl"})
 
 
 def get_backend_spec(backend_id: str) -> DepthBackendSpec:
@@ -232,6 +245,14 @@ def resolve_model_variant(backend_id: str, model_size: str | None) -> ModelVaria
         return spec.variants[selected_size]
     except KeyError as exc:
         raise ValueError(f"Unknown model size for {backend_id}: {selected_size}") from exc
+
+
+def normalize_model_size(backend_id: str, *, model_path: str | None, model_size: str | None) -> str:
+    """Return the canonical registry size for a default, variant, or custom artifact."""
+    if model_path:
+        return "custom"
+    normalized_size = _LEGACY_MODEL_SIZE_ALIASES.get(model_size, model_size)
+    return resolve_model_variant(backend_id, normalized_size).setting
 
 
 def create_registered_depth_estimator(backend_id: str, request: EstimatorRequest) -> Any:

@@ -58,8 +58,10 @@ def test_cli_accepts_see_through_model_version():
 
 
 def test_web_ui_exposes_see_through_model_option():
+    import app as web_app
+
     parser = _DepthModelOptionParser()
-    parser.feed((PROJECT_ROOT / "templates" / "index.html").read_text(encoding="utf-8"))
+    parser.feed(web_app.app.test_client().get("/").get_data(as_text=True))
 
     assert "see_through" in parser.values
 
@@ -75,9 +77,6 @@ def test_web_ui_does_not_force_see_through_depth_resolution():
 
 def test_web_runner_uses_relative_see_through_repo(tmp_path):
     import app as web_app
-    from src.depth_surge_3d.inference.depth.video_depth_estimator_see_through import (
-        DEFAULT_SEE_THROUGH_REPO,
-    )
 
     projector = MagicMock()
     projector.load_model.return_value = False
@@ -101,10 +100,11 @@ def test_web_runner_uses_relative_see_through_repo(tmp_path):
         )
 
     create_projector.assert_called_once_with(
-        DEFAULT_SEE_THROUGH_REPO,
+        None,
         "cuda",
         metric=False,
         depth_model_version="see_through",
+        model_size="vitl",
     )
 
 
@@ -397,10 +397,23 @@ def test_web_background_resume_validates_loaded_model_before_migration(tmp_path)
             {"migration_mode": "archive", "settings_file": settings_file},
         )
 
-    build_fingerprint.assert_called_once_with(projector.depth_estimator, settings)
+    build_fingerprint.assert_called_once_with(
+        projector.depth_estimator,
+        {
+            **settings,
+            "model_size": "vitl",
+            "model_path": None,
+            "depth_resolution": "auto",
+        },
+    )
     build_report.assert_called_once_with(
         output_dir,
-        settings,
+        {
+            **settings,
+            "model_size": "vitl",
+            "model_path": None,
+            "depth_resolution": "auto",
+        },
         source_video=source_video,
         model_fingerprint=fingerprint,
         settings_file=settings_file,
@@ -587,9 +600,14 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
         device="cuda",
         metric=False,
         depth_model_version="see_through",
+        model_size="custom",
     )
     projector.load_model.assert_called_once_with()
-    preflight_settings = {**report.migrated_settings, "verbose": False}
+    preflight_settings = {
+        **report.migrated_settings,
+        "model_size": "custom",
+        "verbose": False,
+    }
     build_fingerprint.assert_called_once_with(projector.depth_estimator, preflight_settings)
     build_report.assert_called_once_with(
         tmp_path,
@@ -671,4 +689,5 @@ def test_cli_resume_infers_see_through_for_legacy_settings(tmp_path, monkeypatch
         device="cuda",
         metric=False,
         depth_model_version="see_through",
+        model_size="custom",
     )

@@ -12,6 +12,7 @@ from src.depth_surge_3d.inference.depth.backend_registry import (
     backend_availability,
     create_registered_depth_estimator,
     get_backend_spec,
+    normalize_model_size,
 )
 
 
@@ -116,3 +117,59 @@ def test_selected_moge_factory_reports_install_command(monkeypatch) -> None:
     request = EstimatorRequest(None, "vitb", "cpu", True, 8)
     with pytest.raises(RuntimeError, match=r"Install with: uv sync --extra moge2"):
         create_registered_depth_estimator("moge2", request)
+
+
+def test_custom_moge_artifact_bypasses_registered_variant_lookup(monkeypatch) -> None:
+    """A custom artifact keeps the normalized custom size instead of requiring a variant."""
+    import src.depth_surge_3d.inference.depth.backend_registry as registry
+    import src.depth_surge_3d.inference.depth.video_depth_estimator_moge2 as adapter
+
+    create = MagicMock(return_value=object())
+    monkeypatch.setattr(
+        registry,
+        "_moge_availability",
+        lambda: BackendAvailability(available=True),
+    )
+    monkeypatch.setattr(adapter, "create_video_depth_estimator_moge2", create)
+
+    result = create_registered_depth_estimator(
+        "moge2",
+        EstimatorRequest("owner/repo@abc", "custom", "cpu", True, 10),
+    )
+
+    assert result is create.return_value
+    create.assert_called_once_with(
+        model_size="custom",
+        model_path="owner/repo@abc",
+        repo_id=None,
+        revision=None,
+        device="cpu",
+    )
+
+
+@pytest.mark.parametrize("backend_id", ["v2", "v3"])
+def test_custom_core_artifact_bypasses_registered_variant_lookup(
+    backend_id: str, monkeypatch
+) -> None:
+    import src.depth_surge_3d.inference.depth.backend_registry as registry
+
+    create = MagicMock(return_value=object())
+    factory_name = (
+        "create_video_depth_estimator" if backend_id == "v2" else "create_video_depth_estimator_da3"
+    )
+    monkeypatch.setattr(registry, factory_name, create)
+
+    result = create_registered_depth_estimator(
+        backend_id,
+        EstimatorRequest("custom-model", "custom", "cpu", False, 10),
+    )
+
+    assert result is create.return_value
+
+
+def test_legacy_v3_model_name_normalizes_to_registry_variant() -> None:
+    assert normalize_model_size("v3", model_path=None, model_size="large") == "vitl"
+
+
+def test_custom_model_path_normalizes_to_custom_size() -> None:
+    assert normalize_model_size("moge2", model_path="owner/repo@abc", model_size="vitb") == "custom"

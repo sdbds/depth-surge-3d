@@ -15,6 +15,7 @@ import argparse
 import sys
 import signal
 import base64
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -36,8 +37,6 @@ warnings.filterwarnings("ignore", category=SyntaxWarning)  # moviepy old regex p
 # Import our constants and utilities
 from depth_surge_3d.core.constants import (  # noqa: E402
     INTERMEDIATE_DIRS,
-    MODEL_PATHS,
-    MODEL_PATHS_METRIC,
     SOCKETIO_PING_TIMEOUT,
     SOCKETIO_PING_INTERVAL,
     SOCKETIO_SLEEP_YIELD,
@@ -67,8 +66,11 @@ from depth_surge_3d.core.constants import (  # noqa: E402
     SIGNAL_SHUTDOWN_TIMEOUT,
 )
 from depth_surge_3d.utils.system.console import warning as console_warning  # noqa: E402
-from depth_surge_3d.inference.depth.video_depth_estimator_see_through import (  # noqa: E402
-    DEFAULT_SEE_THROUGH_REPO,
+from depth_surge_3d.inference.depth.backend_registry import (  # noqa: E402
+    backend_availability,
+    get_backend_spec,
+    list_backend_specs,
+    normalize_model_size,
 )
 from depth_surge_3d.core.settings import validate_settings  # noqa: E402
 
@@ -107,6 +109,50 @@ def _validate_web_settings(settings: dict[str, Any], *, source: str) -> dict[str
     if preserve_source_fps:
         validated["target_fps"] = None
     return validated
+
+
+def _normalize_depth_backend_settings(
+    settings: dict[str, Any], *, default_backend: str = "v3"
+) -> dict[str, Any]:
+    """Resolve product-facing depth selections into the shared settings schema."""
+    normalized = dict(settings)
+    backend_id = normalized.get("depth_model_version", default_backend)
+    spec = get_backend_spec(backend_id)
+    model_path = normalized.get("model_path")
+    normalized["depth_model_version"] = backend_id
+    normalized["model_size"] = normalize_model_size(
+        backend_id,
+        model_path=model_path,
+        model_size=normalized.get("model_size"),
+    )
+    normalized["model_path"] = model_path
+    normalized["depth_resolution"] = normalized.get("depth_resolution", "auto")
+    requested_metric = bool(normalized.get("use_metric_depth", False))
+    normalized["use_metric_depth"] = (
+        True if backend_id == "moge2" else requested_metric and spec.capabilities.metric_depth
+    )
+    return normalized
+
+
+def _depth_backend_options() -> list[dict[str, Any]]:
+    options = []
+    for spec in list_backend_specs():
+        availability = backend_availability(spec.backend_id)
+        options.append(
+            {
+                "id": spec.backend_id,
+                "label": spec.display_name,
+                "default_model_size": spec.default_model_size,
+                "variants": [asdict(value) for value in spec.variants.values()],
+                "capabilities": {
+                    "metric_depth": spec.capabilities.metric_depth,
+                    "pinhole_fx": spec.capabilities.pinhole_fx,
+                    "stereo_geometry_modes": sorted(spec.capabilities.stereo_geometry_modes),
+                },
+                "availability": asdict(availability),
+            }
+        )
+    return options
 
 
 def vprint(*args: Any, **kwargs: Any) -> None:
@@ -891,9 +937,11 @@ def process_video_async(  # noqa: C901
                 output_dir,
                 default="v3",
             )
-        depth_model_version = settings.get("depth_model_version", "v3")  # Default to V3
-        model_size = settings.get("model_size", "vitb")  # Default to Base for 16GB GPUs
-        use_metric = settings.get("use_metric_depth", True)  # Default to metric depth
+        settings = _normalize_depth_backend_settings(settings)
+        depth_model_version = settings["depth_model_version"]
+        model_size = settings["model_size"]
+        model_path = settings["model_path"]
+        use_metric = settings["use_metric_depth"]
 
         device = settings.get("device", "auto")
         if device == "auto":
@@ -907,32 +955,10 @@ def process_video_async(  # noqa: C901
             )
             raise Exception(error_msg)
 
-        # Resolve the model path or Hugging Face repository for the selected backend.
-        if depth_model_version == "v2":
-            if use_metric:
-                model_paths_dict = MODEL_PATHS_METRIC
-                depth_type = "Metric"
-            else:
-                model_paths_dict = MODEL_PATHS
-                depth_type = "Relative"
-
-            model_path = settings.get(
-                "model_path",
-                model_paths_dict.get(model_size, MODEL_PATHS_METRIC["vitb"]),
-            )
-            print(
-                f"Loading Video-Depth-Anything V2: {model_size.upper()} {depth_type} from: {model_path}"
-            )
-        elif depth_model_version == "see_through":
-            model_path = settings.get("model_path", DEFAULT_SEE_THROUGH_REPO)
-            use_metric = False
-            print(f"Loading See-Through Marigold: {model_path} (relative anime depth)")
-        else:
-            # For V3, map model_size to DA3 model names
-            da3_model_map = {"vits": "small", "vitb": "base", "vitl": "large"}
-            model_path = da3_model_map.get(model_size, "large")
-            print(f"Loading Depth-Anything V3: {model_path.upper()} model (metric: {use_metric})")
-
+        print(
+            f"Loading {get_backend_spec(depth_model_version).display_name}: "
+            f"{model_size} (metric inference: {use_metric})"
+        )
         print(f"Using device: {device.upper()}")
 
         projector = create_stereo_projector(
@@ -940,6 +966,7 @@ def process_video_async(  # noqa: C901
             device,
             metric=use_metric,
             depth_model_version=depth_model_version,
+            model_size=model_size,
         )
 
         # Ensure the model is loaded before processing
@@ -1090,7 +1117,7 @@ def process_video_async(  # noqa: C901
 @app.route("/")
 def index():
     """Main page"""
-    return render_template("index.html")
+    return render_template("index.html", depth_backends=_depth_backend_options())
 
 
 @app.route("/upload", methods=["POST"])
@@ -1206,6 +1233,7 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:
     settings = data.get("settings", {})
 
     try:
+        settings = _normalize_depth_backend_settings(settings)
         settings = _validate_web_settings(settings, source="explicit")
     except (TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
