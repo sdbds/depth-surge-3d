@@ -415,14 +415,15 @@ resolved clip-global median. No valid sample is a hard error before stereo
 rendering. A single clip-global value avoids scene-cut convergence pumping. It
 does not claim to handle optical zoom or per-frame focal drift.
 
-A pre-processing preview cannot know clip-global `auto` convergence. When
-`auto` is selected and metric geometry does not yet exist, Web disables metric
-preview and the endpoint rejects a forged request with the normal validation
-error that requires an explicit metric convergence. Supplying an explicit
-convergence enables immediate preview. Once resolved metric metadata exists,
-preview and production invoke the same geometry builder with the same `Z0`.
-There is no new preview protocol state and no provisional frame-median preview
-presented as final output.
+The existing Web preview is an in-process live preview, not a pre-processing
+preview endpoint. With `auto`, depth previews may continue while stage 3 is
+running, but stereo previews begin only after metric geometry has resolved and
+persisted the clip-global `Z0`. With an explicit convergence, stereo rendering
+uses that configured value when stage 4 begins; it does not add a new
+pre-processing preview surface. Live preview and final production frames invoke
+the same geometry builder with the same resolved or explicit `Z0`. There is no
+new preview protocol state and no provisional frame-median preview presented as
+final output.
 
 ## Common Renderer Geometry
 
@@ -706,8 +707,8 @@ Add tests for:
   failed jobs retaining committed checkpoints;
 - crop changes rebuilding metric stereo but retaining the existing relative
   crop-only invalidation boundary;
-- preview disable and endpoint validation before automatic convergence resolves,
-  explicit-convergence preview, and parity after convergence resolves;
+- live-preview sequencing that emits no metric stereo frame before automatic
+  convergence resolves, explicit-convergence use, and preview/final parity;
 - Web model controls, payload validation, resume restoration, unavailable-extra
   disabled state, CLI missing-extra error behavior, and the Experimental
   temporal-stability warning on both product surfaces.
@@ -823,7 +824,7 @@ before continuing.
 
 ### Slice 3: Product Surface and Release Evidence
 
-Complete preview gating, Web controls, CLI reporting, documentation,
+Complete live-preview sequencing, Web controls, CLI reporting, documentation,
 attribution, end-to-end tests, three-variant smoke checks, A/B sample renders,
 and performance/stability reporting. Keep `metric_camera` experimental.
 
