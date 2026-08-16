@@ -100,8 +100,6 @@ from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
 VERBOSE = False
 SHUTDOWN_FLAG = False
 ACTIVE_PROCESSES = set()
-PENDING_PROCESSING_CONFIGURATIONS: dict[str, dict[str, Any]] = {}
-MAX_PENDING_PROCESSING_CONFIGURATIONS = 128
 
 
 def _validate_web_settings(settings: dict[str, Any], *, source: str) -> dict[str, Any]:
@@ -116,6 +114,14 @@ def _validate_web_settings(settings: dict[str, Any], *, source: str) -> dict[str
     if preserve_source_fps:
         validated["target_fps"] = None
     return validated
+
+
+def _active_requester_socket_id(data: Any) -> str:
+    """Return the connected Socket.IO client that owns an HTTP run request."""
+    socket_id = data.get("socket_id") if isinstance(data, dict) else None
+    if not isinstance(socket_id, str) or not socketio.server.manager.is_connected(socket_id, "/"):
+        raise ValueError("A connected Socket.IO client is required")
+    return socket_id
 
 
 def _normalize_depth_backend_settings(
@@ -929,6 +935,7 @@ class ProgressCallback:
 
 def process_video_async(  # noqa: C901
     session_id: str,
+    requester_socket_id: str,
     video_path: str | Path,
     settings: dict[str, Any],
     output_dir: str | Path,
@@ -1007,11 +1014,7 @@ def process_video_async(  # noqa: C901
         )
 
         report = build_effective_depth_run_report(settings, projector.depth_estimator)
-        if len(PENDING_PROCESSING_CONFIGURATIONS) >= MAX_PENDING_PROCESSING_CONFIGURATIONS:
-            oldest_session = next(iter(PENDING_PROCESSING_CONFIGURATIONS))
-            PENDING_PROCESSING_CONFIGURATIONS.pop(oldest_session, None)
-        PENDING_PROCESSING_CONFIGURATIONS[session_id] = report
-        socketio.emit("processing_configuration", report, room=session_id)
+        socketio.emit("processing_configuration", report, room=requester_socket_id)
         if settings["stereo_geometry_mode"] == "metric_camera":
             print(TEMPORAL_STABILITY_WARNING)
 
@@ -1330,6 +1333,11 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:  # noqa:
     except (KeyError, TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
 
+    try:
+        requester_socket_id = _active_requester_socket_id(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
     # Generate session ID
     session_id = str(uuid.uuid4())
 
@@ -1337,6 +1345,7 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:  # noqa:
     thread = socketio.start_background_task(
         process_video_async,
         session_id,
+        requester_socket_id,
         video_path,
         settings,
         output_dir,
@@ -1408,7 +1417,7 @@ def _prepare_resume_request(data: Any) -> tuple[Path, str, str | None]:
 
 
 @app.route("/resume", methods=["POST"])
-def resume_processing():
+def resume_processing():  # noqa: C901
     """Resume processing from a previous interrupted batch"""
     if current_processing["active"]:
         return jsonify({"error": "Processing already in progress"}), 400
@@ -1450,6 +1459,11 @@ def resume_processing():
     except (OSError, TypeError, ValueError) as exc:
         return jsonify({"error": f"Could not migrate resume data: {exc}"}), 409
 
+    try:
+        requester_socket_id = _active_requester_socket_id(request.json)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
     # Generate session ID
     session_id = str(uuid.uuid4())
 
@@ -1457,6 +1471,7 @@ def resume_processing():
     thread = socketio.start_background_task(
         process_video_async,
         session_id,
+        requester_socket_id,
         source_video,
         settings,
         output_path,
@@ -1835,10 +1850,6 @@ def handle_join_session(data):
 
         join_room(session_id)
         vprint(f"Client {request.sid} joined session {session_id[:SESSION_ID_DISPLAY_LENGTH]}...")
-
-        report = PENDING_PROCESSING_CONFIGURATIONS.pop(session_id, None)
-        if report is not None:
-            socketio.emit("processing_configuration", report, room=request.sid)
 
         # Send initial status to joined client
         try:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 import traceback
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -46,11 +47,40 @@ from .stereo_renderer import StereoRenderer, StereoSplatSettings
 class VideoRunPreflight:
     """Validated, resolved video inputs that are safe to execute."""
 
-    video_path: str
-    output_dir: str
-    settings: dict[str, Any]
-    video_properties: dict[str, Any]
-    report: dict[str, Any]
+    _owner: object
+    _video_path: str
+    _output_dir: str
+    _settings: dict[str, Any]
+    _video_properties: dict[str, Any]
+    _report: dict[str, Any]
+
+    @property
+    def settings(self) -> dict[str, Any]:
+        """Return a copy so callers cannot alter the validated execution state."""
+        return deepcopy(self._settings)
+
+    @property
+    def video_properties(self) -> dict[str, Any]:
+        """Return a copy of the canonical source properties."""
+        return deepcopy(self._video_properties)
+
+    @property
+    def report(self) -> dict[str, Any]:
+        """Return a copy of the report emitted for this execution state."""
+        return deepcopy(self._report)
+
+    def _snapshot_for(
+        self, owner: object
+    ) -> tuple[str, str, dict[str, Any], dict[str, Any], dict[str, Any]]:
+        if self._owner is not owner:
+            raise ValueError("Video preflight belongs to a different projector")
+        return (
+            self._video_path,
+            self._output_dir,
+            deepcopy(self._settings),
+            deepcopy(self._video_properties),
+            deepcopy(self._report),
+        )
 
 
 class StereoProjector:
@@ -101,14 +131,13 @@ class StereoProjector:
         )
 
         self._model_loaded = False
+        self._preflight_owner = object()
 
     def process_video(
         self,
         video_path: str,
         output_dir: str,
         settings: dict[str, Any],
-        *,
-        preflight: VideoRunPreflight | None = None,
     ) -> bool:
         """
         Process video to create 3D VR version.
@@ -121,30 +150,29 @@ class StereoProjector:
         Returns:
             True if processing completed successfully
         """
-        try:
-            if preflight is None:
-                preflight = self.preflight_video(video_path, output_dir, settings)
-            elif preflight.video_path != video_path or preflight.output_dir != output_dir:
-                raise ValueError("Video preflight does not match the requested input and output")
-            if preflight is None:
-                return False
+        preflight = self.preflight_video(video_path, output_dir, settings)
+        return False if preflight is None else self.execute_video(preflight)
 
+    def execute_video(self, preflight: VideoRunPreflight) -> bool:
+        """Execute one owned preflight without accepting competing settings."""
+        try:
+            video_path, output_dir, settings, video_properties, _report = preflight._snapshot_for(
+                self._preflight_owner
+            )
             if not self._ensure_model_loaded():
                 return False
             if not self._prepare_output_directory(output_dir):
                 return False
 
             # Create video processor (always uses temporal consistency)
-            processor = VideoProcessor(
-                self.depth_estimator, verbose=preflight.settings.get("verbose", False)
-            )
+            processor = VideoProcessor(self.depth_estimator, verbose=settings.get("verbose", False))
 
             # Process the video
             return processor.process(
                 video_path=video_path,
                 output_dir=output_dir,
-                video_properties=preflight.video_properties,
-                settings=preflight.settings,
+                video_properties=video_properties,
+                settings=settings,
             )
 
         except Exception as e:
@@ -158,6 +186,47 @@ class StereoProjector:
         settings: dict[str, Any],
     ) -> VideoRunPreflight | None:
         """Validate and resolve a video run without loading models or mutating files."""
+        return self._build_video_preflight(
+            video_path,
+            output_dir,
+            settings,
+            video_properties=None,
+            emit_report=True,
+            expected_report=None,
+        )
+
+    def revalidate_video_preflight(
+        self,
+        preflight: VideoRunPreflight,
+        settings: dict[str, Any],
+    ) -> VideoRunPreflight | None:
+        """Rebuild an owned context with new settings without probing or reporting twice."""
+        try:
+            video_path, output_dir, _old_settings, video_properties, report = (
+                preflight._snapshot_for(self._preflight_owner)
+            )
+        except ValueError as error:
+            print(f"Error during video preflight: {error}")
+            return None
+        return self._build_video_preflight(
+            video_path,
+            output_dir,
+            settings,
+            video_properties=video_properties,
+            emit_report=False,
+            expected_report=report,
+        )
+
+    def _build_video_preflight(
+        self,
+        video_path: str,
+        output_dir: str,
+        settings: dict[str, Any],
+        *,
+        video_properties: dict[str, Any] | None,
+        emit_report: bool,
+        expected_report: dict[str, Any] | None,
+    ) -> VideoRunPreflight | None:
         try:
             requested_settings = validate_settings(dict(settings), source="explicit")
             requested_settings["video_path"] = video_path
@@ -169,7 +238,10 @@ class StereoProjector:
             if not self._validate_inputs(video_path, output_dir, requested_settings):
                 return None
 
-            video_properties = get_video_properties(video_path)
+            if video_properties is None:
+                video_properties = get_video_properties(video_path)
+            else:
+                video_properties = deepcopy(video_properties)
             if not video_properties:
                 print(f"Error: Cannot read video properties from {video_path}")
                 return None
@@ -180,15 +252,19 @@ class StereoProjector:
                 resolved_settings,
                 self.depth_estimator,
             )
-            self._print_effective_run_report(report)
-            if resolved_settings["stereo_geometry_mode"] == "metric_camera":
-                print(TEMPORAL_STABILITY_WARNING)
+            if expected_report is not None and report != expected_report:
+                raise ValueError("Migrated settings changed the reported processing configuration")
+            if emit_report:
+                self._print_effective_run_report(report)
+                if resolved_settings["stereo_geometry_mode"] == "metric_camera":
+                    print(TEMPORAL_STABILITY_WARNING)
             return VideoRunPreflight(
-                video_path=video_path,
-                output_dir=output_dir,
-                settings=resolved_settings,
-                video_properties=video_properties,
-                report=report,
+                _owner=self._preflight_owner,
+                _video_path=video_path,
+                _output_dir=output_dir,
+                _settings=deepcopy(resolved_settings),
+                _video_properties=deepcopy(video_properties),
+                _report=deepcopy(report),
             )
         except Exception as error:
             print(f"Error during video preflight: {error}")

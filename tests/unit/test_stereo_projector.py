@@ -84,6 +84,17 @@ def _metric_settings(**overrides):
     )
 
 
+def _video_properties():
+    return {
+        "width": 1920,
+        "height": 1080,
+        "fps": 24.0,
+        "frame_count": 2,
+        "sample_aspect_ratio_numerator": 1,
+        "sample_aspect_ratio_denominator": 1,
+    }
+
+
 def test_effective_moge_report_contains_every_required_identity() -> None:
     estimator = MagicMock()
     estimator.repo_id = "Ruicheng/moge-2-vitb-normal"
@@ -349,12 +360,7 @@ def test_metric_projector_prints_one_warning_and_loads_after_report(
     output_dir = str(tmp_path / "out")
     preflight = projector.preflight_video("clip.mp4", output_dir, _metric_settings())
     assert preflight is not None
-    ok = projector.process_video(
-        "clip.mp4",
-        output_dir,
-        _metric_settings(),
-        preflight=preflight,
-    )
+    ok = projector.execute_video(preflight)
 
     assert ok is True
     assert events == ["load", "process"]
@@ -362,6 +368,96 @@ def test_metric_projector_prints_one_warning_and_loads_after_report(
     output = capsys.readouterr().out
     assert output.count(TEMPORAL_STABILITY_WARNING) == 1
     assert output.index("backend: moge2") < output.index(TEMPORAL_STABILITY_WARNING)
+
+
+def test_preflight_is_bound_to_its_projector(monkeypatch, tmp_path) -> None:
+    first_estimator = MagicMock()
+    first_estimator.device = "cpu"
+    first_estimator.metric = False
+    first_estimator.inference_precision = "float32"
+    second_estimator = MagicMock()
+    second_estimator.device = "cpu"
+    second_estimator.metric = False
+    second_estimator.inference_precision = "float32"
+    estimators = iter((first_estimator, second_estimator))
+    monkeypatch.setattr(
+        stereo_projector,
+        "create_registered_depth_estimator",
+        lambda *_args, **_kwargs: next(estimators),
+    )
+    monkeypatch.setattr(stereo_projector, "validate_video_file", lambda _path: True)
+    monkeypatch.setattr(stereo_projector, "get_video_properties", lambda _path: _video_properties())
+    first = StereoProjector(device="cpu", depth_model_version="v3", model_size="vitl")
+    second = StereoProjector(device="cpu", depth_model_version="v3", model_size="vitl")
+    output_dir = str(tmp_path / "out")
+    preflight = first.preflight_video("clip.mp4", output_dir, {})
+    assert preflight is not None
+
+    ok = second.execute_video(preflight)
+
+    assert ok is False
+    second_estimator.load_model.assert_not_called()
+    assert not (tmp_path / "out").exists()
+
+
+def test_preflight_defensively_snapshots_inputs_and_revalidates_without_duplicates(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    estimator = MagicMock()
+    estimator.device = "cpu"
+    estimator.metric = True
+    estimator.repo_id = "Ruicheng/moge-2-vitb-normal"
+    estimator.revision = "54ad3a693e61907ea4633d13dec6ee682fa09419"
+    estimator.inference_precision = "float32"
+    estimator.resolution_level = 9
+    estimator.processing_resolution = None
+    estimator.denoising_steps = None
+    estimator.seed = None
+    estimator.load_model.return_value = True
+    monkeypatch.setattr(
+        stereo_projector,
+        "create_registered_depth_estimator",
+        lambda *_args, **_kwargs: estimator,
+    )
+    monkeypatch.setattr(stereo_projector, "validate_video_file", lambda _path: True)
+    probed = _video_properties()
+    probe = MagicMock(return_value=probed)
+    monkeypatch.setattr(stereo_projector, "get_video_properties", probe)
+    processor = MagicMock()
+    processor.process.return_value = True
+    monkeypatch.setattr(stereo_projector, "VideoProcessor", lambda *_args, **_kwargs: processor)
+    projector = StereoProjector(
+        device="cpu",
+        metric=True,
+        depth_model_version="moge2",
+        model_size="vitb",
+    )
+    requested = _metric_settings()
+    output_dir = str(tmp_path / "out")
+
+    initial = projector.preflight_video("clip.mp4", output_dir, requested)
+    assert initial is not None
+    requested["apply_distortion"] = True
+    probed["sample_aspect_ratio_numerator"] = 4
+    exposed_settings = initial.settings
+    exposed_settings["apply_distortion"] = True
+    migrated = {**initial.settings, "keep_intermediates": True}
+    assert projector.load_model() is True
+    execution = projector.revalidate_video_preflight(initial, migrated)
+    assert execution is not None
+    ok = projector.execute_video(execution)
+
+    assert ok is True
+    passed_settings = processor.process.call_args.kwargs["settings"]
+    passed_properties = processor.process.call_args.kwargs["video_properties"]
+    assert passed_settings["apply_distortion"] is False
+    assert passed_settings["keep_intermediates"] is True
+    assert passed_properties["sample_aspect_ratio_numerator"] == 1
+    probe.assert_called_once_with("clip.mp4")
+    estimator.load_model.assert_called_once_with()
+    output = capsys.readouterr().out
+    assert output.count("Effective depth run:") == 1
+    assert output.count(TEMPORAL_STABILITY_WARNING) == 1
 
 
 class TestStereoProjector:
@@ -487,7 +583,7 @@ class TestStereoProjector:
     def test_process_video_signature_uses_final_controls(self):
         parameter_names = list(inspect.signature(StereoProjector.process_video).parameters)
 
-        assert parameter_names == ["self", "video_path", "output_dir", "settings", "preflight"]
+        assert parameter_names == ["self", "video_path", "output_dir", "settings"]
 
     def test_duplicate_pipeline_apis_are_removed(self):
         assert {

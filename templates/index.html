@@ -2284,6 +2284,7 @@
                 },
                 body: JSON.stringify({
                     output_dir: uploadedOutputDir,
+                    socket_id: socket.id,
                     settings: settings
                 })
             })
@@ -2318,6 +2319,7 @@
             
             const resumePayload = {
                 output_dir: resumeDirectory,
+                socket_id: socket.id,
                 migrate_legacy: document.getElementById('migrateLegacy').value
             };
             const resumeRawStorageDtype = document.getElementById('rawStorageDtype').value;

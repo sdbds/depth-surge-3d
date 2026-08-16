@@ -242,3 +242,68 @@ def test_cli_resume_rejects_metric_constraints_before_load_or_migration(
     build_fingerprint.assert_not_called()
     build_resume.assert_not_called()
     migrate.assert_not_called()
+
+
+def test_cli_resume_rebuilds_numeric_preflight_from_migrated_settings(
+    cli_module, monkeypatch, tmp_path
+) -> None:
+    initial_preflight = MagicMock()
+    initial_preflight.settings = {
+        "depth_model_version": "v3",
+        "model_size": "vitl",
+        "model_path": None,
+        "depth_resolution": 1080,
+        "keep_intermediates": False,
+    }
+    migrated_settings = {**initial_preflight.settings, "keep_intermediates": True}
+    execution_preflight = MagicMock()
+    projector = MagicMock()
+    projector.preflight_video.return_value = initial_preflight
+    projector.load_model.return_value = True
+    projector.revalidate_video_preflight.return_value = execution_preflight
+    projector.execute_video.return_value = True
+    report = MagicMock(migrated_settings=migrated_settings, stages=(), removed_settings=())
+    resume_info = {
+        "can_resume": True,
+        "batch_name": "resume",
+        "status": "in_progress",
+        "progress_info": None,
+        "recommendations": [],
+        "settings_file": tmp_path / "job-settings.json",
+    }
+    fingerprint = {"backend": "loaded.Estimator"}
+    monkeypatch.setattr(cli_module.sys, "argv", ["depth_surge_3d.py", "--resume", str(tmp_path)])
+    monkeypatch.setattr(cli_module, "can_resume_processing", lambda _path: resume_info)
+    monkeypatch.setattr(
+        cli_module,
+        "load_processing_settings",
+        lambda _path: {
+            "metadata": {"source_video": "source.mp4"},
+            "processing_settings": {
+                "depth_model_version": "v3",
+                "depth_resolution": "auto",
+            },
+        },
+    )
+    monkeypatch.setattr(cli_module, "_backend_is_available", lambda _backend: True)
+    monkeypatch.setattr(cli_module, "create_stereo_projector", lambda **_kwargs: projector)
+    build_fingerprint = MagicMock(return_value=fingerprint)
+    build_report = MagicMock(return_value=report)
+    monkeypatch.setattr(cli_module, "build_current_model_fingerprint", build_fingerprint)
+    monkeypatch.setattr(cli_module, "build_resume_report", build_report)
+    monkeypatch.setattr(cli_module, "apply_legacy_migration", MagicMock())
+
+    result = cli_module.main()
+
+    assert result == 0
+    build_fingerprint.assert_called_once_with(
+        projector.depth_estimator,
+        initial_preflight.settings,
+    )
+    assert build_report.call_args.args[1]["depth_resolution"] == 1080
+    projector.revalidate_video_preflight.assert_called_once_with(
+        initial_preflight,
+        migrated_settings,
+    )
+    projector.execute_video.assert_called_once_with(execution_preflight)
+    projector.process_video.assert_not_called()

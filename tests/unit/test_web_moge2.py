@@ -187,6 +187,7 @@ def test_web_runner_passes_normalized_moge_variant_to_projector(tmp_path) -> Non
     ):
         web_app.process_video_async(
             "test-session",
+            "requester-socket",
             tmp_path / "input.mp4",
             {
                 "depth_model_version": "moge2",
@@ -311,12 +312,37 @@ def test_process_resolves_auto_depth_size_and_passes_probed_properties_once(
     monkeypatch.setattr(web_app, "get_video_properties", probe, raising=False)
     monkeypatch.setattr(web_app.socketio, "start_background_task", start)
 
-    response = client.post("/process", json=_metric_payload(output_dir, depth_resolution="auto"))
+    socket_client = web_app.socketio.test_client(web_app.app, flask_test_client=client)
+    try:
+        socket_id = web_app.socketio.server.manager.sid_from_eio_sid(socket_client.eio_sid, "/")
+        payload = _metric_payload(output_dir, depth_resolution="auto")
+        payload["socket_id"] = socket_id
+        response = client.post("/process", json=payload)
+    finally:
+        socket_client.disconnect()
 
     assert response.status_code == 200
     assert probe.call_count == 1
-    assert start.call_args.args[3]["depth_resolution"] == 1080
-    assert start.call_args.args[6] == _video_properties()
+    assert start.call_args.args[4]["depth_resolution"] == 1080
+    assert start.call_args.args[7] == _video_properties()
+
+
+def test_process_rejects_inactive_requester_socket_before_background_start(
+    client, monkeypatch, tmp_path
+) -> None:
+    import app as web_app
+
+    output_dir = _prepare_process_request(web_app, monkeypatch, tmp_path)
+    start = MagicMock()
+    monkeypatch.setattr(web_app.socketio, "start_background_task", start)
+    payload = _metric_payload(output_dir)
+    payload["socket_id"] = "not-connected"
+
+    response = client.post("/process", json=payload)
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "A connected Socket.IO client is required"}
+    start.assert_not_called()
 
 
 def test_web_resume_restores_moge_variant_and_metric_values(tmp_path) -> None:
@@ -369,6 +395,7 @@ def test_web_emits_configuration_before_model_load(monkeypatch, tmp_path) -> Non
     with patch("torch.cuda.is_available", return_value=False):
         web_app.process_video_async(
             "test-session",
+            "requester-socket",
             tmp_path / "input.mp4",
             _metric_payload(tmp_path)["settings"],
             tmp_path / "output",
@@ -379,7 +406,7 @@ def test_web_emits_configuration_before_model_load(monkeypatch, tmp_path) -> Non
     assert events.index("processing_configuration") < events.index("load_model")
 
 
-def test_join_after_process_response_replays_exact_processing_configuration(
+def test_processing_configuration_is_private_exactly_once_and_has_no_replay_buffer(
     client, monkeypatch, tmp_path
 ) -> None:
     import app as web_app
@@ -400,19 +427,33 @@ def test_join_after_process_response_replays_exact_processing_configuration(
         return object()
 
     monkeypatch.setattr(web_app.socketio, "start_background_task", run_synchronously)
-    response = client.post("/process", json=_metric_payload(output_dir))
-    session_id = response.get_json()["session_id"]
-    socket_client = web_app.socketio.test_client(web_app.app, flask_test_client=client)
+    requester = web_app.socketio.test_client(web_app.app, flask_test_client=client)
+    other_client = web_app.app.test_client()
+    other = web_app.socketio.test_client(web_app.app, flask_test_client=other_client)
     try:
-        socket_client.emit("join_session", {"session_id": session_id})
+        requester_sid = web_app.socketio.server.manager.sid_from_eio_sid(
+            requester.eio_sid,
+            "/",
+        )
+        payload = _metric_payload(output_dir)
+        payload["socket_id"] = requester_sid
+        response = client.post("/process", json=payload)
+        session_id = response.get_json()["session_id"]
+        other.get_received()
+        other.emit("join_session", {"session_id": session_id})
         configurations = [
             event["args"][0]
-            for event in socket_client.get_received()
+            for event in requester.get_received()
             if event["name"] == "processing_configuration"
         ]
+        stolen = [
+            event for event in other.get_received() if event["name"] == "processing_configuration"
+        ]
     finally:
-        socket_client.disconnect()
+        requester.disconnect()
+        other.disconnect()
 
+    assert response.status_code == 200
     assert configurations == [
         {
             "backend": "moge2",
@@ -432,6 +473,8 @@ def test_join_after_process_response_replays_exact_processing_configuration(
             },
         }
     ]
+    assert stolen == []
+    assert not hasattr(web_app, "PENDING_PROCESSING_CONFIGURATIONS")
 
 
 def test_new_runs_clear_stale_effective_configuration(client) -> None:
@@ -442,5 +485,7 @@ def test_new_runs_clear_stale_effective_configuration(client) -> None:
     resume_handler = html[html.index("// Resume processing") : html.index("// Stop processing")]
     assert "clearEffectiveProcessingConfig();" in process_handler
     assert "clearEffectiveProcessingConfig();" in resume_handler
+    assert "socket_id: socket.id" in process_handler
+    assert "socket_id: socket.id" in resume_handler
     assert "values.replaceChildren();" in html
     assert "container.hidden = true;" in html

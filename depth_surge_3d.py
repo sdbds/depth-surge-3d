@@ -566,25 +566,32 @@ def main():  # noqa: C901
         )
         if preflight is None:
             return 1
+        resolved_settings = preflight.settings
         if not projector.load_model():
             print("Could not load depth estimation model")
             return 1
         model_fingerprint = build_current_model_fingerprint(
             projector.depth_estimator,
-            processing_settings,
+            resolved_settings,
         )
 
         try:
             resume_report = build_resume_report(
                 Path(args.resume).resolve(),
-                processing_settings,
+                resolved_settings,
                 source_video=video_path,
                 model_fingerprint=model_fingerprint,
                 settings_file=resume_info["settings_file"],
             )
             _print_resume_report(resume_report)
-            apply_legacy_migration(resume_report, args.migrate_legacy)
             processing_settings = resume_report.migrated_settings
+            execution_preflight = projector.revalidate_video_preflight(
+                preflight,
+                processing_settings,
+            )
+            if execution_preflight is None:
+                return 1
+            apply_legacy_migration(resume_report, args.migrate_legacy)
         except (OSError, TypeError, ValueError) as exc:
             print(f"Cannot migrate resume data: {exc}")
             return 1
@@ -593,12 +600,7 @@ def main():  # noqa: C901
         print(f"Input: {video_path}")
         print(f"Output: {args.resume}")
 
-        success = projector.process_video(
-            video_path=video_path,
-            output_dir=args.resume,
-            settings=processing_settings,
-            preflight=preflight,
-        )
+        success = projector.execute_video(execution_preflight)
 
         if success:
             print("Resume processing completed successfully!")

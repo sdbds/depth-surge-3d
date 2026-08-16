@@ -88,6 +88,7 @@ def test_app_stop_handler_emits_stopped_instead_of_error(tmp_path):
     ):
         web_app.process_video_async(
             "test-session",
+            "requester-socket",
             tmp_path / "source.mp4",
             {
                 "device": "cpu",

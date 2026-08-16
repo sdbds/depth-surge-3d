@@ -90,6 +90,7 @@ def test_web_runner_uses_relative_see_through_repo(tmp_path):
     ):
         web_app.process_video_async(
             "test-session",
+            "requester-socket",
             tmp_path / "input.mp4",
             {
                 "depth_model_version": "see_through",
@@ -278,13 +279,23 @@ def test_web_process_validates_final_settings_before_starting(tmp_path):
         ),
         patch.object(web_app.socketio, "start_background_task", return_value=MagicMock()) as start,
     ):
-        response = web_app.app.test_client().post(
-            "/process",
-            json={"output_dir": str(output_dir), "settings": settings},
-        )
+        flask_client = web_app.app.test_client()
+        socket_client = web_app.socketio.test_client(web_app.app, flask_test_client=flask_client)
+        try:
+            socket_id = web_app.socketio.server.manager.sid_from_eio_sid(socket_client.eio_sid, "/")
+            response = flask_client.post(
+                "/process",
+                json={
+                    "output_dir": str(output_dir),
+                    "socket_id": socket_id,
+                    "settings": settings,
+                },
+            )
+        finally:
+            socket_client.disconnect()
 
     assert response.status_code == 200
-    validated = start.call_args.args[3]
+    validated = start.call_args.args[4]
     for key, value in settings.items():
         assert validated[key] == value
 
@@ -356,13 +367,20 @@ def test_web_resume_requires_current_request_to_authorize_legacy_delete(tmp_path
         patch.object(web_app, "apply_legacy_migration") as migrate,
         patch.object(web_app.socketio, "start_background_task", return_value=MagicMock()) as start,
     ):
-        response = web_app.app.test_client().post(
-            "/resume",
-            json={
-                "output_dir": str(output_dir),
-                "raw_storage_dtype": "float32",
-            },
-        )
+        flask_client = web_app.app.test_client()
+        socket_client = web_app.socketio.test_client(web_app.app, flask_test_client=flask_client)
+        try:
+            socket_id = web_app.socketio.server.manager.sid_from_eio_sid(socket_client.eio_sid, "/")
+            response = flask_client.post(
+                "/resume",
+                json={
+                    "output_dir": str(output_dir),
+                    "raw_storage_dtype": "float32",
+                    "socket_id": socket_id,
+                },
+            )
+        finally:
+            socket_client.disconnect()
 
     assert response.status_code == 200
     assert build.call_args.args[1]["migrate_legacy"] == "archive"
@@ -370,7 +388,7 @@ def test_web_resume_requires_current_request_to_authorize_legacy_delete(tmp_path
     assert build.call_args.kwargs["source_video"] == source_video
     assert build.call_args.kwargs["settings_file"] == settings_file
     migrate.assert_not_called()
-    resume_context = start.call_args.args[5]
+    resume_context = start.call_args.args[6]
     assert resume_context == {
         "migration_mode": "archive",
         "settings_file": settings_file,
@@ -412,6 +430,7 @@ def test_web_background_resume_validates_loaded_model_before_migration(tmp_path)
     ):
         web_app.process_video_async(
             "test-session",
+            "requester-socket",
             source_video,
             settings,
             output_dir,
@@ -508,13 +527,19 @@ def test_web_resume_accepts_legacy_settings_without_source_fingerprint(tmp_path,
         patch.object(web_app, "build_resume_report", return_value=report),
         patch.object(web_app.socketio, "start_background_task", return_value=MagicMock()) as start,
     ):
-        response = web_app.app.test_client().post(
-            "/resume",
-            json={"output_dir": str(output_dir)},
-        )
+        flask_client = web_app.app.test_client()
+        socket_client = web_app.socketio.test_client(web_app.app, flask_test_client=flask_client)
+        try:
+            socket_id = web_app.socketio.server.manager.sid_from_eio_sid(socket_client.eio_sid, "/")
+            response = flask_client.post(
+                "/resume",
+                json={"output_dir": str(output_dir), "socket_id": socket_id},
+            )
+        finally:
+            socket_client.disconnect()
 
     assert response.status_code == 200
-    assert start.call_args.args[2] == correct_source.resolve()
+    assert start.call_args.args[3] == correct_source.resolve()
 
 
 def test_web_resume_rejects_saved_source_fingerprint_mismatch(tmp_path, monkeypatch):
@@ -559,8 +584,8 @@ def test_web_resume_rejects_saved_source_fingerprint_mismatch(tmp_path, monkeypa
     start.assert_not_called()
 
 
-def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp_path, monkeypatch):
-    """CLI resume must rebuild the saved estimator and pass only process-video options."""
+def test_cli_resume_restores_depth_backend_with_owned_resolved_preflight(tmp_path, monkeypatch):
+    """CLI resume rebuilds the saved estimator and executes its resolved context."""
     cli = _load_cli_module()
     projector = MagicMock()
     projector.load_model.return_value = True
@@ -590,6 +615,16 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
     report.stages = ()
     report.removed_settings = ()
     report.migrated_settings = cli.validate_settings(saved_settings, source="legacy_disk")
+    preflight_settings = {
+        **report.migrated_settings,
+        "model_size": "custom",
+        "depth_resolution": 768,
+        "verbose": False,
+    }
+    projector.preflight_video.return_value.settings = preflight_settings
+    execution_preflight = MagicMock()
+    projector.revalidate_video_preflight.return_value = execution_preflight
+    projector.execute_video.return_value = True
     model_fingerprint = {"backend": "loaded.Estimator"}
     monkeypatch.setattr(cli.sys, "argv", ["depth_surge_3d.py", "--resume", str(tmp_path)])
 
@@ -623,15 +658,10 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
         model_size="custom",
     )
     projector.load_model.assert_called_once_with()
-    preflight_settings = {
-        **report.migrated_settings,
-        "model_size": "custom",
-        "verbose": False,
-    }
     projector.preflight_video.assert_called_once_with(
         "source.mkv",
         str(tmp_path),
-        preflight_settings,
+        {**preflight_settings, "depth_resolution": "768"},
     )
     build_fingerprint.assert_called_once_with(projector.depth_estimator, preflight_settings)
     build_report.assert_called_once_with(
@@ -642,23 +672,12 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
         settings_file=resume_info["settings_file"],
     )
     migrate.assert_called_once_with(report, "archive")
-    resume_kwargs = projector.process_video.call_args.kwargs
-    assert resume_kwargs["video_path"] == "source.mkv"
-    assert resume_kwargs["output_dir"] == str(tmp_path)
-    assert resume_kwargs["preflight"] is projector.preflight_video.return_value
-    assert resume_kwargs["settings"]["stereo_strength"] == 3.0
-    assert resume_kwargs["settings"]["keep_intermediates"] is False
-    for metadata_key in (
-        "depth_model_version",
-        "model_path",
-        "model_size",
-        "depth_resolution",
-        "use_metric_depth",
-        "device",
-        "denoising_steps",
-        "seed",
-    ):
-        assert metadata_key not in resume_kwargs
+    projector.revalidate_video_preflight.assert_called_once_with(
+        projector.preflight_video.return_value,
+        report.migrated_settings,
+    )
+    projector.execute_video.assert_called_once_with(execution_preflight)
+    projector.process_video.assert_not_called()
 
 
 def test_cli_resume_infers_see_through_for_legacy_settings(tmp_path, monkeypatch):
