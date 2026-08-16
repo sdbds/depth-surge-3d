@@ -15,9 +15,11 @@ from src.depth_surge_3d.core.file_identity import (
 )
 from src.depth_surge_3d.core.settings import validate_settings
 from src.depth_surge_3d.processing.frames.depth_storage import (
+    RAW_DEPTH_READABLE_SCHEMA_VERSIONS,
     RAW_DEPTH_SCHEMA_VERSION,
     RawDepthStore,
     canonical_json_hash,
+    depth_preprocessing_algorithm,
     select_depth_model_settings,
 )
 from src.depth_surge_3d.processing.frames.depth_processor import (
@@ -118,20 +120,26 @@ def _write_raw_metadata(
     source_fingerprint: str,
     *,
     model_size: str,
+    settings: dict | None = None,
+    schema_version: int = RAW_DEPTH_SCHEMA_VERSION,
+    camera_model: str = "none",
 ) -> None:
     raw_dir = output_dir / "02_depth_raw"
     raw_dir.mkdir()
+    selected_settings = settings or _current_settings(model_size=model_size)
     semantic = {
         "backend": "test.Estimator",
         "model_info": {"revision": "immutable"},
-        "depth_settings": select_depth_model_settings(_current_settings(model_size=model_size)),
+        "depth_settings": select_depth_model_settings(selected_settings),
         "weight_sha256": None,
         "artifact_identity": "immutable",
         "source_frame_fingerprint": source_fingerprint,
-        "preprocessing_algorithm": "native-depth-adapter-v2",
+        "preprocessing_algorithm": depth_preprocessing_algorithm(selected_settings),
     }
+    if schema_version == 3:
+        semantic["camera_model"] = camera_model
     metadata = {
-        "schema_version": RAW_DEPTH_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "storage_status": "ready",
         "representation": "relative_depth",
         "frame_names": [path.name for path in frame_files],
@@ -144,6 +152,8 @@ def _write_raw_metadata(
         "completed_count": 0,
         "promoted_frame_count": 0,
     }
+    if schema_version == 3:
+        metadata["camera_model"] = camera_model
     metadata["fingerprint"] = RawDepthStore._fingerprint(metadata)
     (raw_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
@@ -152,9 +162,21 @@ def _write_current_depth_pipeline(
     output_dir: Path,
     frame_files: list[Path],
     source_fingerprint: str,
+    *,
+    settings: dict | None = None,
+    schema_version: int = RAW_DEPTH_SCHEMA_VERSION,
+    camera_model: str = "none",
 ) -> tuple[dict, dict, dict]:
     _write_candidate_manifest(output_dir, frame_files, source_fingerprint)
-    _write_raw_metadata(output_dir, frame_files, source_fingerprint, model_size="large")
+    _write_raw_metadata(
+        output_dir,
+        frame_files,
+        source_fingerprint,
+        model_size="large",
+        settings=settings,
+        schema_version=schema_version,
+        camera_model=camera_model,
+    )
     raw_dir = output_dir / "02_depth_raw"
     raw_metadata_path = raw_dir / "metadata.json"
     raw_metadata = json.loads(raw_metadata_path.read_text(encoding="utf-8"))
@@ -181,10 +203,10 @@ def _write_current_depth_pipeline(
 
     for index, frame in enumerate(frame_files):
         with (raw_dir / f"{frame.stem}.npz").open("wb") as handle:
-            np.savez_compressed(
-                handle,
-                values=np.full((4, 6), index, dtype=np.float16),
-            )
+            arrays = {"values": np.full((4, 6), index, dtype=np.float16)}
+            if camera_model == "pinhole_fx":
+                arrays["focal_x_normalized"] = np.array(0.8, dtype=np.float32)
+            np.savez_compressed(handle, **arrays)
     raw_metadata = json.loads(raw_metadata_path.read_text(encoding="utf-8"))
     raw_metadata["completed_count"] = len(frame_files)
     raw_metadata_path.write_text(json.dumps(raw_metadata), encoding="utf-8")
@@ -332,6 +354,98 @@ def test_raw_model_fingerprint_mismatch_invalidates_raw_and_downstream(tmp_path)
 
     assert report.stage("depth_raw").disposition == "invalidate"
     assert "model_size" in report.stage("depth_raw").reason
+
+
+def test_raw_mismatch_accepts_schema_v2_for_camera_free_backend(tmp_path):
+    from src.depth_surge_3d.io.resume import _raw_mismatch_reason
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings()
+    _write_raw_metadata(
+        tmp_path,
+        frame_files,
+        fingerprint,
+        model_size="large",
+        settings=settings,
+        schema_version=2,
+    )
+    metadata = RawDepthStore.read_metadata(tmp_path / "02_depth_raw")
+
+    assert RAW_DEPTH_READABLE_SCHEMA_VERSIONS == frozenset({2, 3})
+    assert metadata is not None
+    assert _raw_mismatch_reason(metadata, settings, frame_files, fingerprint, None) is None
+
+
+def test_resume_preserves_valid_schema_v2_metadata_and_payload_bytes(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings()
+    _write_settings(tmp_path, settings, current_schema=True)
+    _write_current_depth_pipeline(
+        tmp_path,
+        frame_files,
+        fingerprint,
+        settings=settings,
+        schema_version=2,
+    )
+    raw_dir = tmp_path / "02_depth_raw"
+    metadata_before = (raw_dir / "metadata.json").read_bytes()
+    payloads_before = [path.read_bytes() for path in sorted(raw_dir.glob("*.npz"))]
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("depth_raw").disposition == "preserve"
+    assert (raw_dir / "metadata.json").read_bytes() == metadata_before
+    assert [path.read_bytes() for path in sorted(raw_dir.glob("*.npz"))] == payloads_before
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "camera_model"),
+    [(2, "none"), (3, "none")],
+)
+def test_moge_resume_requires_v3_pinhole_camera_metadata(tmp_path, schema_version, camera_model):
+    from src.depth_surge_3d.io.resume import _raw_mismatch_reason
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings()
+    settings["depth_model_version"] = "moge2"
+    _write_raw_metadata(
+        tmp_path,
+        frame_files,
+        fingerprint,
+        model_size="large",
+        settings=settings,
+        schema_version=schema_version,
+        camera_model=camera_model,
+    )
+    metadata = RawDepthStore.read_metadata(tmp_path / "02_depth_raw")
+
+    assert metadata is not None
+    reason = _raw_mismatch_reason(metadata, settings, frame_files, fingerprint, None)
+    assert reason is not None
+    assert "pinhole_fx" in reason
+
+
+def test_moge_resume_accepts_v3_pinhole_camera_metadata(tmp_path):
+    from src.depth_surge_3d.io.resume import _raw_mismatch_reason
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings()
+    settings["depth_model_version"] = "moge2"
+    _write_raw_metadata(
+        tmp_path,
+        frame_files,
+        fingerprint,
+        model_size="large",
+        settings=settings,
+        schema_version=3,
+        camera_model="pinhole_fx",
+    )
+    metadata = RawDepthStore.read_metadata(tmp_path / "02_depth_raw")
+
+    assert metadata is not None
+    assert _raw_mismatch_reason(metadata, settings, frame_files, fingerprint, None) is None
 
 
 def test_raw_model_fingerprint_mismatch_recomputes_depth_derived_scene_data(tmp_path):

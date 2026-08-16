@@ -1,12 +1,18 @@
 """Tests for DepthMapProcessor module."""
 
-import pytest
-import numpy as np
 import cv2
+import json
+import numpy as np
+import pytest
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from src.depth_surge_3d.inference.depth.types import DepthBatch, DepthRepresentation
+from src.depth_surge_3d.inference.depth.types import (
+    DepthBatch,
+    DepthRepresentation,
+    PinholeCameraBatch,
+)
 from src.depth_surge_3d.processing.frames.depth_processor import DepthMapProcessor
 
 
@@ -69,6 +75,7 @@ class TestGenerateDepthMaps:
     ):
         """Long videos retain only one inference chunk in memory."""
         estimator = Mock()
+        estimator.camera_model = "none"
         estimator.model_path = None
         estimator.get_model_info.return_value = {
             "family": "processor-test",
@@ -108,6 +115,62 @@ class TestGenerateDepthMaps:
         )
         assert estimator.estimate_depth_batch.call_count == 2
         assert clear_gpu_memory.call_count == 1
+
+    def test_moge_chunk_persists_focal_with_depth_and_keeps_canonical_output(
+        self, mock_progress_tracker, temp_frames, tmp_path
+    ):
+        estimator = Mock()
+        estimator.camera_model = "pinhole_fx"
+        estimator.model_path = None
+        estimator.get_model_info.return_value = {
+            "family": "moge",
+            "repository": "Ruicheng/moge-2-vitl-normal",
+            "source_revision": "immutable",
+            "resolution_level": 9,
+            "preprocessing_algorithm": "rgb-area-max-edge-v1",
+            "camera_model": "pinhole_fx",
+        }
+        estimator.estimate_depth_batch.side_effect = lambda frames, **kwargs: DepthBatch(
+            np.full((len(frames), 2, 3), 2.0, dtype=np.float32),
+            DepthRepresentation.METRIC_DEPTH,
+            camera=PinholeCameraBatch(
+                np.full(len(frames), 0.8, dtype=np.float32),
+            ),
+        )
+        processor = DepthMapProcessor(estimator)
+        canonical_dir = tmp_path / "03_disparity_maps"
+        settings = {
+            "depth_model_version": "moge2",
+            "depth_resolution": "1080",
+            "target_fps": 30,
+            "keep_intermediates": True,
+            "super_sample": "none",
+            "per_eye_width": 100,
+            "per_eye_height": 100,
+        }
+
+        with (
+            patch.object(processor, "_determine_chunk_params", return_value=(2, 1080)),
+            patch.object(processor, "_clear_gpu_memory"),
+        ):
+            result = processor.generate_depth_map_files(
+                temp_frames,
+                settings,
+                {"base": tmp_path, "disparity_maps": canonical_dir},
+                mock_progress_tracker,
+            )
+
+        metadata = json.loads((tmp_path / "02_depth_raw" / "metadata.json").read_text())
+        assert metadata["schema_version"] == 3
+        assert metadata["camera_model"] == "pinhole_fx"
+        assert metadata["semantic_fingerprint"]["camera_model"] == "pinhole_fx"
+        assert metadata["semantic_fingerprint"]["preprocessing_algorithm"] == (
+            "moge2-rgb-area-max-edge-v1"
+        )
+        with zipfile.ZipFile(tmp_path / "02_depth_raw" / "frame_0000.npz") as payload:
+            assert payload.namelist() == ["values.npy", "focal_x_normalized.npy"]
+        assert result is not None
+        assert all(path.is_file() for path in result)
 
 
 def test_native_shape_estimate_uses_estimator_output_contract():

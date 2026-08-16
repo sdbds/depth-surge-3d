@@ -394,6 +394,8 @@ class DepthMapProcessor:
         fingerprint = build_current_model_fingerprint(self.depth_estimator, settings)
         fingerprint["source_frame_fingerprint"] = self._source_frame_fingerprint(frame_files)
         fingerprint["preprocessing_algorithm"] = depth_preprocessing_algorithm(settings)
+        camera_model = str(getattr(self.depth_estimator, "camera_model", "none"))
+        fingerprint["camera_model"] = camera_model
         return fingerprint
 
     @staticmethod
@@ -404,15 +406,14 @@ class DepthMapProcessor:
         semantic_fingerprint: dict[str, Any],
         requested_dtype: str,
     ) -> RawDepthStore | None:
-        metadata_path = raw_dir / "metadata.json"
-        if not metadata_path.is_file():
+        metadata = RawDepthStore.read_metadata(raw_dir)
+        if metadata is None:
+            if (raw_dir / "metadata.json").exists():
+                raise RawDepthFingerprintError("Raw-depth metadata is malformed")
             return None
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        representation = DepthRepresentation(metadata["representation"])
-        return RawDepthStore.open_or_create(
+        return RawDepthStore.open_existing(
             raw_dir,
             frame_names=frame_names,
-            representation=representation,
             semantic_fingerprint=semantic_fingerprint,
             requested_dtype=requested_dtype,
         )
@@ -585,13 +586,12 @@ class DepthMapProcessor:
             raise ValueError("Depth estimator returned an unexpected frame count")
 
         if raw_store is None:
-            raw_store = RawDepthStore.open_or_create(
+            raw_store = RawDepthStore.create(
                 raw_dir,
                 frame_names=frame_names,
-                representation=result.representation,
                 semantic_fingerprint=semantic_fingerprint,
                 requested_dtype=requested_dtype,
-                first_values=result.values,
+                first_batch=result,
             )
             native_height, native_width = result.values.shape[1:]
             selected_bytes = 2 if raw_store.metadata["selected_dtype"] == "float16" else 4
@@ -603,10 +603,10 @@ class DepthMapProcessor:
                 selected_bytes,
                 bool(settings.get("keep_intermediates", False)),
             )
-        elif result.representation.value != raw_store.metadata["representation"]:
-            raise ValueError("Depth representation changed during inference")
+        else:
+            raw_store.validate_batch_contract(result)
 
-        raw_store.write_batch(chunk_names, result.values)
+        raw_store.write_batch(chunk_names, result)
         return raw_store
 
     @staticmethod

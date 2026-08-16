@@ -28,7 +28,7 @@ from ..processing.frames.depth_processor import (
     DEPTH_BOUNDS_SCHEMA_VERSION,
 )
 from ..processing.frames.depth_storage import (
-    RAW_DEPTH_SCHEMA_VERSION,
+    RAW_DEPTH_READABLE_SCHEMA_VERSIONS,
     RawDepthFingerprintError,
     RawDepthStore,
     depth_preprocessing_algorithm,
@@ -628,6 +628,8 @@ def _raw_semantic_mismatch_reason(
 def _raw_storage_mismatch_reason(
     metadata: dict[str, Any], current_settings: dict[str, Any]
 ) -> str | None:
+    if metadata.get("schema_version") == 2 and metadata.get("storage_status") != "ready":
+        return "schema-v2 raw-depth storage transaction status is invalid"
     requested_dtype = current_settings.get("raw_storage_dtype", "auto")
     persisted_request = metadata.get("requested_dtype")
     promotes = metadata.get("selected_dtype") == "float16" and requested_dtype == "float32"
@@ -642,9 +644,12 @@ def _raw_storage_mismatch_reason(
 
 
 def _raw_promotion_pending(metadata: dict[str, Any], current_settings: dict[str, Any]) -> bool:
-    return metadata.get("storage_status") == "promoting" or (
-        metadata.get("selected_dtype") == "float16"
-        and current_settings.get("raw_storage_dtype", "auto") == "float32"
+    return metadata.get("schema_version") == 3 and (
+        metadata.get("storage_status") == "promoting"
+        or (
+            metadata.get("selected_dtype") == "float16"
+            and current_settings.get("raw_storage_dtype", "auto") == "float32"
+        )
     )
 
 
@@ -655,12 +660,31 @@ def _raw_mismatch_reason(
     source_fingerprint: str,
     current_model_fingerprint: dict[str, Any] | None,
 ) -> str | None:
-    if metadata.get("schema_version") != RAW_DEPTH_SCHEMA_VERSION:
+    schema_version = metadata.get("schema_version")
+    if schema_version not in RAW_DEPTH_READABLE_SCHEMA_VERSIONS:
         return "raw-depth schema mismatch"
     if metadata.get("frame_names") != [path.name for path in frame_files]:
         return "raw-depth frame manifest mismatch"
+    semantic = metadata.get("semantic_fingerprint")
+    semantic_camera_model = (
+        semantic.get("camera_model", "none") if isinstance(semantic, dict) else None
+    )
+    if schema_version == 2:
+        if semantic_camera_model != "none":
+            return "schema-v2 raw depth must use camera_model none"
+        camera_model = "none"
+    else:
+        camera_model = metadata.get("camera_model")
+        if camera_model not in {"none", "pinhole_fx"}:
+            return "raw-depth camera_model is invalid"
+        if semantic_camera_model != camera_model:
+            return "raw-depth camera_model fingerprint mismatch"
+    if current_settings.get("depth_model_version") == "moge2" and (
+        schema_version != 3 or camera_model != "pinhole_fx"
+    ):
+        return "moge2 raw depth requires schema 3 camera_model pinhole_fx"
     semantic_reason = _raw_semantic_mismatch_reason(
-        metadata.get("semantic_fingerprint"),
+        semantic,
         current_settings,
         source_fingerprint,
         current_model_fingerprint,
