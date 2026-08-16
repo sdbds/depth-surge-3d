@@ -48,6 +48,49 @@ class TestVideoProcessorInit:
 class TestVideoProcessorProcess:
     """Test VideoProcessor.process delegation."""
 
+    def test_process_unloads_depth_model_before_step_3(self, tmp_path):
+        """VideoProcessor wires its estimator into the stage-boundary cleanup."""
+
+        class LoadedDepthEstimator:
+            def __init__(self):
+                self.loaded = True
+
+            def unload_model(self):
+                self.loaded = False
+
+        estimator = LoadedDepthEstimator()
+        processor = VideoProcessor(estimator)
+        frame = tmp_path / "frame_000001.png"
+        depth = tmp_path / "depth_000001.png"
+        processor.orchestrator._setup_processing = Mock(
+            return_value=(
+                tmp_path,
+                {"base": tmp_path, "frames": tmp_path / "frames"},
+                None,
+            )
+        )
+        processor.video_encoder.extract_frames = Mock(return_value=[frame])
+        processor.depth_processor.generate_depth_map_files = Mock(return_value=[depth])
+        model_loaded_at_step_3 = None
+
+        def observe_model_state(*_args):
+            nonlocal model_loaded_at_step_3
+            model_loaded_at_step_3 = estimator.loaded
+            return False
+
+        processor.stereo_generator.create_stereo_pairs_from_files = observe_model_state
+
+        result = processor.process(
+            tmp_path / "source.mp4",
+            tmp_path,
+            {"fps": 30.0, "frame_count": 1},
+            {},
+        )
+
+        assert result is False
+        assert estimator.loaded is False
+        assert model_loaded_at_step_3 is False
+
     def test_process_delegates_to_orchestrator(self, tmp_path):
         """Test that process method delegates to orchestrator."""
         mock_estimator = Mock()

@@ -102,3 +102,4 @@ def test_app_stop_handler_emits_stopped_instead_of_error(tmp_path):
     assert "processing_error" not in events
     assert web_app.current_processing["active"] is False
     assert web_app.current_processing["stop_requested"] is False
+    projector.unload_model.assert_called_once_with()

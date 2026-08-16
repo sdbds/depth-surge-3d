@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ...io.operations import (
     cleanup_intermediate_files,
@@ -47,6 +47,7 @@ class ProcessingOrchestrator:
         vr_assembler,
         video_encoder,
         verbose: bool = False,
+        release_depth_model: Callable[[], None] | None = None,
     ):
         """
         Initialize processing orchestrator.
@@ -59,6 +60,7 @@ class ProcessingOrchestrator:
             vr_assembler: VRFrameAssembler instance
             video_encoder: VideoEncoder instance
             verbose: Enable verbose output
+            release_depth_model: Callback that unloads the depth model
         """
         self.depth_processor = depth_processor
         self.stereo_generator = stereo_generator
@@ -67,6 +69,8 @@ class ProcessingOrchestrator:
         self.vr_assembler = vr_assembler
         self.video_encoder = video_encoder
         self.verbose = verbose
+        self._release_depth_model_callback = release_depth_model
+        self._depth_model_released = False
         self._settings_file: Path | None = None  # Track settings file for error handling
         self._start_time: float = 0.0  # Track processing start time
 
@@ -96,6 +100,7 @@ class ProcessingOrchestrator:
             - Filesystem state management
             - Delegates to all processor modules
         """
+        self._depth_model_released = False
         try:
             # Start timer
             self._start_time = time.time()
@@ -124,6 +129,8 @@ class ProcessingOrchestrator:
             if self._settings_file:
                 update_processing_status(self._settings_file, "failed", {"error": str(e)})
             return False
+        finally:
+            self._release_depth_model()
 
     def _execute_pipeline(
         self,
@@ -166,9 +173,12 @@ class ProcessingOrchestrator:
         fps = video_properties.get("fps", 30.0)
 
         # Step 2: Generate canonical disparity maps (delegated to depth_processor)
-        depth_files = self.depth_processor.generate_depth_map_files(
-            frame_files, settings, directories, progress_tracker
-        )
+        try:
+            depth_files = self.depth_processor.generate_depth_map_files(
+                frame_files, settings, directories, progress_tracker
+            )
+        finally:
+            self._release_depth_model()
         if depth_files is None:
             return False
         print(step_complete(f"Step 2: Prepared {len(depth_files)} canonical disparity maps"))
@@ -186,6 +196,13 @@ class ProcessingOrchestrator:
             output_path,
             progress_tracker,
         )
+
+    def _release_depth_model(self) -> None:
+        """Release the depth model once per pipeline run."""
+        if self._depth_model_released or self._release_depth_model_callback is None:
+            return
+        self._release_depth_model_callback()
+        self._depth_model_released = True
 
     def _execute_remaining_steps(  # noqa: C901
         self,

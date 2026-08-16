@@ -126,7 +126,9 @@ class StereoProjector:
 
             # Create video processor (always uses temporal consistency)
             processor = VideoProcessor(
-                self.depth_estimator, verbose=resolved_settings.get("verbose", False)
+                self.depth_estimator,
+                verbose=resolved_settings.get("verbose", False),
+                release_depth_model=self.unload_model,
             )
 
             # Process the video

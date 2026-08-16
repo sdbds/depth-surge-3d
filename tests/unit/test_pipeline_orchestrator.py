@@ -256,6 +256,56 @@ class TestFinalizeProcessing:
 
 
 class TestExecutePipeline:
+    def test_releases_depth_model_before_starting_step_3(self, tmp_path):
+        """The depth model leaves memory as soon as its pipeline stage is complete."""
+
+        class LoadedDepthModel:
+            def __init__(self):
+                self.loaded = True
+
+            def unload_model(self):
+                self.loaded = False
+
+        class DepthProcessor:
+            @staticmethod
+            def generate_depth_map_files(*_args):
+                return [tmp_path / "depth_000001.png"]
+
+        class StereoGenerator:
+            def __init__(self, model):
+                self.model = model
+                self.model_loaded_at_step_3 = None
+
+            def create_stereo_pairs_from_files(self, *_args):
+                self.model_loaded_at_step_3 = self.model.loaded
+                return False
+
+        model = LoadedDepthModel()
+        stereo_generator = StereoGenerator(model)
+        video_encoder = Mock()
+        video_encoder.extract_frames.return_value = [tmp_path / "frame_000001.png"]
+        orchestrator = ProcessingOrchestrator(
+            DepthProcessor(),
+            stereo_generator,
+            Mock(),
+            Mock(),
+            Mock(),
+            video_encoder,
+            release_depth_model=model.unload_model,
+        )
+
+        result = orchestrator._execute_pipeline(
+            "source.mp4",
+            tmp_path,
+            {"base": tmp_path, "frames": tmp_path / "frames"},
+            {"fps": 30.0, "frame_count": 1},
+            {},
+        )
+
+        assert result is False
+        assert model.loaded is False
+        assert stereo_generator.model_loaded_at_step_3 is False
+
     @staticmethod
     def _direct_encoding_dependencies(tmp_path):
         frame = tmp_path / "frame_000001.png"
@@ -575,6 +625,47 @@ class TestPrintMethods:
 
 class TestProcessMethod:
     """Test main process method."""
+
+    def test_process_releases_depth_model_when_step_1_raises(self, tmp_path):
+        """A failure before depth inference must not strand a preloaded model."""
+
+        class LoadedDepthModel:
+            def __init__(self):
+                self.loaded = True
+                self.unload_count = 0
+
+            def unload_model(self):
+                self.loaded = False
+                self.unload_count += 1
+
+        model = LoadedDepthModel()
+        video_encoder = Mock()
+        video_encoder.extract_frames.side_effect = OSError("frame extraction failed")
+        orchestrator = ProcessingOrchestrator(
+            Mock(),
+            Mock(),
+            Mock(),
+            Mock(),
+            Mock(),
+            video_encoder,
+            release_depth_model=model.unload_model,
+        )
+
+        with patch.object(
+            orchestrator,
+            "_setup_processing",
+            return_value=(tmp_path, {"base": tmp_path}, tmp_path / "settings.json"),
+        ):
+            result = orchestrator.process(
+                video_path=tmp_path / "source.mp4",
+                output_dir=tmp_path,
+                video_properties={"fps": 30, "frame_count": 1},
+                settings={"keep_intermediates": True},
+            )
+
+        assert result is False
+        assert model.loaded is False
+        assert model.unload_count == 1
 
     @patch("src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time")
     def test_process_exception_handling(self, mock_time):

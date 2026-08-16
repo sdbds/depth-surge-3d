@@ -11,7 +11,7 @@ processor modules for improved maintainability and testability.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..frames.depth_processor import DepthMapProcessor
 from ..frames.stereo_generator import StereoPairGenerator
@@ -39,16 +39,24 @@ class VideoProcessor:
     - ProcessingOrchestrator: Pipeline coordination
     """
 
-    def __init__(self, depth_estimator: Any, verbose: bool = False):
+    def __init__(
+        self,
+        depth_estimator: Any,
+        verbose: bool = False,
+        release_depth_model: Callable[[], None] | None = None,
+    ):
         """
         Initialize video processor with specialized modules.
 
         Args:
             depth_estimator: Depth estimation model instance (VideoDepthEstimator or VideoDepthEstimatorDA3)
             verbose: Enable verbose output
+            release_depth_model: Callback that unloads the owning depth model
         """
         self.depth_estimator = depth_estimator
         self.verbose = verbose
+        if release_depth_model is None:
+            release_depth_model = depth_estimator.unload_model
 
         # Initialize specialized processor modules
         self.depth_processor = DepthMapProcessor(depth_estimator, verbose=verbose)
@@ -67,6 +75,7 @@ class VideoProcessor:
             vr_assembler=self.vr_assembler,
             video_encoder=self.video_encoder,
             verbose=verbose,
+            release_depth_model=release_depth_model,
         )
 
     def process(

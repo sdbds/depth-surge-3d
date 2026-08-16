@@ -871,6 +871,7 @@ def process_video_async(  # noqa: C901
     """Process video in background thread"""
     import torch  # Import here to avoid CUDA initialization issues in main thread
 
+    projector = None
     try:
         current_processing["active"] = True
         current_processing["session_id"] = session_id
@@ -994,7 +995,10 @@ def process_video_async(  # noqa: C901
         # Give client time to join the session room before starting processing
         socketio.sleep(INITIAL_PROCESSING_DELAY)
 
-        processor = VideoProcessor(projector.depth_estimator)
+        processor = VideoProcessor(
+            projector.depth_estimator,
+            release_depth_model=projector.unload_model,
+        )
 
         # Calculate resolution settings that VideoProcessor expects
         from depth_surge_3d.utils.domain.resolution import (
@@ -1081,6 +1085,11 @@ def process_video_async(  # noqa: C901
         print(f"Processing error: {e}")  # Always print errors
 
     finally:
+        if projector is not None:
+            try:
+                projector.unload_model()
+            except Exception as cleanup_error:
+                print(console_warning(f"Error unloading depth model: {cleanup_error}"))
         current_processing["active"] = False
         current_processing["session_id"] = None
         current_processing["stop_requested"] = False

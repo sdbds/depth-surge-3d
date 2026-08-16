@@ -684,6 +684,46 @@ class TestProcessVideoSuccessPath:
     @patch("src.depth_surge_3d.rendering.stereo_projector.get_video_properties")
     @patch("src.depth_surge_3d.rendering.stereo_projector.VideoProcessor")
     @patch("pathlib.Path.mkdir")
+    def test_depth_stage_release_updates_projector_model_state(
+        self, _mkdir, processor_class, get_props, validate, create_estimator
+    ):
+        """The stage cleanup uses the projector owner instead of leaving stale state."""
+        estimator = MagicMock()
+        estimator.load_model.return_value = True
+        estimator.get_model_size.return_value = "vitl"
+        estimator.device = "cpu"
+        estimator.metric = False
+        estimator.processing_resolution = 768
+        create_estimator.return_value = estimator
+        validate.return_value = True
+        get_props.return_value = {"width": 1920, "height": 1080, "fps": 30}
+        observed_states = []
+
+        class ReleasingProcessor:
+            def __init__(self, _estimator, *, verbose, release_depth_model=None):
+                del verbose
+                self.release_depth_model = release_depth_model
+
+            def process(self, **_kwargs):
+                observed_states.append(projector._model_loaded)
+                self.release_depth_model()
+                observed_states.append(projector._model_loaded)
+                return True
+
+        processor_class.side_effect = ReleasingProcessor
+        projector = StereoProjector(device="cpu")
+
+        result = projector.process_video("test.mp4", "/tmp/output", {})
+
+        assert result is True
+        assert observed_states == [True, False]
+        estimator.unload_model.assert_called_once_with()
+
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.get_video_properties")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.VideoProcessor")
+    @patch("pathlib.Path.mkdir")
     def test_process_video_success(
         self, mock_mkdir, mock_processor_class, mock_get_props, mock_validate, mock_create
     ):
@@ -721,7 +761,11 @@ class TestProcessVideoSuccessPath:
         assert passed_settings["upscale_model"] == "x4"
         assert passed_settings["verbose"] is True
         assert passed_settings["depth_resolution"] == "1080"
-        mock_processor_class.assert_called_once_with(mock_estimator, verbose=True)
+        mock_processor_class.assert_called_once_with(
+            mock_estimator,
+            verbose=True,
+            release_depth_model=projector.unload_model,
+        )
 
 
 class TestValidateInputsDirectoryError:
