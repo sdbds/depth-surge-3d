@@ -62,6 +62,14 @@ def _write_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
         np.savez_compressed(handle, **arrays)
 
 
+def _disk_full_failure(kind: str) -> OSError:
+    if kind == "enospc":
+        return OSError(errno.ENOSPC, "disk full")
+    failure = OSError("windows disk full")
+    failure.winerror = 112  # type: ignore[attr-defined]
+    return failure
+
+
 @pytest.fixture
 def raw_metric_store(tmp_path: Path) -> RawDepthStore:
     values = np.array([[[2.0]], [[4.0]], [[6.0]], [[8.0]]], dtype=np.float32)
@@ -236,6 +244,63 @@ def test_allocation_unit_falls_back_to_64_kib(
     assert filesystem_allocation_unit(tmp_path) == 65_536
 
 
+def test_windows_allocation_unit_queries_folder_mounted_volume(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: dict[str, str] = {}
+
+    class Kernel32:
+        def GetVolumePathNameW(self, source, volume_path, _length) -> int:
+            calls["source"] = source.value
+            volume_path.value = "C:\\mounted-volume\\"
+            return 1
+
+        def GetDiskFreeSpaceW(
+            self, volume_path, sectors, bytes_per_sector, free_clusters, total_clusters
+        ) -> int:
+            calls["volume_path"] = volume_path.value
+            sectors._obj.value = 8
+            bytes_per_sector._obj.value = 4096
+            free_clusters._obj.value = 10
+            total_clusters._obj.value = 20
+            return 1
+
+    monkeypatch.setattr(metric_geometry.ctypes, "WinDLL", lambda *_args, **_kwargs: Kernel32())
+
+    assert metric_geometry._windows_allocation_unit(tmp_path / "folder") == 32_768
+    assert calls["source"] == str((tmp_path / "folder").resolve())
+    assert calls["volume_path"] == "C:\\mounted-volume\\"
+
+
+@pytest.mark.parametrize("failure_point", ["volume", "disk", "invalid", "exception"])
+def test_windows_allocation_query_failure_or_invalid_value_uses_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_point: str
+) -> None:
+    class Kernel32:
+        def GetVolumePathNameW(self, _source, volume_path, _length) -> int:
+            if failure_point == "exception":
+                raise TypeError("unavailable Windows API")
+            volume_path.value = "C:\\mounted-volume\\"
+            return int(failure_point != "volume")
+
+        def GetDiskFreeSpaceW(
+            self, _volume_path, sectors, bytes_per_sector, _free_clusters, _total_clusters
+        ) -> int:
+            sectors._obj.value = 0 if failure_point == "invalid" else 8
+            bytes_per_sector._obj.value = 4096
+            return int(failure_point != "disk")
+
+    monkeypatch.setattr(metric_geometry.ctypes, "WinDLL", lambda *_args, **_kwargs: Kernel32())
+    assert metric_geometry._windows_allocation_unit(tmp_path) is None
+    monkeypatch.setattr(metric_geometry, "_windows_allocation_unit", lambda _path: None)
+    monkeypatch.setattr(
+        "os.statvfs",
+        lambda _path: (_ for _ in ()).throw(OSError("no statvfs")),
+        raising=False,
+    )
+    assert filesystem_allocation_unit(tmp_path) == 65_536
+
+
 def test_preflight_disk_error_carries_exact_space_fields(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -269,6 +334,30 @@ def test_new_and_complete_metadata_have_distinct_transaction_fields(tmp_path: Pa
     assert completed["fingerprint"] == canonical_json_hash(
         {key: value for key, value in completed.items() if key != "fingerprint"}
     )
+
+
+def test_metadata_read_treats_only_absence_and_malformed_json_as_missing(
+    tmp_path: Path,
+) -> None:
+    assert MetricGeometryStore.read_metadata(tmp_path) is None
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text("{", encoding="utf-8")
+    assert MetricGeometryStore.read_metadata(tmp_path) is None
+
+
+def test_metadata_read_preserves_non_absence_oserror_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    failure = OSError(errno.EIO, "metadata I/O failure")
+
+    def fail_read(_path: Path, *_args, **_kwargs) -> str:
+        raise failure
+
+    monkeypatch.setattr(Path, "read_text", fail_read)
+    with pytest.raises(OSError) as raised:
+        MetricGeometryStore.read_metadata(tmp_path)
+    assert raised.value is failure
+    assert raised.value.__cause__ is None
 
 
 def test_metric_payload_has_exact_ordered_npz_members(tmp_path: Path) -> None:
@@ -325,6 +414,64 @@ def test_metric_store_rejects_corrupt_payload_contract(
 ) -> None:
     _write_npz(partial_metric_store.path_for(FRAME_NAMES[0]), arrays)
     with pytest.raises(ValueError, match=message):
+        partial_metric_store.validate_payloads()
+
+
+def test_payload_header_validation_preserves_oserror_identity(
+    monkeypatch: pytest.MonkeyPatch, partial_metric_store: MetricGeometryStore
+) -> None:
+    failure = OSError(errno.EIO, "payload header I/O failure")
+
+    def fail_zip(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(metric_geometry.zipfile, "ZipFile", fail_zip)
+    with pytest.raises(OSError) as raised:
+        partial_metric_store.validate_payloads()
+    assert raised.value is failure
+    assert raised.value.__cause__ is None
+
+
+def test_payload_body_read_preserves_oserror_identity(
+    monkeypatch: pytest.MonkeyPatch, partial_metric_store: MetricGeometryStore
+) -> None:
+    path = partial_metric_store.path_for(FRAME_NAMES[0])
+    failure = OSError(errno.EIO, "payload body I/O failure")
+
+    def fail_load(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(metric_geometry.np, "load", fail_load)
+    with pytest.raises(OSError) as raised:
+        partial_metric_store.load(path)
+    assert raised.value is failure
+    assert raised.value.__cause__ is None
+
+
+def test_payload_presence_check_preserves_oserror_identity(
+    monkeypatch: pytest.MonkeyPatch, partial_metric_store: MetricGeometryStore
+) -> None:
+    path = partial_metric_store.path_for(FRAME_NAMES[0])
+    failure = PermissionError(errno.EACCES, "payload stat denied")
+    real_stat = Path.stat
+
+    def fail_payload_stat(candidate: Path, *args, **kwargs):
+        if candidate == path:
+            raise failure
+        return real_stat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fail_payload_stat)
+    with pytest.raises(PermissionError) as raised:
+        partial_metric_store.validate_payloads()
+    assert raised.value is failure
+    assert raised.value.__cause__ is None
+
+
+def test_corrupt_npz_archive_is_reported_as_value_error(
+    partial_metric_store: MetricGeometryStore,
+) -> None:
+    partial_metric_store.path_for(FRAME_NAMES[0]).write_bytes(b"not a zip archive")
+    with pytest.raises(ValueError, match="payload is unreadable"):
         partial_metric_store.validate_payloads()
 
 
@@ -445,6 +592,81 @@ def test_complete_files_are_always_returned_in_source_order(tmp_path: Path) -> N
     )
 
 
+@pytest.mark.parametrize("error_kind", ["enospc", "windows"])
+def test_initial_directory_creation_normalizes_disk_full(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error_kind: str
+) -> None:
+    directory = tmp_path / "missing" / "metric"
+    failure = _disk_full_failure(error_kind)
+    real_mkdir = Path.mkdir
+
+    def fail_target(path: Path, *args, **kwargs) -> None:
+        if path == directory:
+            raise failure
+        real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_target)
+    with pytest.raises(MetricGeometryDiskFullError) as raised:
+        _create_metric_store(directory, preflight_required_bytes=321)
+    assert raised.value.required_bytes == 321
+    assert raised.value.failing_path == directory
+    assert raised.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("error_kind", ["enospc", "windows"])
+def test_initial_metadata_creation_normalizes_disk_full(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error_kind: str
+) -> None:
+    directory = tmp_path / "initial-metadata"
+    directory.mkdir()
+    failure = _disk_full_failure(error_kind)
+
+    def fail_replace(_path: Path, destination: Path) -> Path:
+        if Path(destination) == directory / "metadata.json":
+            raise failure
+        raise AssertionError(f"Unexpected replace destination: {destination}")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(MetricGeometryDiskFullError) as raised:
+        _create_metric_store(directory, preflight_required_bytes=654)
+    assert raised.value.required_bytes == 654
+    assert raised.value.failing_path == directory / "metadata.json"
+    assert raised.value.__cause__ is failure
+    assert not (directory / "metadata.json").exists()
+    assert not list(directory.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("failure_point", ["directory", "metadata"])
+def test_initial_creation_preserves_every_other_oserror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_point: str
+) -> None:
+    directory = tmp_path / "other-oserror"
+    failure = OSError(errno.EIO, f"{failure_point} I/O failure")
+    if failure_point == "directory":
+        real_mkdir = Path.mkdir
+
+        def fail_target(path: Path, *args, **kwargs) -> None:
+            if path == directory:
+                raise failure
+            real_mkdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", fail_target)
+    else:
+        directory.mkdir()
+
+        def fail_replace(_path: Path, _destination: Path) -> Path:
+            raise failure
+
+        monkeypatch.setattr(Path, "replace", fail_replace)
+
+    with pytest.raises(OSError) as raised:
+        _create_metric_store(directory, preflight_required_bytes=777)
+    assert raised.value is failure
+    assert raised.value.__cause__ is None
+    if directory.exists():
+        assert not list(directory.glob("*.tmp"))
+
+
 def test_enospc_removes_only_current_temp_and_keeps_committed_frames(
     monkeypatch: pytest.MonkeyPatch, partial_metric_store: MetricGeometryStore
 ) -> None:
@@ -465,20 +687,51 @@ def test_enospc_removes_only_current_temp_and_keeps_committed_frames(
     assert not list(partial_metric_store.directory.glob("*.tmp"))
     assert partial_metric_store.metadata.get("status") == "writing"
     assert "fingerprint" not in partial_metric_store.metadata
-    assert raised.value.required_bytes > 0
+    assert raised.value.required_bytes == 1024
     assert raised.value.failing_path == failing
 
 
-def test_finalize_enospc_keeps_writing_metadata_and_all_payloads(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_disk_full_samples_free_space_before_current_temp_cleanup(
+    monkeypatch: pytest.MonkeyPatch, partial_metric_store: MetricGeometryStore
+) -> None:
+    failing = partial_metric_store.path_for(FRAME_NAMES[1])
+    usage = shutil.disk_usage(partial_metric_store.directory)
+    observed_temp_sizes: list[int] = []
+
+    def fail_replace(_path: Path, destination: Path) -> Path:
+        if Path(destination) == failing:
+            raise OSError(errno.ENOSPC, "disk full")
+        raise AssertionError(f"Unexpected replace destination: {destination}")
+
+    def free_depends_on_temp(_path: Path):
+        temp_size = sum(
+            path.stat().st_size for path in partial_metric_store.directory.glob("*.tmp")
+        )
+        observed_temp_sizes.append(temp_size)
+        free = 11 if temp_size > 0 else 99
+        return type(usage)(usage.total, usage.used, free)
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    monkeypatch.setattr(metric_geometry.shutil, "disk_usage", free_depends_on_temp)
+    with pytest.raises(MetricGeometryDiskFullError) as raised:
+        partial_metric_store.write_frame(FRAME_NAMES[1], VALID_FRAME)
+    assert observed_temp_sizes and observed_temp_sizes[0] > 0
+    assert raised.value.free_bytes == 11
+    assert not list(partial_metric_store.directory.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("error_kind", ["enospc", "windows"])
+def test_finalize_disk_full_keeps_writing_metadata_and_all_payloads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error_kind: str
 ) -> None:
     store = _create_metric_store(tmp_path / "finalize", frame_names=[FRAME_NAMES[0]])
     payload = store.write_frame(FRAME_NAMES[0], VALID_FRAME)
     real_replace = Path.replace
+    failure = _disk_full_failure(error_kind)
 
     def fail_metadata_replace(path: Path, destination: Path) -> Path:
         if Path(destination) == store.metadata_path:
-            raise OSError(errno.ENOSPC, "disk full")
+            raise failure
         return real_replace(path, destination)
 
     monkeypatch.setattr(Path, "replace", fail_metadata_replace)
@@ -490,16 +743,19 @@ def test_finalize_enospc_keeps_writing_metadata_and_all_payloads(
     assert payload.is_file()
     assert not list(store.directory.glob("*.tmp"))
     assert raised.value.required_bytes == persisted["preflight_required_bytes"]
+    assert raised.value.__cause__ is failure
 
 
-def test_preflight_update_enospc_reports_the_persisted_current_estimate(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("error_kind", ["enospc", "windows"])
+def test_preflight_update_disk_full_reports_the_persisted_current_estimate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error_kind: str
 ) -> None:
     directory = tmp_path / "preflight-update"
     store = _create_metric_store(directory, preflight_required_bytes=100)
+    failure = _disk_full_failure(error_kind)
 
     def fail_replace(_path: Path, _destination: Path) -> Path:
-        raise OSError(errno.ENOSPC, "disk full")
+        raise failure
 
     monkeypatch.setattr(Path, "replace", fail_replace)
     with pytest.raises(MetricGeometryDiskFullError) as raised:
@@ -507,6 +763,7 @@ def test_preflight_update_enospc_reports_the_persisted_current_estimate(
     persisted = json.loads(store.metadata_path.read_text(encoding="utf-8"))
     assert persisted["preflight_required_bytes"] == 100
     assert raised.value.required_bytes == 100
+    assert raised.value.__cause__ is failure
     assert not list(directory.glob("*.tmp"))
 
 
@@ -523,6 +780,7 @@ def test_windows_error_disk_full_112_uses_same_restartable_error(
     with pytest.raises(MetricGeometryDiskFullError) as raised:
         partial_metric_store.write_frame(FRAME_NAMES[1], VALID_FRAME)
     assert raised.value.failing_path == partial_metric_store.path_for(FRAME_NAMES[1])
+    assert raised.value.required_bytes == 1024
     assert partial_metric_store.path_for(FRAME_NAMES[0]).is_file()
     assert not list(partial_metric_store.directory.glob("*.tmp"))
 

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 from typing import Any, Sequence
 import zipfile
 
@@ -257,16 +258,23 @@ def _windows_allocation_unit(directory: Path) -> int | None:
 
     try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_volume_path = kernel32.GetVolumePathNameW
         get_disk_free_space = kernel32.GetDiskFreeSpaceW
-        root = Path(directory).resolve().anchor
-        if not root:
+        resolved = str(Path(directory).resolve())
+        volume_path = ctypes.create_unicode_buffer(32_768)
+        found_volume = get_volume_path(
+            ctypes.c_wchar_p(resolved),
+            volume_path,
+            ctypes.c_ulong(len(volume_path)),
+        )
+        if not found_volume or not volume_path.value:
             return None
         sectors_per_cluster = ctypes.c_ulong()
         bytes_per_sector = ctypes.c_ulong()
         free_clusters = ctypes.c_ulong()
         total_clusters = ctypes.c_ulong()
         succeeded = get_disk_free_space(
-            ctypes.c_wchar_p(root),
+            ctypes.c_wchar_p(volume_path.value),
             ctypes.byref(sectors_per_cluster),
             ctypes.byref(bytes_per_sector),
             ctypes.byref(free_clusters),
@@ -276,7 +284,7 @@ def _windows_allocation_unit(directory: Path) -> int | None:
             return None
         allocation = int(sectors_per_cluster.value) * int(bytes_per_sector.value)
         return allocation if allocation > 0 else None
-    except (AttributeError, OSError, ValueError):
+    except (AttributeError, OSError, TypeError, ValueError):
         return None
 
 
@@ -300,6 +308,38 @@ def _current_free_bytes(path: Path) -> int:
     return int(shutil.disk_usage(path).free)
 
 
+def _nearest_existing_path(path: Path) -> Path:
+    candidate = Path(path)
+    while True:
+        try:
+            candidate.stat()
+            return candidate
+        except FileNotFoundError:
+            parent = candidate.parent
+            if parent == candidate:
+                raise
+            candidate = parent
+
+
+def _is_regular_file(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(path.stat().st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def _mkdir_with_disk_full_context(
+    directory: Path, *, required_bytes: int, failing_path: Path
+) -> None:
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        if not _is_disk_full(error):
+            raise
+        free_bytes = _current_free_bytes(_nearest_existing_path(directory.parent))
+        raise MetricGeometryDiskFullError(required_bytes, free_bytes, failing_path) from error
+
+
 def require_metric_geometry_disk_space(directory: Path, required_bytes: int) -> None:
     """Fail preflight with the exact estimate and current target-filesystem free bytes."""
 
@@ -308,24 +348,41 @@ def require_metric_geometry_disk_space(directory: Path, required_bytes: int) -> 
     if required_bytes < 0:
         raise ValueError("Metric geometry required bytes must be nonnegative")
     directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
+    _mkdir_with_disk_full_context(
+        directory,
+        required_bytes=int(required_bytes),
+        failing_path=directory,
+    )
     free_bytes = _current_free_bytes(directory)
     if free_bytes < required_bytes:
         raise MetricGeometryDiskFullError(int(required_bytes), free_bytes, directory)
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _atomic_write_json(path: Path, payload: dict[str, Any], *, required_bytes: int) -> None:
+    _mkdir_with_disk_full_context(
+        path.parent,
+        required_bytes=required_bytes,
+        failing_path=path,
+    )
     temporary = path.with_name(f"{path.name}.tmp")
     try:
         temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         temporary.replace(path)
+    except OSError as error:
+        if not _is_disk_full(error):
+            raise
+        free_bytes = _current_free_bytes(path.parent)
+        raise MetricGeometryDiskFullError(required_bytes, free_bytes, path) from error
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def _atomic_save_npz(path: Path, frame: MetricGeometryFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _atomic_save_npz(path: Path, frame: MetricGeometryFrame, *, required_bytes: int) -> None:
+    _mkdir_with_disk_full_context(
+        path.parent,
+        required_bytes=required_bytes,
+        failing_path=path,
+    )
     temporary = path.with_name(f"{path.name}.tmp")
     try:
         with temporary.open("wb") as handle:
@@ -336,6 +393,11 @@ def _atomic_save_npz(path: Path, frame: MetricGeometryFrame) -> None:
                 focal_x_normalized=np.asarray(frame.focal_x_normalized, dtype=np.float32),
             )
         temporary.replace(path)
+    except OSError as error:
+        if not _is_disk_full(error):
+            raise
+        free_bytes = _current_free_bytes(path.parent)
+        raise MetricGeometryDiskFullError(required_bytes, free_bytes, path) from error
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -391,7 +453,9 @@ class MetricGeometryStore:
         path = Path(directory) / "metadata.json"
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except FileNotFoundError:
+            return None
+        except (UnicodeError, json.JSONDecodeError):
             return None
         return payload if isinstance(payload, dict) else None
 
@@ -491,7 +555,11 @@ class MetricGeometryStore:
         if preflight_required_bytes < 0:
             raise ValueError("Metric geometry preflight estimate must be nonnegative")
         directory = Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
+        _mkdir_with_disk_full_context(
+            directory,
+            required_bytes=int(preflight_required_bytes),
+            failing_path=directory,
+        )
         metadata_path = directory / "metadata.json"
         metadata = cls.read_metadata(directory)
         if metadata is None:
@@ -516,7 +584,7 @@ class MetricGeometryStore:
         requested: dict[str, Any],
         preflight_required_bytes: int,
     ) -> "MetricGeometryStore":
-        if metadata_path.exists():
+        if _is_regular_file(metadata_path):
             raise ValueError("Metric geometry metadata is malformed")
         for temporary in directory.glob("*.tmp"):
             temporary.unlink(missing_ok=True)
@@ -533,14 +601,11 @@ class MetricGeometryStore:
             "storage_dtype": "float32",
             "compression": "npz_deflate",
         }
-        try:
-            _atomic_write_json(metadata_path, metadata)
-        except OSError as error:
-            if not _is_disk_full(error):
-                raise
-            raise MetricGeometryDiskFullError(
-                preflight_required_bytes, _current_free_bytes(directory), metadata_path
-            ) from error
+        _atomic_write_json(
+            metadata_path,
+            metadata,
+            required_bytes=preflight_required_bytes,
+        )
         return cls(directory, metadata)
 
     @classmethod
@@ -696,27 +761,18 @@ class MetricGeometryStore:
         if invalid_distance:
             raise ValueError("Metric geometry resolved auto distance is invalid")
 
-    def _disk_full_error(self, failing_path: Path) -> MetricGeometryDiskFullError:
-        persisted = self.read_metadata(self.directory)
-        required = (
-            persisted.get("preflight_required_bytes") if isinstance(persisted, dict) else None
-        )
+    def _persisted_required_bytes(self) -> int:
+        required = self.metadata.get("preflight_required_bytes")
         if isinstance(required, bool) or not isinstance(required, int) or required < 0:
-            current = self.metadata.get("preflight_required_bytes", 0)
-            required = int(current) if isinstance(current, int) else 0
-        return MetricGeometryDiskFullError(
-            required,
-            _current_free_bytes(self.directory),
-            failing_path,
-        )
+            raise ValueError("Metric geometry persisted preflight estimate is invalid")
+        return required
 
     def _commit_metadata(self, updated: dict[str, Any]) -> None:
-        try:
-            _atomic_write_json(self.metadata_path, updated)
-        except OSError as error:
-            if not _is_disk_full(error):
-                raise
-            raise self._disk_full_error(self.metadata_path) from error
+        _atomic_write_json(
+            self.metadata_path,
+            updated,
+            required_bytes=self._persisted_required_bytes(),
+        )
         self.metadata = updated
 
     def path_for(self, frame_name: str) -> Path:
@@ -737,6 +793,10 @@ class MetricGeometryStore:
                 for member_name in _METRIC_PAYLOAD_MEMBERS:
                     with payload.open(member_name) as member:
                         headers[member_name] = _read_npy_header(member)
+        except FileNotFoundError as error:
+            raise ValueError(f"Metric geometry payload is missing: {path}") from error
+        except OSError:
+            raise
         except ValueError:
             raise
         except Exception as error:
@@ -765,6 +825,10 @@ class MetricGeometryStore:
                 inverse = np.array(payload["inverse_depth"], copy=True)
                 valid = np.array(payload["valid"], copy=True)
                 focal = np.float32(payload["focal_x_normalized"].item())
+        except FileNotFoundError as error:
+            raise ValueError(f"Metric geometry payload is missing: {path}") from error
+        except OSError:
+            raise
         except Exception as error:
             raise ValueError(f"Metric geometry payload is unreadable: {path}") from error
         return MetricGeometryFrame(inverse, valid, focal)
@@ -784,7 +848,7 @@ class MetricGeometryStore:
         completed = 0
         for frame_name in frame_names:
             path = self.path_for(frame_name)
-            if not path.is_file():
+            if not _is_regular_file(path):
                 continue
             self._load_validated_payload(path)
             completed += 1
@@ -798,7 +862,7 @@ class MetricGeometryStore:
         return tuple(
             path
             for frame_name in self.metadata["frame_names"]
-            if (path := self.path_for(frame_name)).is_file()
+            if _is_regular_file(path := self.path_for(frame_name))
         )
 
     def write_frame(self, frame_name: str, frame: MetricGeometryFrame) -> Path:
@@ -810,15 +874,14 @@ class MetricGeometryStore:
         path = self.path_for(frame_name)
         if tuple(frame.inverse_depth.shape) != tuple(self.metadata["native_shape"]):
             raise ValueError("Metric geometry frame shape does not match native shape")
-        if path.is_file():
+        if _is_regular_file(path):
             self._load_validated_payload(path)
             return path
-        try:
-            _atomic_save_npz(path, frame)
-        except OSError as error:
-            if not _is_disk_full(error):
-                raise
-            raise self._disk_full_error(path) from error
+        _atomic_save_npz(
+            path,
+            frame,
+            required_bytes=self._persisted_required_bytes(),
+        )
         return path
 
     def load(self, path: Path) -> MetricGeometryFrame:
