@@ -134,6 +134,19 @@ def _normalize_depth_backend_settings(
     return normalized
 
 
+def _normalize_available_depth_backend_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_depth_backend_settings(settings)
+    availability = backend_availability(normalized["depth_model_version"])
+    if availability.available:
+        return normalized
+    error = (
+        availability.reason or f"Depth backend {normalized['depth_model_version']} is unavailable"
+    )
+    if availability.install_command:
+        error = f"{error}. Install with: {availability.install_command}"
+    raise ValueError(error)
+
+
 def _depth_backend_options() -> list[dict[str, Any]]:
     options = []
     for spec in list_backend_specs():
@@ -1233,7 +1246,7 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:
     settings = data.get("settings", {})
 
     try:
-        settings = _normalize_depth_backend_settings(settings)
+        settings = _normalize_available_depth_backend_settings(settings)
         settings = _validate_web_settings(settings, source="explicit")
     except (TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400

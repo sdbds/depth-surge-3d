@@ -3045,6 +3045,19 @@
             localStorage.setItem('stereoProjectorSettings', JSON.stringify(settings));
         }
         
+        function ensureAvailableDepthBackend() {
+            const backendSelect = document.getElementById('depthModelVersion');
+            const selectedOption = backendSelect.selectedOptions[0];
+            if (selectedOption && !selectedOption.disabled) return selectedOption.value;
+
+            const fallbackOption = backendSelect.querySelector('option[selected]:not(:disabled)')
+                || backendSelect.querySelector('option:not(:disabled)');
+            if (!fallbackOption) return null;
+
+            backendSelect.value = fallbackOption.value;
+            return fallbackOption.value;
+        }
+
         function loadSettings() {
             const SETTINGS_VERSION = 3; // Increment to force reset of old settings
             const savedSettings = localStorage.getItem('stereoProjectorSettings');
@@ -3072,6 +3085,13 @@
                         }
                     }
                 });
+
+                const restoredBackend = ensureAvailableDepthBackend();
+                if (restoredBackend && settings.depthModelVersion !== restoredBackend) {
+                    settings.depthModelVersion = restoredBackend;
+                    localStorage.setItem('stereoProjectorSettings', JSON.stringify(settings));
+                }
+                updateDepthModelControls();
                 
                 // Trigger change events for elements that have dependencies
                 if (settings.applyDistortion !== undefined) {

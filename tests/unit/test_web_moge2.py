@@ -40,6 +40,68 @@ def test_moge_model_sizes_use_vits_vitb_vitl_values(client, monkeypatch) -> None
     assert 'data-model-size="vitl"' in html
 
 
+def test_saved_disabled_backend_falls_back_before_refreshing_controls(client, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.backend_availability",
+        lambda backend_id: BackendAvailability(backend_id != "moge2"),
+    )
+
+    html = client.get("/").get_data(as_text=True)
+    load_settings = html[
+        html.index("function loadSettings()") : html.index("function resetToDefaults()")
+    ]
+
+    assert "ensureAvailableDepthBackend();" in load_settings
+    assert "option[selected]:not(:disabled)" in html
+    assert "option:not(:disabled)" in html
+    assert load_settings.index("ensureAvailableDepthBackend();") < load_settings.index(
+        "updateDepthModelControls();"
+    )
+
+
+def test_process_rejects_unavailable_moge_before_background_start(
+    client, monkeypatch, tmp_path
+) -> None:
+    import app as web_app
+
+    web_app.current_processing.update(
+        {"active": False, "session_id": None, "thread": None, "stop_requested": False}
+    )
+    monkeypatch.setitem(web_app.app.config, "OUTPUT_FOLDER", str(tmp_path))
+    monkeypatch.setattr(
+        web_app,
+        "backend_availability",
+        lambda backend_id: (
+            BackendAvailability(
+                False,
+                "MoGe-2 optional dependency is not installed",
+                "uv sync --extra moge2",
+            )
+            if backend_id == "moge2"
+            else BackendAvailability(True)
+        ),
+    )
+    start = MagicMock()
+    create_projector = MagicMock()
+    monkeypatch.setattr(web_app.socketio, "start_background_task", start)
+    monkeypatch.setattr(web_app, "create_stereo_projector", create_projector)
+
+    response = client.post(
+        "/process",
+        json={
+            "output_dir": str(tmp_path / "job"),
+            "settings": {"depth_model_version": "moge2"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "error": "MoGe-2 optional dependency is not installed. Install with: uv sync --extra moge2"
+    }
+    start.assert_not_called()
+    create_projector.assert_not_called()
+
+
 def test_web_normalizes_moge_defaults_and_forces_metric_inference() -> None:
     import app as web_app
 
