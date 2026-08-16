@@ -181,6 +181,7 @@ def test_web_runner_passes_normalized_moge_variant_to_projector(tmp_path) -> Non
     with (
         patch("torch.cuda.is_available", return_value=True),
         patch("torch.cuda.get_device_name", return_value="Test CUDA device"),
+        patch.object(web_app, "_acknowledge_processing_configuration"),
         patch.object(
             web_app, "create_stereo_projector", return_value=projector
         ) as create_projector,
@@ -382,10 +383,20 @@ def test_web_emits_configuration_before_model_load(monkeypatch, tmp_path) -> Non
     projector = MagicMock(depth_estimator=estimator)
     projector.load_model.side_effect = lambda: events.append("load_model") or False
     monkeypatch.setattr(web_app, "create_stereo_projector", lambda *_args, **_kwargs: projector)
+
+    def acknowledge(event, *_args, **kwargs):
+        assert kwargs == {
+            "to": "requester-socket",
+            "timeout": web_app.PROCESSING_CONFIGURATION_ACK_TIMEOUT,
+        }
+        events.append(event)
+        return {"accepted": True}
+
+    monkeypatch.setattr(web_app.socketio, "call", acknowledge)
     monkeypatch.setattr(
-        web_app.socketio,
-        "emit",
-        lambda event, *_args, **_kwargs: events.append(event),
+        web_app.socketio.server.manager,
+        "is_connected",
+        lambda *_args, **_kwargs: True,
     )
     monkeypatch.setattr(web_app.socketio, "sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -406,7 +417,7 @@ def test_web_emits_configuration_before_model_load(monkeypatch, tmp_path) -> Non
     assert events.index("processing_configuration") < events.index("load_model")
 
 
-def test_processing_configuration_is_private_exactly_once_and_has_no_replay_buffer(
+def test_delayed_configuration_is_private_and_job_room_join_still_works(
     client, monkeypatch, tmp_path
 ) -> None:
     import app as web_app
@@ -422,11 +433,14 @@ def test_processing_configuration_is_private_exactly_once_and_has_no_replay_buff
     projector.load_model.return_value = False
     monkeypatch.setattr(web_app, "create_stereo_projector", lambda *_args, **_kwargs: projector)
 
-    def run_synchronously(target, *args):
-        target(*args)
+    background_call = {}
+
+    def capture_background(target, *args):
+        background_call["target"] = target
+        background_call["args"] = args
         return object()
 
-    monkeypatch.setattr(web_app.socketio, "start_background_task", run_synchronously)
+    monkeypatch.setattr(web_app.socketio, "start_background_task", capture_background)
     requester = web_app.socketio.test_client(web_app.app, flask_test_client=client)
     other_client = web_app.app.test_client()
     other = web_app.socketio.test_client(web_app.app, flask_test_client=other_client)
@@ -439,16 +453,28 @@ def test_processing_configuration_is_private_exactly_once_and_has_no_replay_buff
         payload["socket_id"] = requester_sid
         response = client.post("/process", json=payload)
         session_id = response.get_json()["session_id"]
+        attacker_sid = web_app.socketio.server.manager.sid_from_eio_sid(other.eio_sid, "/")
         other.get_received()
-        other.emit("join_session", {"session_id": session_id})
+        other.emit("join_session", {"session_id": requester_sid})
+        requester.emit("join_session", {"session_id": session_id})
+
+        def acknowledged_call(event, data, *, to, timeout):
+            web_app.socketio.emit(event, data, room=to)
+            return {"accepted": True}
+
+        monkeypatch.setattr(web_app.socketio, "call", acknowledged_call)
+        background_call["target"](*background_call["args"])
+        requester_events = requester.get_received()
+        attacker_events = other.get_received()
         configurations = [
             event["args"][0]
-            for event in requester.get_received()
+            for event in requester_events
             if event["name"] == "processing_configuration"
         ]
-        stolen = [
-            event for event in other.get_received() if event["name"] == "processing_configuration"
-        ]
+        stolen = [event for event in attacker_events if event["name"] == "processing_configuration"]
+        assert any(event["name"] == "progress_update" for event in requester_events)
+        assert any(event["name"] == "session_join_error" for event in attacker_events)
+        assert attacker_sid != requester_sid
     finally:
         requester.disconnect()
         other.disconnect()
@@ -477,6 +503,70 @@ def test_processing_configuration_is_private_exactly_once_and_has_no_replay_buff
     assert not hasattr(web_app, "PENDING_PROCESSING_CONFIGURATIONS")
 
 
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_error"),
+    [
+        ("disconnect", "requester disconnected"),
+        ("timeout", "acknowledgement timed out"),
+        ("negative", "not positively acknowledged"),
+        ("malformed", "not positively acknowledged"),
+    ],
+)
+def test_configuration_ack_failure_aborts_before_model_load(
+    monkeypatch, tmp_path, capsys, failure_mode, expected_error
+) -> None:
+    import app as web_app
+    from socketio.exceptions import TimeoutError as SocketIOTimeoutError
+
+    estimator = MagicMock()
+    estimator.repo_id = "Ruicheng/moge-2-vitb-normal"
+    estimator.revision = "54ad3a693e61907ea4633d13dec6ee682fa09419"
+    estimator.device = "cpu"
+    estimator.inference_precision = "float32"
+    estimator.resolution_level = 9
+    projector = MagicMock(depth_estimator=estimator)
+    monkeypatch.setattr(web_app, "create_stereo_projector", lambda *_args, **_kwargs: projector)
+    monkeypatch.setattr(web_app.socketio, "sleep", lambda *_args, **_kwargs: None)
+    if failure_mode == "disconnect":
+        monkeypatch.setattr(
+            web_app.socketio.server.manager,
+            "is_connected",
+            lambda *_args, **_kwargs: False,
+        )
+        call = MagicMock()
+    else:
+        monkeypatch.setattr(
+            web_app.socketio.server.manager,
+            "is_connected",
+            lambda *_args, **_kwargs: True,
+        )
+        if failure_mode == "timeout":
+            call = MagicMock(side_effect=SocketIOTimeoutError())
+        elif failure_mode == "negative":
+            call = MagicMock(return_value={"accepted": False})
+        else:
+            call = MagicMock(return_value="accepted")
+    monkeypatch.setattr(web_app.socketio, "call", call)
+
+    with patch("torch.cuda.is_available", return_value=False):
+        web_app.process_video_async(
+            "00000000-0000-4000-8000-000000000001",
+            "requester-socket",
+            tmp_path / "input.mp4",
+            _metric_payload(tmp_path)["settings"],
+            tmp_path / "output",
+            None,
+            _video_properties(),
+        )
+
+    projector.load_model.assert_not_called()
+    assert expected_error in capsys.readouterr().out
+    if failure_mode == "disconnect":
+        call.assert_not_called()
+    else:
+        call.assert_called_once()
+
+
 def test_new_runs_clear_stale_effective_configuration(client) -> None:
     html = client.get("/").get_data(as_text=True)
 
@@ -487,5 +577,8 @@ def test_new_runs_clear_stale_effective_configuration(client) -> None:
     assert "clearEffectiveProcessingConfig();" in resume_handler
     assert "socket_id: socket.id" in process_handler
     assert "socket_id: socket.id" in resume_handler
+    assert "function(data, acknowledge)" in html
+    assert "acknowledge({accepted: true});" in html
+    assert html.index("container.hidden = false;") < html.index("acknowledge({accepted: true});")
     assert "values.replaceChildren();" in html
     assert "container.hidden = true;" in html

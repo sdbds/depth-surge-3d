@@ -81,6 +81,9 @@ from depth_surge_3d.utils.domain.resolution import resolve_depth_input_size  # n
 
 from flask import Flask, render_template, request, jsonify  # noqa: E402
 from flask_socketio import SocketIO  # noqa: E402
+from socketio.exceptions import (  # type: ignore[import-untyped]  # noqa: E402
+    TimeoutError as SocketIOTimeoutError,
+)
 
 # NOTE: torch is imported later (line ~960) to avoid CUDA initialization issues
 
@@ -100,6 +103,7 @@ from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
 VERBOSE = False
 SHUTDOWN_FLAG = False
 ACTIVE_PROCESSES = set()
+PROCESSING_CONFIGURATION_ACK_TIMEOUT = 5.0
 
 
 def _validate_web_settings(settings: dict[str, Any], *, source: str) -> dict[str, Any]:
@@ -400,6 +404,39 @@ current_processing = {
     "stop_requested": False,
     "thread": None,
 }
+
+
+def _is_active_job_session_id(session_id: object) -> bool:
+    """Accept only the canonical UUID room issued for the active job."""
+    if not isinstance(session_id, str):
+        return False
+    try:
+        parsed = uuid.UUID(session_id)
+    except ValueError:
+        return False
+    return (
+        parsed.version == 4
+        and str(parsed) == session_id
+        and current_processing.get("active") is True
+        and current_processing.get("session_id") == session_id
+    )
+
+
+def _acknowledge_processing_configuration(requester_socket_id: str, report: dict[str, Any]) -> None:
+    """Deliver configuration privately and require a bounded positive acknowledgement."""
+    if not socketio.server.manager.is_connected(requester_socket_id, "/"):
+        raise RuntimeError("Processing configuration requester disconnected")
+    try:
+        acknowledgement = socketio.call(
+            "processing_configuration",
+            report,
+            to=requester_socket_id,
+            timeout=PROCESSING_CONFIGURATION_ACK_TIMEOUT,
+        )
+    except SocketIOTimeoutError as error:
+        raise RuntimeError("Processing configuration acknowledgement timed out") from error
+    if acknowledgement != {"accepted": True}:
+        raise RuntimeError("Processing configuration was not positively acknowledged")
 
 
 def ensure_directories() -> None:
@@ -1014,7 +1051,7 @@ def process_video_async(  # noqa: C901
         )
 
         report = build_effective_depth_run_report(settings, projector.depth_estimator)
-        socketio.emit("processing_configuration", report, room=requester_socket_id)
+        _acknowledge_processing_configuration(requester_socket_id, report)
         if settings["stereo_geometry_mode"] == "metric_camera":
             print(TEMPORAL_STABILITY_WARNING)
 
@@ -1340,18 +1377,25 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:  # noqa:
 
     # Generate session ID
     session_id = str(uuid.uuid4())
+    current_processing["active"] = True
+    current_processing["session_id"] = session_id
 
     # Start processing in background using socketio's method for proper context handling
-    thread = socketio.start_background_task(
-        process_video_async,
-        session_id,
-        requester_socket_id,
-        video_path,
-        settings,
-        output_dir,
-        None,
-        video_properties,
-    )
+    try:
+        thread = socketio.start_background_task(
+            process_video_async,
+            session_id,
+            requester_socket_id,
+            video_path,
+            settings,
+            output_dir,
+            None,
+            video_properties,
+        )
+    except Exception:
+        current_processing["active"] = False
+        current_processing["session_id"] = None
+        raise
     current_processing["thread"] = thread
 
     return jsonify({"success": True, "session_id": session_id, "output_dir": str(output_dir)})
@@ -1466,17 +1510,24 @@ def resume_processing():  # noqa: C901
 
     # Generate session ID
     session_id = str(uuid.uuid4())
+    current_processing["active"] = True
+    current_processing["session_id"] = session_id
 
     # Start processing in background using socketio's method for proper context handling
-    thread = socketio.start_background_task(
-        process_video_async,
-        session_id,
-        requester_socket_id,
-        source_video,
-        settings,
-        output_path,
-        {"migration_mode": migrate_legacy, "settings_file": settings_file},
-    )
+    try:
+        thread = socketio.start_background_task(
+            process_video_async,
+            session_id,
+            requester_socket_id,
+            source_video,
+            settings,
+            output_path,
+            {"migration_mode": migrate_legacy, "settings_file": settings_file},
+        )
+    except Exception:
+        current_processing["active"] = False
+        current_processing["session_id"] = None
+        raise
     current_processing["thread"] = thread
 
     return jsonify(
@@ -1843,8 +1894,8 @@ def handle_disconnect():
 
 @socketio.on("join_session")
 def handle_join_session(data):
-    session_id = data.get("session_id")
-    if session_id:
+    session_id = data.get("session_id") if isinstance(data, dict) else None
+    if _is_active_job_session_id(session_id):
         # Join the session room for progress updates
         from flask_socketio import join_room
 
@@ -1866,6 +1917,12 @@ def handle_join_session(data):
             socketio.emit("progress_update", initial_data, room=session_id)
         except Exception as e:
             print(console_warning(f"Error emitting initial progress: {e}"))
+    else:
+        socketio.emit(
+            "session_join_error",
+            {"error": "Invalid or inactive processing session"},
+            room=request.sid,
+        )
 
 
 if __name__ == "__main__":

@@ -13,7 +13,8 @@ import traceback
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from types import MappingProxyType
+from typing import Any, Literal, Mapping, cast
 
 from ..inference.depth.backend_registry import (
     EstimatorRequest,
@@ -43,6 +44,28 @@ from .stereo_geometry import build_relative_geometry
 from .stereo_renderer import StereoRenderer, StereoSplatSettings
 
 
+def _freeze_snapshot(value: Any) -> Any:
+    """Recursively freeze JSON-like run state for trusted later execution."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_snapshot(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_snapshot(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_snapshot(item) for item in value)
+    return deepcopy(value)
+
+
+def _thaw_snapshot(value: Any) -> Any:
+    """Return a detached mutable copy of recursively frozen run state."""
+    if isinstance(value, Mapping):
+        return {key: _thaw_snapshot(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_snapshot(item) for item in value]
+    if isinstance(value, frozenset):
+        return {_thaw_snapshot(item) for item in value}
+    return deepcopy(value)
+
+
 @dataclass(frozen=True)
 class VideoRunPreflight:
     """Validated, resolved video inputs that are safe to execute."""
@@ -50,24 +73,24 @@ class VideoRunPreflight:
     _owner: object
     _video_path: str
     _output_dir: str
-    _settings: dict[str, Any]
-    _video_properties: dict[str, Any]
-    _report: dict[str, Any]
+    _settings: Mapping[str, Any]
+    _video_properties: Mapping[str, Any]
+    _report: Mapping[str, Any]
 
     @property
     def settings(self) -> dict[str, Any]:
         """Return a copy so callers cannot alter the validated execution state."""
-        return deepcopy(self._settings)
+        return cast(dict[str, Any], _thaw_snapshot(self._settings))
 
     @property
     def video_properties(self) -> dict[str, Any]:
         """Return a copy of the canonical source properties."""
-        return deepcopy(self._video_properties)
+        return cast(dict[str, Any], _thaw_snapshot(self._video_properties))
 
     @property
     def report(self) -> dict[str, Any]:
         """Return a copy of the report emitted for this execution state."""
-        return deepcopy(self._report)
+        return cast(dict[str, Any], _thaw_snapshot(self._report))
 
     def _snapshot_for(
         self, owner: object
@@ -77,9 +100,9 @@ class VideoRunPreflight:
         return (
             self._video_path,
             self._output_dir,
-            deepcopy(self._settings),
-            deepcopy(self._video_properties),
-            deepcopy(self._report),
+            cast(dict[str, Any], _thaw_snapshot(self._settings)),
+            cast(dict[str, Any], _thaw_snapshot(self._video_properties)),
+            cast(dict[str, Any], _thaw_snapshot(self._report)),
         )
 
 
@@ -262,9 +285,9 @@ class StereoProjector:
                 _owner=self._preflight_owner,
                 _video_path=video_path,
                 _output_dir=output_dir,
-                _settings=deepcopy(resolved_settings),
-                _video_properties=deepcopy(video_properties),
-                _report=deepcopy(report),
+                _settings=cast(Mapping[str, Any], _freeze_snapshot(resolved_settings)),
+                _video_properties=cast(Mapping[str, Any], _freeze_snapshot(video_properties)),
+                _report=cast(Mapping[str, Any], _freeze_snapshot(report)),
             )
         except Exception as error:
             print(f"Error during video preflight: {error}")

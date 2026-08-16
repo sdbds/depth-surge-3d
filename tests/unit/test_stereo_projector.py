@@ -437,6 +437,12 @@ def test_preflight_defensively_snapshots_inputs_and_revalidates_without_duplicat
 
     initial = projector.preflight_video("clip.mp4", output_dir, requested)
     assert initial is not None
+    with pytest.raises(TypeError):
+        initial._settings["apply_distortion"] = True
+    with pytest.raises(TypeError):
+        initial._video_properties["sample_aspect_ratio_numerator"] = 4
+    with pytest.raises(TypeError):
+        initial._report["projection"]["virtual_baseline_mm"] = 99.0
     requested["apply_distortion"] = True
     probed["sample_aspect_ratio_numerator"] = 4
     exposed_settings = initial.settings

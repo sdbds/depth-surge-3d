@@ -84,6 +84,7 @@ def test_web_runner_uses_relative_see_through_repo(tmp_path):
     with (
         patch("torch.cuda.is_available", return_value=True),
         patch("torch.cuda.get_device_name", return_value="Test CUDA device"),
+        patch.object(web_app, "_acknowledge_processing_configuration"),
         patch.object(
             web_app, "create_stereo_projector", return_value=projector
         ) as create_projector,
@@ -418,6 +419,7 @@ def test_web_background_resume_validates_loaded_model_before_migration(tmp_path)
 
     with (
         patch("torch.cuda.is_available", return_value=False),
+        patch.object(web_app, "_acknowledge_processing_configuration"),
         patch.object(web_app, "create_stereo_projector", return_value=projector),
         patch.object(
             web_app,

@@ -1862,22 +1862,30 @@
                 handleFramePreview(data);
             });
 
-            socket.on('processing_configuration', function(data) {
-                const container = document.getElementById('effectiveProcessingConfig');
-                const values = document.getElementById('effectiveProcessingConfigValues');
-                values.replaceChildren();
-                Object.entries(data).forEach(([name, value]) => {
-                    const term = document.createElement('dt');
-                    term.className = 'col-sm-4';
-                    term.textContent = name;
-                    const description = document.createElement('dd');
-                    description.className = 'col-sm-8';
-                    description.textContent = typeof value === 'object' && value !== null
-                        ? JSON.stringify(value)
-                        : String(value);
-                    values.append(term, description);
-                });
-                container.hidden = false;
+            socket.on('processing_configuration', function(data, acknowledge) {
+                try {
+                    const container = document.getElementById('effectiveProcessingConfig');
+                    const values = document.getElementById('effectiveProcessingConfigValues');
+                    values.replaceChildren();
+                    Object.entries(data).forEach(([name, value]) => {
+                        const term = document.createElement('dt');
+                        term.className = 'col-sm-4';
+                        term.textContent = name;
+                        const description = document.createElement('dd');
+                        description.className = 'col-sm-8';
+                        description.textContent = typeof value === 'object' && value !== null
+                            ? JSON.stringify(value)
+                            : String(value);
+                        values.append(term, description);
+                    });
+                    container.hidden = false;
+                    acknowledge({accepted: true});
+                } catch (error) {
+                    if (typeof acknowledge === 'function') {
+                        acknowledge({accepted: false});
+                    }
+                    throw error;
+                }
             });
         }
 
