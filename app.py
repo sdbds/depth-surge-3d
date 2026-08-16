@@ -435,7 +435,11 @@ def _acknowledge_processing_configuration(requester_socket_id: str, report: dict
         )
     except SocketIOTimeoutError as error:
         raise RuntimeError("Processing configuration acknowledgement timed out") from error
-    if acknowledgement != {"accepted": True}:
+    if (
+        type(acknowledgement) is not dict
+        or set(acknowledgement) != {"accepted"}
+        or acknowledgement["accepted"] is not True
+    ):
         raise RuntimeError("Processing configuration was not positively acknowledged")
 
 

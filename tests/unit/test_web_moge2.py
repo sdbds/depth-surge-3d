@@ -510,6 +510,10 @@ def test_delayed_configuration_is_private_and_job_room_join_still_works(
         ("timeout", "acknowledgement timed out"),
         ("negative", "not positively acknowledged"),
         ("malformed", "not positively acknowledged"),
+        ("integer_true", "not positively acknowledged"),
+        ("float_true", "not positively acknowledged"),
+        ("extra_boolean", "not positively acknowledged"),
+        ("wrong_boolean_shape", "not positively acknowledged"),
     ],
 )
 def test_configuration_ack_failure_aborts_before_model_load(
@@ -544,6 +548,14 @@ def test_configuration_ack_failure_aborts_before_model_load(
             call = MagicMock(side_effect=SocketIOTimeoutError())
         elif failure_mode == "negative":
             call = MagicMock(return_value={"accepted": False})
+        elif failure_mode == "integer_true":
+            call = MagicMock(return_value={"accepted": 1})
+        elif failure_mode == "float_true":
+            call = MagicMock(return_value={"accepted": 1.0})
+        elif failure_mode == "extra_boolean":
+            call = MagicMock(return_value={"accepted": True, "rendered": True})
+        elif failure_mode == "wrong_boolean_shape":
+            call = MagicMock(return_value={"acknowledged": True})
         else:
             call = MagicMock(return_value="accepted")
     monkeypatch.setattr(web_app.socketio, "call", call)
