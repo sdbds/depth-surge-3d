@@ -28,6 +28,7 @@ from src.depth_surge_3d.processing.frames.stereo_generator import (
     calculate_stereo_pipeline_capacity,
     validate_stereo_io_workers,
 )
+from src.depth_surge_3d.rendering.stereo_geometry import StereoGeometryFrame
 from src.depth_surge_3d.rendering.stereo_renderer import (
     StereoRenderResult,
     StereoRenderer,
@@ -135,7 +136,7 @@ class _FakeRenderer:
 
 class _RecordingCommonRenderer:
     def __init__(self) -> None:
-        self.geometry_calls: list[tuple[int, object, StereoSplatSettings]] = []
+        self.geometry_calls: list[tuple[int, StereoGeometryFrame, StereoSplatSettings]] = []
         self.legacy_relative_calls: list[object] = []
 
     def render(self, *args: object, **kwargs: object) -> StereoRenderResult:
@@ -145,7 +146,7 @@ class _RecordingCommonRenderer:
     def render_geometry(
         self,
         frame: np.ndarray,
-        geometry: object,
+        geometry: StereoGeometryFrame,
         settings: StereoSplatSettings,
     ) -> StereoRenderResult:
         self.geometry_calls.append((threading.get_ident(), geometry, settings))
@@ -207,6 +208,68 @@ def _make_metric_inputs(
         {"left_frames": left_dir, "right_frames": right_dir},
         resolved_auto_distance_m,
     )
+
+
+@pytest.mark.parametrize(
+    "metadata_mutation",
+    [
+        {"status": "writing"},
+        {"fingerprint": "not-the-completed-stage-fingerprint"},
+        {"frame_names": ["frame_0000.png", "frame_0002.png", "frame_0001.png"]},
+        {"convergence": None},
+    ],
+    ids=["status", "fingerprint", "ordered-manifest", "convergence"],
+)
+def test_metric_stereo_rejects_incomplete_stage_before_constructing_renderer(
+    tmp_path: Path,
+    metadata_mutation: dict[str, object],
+) -> None:
+    frame_files, metric_files, directories, _ = _make_metric_inputs(tmp_path)
+    metadata_path = metric_files[0].parent / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.update(metadata_mutation)
+    if "fingerprint" not in metadata_mutation:
+        metadata.pop("fingerprint")
+        metadata["fingerprint"] = canonical_json_hash(metadata)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with patch.object(
+        stereo_generator,
+        "StereoRenderer",
+        side_effect=AssertionError("renderer constructed before metric barrier"),
+    ) as renderer_factory:
+        generator = StereoPairGenerator()
+        with pytest.raises(
+            ValueError,
+            match="^metric stereo requires completed clip-global convergence metadata$",
+        ):
+            generator.create_stereo_pairs_from_files(
+                frame_files,
+                metric_files,
+                directories,
+                _settings(stereo_geometry_mode="metric_camera"),
+            )
+
+    renderer_factory.assert_not_called()
+
+
+def test_relative_stereo_setup_does_not_read_metric_metadata(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=1)
+    renderer = _FakeRenderer()
+
+    with patch.object(
+        MetricGeometryStore,
+        "read_metadata",
+        side_effect=AssertionError("relative setup read metric metadata"),
+    ):
+        assert StereoPairGenerator(renderer=renderer).create_stereo_pairs_from_files(
+            frame_files,
+            depth_files,
+            directories,
+            _settings(stereo_geometry_mode="relative"),
+        )
+
+    assert len(renderer.calls) == 1
 
 
 @pytest.mark.parametrize("workers", [0, -1, 17, 100])

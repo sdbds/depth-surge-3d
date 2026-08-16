@@ -46,6 +46,7 @@ STEREO_STAGE_SCHEMA_VERSION = 1
 STEREO_STAGE_ALGORITHM_VERSION = "torch-horizontal-16x-zbuffer-v3"
 METRIC_PROJECTION_ALGORITHM_VERSION = "crop-aware-metric-pinhole-v1"
 METRIC_CLAMP_STATS_SCHEMA_VERSION = 1
+METRIC_STEREO_COMPLETION_ERROR = "metric stereo requires completed clip-global convergence metadata"
 STEREO_HOST_BUDGET = 512 * 1024 * 1024
 HOST_STEREO_BYTES_PER_PIXEL = 24
 HOST_SLOT_OVERHEAD = 1024 * 1024
@@ -280,6 +281,14 @@ def _atomic_write_png(path: Path, image: np.ndarray) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _stereo_creation_failed(error: Exception) -> bool:
+    if isinstance(error, ValueError) and str(error) == METRIC_STEREO_COMPLETION_ERROR:
+        raise error
+    print(f"Error creating stereo pairs: {error}")
+    traceback.print_exc()
+    return False
 
 
 def _write_pair(item: _WriteItem) -> None:
@@ -603,9 +612,15 @@ class StereoPairGenerator:
         renderer: StereoRenderer | None = None,
     ) -> None:
         self.verbose = verbose
-        self.renderer = renderer if renderer is not None else StereoRenderer()
+        self._renderer = renderer
         self.last_pipeline_stats: StereoPipelineStats | None = None
         self.last_metric_clamp_summary: dict[str, Any] | None = None
+
+    @property
+    def renderer(self) -> StereoRenderer:
+        if self._renderer is None:
+            self._renderer = StereoRenderer()
+        return self._renderer
 
     @staticmethod
     def _occlusion_fill(settings: dict[str, Any]) -> Literal["none", "background"]:
@@ -806,9 +821,7 @@ class StereoPairGenerator:
                 self._summarize_metric_clamps(frame_files, left_dir)
             return True
         except Exception as error:
-            print(f"Error creating stereo pairs: {error}")
-            traceback.print_exc()
-            return False
+            return _stereo_creation_failed(error)
 
     def _stereo_stage_metadata(
         self,
@@ -1177,19 +1190,25 @@ class StereoPairGenerator:
         depth_files: list[Path],
         frame_files: list[Path],
     ) -> tuple[MetricGeometryStore, dict[str, Any]]:
-        if not depth_files:
-            raise ValueError("Metric geometry files are required")
-        metadata = MetricGeometryStore.read_metadata(depth_files[0].parent)
-        if metadata is None:
-            raise ValueError("Metric geometry metadata is missing or malformed")
-        store = MetricGeometryStore.open_existing(
-            depth_files[0].parent,
-            frame_names=[path.name for path in frame_files],
-            source_raw_fingerprint=cast(str, metadata.get("source_raw_fingerprint")),
-            source_frame_fingerprint=cast(str, metadata.get("source_frame_fingerprint")),
-            candidate_scene_fingerprint=cast(str, metadata.get("candidate_scene_fingerprint")),
-        )
-        expected_paths = [path.resolve() for path in store.complete_files]
-        if [path.resolve() for path in depth_files] != expected_paths:
-            raise ValueError("Metric geometry files do not match the metadata path manifest")
-        return store, store.metadata
+        try:
+            if not depth_files:
+                raise ValueError("Metric geometry files are required")
+            metadata = MetricGeometryStore.read_metadata(depth_files[0].parent)
+            if metadata is None:
+                raise ValueError("Metric geometry metadata is missing or malformed")
+            store = MetricGeometryStore.open_existing(
+                depth_files[0].parent,
+                frame_names=[path.name for path in frame_files],
+                source_raw_fingerprint=cast(str, metadata.get("source_raw_fingerprint")),
+                source_frame_fingerprint=cast(str, metadata.get("source_frame_fingerprint")),
+                candidate_scene_fingerprint=cast(
+                    str,
+                    metadata.get("candidate_scene_fingerprint"),
+                ),
+            )
+            expected_paths = [path.resolve() for path in store.complete_files]
+            if [path.resolve() for path in depth_files] != expected_paths:
+                raise ValueError("Metric geometry files do not match the metadata path manifest")
+            return store, store.metadata
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            raise ValueError(METRIC_STEREO_COMPLETION_ERROR) from error
