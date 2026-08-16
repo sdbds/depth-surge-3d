@@ -1,11 +1,14 @@
 """Unit tests for StereoProjector."""
 
 import inspect
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
+import pytest
 
 from src.depth_surge_3d.inference.depth.types import DepthBatch, DepthRepresentation
+from src.depth_surge_3d.inference.depth.backend_registry import EstimatorRequest
+from src.depth_surge_3d.rendering import stereo_projector
 from src.depth_surge_3d.rendering import (
     StereoRenderResult,
     StereoRenderSettings,
@@ -27,10 +30,19 @@ def _stereo_result(image: np.ndarray) -> StereoRenderResult:
     )
 
 
+def test_projector_rejects_unknown_backend_without_constructing_an_estimator(monkeypatch) -> None:
+    """Invalid backend IDs fail before the registry factory can create anything."""
+    factory = Mock()
+    monkeypatch.setattr(stereo_projector, "create_registered_depth_estimator", factory)
+    with pytest.raises(ValueError, match="Unknown depth backend: typo"):
+        create_stereo_projector(depth_model_version="typo")
+    factory.assert_not_called()
+
+
 class TestStereoProjector:
     """Test StereoProjector class."""
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_init_with_v2_default(self, mock_create_v2):
         """Test initialization with V2 (default)."""
         mock_estimator = MagicMock()
@@ -46,9 +58,11 @@ class TestStereoProjector:
         assert projector.depth_model_version == "v2"
         assert projector.depth_estimator == mock_estimator
         assert projector._model_loaded is False
-        mock_create_v2.assert_called_once_with("models/test.pth", "cpu", False, 10)
+        mock_create_v2.assert_called_once_with(
+            "v2", EstimatorRequest("models/test.pth", None, "cpu", False, 10)
+        )
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator_da3")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_init_with_v3(self, mock_create_v3):
         """Test initialization with V3."""
         mock_estimator = MagicMock()
@@ -63,9 +77,11 @@ class TestStereoProjector:
 
         assert projector.depth_model_version == "v3"
         assert projector.depth_estimator == mock_estimator
-        mock_create_v3.assert_called_once_with("large", "cpu", False)
+        mock_create_v3.assert_called_once_with(
+            "v3", EstimatorRequest("large", None, "cpu", False, 10)
+        )
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_see_through_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_init_with_see_through(self, mock_create_see_through):
         """Test initialization with the anime-focused See-Through model."""
         mock_estimator = MagicMock()
@@ -80,9 +96,12 @@ class TestStereoProjector:
 
         assert projector.depth_model_version == "see_through"
         assert projector.depth_estimator == mock_estimator
-        mock_create_see_through.assert_called_once_with("24yearsold/custom-marigold", "cuda", True)
+        mock_create_see_through.assert_called_once_with(
+            "see_through",
+            EstimatorRequest("24yearsold/custom-marigold", None, "cuda", True, 10),
+        )
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_init_with_none_model_path_v2(self, mock_create_v2):
         """Test initialization with None model path for V2."""
         mock_estimator = MagicMock()
@@ -95,9 +114,9 @@ class TestStereoProjector:
         )
 
         assert projector.depth_model_version == "v2"
-        mock_create_v2.assert_called_once_with(None, "cpu", False, 10)
+        mock_create_v2.assert_called_once_with("v2", EstimatorRequest(None, None, "cpu", False, 10))
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator_da3")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_init_with_none_model_path_v3(self, mock_create_v3):
         """Test initialization with None model path for V3."""
         mock_estimator = MagicMock()
@@ -110,9 +129,9 @@ class TestStereoProjector:
         )
 
         assert projector.depth_model_version == "v3"
-        mock_create_v3.assert_called_once_with(None, "cpu", False)
+        mock_create_v3.assert_called_once_with("v3", EstimatorRequest(None, None, "cpu", False, 10))
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_apply_default_settings(self, mock_create_v2):
         """Test default settings application."""
         mock_estimator = MagicMock()
@@ -159,7 +178,7 @@ class TestStereoProjector:
 class TestCreateStereoProjector:
     """Test factory function for StereoProjector."""
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_create_with_defaults(self, mock_create_v2):
         """Test factory function with defaults."""
         mock_estimator = MagicMock()
@@ -168,9 +187,11 @@ class TestCreateStereoProjector:
         projector = create_stereo_projector()
 
         assert isinstance(projector, StereoProjector)
-        mock_create_v2.assert_called_once_with(None, "auto", False, 10)
+        mock_create_v2.assert_called_once_with(
+            "v2", EstimatorRequest(None, None, "auto", False, 10)
+        )
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_create_with_v2(self, mock_create_v2):
         """Test factory function with V2."""
         mock_estimator = MagicMock()
@@ -185,9 +206,11 @@ class TestCreateStereoProjector:
 
         assert isinstance(projector, StereoProjector)
         assert projector.depth_model_version == "v2"
-        mock_create_v2.assert_called_once_with("models/test.pth", "cpu", True, 10)
+        mock_create_v2.assert_called_once_with(
+            "v2", EstimatorRequest("models/test.pth", None, "cpu", True, 10)
+        )
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator_da3")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_create_with_v3(self, mock_create_v3):
         """Test factory function with V3."""
         mock_estimator = MagicMock()
@@ -202,13 +225,15 @@ class TestCreateStereoProjector:
 
         assert isinstance(projector, StereoProjector)
         assert projector.depth_model_version == "v3"
-        mock_create_v3.assert_called_once_with("large", "cuda", False)
+        mock_create_v3.assert_called_once_with(
+            "v3", EstimatorRequest("large", None, "cuda", False, 10)
+        )
 
 
 class TestStereoProjectorHelpers:
     """Test helper methods of StereoProjector."""
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_ensure_model_loaded_success(self, mock_create):
         """Test model loading success."""
         mock_estimator = MagicMock()
@@ -224,7 +249,7 @@ class TestStereoProjectorHelpers:
         assert projector._model_loaded is True
         mock_estimator.load_model.assert_called_once()
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_ensure_model_loaded_already_loaded(self, mock_create):
         """Test model loading when already loaded."""
         mock_estimator = MagicMock()
@@ -239,7 +264,7 @@ class TestStereoProjectorHelpers:
         # Should not call load_model again
         mock_estimator.load_model.assert_not_called()
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_ensure_model_loaded_failure(self, mock_create):
         """Test model loading failure."""
         mock_estimator = MagicMock()
@@ -253,7 +278,7 @@ class TestStereoProjectorHelpers:
         assert result is False
         assert projector._model_loaded is False
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
     def test_validate_inputs_valid(self, mock_validate, mock_create):
         """Test input validation with valid inputs."""
@@ -268,7 +293,7 @@ class TestStereoProjectorHelpers:
         assert result is True
         mock_validate.assert_called_once_with("video.mp4")
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
     def test_validate_inputs_invalid_video(self, mock_validate, mock_create):
         """Test input validation with invalid video."""
@@ -285,7 +310,7 @@ class TestStereoProjectorHelpers:
 class TestResolveSettings:
     """Test _resolve_settings method."""
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.auto_detect_resolution")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_resolution_settings")
     @patch("src.depth_surge_3d.rendering.stereo_projector.get_resolution_dimensions")
@@ -337,7 +362,7 @@ class TestResolveSettings:
 
         mock_auto_detect.assert_called_once_with(1920, 1080, "side_by_side")
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_resolution_settings")
     @patch("src.depth_surge_3d.rendering.stereo_projector.get_resolution_dimensions")
     @patch("src.depth_surge_3d.rendering.stereo_projector.calculate_vr_output_dimensions")
@@ -379,7 +404,7 @@ class TestResolveSettings:
         assert resolved["vr_output_width"] == 4096
         assert resolved["vr_output_height"] == 2048
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.auto_detect_resolution")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_resolution_settings")
     @patch("src.depth_surge_3d.rendering.stereo_projector.get_resolution_dimensions")
@@ -425,7 +450,7 @@ class TestResolveSettings:
 class TestModelDelegation:
     """Test model delegation methods."""
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_get_model_info(self, mock_create):
         """Test get_model_info delegation."""
         mock_estimator = MagicMock()
@@ -442,7 +467,7 @@ class TestModelDelegation:
         assert info["encoder"] == "vitl"
         mock_estimator.get_model_info.assert_called_once()
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_unload_model(self, mock_create):
         """Test unload_model delegation."""
         mock_estimator = MagicMock()
@@ -460,7 +485,7 @@ class TestModelDelegation:
 class TestProcessVideoErrorPaths:
     """Test error handling in process_video method."""
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
     def test_process_video_invalid_input(self, mock_validate, mock_create):
         """Test process_video with invalid video input."""
@@ -473,7 +498,7 @@ class TestProcessVideoErrorPaths:
         assert result is False
         mock_validate.assert_called_once_with("invalid.txt")
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
     def test_process_video_model_load_failure(self, mock_validate, mock_create):
         """Test process_video when model fails to load."""
@@ -490,7 +515,7 @@ class TestProcessVideoErrorPaths:
         assert result is False
         mock_estimator.load_model.assert_called_once()
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
     @patch("src.depth_surge_3d.rendering.stereo_projector.get_video_properties")
     def test_process_video_invalid_video_properties(
@@ -511,7 +536,7 @@ class TestProcessVideoErrorPaths:
         assert result is False
         mock_get_props.assert_called_once_with("test.mp4")
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
     @patch("src.depth_surge_3d.io.operations.get_video_properties")
     def test_process_video_exception_handling(self, mock_get_props, mock_validate, mock_create):
@@ -532,7 +557,7 @@ class TestProcessVideoErrorPaths:
 class TestProcessImage:
     """Test process_image method."""
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("cv2.imread")
     @patch("cv2.imwrite")
     @patch("pathlib.Path.mkdir")
@@ -568,7 +593,7 @@ class TestProcessImage:
         # Should save 4 images: left, right, vr, depth
         assert mock_imwrite.call_count == 4
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("cv2.imread")
     def test_process_image_model_load_failure(self, mock_imread, mock_create):
         """Test process_image when model fails to load."""
@@ -581,7 +606,7 @@ class TestProcessImage:
 
         assert result is False
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("cv2.imread")
     def test_process_image_invalid_image(self, mock_imread, mock_create):
         """Test process_image with invalid image file."""
@@ -596,7 +621,7 @@ class TestProcessImage:
 
         assert result is False
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("cv2.imread")
     def test_process_image_depth_estimation_failure(self, mock_imread, mock_create):
         """Test process_image when depth estimation fails."""
@@ -614,7 +639,7 @@ class TestProcessImage:
 
         assert result is False
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("cv2.imread")
     def test_process_image_with_custom_settings(self, mock_imread, mock_create):
         """Test process_image with custom settings."""
@@ -657,7 +682,7 @@ class TestProcessImage:
             occlusion_fill="none",
         )
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("cv2.imread")
     def test_process_image_exception_handling(self, mock_imread, mock_create):
         """Test process_image handles exceptions gracefully."""
@@ -679,7 +704,7 @@ class TestProcessImage:
 class TestProcessVideoSuccessPath:
     """Test process_video successful path."""
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
     @patch("src.depth_surge_3d.rendering.stereo_projector.get_video_properties")
     @patch("src.depth_surge_3d.rendering.stereo_projector.VideoProcessor")
@@ -727,7 +752,7 @@ class TestProcessVideoSuccessPath:
 class TestValidateInputsDirectoryError:
     """Test validate_inputs with directory creation failure."""
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
     @patch("pathlib.Path.mkdir")
     def test_validate_inputs_directory_creation_fails(self, mock_mkdir, mock_validate, mock_create):

@@ -13,10 +13,10 @@ import traceback
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from ..inference import (
-    create_see_through_depth_estimator,
-    create_video_depth_estimator,
-    create_video_depth_estimator_da3,
+from ..inference.depth.backend_registry import (
+    EstimatorRequest,
+    create_registered_depth_estimator,
+    get_backend_spec,
 )
 from ..inference.depth.types import DepthBatch
 from ..utils import (
@@ -50,7 +50,9 @@ class StereoProjector:
         depth_model_version: str = "v2",
         temporal_window_overlap: int = 10,
         stereo_renderer: StereoRenderer | None = None,
-    ):
+        *,
+        model_size: str | None = None,
+    ) -> None:
         """
         Initialize StereoProjector.
 
@@ -58,27 +60,27 @@ class StereoProjector:
             model_path: Path to video depth estimation model (DA2) or model name (DA3)
             device: Processing device ('auto', 'cuda', 'cpu')
             metric: Use metric depth model (true depth values)
-            depth_model_version: Depth model version ('v2', 'v3', or 'see_through')
+            depth_model_version: Registered depth backend ID
             temporal_window_overlap: Frame overlap for V2 temporal windows (default: 10)
+            model_size: Optional registered model variant (vits, vitb, or vitl)
         """
         self.depth_model_version = depth_model_version
         self.model_path = model_path
+        self.model_size = model_size
         self.device = device
         self.metric = metric
         self.stereo_renderer = stereo_renderer
-        self.depth_estimator: Any
-
-        if depth_model_version == "see_through":
-            self.depth_estimator = create_see_through_depth_estimator(model_path, device, metric)
-        elif depth_model_version == "v3":
-            # Use Depth Anything V3 (model_path is used as model_name)
-            model_name = model_path if model_path else None
-            self.depth_estimator = create_video_depth_estimator_da3(model_name, device, metric)
-        else:
-            # Use Video-Depth-Anything V2 (default)
-            self.depth_estimator = create_video_depth_estimator(  # type: ignore[assignment]
-                model_path, device, metric, temporal_window_overlap
-            )
+        self.backend_spec = get_backend_spec(depth_model_version)
+        self.depth_estimator: Any = create_registered_depth_estimator(
+            depth_model_version,
+            EstimatorRequest(
+                model_path=model_path,
+                model_size=model_size,
+                device=device,
+                metric=metric,
+                temporal_window_overlap=temporal_window_overlap,
+            ),
+        )
 
         self._model_loaded = False
 
@@ -416,6 +418,8 @@ def create_stereo_projector(
     device: str = "auto",
     metric: bool = False,
     depth_model_version: str = "v2",
+    *,
+    model_size: str | None = None,
 ) -> StereoProjector:
     """
     Factory function to create a StereoProjector instance.
@@ -424,9 +428,16 @@ def create_stereo_projector(
         model_path: Path to model file (V2) or model name (V3)
         device: Processing device
         metric: Use metric depth model (true depth values)
-        depth_model_version: Depth model version ('v2', 'v3', or 'see_through')
+        depth_model_version: Registered depth backend ID
+        model_size: Optional registered model variant (vits, vitb, or vitl)
 
     Returns:
         Configured StereoProjector instance
     """
-    return StereoProjector(model_path, device, metric, depth_model_version)
+    return StereoProjector(
+        model_path,
+        device,
+        metric,
+        depth_model_version,
+        model_size=model_size,
+    )

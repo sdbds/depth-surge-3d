@@ -13,6 +13,18 @@ from .video_depth_estimator_see_through import (
     create_see_through_depth_estimator,
 )
 from .types import DepthBatch, DepthRepresentation
+from .backend_registry import (
+    BackendAvailability,
+    BackendCapabilities,
+    DepthBackendSpec,
+    EstimatorRequest,
+    ModelVariantSpec,
+    backend_availability,
+    create_registered_depth_estimator,
+    get_backend_spec,
+    list_backend_specs,
+    resolve_model_variant,
+)
 
 __all__ = [
     "VideoDepthEstimator",
@@ -22,4 +34,14 @@ __all__ = [
     "create_see_through_depth_estimator",
     "DepthBatch",
     "DepthRepresentation",
+    "BackendAvailability",
+    "BackendCapabilities",
+    "DepthBackendSpec",
+    "EstimatorRequest",
+    "ModelVariantSpec",
+    "backend_availability",
+    "create_registered_depth_estimator",
+    "get_backend_spec",
+    "list_backend_specs",
+    "resolve_model_variant",
 ]
