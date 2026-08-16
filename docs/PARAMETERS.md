@@ -72,7 +72,18 @@ manifest, and bounds.
 
 ## Model And Projection
 
-- `--depth-model-version`: `v2`, `v3`, or `see_through`.
+- `--depth-model-version`: `v2`, `v3`, `see_through`, or `moge2`. Select
+  MoGe-2 with `--depth-model-version moge2`.
+- `--model-size {vits,vitb,vitl}`: MoGe-2 Small, Base, or Large. MoGe-2
+  defaults to `vitb`.
+- `--stereo-geometry-mode {relative,metric_camera}`: geometry interpretation.
+  Default: `relative`. `metric_camera` is Experimental.
+- `--virtual-baseline-mm`: finite `0` to `100`. Default: `63.0`. This is the
+  separation between virtual capture cameras, not viewer IPD.
+- `--metric-convergence-distance {auto|metres}`: `auto` or a finite distance
+  from `0.1` to `1000` metres. Default: `auto`.
+- `--max-disparity-percent`: finite `0` to `5`. Default: `2.0`. This caps total
+  left-to-right disparity in retained final-output coordinates.
 - `--model`: checkpoint path, model name, or repository as appropriate.
 - `--metric`: select metric output where the adapter supports it.
 - `--device`: `auto`, `cuda`, or `cpu`.
@@ -81,6 +92,35 @@ manifest, and bounds.
 - `--fisheye-fov`: projection field of view in degrees.
 - `--no-distortion`: keep rectilinear stereo images.
 - `--crop-factor` and `--fisheye-crop-factor`: post-render crop controls.
+
+Relative geometry remains the default, and flat rectilinear SBS is the
+main playback path. Experimental `metric_camera` requires MoGe-2 pinhole focal
+data, `--format side_by_side`, `--no-distortion`, and canonical square source
+SAR `1:1`. Missing or `N/A` SAR is normalized to `1:1`; malformed, explicit
+non-square, or otherwise invalid SAR fails before model loading. Letterbox bars
+inside a square-SAR image may still bias automatic convergence.
+
+The automatic convergence distance is resolved once from clip-global valid
+metric samples and persisted before metric stereo rendering or preview. The
+crop-aware projection converts pre-crop source disparity to retained-output
+coordinates, clamps total disparity there, then uses the same center crop and
+axis-aligned resize rule as the rest of the pipeline. Changing final output
+width does not change the projection fraction.
+
+MoGe-2 performs per-frame depth and focal estimation. Temporal stability on video is not guaranteed; depth or focal drift may be visible across frames.
+
+The mode does not establish calibrated physical scale, physically correct
+reconstruction, improved stereo quality, temporal stability, viewing comfort
+or safety, or superiority over relative mode. The adapter level is fixed at
+`9`, is report-only, and is not exposed as a public setting or CLI flag.
+
+### Pinned MoGe-2 Variants
+
+| UI/setting | Parameters | Repository | Revision |
+| --- | ---: | --- | --- |
+| Small / `vits` | 35M | `Ruicheng/moge-2-vits-normal` | `679230677b4d282c6f304189a93e98e14f085902` |
+| Base / `vitb` default | 104M | `Ruicheng/moge-2-vitb-normal` | `54ad3a693e61907ea4633d13dec6ee682fa09419` |
+| Large / `vitl` | 326M | `Ruicheng/moge-2-vitl` | `39c4d5e957afe587e04eec59dc2bcc3be5ecd968` |
 
 ## Tuning
 

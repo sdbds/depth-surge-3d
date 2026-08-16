@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Optional MoGe-2 Small, Base, and Large backends with immutable source and
+  weight revisions.
+- Experimental metric-camera geometry for flat rectilinear side-by-side output,
+  with clip-global convergence and a retained-output disparity cap. Relative
+  geometry remains the default.
+- Raw depth schema v3 camera/focal persistence and independent restartable
+  relative and metric Stage-3 stores.
+- Third-party notices for Microsoft MoGe and its bundled/derived DINOv2 code.
+
+The [MoGe-2 release-evidence checklist](docs/release/moge2-release-checklist.md)
+defines the separate three-variant evidence process that will be added with the
+release tooling. This changelog entry does not claim that real-model evidence
+has been executed.
+
 ## [0.9.2] - 2026-01-19
 
 ### Fixed

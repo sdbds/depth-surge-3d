@@ -46,6 +46,36 @@ python depth_surge_3d.py input_video.mp4 --no-intermediates
 
 Run `python depth_surge_3d.py --help` for every option and its current default.
 
+### MoGe-2 Examples
+
+Install the optional extra first with `uv sync --extra moge2`. Relative
+geometry is the default:
+
+```bash
+uv run depth-surge-3d clip.mp4 --depth-model-version moge2 --model-size vitb
+```
+
+The Experimental metric-camera path uses flat rectilinear side-by-side output:
+
+```bash
+uv run depth-surge-3d clip.mp4 --depth-model-version moge2 --model-size vitb \
+  --stereo-geometry-mode metric_camera --format side_by_side --no-distortion \
+  --virtual-baseline-mm 63 --metric-convergence-distance auto \
+  --max-disparity-percent 2
+```
+
+The six public selection and projection flags are `--depth-model-version
+moge2`, `--model-size`, `--stereo-geometry-mode`, `--virtual-baseline-mm`,
+`--metric-convergence-distance`, and `--max-disparity-percent`. Metric mode
+requires square source SAR `1:1`; missing or `N/A` SAR is normalized to `1:1`,
+while malformed or explicit non-square SAR is rejected. Letterbox bars remain
+part of the picture and can bias automatic convergence even when SAR is square.
+
+Automatic convergence is one persisted clip-global value resolved before
+metric stereo or preview. The disparity cap is applied as total left-to-right
+disparity in retained final-output coordinates before the shared center crop
+and resize. Final output width does not alter that projection fraction.
+
 ## Output Structure
 
 Each conversion uses a self-contained output directory:
@@ -60,6 +90,7 @@ output/video_timestamp/
 |   `-- depth_bounds.json
 |-- 02_depth_raw/
 |-- 03_disparity_maps/
+|-- 03_metric_geometry/
 |-- 04_left_frames/
 |-- 04_right_frames/
 |-- 05_left_distorted/
@@ -73,9 +104,13 @@ output/video_timestamp/
 `-- output.mp4
 ```
 
-Optional stages may be empty. With `--no-intermediates`, restartable working
-payloads are removed only after their replacement output has been written and
-validated.
+Only the selected Stage 3 is derived. A compatible inactive
+`03_disparity_maps` or `03_metric_geometry` stage is preserved during mode
+switches. With `--no-intermediates`, raw frame NPZ files are deleted only after
+the selected Stage 3 payloads and metadata validate. If later rendering fails,
+that completed Stage 3 remains available for resume. Full intermediate cleanup,
+including payloads from both Stage-3 directories, runs only after final output
+is successfully finalized.
 
 ## Resume
 
@@ -114,6 +149,11 @@ python depth_surge_3d.py --resume ./output/old_job/ --migrate-legacy delete
 The resume report lists every preserved, resumed, invalidated, archived, or
 deleted stage. Destructive migration starts only after the configured estimator
 loads and its exact fingerprint has been checked.
+
+Relative and metric geometry use independent fingerprints. Switching modes
+selects the matching Stage 3 without interpreting relative disparity as metric
+geometry or deleting a still-valid inactive stage. Metric stereo begins only
+after its clip-global convergence metadata is finalized.
 
 Stereo renderer v3 invalidates v1 left/right metadata and all tracked
 downstream frame stages while preserving valid source, scene, raw-depth, and

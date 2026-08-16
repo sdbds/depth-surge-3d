@@ -30,6 +30,53 @@ The setup script will automatically:
 - Download Video-Depth-Anything-Large model (~1.3GB)
 - Verify system requirements
 
+## Default And Optional uv Installs
+
+The default environment does not install MoGe. Install the normal project
+dependencies with:
+
+```bash
+uv sync
+```
+
+MoGe-2 support is optional. Its only supported uv install command is:
+
+```bash
+uv sync --extra moge2
+```
+
+For a separate pip or manual environment, `requirements-moge2.txt` records the
+pinned MoGe source dependency:
+
+```bash
+pip install -r requirements-moge2.txt
+```
+
+This is a pip requirements path, not another uv command.
+
+The MoGe source is fixed at Microsoft MoGe commit
+`925b8ed835a7a9cdb7578ba15c658a0afc969030`. The selectable weights are also
+resolved at immutable Hugging Face revisions:
+
+| UI/setting | Parameters | Repository | Revision |
+| --- | ---: | --- | --- |
+| Small / `vits` | 35M | `Ruicheng/moge-2-vits-normal` | `679230677b4d282c6f304189a93e98e14f085902` |
+| Base / `vitb` default | 104M | `Ruicheng/moge-2-vitb-normal` | `54ad3a693e61907ea4633d13dec6ee682fa09419` |
+| Large / `vitl` | 326M | `Ruicheng/moge-2-vitl` | `39c4d5e957afe587e04eec59dc2bcc3be5ecd968` |
+
+Remote resolution records the exact snapshot identity. Offline use therefore
+requires the exact pinned snapshot to be present in the Hugging Face cache.
+Every resolved snapshot, and every local custom model directory, must contain a
+concrete `model.pt`; a missing file is an error rather than a request to select
+another artifact.
+
+MoGe inference uses float32 on CPU and float16 on CUDA. CUDA out-of-memory is
+reported explicitly with the active variant, input size, precision, device,
+and fixed adapter level. The application does not silently change variant,
+lower resolution, switch to CPU, or choose another geometry mode. The adapter
+level is fixed at `9`, appears only in run reports and fingerprints, and is not
+a user setting or CLI control.
+
 ## Model Management
 
 The project includes flexible model management:
