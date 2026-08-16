@@ -2405,9 +2405,11 @@ def test_metric_projection_zero_near_far_sign_and_foreground_convention() -> Non
     assert geometry.total_disparity_fraction[0, 0] > 0.0
     assert geometry.total_disparity_fraction[0, 1] == 0.0
     assert geometry.total_disparity_fraction[0, 2] < 0.0
-    left, right = calculate_geometry_eye_sample_offsets(
-        geometry.total_disparity_fraction
-    )
+    # The three-pixel raster is below the frozen 1/16-pixel offset quantum.
+    # Repeat the same geometry to test the foreground eye sign without
+    # changing the projection formula or Task 8 rounding contract.
+    expanded = np.tile(geometry.total_disparity_fraction, (1, 100))
+    left, right = calculate_geometry_eye_sample_offsets(expanded)
     assert left[0, 0] > right[0, 0]
     assert stats.clamped_fraction == 0.0
 
