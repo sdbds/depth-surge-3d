@@ -11,17 +11,23 @@ from src.depth_surge_3d.rendering.forward_splat import (
     HORIZONTAL_SUBPIXELS,
     SubpixelSplatResult,
 )
+from src.depth_surge_3d.rendering.stereo_geometry import (
+    StereoGeometryFrame,
+    build_relative_geometry,
+)
 from src.depth_surge_3d.rendering.stereo_renderer import (
     GPU_TEMP_BUDGET,
     SPLAT_BYTES_PER_PIXEL,
     StereoRenderResult,
     StereoRenderer,
     StereoRenderSettings,
+    StereoSplatSettings,
     _convert_image_band,
     _downsample_subpixel_band,
     _fill_background_band,
     calculate_band_height,
     calculate_eye_sample_offsets,
+    calculate_geometry_eye_sample_offsets,
 )
 
 
@@ -128,6 +134,82 @@ def test_full_frame_eye_offsets_use_host_float64_and_int32_storage() -> None:
     assert right[0, :3].tolist() == [extreme_offset, -extreme_offset, 0]
 
 
+def test_geometry_eye_offsets_use_total_disparity_fraction_directly() -> None:
+    left, right = calculate_geometry_eye_sample_offsets(
+        np.array([[-0.25, 0.0, 0.25]], dtype=np.float64)
+    )
+
+    assert left.dtype == np.int32 and right.dtype == np.int32
+    assert left.flags.c_contiguous and right.flags.c_contiguous
+    assert left.tolist() == [[-6, 0, 6]]
+    assert right.tolist() == [[6, 0, -6]]
+
+
+def test_legacy_and_common_offsets_keep_their_distinct_half_lane_rounding() -> None:
+    width = 8950
+    canonical = np.full(
+        (1, width),
+        np.float32(0.23064221441745758),
+        dtype=np.float32,
+    )
+    settings = StereoRenderSettings(
+        stereo_strength=0.473053267491137,
+        convergence=0.05202130106440961,
+    )
+    geometry = build_relative_geometry(
+        canonical,
+        canonical.shape,
+        stereo_strength=settings.stereo_strength,
+        convergence=settings.convergence,
+    )
+
+    legacy_left, _legacy_right = calculate_eye_sample_offsets(
+        torch.from_numpy(canonical.copy()),
+        settings,
+    )
+    common_left, _common_right = calculate_geometry_eye_sample_offsets(
+        geometry.total_disparity_fraction
+    )
+
+    assert legacy_left[0, 0] == 61
+    assert common_left[0, 0] == 60
+
+
+def test_relative_wrapper_passes_legacy_offsets_to_the_common_splat_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    width = 8950
+    frame = np.zeros((1, width, 3), dtype=np.uint8)
+    canonical = np.full(
+        (1, width),
+        np.float32(0.23064221441745758),
+        dtype=np.float32,
+    )
+    settings = StereoRenderSettings(
+        stereo_strength=0.473053267491137,
+        convergence=0.05202130106440961,
+    )
+    captured_offsets: list[tuple[np.ndarray, np.ndarray]] = []
+    renderer = StereoRenderer(device="cpu")
+
+    def fake_splat_core(
+        source: np.ndarray,
+        geometry: StereoGeometryFrame,
+        eye_offsets: tuple[np.ndarray, np.ndarray],
+        splat_settings: StereoSplatSettings,
+        geometry_seconds: float,
+    ) -> StereoRenderResult:
+        del geometry, splat_settings, geometry_seconds
+        captured_offsets.append(eye_offsets)
+        return _empty_render_result(source)
+
+    monkeypatch.setattr(renderer, "_render_splat_core", fake_splat_core)
+
+    renderer.render(frame, canonical, settings)
+
+    assert captured_offsets[0][0][0, 0] == 61
+
+
 def test_half_lane_boundaries_obey_ceil_without_epsilon() -> None:
     boundary = np.float32(2.0 / HORIZONTAL_SUBPIXELS)
     below = np.nextafter(boundary, np.float32(0.0))
@@ -159,6 +241,54 @@ def test_canonical_resize_remains_bilinear_and_bounded() -> None:
     assert actual.max().item() <= 1.0
 
 
+def test_render_geometry_requires_geometry_matching_the_source_raster() -> None:
+    geometry = StereoGeometryFrame(
+        near_score=np.ones((1, 2), dtype=np.float32),
+        total_disparity_fraction=np.zeros((1, 2), dtype=np.float64),
+        source_valid=np.ones((1, 2), dtype=np.bool_),
+    )
+
+    with pytest.raises(ValueError, match="match.*source raster"):
+        StereoRenderer(device="cpu").render_geometry(
+            np.zeros((1, 3, 3), dtype=np.uint8),
+            geometry,
+            StereoSplatSettings(max_eye_shift_fraction=0.0),
+        )
+
+
+def test_render_geometry_excludes_invalid_nearer_sources_from_fill() -> None:
+    frame = np.array([[[255, 0, 0], [0, 0, 255]]], dtype=np.uint8)
+    geometry = StereoGeometryFrame(
+        near_score=np.array([[10.0, 1.0]], dtype=np.float32),
+        total_disparity_fraction=np.array([[1.0, 0.0]], dtype=np.float64),
+        source_valid=np.array([[False, True]], dtype=np.bool_),
+    )
+
+    result = StereoRenderer(device="cpu").render_geometry(
+        frame,
+        geometry,
+        StereoSplatSettings(max_eye_shift_fraction=1.0, occlusion_fill="background"),
+    )
+
+    expected = np.broadcast_to(np.array([0, 0, 255], dtype=np.uint8), frame.shape)
+    assert np.array_equal(result.left_image, expected)
+    assert result.left_valid_mask.tolist() == [[False, True]]
+    assert not result.left_hole_mask.any()
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"max_eye_shift_fraction": -0.1},
+        {"max_eye_shift_fraction": float("inf")},
+        {"max_eye_shift_fraction": 0.1, "occlusion_fill": "telea"},
+    ],
+)
+def test_splat_settings_reject_invalid_values(values: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        StereoSplatSettings(**values)
+
+
 def test_geometry_maps_are_built_once_and_reused_after_oom(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -171,35 +301,43 @@ def test_geometry_maps_are_built_once_and_reused_after_oom(
     attempts: list[tuple[int, int]] = []
 
     def fake_geometry(
-        canonical: torch.Tensor,
-        settings: StereoRenderSettings,
+        total_disparity_fraction: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
         nonlocal geometry_calls
-        del settings
         geometry_calls += 1
-        offsets = np.zeros(canonical.shape, dtype=np.int32)
+        offsets = np.zeros(total_disparity_fraction.shape, dtype=np.int32)
         return offsets, offsets.copy()
 
     def fake_render(
         source: np.ndarray,
-        resized_canonical: torch.Tensor,
+        geometry: StereoGeometryFrame,
         eye_offsets: tuple[np.ndarray, np.ndarray],
-        settings: StereoRenderSettings,
+        settings: StereoSplatSettings,
         band_height: int,
     ) -> StereoRenderResult:
-        del resized_canonical, settings
+        del geometry, settings
         attempts.append((band_height, id(eye_offsets)))
         if len(attempts) == 1:
             raise torch.cuda.OutOfMemoryError("simulated")
         return _empty_render_result(source)
 
     monkeypatch.setattr(
-        "src.depth_surge_3d.rendering.stereo_renderer.calculate_eye_sample_offsets",
+        "src.depth_surge_3d.rendering.stereo_renderer.calculate_geometry_eye_sample_offsets",
         fake_geometry,
     )
     monkeypatch.setattr(renderer, "_render_with_band_height", fake_render)
 
-    renderer.render(frame, np.full((1, 1), 0.5, dtype=np.float32))
+    geometry = build_relative_geometry(
+        np.full((1, 1), 0.5, dtype=np.float32),
+        frame.shape[:2],
+        stereo_strength=2.0,
+        convergence=0.5,
+    )
+    renderer.render_geometry(
+        frame,
+        geometry,
+        StereoSplatSettings(max_eye_shift_fraction=0.01),
+    )
 
     assert geometry_calls == 1
     assert [height for height, _identity in attempts] == [4, 2]
@@ -227,9 +365,9 @@ def test_real_oom_retry_is_byte_identical_to_direct_retry_band(
 
     def fail_first_attempt(
         source: np.ndarray,
-        resized_canonical: torch.Tensor,
+        geometry: StereoGeometryFrame,
         eye_offsets: tuple[np.ndarray, np.ndarray],
-        render_settings: StereoRenderSettings,
+        render_settings: StereoSplatSettings,
         band_height: int,
     ) -> StereoRenderResult:
         attempted_heights.append(band_height)
@@ -237,7 +375,7 @@ def test_real_oom_retry_is_byte_identical_to_direct_retry_band(
             raise torch.cuda.OutOfMemoryError("simulated")
         return original(
             source,
-            resized_canonical,
+            geometry,
             eye_offsets,
             render_settings,
             band_height,
@@ -255,18 +393,25 @@ def test_real_oom_retry_is_byte_identical_to_direct_retry_band(
 def test_renderer_slices_full_frame_offsets_and_uses_global_source_indexes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[torch.Tensor, int]] = []
+    calls: list[tuple[torch.Tensor, torch.Tensor, int]] = []
 
     def fake_splat(
         image: torch.Tensor,
-        canonical: torch.Tensor,
+        near_score: torch.Tensor,
         sample_offsets: torch.Tensor,
         *,
         source_index_offset: int,
+        source_valid: torch.Tensor,
     ) -> SubpixelSplatResult:
-        calls.append((sample_offsets.detach().cpu(), source_index_offset))
+        calls.append(
+            (
+                sample_offsets.detach().cpu(),
+                source_valid.detach().cpu(),
+                source_index_offset,
+            )
+        )
         colour = image.to(torch.float32).repeat_interleave(HORIZONTAL_SUBPIXELS, dim=1)
-        disparity = canonical.repeat_interleave(HORIZONTAL_SUBPIXELS, dim=1)
+        disparity = near_score.repeat_interleave(HORIZONTAL_SUBPIXELS, dim=1)
         valid = torch.ones(disparity.shape, dtype=torch.bool, device=image.device)
         return _subpixel_result(colour, valid, disparity)
 
@@ -287,7 +432,7 @@ def test_renderer_slices_full_frame_offsets_and_uses_global_source_indexes(
         StereoRenderSettings(stereo_strength=0.0, occlusion_fill="none"),
     )
 
-    assert [(value.shape[0], offset) for value, offset in calls] == [
+    assert [(value.shape[0], offset) for value, _valid, offset in calls] == [
         (2, 0),
         (2, 10),
         (1, 20),
@@ -295,7 +440,8 @@ def test_renderer_slices_full_frame_offsets_and_uses_global_source_indexes(
         (2, 10),
         (1, 20),
     ]
-    assert all(value.dtype == torch.int32 for value, _offset in calls)
+    assert all(value.dtype == torch.int32 for value, _valid, _offset in calls)
+    assert all(valid.dtype == torch.bool and valid.all() for _value, valid, _offset in calls)
     assert np.array_equal(result.left_image, frame)
     assert np.array_equal(result.right_image, frame)
 
@@ -451,7 +597,7 @@ def test_second_cuda_oom_reports_frame_and_both_attempted_heights(
 
 
 def test_renderer_catches_the_cuda_oom_type_supported_by_torch_2_0() -> None:
-    text = inspect.getsource(StereoRenderer.render)
+    text = inspect.getsource(StereoRenderer._render_splat_core)
 
     assert "except torch.cuda.OutOfMemoryError" in text
     assert "except torch.OutOfMemoryError" not in text

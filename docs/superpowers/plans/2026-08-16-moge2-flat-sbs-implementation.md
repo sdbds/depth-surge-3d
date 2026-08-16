@@ -1786,7 +1786,7 @@ def calculate_geometry_eye_sample_offsets(
 
 `StereoRenderer.render_geometry(frame, geometry, StereoSplatSettings)` validates that geometry already matches the source raster, computes offsets once, and passes `geometry.near_score` plus `geometry.source_valid` to every band. Fill width is `ceil(width * max_eye_shift_fraction) + 2`.
 
-Retain `StereoRenderer.render(frame, canonical, StereoRenderSettings)` as a relative-only compatibility wrapper that calls `build_relative_geometry` and `render_geometry` with `max_eye_shift_fraction=stereo_strength/200`. Keep the existing `calculate_eye_sample_offsets(canonical, settings)` wrapper for callers/tests.
+Human-approved compatibility exception (2026-08-16): retain `StereoRenderer.render(frame, canonical, StereoRenderSettings)` as a relative-only compatibility wrapper that calls `build_relative_geometry`, computes eye offsets with the legacy `calculate_eye_sample_offsets(canonical, settings)` float64 operation order, and delegates those offsets to the same private splat core used by `render_geometry`, with `max_eye_shift_fraction=stereo_strength/200`. It must not delegate offset calculation through public `render_geometry`: the common formula's required operation order differs at legal half-lane boundaries. `render_geometry` continues to use `calculate_geometry_eye_sample_offsets` exactly as specified above; do not expose legacy arithmetic through common/metric geometry fields or the public geometry path.
 
 - [ ] **Step 7: Run common renderer tests and the frozen hash**
 

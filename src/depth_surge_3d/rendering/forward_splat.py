@@ -23,40 +23,64 @@ class SubpixelSplatResult:
 
 def _validate_inputs(
     image: torch.Tensor,
-    canonical: torch.Tensor,
+    near_score: torch.Tensor,
     sample_offsets: torch.Tensor,
     source_index_offset: int,
-) -> torch.Tensor:
-    if image.ndim != 3 or canonical.ndim != 2 or sample_offsets.ndim != 2:
+    source_valid: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if image.ndim != 3 or near_score.ndim != 2 or sample_offsets.ndim != 2:
         raise ValueError("Splat inputs must be unbatched [H,W,3], [H,W], and [H,W]")
     if image.shape[-1] != 3:
         raise ValueError("Image must have exactly three channels")
-    if canonical.shape != image.shape[:2] or sample_offsets.shape != canonical.shape:
-        raise ValueError("Canonical disparity and sample offsets must match the image")
-    if image.device != canonical.device or image.device != sample_offsets.device:
-        raise ValueError("Image, canonical disparity, and offsets must use the same device")
-    if canonical.dtype != torch.float32:
-        raise ValueError("Canonical disparity must use float32")
+    if near_score.shape != image.shape[:2] or sample_offsets.shape != near_score.shape:
+        raise ValueError("Near score and sample offsets must match the image")
+    if image.device != near_score.device or image.device != sample_offsets.device:
+        raise ValueError("Image, near score, and offsets must use the same device")
+    _validate_near_score(near_score)
     if sample_offsets.dtype != torch.int32:
         raise ValueError("Sample offsets must use int32")
     if image.is_floating_point() and not torch.isfinite(image).all():
         raise ValueError("Image values must be finite")
-    if not torch.isfinite(canonical).all() or (canonical < 0.0).any() or (canonical > 1.0).any():
-        raise ValueError("Canonical disparity must be finite and lie within [0, 1]")
-    pixel_count = canonical.numel()
+    source_valid = _validate_source_valid(image, near_score, source_valid)
+    pixel_count = near_score.numel()
     if source_index_offset < 0 or source_index_offset + pixel_count > _SOURCE_INDEX_LIMIT:
         raise ValueError("Full-frame source indexes must fit in 32 bits")
-    return image.to(dtype=torch.float32)
+    return image.to(dtype=torch.float32), source_valid
+
+
+def _validate_near_score(near_score: torch.Tensor) -> None:
+    if near_score.dtype != torch.float32:
+        raise ValueError("Near score must use float32")
+    if not torch.isfinite(near_score).all():
+        raise ValueError("Near score must be finite")
+    if (near_score < 0.0).any():
+        raise ValueError("Near score must be nonnegative")
+
+
+def _validate_source_valid(
+    image: torch.Tensor,
+    near_score: torch.Tensor,
+    source_valid: torch.Tensor | None,
+) -> torch.Tensor:
+    if source_valid is None:
+        return torch.ones_like(near_score, dtype=torch.bool)
+    if source_valid.shape != near_score.shape:
+        raise ValueError("Source validity must match the near score")
+    if source_valid.dtype != torch.bool:
+        raise ValueError("Source validity must use bool")
+    if source_valid.device != image.device:
+        raise ValueError("Source validity must use the same device as the image")
+    return source_valid
 
 
 def _pack_depth_source_key(
-    canonical: torch.Tensor,
+    near_score: torch.Tensor,
     source_index: torch.Tensor,
 ) -> torch.Tensor:
     """Pack nonnegative float32 depth and lowest-source tie order into int64."""
 
-    positive_zero = torch.zeros((), dtype=torch.float32, device=canonical.device)
-    normalized = torch.where(canonical == 0.0, positive_zero, canonical)
+    positive_zero = torch.zeros((), dtype=torch.float32, device=near_score.device)
+    normalized = torch.where(near_score == 0.0, positive_zero, near_score)
     depth_bits = normalized.contiguous().view(torch.int32).to(torch.int64)
     depth_bits.bitwise_and_(_UINT32_MASK)
     indexes = source_index.to(dtype=torch.int64)
@@ -86,27 +110,29 @@ def _expanded_targets(sample_offsets: torch.Tensor) -> tuple[torch.Tensor, torch
 
 
 def _winner_keys(
-    canonical: torch.Tensor,
+    near_score: torch.Tensor,
     sample_offsets: torch.Tensor,
     source_index_offset: int,
+    source_valid: torch.Tensor,
 ) -> torch.Tensor:
-    pixel_count = canonical.numel()
+    pixel_count = near_score.numel()
     target_count = pixel_count * HORIZONTAL_SUBPIXELS
     source_indexes = torch.arange(
         source_index_offset,
         source_index_offset + pixel_count,
         dtype=torch.int64,
-        device=canonical.device,
-    ).reshape(canonical.shape)
-    source_keys = _pack_depth_source_key(canonical, source_indexes)
+        device=near_score.device,
+    ).reshape(near_score.shape)
+    source_keys = _pack_depth_source_key(near_score, source_indexes)
     target_indexes, in_bounds = _expanded_targets(sample_offsets)
     candidate_keys = source_keys.unsqueeze(-1).expand_as(target_indexes)
-    candidate_keys = candidate_keys.masked_fill(~in_bounds, -1)
+    candidate_valid = in_bounds & source_valid.unsqueeze(-1)
+    candidate_keys = candidate_keys.masked_fill(~candidate_valid, -1)
     winners = torch.full(
         (target_count,),
         -1,
         dtype=torch.int64,
-        device=canonical.device,
+        device=near_score.device,
     )
     winners.scatter_reduce_(
         0,
@@ -120,17 +146,17 @@ def _winner_keys(
 
 def _gather_winners(
     source: torch.Tensor,
-    canonical: torch.Tensor,
+    near_score: torch.Tensor,
     winners: torch.Tensor,
     source_index_offset: int,
 ) -> SubpixelSplatResult:
-    height, width = canonical.shape
+    height, width = near_score.shape
     fine_width = width * HORIZONTAL_SUBPIXELS
     valid = winners >= 0
     local_indexes = _decode_source_index(winners) - source_index_offset
-    local_indexes.clamp_(0, canonical.numel() - 1)
+    local_indexes.clamp_(0, near_score.numel() - 1)
     colour = source.reshape(-1, 3)[local_indexes]
-    disparity = canonical.reshape(-1)[local_indexes]
+    disparity = near_score.reshape(-1)[local_indexes]
     colour = torch.where(valid.unsqueeze(1), colour, 0.0)
     disparity = torch.where(valid, disparity, -torch.inf)
     return SubpixelSplatResult(
@@ -142,13 +168,20 @@ def _gather_winners(
 
 def forward_splat_band(
     image: torch.Tensor,
-    canonical: torch.Tensor,
+    near_score: torch.Tensor,
     sample_offsets: torch.Tensor,
     *,
     source_index_offset: int = 0,
+    source_valid: torch.Tensor | None = None,
 ) -> SubpixelSplatResult:
     """Resolve 16 horizontal samples per source pixel with one integer max."""
 
-    source = _validate_inputs(image, canonical, sample_offsets, source_index_offset)
-    winners = _winner_keys(canonical, sample_offsets, source_index_offset)
-    return _gather_winners(source, canonical, winners, source_index_offset)
+    source, source_valid = _validate_inputs(
+        image,
+        near_score,
+        sample_offsets,
+        source_index_offset,
+        source_valid,
+    )
+    winners = _winner_keys(near_score, sample_offsets, source_index_offset, source_valid)
+    return _gather_winners(source, near_score, winners, source_index_offset)

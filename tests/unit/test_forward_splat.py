@@ -62,6 +62,30 @@ def test_nearer_depth_wins_every_colliding_fine_sample() -> None:
     torch.testing.assert_close(result.disparity[0, full:], torch.full((full,), 0.9))
 
 
+def test_invalid_nearer_source_cannot_win_or_fill() -> None:
+    image = torch.tensor([[[255.0, 0.0, 0.0], [0.0, 0.0, 255.0]]])
+    near_score = torch.tensor([[10.0, 1.0]], dtype=torch.float32)
+    valid = torch.tensor([[False, True]])
+    result = forward_splat_band(
+        image,
+        near_score,
+        _offsets([[HORIZONTAL_SUBPIXELS, 0]]),
+        source_valid=valid,
+    )
+    torch.testing.assert_close(
+        result.colour[0, HORIZONTAL_SUBPIXELS:],
+        image[0, 1].expand(HORIZONTAL_SUBPIXELS, 3),
+    )
+
+
+def test_near_score_may_exceed_one_but_must_be_finite_and_nonnegative() -> None:
+    image = torch.zeros((1, 1, 3))
+    offsets = _offsets([[0]])
+    assert forward_splat_band(image, torch.tensor([[12.0]]), offsets).valid.all()
+    with pytest.raises(ValueError, match="nonnegative"):
+        forward_splat_band(image, torch.tensor([[-0.1]]), offsets)
+
+
 def test_equal_depth_collision_uses_lowest_full_frame_source_index() -> None:
     image = torch.tensor([[[1.0, 2.0, 3.0], [9.0, 8.0, 7.0]]])
     canonical = torch.full((1, 2), 0.5, dtype=torch.float32)
@@ -174,13 +198,33 @@ def test_invalid_shapes_and_offset_dtype_are_rejected(
         forward_splat_band(image, canonical, offsets)
 
 
-@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -0.1, 1.1])
-def test_nonfinite_or_out_of_range_canonical_is_rejected(bad_value: float) -> None:
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -0.1])
+def test_nonfinite_or_negative_near_score_is_rejected(bad_value: float) -> None:
     image = torch.zeros((1, 2, 3), dtype=torch.float32)
-    canonical = torch.tensor([[0.0, bad_value]], dtype=torch.float32)
+    near_score = torch.tensor([[0.0, bad_value]], dtype=torch.float32)
 
-    with pytest.raises(ValueError, match="Canonical"):
-        forward_splat_band(image, canonical, _offsets([[0, 0]]))
+    with pytest.raises(ValueError, match="Near score"):
+        forward_splat_band(image, near_score, _offsets([[0, 0]]))
+
+
+@pytest.mark.parametrize(
+    ("source_valid", "message"),
+    [
+        (torch.ones((1, 2), dtype=torch.float32), "bool"),
+        (torch.ones((2, 1), dtype=torch.bool), "match"),
+    ],
+)
+def test_source_valid_requires_boolean_values_matching_the_raster(
+    source_valid: torch.Tensor,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        forward_splat_band(
+            torch.zeros((1, 2, 3)),
+            torch.ones((1, 2)),
+            _offsets([[0, 0]]),
+            source_valid=source_valid,
+        )
 
 
 def test_source_index_must_fit_in_low_32_bits() -> None:
