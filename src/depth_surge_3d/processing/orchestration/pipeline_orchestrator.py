@@ -165,14 +165,18 @@ class ProcessingOrchestrator:
 
         fps = video_properties.get("fps", 30.0)
 
-        # Step 2: Generate canonical disparity maps (delegated to depth_processor)
-        depth_files = self.depth_processor.generate_depth_map_files(
+        # Step 2: Generate selected geometry (delegated to depth_processor)
+        geometry_files = self.depth_processor.generate_depth_map_files(
             frame_files, settings, directories, progress_tracker
         )
-        if depth_files is None:
+        if geometry_files is None:
             return False
-        print(step_complete(f"Step 2: Prepared {len(depth_files)} canonical disparity maps"))
-        self._print_saved_to(directories.get("disparity_maps"), "Canonical disparity maps")
+        metric_mode = settings.get("stereo_geometry_mode", "relative") == "metric_camera"
+        geometry_label = "metric geometry frames" if metric_mode else "canonical disparity maps"
+        saved_label = "Metric geometry frames" if metric_mode else "Canonical disparity maps"
+        geometry_dir = directories.get("metric_geometry" if metric_mode else "disparity_maps")
+        print(step_complete(f"Step 2: Prepared {len(geometry_files)} {geometry_label}"))
+        self._print_saved_to(geometry_dir, saved_label)
         print()  # Blank line after step
 
         # Execute steps 3-8
@@ -180,7 +184,7 @@ class ProcessingOrchestrator:
             directories,
             settings,
             frame_files,
-            depth_files,
+            geometry_files,
             fps,
             video_path,
             output_path,
@@ -192,7 +196,7 @@ class ProcessingOrchestrator:
         directories: dict[str, Path],
         settings: dict[str, Any],
         frame_files: list[Path],
-        depth_files: list[Path],
+        geometry_files: list[Path],
         fps: float,
         video_path: str,
         output_path: Path,
@@ -205,7 +209,7 @@ class ProcessingOrchestrator:
             directories: Dictionary of processing directories
             settings: Processing settings
             frame_files: List of extracted frame files
-            depth_files: List of disk-backed depth map files
+            geometry_files: List of disk-backed geometry files
             fps: Video frames per second
             video_path: Input video path
             output_path: Output directory path
@@ -223,7 +227,7 @@ class ProcessingOrchestrator:
         # Step 3: Create stereo pairs (delegated to stereo_generator)
         if not self.stereo_generator.create_stereo_pairs_from_files(
             frame_files,
-            depth_files,
+            geometry_files,
             directories,
             settings,
             progress_tracker,

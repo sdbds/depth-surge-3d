@@ -457,12 +457,21 @@ class TestExecutePipeline:
         assert result is False
         distortion_processor.apply_distortion.assert_not_called()
 
-    def test_pipeline_uses_disk_backed_depth_and_stereo_apis(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("geometry_mode", "stage_key", "suffix", "saved_label"),
+        [
+            ("relative", "disparity_maps", ".png", "Canonical disparity maps"),
+            ("metric_camera", "metric_geometry", ".npz", "Metric geometry frames"),
+        ],
+    )
+    def test_pipeline_uses_disk_backed_depth_and_stereo_apis(
+        self, tmp_path, geometry_mode, stage_key, suffix, saved_label
+    ):
         """The video path never builds whole-video frame or depth arrays."""
         frame_files = [tmp_path / "frame_000001.png"]
-        depth_files = [tmp_path / "depth_000001.png"]
+        geometry_files = [tmp_path / f"depth_000001{suffix}"]
         depth_processor = Mock()
-        depth_processor.generate_depth_map_files.return_value = depth_files
+        depth_processor.generate_depth_map_files.return_value = geometry_files
         depth_processor.generate_depth_maps.side_effect = AssertionError("array depth API used")
         stereo_generator = Mock()
         stereo_generator.create_stereo_pairs_from_files.return_value = True
@@ -478,6 +487,7 @@ class TestExecutePipeline:
             "base": tmp_path,
             "frames": tmp_path / "frames",
             "disparity_maps": tmp_path / "disparity",
+            "metric_geometry": tmp_path / "metric_geometry",
             "left_frames": tmp_path / "left",
             "right_frames": tmp_path / "right",
             "left_cropped": tmp_path / "left_cropped",
@@ -494,6 +504,7 @@ class TestExecutePipeline:
             "vr_output_height": 8,
             "vr_resolution": "custom",
             "keep_intermediates": True,
+            "stereo_geometry_mode": geometry_mode,
         }
         orchestrator = ProcessingOrchestrator(
             depth_processor,
@@ -520,7 +531,7 @@ class TestExecutePipeline:
         depth_processor.generate_depth_map_files.assert_called_once()
         stereo_generator.create_stereo_pairs_from_files.assert_called_once()
         video_encoder.create_video_from_stereo_sequences.assert_not_called()
-        saved_to.assert_any_call(directories["disparity_maps"], "Canonical disparity maps")
+        saved_to.assert_any_call(directories[stage_key], saved_label)
 
 
 class TestHandleStepError:

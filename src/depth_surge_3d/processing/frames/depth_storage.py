@@ -164,7 +164,7 @@ def _fits_float16(values: np.ndarray) -> bool:
     finite = finite[np.isfinite(finite)]
     if finite.size == 0:
         return True
-    limit = np.finfo(np.float16).max
+    limit: float = float(np.finfo(np.float16).max)
     return bool(finite.min() >= -limit and finite.max() <= limit)
 
 
@@ -188,6 +188,24 @@ def estimate_depth_disk_bytes(
         native_width * native_height * storage_bytes, native_width * native_height * 2
     )
     return int(max(raw_allowance, canonical_allowance) + atomic_overlap)
+
+
+def estimate_raw_depth_only_bytes(
+    *,
+    frame_count: int,
+    native_width: int,
+    native_height: int,
+    storage_bytes: int,
+    camera_bytes_per_frame: int,
+) -> int:
+    """Return the conservative raw-only payload allowance for metric preflight."""
+
+    if frame_count < 0 or native_width < 1 or native_height < 1 or storage_bytes < 1:
+        raise ValueError("Raw frame count must be nonnegative and dimensions/storage positive")
+    if camera_bytes_per_frame < 0:
+        raise ValueError("Raw camera bytes must be nonnegative")
+    payload = frame_count * (native_width * native_height * storage_bytes + camera_bytes_per_frame)
+    return (5 * payload + 3) // 4
 
 
 def require_disk_space(

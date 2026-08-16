@@ -19,8 +19,47 @@ from src.depth_surge_3d.processing.frames.depth_storage import (
     RawDepthStore,
     build_model_fingerprint,
     estimate_depth_disk_bytes,
+    estimate_raw_depth_only_bytes,
     require_disk_space,
 )
+
+
+def test_raw_depth_only_estimate_preserves_five_quarters_payload_allowance() -> None:
+    assert (
+        estimate_raw_depth_only_bytes(
+            frame_count=3,
+            native_width=6,
+            native_height=8,
+            storage_bytes=4,
+            camera_bytes_per_frame=4,
+        )
+        == 735
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"frame_count": -1, "native_width": 1, "native_height": 1, "storage_bytes": 1},
+        {"frame_count": 0, "native_width": 0, "native_height": 1, "storage_bytes": 1},
+        {"frame_count": 0, "native_width": 1, "native_height": 0, "storage_bytes": 1},
+        {"frame_count": 0, "native_width": 1, "native_height": 1, "storage_bytes": 0},
+    ],
+)
+def test_raw_depth_only_estimate_rejects_invalid_shape_and_storage(arguments) -> None:
+    with pytest.raises(ValueError):
+        estimate_raw_depth_only_bytes(**arguments, camera_bytes_per_frame=0)
+
+
+def test_raw_depth_only_estimate_rejects_negative_camera_payload() -> None:
+    with pytest.raises(ValueError, match="camera"):
+        estimate_raw_depth_only_bytes(
+            frame_count=0,
+            native_width=1,
+            native_height=1,
+            storage_bytes=1,
+            camera_bytes_per_frame=-1,
+        )
 
 
 class _Estimator:
