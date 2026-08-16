@@ -1013,13 +1013,7 @@ class DepthMapProcessor:
         else:
             input_size = self._auto_determine_input_size(frame_w, frame_h, megapixels)
 
-        # Get model information
-        model_version = "v3" if hasattr(self.depth_estimator, "model_type") else "v2"
-        model_size = (
-            self.depth_estimator.get_model_size()
-            if hasattr(self.depth_estimator, "get_model_size")
-            else "base"
-        )
+        model_version, model_size = self._resource_profile()
 
         # Calculate optimal chunk size based on VRAM
         if vram_info["total"] > 0:
@@ -1040,6 +1034,34 @@ class DepthMapProcessor:
             chunk_size = min(chunk_size, max_batch_size)
 
         return chunk_size, input_size
+
+    def _resource_profile(self) -> tuple[str, str]:
+        """Map stable estimator metadata to the existing VRAM sizing profiles."""
+        metadata: dict[str, Any] = {}
+        get_model_info = getattr(self.depth_estimator, "get_model_info", None)
+        if callable(get_model_info):
+            reported = get_model_info()
+            if isinstance(reported, dict):
+                metadata = reported
+
+        backend_id = metadata.get("backend_id", getattr(self.depth_estimator, "backend_id", None))
+        family = metadata.get("family")
+        if backend_id == "moge2" or family == "moge":
+            model_size = metadata.get(
+                "model_size",
+                getattr(self.depth_estimator, "model_size", metadata.get("model_name", "vitb")),
+            )
+            return "v3", {"vits": "small", "vitb": "base", "vitl": "large"}.get(
+                str(model_size), "base"
+            )
+
+        model_version = "v3" if hasattr(self.depth_estimator, "model_type") else "v2"
+        model_size = (
+            self.depth_estimator.get_model_size()
+            if hasattr(self.depth_estimator, "get_model_size")
+            else "base"
+        )
+        return model_version, model_size
 
     def _auto_determine_input_size(self, frame_w: int, frame_h: int, megapixels: float) -> int:
         """

@@ -494,12 +494,19 @@ git commit -m "build: add pinned optional MoGe-2 dependency"
 - Modify: `src/depth_surge_3d/inference/__init__.py`
 - Modify: `src/depth_surge_3d/rendering/stereo_projector.py`
 - Modify: `src/depth_surge_3d/processing/frames/depth_processor.py`
-- Modify: `src/depth_surge_3d/utils/domain/resolution.py`
+- Modify: `tests/unit/test_depth_processor.py`
 - Modify: `tests/integration/test_end_to_end.py`
 
 **Interfaces:**
 - Consumes: existing V2, V3, and See-Through factory functions and constants.
-- Produces: all registry interfaces in **Shared Interfaces** and registry-based projector construction.
+- Produces: foundational registry dataclasses plus `get_backend_spec`,
+  `list_backend_specs`, `backend_availability`, `resolve_model_variant`, and
+  `create_registered_depth_estimator`, together with registry-based projector
+  construction.
+- Deferred ownership: Task 7 implements `validate_backend_geometry_request`;
+  Task 13 implements `TEMPORAL_STABILITY_WARNING` and
+  `build_effective_depth_run_report`. The global **Shared Interfaces** section
+  remains the eventual cross-task contract.
 
 - [ ] **Step 1: Write failing registry tests for identity, variants, capabilities, and unknown IDs**
 
@@ -625,7 +632,7 @@ def _create_see_through(request: EstimatorRequest) -> Any:
     )
 ```
 
-Register V2 defaults as `vitl`, V3 defaults as `vitl`, See-Through as the single `vitl` presentation variant, and MoGe as `vitb`. The MoGe factory imports `create_video_depth_estimator_moge2` inside the function so a default installation can import the registry.
+Register V2 defaults as `vitl`, V3 defaults as `vitl`, See-Through as the single `vitl` presentation variant, and MoGe as `vitb`. The MoGe entry is a lazy adapter handoff so a default installation can import the registry; Task 4 owns `video_depth_estimator_moge2.py`, selected-factory construction, and its focused adapter test.
 
 - [ ] **Step 5: Replace projector `if/elif/else` construction with one registry call**
 
@@ -669,14 +676,14 @@ def test_projector_rejects_unknown_backend_without_constructing_an_estimator(mon
 
 - [ ] **Step 6: Run registry and projector tests**
 
-Run: `uv run pytest tests/unit/test_backend_registry.py tests/unit/test_stereo_projector.py tests/integration/test_end_to_end.py -v`
+Run: `uv run pytest tests/unit/test_depth_processor.py tests/unit/test_backend_registry.py tests/unit/test_stereo_projector.py tests/integration/test_end_to_end.py -v`
 
 Expected: PASS without importing `moge` in tests that do not select it.
 
 - [ ] **Step 7: Commit the registry slice**
 
 ```bash
-git add src/depth_surge_3d/inference/depth/backend_registry.py src/depth_surge_3d/inference/depth/__init__.py src/depth_surge_3d/inference/__init__.py src/depth_surge_3d/rendering/stereo_projector.py tests/unit/test_backend_registry.py tests/unit/test_stereo_projector.py tests/integration/test_end_to_end.py
+git add docs/superpowers/plans/2026-08-16-moge2-flat-sbs-implementation.md src/depth_surge_3d/inference/depth/backend_registry.py src/depth_surge_3d/inference/depth/__init__.py src/depth_surge_3d/inference/__init__.py src/depth_surge_3d/rendering/stereo_projector.py src/depth_surge_3d/processing/frames/depth_processor.py tests/unit/test_backend_registry.py tests/unit/test_depth_processor.py tests/unit/test_stereo_projector.py tests/integration/test_end_to_end.py
 git commit -m "refactor: centralize depth backend dispatch"
 ```
 

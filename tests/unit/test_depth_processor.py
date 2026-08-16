@@ -198,6 +198,34 @@ class TestDetermineChunkParams:
         assert chunk_size in [4, 6, 8, 12, 16, 24, 32]  # Fixed size for CPU (actual constants)
         assert input_size == 1080
 
+    def test_moge_uses_framewise_base_profile_and_single_frame_cap(self):
+        """MoGe metadata selects its framewise profile before enforcing its batch cap."""
+
+        class FakeMoGeEstimator:
+            backend_id = "moge2"
+            model_size = "vitb"
+            max_batch_size = 1
+
+            @staticmethod
+            def get_model_info() -> dict[str, str]:
+                return {"family": "moge", "model_name": "vitb"}
+
+        processor = DepthMapProcessor(FakeMoGeEstimator(), verbose=False)
+        with (
+            patch(
+                "src.depth_surge_3d.processing.frames.depth_processor.get_vram_info",
+                return_value={"total": 8.0, "available": 6.0},
+            ),
+            patch(
+                "src.depth_surge_3d.processing.frames.depth_processor.calculate_optimal_chunk_size",
+                return_value=8,
+            ) as calculate_chunk_size,
+        ):
+            chunk_size, input_size = processor._determine_chunk_params(1920, 1080, "auto")
+
+        assert (chunk_size, input_size) == (1, 1080)
+        calculate_chunk_size.assert_called_once_with(1920, 1080, 1080, "v3", "base")
+
 
 class TestAutoDetermineInputSize:
     """Test automatic input size determination."""
