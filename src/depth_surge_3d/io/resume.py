@@ -776,16 +776,18 @@ def _validate_raw_stage(
     source_fingerprint: str | None,
     upstream_reusable: bool,
     current_model_fingerprint: dict[str, Any] | None,
-) -> tuple[ResumeStage, dict[str, Any] | None]:
+) -> tuple[ResumeStage, dict[str, Any] | None, int]:
     raw_dir = output_dir / "02_depth_raw"
     paths = (raw_dir,)
     if not _has_payload(raw_dir):
-        return _stage("depth_raw", paths, "missing", "raw depth is absent"), None
+        return _stage("depth_raw", paths, "missing", "raw depth is absent"), None, 0
     if not upstream_reusable or source_fingerprint is None:
-        return _stage("depth_raw", paths, "invalidate", "scene or frame stage is invalid"), None
+        stage = _stage("depth_raw", paths, "invalidate", "scene or frame stage is invalid")
+        return stage, None, 0
     metadata = _read_json(raw_dir / "metadata.json")
     if metadata is None:
-        return _stage("depth_raw", paths, "invalidate", "raw-depth metadata is missing"), None
+        stage = _stage("depth_raw", paths, "invalidate", "raw-depth metadata is missing")
+        return stage, None, 0
     reason = _raw_mismatch_reason(
         metadata,
         current_settings,
@@ -794,20 +796,22 @@ def _validate_raw_stage(
         current_model_fingerprint,
     )
     if reason is not None:
-        return _stage("depth_raw", paths, "invalidate", reason), None
+        return _stage("depth_raw", paths, "invalidate", reason), None, 0
     try:
-        completed_count = RawDepthStore(raw_dir, metadata).validate_payloads()
+        completed_count = RawDepthStore(raw_dir, metadata).validate_payloads(
+            cleanup_temporaries=False
+        )
     except RawDepthFingerprintError as error:
         reason = f"raw-depth payload validation failed: {error}"
-        return _stage("depth_raw", paths, "invalidate", reason), None
+        return _stage("depth_raw", paths, "invalidate", reason), None, 0
     if _raw_promotion_pending(metadata, current_settings):
         reason = "raw-depth float16-to-float32 promotion will resume"
-        return _stage("depth_raw", paths, "resume", reason), None
+        return _stage("depth_raw", paths, "resume", reason), None, completed_count
     disposition: Disposition = "resume"
     if completed_count == len(frame_files):
         disposition = "preserve"
     reason = "raw-depth metadata and partial frame names are reusable"
-    return _stage("depth_raw", paths, disposition, reason), metadata
+    return _stage("depth_raw", paths, disposition, reason), metadata, completed_count
 
 
 def _canonical_mismatch_reason(
@@ -929,13 +933,11 @@ def _metric_raw_identity_reason(
     metadata: dict[str, Any],
     raw_metadata: dict[str, Any] | None,
 ) -> tuple[str | None, str | None]:
-    raw_fingerprint = raw_metadata.get("fingerprint") if isinstance(raw_metadata, dict) else None
-    if not isinstance(raw_fingerprint, str) or not raw_fingerprint:
-        raw_fingerprint = metadata.get("source_raw_fingerprint")
+    if not isinstance(raw_metadata, dict):
+        return None, "current raw depth identity is incompatible or unavailable"
+    raw_fingerprint = raw_metadata.get("fingerprint")
     if not isinstance(raw_fingerprint, str) or not raw_fingerprint:
         return None, "metric geometry source raw fingerprint is missing"
-    if not isinstance(raw_metadata, dict):
-        return raw_fingerprint, None
     if metadata.get("native_shape") != raw_metadata.get("native_shape"):
         return None, "metric geometry native shape does not match raw depth"
     if metadata.get("source_raw_fingerprint") != raw_metadata.get("fingerprint"):
@@ -976,6 +978,7 @@ def _validate_metric_geometry_stage(
             source_raw_fingerprint=raw_fingerprint,
             source_frame_fingerprint=source_frame_fingerprint,
             candidate_scene_fingerprint=_candidate_scene_fingerprint(manifest),
+            cleanup_temporaries=False,
         )
     except (KeyError, OSError, TypeError, ValueError) as error:
         reason = f"metric geometry validation failed: {error}"
@@ -1050,9 +1053,9 @@ def _stereo_metadata_matches(
         return False
 
     occlusion_fill = current_settings.get("occlusion_fill")
-    if metadata.get("occlusion_fill", occlusion_fill) != occlusion_fill:
-        return False
     if geometry_mode == "relative":
+        if metadata.get("occlusion_fill", occlusion_fill) != occlusion_fill:
+            return False
         expected_render_settings = {
             "stereo_strength": current_settings.get("stereo_strength"),
             "convergence": current_settings.get("convergence"),
@@ -1062,6 +1065,8 @@ def _stereo_metadata_matches(
             metadata.get("source_canonical_fingerprint") == geometry_metadata.get("fingerprint")
             and metadata.get("render_settings") == expected_render_settings
         )
+    if metadata.get("occlusion_fill") != occlusion_fill:
+        return False
 
     render_shape = _positive_shape(metadata, "render_shape")
     if render_shape is None:
@@ -1266,7 +1271,7 @@ def build_resume_report(
         migrated_settings,
     )
     scene_reusable = scene.disposition in {"preserve", "resume"}
-    raw, raw_metadata = _validate_raw_stage(
+    raw, raw_metadata, raw_completed_count = _validate_raw_stage(
         root,
         migrated_settings,
         frame_files,
@@ -1304,7 +1309,7 @@ def build_resume_report(
     stages.append(metric)
 
     selected_stage = canonical if geometry_mode == "relative" else metric
-    if selected_stage.disposition == "missing" and raw.disposition not in {"preserve", "resume"}:
+    if selected_stage.disposition == "missing" and raw_completed_count == 0:
         selected_stage = _stage(
             selected_stage.name,
             selected_stage.paths,

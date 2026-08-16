@@ -506,13 +506,14 @@ class RawDepthStore:
         if np.dtype(dtype) not in allowed_dtypes:
             raise RawDepthFingerprintError(f"Raw-depth payload dtype mismatch: {path}")
 
-    def validate_payloads(self) -> int:
-        """Validate every persisted NPZ header and return the completed count."""
+    def validate_payloads(self, *, cleanup_temporaries: bool = True) -> int:
+        """Validate persisted NPZ headers, optionally cleaning interrupted writes."""
 
         frame_names, native_shape, allowed_dtypes = self._payload_contract()
 
-        for temporary in self.directory.glob("*.npz.tmp"):
-            temporary.unlink(missing_ok=True)
+        if cleanup_temporaries:
+            for temporary in self.directory.glob("*.npz.tmp"):
+                temporary.unlink(missing_ok=True)
 
         expected_names = {self.path_for(name).name for name in frame_names}
         actual_names = {path.name for path in self.directory.glob("*.npz")}

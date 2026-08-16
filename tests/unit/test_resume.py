@@ -1133,6 +1133,38 @@ def test_metric_stereo_settings_invalidate_only_stereo(tmp_path, setting_name, n
     assert report.stage("stereo").disposition == "invalidate"
 
 
+def test_depth_identity_change_invalidates_metric_geometry_and_stereo(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path)
+
+    report = build_resume_report(tmp_path, {**settings, "depth_resolution": 512})
+
+    assert report.stage("depth_raw").disposition == "invalidate"
+    assert "depth_resolution" in report.stage("depth_raw").reason
+    assert report.stage("metric_geometry").disposition == "invalidate"
+    assert report.stage("stereo").disposition == "invalidate"
+
+
+def test_completed_metric_geometry_reuses_compatible_ready_raw_identity_without_payloads(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path)
+    raw_dir = tmp_path / "02_depth_raw"
+    for path in raw_dir.glob("*.npz"):
+        path.unlink()
+    metadata_path = raw_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["completed_count"] = 0
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("depth_raw").disposition == "resume"
+    assert report.stage("metric_geometry").disposition == "preserve"
+    assert report.stage("stereo").disposition == "preserve"
+
+
 def test_crop_change_invalidates_metric_stereo_but_not_relative_stereo(tmp_path):
     from src.depth_surge_3d.io.resume import build_resume_report
 
@@ -1193,8 +1225,12 @@ def test_no_raw_missing_selected_mode_reports_reinference_without_deletion(tmp_p
 
     _, settings = _metric_job(tmp_path, include_relative=False)
     raw_dir = tmp_path / "02_depth_raw"
-    for path in raw_dir.iterdir():
+    for path in raw_dir.glob("*.npz"):
         path.unlink()
+    metadata_path = raw_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["completed_count"] = 0
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
     frames_before = _directory_bytes(tmp_path / "00_original_frames")
     metric_before = _directory_bytes(tmp_path / "03_metric_geometry")
 
@@ -1207,6 +1243,45 @@ def test_no_raw_missing_selected_mode_reports_reinference_without_deletion(tmp_p
     assert report.stage("metric_geometry").disposition == "preserve"
     assert _directory_bytes(tmp_path / "00_original_frames") == frames_before
     assert _directory_bytes(tmp_path / "03_metric_geometry") == metric_before
+
+
+def test_resume_report_keeps_raw_and_metric_temporary_files(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path)
+    raw_temporary = tmp_path / "02_depth_raw" / "sentinel.npz.tmp"
+    metric_temporary = tmp_path / "03_metric_geometry" / "sentinel.tmp"
+    raw_temporary.write_bytes(b"raw temporary")
+    metric_temporary.write_bytes(b"metric temporary")
+    before = {
+        "raw": _directory_bytes(tmp_path / "02_depth_raw"),
+        "metric": _directory_bytes(tmp_path / "03_metric_geometry"),
+    }
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("depth_raw").disposition == "preserve"
+    assert report.stage("metric_geometry").disposition == "preserve"
+    assert _directory_bytes(tmp_path / "02_depth_raw") == before["raw"]
+    assert _directory_bytes(tmp_path / "03_metric_geometry") == before["metric"]
+
+
+def test_metric_stereo_manifest_requires_explicit_occlusion_fill(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path)
+    metadata_path = tmp_path / "04_left_frames" / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("occlusion_fill")
+    metadata["fingerprint"] = canonical_json_hash(
+        {key: value for key, value in metadata.items() if key != "fingerprint"}
+    )
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("metric_geometry").disposition == "preserve"
+    assert report.stage("stereo").disposition == "invalidate"
 
 
 def test_legacy_metric_resume_reprobes_sar_before_report_construction(tmp_path, monkeypatch):

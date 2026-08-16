@@ -506,6 +506,7 @@ class MetricGeometryStore:
         source_raw_fingerprint: str,
         source_frame_fingerprint: str,
         candidate_scene_fingerprint: str,
+        cleanup_temporaries: bool = True,
     ) -> "MetricGeometryStore":
         metadata = cls.read_metadata(directory)
         if metadata is None:
@@ -526,7 +527,7 @@ class MetricGeometryStore:
             raise ValueError("Metric geometry store is not complete")
         store._validate_complete_metadata()
         store._validate_expected_identity(requested)
-        store.validate_payloads()
+        store.validate_payloads(cleanup_temporaries=cleanup_temporaries)
         return store
 
     @classmethod
@@ -833,11 +834,12 @@ class MetricGeometryStore:
             raise ValueError(f"Metric geometry payload is unreadable: {path}") from error
         return MetricGeometryFrame(inverse, valid, focal)
 
-    def validate_payloads(self) -> int:
-        """Validate exact payload membership and content, returning the committed count."""
+    def validate_payloads(self, *, cleanup_temporaries: bool = True) -> int:
+        """Validate exact payloads, optionally cleaning interrupted writes."""
 
-        for temporary in self.directory.glob("*.tmp"):
-            temporary.unlink(missing_ok=True)
+        if cleanup_temporaries:
+            for temporary in self.directory.glob("*.tmp"):
+                temporary.unlink(missing_ok=True)
         frame_names = self.metadata["frame_names"]
         expected_names = {f"{Path(name).stem}.npz" for name in frame_names}
         actual_names = {path.name for path in self.directory.glob("*.npz")}
