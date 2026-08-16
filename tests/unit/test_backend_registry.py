@@ -5,6 +5,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.depth_surge_3d.core.settings import validate_settings
+
 from src.depth_surge_3d.inference.depth.backend_registry import (
     BackendAvailability,
     BackendCapabilities,
@@ -13,7 +15,54 @@ from src.depth_surge_3d.inference.depth.backend_registry import (
     create_registered_depth_estimator,
     get_backend_spec,
     normalize_model_size,
+    validate_backend_geometry_request,
 )
+
+
+def test_non_square_explicit_sar_parses_but_metric_validation_rejects() -> None:
+    from src.depth_surge_3d.io.operations import parse_sample_aspect_ratio
+
+    assert parse_sample_aspect_ratio("4:3") == (4, 3)
+    settings = validate_settings(
+        {
+            "depth_model_version": "moge2",
+            "stereo_geometry_mode": "metric_camera",
+            "vr_format": "side_by_side",
+            "apply_distortion": False,
+        },
+        source="explicit",
+    )
+    with pytest.raises(ValueError, match="square-pixel"):
+        validate_backend_geometry_request(
+            settings,
+            {"sample_aspect_ratio_numerator": 4, "sample_aspect_ratio_denominator": 3},
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "video_properties", "message"),
+    [
+        ({"depth_model_version": "v2"}, {}, "does not support"),
+        ({"vr_format": "over_under"}, {}, "vr_format=side_by_side"),
+        ({"apply_distortion": True}, {}, "apply_distortion=false"),
+        ({}, {}, "sample-aspect-ratio metadata"),
+    ],
+)
+def test_metric_geometry_request_rejects_incompatible_contracts(
+    overrides, video_properties, message
+) -> None:
+    settings = validate_settings(
+        {
+            "depth_model_version": "moge2",
+            "stereo_geometry_mode": "metric_camera",
+            "vr_format": "side_by_side",
+            "apply_distortion": False,
+            **overrides,
+        },
+        source="explicit",
+    )
+    with pytest.raises(ValueError, match=message):
+        validate_backend_geometry_request(settings, video_properties)
 
 
 @pytest.mark.parametrize("backend_id", ["v2", "v3", "see_through", "moge2"])

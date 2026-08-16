@@ -227,6 +227,29 @@ def get_backend_spec(backend_id: str) -> DepthBackendSpec:
         raise ValueError(f"Unknown depth backend: {backend_id}") from exc
 
 
+def validate_backend_geometry_request(
+    settings: Mapping[str, Any], video_properties: Mapping[str, Any]
+) -> None:
+    backend_id = str(settings.get("depth_model_version", "v2"))
+    spec = get_backend_spec(backend_id)
+    mode = cast(StereoGeometryMode, settings.get("stereo_geometry_mode", "relative"))
+    if mode not in spec.capabilities.stereo_geometry_modes:
+        raise ValueError(f"{backend_id} does not support stereo geometry mode {mode}")
+    if mode == "metric_camera":
+        if not spec.capabilities.pinhole_fx:
+            raise ValueError("metric_camera requires pinhole_fx camera output")
+        if settings.get("vr_format") != "side_by_side":
+            raise ValueError("metric_camera requires vr_format=side_by_side")
+        if settings.get("apply_distortion") is not False:
+            raise ValueError("metric_camera requires apply_distortion=false")
+        numerator = video_properties.get("sample_aspect_ratio_numerator")
+        denominator = video_properties.get("sample_aspect_ratio_denominator")
+        if numerator is None or denominator is None:
+            raise ValueError("metric_camera requires source sample-aspect-ratio metadata")
+        if (numerator, denominator) != (1, 1):
+            raise ValueError("metric_camera requires square-pixel source sample_aspect_ratio=1:1")
+
+
 def list_backend_specs() -> tuple[DepthBackendSpec, ...]:
     """List registered backends in their stable presentation order."""
     return _BACKEND_SPECS

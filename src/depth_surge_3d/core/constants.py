@@ -49,6 +49,10 @@ MODEL_CONFIGS = {
 DEFAULT_SETTINGS = {
     "stereo_strength": 2.0,
     "convergence": 0.5,
+    "stereo_geometry_mode": "relative",
+    "virtual_baseline_mm": 63.0,
+    "metric_convergence_distance": "auto",
+    "max_disparity_percent": 2.0,
     "occlusion_fill": "background",
     "scene_detection": True,
     "scene_cut_threshold": 0.55,

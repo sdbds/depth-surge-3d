@@ -11,7 +11,7 @@ from .constants import DEFAULT_SETTINGS, VALIDATION_RANGES
 
 
 SettingsSource = Literal["explicit", "legacy_disk"]
-PROCESSING_SETTINGS_SCHEMA_VERSION = 2
+PROCESSING_SETTINGS_SCHEMA_VERSION = 3
 REMOVED_SETTING_NAMES = {
     "baseline",
     "focal_length",
@@ -53,6 +53,7 @@ _EXISTING_BOOLEAN_SETTINGS = {
     "experimental_frame_interpolation",
 }
 _EXISTING_CHOICE_SETTINGS = {
+    "stereo_geometry_mode": {"relative", "metric_camera"},
     "vr_format": {"side_by_side", "over_under"},
     "fisheye_projection": {"equidistant", "equisolid", "orthogonal", "stereographic"},
     "super_sample": {"auto", "none", "1080p", "4k"},
@@ -143,6 +144,20 @@ def _validate_output_dir(value: object) -> str:
     raise ValueError("output_dir must be a filesystem path")
 
 
+def _validate_metric_convergence(value: object) -> str | float:
+    if value == "auto":
+        return "auto"
+    return _number("metric_convergence_distance", value, 0.1, 1000.0)
+
+
+def _validate_metric_setting(name: str, value: object) -> str | float:
+    if name == "virtual_baseline_mm":
+        return _number(name, value, 0.0, 100.0)
+    if name == "metric_convergence_distance":
+        return _validate_metric_convergence(value)
+    return _number(name, value, 0.0, 5.0)
+
+
 def _validate_existing_setting(name: str, value: object) -> Any:
     if name in _EXISTING_BOOLEAN_SETTINGS:
         return _boolean(name, value)
@@ -209,6 +224,12 @@ def _validate_optional_setting(name: str, value: object) -> Any:
 
 
 def _validate_value(name: str, value: object) -> Any:
+    if name in {
+        "virtual_baseline_mm",
+        "metric_convergence_distance",
+        "max_disparity_percent",
+    }:
+        return _validate_metric_setting(name, value)
     if name in {
         "stereo_strength",
         "convergence",

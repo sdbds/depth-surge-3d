@@ -12,8 +12,10 @@ For pure functions without side effects, see utils/path_utils.py.
 
 from __future__ import annotations
 
-import os
 import json
+import math
+import os
+import re
 import shutil
 import subprocess
 import time
@@ -36,6 +38,25 @@ from ..utils.path_utils import (
     generate_output_filename,
     format_time_duration,
 )
+
+
+_SAR_PATTERN = re.compile(r"([0-9]+):([0-9]+)", flags=re.ASCII)
+_SAR_COMPONENT_MAX = 2_147_483_647
+
+
+def parse_sample_aspect_ratio(value: object) -> tuple[int, int]:
+    if value is None or value == "N/A":
+        return 1, 1
+    if not isinstance(value, str):
+        raise ValueError("sample_aspect_ratio must be an unsigned numerator:denominator")
+    match = _SAR_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError("sample_aspect_ratio must be an unsigned numerator:denominator")
+    numerator, denominator = (int(part) for part in match.groups())
+    if not 1 <= numerator <= _SAR_COMPONENT_MAX or not 1 <= denominator <= _SAR_COMPONENT_MAX:
+        raise ValueError("sample_aspect_ratio components must be in 1..2147483647")
+    divisor = math.gcd(numerator, denominator)
+    return numerator // divisor, denominator // divisor
 
 
 def validate_video_file(video_path: str) -> bool:
@@ -126,6 +147,26 @@ def get_video_properties(video_path: str) -> dict[str, Any]:
     finally:
         if cap is not None:
             cap.release()
+
+    if properties:
+        video_info = get_video_info_ffprobe(video_path)
+        video_stream = next(
+            (
+                stream
+                for stream in video_info.get("streams", [])
+                if isinstance(stream, dict) and stream.get("codec_type") == "video"
+            ),
+            None,
+        )
+        sar_value = video_stream.get("sample_aspect_ratio") if video_stream is not None else None
+        numerator, denominator = parse_sample_aspect_ratio(sar_value)
+        properties.update(
+            {
+                "sample_aspect_ratio_numerator": numerator,
+                "sample_aspect_ratio_denominator": denominator,
+                "sample_aspect_ratio": f"{numerator}:{denominator}",
+            }
+        )
 
     return properties
 

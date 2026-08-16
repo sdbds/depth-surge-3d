@@ -9,8 +9,44 @@ from src.depth_surge_3d.io.operations import (
     _remove_file_safe,
     get_frame_files,
     create_output_directories,
+    parse_sample_aspect_ratio,
 )
 from src.depth_surge_3d.core.constants import INTERMEDIATE_DIRS
+
+import pytest
+
+
+@pytest.mark.parametrize("value", [None, "N/A"])
+def test_missing_sar_normalizes_to_square(value) -> None:
+    assert parse_sample_aspect_ratio(value) == (1, 1)
+
+
+@pytest.mark.parametrize("value", ["1:1", "2:2", "2147483647:2147483647"])
+def test_reducible_square_sar_is_canonicalized(value) -> None:
+    assert parse_sample_aspect_ratio(value) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0:0",
+        "1:0",
+        "0:1",
+        "+1:1",
+        "-1:1",
+        "1:-1",
+        "1:1x",
+        " 1:1",
+        "1:1 ",
+        "2147483648:1",
+        "1:2147483648",
+        "1/1",
+        "١:١",
+    ],
+)
+def test_invalid_explicit_sar_is_rejected(value) -> None:
+    with pytest.raises(ValueError, match="sample_aspect_ratio"):
+        parse_sample_aspect_ratio(value)
 
 
 class TestShouldKeepFile:
@@ -539,6 +575,51 @@ class TestGetVideoProperties:
         assert result["frame_count"] == 900
         assert result["duration"] == 30.0  # 900 / 30
         mock_cap.release.assert_called_once()
+
+    def test_get_video_properties_uses_first_video_stream_sar(self):
+        from src.depth_surge_3d.io.operations import get_video_properties
+
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.get.side_effect = [30.0, 900, 1920, 1080, 1196444237]
+        ffprobe_info = {
+            "streams": [
+                {"codec_type": "audio", "sample_aspect_ratio": "9:8"},
+                {"codec_type": "video", "sample_aspect_ratio": "8:6"},
+                {"codec_type": "video", "sample_aspect_ratio": "1:1"},
+            ]
+        }
+
+        with (
+            patch("cv2.VideoCapture", return_value=mock_cap),
+            patch(
+                "src.depth_surge_3d.io.operations.get_video_info_ffprobe",
+                return_value=ffprobe_info,
+            ),
+        ):
+            result = get_video_properties("test.mp4")
+
+        assert result["sample_aspect_ratio_numerator"] == 4
+        assert result["sample_aspect_ratio_denominator"] == 3
+        assert result["sample_aspect_ratio"] == "4:3"
+
+    def test_get_video_properties_rejects_malformed_explicit_sar(self):
+        from src.depth_surge_3d.io.operations import get_video_properties
+
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.get.side_effect = [30.0, 900, 1920, 1080, 1196444237]
+        ffprobe_info = {"streams": [{"codec_type": "video", "sample_aspect_ratio": "1/1"}]}
+
+        with (
+            patch("cv2.VideoCapture", return_value=mock_cap),
+            patch(
+                "src.depth_surge_3d.io.operations.get_video_info_ffprobe",
+                return_value=ffprobe_info,
+            ),
+            pytest.raises(ValueError, match="sample_aspect_ratio"),
+        ):
+            get_video_properties("test.mp4")
 
     def test_get_video_properties_not_opened(self):
         """Test video properties when video cannot be opened."""

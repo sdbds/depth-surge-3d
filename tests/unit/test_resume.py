@@ -13,7 +13,7 @@ from src.depth_surge_3d.core.file_identity import (
     FILE_IDENTITY_ALGORITHM_VERSION,
     file_sample_fingerprint,
 )
-from src.depth_surge_3d.core.settings import validate_settings
+from src.depth_surge_3d.core.settings import PROCESSING_SETTINGS_SCHEMA_VERSION, validate_settings
 from src.depth_surge_3d.processing.frames.depth_storage import (
     RAW_DEPTH_READABLE_SCHEMA_VERSIONS,
     RAW_DEPTH_SCHEMA_VERSION,
@@ -72,7 +72,7 @@ def _write_settings(
         metadata["source_video_fingerprint_algorithm"] = FILE_IDENTITY_ALGORITHM_VERSION
         metadata["source_video_fingerprint"] = file_sample_fingerprint(source_video)
     if current_schema:
-        metadata["settings_schema_version"] = 2
+        metadata["settings_schema_version"] = PROCESSING_SETTINGS_SCHEMA_VERSION
     payload = {
         "metadata": metadata,
         "video_properties": {"frame_count": 2, "width": 6, "height": 4, "fps": 30.0},
