@@ -47,6 +47,8 @@ def test_final_defaults_cover_depth_dibr_and_migration_controls() -> None:
     assert settings["scene_cut_threshold"] == 0.55
     assert settings["min_scene_frames"] == 8
     assert settings["raw_storage_dtype"] == "auto"
+    assert settings["temporal_window_size"] == 32
+    assert settings["temporal_window_overlap"] == 10
     assert settings["stereo_io_workers"] == min(4, max(1, (os.cpu_count() or 1) - 2))
     assert settings["migrate_legacy"] == "archive"
     assert REMOVED_SETTING_NAMES == {
@@ -56,6 +58,16 @@ def test_final_defaults_cover_depth_dibr_and_migration_controls() -> None:
         "processing_mode",
     }
     assert REMOVED_SETTING_NAMES.isdisjoint(settings)
+
+
+def test_temporal_compatibility_settings_remain_validated_and_saved() -> None:
+    settings = validate_settings(
+        {"temporal_window_size": 64, "temporal_window_overlap": 20},
+        source="explicit",
+    )
+
+    assert settings["temporal_window_size"] == 64
+    assert settings["temporal_window_overlap"] == 20
 
 
 @pytest.mark.parametrize(

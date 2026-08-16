@@ -32,6 +32,11 @@ DEPTH_MODEL_SETTING_KEYS = (
     "denoising_steps",
     "seed",
 )
+V2_SCENE_SETTING_KEYS = (
+    "scene_detection",
+    "scene_cut_threshold",
+    "min_scene_frames",
+)
 MODEL_IDENTITY_INFO_KEYS = (
     "family",
     "model_name",
@@ -52,6 +57,7 @@ MODEL_IDENTITY_INFO_KEYS = (
     "precision",
     "dtype",
     "inference_batch_size",
+    "inference_algorithm",
 )
 MODEL_PRESENTATION_INFO_KEYS = (
     "loaded",
@@ -117,16 +123,27 @@ def build_model_fingerprint(estimator: Any, settings: dict[str, Any]) -> dict[st
     }
 
 
-def select_depth_model_settings(settings: dict[str, Any]) -> dict[str, Any]:
+def select_depth_model_settings(
+    settings: dict[str, Any], estimator: Any | None = None
+) -> dict[str, Any]:
     """Select only settings that can change estimator output."""
 
-    return {key: settings.get(key) for key in DEPTH_MODEL_SETTING_KEYS if key in settings}
+    selected = {key: settings.get(key) for key in DEPTH_MODEL_SETTING_KEYS if key in settings}
+    sequence_method = getattr(type(estimator), "iter_sequence_depth", None)
+    is_v2 = callable(sequence_method) or (
+        estimator is None and settings.get("depth_model_version") == "v2"
+    )
+    if is_v2:
+        selected.update(
+            {key: settings.get(key) for key in V2_SCENE_SETTING_KEYS if key in settings}
+        )
+    return selected
 
 
 def build_current_model_fingerprint(estimator: Any, settings: dict[str, Any]) -> dict[str, Any]:
     """Fingerprint the loaded estimator with its depth-affecting settings."""
 
-    return build_model_fingerprint(estimator, select_depth_model_settings(settings))
+    return build_model_fingerprint(estimator, select_depth_model_settings(settings, estimator))
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -445,6 +462,17 @@ class RawDepthStore:
             int(self.metadata.get("completed_count", 0)) + newly_written,
         )
         return paths
+
+    def discard_frames(self, frame_names: list[str]) -> None:
+        """Discard one incomplete shot without touching unrelated raw payloads."""
+
+        unknown = set(frame_names).difference(self.metadata["frame_names"])
+        if unknown:
+            raise RawDepthFingerprintError(f"Unknown raw-depth frame names: {sorted(unknown)}")
+        for frame_name in frame_names:
+            self.path_for(frame_name).unlink(missing_ok=True)
+        self.metadata["completed_count"] = self.validate_payloads()
+        self.flush_metadata()
 
     def flush_metadata(self) -> None:
         """Persist in-memory progress once at a stage or transaction boundary."""

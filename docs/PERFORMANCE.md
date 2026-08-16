@@ -1,7 +1,7 @@
 # Performance Benchmarks and Optimization Guide
 
 **Version**: 0.9.0
-**Last Updated**: 2026-01-18
+**Last Updated**: 2026-08-16
 
 ---
 
@@ -45,7 +45,8 @@ Reference system: RTX 4070 Ti SUPER, 32GB RAM, AMD Ryzen 9 7950X
 
 **Key Characteristics**:
 - 3-4 seconds per output frame
-- 32-frame temporal windows with 10-frame overlap
+- Fixed 32-frame temporal windows with 10-frame overlap inside each detected shot
+- Temporal state resets at candidate scene cuts rather than at processor batch boundaries
 - Higher VRAM usage (~8-12GB depending on resolution)
 - Better temporal consistency but slower
 
@@ -113,17 +114,19 @@ Depth Surge 3D automatically calculates optimal batch sizes based on available V
 
 **Max chunk size**: 24 frames (V3)
 
-#### V2 Chunk Sizes (frames per temporal window)
+#### V2 Temporal Windows
 
-| VRAM Available | 720p  | 1080p | 1440p | 4K    |
-|----------------|-------|-------|-------|-------|
-| 6GB            | 16    | 12    | 8     | 4     |
-| 8GB            | 24    | 16    | 12    | 8     |
-| 12GB           | 32    | 24    | 16    | 12    |
-| 16GB+          | 32    | 32    | 24    | 16    |
+V2 does not reduce its temporal window length according to available VRAM. It
+uses the upstream offline contract: 32-frame windows, ten carried frames, and
+ten-frame overlap, independently within each detected shot. Short shot tails
+are padded internally and padding predictions are discarded.
 
-**Optimal chunk size**: 32 frames (model's training window)
-**Note**: V2 uses sliding windows with 10-frame overlap for temporal consistency.
+When a CUDA allocation cannot fit the requested depth input resolution, the
+processor retries the entire V2 raw-depth stage at one uniformly lower input
+size. It halves the current size down to a 384-pixel floor, records the selected
+size in `02_depth_raw/metadata.json`, and never mixes resolutions within one raw
+stage. A lower explicit depth resolution remains the most predictable way to
+reduce V2 memory use.
 
 ### Total VRAM Estimates
 
@@ -190,7 +193,7 @@ Depth Surge 3D automatically calculates optimal batch sizes based on available V
 
 **Performance**:
 - 1080p → 1080p VR: ~2 hours per minute (V3 small)
-- V2 not recommended (insufficient VRAM for temporal windows)
+- V2 may select a lower uniform depth input size after CUDA OOM; V3 remains the faster choice
 - Small chunk sizes (4-6 frames typical)
 - Prioritize efficiency over maximum quality
 
@@ -264,7 +267,7 @@ Percentage of total processing time by stage (typical 1080p → 4K with V3):
 ### Video-Depth-Anything V2 (Temporal)
 
 **Pros**:
-- ✅ Superior temporal consistency (smooth depth across frames)
+- ✅ Model-native temporal consistency within detected shots
 - ✅ Excellent for long static scenes
 - ✅ Better for slow-motion content
 - ✅ Trained on video sequences (32-frame windows)
@@ -273,7 +276,8 @@ Percentage of total processing time by stage (typical 1080p → 4K with V3):
 - ❌ 40-50% slower than V3
 - ❌ Higher VRAM requirements (30% more)
 - ❌ Sliding window overhead (10-frame overlap)
-- ❌ Requires at least 8GB VRAM for 1080p
+- ❌ Temporal state intentionally resets at detected scene cuts
+- ❌ Constrained VRAM can force a lower effective depth input resolution
 
 **Best For**:
 - Long videos with static scenes

@@ -148,6 +148,63 @@ def _write_raw_metadata(
     (raw_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
 
+def _write_v2_raw_metadata(
+    output_dir: Path,
+    frame_files: list[Path],
+    source_fingerprint: str,
+) -> dict:
+    settings = _current_settings(
+        depth_model_version="v2",
+        model_size="base",
+        depth_resolution="518",
+    )
+    _write_raw_metadata(
+        output_dir,
+        frame_files,
+        source_fingerprint,
+        model_size="base",
+    )
+    metadata_path = output_dir / "02_depth_raw" / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    semantic = metadata["semantic_fingerprint"]
+    semantic.update(
+        {
+            "model_info": {
+                "revision": "immutable",
+                "inference_algorithm": "vda-offline-shot-v1",
+            },
+            "depth_settings": select_depth_model_settings(settings),
+            "scene_algorithm_version": SCENE_ALGORITHM_VERSION,
+            "execution_plan": {
+                "requested_input_size": 518,
+                "effective_input_size": 384,
+                "precision": "fp16",
+                "fallback_policy": "v2-uniform-halving-v1",
+            },
+        }
+    )
+    metadata["fingerprint"] = RawDepthStore._fingerprint(metadata)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    return {
+        key: semantic[key]
+        for key in (
+            "backend",
+            "model_info",
+            "depth_settings",
+            "weight_sha256",
+            "artifact_identity",
+        )
+    }
+
+
+def _mutate_raw_semantic(output_dir: Path, mutate) -> None:
+    metadata_path = output_dir / "02_depth_raw" / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    mutate(metadata["semantic_fingerprint"])
+    metadata["fingerprint"] = RawDepthStore._fingerprint(metadata)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+
 def _write_current_depth_pipeline(
     output_dir: Path,
     frame_files: list[Path],
@@ -642,6 +699,158 @@ def test_current_model_fingerprint_is_compared_outside_user_settings(tmp_path):
 
     assert report.stage("depth_raw").disposition == "invalidate"
     assert "model fingerprint" in report.stage("depth_raw").reason
+
+
+@pytest.mark.parametrize(
+    "execution_plan",
+    [
+        None,
+        {
+            "requested_input_size": 518,
+            "effective_input_size": 500,
+            "precision": "fp16",
+            "fallback_policy": "v2-uniform-halving-v1",
+        },
+        {
+            "requested_input_size": 518,
+            "effective_input_size": 384,
+            "fallback_policy": "v2-uniform-halving-v1",
+        },
+        {
+            "requested_input_size": 518,
+            "effective_input_size": 384,
+            "precision": [],
+            "fallback_policy": "v2-uniform-halving-v1",
+        },
+        {
+            "requested_input_size": 720,
+            "effective_input_size": 384,
+            "precision": "fp16",
+            "fallback_policy": "v2-uniform-halving-v1",
+        },
+        {
+            "requested_input_size": 518,
+            "effective_input_size": 384,
+            "precision": "fp32",
+            "fallback_policy": "v2-uniform-halving-v1",
+        },
+    ],
+)
+def test_v2_resume_invalidates_missing_or_incompatible_execution_plan(
+    tmp_path,
+    execution_plan,
+):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    settings = _current_settings(
+        depth_model_version="v2",
+        model_size="base",
+        depth_resolution="518",
+    )
+    frame_files, fingerprint = _write_frames(tmp_path)
+    _write_settings(tmp_path, settings, current_schema=True)
+    _write_candidate_manifest(tmp_path, frame_files, fingerprint)
+    model_fingerprint = _write_v2_raw_metadata(tmp_path, frame_files, fingerprint)
+
+    def replace_plan(semantic):
+        if execution_plan is None:
+            semantic.pop("execution_plan")
+        else:
+            semantic["execution_plan"] = execution_plan
+
+    _mutate_raw_semantic(tmp_path, replace_plan)
+
+    report = build_resume_report(
+        tmp_path,
+        settings,
+        model_fingerprint=model_fingerprint,
+    )
+
+    assert report.stage("depth_raw").disposition == "invalidate"
+    assert "execution plan" in report.stage("depth_raw").reason
+
+
+@pytest.mark.parametrize("scene_version", [None, "scene-analysis-v0"])
+def test_v2_resume_invalidates_missing_or_incompatible_scene_algorithm(
+    tmp_path,
+    scene_version,
+):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    settings = _current_settings(
+        depth_model_version="v2",
+        model_size="base",
+        depth_resolution="518",
+    )
+    frame_files, fingerprint = _write_frames(tmp_path)
+    _write_settings(tmp_path, settings, current_schema=True)
+    _write_candidate_manifest(tmp_path, frame_files, fingerprint)
+    model_fingerprint = _write_v2_raw_metadata(tmp_path, frame_files, fingerprint)
+
+    def replace_scene_version(semantic):
+        if scene_version is None:
+            semantic.pop("scene_algorithm_version")
+        else:
+            semantic["scene_algorithm_version"] = scene_version
+
+    _mutate_raw_semantic(tmp_path, replace_scene_version)
+
+    report = build_resume_report(
+        tmp_path,
+        settings,
+        model_fingerprint=model_fingerprint,
+    )
+
+    assert report.stage("depth_raw").disposition == "invalidate"
+    assert "scene algorithm" in report.stage("depth_raw").reason
+
+
+def test_v2_resume_accepts_valid_execution_contract(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    settings = _current_settings(
+        depth_model_version="v2",
+        model_size="base",
+        depth_resolution="518",
+    )
+    frame_files, fingerprint = _write_frames(tmp_path)
+    _write_settings(tmp_path, settings, current_schema=True)
+    _write_candidate_manifest(tmp_path, frame_files, fingerprint)
+    model_fingerprint = _write_v2_raw_metadata(tmp_path, frame_files, fingerprint)
+
+    report = build_resume_report(
+        tmp_path,
+        settings,
+        model_fingerprint=model_fingerprint,
+    )
+
+    assert report.stage("depth_raw").disposition == "resume"
+
+
+def test_loaded_model_depth_settings_override_backend_name_heuristic(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    v2_settings = _current_settings(
+        depth_model_version="v2",
+        model_size="base",
+        depth_resolution="518",
+    )
+    frame_files, fingerprint = _write_frames(tmp_path)
+    _write_settings(tmp_path, v2_settings, current_schema=True)
+    _write_candidate_manifest(tmp_path, frame_files, fingerprint)
+    model_fingerprint = _write_v2_raw_metadata(tmp_path, frame_files, fingerprint)
+
+    report = build_resume_report(
+        tmp_path,
+        _current_settings(
+            depth_model_version="v3",
+            model_size="large",
+            depth_resolution="518",
+        ),
+        model_fingerprint=model_fingerprint,
+    )
+
+    assert report.stage("depth_raw").disposition == "resume"
 
 
 def test_final_bounds_must_cover_exact_manifest_scene_set(tmp_path):

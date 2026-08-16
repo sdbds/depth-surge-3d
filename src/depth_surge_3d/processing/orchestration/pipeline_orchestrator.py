@@ -387,7 +387,12 @@ class ProcessingOrchestrator:
         print(f"\n{title_bar('=== Depth Surge 3D Video Processing ===')}")
         print(f"Input: {video_path}")
         print(f"Output: {output_path}")
-        print("Using Video-Depth-Anything for temporal consistency\n")
+        if settings.get("depth_model_version") == "v2":
+            print(
+                "Using Video-Depth-Anything V2 for temporal consistency " "within detected shots\n"
+            )
+        else:
+            print(f"Using depth backend: {settings.get('depth_model_version', 'v3')}\n")
 
         return output_path, directories, settings_file
 

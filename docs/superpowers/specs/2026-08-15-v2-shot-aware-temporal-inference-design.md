@@ -341,7 +341,10 @@ device depth output    <= 32 * Hd * Wd * 4 bytes
 The conservative 50-map host depth term covers the current 32 predictions,
 eight previous pending maps, two alignment references, and eight newly blended
 maps at the interpolation peak. The 42-frame device input term covers one
-current window plus ten retained key-frame tensors before old state is released.
+current window plus ten retained key-frame tensors.
+The implementation repacks finalized maps into the writable current-depth
+buffer and refreshes the ten retained device frames in place; it does not
+allocate second 30-map host or ten-frame device state buffers.
 Later source loads request at most 22 new decoded frames, but the first-window
 32-frame bound is used for the invariant.
 
@@ -393,10 +396,11 @@ candidate, rebuilds the fingerprint, and restarts the raw stage from frame zero.
 It never continues with mixed resolutions. If no smaller candidate exists, the
 stage fails with the requested and effective sizes in the error.
 
-Any fallback is non-blocking but visible. CLI writes one warning to stderr; Web
-emits one warning through the existing progress-message channel. Both state the
-requested size, selected effective size, and that the selection applies to the
-whole V2 raw stage.
+Any fallback is non-blocking but visible. Every invocation writes one warning to
+stderr; Web additionally emits the warning through the existing progress-message
+channel. Both state the requested size, selected effective size, and that the
+selection applies to the whole V2 raw stage. Warning-only progress messages do
+not set a step name or start step timing.
 
 ## Resume Semantics
 
@@ -512,10 +516,11 @@ future breaking migration with no date committed by this specification.
 
 The compatibility warning does not block processing. It fires once at V2
 raw-stage entry, before cache reuse, the capacity probe, or the first temporal
-window. CLI writes it once to stderr. Web sends it once through the existing
-progress-message channel so it is visible in the active job. The message
-includes both supplied values and states that VDA uses fixed window 32 and
-overlap 10. Default 32/10 values emit no warning.
+window. Every invocation writes it once to stderr. Web additionally sends it
+once through the existing progress-message channel so it is visible in the
+active job. The progress update does not set a step name or affect step timing.
+The message includes both supplied values and states that VDA uses fixed window
+32 and overlap 10. Default 32/10 values emit no warning.
 
 ## Error Handling
 

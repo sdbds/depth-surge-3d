@@ -24,9 +24,15 @@ from ..core.depth_contract import (
     CANONICAL_DEPTH_SCHEMA_VERSION,
     canonical_json_hash,
 )
+from ..inference.depth.v2_temporal_contract import (
+    VDA_INFERENCE_ALGORITHM,
+    build_v2_execution_plan,
+    is_compatible_v2_execution_plan,
+)
 from ..processing.frames.depth_processor import (
     DEPTH_BOUNDS_SCHEMA_VERSION,
 )
+from ..processing.frames.depth_resolution import resolve_depth_input_size
 from ..processing.frames.depth_storage import (
     RAW_DEPTH_SCHEMA_VERSION,
     RawDepthFingerprintError,
@@ -583,10 +589,61 @@ def _validate_scene_stage(
     )
 
 
+def _v2_execution_contract_mismatch_reason(
+    semantic: dict[str, Any],
+    current_settings: dict[str, Any],
+    frame_files: list[Path],
+    current_model_fingerprint: dict[str, Any] | None,
+) -> str | None:
+    persisted_model_info = semantic.get("model_info")
+    current_model_info = (
+        current_model_fingerprint.get("model_info")
+        if current_model_fingerprint is not None
+        else None
+    )
+    persisted_algorithm = (
+        persisted_model_info.get("inference_algorithm")
+        if isinstance(persisted_model_info, dict)
+        else None
+    )
+    current_algorithm = (
+        current_model_info.get("inference_algorithm")
+        if isinstance(current_model_info, dict)
+        else None
+    )
+    is_v2 = (
+        persisted_algorithm == VDA_INFERENCE_ALGORITHM
+        or current_algorithm == VDA_INFERENCE_ALGORITHM
+    )
+    if not is_v2:
+        return None
+    if semantic.get("scene_algorithm_version") != SCENE_ALGORITHM_VERSION:
+        return "raw-depth V2 scene algorithm fingerprint mismatch"
+    header = read_png_header(frame_files[0]) if frame_files else None
+    if header is None:
+        return "raw-depth V2 execution plan source geometry is unavailable"
+    requested_size = resolve_depth_input_size(
+        header.width,
+        header.height,
+        current_settings.get("depth_resolution", "auto"),
+    )
+    try:
+        requested_plan = build_v2_execution_plan(requested_size, requested_size)
+    except ValueError:
+        return "raw-depth V2 execution plan request is invalid"
+    if not is_compatible_v2_execution_plan(
+        semantic.get("execution_plan"),
+        requested_plan,
+    ):
+        return "raw-depth V2 execution plan is missing or incompatible"
+    return None
+
+
 def _raw_semantic_mismatch_reason(
     semantic: object,
     current_settings: dict[str, Any],
     source_fingerprint: str,
+    frame_files: list[Path],
     current_model_fingerprint: dict[str, Any] | None,
 ) -> str | None:
     if not isinstance(semantic, dict):
@@ -596,7 +653,25 @@ def _raw_semantic_mismatch_reason(
     depth_settings = semantic.get("depth_settings")
     if not isinstance(depth_settings, dict):
         return "raw-depth model settings fingerprint is missing"
-    expected_depth_settings = select_depth_model_settings(current_settings)
+    persisted_model = {
+        key: semantic.get(key)
+        for key in (
+            "backend",
+            "model_info",
+            "depth_settings",
+            "weight_sha256",
+            "artifact_identity",
+        )
+    }
+    if current_model_fingerprint is not None and persisted_model != current_model_fingerprint:
+        return "raw-depth model fingerprint mismatch"
+    if current_model_fingerprint is None:
+        expected_depth_settings = select_depth_model_settings(current_settings)
+    else:
+        model_depth_settings = current_model_fingerprint.get("depth_settings")
+        if not isinstance(model_depth_settings, dict):
+            return "current model settings fingerprint is missing"
+        expected_depth_settings = model_depth_settings
     if depth_settings != expected_depth_settings:
         changed = sorted(set(depth_settings) | set(expected_depth_settings))
         key = next(
@@ -610,19 +685,12 @@ def _raw_semantic_mismatch_reason(
         return f"raw-depth model setting mismatch: {key}"
     if semantic.get("preprocessing_algorithm") != depth_preprocessing_algorithm(current_settings):
         return "raw-depth preprocessing fingerprint mismatch"
-    persisted_model = {
-        key: semantic.get(key)
-        for key in (
-            "backend",
-            "model_info",
-            "depth_settings",
-            "weight_sha256",
-            "artifact_identity",
-        )
-    }
-    if current_model_fingerprint is not None and persisted_model != current_model_fingerprint:
-        return "raw-depth model fingerprint mismatch"
-    return None
+    return _v2_execution_contract_mismatch_reason(
+        semantic,
+        current_settings,
+        frame_files,
+        current_model_fingerprint,
+    )
 
 
 def _raw_storage_mismatch_reason(
@@ -663,6 +731,7 @@ def _raw_mismatch_reason(
         metadata.get("semantic_fingerprint"),
         current_settings,
         source_fingerprint,
+        frame_files,
         current_model_fingerprint,
     )
     if semantic_reason is not None:

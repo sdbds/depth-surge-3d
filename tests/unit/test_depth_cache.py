@@ -116,6 +116,8 @@ class TestComputeCacheKey:
             start_time="03:15",
             end_time="03:22",
             super_sample="none",
+            temporal_window_size=32,
+            temporal_window_overlap=10,
         )
         base_key = compute_cache_key(str(video_file), base)
 
@@ -124,6 +126,7 @@ class TestComputeCacheKey:
             {"model_path": "24yearsold/a-different-checkpoint"},
             {"start_time": "10:00", "end_time": "10:07"},
             {"super_sample": "auto"},
+            {"temporal_window_size": 64},
         ):
             assert compute_cache_key(str(video_file), {**base, **change}) != base_key
 

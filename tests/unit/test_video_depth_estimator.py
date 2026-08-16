@@ -1,10 +1,18 @@
 """Unit tests for VideoDepthEstimator (V2)."""
 
+import sys
+import types
+
 import numpy as np
 import pytest
+import torch
 from unittest.mock import patch, MagicMock
 
 from src.depth_surge_3d.inference.depth.video_depth_estimator import (
+    VDA_INFER_LEN,
+    VDA_INTERP_LEN,
+    VDA_KEYFRAMES,
+    VDA_OVERLAP,
     VideoDepthEstimator,
     create_video_depth_estimator,
 )
@@ -79,34 +87,7 @@ class TestVideoDepthEstimator:
         estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
         info = estimator.get_model_info()
 
-        assert info == {}
-
-    def test_determine_chunk_overlap_first_chunk(self):
-        """Test chunk overlap determination for first chunk."""
-        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
-
-        depths = np.zeros((32, 100, 100))
-        keep = estimator._determine_chunk_overlap(0, 32, 100, 4, depths)
-
-        assert len(keep) == 32  # Keep all frames from first chunk
-
-    def test_determine_chunk_overlap_last_chunk(self):
-        """Test chunk overlap determination for last chunk."""
-        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
-
-        depths = np.zeros((32, 100, 100))
-        keep = estimator._determine_chunk_overlap(68, 100, 100, 4, depths)
-
-        assert len(keep) == 28  # Skip 4 overlap frames
-
-    def test_determine_chunk_overlap_middle_chunk(self):
-        """Test chunk overlap determination for middle chunk."""
-        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
-
-        depths = np.zeros((32, 100, 100))
-        keep = estimator._determine_chunk_overlap(28, 60, 100, 4, depths)
-
-        assert len(keep) == 28  # Skip 4 overlap frames
+        assert info == {"inference_algorithm": "vda-offline-shot-v1"}
 
     @patch("torch.cuda.is_available", return_value=True)
     @patch("torch.cuda.empty_cache")
@@ -310,10 +291,11 @@ class TestGetModelInfo:
         assert info["features"] == 256
         assert "temporal_consistency" in info
         assert info["temporal_consistency"] is True
+        assert info["inference_algorithm"] == "vda-offline-shot-v1"
 
 
-class TestEstimateDepthBatchDecisionLogic:
-    """Test estimate_depth_batch chunking decision logic."""
+class TestEstimateDepthBatchCompatibility:
+    """The in-memory API delegates one complete array to upstream VDA."""
 
     def test_estimate_depth_batch_model_not_loaded(self):
         """Test batch estimation when model not loaded."""
@@ -326,63 +308,17 @@ class TestEstimateDepthBatchDecisionLogic:
         with pytest.raises(RuntimeError, match="Model not loaded"):
             estimator.estimate_depth_batch(frames)
 
-    @patch("torch.cuda.is_available", return_value=True)
-    def test_estimate_depth_batch_uses_chunking_for_large_video(self, mock_cuda):
-        """Test that large videos trigger chunking on CUDA."""
-        import numpy as np
-
-        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cuda")
-        estimator.model = MagicMock()
-
-        # Large video (>60 frames) should trigger chunking
-        frames = np.random.rand(70, 480, 640, 3).astype(np.uint8)
-
-        with patch.object(estimator, "_estimate_depth_chunked") as mock_chunked:
-            mock_chunked.return_value = np.random.rand(70, 480, 640)
-            result = estimator.estimate_depth_batch(frames)
-
-            mock_chunked.assert_called_once()
-            assert result.values.shape == (70, 480, 640)
-            assert result.representation is DepthRepresentation.INVERSE_DEPTH
-
-    @patch("torch.cuda.is_available", return_value=True)
-    def test_estimate_depth_batch_uses_chunking_for_high_res(self, mock_cuda):
-        """Test that high-res videos trigger chunking on CUDA."""
-        import numpy as np
-
-        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cuda")
-        estimator.model = MagicMock()
-
-        # Only shape drives this branch; broadcast views avoid a 13 GiB fixture.
-        frames = np.broadcast_to(
-            np.zeros((1, 1, 1, 3), dtype=np.uint8),
-            (70, 2160, 3840, 3),
-        )
-
-        with patch.object(estimator, "_estimate_depth_chunked") as mock_chunked:
-            mock_chunked.return_value = np.broadcast_to(
-                np.zeros((1, 1, 1), dtype=np.float32),
-                (70, 2160, 3840),
-            )
-            estimator.estimate_depth_batch(frames)
-
-            mock_chunked.assert_called_once()
-
-    @patch("torch.cuda.is_available", return_value=False)
-    def test_estimate_depth_batch_single_batch_on_cpu(self, mock_cuda):
-        """Test that CPU processing uses single batch."""
-        import numpy as np
-
+    def test_large_batch_calls_upstream_once(self):
         estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
         estimator.model = MagicMock()
-
-        frames = np.random.rand(50, 480, 640, 3).astype(np.uint8)
-
+        frames = np.zeros((70, 2, 3, 3), dtype=np.uint8)
         with patch.object(estimator, "_estimate_depth_single_batch") as mock_single:
-            mock_single.return_value = np.random.rand(50, 480, 640)
-            estimator.estimate_depth_batch(frames)
+            mock_single.return_value = np.zeros((70, 2, 3), dtype=np.float32)
+            result = estimator.estimate_depth_batch(frames)
 
             mock_single.assert_called_once()
+            assert result.values.shape == (70, 2, 3)
+            assert result.representation is DepthRepresentation.INVERSE_DEPTH
 
 
 class TestEstimateDepthSingleBatch:
@@ -423,139 +359,636 @@ class TestEstimateDepthSingleBatch:
                 estimator._estimate_depth_single_batch(frames, 30, 518, False)
 
 
-class TestEstimateDepthChunked:
-    """Test _estimate_depth_chunked method."""
+def _frame_loader(frame_count, requests):
+    def load(indexes):
+        requested = list(indexes)
+        requests.append(requested)
+        frames = np.zeros((len(requested), 2, 3, 3), dtype=np.uint8)
+        for offset, index in enumerate(requested):
+            frames[offset].fill(index)
+        return frames
 
-    @patch("torch.cuda.is_available", return_value=True)
-    @patch("torch.cuda.empty_cache")
-    def test_estimate_depth_chunked_success(self, mock_cache, mock_cuda):
-        """Test chunked depth estimation."""
-        import numpy as np
+    return load
 
-        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cuda")
-        estimator.model = MagicMock()
 
-        # Mock _process_depth_chunk to return chunk depths
-        def mock_process_chunk(frames_rgb, fps, size, fp32):
-            return np.random.rand(len(frames_rgb), 480, 640)
+def _install_fake_fixed_forward(estimator, monkeypatch, *, fail_calls=(), observer=None):
+    calls = []
+    failures = set(fail_calls)
 
-        estimator._process_depth_chunk = mock_process_chunk
+    def infer_fixed_window(
+        frames,
+        *,
+        input_size,
+        fp32,
+        carried_input=None,
+        padding_input=None,
+        transform=None,
+        output_shape=None,
+    ):
+        del input_size, fp32
+        call_number = len(calls) + 1
+        decoded = [int(frame[0, 0, 0]) for frame in frames]
+        calls.append(decoded)
+        if call_number in failures:
+            failures.remove(call_number)
+            raise torch.cuda.OutOfMemoryError("test window OOM")
 
-        # 50 frames should be split into chunks
-        frames = np.random.rand(50, 480, 640, 3).astype(np.uint8)
+        if carried_input is None:
+            markers = list(decoded)
+            markers.extend([markers[-1]] * (32 - len(markers)))
+        else:
+            markers = [int(value) for value in carried_input.flatten().tolist()]
+            markers.extend(decoded)
+            pad_value = decoded[-1] if decoded else int(padding_input.flatten()[0].item())
+            markers.extend([pad_value] * (32 - len(markers)))
+        current_input = torch.tensor(markers, dtype=torch.float32).reshape(1, 32, 1, 1, 1)
+        depths = np.asarray(markers, dtype=np.float32).reshape(32, 1, 1)
+        depths = np.broadcast_to(depths, (32, *output_shape)).copy()
+        if observer is not None:
+            observer(frames, carried_input, current_input, depths)
+        return depths, current_input, transform or object()
 
-        with patch("src.depth_surge_3d.core.constants.DEPTH_MODEL_CHUNK_SIZE", 24):
-            result = estimator._estimate_depth_chunked(frames, 30, 518, False)
+    monkeypatch.setattr(estimator, "_infer_fixed_window", infer_fixed_window, raising=False)
+    monkeypatch.setattr(
+        estimator,
+        "_interpolate_depths",
+        lambda previous, current: (np.asarray(previous) + np.asarray(current)) / 2,
+        raising=False,
+    )
+    return calls
 
-        assert result.shape == (50, 480, 640)
-        # Should clear cache between chunks
-        assert mock_cache.called
 
-    @patch("torch.cuda.is_available", return_value=True)
-    @patch("torch.cuda.empty_cache")
-    def test_estimate_depth_chunked_with_oom_retry(self, mock_cache, mock_cuda):
-        """Test chunked processing with OOM error and retry."""
-        import numpy as np
+def _install_fake_vda_transform_modules(monkeypatch, observed):
+    transform_module = types.ModuleType("video_depth_anything.util.transform")
 
-        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cuda")
-        estimator.model = MagicMock()
+    class Resize:
+        def __init__(self, **kwargs):
+            observed.update(kwargs)
 
-        # First chunk fails with OOM, retry succeeds
+    class Passthrough:
+        def __init__(self, **_kwargs):
+            pass
+
+    transform_module.Resize = Resize
+    transform_module.NormalizeImage = Passthrough
+    transform_module.PrepareForNet = Passthrough
+    package = types.ModuleType("video_depth_anything")
+    util_package = types.ModuleType("video_depth_anything.util")
+    monkeypatch.setitem(sys.modules, "video_depth_anything", package)
+    monkeypatch.setitem(sys.modules, "video_depth_anything.util", util_package)
+    monkeypatch.setitem(sys.modules, "video_depth_anything.util.transform", transform_module)
+
+
+def _install_upstream_numeric_helpers(monkeypatch, calls):
+    util_module = types.ModuleType("utils.util")
+
+    def compute_scale_and_shift(prediction, target, mask):
+        calls["scale"] += 1
+        prediction = np.asarray(prediction, dtype=np.float32)
+        target = np.asarray(target, dtype=np.float32)
+        mask = np.asarray(mask, dtype=np.float32)
+        a_00 = np.sum(mask * prediction * prediction)
+        a_01 = np.sum(mask * prediction)
+        a_11 = np.sum(mask)
+        b_0 = np.sum(mask * prediction * target)
+        b_1 = np.sum(mask * target)
+        determinant = a_00 * a_11 - a_01 * a_01
+        if determinant == 0:
+            return 1.0, 0.0
+        return (
+            (a_11 * b_0 - a_01 * b_1) / determinant,
+            (-a_01 * b_0 + a_00 * b_1) / determinant,
+        )
+
+    def get_interpolate_frames(previous, current):
+        calls["interpolate"] += 1
+        weights = np.linspace(0.0, 1.0, len(previous), dtype=np.float32)
+        return [
+            previous[index] * (1.0 - weight) + current[index] * weight
+            for index, weight in enumerate(weights)
+        ]
+
+    util_module.compute_scale_and_shift = compute_scale_and_shift
+    util_module.get_interpolate_frames = get_interpolate_frames
+    utils_package = types.ModuleType("utils")
+    utils_package.util = util_module
+    monkeypatch.setitem(sys.modules, "utils", utils_package)
+    monkeypatch.setitem(sys.modules, "utils.util", util_module)
+    return compute_scale_and_shift, get_interpolate_frames
+
+
+class _DeterministicWindowModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def forward(self, current_input):
+        call = self.calls
+        self.calls += 1
+        values = current_input[:, :, 0].float()
+        temporal = torch.arange(VDA_INFER_LEN, dtype=torch.float32).reshape(1, -1, 1, 1)
+        height, width = values.shape[-2:]
+        spatial = torch.arange(height * width, dtype=torch.float32).reshape(1, 1, height, width)
+        return (
+            values * (1.0 + 0.35 * call)
+            + 3.0 * call
+            + temporal * 0.07 * call
+            + spatial * 0.03 * call
+        )
+
+
+class _UpstreamOfflineReference:
+    """Small direct transcription of upstream infer_video_depth orchestration."""
+
+    def __init__(self, model, metric, compute_scale_and_shift, get_interpolate_frames):
+        self.model = model
+        self.metric = metric
+        self.compute_scale_and_shift = compute_scale_and_shift
+        self.get_interpolate_frames = get_interpolate_frames
+
+    def infer_video_depth(self, frames, target_fps, **_kwargs):
+        frame_list = [
+            torch.from_numpy(frame[..., 0].astype(np.float32)).reshape(1, 1, 1, 2, 3)
+            for frame in frames
+        ]
+        frame_step = VDA_INFER_LEN - VDA_OVERLAP
+        original_length = len(frame_list)
+        append_length = (frame_step - (original_length % frame_step)) % frame_step + (
+            VDA_INFER_LEN - frame_step
+        )
+        frame_list.extend([frame_list[-1].clone()] * append_length)
+        depth_list = []
+        previous_input = None
+        for frame_start in range(0, original_length, frame_step):
+            current_input = torch.cat(
+                frame_list[frame_start : frame_start + VDA_INFER_LEN],
+                dim=1,
+            )
+            if previous_input is not None:
+                current_input[:, :VDA_OVERLAP] = previous_input[:, list(VDA_KEYFRAMES)]
+            depth = self.model.forward(current_input)[0]
+            depth_list.extend(depth[index].numpy() for index in range(VDA_INFER_LEN))
+            previous_input = current_input
+
+        aligned = []
+        references = []
+        alignment_length = VDA_OVERLAP - VDA_INTERP_LEN
+        keyframe_alignment = VDA_KEYFRAMES[:alignment_length]
+        for frame_start in range(0, len(depth_list), VDA_INFER_LEN):
+            if not aligned:
+                aligned.extend(depth_list[:VDA_INFER_LEN])
+                references.extend(depth_list[frame_start + index] for index in keyframe_alignment)
+                continue
+            current_references = [
+                depth_list[frame_start + index] for index in range(len(keyframe_alignment))
+            ]
+            if self.metric:
+                scale, shift = 1.0, 0.0
+            else:
+                scale, shift = self.compute_scale_and_shift(
+                    np.concatenate(current_references),
+                    np.concatenate(references),
+                    np.concatenate(np.ones_like(references) == 1),
+                )
+            previous_overlap = aligned[-VDA_INTERP_LEN:]
+            current_overlap = depth_list[frame_start + alignment_length : frame_start + VDA_OVERLAP]
+            current_overlap = [np.maximum(value * scale + shift, 0) for value in current_overlap]
+            aligned[-VDA_INTERP_LEN:] = self.get_interpolate_frames(
+                previous_overlap,
+                current_overlap,
+            )
+            for index in range(VDA_OVERLAP, VDA_INFER_LEN):
+                aligned.append(np.maximum(depth_list[frame_start + index] * scale + shift, 0))
+            references = references[:1]
+            references.extend(
+                np.maximum(depth_list[frame_start + index] * scale + shift, 0)
+                for index in keyframe_alignment[1:]
+            )
+        return np.stack(aligned[:original_length], axis=0), target_fps
+
+
+@pytest.mark.parametrize("input_size", [2160, 1080, 720, 640, 518, 384])
+def test_vda_transform_preserves_requested_size_at_16_by_9(
+    input_size,
+    monkeypatch,
+):
+    observed = {}
+    _install_fake_vda_transform_modules(monkeypatch, observed)
+
+    VideoDepthEstimator._build_vda_transform(1080, 1920, input_size)
+
+    assert observed["width"] == input_size
+    assert observed["height"] == input_size
+
+
+def test_vda_transform_rounds_only_after_ultrawide_ratio_reduction(monkeypatch):
+    observed = {}
+    _install_fake_vda_transform_modules(monkeypatch, observed)
+
+    VideoDepthEstimator._build_vda_transform(1000, 2000, 518)
+
+    expected = round(int(518 * 1.777 / 2.0) / 14) * 14
+    assert observed["width"] == expected
+    assert observed["height"] == expected
+
+
+class TestSequenceDepth:
+    @pytest.mark.parametrize("frame_count", [1, 22, 23, 24, 25, 31, 32, 33, 53, 54, 55, 100])
+    def test_sequence_yields_every_source_frame_once(self, frame_count, monkeypatch):
+        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu", metric=True)
+        estimator.model = object()
+        requests = []
+        _install_fake_fixed_forward(estimator, monkeypatch)
+
+        yielded = list(
+            estimator.iter_sequence_depth(
+                frame_count,
+                _frame_loader(frame_count, requests),
+                target_fps=30,
+                input_size=518,
+                fp32=False,
+            )
+        )
+
+        values = np.concatenate([batch.values for _start, batch in yielded], axis=0)
+        starts = [start for start, _batch in yielded]
+        expected_starts = []
+        cursor = 0
+        for start, batch in yielded:
+            expected_starts.append(cursor)
+            cursor += len(batch.values)
+            assert start == expected_starts[-1]
+            assert batch.representation is DepthRepresentation.METRIC_DEPTH
+        assert starts == expected_starts
+        assert cursor == frame_count
+        assert values[:, 0, 0].tolist() == list(range(frame_count))
+        assert max(map(len, requests)) <= 32
+        assert all(request == sorted(set(request)) for request in requests)
+
+    def test_sequence_requests_only_new_shot_local_indexes(self, monkeypatch):
+        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu", metric=True)
+        estimator.model = object()
+        requests = []
+        _install_fake_fixed_forward(estimator, monkeypatch)
+
+        list(
+            estimator.iter_sequence_depth(
+                55,
+                _frame_loader(55, requests),
+                target_fps=30,
+                input_size=518,
+                fp32=False,
+            )
+        )
+
+        assert requests == [list(range(32)), list(range(32, 54)), [54]]
+
+    def test_failed_window_can_be_retried_without_advancing_state(self, monkeypatch):
+        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu", metric=True)
+        estimator.model = object()
+        requests = []
+        calls = _install_fake_fixed_forward(estimator, monkeypatch, fail_calls={2})
+        iterator = estimator.iter_sequence_depth(
+            55,
+            _frame_loader(55, requests),
+            target_fps=30,
+            input_size=518,
+            fp32=False,
+        )
+
+        first_start, first = next(iterator)
+        with pytest.raises(torch.cuda.OutOfMemoryError, match="test window OOM"):
+            next(iterator)
+        second_start, second = next(iterator)
+
+        assert first_start == 0
+        assert first.values[:, 0, 0].tolist() == list(range(24))
+        assert second_start == 24
+        assert second.values[:, 0, 0].tolist() == list(range(24, 46))
+        assert calls[1] == calls[2] == list(range(32, 54))
+        assert requests[1] == requests[2] == list(range(32, 54))
+
+    def test_later_windows_reuse_the_ten_frame_device_state_buffer(self, monkeypatch):
+        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu", metric=True)
+        estimator.model = object()
+        _install_fake_fixed_forward(estimator, monkeypatch)
+        iterator = estimator.iter_sequence_depth(
+            55,
+            _frame_loader(55, []),
+            target_fps=30,
+            input_size=518,
+            fp32=False,
+        )
+
+        next(iterator)
+        assert iterator._retained_input is not None
+        retained_pointer = iterator._retained_input.data_ptr()
+        next(iterator)
+
+        assert iterator._retained_input is not None
+        assert iterator._retained_input.data_ptr() == retained_pointer
+
+    def test_close_releases_retained_device_and_host_state(self, monkeypatch):
+        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu", metric=True)
+        estimator.model = object()
+        _install_fake_fixed_forward(estimator, monkeypatch)
+        iterator = estimator.iter_sequence_depth(
+            55,
+            _frame_loader(55, []),
+            target_fps=30,
+            input_size=518,
+            fp32=False,
+        )
+        next(iterator)
+        assert iterator._retained_input is not None
+
+        iterator.close()
+
+        assert iterator._retained_input is None
+        assert iterator._alignment_refs is None
+        assert iterator._pending_depth is None
+        with pytest.raises(StopIteration):
+            next(iterator)
+
+    @pytest.mark.parametrize(
+        ("bad_frames", "message"),
+        [
+            (np.zeros((0, 2, 3, 3), dtype=np.uint8), "count"),
+            (np.zeros((1, 2, 3, 3), dtype=np.float32), "uint8"),
+            (np.zeros((1, 2, 3), dtype=np.uint8), "rank"),
+            (np.zeros((1, 2, 3, 4), dtype=np.uint8), "channels"),
+        ],
+    )
+    def test_sequence_rejects_invalid_loader_arrays(self, bad_frames, message):
+        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
+        estimator.model = object()
+
+        iterator = estimator.iter_sequence_depth(
+            1,
+            lambda _indexes: bad_frames,
+            target_fps=30,
+            input_size=518,
+            fp32=False,
+        )
+
+        with pytest.raises((TypeError, ValueError), match=message):
+            next(iterator)
+
+    def test_sequence_rejects_geometry_change(self, monkeypatch):
+        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu", metric=True)
+        estimator.model = object()
+        _install_fake_fixed_forward(estimator, monkeypatch)
         call_count = 0
 
-        def mock_process_chunk(frames_rgb, fps, size, fp32):
+        def load(indexes):
             nonlocal call_count
             call_count += 1
-            if call_count == 1:
-                raise RuntimeError("CUDA out of memory")
-            return np.random.rand(len(frames_rgb), 480, 640)
+            height = 2 if call_count == 1 else 4
+            return np.zeros((len(indexes), height, 3, 3), dtype=np.uint8)
 
-        estimator._process_depth_chunk = mock_process_chunk
+        iterator = estimator.iter_sequence_depth(
+            33,
+            load,
+            target_fps=30,
+            input_size=518,
+            fp32=False,
+        )
+        next(iterator)
 
-        # Mock retry method
-        def mock_retry(frames_rgb, fps, size, fp32):
-            return np.random.rand(len(frames_rgb), 480, 640)
+        with pytest.raises(ValueError, match="geometry"):
+            next(iterator)
 
-        estimator._retry_chunk_with_reduced_resolution = mock_retry
-
-        frames = np.random.rand(30, 480, 640, 3).astype(np.uint8)
-
-        with patch("src.depth_surge_3d.core.constants.DEPTH_MODEL_CHUNK_SIZE", 24):
-            result = estimator._estimate_depth_chunked(frames, 30, 518, False)
-
-        assert result.shape == (30, 480, 640)
-
-    @patch("torch.cuda.is_available", return_value=True)
-    @patch("torch.cuda.empty_cache")
-    def test_estimate_depth_chunked_non_oom_error_reraise(self, mock_cache, mock_cuda):
-        """Test chunked processing re-raises non-OOM errors."""
-        import numpy as np
-
-        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cuda")
-        estimator.model = MagicMock()
-
-        # Raise a non-OOM error
-        def mock_process_chunk(frames_rgb, fps, size, fp32):
-            raise ValueError("Some other error")
-
-        estimator._process_depth_chunk = mock_process_chunk
-
-        frames = np.random.rand(30, 480, 640, 3).astype(np.uint8)
-
-        with patch("src.depth_surge_3d.core.constants.DEPTH_MODEL_CHUNK_SIZE", 24):
-            with pytest.raises(ValueError, match="Some other error"):
-                estimator._estimate_depth_chunked(frames, 30, 518, False)
-
-
-class TestProcessDepthChunk:
-    """Test _process_depth_chunk method."""
-
-    def test_process_depth_chunk_with_output_suppression(self):
-        """Test chunk processing suppresses output."""
-        import numpy as np
-
+    def test_sequence_propagates_loader_exception(self):
         estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
-        estimator.model = MagicMock()
+        estimator.model = object()
 
-        mock_depths = np.random.rand(10, 480, 640)
-        estimator.model.infer_video_depth.return_value = (mock_depths, None)
+        def load(_indexes):
+            raise OSError("missing source.png")
 
-        frames_rgb = np.random.rand(10, 480, 640, 3).astype(np.uint8)
+        iterator = estimator.iter_sequence_depth(
+            1,
+            load,
+            target_fps=30,
+            input_size=518,
+            fp32=False,
+        )
 
-        with patch.object(estimator, "_suppress_model_output") as mock_suppress:
-            mock_suppress.return_value.__enter__ = MagicMock()
-            mock_suppress.return_value.__exit__ = MagicMock()
+        with pytest.raises(OSError, match="missing source.png"):
+            next(iterator)
 
-            result = estimator._process_depth_chunk(frames_rgb, 30, 518, False)
+    def test_sequence_retains_only_fixed_temporal_state(self, monkeypatch):
+        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu", metric=True)
+        estimator.model = object()
+        _install_fake_fixed_forward(estimator, monkeypatch)
+        iterator = estimator.iter_sequence_depth(
+            100,
+            _frame_loader(100, []),
+            target_fps=30,
+            input_size=518,
+            fp32=False,
+        )
 
-            assert result.shape == (10, 480, 640)
-            mock_suppress.assert_called_once()
+        next(iterator)
+
+        assert iterator._retained_input.shape[1] == 10
+        assert iterator._alignment_refs.shape[0] == 2
+        assert iterator._pending_depth.shape[0] == 8
+        assert not hasattr(iterator, "_all_depths")
+
+    @pytest.mark.parametrize("metric", [False, True])
+    def test_sequence_is_numerically_equivalent_to_upstream_offline_inference(
+        self,
+        metric,
+        monkeypatch,
+    ):
+        frame_count = 55
+        frames = np.empty((frame_count, 2, 3, 3), dtype=np.uint8)
+        spatial = np.arange(6, dtype=np.uint8).reshape(2, 3)
+        for index in range(frame_count):
+            frames[index] = (index + spatial[..., None]) % 255
+        helper_calls = {"scale": 0, "interpolate": 0}
+        compute_scale_and_shift, get_interpolate_frames = _install_upstream_numeric_helpers(
+            monkeypatch,
+            helper_calls,
+        )
+        reference = _UpstreamOfflineReference(
+            _DeterministicWindowModel(),
+            metric,
+            compute_scale_and_shift,
+            get_interpolate_frames,
+        )
+        expected, _fps = reference.infer_video_depth(
+            frames,
+            30,
+            input_size=518,
+            device="cpu",
+            fp32=True,
+        )
+        helper_calls.update(scale=0, interpolate=0)
+        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu", metric=metric)
+        estimator.model = _DeterministicWindowModel()
+        monkeypatch.setattr(estimator, "_build_vda_transform", lambda *_args: object())
+        monkeypatch.setattr(
+            estimator,
+            "_transform_vda_frame",
+            lambda frame, _transform: torch.from_numpy(frame[..., 0].astype(np.float32)).reshape(
+                1, 1, 1, 2, 3
+            ),
+        )
+
+        yielded = list(
+            estimator.iter_sequence_depth(
+                frame_count,
+                lambda indexes: frames[list(indexes)].copy(),
+                target_fps=30,
+                input_size=518,
+                fp32=True,
+            )
+        )
+        actual = np.concatenate([batch.values for _start, batch in yielded], axis=0)
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+        assert helper_calls["scale"] == (0 if metric else 2)
+        assert helper_calls["interpolate"] == 2
+
+    @pytest.mark.parametrize("frame_count", [55, 220])
+    def test_sequence_enforces_documented_working_memory_bounds(
+        self,
+        frame_count,
+        monkeypatch,
+    ):
+        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu", metric=True)
+        estimator.model = object()
+        observed = {"decoded": 0, "host_depth": 0, "device_input": 0}
+
+        def observe_window(frames, carried_input, current_input, depths):
+            observed["decoded"] = max(observed["decoded"], len(frames))
+            carried_count = 0 if carried_input is None else carried_input.shape[1]
+            observed["device_input"] = max(
+                observed["device_input"],
+                current_input.shape[1] + carried_count,
+            )
+            assert len(depths) == VDA_INFER_LEN
+
+        _install_fake_fixed_forward(estimator, monkeypatch, observer=observe_window)
+
+        def observe_interpolation(previous, current):
+            blended = [
+                previous[index] * 0.5 + current[index] * 0.5 for index in range(VDA_INTERP_LEN)
+            ]
+            observed["host_depth"] = max(
+                observed["host_depth"],
+                len(previous) + VDA_INFER_LEN + 2 + len(blended),
+            )
+            return blended
+
+        monkeypatch.setattr(estimator, "_interpolate_depths", observe_interpolation)
+
+        list(
+            estimator.iter_sequence_depth(
+                frame_count,
+                _frame_loader(frame_count, []),
+                target_fps=30,
+                input_size=518,
+                fp32=False,
+            )
+        )
+
+        assert observed == {"decoded": 32, "host_depth": 50, "device_input": 42}
+
+    def test_finalize_window_reuses_current_storage_for_finalized_output(self, monkeypatch):
+        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu", metric=True)
+        current = np.arange(VDA_INFER_LEN * 6, dtype=np.float32).reshape(
+            VDA_INFER_LEN,
+            2,
+            3,
+        )
+        pending = np.arange(VDA_INTERP_LEN * 6, dtype=np.float32).reshape(
+            VDA_INTERP_LEN,
+            2,
+            3,
+        )
+        references = np.zeros((2, 2, 3), dtype=np.float32)
+        monkeypatch.setattr(
+            estimator,
+            "_interpolate_depths",
+            lambda previous, post: [value.copy() for value in previous],
+        )
+
+        finalized, next_pending, next_reference = estimator._finalize_window(
+            pending,
+            current,
+            references,
+        )
+
+        assert np.shares_memory(finalized, current)
+        assert not np.shares_memory(next_pending, current)
+        assert np.shares_memory(next_reference, current)
+        assert references[:, 0, 0].tolist() == [0.0, 0.0]
 
 
-class TestRetryChunkWithReducedResolution:
-    """Test _retry_chunk_with_reduced_resolution method."""
+def test_finalize_window_aligns_only_non_keyframe_outputs(monkeypatch):
+    estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu", metric=False)
+    current = np.arange(32, dtype=np.float32).reshape(32, 1, 1)
+    pending = np.arange(100, 108, dtype=np.float32).reshape(8, 1, 1)
+    references = np.asarray([[[10.0]], [[20.0]]], dtype=np.float32)
+    observed = {}
 
-    @patch("torch.cuda.empty_cache")
-    def test_retry_chunk_with_reduced_resolution(self, mock_cache):
-        """Test OOM retry with reduced input size."""
-        import numpy as np
+    def compute(current_refs, retained_refs):
+        observed["current_refs"] = current_refs.copy()
+        observed["retained_refs"] = retained_refs.copy()
+        return 2.0, 3.0
 
-        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cuda")
-        estimator.model = MagicMock()
+    def interpolate(previous, post):
+        observed["post"] = np.asarray(post).copy()
+        return np.asarray(previous)
 
-        mock_depths = np.random.rand(10, 480, 640)
-        estimator.model.infer_video_depth.return_value = (mock_depths, None)
+    monkeypatch.setattr(estimator, "_compute_scale_and_shift", compute, raising=False)
+    monkeypatch.setattr(estimator, "_interpolate_depths", interpolate, raising=False)
 
-        frames_rgb = np.random.rand(10, 480, 640, 3).astype(np.uint8)
+    finalized, next_pending, next_reference = estimator._finalize_window(
+        pending, current, references
+    )
 
-        with patch.object(estimator, "_suppress_model_output") as mock_suppress:
-            mock_suppress.return_value.__enter__ = MagicMock()
-            mock_suppress.return_value.__exit__ = MagicMock()
+    assert observed["current_refs"][:, 0, 0].tolist() == [0.0, 1.0]
+    assert observed["retained_refs"][:, 0, 0].tolist() == [10.0, 20.0]
+    assert observed["post"][:, 0, 0].tolist() == list(range(7, 23, 2))
+    assert finalized[:8, 0, 0].tolist() == list(range(100, 108))
+    assert finalized[8:, 0, 0].tolist() == list(range(23, 51, 2))
+    assert next_pending[:, 0, 0].tolist() == list(range(51, 67, 2))
+    assert next_reference[0, 0] == 27.0
+    assert references[:, 0, 0].tolist() == [10.0, 20.0]
 
-            result = estimator._retry_chunk_with_reduced_resolution(frames_rgb, 30, 1024, False)
 
-            assert result.shape == (10, 480, 640)
-            # Should use reduced input size (max(384, 1024 // 2) = 512)
-            call_args = estimator.model.infer_video_depth.call_args
-            assert call_args[1]["input_size"] == 512
-            mock_cache.assert_called_once()
+def test_fixed_window_pads_from_latest_new_source_frame(monkeypatch):
+    class EchoModel:
+        @staticmethod
+        def forward(values):
+            return values[:, :, 0]
+
+    estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu", metric=True)
+    estimator.model = EchoModel()
+    frames = np.zeros((2, 1, 1, 3), dtype=np.uint8)
+    frames[0].fill(50)
+    frames[1].fill(51)
+    carried = torch.arange(10, dtype=torch.float32).reshape(1, 10, 1, 1, 1)
+    monkeypatch.setattr(
+        estimator,
+        "_transform_vda_frame",
+        lambda frame, _transform: torch.tensor(float(frame[0, 0, 0]), dtype=torch.float32).reshape(
+            1, 1, 1, 1, 1
+        ),
+    )
+
+    depths, current_input, _transform = estimator._infer_fixed_window(
+        frames,
+        input_size=518,
+        fp32=True,
+        carried_input=carried,
+        padding_input=carried[:, -1:],
+        transform=object(),
+        output_shape=(1, 1),
+    )
+
+    expected = list(range(10)) + [50, 51] + [51] * 20
+    assert current_input.flatten().tolist() == expected
+    assert depths[:, 0, 0].tolist() == expected

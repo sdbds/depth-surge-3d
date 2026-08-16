@@ -7,13 +7,13 @@
 
 **Convert 2D videos to 3D VR format using AI depth estimation.**
 
-Depth Surge 3D transforms flat videos into stereoscopic 3D for VR headsets using **Depth Anything V3** and **Video-Depth-Anything V2** neural networks. It analyzes video frames with temporal consistency to predict depth, then generates left and right eye views for immersive stereoscopic viewing.
+Depth Surge 3D transforms flat videos into stereoscopic 3D for VR headsets using **Depth Anything V3** and **Video-Depth-Anything V2** neural networks. It predicts depth with the selected backend, then generates left and right eye views for immersive stereoscopic viewing. V2 applies model-native temporal inference independently within each detected shot.
 
 ## Key Features
 
 - **Dual Depth Models**:
   - **Depth Anything V3** (default): 50% lower VRAM, faster processing, optimized for modern GPUs
-  - **Video-Depth-Anything V2**: Superior temporal consistency with 32-frame sliding windows
+  - **Video-Depth-Anything V2**: Shot-aware temporal consistency with fixed 32-frame windows, 10-frame overlap, and state resets at detected cuts
 - **AI Upscaling**: Optional Real-ESRGAN enhancement (2x/4x) for higher output resolution
 - **CUDA Hardware Acceleration**: NVENC H.265 encoding and GPU-accelerated frame decoding
 - **Configurable Depth Quality**: Adjustable depth map resolution (518px to 4K) for quality vs. speed
@@ -135,7 +135,7 @@ Generated videos work with:
 This project uses state-of-the-art depth estimation models:
 
 - **[Depth Anything V3](https://github.com/ByteDance-Seed/Depth-Anything-3)** - Default model with improved memory efficiency and performance
-- **[Video-Depth-Anything V2](https://github.com/DepthAnything/Video-Depth-Anything)** - Temporal-consistent depth estimation with 32-frame sliding windows
+- **[Video-Depth-Anything V2](https://github.com/DepthAnything/Video-Depth-Anything)** - Shot-aware temporal depth estimation with fixed 32-frame windows and 10-frame overlap
 
 Both models are based on vision transformer architectures optimized for monocular depth prediction.
 
