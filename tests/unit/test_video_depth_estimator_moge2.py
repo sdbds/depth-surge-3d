@@ -104,6 +104,21 @@ def test_moge_preprocessing_is_rgb_area_no_upscale_and_forwards_fixed_options(
     )
 
 
+def test_moge_normalizes_to_float32_before_area_downscale() -> None:
+    estimator = loaded_fake_moge()
+    bgr = np.zeros((1, 4, 8, 3), dtype=np.uint8)
+    bgr[0, 0, 0, 0] = 1
+    expected_rgb = np.ascontiguousarray(bgr[0, ..., ::-1]).astype(np.float32) / 255.0
+    expected_rgb = cv2.resize(expected_rgb, (4, 2), interpolation=cv2.INTER_AREA)
+
+    estimator.estimate_depth_batch(bgr, input_size=4)
+
+    image, _kwargs = estimator.model.calls[0]
+    expected = torch.from_numpy(expected_rgb.transpose(2, 0, 1)).unsqueeze(0)
+    torch.testing.assert_close(image, expected, rtol=0.0, atol=0.0)
+    assert image[0, 2, 0, 0].item() == pytest.approx(1.0 / (4.0 * 255.0))
+
+
 def test_moge_never_upscales_and_accepts_only_one_frame() -> None:
     estimator = loaded_fake_moge()
     estimator.estimate_depth_batch(np.zeros((1, 3, 5, 3), dtype=np.uint8), input_size=20)

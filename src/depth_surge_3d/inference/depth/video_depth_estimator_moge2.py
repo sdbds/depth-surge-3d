@@ -215,7 +215,8 @@ class VideoDepthEstimatorMoGe2:
     def _preprocess(self, frame: np.ndarray, max_edge: int) -> torch.Tensor:
         height, width = frame.shape[:2]
         target_height, target_width = _scaled_shape(width, height, max_edge)
-        rgb = np.ascontiguousarray(frame[..., ::-1])
+        rgb = np.ascontiguousarray(frame[..., ::-1], dtype=np.float32)
+        rgb /= 255.0
         if (target_height, target_width) != (height, width):
             rgb = cv2.resize(
                 rgb,
@@ -223,7 +224,7 @@ class VideoDepthEstimatorMoGe2:
                 interpolation=cv2.INTER_AREA,
             )
         image = torch.from_numpy(np.ascontiguousarray(rgb.transpose(2, 0, 1)))
-        return image.unsqueeze(0).to(dtype=torch.float32).div_(255.0)
+        return image.unsqueeze(0)
 
     def estimate_depth_batch(
         self,
