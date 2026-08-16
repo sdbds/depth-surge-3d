@@ -459,6 +459,129 @@ def test_clean_chunked_and_resumed_metric_stages_are_byte_identical(
     assert hash_directory(resumed_directories["metric_geometry"]) == expected
 
 
+def test_relative_cache_hit_clears_incompatible_raw_and_both_derived_stages(
+    fresh_metric_job: MetricJob,
+    tmp_path: Path,
+) -> None:
+    fresh_metric_job.run()
+    directories = fresh_metric_job.directories
+    stale_canonical = directories["disparity_maps"] / "stale.png"
+    stale_canonical.write_bytes(b"stale")
+    restored = tmp_path / "restored.png"
+    restored.write_bytes(b"restored")
+
+    def lookup_after_classification(*_args):
+        assert not list(directories["depth_raw"].glob("*.npz"))
+        assert not list(directories["disparity_maps"].iterdir())
+        assert not list(directories["metric_geometry"].iterdir())
+        return [restored]
+
+    with (
+        patch.object(
+            depth_processor,
+            "get_cached_depth_map_files",
+            side_effect=lookup_after_classification,
+        ),
+        patch.object(
+            fresh_metric_job.processor,
+            "_restore_cached_canonical_stage",
+            return_value=[restored],
+        ),
+    ):
+        files = fresh_metric_job.processor.generate_depth_map_files(
+            fresh_metric_job.frame_files,
+            {
+                **fresh_metric_job.settings,
+                "stereo_geometry_mode": "relative",
+                "depth_resolution": "7",
+                "video_path": "source.mp4",
+            },
+            directories,
+            None,
+        )
+
+    assert files == [restored]
+
+
+def test_relative_cache_hit_removes_compatible_raw_after_validation(
+    fresh_metric_job: MetricJob,
+    tmp_path: Path,
+) -> None:
+    settings = {
+        **fresh_metric_job.settings,
+        "stereo_geometry_mode": "relative",
+        "keep_intermediates": True,
+    }
+    files = fresh_metric_job.processor.generate_depth_map_files(
+        fresh_metric_job.frame_files,
+        settings,
+        fresh_metric_job.directories,
+        None,
+    )
+    assert files
+    raw_dir = fresh_metric_job.directories["depth_raw"]
+    assert list(raw_dir.glob("*.npz"))
+    restored = tmp_path / "restored.png"
+    restored.write_bytes(b"restored")
+
+    with (
+        patch.object(depth_processor, "get_cached_depth_map_files", return_value=[restored]),
+        patch.object(
+            fresh_metric_job.processor,
+            "_restore_cached_canonical_stage",
+            return_value=[restored],
+        ),
+    ):
+        result = fresh_metric_job.processor.generate_depth_map_files(
+            fresh_metric_job.frame_files,
+            {**settings, "keep_intermediates": False, "video_path": "source.mp4"},
+            fresh_metric_job.directories,
+            None,
+        )
+
+    assert result == [restored]
+    assert not list(raw_dir.glob("*.npz"))
+    metadata = json.loads((raw_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["storage_status"] == "ready"
+    assert metadata["completed_count"] == 0
+
+
+def test_relative_cache_validation_failure_preserves_compatible_raw_payloads(
+    fresh_metric_job: MetricJob,
+) -> None:
+    settings = {
+        **fresh_metric_job.settings,
+        "stereo_geometry_mode": "relative",
+        "keep_intermediates": True,
+    }
+    assert fresh_metric_job.processor.generate_depth_map_files(
+        fresh_metric_job.frame_files,
+        settings,
+        fresh_metric_job.directories,
+        None,
+    )
+    raw_dir = fresh_metric_job.directories["depth_raw"]
+    before = hash_directory(raw_dir)
+
+    with (
+        patch.object(depth_processor, "get_cached_depth_map_files", return_value=[raw_dir]),
+        patch.object(
+            fresh_metric_job.processor,
+            "_restore_cached_canonical_stage",
+            side_effect=OSError("restored canonical validation failed"),
+        ),
+        pytest.raises(OSError, match="validation failed"),
+    ):
+        fresh_metric_job.processor.generate_depth_map_files(
+            fresh_metric_job.frame_files,
+            {**settings, "keep_intermediates": False, "video_path": "source.mp4"},
+            fresh_metric_job.directories,
+            None,
+        )
+
+    assert hash_directory(raw_dir) == before
+
+
 class TestDepthMapProcessorInit:
     """Test DepthMapProcessor initialization."""
 

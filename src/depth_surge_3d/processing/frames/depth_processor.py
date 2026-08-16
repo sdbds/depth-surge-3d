@@ -145,16 +145,6 @@ class DepthMapProcessor:
         model_fingerprint = canonical_json_hash(semantic_fingerprint)
         cache_settings = dict(settings, model_fingerprint=model_fingerprint)
         video_path = settings.get("video_path")
-        if geometry_mode == "relative":
-            restored = self._try_restore_global_canonical_cache(
-                video_path,
-                frame_files,
-                cache_settings,
-                canonical_dir,
-                progress_tracker,
-            )
-            if restored is not None:
-                return restored
 
         manifest = self._load_or_analyze_scenes(
             frame_files,
@@ -207,6 +197,18 @@ class DepthMapProcessor:
             raw_store = None
 
         if geometry_mode == "relative":
+            restored = self._try_restore_global_canonical_cache(
+                video_path,
+                frame_files,
+                cache_settings,
+                canonical_dir,
+                progress_tracker,
+            )
+            if restored is not None:
+                if raw_store is not None and not settings.get("keep_intermediates", False):
+                    self._remove_raw_payloads(raw_store)
+                return restored
+
             final_state = self._load_final_scene_state(
                 scene_dir,
                 manifest,
