@@ -747,6 +747,11 @@ class StereoPairGenerator:
 
         self.last_pipeline_stats = None
         self.last_metric_clamp_summary = None
+        geometry_mode = str(settings.get("stereo_geometry_mode", "relative"))
+        if geometry_mode == "metric_camera" and (
+            not frame_files or len(frame_files) != len(depth_files)
+        ):
+            raise ValueError(METRIC_STEREO_COMPLETION_ERROR)
         if len(frame_files) != len(depth_files):
             print(
                 f"Error: Frame/depth count mismatch: {len(frame_files)} frames, "

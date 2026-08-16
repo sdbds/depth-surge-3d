@@ -253,6 +253,51 @@ def test_metric_stereo_rejects_incomplete_stage_before_constructing_renderer(
     renderer_factory.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("frame_count", "metric_count"),
+    [(0, 0), (3, 0), (3, 2)],
+    ids=["empty", "missing-metric-payloads", "mismatched-manifest"],
+)
+def test_metric_stereo_rejects_invalid_payload_count_before_constructing_renderer(
+    tmp_path: Path,
+    frame_count: int,
+    metric_count: int,
+) -> None:
+    frame_files, metric_files, directories, _ = _make_metric_inputs(tmp_path)
+
+    with patch.object(
+        stereo_generator,
+        "StereoRenderer",
+        side_effect=AssertionError("renderer constructed before metric barrier"),
+    ) as renderer_factory:
+        generator = StereoPairGenerator()
+        with pytest.raises(
+            ValueError,
+            match="^metric stereo requires completed clip-global convergence metadata$",
+        ):
+            generator.create_stereo_pairs_from_files(
+                frame_files[:frame_count],
+                metric_files[:metric_count],
+                directories,
+                _settings(stereo_geometry_mode="metric_camera"),
+            )
+
+    renderer_factory.assert_not_called()
+
+
+def test_relative_stereo_preserves_legacy_count_mismatch_result(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=2)
+    renderer = _FakeRenderer()
+
+    assert not StereoPairGenerator(renderer=renderer).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files[:1],
+        directories,
+        _settings(stereo_geometry_mode="relative"),
+    )
+    assert renderer.calls == []
+
+
 def test_relative_stereo_setup_does_not_read_metric_metadata(tmp_path: Path) -> None:
     frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=1)
     renderer = _FakeRenderer()

@@ -30,6 +30,7 @@ from depth_surge_3d.inference.depth.types import (  # noqa: E402
 from depth_surge_3d.io.operations import generate_output_filename  # noqa: E402
 from depth_surge_3d.io.resume import build_resume_report  # noqa: E402
 from depth_surge_3d.processing.frames import depth_processor  # noqa: E402
+from depth_surge_3d.processing.frames.depth_storage import RawDepthStore  # noqa: E402
 from depth_surge_3d.processing.frames.metric_geometry import (  # noqa: E402
     MetricGeometryStore,
 )
@@ -108,6 +109,13 @@ class _RecordedEvent:
     png_bytes: bytes | None
 
 
+@dataclass(frozen=True)
+class _StageObservation:
+    sequence: int
+    kind: str
+    raw_payload_names: tuple[str, ...]
+
+
 class _RecordingProgressTracker:
     def __init__(self) -> None:
         self.events: list[_RecordedEvent] = []
@@ -138,6 +146,7 @@ class _PipelineResult:
     settings: dict[str, Any]
     settings_file: Path | None
     progress: _RecordingProgressTracker
+    stage_observations: tuple[_StageObservation, ...]
 
     @property
     def final_video(self) -> Path:
@@ -154,6 +163,8 @@ class _PipelineHarness:
         self.source_video = root / "clip.mp4"
         self.source_video.write_bytes(b"deterministic fake video boundary")
         self._active_tracker: _RecordingProgressTracker | None = None
+        self._active_output_dir: Path | None = None
+        self._stage_observations: list[_StageObservation] = []
         self._source_colors = ((20, 40, 220), (30, 210, 70), (220, 60, 30))
 
         monkeypatch.setattr(
@@ -197,14 +208,67 @@ class _PipelineHarness:
             ),
         )
         real_finalize = MetricGeometryStore.finalize
+        real_open_existing = MetricGeometryStore.open_existing
+        real_remove_raw_payloads = depth_processor.DepthMapProcessor._remove_raw_payloads
 
         def observed_finalize(store, convergence):
             metadata = real_finalize(store, convergence)
+            self._record_stage_observation("metric_finalize")
             if self._active_tracker is not None:
                 self._active_tracker.record_metric_complete(store.metadata_path)
             return metadata
 
         monkeypatch.setattr(MetricGeometryStore, "finalize", observed_finalize)
+
+        def observed_open_existing(
+            _store_type: type[MetricGeometryStore],
+            directory: Path,
+            *,
+            frame_names: list[str],
+            source_raw_fingerprint: str,
+            source_frame_fingerprint: str,
+            candidate_scene_fingerprint: str,
+            cleanup_temporaries: bool = True,
+        ) -> MetricGeometryStore:
+            store = real_open_existing(
+                directory,
+                frame_names=frame_names,
+                source_raw_fingerprint=source_raw_fingerprint,
+                source_frame_fingerprint=source_frame_fingerprint,
+                candidate_scene_fingerprint=candidate_scene_fingerprint,
+                cleanup_temporaries=cleanup_temporaries,
+            )
+            self._record_stage_observation("metric_open_existing")
+            return store
+
+        def observed_remove_raw_payloads(raw_store: RawDepthStore) -> None:
+            self._record_stage_observation("remove_raw_payloads")
+            real_remove_raw_payloads(raw_store)
+
+        monkeypatch.setattr(
+            MetricGeometryStore,
+            "open_existing",
+            classmethod(observed_open_existing),
+        )
+        monkeypatch.setattr(
+            depth_processor.DepthMapProcessor,
+            "_remove_raw_payloads",
+            staticmethod(observed_remove_raw_payloads),
+        )
+
+    def _record_stage_observation(self, kind: str) -> None:
+        if self._active_output_dir is None:
+            return
+        raw_payload_names = tuple(
+            sorted(path.name for path in (self._active_output_dir / "02_depth_raw").glob("*.npz"))
+        )
+        self._stage_observations.append(
+            _StageObservation(
+                sequence=len(self._stage_observations),
+                kind=kind,
+                raw_payload_names=raw_payload_names,
+            )
+        )
 
     def patch_package_namespace(self, monkeypatch: pytest.MonkeyPatch) -> Any:
         """Apply the same media/fingerprint boundaries to the product import namespace."""
@@ -292,6 +356,8 @@ class _PipelineHarness:
         if fail_stereo:
             processor.stereo_generator._run_file_pipeline = self._fail_stereo
         self._active_tracker = progress
+        self._active_output_dir = output_dir
+        self._stage_observations = []
         try:
             success = processor.process(
                 video_path=str(self.source_video),
@@ -302,6 +368,7 @@ class _PipelineHarness:
             )
         finally:
             self._active_tracker = None
+            self._active_output_dir = None
         return _PipelineResult(
             success=success,
             output_dir=output_dir,
@@ -310,6 +377,7 @@ class _PipelineHarness:
             settings=settings,
             settings_file=processor.orchestrator._settings_file,
             progress=progress,
+            stage_observations=tuple(self._stage_observations),
         )
 
     @staticmethod
@@ -384,6 +452,35 @@ def _tree_hashes(directory: Path) -> dict[str, str]:
         for path in sorted(directory.rglob("*"))
         if path.is_file()
     }
+
+
+def _png_hashes(directory: Path) -> dict[str, str]:
+    return {path.name: _sha256(path) for path in sorted(directory.glob("*.png")) if path.is_file()}
+
+
+def _png_pixel_hashes(directory: Path) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for path in sorted(directory.glob("*.png")):
+        image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        assert image is not None
+        hashes[path.name] = _array_sha256(image)
+    return hashes
+
+
+def _output_tree_snapshot(directory: Path) -> dict[str, tuple[str, str | None]]:
+    snapshot: dict[str, tuple[str, str | None]] = {}
+    for path in sorted(directory.rglob("*")):
+        relative = path.relative_to(directory).as_posix()
+        if path.is_symlink():
+            target = str(path.readlink()).encode("utf-8")
+            snapshot[relative] = ("symlink", hashlib.sha256(target).hexdigest())
+        elif path.is_file():
+            snapshot[relative] = ("file", _sha256(path))
+        elif path.is_dir():
+            snapshot[relative] = ("directory", None)
+        else:
+            snapshot[relative] = ("other", None)
+    return snapshot
 
 
 def _array_sha256(values: np.ndarray) -> str:
@@ -553,13 +650,28 @@ def test_metric_projection_setting_change_reuses_raw_and_metric_stage(
     first = pipeline_harness.run("metric_camera", output_dir=output_dir)
     metric_before = _tree_hashes(output_dir / "03_metric_geometry")
     raw_before = _tree_hashes(output_dir / "02_depth_raw")
-    stereo_before = {
-        **_tree_hashes(output_dir / "04_left_frames"),
+    eye_content_before = {
+        **{
+            f"left/{name}": digest
+            for name, digest in _png_hashes(output_dir / "04_left_frames").items()
+        },
         **{
             f"right/{name}": digest
-            for name, digest in _tree_hashes(output_dir / "04_right_frames").items()
+            for name, digest in _png_hashes(output_dir / "04_right_frames").items()
         },
     }
+    eye_pixels_before = {
+        **{
+            f"left/{name}": digest
+            for name, digest in _png_pixel_hashes(output_dir / "04_left_frames").items()
+        },
+        **{
+            f"right/{name}": digest
+            for name, digest in _png_pixel_hashes(output_dir / "04_right_frames").items()
+        },
+    }
+    packed_content_before = _png_hashes(output_dir / "99_vr_frames")
+    packed_pixels_before = _png_pixel_hashes(output_dir / "99_vr_frames")
 
     second = pipeline_harness.run(
         "metric_camera",
@@ -569,20 +681,38 @@ def test_metric_projection_setting_change_reuses_raw_and_metric_stage(
         metric_convergence_distance=0.1,
         max_disparity_percent=5.0,
     )
-    stereo_after = {
-        **_tree_hashes(output_dir / "04_left_frames"),
+    eye_content_after = {
+        **{
+            f"left/{name}": digest
+            for name, digest in _png_hashes(output_dir / "04_left_frames").items()
+        },
         **{
             f"right/{name}": digest
-            for name, digest in _tree_hashes(output_dir / "04_right_frames").items()
+            for name, digest in _png_hashes(output_dir / "04_right_frames").items()
         },
     }
+    eye_pixels_after = {
+        **{
+            f"left/{name}": digest
+            for name, digest in _png_pixel_hashes(output_dir / "04_left_frames").items()
+        },
+        **{
+            f"right/{name}": digest
+            for name, digest in _png_pixel_hashes(output_dir / "04_right_frames").items()
+        },
+    }
+    packed_content_after = _png_hashes(output_dir / "99_vr_frames")
+    packed_pixels_after = _png_pixel_hashes(output_dir / "99_vr_frames")
 
     assert first.success and second.success
     assert first.estimator.calls == _FRAME_COUNT
     assert second.estimator.calls == 0
     assert _tree_hashes(output_dir / "02_depth_raw") == raw_before
     assert _tree_hashes(output_dir / "03_metric_geometry") == metric_before
-    assert stereo_after != stereo_before
+    assert eye_content_after != eye_content_before
+    assert eye_pixels_after != eye_pixels_before
+    assert packed_content_after != packed_content_before
+    assert packed_pixels_after != packed_pixels_before
 
 
 def test_retained_mode_switch_builds_only_missing_selected_stage(
@@ -627,8 +757,25 @@ def test_no_retention_failure_keeps_completed_stage_and_reports_required_inferen
     raw_metadata = json.loads((raw_dir / "metadata.json").read_text(encoding="utf-8"))
     assert raw_metadata["storage_status"] == "ready"
     assert list(raw_dir.glob("*.npz")) == []
-    source_before = _tree_hashes(output_dir / "00_original_frames")
-    metric_before = _tree_hashes(output_dir / "03_metric_geometry")
+    expected_raw_payloads = tuple(f"frame_{index:06d}.npz" for index in range(1, _FRAME_COUNT + 1))
+    finalization = next(
+        observation
+        for observation in failed.stage_observations
+        if observation.kind == "metric_finalize"
+    )
+    final_validation = next(
+        observation
+        for observation in failed.stage_observations
+        if observation.kind == "metric_open_existing" and observation.raw_payload_names
+    )
+    raw_removal = next(
+        observation
+        for observation in failed.stage_observations
+        if observation.kind == "remove_raw_payloads"
+    )
+    assert final_validation.raw_payload_names == expected_raw_payloads
+    assert raw_removal.raw_payload_names == expected_raw_payloads
+    assert finalization.sequence < final_validation.sequence < raw_removal.sequence
     assert len(list((output_dir / "00_original_frames").glob("*.png"))) == _FRAME_COUNT
     assert len(list((output_dir / "03_metric_geometry").glob("*.npz"))) == _FRAME_COUNT
     assert failed.settings_file is not None
@@ -643,6 +790,7 @@ def test_no_retention_failure_keeps_completed_stage_and_reports_required_inferen
         _FakeMoGeEstimator(),
         relative_settings,
     )
+    output_before = _output_tree_snapshot(output_dir)
     report = build_resume_report(
         output_dir,
         relative_settings,
@@ -654,8 +802,7 @@ def test_no_retention_failure_keeps_completed_stage_and_reports_required_inferen
     assert report.stage("disparity_maps").reason == (
         "MoGe inference is required to build the selected geometry stage"
     )
-    assert _tree_hashes(output_dir / "00_original_frames") == source_before
-    assert _tree_hashes(output_dir / "03_metric_geometry") == metric_before
+    assert _output_tree_snapshot(output_dir) == output_before
 
 
 def _load_cli_module():
