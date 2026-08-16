@@ -3012,8 +3012,8 @@ def resolve_depth_input_size(width: int, height: int, value: int | str) -> int:
 @pytest.mark.parametrize(
     ("width", "height", "expected"),
     [
-        (640, 360, 518),
-        (1280, 720, 518),
+        (640, 360, 640),
+        (1280, 720, 640),
         (1920, 1080, 1080),
         (3840, 2160, 2160),
         (7680, 4320, 2160),
