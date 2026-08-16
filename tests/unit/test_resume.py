@@ -1165,6 +1165,20 @@ def test_completed_metric_geometry_reuses_compatible_ready_raw_identity_without_
     assert report.stage("stereo").disposition == "preserve"
 
 
+def test_corrupt_raw_payload_does_not_invalidate_completed_metric_stage(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path)
+    (tmp_path / "02_depth_raw" / "frame_000001.npz").write_bytes(b"corrupt raw payload")
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("depth_raw").disposition == "invalidate"
+    assert "payload validation failed" in report.stage("depth_raw").reason
+    assert report.stage("metric_geometry").disposition == "preserve"
+    assert report.stage("stereo").disposition == "preserve"
+
+
 def test_crop_change_invalidates_metric_stereo_but_not_relative_stereo(tmp_path):
     from src.depth_surge_3d.io.resume import build_resume_report
 

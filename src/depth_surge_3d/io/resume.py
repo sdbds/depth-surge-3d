@@ -558,11 +558,13 @@ def _bind_final_scene_to_raw_depth(
     manifest: dict[str, Any] | None,
     bounds: dict[str, Any] | None,
     raw: ResumeStage,
-    raw_metadata: dict[str, Any] | None,
+    raw_identity_metadata: dict[str, Any] | None,
 ) -> tuple[ResumeStage, dict[str, Any] | None]:
     if scene.disposition != "preserve" or manifest is None or bounds is None:
         return scene, bounds
-    raw_fingerprint = raw_metadata.get("fingerprint") if raw_metadata is not None else None
+    raw_fingerprint = (
+        raw_identity_metadata.get("fingerprint") if raw_identity_metadata is not None else None
+    )
     if (
         raw.disposition not in {"preserve", "resume"}
         or not isinstance(raw_fingerprint, str)
@@ -803,7 +805,7 @@ def _validate_raw_stage(
         )
     except RawDepthFingerprintError as error:
         reason = f"raw-depth payload validation failed: {error}"
-        return _stage("depth_raw", paths, "invalidate", reason), None, 0
+        return _stage("depth_raw", paths, "invalidate", reason), metadata, 0
     if _raw_promotion_pending(metadata, current_settings):
         reason = "raw-depth float16-to-float32 promotion will resume"
         return _stage("depth_raw", paths, "resume", reason), None, completed_count
@@ -931,16 +933,16 @@ def _candidate_scene_fingerprint(manifest: dict[str, Any]) -> str:
 
 def _metric_raw_identity_reason(
     metadata: dict[str, Any],
-    raw_metadata: dict[str, Any] | None,
+    raw_identity_metadata: dict[str, Any] | None,
 ) -> tuple[str | None, str | None]:
-    if not isinstance(raw_metadata, dict):
+    if not isinstance(raw_identity_metadata, dict):
         return None, "current raw depth identity is incompatible or unavailable"
-    raw_fingerprint = raw_metadata.get("fingerprint")
+    raw_fingerprint = raw_identity_metadata.get("fingerprint")
     if not isinstance(raw_fingerprint, str) or not raw_fingerprint:
         return None, "metric geometry source raw fingerprint is missing"
-    if metadata.get("native_shape") != raw_metadata.get("native_shape"):
+    if metadata.get("native_shape") != raw_identity_metadata.get("native_shape"):
         return None, "metric geometry native shape does not match raw depth"
-    if metadata.get("source_raw_fingerprint") != raw_metadata.get("fingerprint"):
+    if metadata.get("source_raw_fingerprint") != raw_identity_metadata.get("fingerprint"):
         return None, "metric geometry source raw fingerprint mismatch"
     return raw_fingerprint, None
 
@@ -950,7 +952,7 @@ def _validate_metric_geometry_stage(
     frame_files: list[Path],
     manifest: dict[str, Any] | None,
     source_frame_fingerprint: str | None,
-    raw_metadata: dict[str, Any] | None,
+    raw_identity_metadata: dict[str, Any] | None,
     *,
     frames_reusable: bool,
 ) -> tuple[ResumeStage, dict[str, Any] | None]:
@@ -966,7 +968,7 @@ def _validate_metric_geometry_stage(
     if metadata is None:
         reason = "metric geometry metadata is missing or malformed"
         return _stage("metric_geometry", paths, "invalidate", reason), None
-    raw_fingerprint, raw_reason = _metric_raw_identity_reason(metadata, raw_metadata)
+    raw_fingerprint, raw_reason = _metric_raw_identity_reason(metadata, raw_identity_metadata)
     if raw_fingerprint is None:
         assert raw_reason is not None
         return _stage("metric_geometry", paths, "invalidate", raw_reason), None
@@ -1271,7 +1273,7 @@ def build_resume_report(
         migrated_settings,
     )
     scene_reusable = scene.disposition in {"preserve", "resume"}
-    raw, raw_metadata, raw_completed_count = _validate_raw_stage(
+    raw, raw_identity_metadata, raw_completed_count = _validate_raw_stage(
         root,
         migrated_settings,
         frame_files,
@@ -1284,7 +1286,7 @@ def build_resume_report(
         manifest,
         bounds,
         raw,
-        raw_metadata,
+        raw_identity_metadata,
     )
 
     stages: list[ResumeStage] = [frames, scene, raw]
@@ -1294,7 +1296,7 @@ def build_resume_report(
         frame_files,
         manifest,
         bounds,
-        raw_metadata,
+        raw_identity_metadata,
         scene.disposition == "preserve",
     )
     stages.append(canonical)
@@ -1303,7 +1305,7 @@ def build_resume_report(
         frame_files,
         manifest,
         source_fingerprint,
-        raw_metadata,
+        raw_identity_metadata,
         frames_reusable=frames_reusable,
     )
     stages.append(metric)
