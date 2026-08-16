@@ -200,6 +200,11 @@ class SeeThroughDepthEstimator:
             _run_opaque_marigold_batch if self.device.startswith("cuda") else None
         )
 
+    @property
+    def inference_precision(self) -> str:
+        """Report the same dtype selected by the model loader."""
+        return str(self._resolve_dtype()).removeprefix("torch.")
+
     def _recommended_batch_size(self) -> int:
         if not self.device.startswith("cuda"):
             return 1

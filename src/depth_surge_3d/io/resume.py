@@ -80,7 +80,7 @@ _VR_SETTING_KEYS = (
     "vr_output_width",
     "vr_output_height",
 )
-_DEPTH_MODEL_VERSIONS = frozenset({"v2", "v3", "see_through"})
+_DEPTH_MODEL_VERSIONS = frozenset({"v2", "v3", "see_through", "moge2"})
 _SEE_THROUGH_MARKERS = ("see_through", "seethrough")
 
 

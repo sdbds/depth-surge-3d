@@ -67,12 +67,17 @@ from depth_surge_3d.core.constants import (  # noqa: E402
 )
 from depth_surge_3d.utils.system.console import warning as console_warning  # noqa: E402
 from depth_surge_3d.inference.depth.backend_registry import (  # noqa: E402
+    TEMPORAL_STABILITY_WARNING,
     backend_availability,
+    build_effective_depth_run_report,
     get_backend_spec,
     list_backend_specs,
     normalize_model_size,
+    validate_backend_geometry_request,
 )
 from depth_surge_3d.core.settings import validate_settings  # noqa: E402
+from depth_surge_3d.io.operations import get_video_properties  # noqa: E402
+from depth_surge_3d.utils.domain.resolution import resolve_depth_input_size  # noqa: E402
 
 from flask import Flask, render_template, request, jsonify  # noqa: E402
 from flask_socketio import SocketIO  # noqa: E402
@@ -926,6 +931,7 @@ def process_video_async(  # noqa: C901
     settings: dict[str, Any],
     output_dir: str | Path,
     resume_context: dict[str, Any] | None = None,
+    video_properties: dict[str, Any] | None = None,
 ) -> None:
     """Process video in background thread"""
     import torch  # Import here to avoid CUDA initialization issues in main thread
@@ -950,7 +956,10 @@ def process_video_async(  # noqa: C901
                 output_dir,
                 default="v3",
             )
-        settings = _normalize_depth_backend_settings(settings)
+        settings = _validate_web_settings(
+            _normalize_depth_backend_settings(settings),
+            source="explicit",
+        )
         depth_model_version = settings["depth_model_version"]
         model_size = settings["model_size"]
         model_path = settings["model_path"]
@@ -968,6 +977,19 @@ def process_video_async(  # noqa: C901
             )
             raise Exception(error_msg)
 
+        if video_properties is None:
+            video_properties = get_video_properties(str(video_path))
+            if not video_properties:
+                video_properties = get_video_info(video_path)
+        if not video_properties:
+            raise Exception("Could not read video file")
+        settings["depth_resolution"] = resolve_depth_input_size(
+            int(video_properties["width"]),
+            int(video_properties["height"]),
+            settings.get("depth_resolution", "auto"),
+        )
+        validate_backend_geometry_request(settings, video_properties)
+
         print(
             f"Loading {get_backend_spec(depth_model_version).display_name}: "
             f"{model_size} (metric inference: {use_metric})"
@@ -981,6 +1003,11 @@ def process_video_async(  # noqa: C901
             depth_model_version=depth_model_version,
             model_size=model_size,
         )
+
+        report = build_effective_depth_run_report(settings, projector.depth_estimator)
+        socketio.emit("processing_configuration", report, room=session_id)
+        if settings["stereo_geometry_mode"] == "metric_camera":
+            print(TEMPORAL_STABILITY_WARNING)
 
         # Ensure the model is loaded before processing
         if not projector.load_model():
@@ -1002,10 +1029,7 @@ def process_video_async(  # noqa: C901
             apply_legacy_migration(resume_report, migration_mode)
             settings = resume_report.migrated_settings
 
-        # Get video info for progress tracking
-        video_info = get_video_info(video_path)
-        if not video_info:
-            raise Exception("Could not read video file")
+        video_info = video_properties
 
         # Calculate expected frame count based on time range and ORIGINAL fps (since we extract at original fps)
         start_time = settings.get("start_time")
@@ -1236,7 +1260,7 @@ def upload_video() -> tuple[dict[str, Any], int] | tuple[Any, int]:
 
 
 @app.route("/process", methods=["POST"])
-def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:
+def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:  # noqa: C901
     """Start video processing"""
     if current_processing["active"]:
         return jsonify({"error": "Processing already in progress"}), 400
@@ -1287,12 +1311,31 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:
             404,
         )
 
+    try:
+        video_properties = get_video_properties(str(video_path))
+        if not video_properties:
+            raise ValueError("Could not read video file")
+        settings["depth_resolution"] = resolve_depth_input_size(
+            int(video_properties["width"]),
+            int(video_properties["height"]),
+            settings.get("depth_resolution", "auto"),
+        )
+        validate_backend_geometry_request(settings, video_properties)
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
     # Generate session ID
     session_id = str(uuid.uuid4())
 
     # Start processing in background using socketio's method for proper context handling
     thread = socketio.start_background_task(
-        process_video_async, session_id, video_path, settings, output_dir
+        process_video_async,
+        session_id,
+        video_path,
+        settings,
+        output_dir,
+        None,
+        video_properties,
     )
     current_processing["thread"] = thread
 

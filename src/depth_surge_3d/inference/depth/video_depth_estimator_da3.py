@@ -71,6 +71,11 @@ class VideoDepthEstimatorDA3:
         self.model = None
         self.artifact_identity: str | None = None
 
+    @property
+    def inference_precision(self) -> str:
+        """DA3 runs its float32 weights without an autocast policy."""
+        return "float32"
+
     def _determine_device(self, device: str) -> str:
         """Determine the best device to use for inference."""
         if device == "auto":

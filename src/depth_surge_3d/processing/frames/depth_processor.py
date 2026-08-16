@@ -22,10 +22,6 @@ from ...core.constants import (
     RESOLUTION_1440P,
     RESOLUTION_1080P,
     RESOLUTION_720P,
-    RESOLUTION_SD,
-    MEGAPIXELS_4K,
-    MEGAPIXELS_1080P,
-    MEGAPIXELS_720P,
     CHUNK_SIZE_4K,
     CHUNK_SIZE_1440P,
     CHUNK_SIZE_1080P_MANUAL,
@@ -33,6 +29,7 @@ from ...core.constants import (
     CHUNK_SIZE_SMALL,
     PREVIEW_FRAME_SAMPLE_RATE,
 )
+from ...utils.domain.resolution import resolve_depth_input_size
 from ...core.depth_contract import (
     CANONICAL_DEPTH_ALGORITHM_VERSION,
     CANONICAL_DEPTH_SCHEMA_VERSION,
@@ -1355,16 +1352,15 @@ class DepthMapProcessor:
                 f"  GPU VRAM: {vram_info['available']:.1f}GB available / {vram_info['total']:.1f}GB total"
             )
 
-        # Determine input size (depth resolution)
-        if depth_resolution != "auto":
-            try:
-                input_size = int(depth_resolution)
-                print(f"  Using manual depth resolution: {input_size}px")
-            except (ValueError, TypeError):
-                print(f"  Warning: Invalid depth_resolution '{depth_resolution}', using auto")
-                input_size = self._auto_determine_input_size(frame_w, frame_h, megapixels)
+        try:
+            input_size = resolve_depth_input_size(frame_w, frame_h, depth_resolution)
+        except (TypeError, ValueError):
+            print(f"  Warning: Invalid depth_resolution '{depth_resolution}', using auto")
+            input_size = resolve_depth_input_size(frame_w, frame_h, "auto")
+        if depth_resolution == "auto":
+            print(f"  Auto depth resolution: {input_size}px")
         else:
-            input_size = self._auto_determine_input_size(frame_w, frame_h, megapixels)
+            print(f"  Using manual depth resolution: {input_size}px")
 
         model_version, model_size = self._resource_profile()
 
@@ -1428,16 +1424,8 @@ class DepthMapProcessor:
         Returns:
             Optimal input size for depth estimation
         """
-        # Auto mode: Match depth resolution to actual frame size
-        # Never exceed source frame resolution - upscaling depth is pointless
-        if megapixels > MEGAPIXELS_4K:  # >8MP (4K is ~8.3MP)
-            input_size = min(max(frame_w, frame_h), RESOLUTION_4K)
-        elif megapixels > MEGAPIXELS_1080P:  # >2MP (1080p is 2.1MP)
-            input_size = min(max(frame_w, frame_h), RESOLUTION_1080P)
-        elif megapixels > MEGAPIXELS_720P:  # >1MP (720p is 0.9MP)
-            input_size = min(max(frame_w, frame_h), RESOLUTION_720P)
-        else:
-            input_size = min(max(frame_w, frame_h), RESOLUTION_SD)
+        del megapixels
+        input_size = resolve_depth_input_size(frame_w, frame_h, "auto")
 
         print(f"  Auto depth resolution: {input_size}px")
         return input_size

@@ -15,8 +15,11 @@ from typing import Any, Literal, cast
 
 from ..inference.depth.backend_registry import (
     EstimatorRequest,
+    TEMPORAL_STABILITY_WARNING,
+    build_effective_depth_run_report,
     create_registered_depth_estimator,
     get_backend_spec,
+    validate_backend_geometry_request,
 )
 from ..inference.depth.types import DepthBatch
 from ..utils import (
@@ -25,6 +28,7 @@ from ..utils import (
     validate_resolution_settings,
     auto_detect_resolution,
 )
+from ..utils.domain.resolution import resolve_depth_input_size
 from ..io.operations import (
     validate_video_file,
     get_video_properties,
@@ -110,22 +114,30 @@ class StereoProjector:
                 depth_settings["depth_resolution"] = requested_settings["depth_resolution"]
             requested_settings.update(depth_settings)
 
-            # Validate inputs
+            # Validate paths without creating output state.
             if not self._validate_inputs(video_path, output_dir, requested_settings):
                 return False
 
-            # Ensure model is loaded
-            if not self._ensure_model_loaded():
-                return False
-
-            # Get video properties
             video_props = get_video_properties(video_path)
             if not video_props:
                 print(f"Error: Cannot read video properties from {video_path}")
                 return False
 
-            # Validate and resolve settings
             resolved_settings = self._resolve_settings(requested_settings, video_props)
+            validate_backend_geometry_request(resolved_settings, video_props)
+
+            report = build_effective_depth_run_report(
+                resolved_settings,
+                self.depth_estimator,
+            )
+            self._print_effective_run_report(report)
+            if resolved_settings["stereo_geometry_mode"] == "metric_camera":
+                print(TEMPORAL_STABILITY_WARNING)
+
+            if not self._ensure_model_loaded():
+                return False
+            if not self._prepare_output_directory(output_dir):
+                return False
 
             # Create video processor (always uses temporal consistency)
             processor = VideoProcessor(
@@ -303,10 +315,13 @@ class StereoProjector:
             model_path = getattr(self.depth_estimator, "model_name", model_path)
 
         processing_resolution = getattr(self.depth_estimator, "processing_resolution", None)
+        reported_model_size = self.depth_estimator.get_model_size()
+        if not isinstance(reported_model_size, str):
+            reported_model_size = self.model_size
         return {
             "depth_model_version": self.depth_model_version,
             "model_path": model_path,
-            "model_size": self.depth_estimator.get_model_size(),
+            "model_size": reported_model_size,
             "depth_resolution": processing_resolution or "auto",
             "use_metric_depth": bool(getattr(self.depth_estimator, "metric", self.metric)),
             "device": str(getattr(self.depth_estimator, "device", self.device)),
@@ -315,20 +330,33 @@ class StereoProjector:
         }
 
     def _validate_inputs(self, video_path: str, output_dir: str, settings: dict[str, Any]) -> bool:
-        """Validate input parameters."""
+        """Validate input and output paths without filesystem mutation."""
+        del settings
         # Validate video file
         if not validate_video_file(video_path):
             print(f"Error: Invalid or unsupported video file: {video_path}")
             return False
 
-        # Validate output directory
+        output_path = Path(output_dir)
+        if output_path.exists() and not output_path.is_dir():
+            print(f"Error: Output path is not a directory: {output_dir}")
+            return False
+        return True
+
+    @staticmethod
+    def _prepare_output_directory(output_dir: str) -> bool:
         try:
             Path(output_dir).mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            print(f"Error: Cannot create output directory {output_dir}: {e}")
+        except Exception as error:
+            print(f"Error: Cannot create output directory {output_dir}: {error}")
             return False
-
         return True
+
+    @staticmethod
+    def _print_effective_run_report(report: dict[str, Any]) -> None:
+        print("Effective depth run:")
+        for name, value in report.items():
+            print(f"  {name}: {value}")
 
     def _ensure_model_loaded(self) -> bool:
         """Ensure the depth estimation model is loaded."""
@@ -370,6 +398,12 @@ class StereoProjector:
     ) -> dict[str, Any]:
         """Resolve and validate settings based on video properties."""
         resolved = settings.copy()
+
+        resolved["depth_resolution"] = resolve_depth_input_size(
+            int(video_props["width"]),
+            int(video_props["height"]),
+            resolved.get("depth_resolution", "auto"),
+        )
 
         # Resolve VR resolution
         if resolved["vr_resolution"] == "auto":

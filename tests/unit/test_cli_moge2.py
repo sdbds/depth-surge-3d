@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 from pathlib import Path
 
 import pytest
@@ -96,3 +97,58 @@ def test_cli_disables_metric_inference_for_non_metric_backend(cli_module) -> Non
     settings = cli_module._build_processing_settings(args)
 
     assert settings["use_metric_depth"] is False
+
+
+def test_cli_normalizes_metric_geometry_options(cli_module) -> None:
+    args = cli_module.create_argument_parser().parse_args(
+        [
+            "clip.mp4",
+            "--depth-model-version",
+            "moge2",
+            "--model-size",
+            "vits",
+            "--stereo-geometry-mode",
+            "metric_camera",
+            "--virtual-baseline-mm",
+            "64.0",
+            "--metric-convergence-distance",
+            "2.5",
+            "--max-disparity-percent",
+            "1.5",
+            "--format",
+            "side_by_side",
+            "--no-distortion",
+        ]
+    )
+
+    settings = cli_module._build_processing_settings(args)
+
+    assert settings["stereo_geometry_mode"] == "metric_camera"
+    assert settings["virtual_baseline_mm"] == 64.0
+    assert settings["metric_convergence_distance"] == 2.5
+    assert settings["max_disparity_percent"] == 1.5
+
+
+def test_cli_accepts_auto_metric_convergence(cli_module) -> None:
+    args = cli_module.create_argument_parser().parse_args(
+        ["clip.mp4", "--metric-convergence-distance", "auto"]
+    )
+
+    assert cli_module._build_processing_settings(args)["metric_convergence_distance"] == "auto"
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_cli_rejects_nonfinite_metric_convergence(cli_module, value: str) -> None:
+    parser = cli_module.create_argument_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["clip.mp4", "--metric-convergence-distance", value])
+
+    assert not math.isfinite(float(value))
+
+
+def test_cli_has_no_public_moge_resolution_level_flag(cli_module) -> None:
+    help_text = cli_module.create_argument_parser().format_help()
+
+    assert "moge-resolution" not in help_text
+    assert "resolution-level" not in help_text

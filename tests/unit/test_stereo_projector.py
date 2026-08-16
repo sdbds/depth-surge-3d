@@ -7,7 +7,12 @@ import numpy as np
 import pytest
 
 from src.depth_surge_3d.inference.depth.types import DepthBatch, DepthRepresentation
-from src.depth_surge_3d.inference.depth.backend_registry import EstimatorRequest
+from src.depth_surge_3d.core.settings import validate_settings
+from src.depth_surge_3d.inference.depth.backend_registry import (
+    EstimatorRequest,
+    TEMPORAL_STABILITY_WARNING,
+    build_effective_depth_run_report,
+)
 from src.depth_surge_3d.rendering import stereo_projector
 from src.depth_surge_3d.rendering import (
     StereoRenderResult,
@@ -53,6 +58,178 @@ def test_projector_preserves_four_positional_arguments_and_forwards_model_size(m
 
     assert projector.model_size == "vitb"
     factory.assert_called_once_with("moge2", EstimatorRequest(None, "vitb", "cpu", True, 10))
+
+
+def _metric_settings(**overrides):
+    return validate_settings(
+        {
+            "depth_model_version": "moge2",
+            "model_size": "vitb",
+            "model_path": None,
+            "device": "cpu",
+            "depth_resolution": 1080,
+            "stereo_geometry_mode": "metric_camera",
+            "vr_format": "side_by_side",
+            "apply_distortion": False,
+            **overrides,
+        },
+        source="explicit",
+    )
+
+
+def test_effective_moge_report_contains_every_required_identity() -> None:
+    estimator = MagicMock()
+    estimator.repo_id = "Ruicheng/moge-2-vitb-normal"
+    estimator.revision = "54ad3a693e61907ea4633d13dec6ee682fa09419"
+    estimator.device = "cpu"
+    estimator.inference_precision = "float32"
+    estimator.resolution_level = 9
+
+    report = build_effective_depth_run_report(_metric_settings(), estimator)
+
+    assert report == {
+        "backend": "moge2",
+        "model_size": "vitb",
+        "repository": "Ruicheng/moge-2-vitb-normal",
+        "revision": "54ad3a693e61907ea4633d13dec6ee682fa09419",
+        "device": "cpu",
+        "precision": "float32",
+        "depth_resolution": 1080,
+        "adapter_resolution_level": 9,
+        "camera_capability": "pinhole_fx",
+        "geometry_mode": "metric_camera",
+        "projection": {
+            "virtual_baseline_mm": 63.0,
+            "metric_convergence_distance": "auto",
+            "max_disparity_percent": 2.0,
+        },
+    }
+
+
+def test_relative_report_contains_only_active_projection_settings() -> None:
+    estimator = MagicMock(device="cpu", inference_precision="float32")
+    report = build_effective_depth_run_report(
+        _metric_settings(
+            stereo_geometry_mode="relative",
+            stereo_strength=2.0,
+            convergence=0.5,
+            occlusion_fill="background",
+        ),
+        estimator,
+    )
+
+    assert report["projection"] == {
+        "stereo_strength": 2.0,
+        "convergence": 0.5,
+        "occlusion_fill": "background",
+    }
+
+
+def test_custom_model_report_does_not_claim_a_registry_revision() -> None:
+    estimator = MagicMock()
+    estimator.repo_id = "D:/models/custom/model.pt"
+    estimator.revision = None
+    estimator.device = "cpu"
+    estimator.inference_precision = "float32"
+    report = build_effective_depth_run_report(
+        _metric_settings(model_path="D:/models/custom/model.pt", model_size="custom"),
+        estimator,
+    )
+
+    assert report["model_size"] == "custom"
+    assert report["repository"] == "D:/models/custom/model.pt"
+    assert report["revision"] is None
+
+
+def test_metric_sar_is_rejected_before_model_load_or_output_creation(monkeypatch, tmp_path) -> None:
+    estimator = MagicMock()
+    estimator.get_model_size.return_value = "vitb"
+    estimator.device = "cpu"
+    estimator.metric = True
+    estimator.repo_id = "Ruicheng/moge-2-vitb-normal"
+    estimator.revision = "54ad3a693e61907ea4633d13dec6ee682fa09419"
+    estimator.inference_precision = "float32"
+    monkeypatch.setattr(
+        stereo_projector,
+        "create_registered_depth_estimator",
+        lambda *_args, **_kwargs: estimator,
+    )
+    monkeypatch.setattr(stereo_projector, "validate_video_file", lambda _path: True)
+    monkeypatch.setattr(
+        stereo_projector,
+        "get_video_properties",
+        lambda _path: {
+            "width": 8,
+            "height": 4,
+            "fps": 24.0,
+            "frame_count": 2,
+            "sample_aspect_ratio_numerator": 4,
+            "sample_aspect_ratio_denominator": 3,
+        },
+    )
+    output_dir = tmp_path / "out"
+    projector = StereoProjector(
+        device="cpu",
+        metric=True,
+        depth_model_version="moge2",
+        model_size="vitb",
+    )
+
+    ok = projector.process_video("clip.mp4", str(output_dir), _metric_settings())
+
+    assert ok is False
+    estimator.load_model.assert_not_called()
+    assert not output_dir.exists()
+
+
+def test_metric_projector_prints_one_warning_and_loads_after_report(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    events: list[str] = []
+    estimator = MagicMock()
+    estimator.get_model_size.return_value = "vitb"
+    estimator.device = "cpu"
+    estimator.metric = True
+    estimator.repo_id = "Ruicheng/moge-2-vitb-normal"
+    estimator.revision = "54ad3a693e61907ea4633d13dec6ee682fa09419"
+    estimator.inference_precision = "float32"
+    estimator.resolution_level = 9
+    estimator.load_model.side_effect = lambda: events.append("load") or True
+    monkeypatch.setattr(
+        stereo_projector,
+        "create_registered_depth_estimator",
+        lambda *_args, **_kwargs: estimator,
+    )
+    monkeypatch.setattr(stereo_projector, "validate_video_file", lambda _path: True)
+    monkeypatch.setattr(
+        stereo_projector,
+        "get_video_properties",
+        lambda _path: {
+            "width": 1920,
+            "height": 1080,
+            "fps": 24.0,
+            "frame_count": 2,
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+        },
+    )
+    processor = MagicMock()
+    processor.process.side_effect = lambda **_kwargs: events.append("process") or True
+    monkeypatch.setattr(stereo_projector, "VideoProcessor", lambda *_args, **_kwargs: processor)
+    projector = StereoProjector(
+        device="cpu",
+        metric=True,
+        depth_model_version="moge2",
+        model_size="vitb",
+    )
+
+    ok = projector.process_video("clip.mp4", str(tmp_path / "out"), _metric_settings())
+
+    assert ok is True
+    assert events == ["load", "process"]
+    output = capsys.readouterr().out
+    assert output.count(TEMPORAL_STABILITY_WARNING) == 1
+    assert output.index("backend: moge2") < output.index(TEMPORAL_STABILITY_WARNING)
 
 
 class TestStereoProjector:
@@ -516,12 +693,21 @@ class TestProcessVideoErrorPaths:
 
     @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
-    def test_process_video_model_load_failure(self, mock_validate, mock_create):
+    @patch("src.depth_surge_3d.rendering.stereo_projector.get_video_properties")
+    def test_process_video_model_load_failure(self, mock_get_props, mock_validate, mock_create):
         """Test process_video when model fails to load."""
         mock_estimator = MagicMock()
         mock_estimator.load_model.return_value = False
         mock_create.return_value = mock_estimator
         mock_validate.return_value = True
+        mock_get_props.return_value = {
+            "width": 1920,
+            "height": 1080,
+            "fps": 30.0,
+            "frame_count": 1,
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+        }
 
         projector = StereoProjector(device="cpu")
 
@@ -781,7 +967,7 @@ class TestProcessVideoSuccessPath:
         assert passed_settings["model_path"] is None
         assert passed_settings["upscale_model"] == "x4"
         assert passed_settings["verbose"] is True
-        assert passed_settings["depth_resolution"] == "1080"
+        assert passed_settings["depth_resolution"] == 1080
         mock_processor_class.assert_called_once_with(mock_estimator, verbose=True)
 
 
@@ -798,6 +984,6 @@ class TestValidateInputsDirectoryError:
         mock_mkdir.side_effect = PermissionError("Permission denied")
 
         projector = StereoProjector(device="cpu")
-        result = projector._validate_inputs("test.mp4", "/root/forbidden", {})
+        result = projector._prepare_output_directory("/root/forbidden")
 
         assert result is False

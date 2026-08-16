@@ -71,6 +71,7 @@ class VideoDepthEstimatorMoGe2:
 
     max_batch_size = 1
     camera_model = "pinhole_fx"
+    resolution_level = MOGE_RESOLUTION_LEVEL
 
     def __init__(
         self,

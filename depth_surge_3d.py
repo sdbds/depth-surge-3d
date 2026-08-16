@@ -6,6 +6,7 @@ This is the main entry point using the new modular architecture.
 """
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -66,6 +67,22 @@ def _parse_vr_resolution(value: str) -> str:
     return value
 
 
+def _parse_metric_convergence(value: str) -> str | float:
+    if value == "auto":
+        return value
+    try:
+        resolved = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "metric convergence distance must be auto or a finite number"
+        ) from exc
+    if not math.isfinite(resolved):
+        raise argparse.ArgumentTypeError(
+            "metric convergence distance must be auto or a finite number"
+        )
+    return resolved
+
+
 def _build_processing_settings(args: argparse.Namespace) -> dict[str, object]:
     """Translate CLI names once, then hand one validated object to the pipeline."""
     spec = get_backend_spec(args.depth_model_version)
@@ -86,6 +103,10 @@ def _build_processing_settings(args: argparse.Namespace) -> dict[str, object]:
             "stereo_strength": args.stereo_strength,
             "convergence": args.convergence,
             "occlusion_fill": args.occlusion_fill,
+            "stereo_geometry_mode": args.stereo_geometry_mode,
+            "virtual_baseline_mm": args.virtual_baseline_mm,
+            "metric_convergence_distance": args.metric_convergence_distance,
+            "max_disparity_percent": args.max_disparity_percent,
             "scene_detection": args.scene_detection,
             "scene_cut_threshold": args.scene_cut_threshold,
             "min_scene_frames": args.min_scene_frames,
@@ -197,6 +218,30 @@ Note: Always uses Video-Depth-Anything for temporal consistency across frames.
         choices=["none", "background"],
         default=DEFAULT_SETTINGS["occlusion_fill"],
         help="Disocclusion handling mode (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--stereo-geometry-mode",
+        choices=["relative", "metric_camera"],
+        default=DEFAULT_SETTINGS["stereo_geometry_mode"],
+        help="Stereo projection geometry (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--virtual-baseline-mm",
+        type=float,
+        default=DEFAULT_SETTINGS["virtual_baseline_mm"],
+        help="Virtual camera baseline in millimeters (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--metric-convergence-distance",
+        type=_parse_metric_convergence,
+        default=DEFAULT_SETTINGS["metric_convergence_distance"],
+        help="Zero-parallax distance in meters or auto (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-disparity-percent",
+        type=float,
+        default=DEFAULT_SETTINGS["max_disparity_percent"],
+        help="Maximum stereo disparity percentage (default: %(default)s)",
     )
     parser.add_argument(
         "--scene-detection",

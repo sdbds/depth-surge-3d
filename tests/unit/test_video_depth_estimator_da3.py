@@ -43,6 +43,11 @@ class TestVideoDepthEstimatorDA3:
         assert estimator.device == "cpu"
         assert estimator.metric is True
 
+    def test_cuda_inference_precision_matches_float32_weights_without_autocast(self):
+        estimator = VideoDepthEstimatorDA3(device="cuda")
+
+        assert estimator.inference_precision == "float32"
+
     def test_determine_device_auto_with_cuda(self):
         """Test device determination when CUDA is available."""
         with patch("torch.cuda.is_available", return_value=True):

@@ -97,6 +97,15 @@ def test_web_runner_uses_relative_see_through_repo(tmp_path):
                 "use_metric_depth": True,
             },
             tmp_path / "output",
+            None,
+            {
+                "width": 1920,
+                "height": 1080,
+                "fps": 24.0,
+                "frame_count": 1,
+                "sample_aspect_ratio_numerator": 1,
+                "sample_aspect_ratio_denominator": 1,
+            },
         )
 
     create_projector.assert_called_once_with(
@@ -255,6 +264,18 @@ def test_web_process_validates_final_settings_before_starting(tmp_path):
 
     with (
         patch.object(web_app, "find_source_video", return_value=source_video),
+        patch.object(
+            web_app,
+            "get_video_properties",
+            return_value={
+                "width": 1920,
+                "height": 1080,
+                "fps": 24.0,
+                "frame_count": 1,
+                "sample_aspect_ratio_numerator": 1,
+                "sample_aspect_ratio_denominator": 1,
+            },
+        ),
         patch.object(web_app.socketio, "start_background_task", return_value=MagicMock()) as start,
     ):
         response = web_app.app.test_client().post(
@@ -395,25 +416,24 @@ def test_web_background_resume_validates_loaded_model_before_migration(tmp_path)
             settings,
             output_dir,
             {"migration_mode": "archive", "settings_file": settings_file},
+            {
+                "width": 1920,
+                "height": 1080,
+                "fps": 24.0,
+                "frame_count": 1,
+                "sample_aspect_ratio_numerator": 1,
+                "sample_aspect_ratio_denominator": 1,
+            },
         )
 
-    build_fingerprint.assert_called_once_with(
-        projector.depth_estimator,
-        {
-            **settings,
-            "model_size": "vitl",
-            "model_path": None,
-            "depth_resolution": "auto",
-        },
-    )
+    fingerprint_settings = build_fingerprint.call_args.args[1]
+    assert fingerprint_settings["depth_model_version"] == "v3"
+    assert fingerprint_settings["model_size"] == "vitl"
+    assert fingerprint_settings["model_path"] is None
+    assert fingerprint_settings["depth_resolution"] == 1080
     build_report.assert_called_once_with(
         output_dir,
-        {
-            **settings,
-            "model_size": "vitl",
-            "model_path": None,
-            "depth_resolution": "auto",
-        },
+        fingerprint_settings,
         source_video=source_video,
         model_fingerprint=fingerprint,
         settings_file=settings_file,

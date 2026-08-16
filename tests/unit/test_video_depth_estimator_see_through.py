@@ -45,6 +45,25 @@ class TestSeeThroughDepthEstimator:
         assert estimator.seed == 1026
         assert estimator.max_batch_size == 1
         assert estimator.model is None
+        assert estimator.inference_precision == "float32"
+
+    @pytest.mark.parametrize(
+        ("bf16_supported", "precision"),
+        [(True, "bfloat16"), (False, "float16")],
+    )
+    def test_cuda_inference_precision_matches_loader_dtype(self, bf16_supported, precision):
+        module = _module()
+
+        with (
+            patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(total_memory=8 * 1024**3),
+            ),
+            patch.object(torch.cuda, "is_bf16_supported", return_value=bf16_supported),
+        ):
+            estimator = module.SeeThroughDepthEstimator(device="cuda")
+            assert estimator.inference_precision == precision
 
     def test_cuda_uses_bounded_independent_frame_batches(self):
         module = _module()

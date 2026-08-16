@@ -1063,19 +1063,50 @@
                             <h6 class="step-title">Stereo Pair Generation</h6>
                         </div>
                         <div class="mb-3">
-                            <label class="form-label" for="stereoStrength">Stereo Strength</label>
-                            <input type="number" class="form-control" id="stereoStrength" value="2.0" step="0.1" min="0" max="5">
+                            <label class="form-label" for="stereoGeometryMode">Geometry Mode</label>
+                            <select class="form-select" id="stereoGeometryMode"></select>
                         </div>
-                        <div class="mb-3">
-                            <label class="form-label" for="convergence">Convergence</label>
-                            <input type="number" class="form-control" id="convergence" value="0.5" step="0.05" min="0" max="1">
+                        <div id="relativeGeometrySettings">
+                            <div class="mb-3">
+                                <label class="form-label" for="stereoStrength">Stereo Strength</label>
+                                <input type="number" class="form-control" id="stereoStrength" value="2.0" step="0.1" min="0" max="5">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label" for="convergence">Convergence</label>
+                                <input type="number" class="form-control" id="convergence" value="0.5" step="0.05" min="0" max="1">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label" for="occlusionFill">Occlusion Fill</label>
+                                <select class="form-select" id="occlusionFill">
+                                    <option value="background" selected>Background propagation</option>
+                                    <option value="none">None</option>
+                                </select>
+                            </div>
                         </div>
-                        <div class="mb-3">
-                            <label class="form-label" for="occlusionFill">Occlusion Fill</label>
-                            <select class="form-select" id="occlusionFill">
-                                <option value="background" selected>Background propagation</option>
-                                <option value="none">None</option>
-                            </select>
+                        <div id="metricGeometrySettings" style="display: none;">
+                            <div class="alert alert-warning" id="metricExperimentalWarning">
+                                <span class="badge bg-warning text-dark">Experimental</span>
+                                MoGe-2 performs per-frame depth and focal estimation. Temporal stability on video is not guaranteed; depth or focal drift may be visible across frames.
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label" for="virtualBaselineMm">Virtual Baseline (mm)</label>
+                                <input type="number" class="form-control" id="virtualBaselineMm" value="63.0" step="0.1" min="0" max="100">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label" for="metricConvergenceMode">Convergence Distance</label>
+                                <select class="form-select" id="metricConvergenceMode">
+                                    <option value="auto" selected>Auto</option>
+                                    <option value="custom">Custom</option>
+                                </select>
+                            </div>
+                            <div class="mb-3" id="metricConvergenceDistanceSettings" style="display: none;">
+                                <label class="form-label" for="metricConvergenceDistance">Custom Distance (m)</label>
+                                <input type="number" class="form-control" id="metricConvergenceDistance" value="3.0" step="0.1" min="0.1" max="1000" disabled>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label" for="maxDisparityPercent">Maximum Disparity (%)</label>
+                                <input type="number" class="form-control" id="maxDisparityPercent" value="2.0" step="0.1" min="0" max="5">
+                            </div>
                         </div>
                         <div class="mb-3">
                             <label class="form-label" for="stereoIoWorkers">Stereo I/O Workers</label>
@@ -1487,6 +1518,10 @@
                             <h5><i class="fas fa-spinner fa-spin"></i> Processing Progress</h5>
                         </div>
                         <div class="card-body">
+                            <div class="mb-4" id="effectiveProcessingConfig" hidden>
+                                <strong>Effective Processing Configuration</strong>
+                                <dl class="row mb-0" id="effectiveProcessingConfigValues"></dl>
+                            </div>
                             <!-- Overall Progress -->
                             <div class="mb-4">
                                 <div class="d-flex justify-content-between align-items-center mb-2">
@@ -1825,6 +1860,24 @@
 
             socket.on('frame_preview', function(data) {
                 handleFramePreview(data);
+            });
+
+            socket.on('processing_configuration', function(data) {
+                const container = document.getElementById('effectiveProcessingConfig');
+                const values = document.getElementById('effectiveProcessingConfigValues');
+                values.replaceChildren();
+                Object.entries(data).forEach(([name, value]) => {
+                    const term = document.createElement('dt');
+                    term.className = 'col-sm-4';
+                    term.textContent = name;
+                    const description = document.createElement('dd');
+                    description.className = 'col-sm-8';
+                    description.textContent = typeof value === 'object' && value !== null
+                        ? JSON.stringify(value)
+                        : String(value);
+                    values.append(term, description);
+                });
+                container.hidden = false;
             });
         }
 
@@ -2181,6 +2234,12 @@
                 stereo_strength: parseFloat(document.getElementById('stereoStrength').value),
                 convergence: parseFloat(document.getElementById('convergence').value),
                 occlusion_fill: document.getElementById('occlusionFill').value,
+                stereo_geometry_mode: document.getElementById('stereoGeometryMode').value,
+                virtual_baseline_mm: parseFloat(document.getElementById('virtualBaselineMm').value),
+                metric_convergence_distance: document.getElementById('metricConvergenceMode').value === 'auto'
+                    ? 'auto'
+                    : parseFloat(document.getElementById('metricConvergenceDistance').value),
+                max_disparity_percent: parseFloat(document.getElementById('maxDisparityPercent').value),
                 scene_detection: document.getElementById('sceneDetection').checked,
                 scene_cut_threshold: parseFloat(document.getElementById('sceneCutThreshold').value),
                 min_scene_frames: parseInt(document.getElementById('minSceneFrames').value),
@@ -3006,6 +3065,11 @@
                 stereoStrength: document.getElementById('stereoStrength').value,
                 convergence: document.getElementById('convergence').value,
                 occlusionFill: document.getElementById('occlusionFill').value,
+                stereoGeometryMode: document.getElementById('stereoGeometryMode').value,
+                virtualBaselineMm: document.getElementById('virtualBaselineMm').value,
+                metricConvergenceMode: document.getElementById('metricConvergenceMode').value,
+                metricConvergenceDistance: document.getElementById('metricConvergenceDistance').value,
+                maxDisparityPercent: document.getElementById('maxDisparityPercent').value,
                 sceneDetection: document.getElementById('sceneDetection').checked,
                 sceneCutThreshold: document.getElementById('sceneCutThreshold').value,
                 minSceneFrames: document.getElementById('minSceneFrames').value,
@@ -3092,6 +3156,15 @@
                     localStorage.setItem('stereoProjectorSettings', JSON.stringify(settings));
                 }
                 updateDepthModelControls();
+                const geometryMode = document.getElementById('stereoGeometryMode');
+                if (
+                    settings.stereoGeometryMode
+                    && Array.from(geometryMode.options).some(option => option.value === settings.stereoGeometryMode)
+                ) {
+                    geometryMode.value = settings.stereoGeometryMode;
+                }
+                updateGeometryControls();
+                updateMetricConvergenceControls();
                 
                 // Trigger change events for elements that have dependencies
                 if (settings.applyDistortion !== undefined) {
@@ -3118,6 +3191,11 @@
                 stereoStrength: '2.0',
                 convergence: '0.5',
                 occlusionFill: 'background',
+                stereoGeometryMode: 'relative',
+                virtualBaselineMm: '63.0',
+                metricConvergenceMode: 'auto',
+                metricConvergenceDistance: '3.0',
+                maxDisparityPercent: '2.0',
                 sceneDetection: true,
                 sceneCutThreshold: '0.55',
                 minSceneFrames: '8',
@@ -3173,6 +3251,7 @@
         function setupAutoSave() {
             const settingsElements = [
                 'startTime', 'endTime', 'vrFormat', 'vrResolution', 'stereoStrength', 'convergence', 'occlusionFill',
+                'stereoGeometryMode', 'virtualBaselineMm', 'metricConvergenceMode', 'metricConvergenceDistance', 'maxDisparityPercent',
                 'sceneDetection', 'sceneCutThreshold', 'minSceneFrames', 'rawStorageDtype', 'stereoIoWorkers', 'migrateLegacy',
                 'resolution', 'targetFps', 'superSample', 'device', 'modelSize', 'depthModelVersion', 'depthModelType', 'depthResolution', 'videoEncoder',
                 'preserveAudio', 'keepIntermediates', 'directVrEncode', 'applyDistortion', 'fisheyeProjection', 'fisheyeFov', 'cropFactor',
@@ -3329,12 +3408,52 @@
             } else if (!backend.capabilities.metric_depth) {
                 document.getElementById('depthModelType').value = 'relative';
             }
+
+            const geometryMode = document.getElementById('stereoGeometryMode');
+            const preferredMode = geometryMode.value;
+            geometryMode.replaceChildren();
+            backend.capabilities.stereo_geometry_modes.forEach(mode => {
+                const option = document.createElement('option');
+                option.value = mode;
+                option.textContent = mode === 'metric_camera' ? 'Metric Camera' : 'Relative';
+                geometryMode.appendChild(option);
+            });
+            geometryMode.value = backend.capabilities.stereo_geometry_modes.includes(preferredMode)
+                ? preferredMode
+                : 'relative';
+            updateGeometryControls();
+        }
+
+        function updateGeometryControls() {
+            const metric = document.getElementById('stereoGeometryMode').value === 'metric_camera';
+            const format = document.getElementById('vrFormat');
+            const distortion = document.getElementById('applyDistortion');
+            document.getElementById('relativeGeometrySettings').style.display = metric ? 'none' : 'block';
+            document.getElementById('metricGeometrySettings').style.display = metric ? 'block' : 'none';
+            if (metric) {
+                format.value = 'side_by_side';
+                format.disabled = true;
+                distortion.checked = false;
+                distortion.disabled = true;
+            } else {
+                format.disabled = false;
+                distortion.disabled = false;
+            }
+            updateOptionalStepStyling();
+        }
+
+        function updateMetricConvergenceControls() {
+            const custom = document.getElementById('metricConvergenceMode').value === 'custom';
+            document.getElementById('metricConvergenceDistanceSettings').style.display = custom ? 'block' : 'none';
+            document.getElementById('metricConvergenceDistance').disabled = !custom;
         }
 
         // Toggle model-specific settings based on depth backend.
         document.getElementById('depthModelVersion').addEventListener('change', function() {
             updateDepthModelControls();
         });
+        document.getElementById('stereoGeometryMode').addEventListener('change', updateGeometryControls);
+        document.getElementById('metricConvergenceMode').addEventListener('change', updateMetricConvergenceControls);
 
         // Update temporal window size value display
         document.getElementById('temporalWindowSize').addEventListener('input', function() {
@@ -3365,6 +3484,7 @@
         document.addEventListener('DOMContentLoaded', function() {
             initSocket();
             updateSystemInfo();
+            updateDepthModelControls();
             loadSettings();
             setupAutoSave();
             checkForResumableJobs();  // Check for incomplete jobs
@@ -3373,6 +3493,7 @@
             setInterval(updateSystemInfo, 5000);
 
             updateDepthModelControls();
+            updateMetricConvergenceControls();
         });
     </script>
 </body>

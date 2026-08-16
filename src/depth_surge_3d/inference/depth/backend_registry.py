@@ -18,6 +18,11 @@ from .video_depth_estimator_see_through import (
 
 StereoGeometryMode = Literal["relative", "metric_camera"]
 
+TEMPORAL_STABILITY_WARNING = (
+    "MoGe-2 performs per-frame depth and focal estimation. Temporal stability "
+    "on video is not guaranteed; depth or focal drift may be visible across frames."
+)
+
 
 @dataclass(frozen=True)
 class BackendCapabilities:
@@ -248,6 +253,64 @@ def validate_backend_geometry_request(
             raise ValueError("metric_camera requires source sample-aspect-ratio metadata")
         if (numerator, denominator) != (1, 1):
             raise ValueError("metric_camera requires square-pixel source sample_aspect_ratio=1:1")
+
+
+def build_effective_depth_run_report(settings: Mapping[str, Any], estimator: Any) -> dict[str, Any]:
+    """Describe only the artifact and projection values active for this run."""
+    backend_id = str(settings["depth_model_version"])
+    spec = get_backend_spec(backend_id)
+    custom_path = cast(str | None, settings.get("model_path"))
+    variant = None
+    if not custom_path:
+        variant = resolve_model_variant(
+            backend_id,
+            cast(str | None, settings.get("model_size")),
+        )
+    mode = cast(StereoGeometryMode, settings["stereo_geometry_mode"])
+    if mode == "metric_camera":
+        projection = {
+            "virtual_baseline_mm": settings["virtual_baseline_mm"],
+            "metric_convergence_distance": settings["metric_convergence_distance"],
+            "max_disparity_percent": settings["max_disparity_percent"],
+        }
+    else:
+        projection = {
+            "stereo_strength": settings["stereo_strength"],
+            "convergence": settings["convergence"],
+            "occlusion_fill": settings["occlusion_fill"],
+        }
+
+    if custom_path:
+        model_size = "custom"
+        repository = getattr(estimator, "repo_id", None) or custom_path
+        revision = getattr(estimator, "revision", None)
+    else:
+        assert variant is not None
+        model_size = variant.setting
+        repository = (
+            variant.repo_id
+            or variant.backend_value
+            or getattr(estimator, "repo_id", None)
+            or getattr(estimator, "model_path", None)
+        )
+        revision = variant.revision
+
+    adapter_resolution_level = getattr(estimator, "resolution_level", None)
+    if not isinstance(adapter_resolution_level, int):
+        adapter_resolution_level = None
+    return {
+        "backend": backend_id,
+        "model_size": model_size,
+        "repository": repository,
+        "revision": revision,
+        "device": str(getattr(estimator, "device")),
+        "precision": str(getattr(estimator, "inference_precision")),
+        "depth_resolution": settings["depth_resolution"],
+        "adapter_resolution_level": adapter_resolution_level,
+        "camera_capability": "pinhole_fx" if spec.capabilities.pinhole_fx else "none",
+        "geometry_mode": mode,
+        "projection": projection,
+    }
 
 
 def list_backend_specs() -> tuple[DepthBackendSpec, ...]:
