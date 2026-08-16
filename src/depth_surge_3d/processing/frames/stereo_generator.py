@@ -25,14 +25,27 @@ from ...core.depth_contract import (
     canonical_json_hash,
 )
 from ...utils.imaging.png_header import png_header_matches, read_png_header
+from ...utils.imaging.image_processing import (
+    CENTER_CROP_ALGORITHM_VERSION,
+    calculate_center_crop_dimensions,
+)
+from ...rendering.stereo_geometry import (
+    MetricProjectionStats,
+    StereoGeometryFrame,
+    build_metric_geometry,
+    build_relative_geometry,
+)
 from ...rendering.stereo_renderer import (
     StereoRenderer,
-    StereoRenderSettings,
+    StereoSplatSettings,
 )
 from .frame_stage_parallelism import png_headers_match
+from .metric_geometry import MetricGeometryStore
 
 STEREO_STAGE_SCHEMA_VERSION = 1
 STEREO_STAGE_ALGORITHM_VERSION = "torch-horizontal-16x-zbuffer-v3"
+METRIC_PROJECTION_ALGORITHM_VERSION = "crop-aware-metric-pinhole-v1"
+METRIC_CLAMP_STATS_SCHEMA_VERSION = 1
 STEREO_HOST_BUDGET = 512 * 1024 * 1024
 HOST_STEREO_BYTES_PER_PIXEL = 24
 HOST_SLOT_OVERHEAD = 1024 * 1024
@@ -41,12 +54,16 @@ MAX_STEREO_IO_WORKERS = 16
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    temporary = path.with_name(f"{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def validate_stereo_io_workers(workers: int) -> int:
@@ -195,13 +212,31 @@ class _FileWorkItem:
     frame_name: str
     left_path: Path
     right_path: Path
+    stat_path: Path | None = None
+
+
+_DecodeFrame = Callable[
+    [_FileWorkItem],
+    tuple[np.ndarray, StereoGeometryFrame, MetricProjectionStats | None],
+]
+
+
+@dataclass(frozen=True)
+class _StereoStagePlan:
+    geometry_mode: str
+    source_metadata: dict[str, Any]
+    decode: _DecodeFrame
+    splat_settings: StereoSplatSettings
+    retained_crop_width: int | None = None
+    effective_convergence: float | None = None
 
 
 @dataclass(frozen=True)
 class _DecodedMessage:
     work: _FileWorkItem
     frame: np.ndarray | None = None
-    canonical: np.ndarray | None = None
+    geometry: StereoGeometryFrame | None = None
+    projection_stats: MetricProjectionStats | None = None
     error: Exception | None = None
 
 
@@ -210,6 +245,7 @@ class _WriteItem:
     work: _FileWorkItem
     left_image: np.ndarray
     right_image: np.ndarray
+    projection_stats: MetricProjectionStats | None = None
 
 
 @dataclass(frozen=True)
@@ -250,18 +286,36 @@ def _write_pair(item: _WriteItem) -> None:
     try:
         _atomic_write_png(item.work.left_path, item.left_image)
         _atomic_write_png(item.work.right_path, item.right_image)
+        if item.work.stat_path is not None:
+            if item.projection_stats is None:
+                raise ValueError("Metric stereo writes require projection statistics")
+            stats = item.projection_stats
+            _atomic_write_json(
+                item.work.stat_path,
+                {
+                    "schema_version": METRIC_CLAMP_STATS_SCHEMA_VERSION,
+                    "frame_name": item.work.frame_name,
+                    "valid_pixel_count": stats.valid_pixel_count,
+                    "clamped_pixel_count": stats.clamped_pixel_count,
+                    "clamped_fraction": stats.clamped_fraction,
+                },
+            )
     except Exception:
         item.work.left_path.unlink(missing_ok=True)
         item.work.right_path.unlink(missing_ok=True)
+        if item.work.stat_path is not None:
+            item.work.stat_path.unlink(missing_ok=True)
         raise
 
 
-def _decode_work_item(
+def _decode_relative_work_item(
     work: _FileWorkItem,
     *,
     encoding_scale: float,
     render_shape: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray]:
+    stereo_strength: float,
+    convergence: float,
+) -> tuple[np.ndarray, StereoGeometryFrame, None]:
     frame = cv2.imread(str(work.frame_path), cv2.IMREAD_COLOR)
     encoded = cv2.imread(str(work.depth_path), cv2.IMREAD_UNCHANGED)
     if frame is None:
@@ -277,7 +331,45 @@ def _decode_work_item(
         raise TypeError(f"Canonical disparity must be uint16: {work.depth_path}")
     canonical = encoded.astype(np.float32)
     canonical *= np.float32(1.0 / encoding_scale)
-    return frame, canonical
+    geometry = build_relative_geometry(
+        canonical,
+        render_shape,
+        stereo_strength=stereo_strength,
+        convergence=convergence,
+    )
+    return frame, geometry, None
+
+
+def _decode_metric_work_item(
+    work: _FileWorkItem,
+    *,
+    store: MetricGeometryStore,
+    render_shape: tuple[int, int],
+    virtual_baseline_mm: float,
+    convergence_distance_m: float,
+    max_disparity_percent: float,
+    retained_crop_width: int,
+) -> tuple[np.ndarray, StereoGeometryFrame, MetricProjectionStats]:
+    frame = cv2.imread(str(work.frame_path), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise OSError(f"Could not load frame: {work.frame_path}")
+    if frame.shape[:2] != render_shape:
+        raise ValueError(
+            f"Frame shape changed at {work.frame_path}: "
+            f"expected {render_shape}, got {frame.shape[:2]}"
+        )
+    metric = store.load(work.depth_path)
+    geometry, stats = build_metric_geometry(
+        metric.inverse_depth,
+        metric.valid,
+        metric.focal_x_normalized,
+        render_shape,
+        virtual_baseline_mm=virtual_baseline_mm,
+        convergence_distance_m=convergence_distance_m,
+        max_disparity_percent=max_disparity_percent,
+        retained_crop_width=retained_crop_width,
+    )
+    return frame, geometry, stats
 
 
 class _StereoFilePipeline:
@@ -288,9 +380,8 @@ class _StereoFilePipeline:
         *,
         renderer: StereoRenderer,
         work_items: list[_FileWorkItem],
-        encoding_scale: float,
-        render_shape: tuple[int, int],
-        render_settings: StereoRenderSettings,
+        decode: _DecodeFrame,
+        splat_settings: StereoSplatSettings,
         workers: int,
         capacity: int,
         completed: int,
@@ -299,9 +390,8 @@ class _StereoFilePipeline:
     ) -> None:
         self.renderer = renderer
         self.work_items = work_items
-        self.encoding_scale = encoding_scale
-        self.render_shape = render_shape
-        self.render_settings = render_settings
+        self.decode = decode
+        self.splat_settings = splat_settings
         self.workers = workers
         self.completed = completed
         self.total_frames = total_frames
@@ -392,11 +482,7 @@ class _StereoFilePipeline:
 
     def _decode(self, work: _FileWorkItem) -> _DecodedMessage:
         try:
-            frame, canonical = _decode_work_item(
-                work,
-                encoding_scale=self.encoding_scale,
-                render_shape=self.render_shape,
-            )
+            frame, geometry, projection_stats = self.decode(work)
         except Exception as error:
             self.permits.release()
             return _DecodedMessage(work=work, error=error)
@@ -404,7 +490,8 @@ class _StereoFilePipeline:
         return _DecodedMessage(
             work=work,
             frame=frame,
-            canonical=canonical,
+            geometry=geometry,
+            projection_stats=projection_stats,
         )
 
     def _render_decoded(self, message: _DecodedMessage) -> _WriteItem | None:
@@ -414,12 +501,12 @@ class _StereoFilePipeline:
         if self.first_error is not None:
             self.permits.release()
             return None
-        assert message.frame is not None and message.canonical is not None
+        assert message.frame is not None and message.geometry is not None
         try:
-            result = self.renderer.render(
+            result = self.renderer.render_geometry(
                 message.frame,
-                message.canonical,
-                self.render_settings,
+                message.geometry,
+                self.splat_settings,
             )
         except Exception as error:
             self.permits.release()
@@ -430,6 +517,7 @@ class _StereoFilePipeline:
             work=message.work,
             left_image=result.left_image,
             right_image=result.right_image,
+            projection_stats=message.projection_stats,
         )
 
     def _write_worker(self) -> None:
@@ -517,16 +605,119 @@ class StereoPairGenerator:
         self.verbose = verbose
         self.renderer = renderer if renderer is not None else StereoRenderer()
         self.last_pipeline_stats: StereoPipelineStats | None = None
+        self.last_metric_clamp_summary: dict[str, Any] | None = None
 
     @staticmethod
-    def _render_settings(settings: dict[str, Any]) -> StereoRenderSettings:
-        return StereoRenderSettings(
-            stereo_strength=float(settings.get("stereo_strength", 2.0)),
-            convergence=float(settings.get("convergence", 0.5)),
-            occlusion_fill=cast(
-                Literal["none", "background"],
-                str(settings.get("occlusion_fill", "background")),
+    def _occlusion_fill(settings: dict[str, Any]) -> Literal["none", "background"]:
+        return cast(
+            Literal["none", "background"],
+            str(settings.get("occlusion_fill", "background")),
+        )
+
+    def _build_stage_plan(
+        self,
+        depth_files: list[Path],
+        frame_files: list[Path],
+        render_shape: tuple[int, int],
+        settings: dict[str, Any],
+        occlusion_fill: Literal["none", "background"],
+    ) -> _StereoStagePlan:
+        geometry_mode = str(settings.get("stereo_geometry_mode", "relative"))
+        if geometry_mode == "relative":
+            return self._build_relative_plan(
+                depth_files,
+                frame_files,
+                render_shape,
+                settings,
+                occlusion_fill,
+            )
+        if geometry_mode == "metric_camera":
+            return self._build_metric_plan(
+                depth_files,
+                frame_files,
+                render_shape,
+                settings,
+                occlusion_fill,
+            )
+        raise ValueError(f"Unsupported stereo geometry mode: {geometry_mode}")
+
+    def _build_relative_plan(
+        self,
+        depth_files: list[Path],
+        frame_files: list[Path],
+        render_shape: tuple[int, int],
+        settings: dict[str, Any],
+        occlusion_fill: Literal["none", "background"],
+    ) -> _StereoStagePlan:
+        metadata = self._get_canonical_metadata(depth_files, frame_files)
+        stereo_strength = float(settings.get("stereo_strength", 2.0))
+        convergence = float(settings.get("convergence", 0.5))
+
+        def decode(work: _FileWorkItem):
+            return _decode_relative_work_item(
+                work,
+                encoding_scale=float(metadata["encoding_scale"]),
+                render_shape=render_shape,
+                stereo_strength=stereo_strength,
+                convergence=convergence,
+            )
+
+        return _StereoStagePlan(
+            geometry_mode="relative",
+            source_metadata=metadata,
+            decode=decode,
+            splat_settings=StereoSplatSettings(
+                max_eye_shift_fraction=stereo_strength / 200.0,
+                occlusion_fill=occlusion_fill,
             ),
+        )
+
+    def _build_metric_plan(
+        self,
+        depth_files: list[Path],
+        frame_files: list[Path],
+        render_shape: tuple[int, int],
+        settings: dict[str, Any],
+        occlusion_fill: Literal["none", "background"],
+    ) -> _StereoStagePlan:
+        store, metadata = self._get_metric_store(depth_files, frame_files)
+        requested_convergence = settings.get("metric_convergence_distance", "auto")
+        effective_convergence = (
+            float(metadata["convergence"]["resolved_auto_distance_m"])
+            if requested_convergence == "auto"
+            else float(requested_convergence)
+        )
+        retained_crop_width, _retained_crop_height = calculate_center_crop_dimensions(
+            render_shape[1],
+            render_shape[0],
+            float(settings.get("crop_factor", 1.0)),
+        )
+        virtual_baseline_mm = float(settings.get("virtual_baseline_mm", 63.0))
+        max_disparity_percent = float(settings.get("max_disparity_percent", 2.0))
+
+        def decode(work: _FileWorkItem):
+            return _decode_metric_work_item(
+                work,
+                store=store,
+                render_shape=render_shape,
+                virtual_baseline_mm=virtual_baseline_mm,
+                convergence_distance_m=effective_convergence,
+                max_disparity_percent=max_disparity_percent,
+                retained_crop_width=retained_crop_width,
+            )
+
+        return _StereoStagePlan(
+            geometry_mode="metric_camera",
+            source_metadata=metadata,
+            decode=decode,
+            splat_settings=StereoSplatSettings(
+                max_eye_shift_fraction=(
+                    max_disparity_percent / 100.0 * (retained_crop_width / render_shape[1]) / 2.0
+                ),
+                occlusion_fill=occlusion_fill,
+            ),
+            retained_crop_width=retained_crop_width,
+            effective_convergence=effective_convergence,
         )
 
     def create_stereo_pairs_from_files(
@@ -540,6 +731,7 @@ class StereoPairGenerator:
         """Decode, render, and atomically write file-backed stereo pairs."""
 
         self.last_pipeline_stats = None
+        self.last_metric_clamp_summary = None
         if len(frame_files) != len(depth_files):
             print(
                 f"Error: Frame/depth count mismatch: {len(frame_files)} frames, "
@@ -551,14 +743,24 @@ class StereoPairGenerator:
             right_dir = directories["right_frames"]
             left_dir.mkdir(parents=True, exist_ok=True)
             right_dir.mkdir(parents=True, exist_ok=True)
-            metadata = self._get_canonical_metadata(depth_files, frame_files)
             render_shape = self._read_render_shape(frame_files[0])
-            render_settings = self._render_settings(settings)
-            stage_metadata = self._stereo_stage_metadata(
-                metadata,
+            occlusion_fill = self._occlusion_fill(settings)
+            plan = self._build_stage_plan(
+                depth_files,
                 frame_files,
                 render_shape,
-                render_settings,
+                settings,
+                occlusion_fill,
+            )
+            stage_metadata = self._stereo_stage_metadata(
+                plan.source_metadata,
+                frame_files,
+                render_shape,
+                settings,
+                geometry_mode=plan.geometry_mode,
+                occlusion_fill=occlusion_fill,
+                retained_crop_width=plan.retained_crop_width,
+                effective_convergence=plan.effective_convergence,
             )
             stage_changed = self._prepare_stereo_stage(left_dir, right_dir, stage_metadata)
             if stage_changed:
@@ -569,11 +771,14 @@ class StereoPairGenerator:
                 left_dir,
                 right_dir,
                 render_shape,
+                metric_mode=plan.geometry_mode == "metric_camera",
             )
             if repaired_outputs and not stage_changed:
                 self._reset_downstream_stages(directories)
             if not work_items:
                 print(f"  Reusing {completed} existing stereo pairs")
+                if plan.geometry_mode == "metric_camera":
+                    self._summarize_metric_clamps(frame_files, left_dir)
                 return True
 
             workers = validate_stereo_io_workers(
@@ -589,15 +794,16 @@ class StereoPairGenerator:
             )
             self._run_file_pipeline(
                 work_items,
-                encoding_scale=float(metadata["encoding_scale"]),
-                render_shape=render_shape,
-                render_settings=render_settings,
+                decode=plan.decode,
+                splat_settings=plan.splat_settings,
                 workers=workers,
                 capacity=capacity,
                 completed=completed,
                 total_frames=len(frame_files),
                 progress_tracker=progress_tracker,
             )
+            if plan.geometry_mode == "metric_camera":
+                self._summarize_metric_clamps(frame_files, left_dir)
             return True
         except Exception as error:
             print(f"Error creating stereo pairs: {error}")
@@ -609,24 +815,55 @@ class StereoPairGenerator:
         canonical_metadata: dict[str, Any],
         frame_files: list[Path],
         render_shape: tuple[int, int],
-        render_settings: StereoRenderSettings,
+        settings: dict[str, Any],
+        *,
+        geometry_mode: str,
+        occlusion_fill: Literal["none", "background"],
+        retained_crop_width: int | None,
+        effective_convergence: float | None,
     ) -> dict[str, Any]:
         device = getattr(self.renderer, "device", None)
         device_type = getattr(device, "type", None) or "custom"
         metadata = {
             "schema_version": STEREO_STAGE_SCHEMA_VERSION,
             "algorithm_version": STEREO_STAGE_ALGORITHM_VERSION,
-            "source_canonical_fingerprint": canonical_metadata["fingerprint"],
+            "geometry_mode": geometry_mode,
             "frame_names": [path.name for path in frame_files],
             "render_shape": [int(render_shape[0]), int(render_shape[1])],
-            "render_settings": {
-                "stereo_strength": render_settings.stereo_strength,
-                "convergence": render_settings.convergence,
-                "occlusion_fill": render_settings.occlusion_fill,
-            },
+            "occlusion_fill": occlusion_fill,
             "renderer_device_type": str(device_type),
             "encoding": "uint8_png",
         }
+        if geometry_mode == "relative":
+            metadata.update(
+                {
+                    "source_canonical_fingerprint": canonical_metadata["fingerprint"],
+                    "render_settings": {
+                        "stereo_strength": float(settings.get("stereo_strength", 2.0)),
+                        "convergence": float(settings.get("convergence", 0.5)),
+                        "occlusion_fill": occlusion_fill,
+                    },
+                }
+            )
+        else:
+            assert retained_crop_width is not None and effective_convergence is not None
+            requested_convergence = settings.get("metric_convergence_distance", "auto")
+            metadata.update(
+                {
+                    "source_metric_fingerprint": canonical_metadata["fingerprint"],
+                    "projection_algorithm_version": METRIC_PROJECTION_ALGORITHM_VERSION,
+                    "source_width": int(render_shape[1]),
+                    "retained_crop_width": int(retained_crop_width),
+                    "center_crop_algorithm_version": CENTER_CROP_ALGORITHM_VERSION,
+                    "sample_aspect_ratio": "1:1",
+                    "virtual_baseline_mm": float(settings.get("virtual_baseline_mm", 63.0)),
+                    "requested_convergence_distance": (
+                        "auto" if requested_convergence == "auto" else float(requested_convergence)
+                    ),
+                    "effective_convergence_distance_m": float(effective_convergence),
+                    "max_disparity_percent": float(settings.get("max_disparity_percent", 2.0)),
+                }
+            )
         metadata["fingerprint"] = canonical_json_hash(metadata)
         return metadata
 
@@ -643,7 +880,7 @@ class StereoPairGenerator:
         except (OSError, json.JSONDecodeError):
             pass
 
-        has_outputs = any(left_dir.glob("*.png")) or any(right_dir.glob("*.png"))
+        has_outputs = any(left_dir.iterdir()) or any(right_dir.iterdir())
         stage_changed = existing_metadata is not None or has_outputs
         stage_changed = stage_changed and existing_metadata != expected_metadata
         if stage_changed:
@@ -682,9 +919,8 @@ class StereoPairGenerator:
         self,
         work_items: list[_FileWorkItem],
         *,
-        encoding_scale: float,
-        render_shape: tuple[int, int],
-        render_settings: StereoRenderSettings,
+        decode: _DecodeFrame,
+        splat_settings: StereoSplatSettings,
         workers: int,
         capacity: int,
         completed: int,
@@ -694,9 +930,8 @@ class StereoPairGenerator:
         pipeline = _StereoFilePipeline(
             renderer=self.renderer,
             work_items=work_items,
-            encoding_scale=encoding_scale,
-            render_shape=render_shape,
-            render_settings=render_settings,
+            decode=decode,
+            splat_settings=splat_settings,
             workers=workers,
             capacity=capacity,
             completed=completed,
@@ -751,25 +986,39 @@ class StereoPairGenerator:
         left_dir: Path,
         right_dir: Path,
         render_shape: tuple[int, int],
+        *,
+        metric_mode: bool,
     ) -> tuple[list[_FileWorkItem], int, bool]:
         work_items: list[_FileWorkItem] = []
         completed = 0
         repaired_outputs = False
+        stat_dir = left_dir / "clamp_stats"
+        for directory in (left_dir, right_dir, stat_dir):
+            if directory.is_dir():
+                for temporary in directory.glob("*.tmp"):
+                    temporary.unlink(missing_ok=True)
+        if metric_mode:
+            stat_dir.mkdir(parents=True, exist_ok=True)
         for index, (frame_file, depth_file) in enumerate(zip(frame_files, depth_files)):
             frame_name = frame_file.stem
             left_path = left_dir / f"{frame_name}.png"
             right_path = right_dir / f"{frame_name}.png"
-            pair_is_valid = True
-            for path in (left_path, right_path):
-                if not png_header_matches(path, shape=(*render_shape, 3), bit_depth=8):
-                    pair_is_valid = False
-                    break
-            if pair_is_valid:
+            stat_path = stat_dir / f"{frame_name}.json" if metric_mode else None
+            if StereoPairGenerator._stereo_outputs_are_valid(
+                left_path,
+                right_path,
+                stat_path,
+                frame_name,
+                render_shape,
+            ):
                 completed += 1
                 continue
-            repaired_outputs = repaired_outputs or left_path.exists() or right_path.exists()
-            left_path.unlink(missing_ok=True)
-            right_path.unlink(missing_ok=True)
+            output_paths = [left_path, right_path]
+            if stat_path is not None:
+                output_paths.append(stat_path)
+            repaired_outputs = repaired_outputs or any(path.exists() for path in output_paths)
+            for path in output_paths:
+                path.unlink(missing_ok=True)
             work_items.append(
                 _FileWorkItem(
                     index=index,
@@ -778,9 +1027,92 @@ class StereoPairGenerator:
                     frame_name=frame_name,
                     left_path=left_path,
                     right_path=right_path,
+                    stat_path=stat_path,
                 )
             )
         return work_items, completed, repaired_outputs
+
+    @staticmethod
+    def _stereo_outputs_are_valid(
+        left_path: Path,
+        right_path: Path,
+        stat_path: Path | None,
+        frame_name: str,
+        render_shape: tuple[int, int],
+    ) -> bool:
+        for path in (left_path, right_path):
+            if not png_header_matches(path, shape=(*render_shape, 3), bit_depth=8):
+                return False
+        return (
+            stat_path is None
+            or StereoPairGenerator._read_metric_stat_sidecar(
+                stat_path,
+                frame_name,
+            )
+            is not None
+        )
+
+    @staticmethod
+    def _read_metric_stat_sidecar(
+        path: Path,
+        frame_name: str,
+    ) -> MetricProjectionStats | None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or set(payload) != {
+            "schema_version",
+            "frame_name",
+            "valid_pixel_count",
+            "clamped_pixel_count",
+            "clamped_fraction",
+        }:
+            return None
+        if (
+            payload.get("schema_version") != METRIC_CLAMP_STATS_SCHEMA_VERSION
+            or payload.get("frame_name") != frame_name
+        ):
+            return None
+        try:
+            return MetricProjectionStats(
+                payload["valid_pixel_count"],
+                payload["clamped_pixel_count"],
+                payload["clamped_fraction"],
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _summarize_metric_clamps(self, frame_files: list[Path], left_dir: Path) -> None:
+        fractions: list[float] = []
+        earliest_warning: str | None = None
+        for frame_file in frame_files:
+            frame_name = frame_file.stem
+            stats = self._read_metric_stat_sidecar(
+                left_dir / "clamp_stats" / f"{frame_name}.json",
+                frame_name,
+            )
+            if stats is None:
+                raise ValueError(f"Metric clamp statistics are invalid for {frame_name}")
+            fractions.append(stats.clamped_fraction)
+            if earliest_warning is None and stats.clamped_fraction > 0.05:
+                earliest_warning = frame_name
+
+        summary: dict[str, Any] = {
+            "schema_version": METRIC_CLAMP_STATS_SCHEMA_VERSION,
+            "frame_names": [path.stem for path in frame_files],
+            "clamped_fractions": fractions,
+            "affected_frame_count": sum(fraction > 0.0 for fraction in fractions),
+            "mean_clamped_fraction": float(np.mean(fractions)) if fractions else 0.0,
+            "max_clamped_fraction": max(fractions, default=0.0),
+        }
+        _atomic_write_json(left_dir / "clamp_summary.json", summary)
+        self.last_metric_clamp_summary = summary
+        if earliest_warning is not None:
+            print(
+                "Warning: metric disparity was clamped above 5% of valid pixels "
+                f"starting at source frame {earliest_warning}"
+            )
 
     @staticmethod
     def _get_canonical_metadata(
@@ -839,3 +1171,25 @@ class StereoPairGenerator:
             )
             raise ValueError(f"Canonical disparity payload does not match metadata: {invalid_path}")
         return metadata
+
+    @staticmethod
+    def _get_metric_store(
+        depth_files: list[Path],
+        frame_files: list[Path],
+    ) -> tuple[MetricGeometryStore, dict[str, Any]]:
+        if not depth_files:
+            raise ValueError("Metric geometry files are required")
+        metadata = MetricGeometryStore.read_metadata(depth_files[0].parent)
+        if metadata is None:
+            raise ValueError("Metric geometry metadata is missing or malformed")
+        store = MetricGeometryStore.open_existing(
+            depth_files[0].parent,
+            frame_names=[path.name for path in frame_files],
+            source_raw_fingerprint=cast(str, metadata.get("source_raw_fingerprint")),
+            source_frame_fingerprint=cast(str, metadata.get("source_frame_fingerprint")),
+            candidate_scene_fingerprint=cast(str, metadata.get("candidate_scene_fingerprint")),
+        )
+        expected_paths = [path.resolve() for path in store.complete_files]
+        if [path.resolve() for path in depth_files] != expected_paths:
+            raise ValueError("Metric geometry files do not match the metadata path manifest")
+        return store, store.metadata

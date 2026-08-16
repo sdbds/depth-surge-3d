@@ -11,10 +11,10 @@ from src.depth_surge_3d.inference.depth.backend_registry import EstimatorRequest
 from src.depth_surge_3d.rendering import stereo_projector
 from src.depth_surge_3d.rendering import (
     StereoRenderResult,
-    StereoRenderSettings,
     StereoProjector,
     create_stereo_projector,
 )
+from src.depth_surge_3d.rendering.stereo_renderer import StereoSplatSettings
 
 
 def _stereo_result(image: np.ndarray) -> StereoRenderResult:
@@ -592,7 +592,7 @@ class TestProcessImage:
         mock_imread.return_value = image
         mock_imwrite.return_value = True
         renderer = MagicMock()
-        renderer.render.return_value = _stereo_result(image)
+        renderer.render_geometry.return_value = _stereo_result(image)
 
         projector = StereoProjector(device="cpu", stereo_renderer=renderer)
         result = projector.process_image("test.jpg", "/tmp/output")
@@ -600,12 +600,13 @@ class TestProcessImage:
         assert result is True
         mock_estimator.load_model.assert_called_once()
         mock_estimator.estimate_depth_batch.assert_called_once()
-        render_image, canonical, render_settings = renderer.render.call_args.args
+        render_image, geometry, render_settings = renderer.render_geometry.call_args.args
         assert render_image is image
-        assert canonical.dtype == np.float32
-        assert canonical[0, 0] == 0.0
-        assert canonical[-1, -1] == 1.0
-        assert isinstance(render_settings, StereoRenderSettings)
+        assert geometry.near_score.dtype == np.float32
+        assert geometry.near_score[0, 0] == 0.0
+        assert geometry.near_score[-1, -1] == 1.0
+        assert isinstance(render_settings, StereoSplatSettings)
+        renderer.render.assert_not_called()
         # Should save 4 images: left, right, vr, depth
         assert mock_imwrite.call_count == 4
 
@@ -670,7 +671,7 @@ class TestProcessImage:
         image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
         mock_imread.return_value = image
         renderer = MagicMock()
-        renderer.render.return_value = _stereo_result(image)
+        renderer.render_geometry.return_value = _stereo_result(image)
 
         projector = StereoProjector(device="cpu", stereo_renderer=renderer)
 
@@ -688,15 +689,34 @@ class TestProcessImage:
         assert result is True
         # Verify custom depth resolution was used (batch estimation called)
         mock_estimator.estimate_depth_batch.assert_called_once()
-        canonical = renderer.render.call_args.args[1]
-        render_settings = renderer.render.call_args.args[2]
-        assert canonical[0, 0] == 1.0
-        assert canonical[-1, -1] == 0.0
-        assert render_settings == StereoRenderSettings(
-            stereo_strength=4.0,
-            convergence=0.25,
+        geometry = renderer.render_geometry.call_args.args[1]
+        render_settings = renderer.render_geometry.call_args.args[2]
+        assert geometry.near_score[0, 0] == 1.0
+        assert geometry.near_score[-1, -1] == 0.0
+        assert render_settings == StereoSplatSettings(
+            max_eye_shift_fraction=0.02,
             occlusion_fill="none",
         )
+
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
+    def test_process_image_rejects_metric_geometry_without_loading_model(
+        self,
+        mock_create,
+        capsys,
+    ) -> None:
+        estimator = MagicMock()
+        mock_create.return_value = estimator
+
+        projector = StereoProjector(device="cpu")
+        result = projector.process_image(
+            "test.jpg",
+            "/tmp/output",
+            stereo_geometry_mode="metric_camera",
+        )
+
+        assert result is False
+        estimator.load_model.assert_not_called()
+        assert "metric_camera is supported for video processing only" in capsys.readouterr().out
 
     @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("cv2.imread")
