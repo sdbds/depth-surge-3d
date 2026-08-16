@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 
 import numpy as np
@@ -24,6 +25,10 @@ from src.depth_surge_3d.rendering.stereo_renderer import (
 )
 
 
+def _array_sha256(values: np.ndarray) -> str:
+    return hashlib.sha256(np.ascontiguousarray(values).tobytes()).hexdigest()
+
+
 def _subpixel_result(
     colour: torch.Tensor,
     valid: torch.Tensor,
@@ -43,6 +48,43 @@ def _empty_render_result(frame: np.ndarray) -> StereoRenderResult:
         right_valid_mask=mask.copy(),
         left_hole_mask=~mask,
         right_hole_mask=~mask,
+    )
+
+
+def test_relative_cpu_regression_corpus_is_byte_frozen() -> None:
+    generator = np.random.default_rng(20260816)
+    frame = generator.integers(0, 256, size=(7, 19, 3), dtype=np.uint8)
+    canonical = generator.random((5, 13), dtype=np.float32)
+    result = StereoRenderer(
+        device="cpu",
+        temporary_budget_bytes=19 * SPLAT_BYTES_PER_PIXEL * 2,
+    ).render(
+        frame,
+        canonical,
+        StereoRenderSettings(
+            stereo_strength=3.75,
+            convergence=0.42,
+            occlusion_fill="background",
+        ),
+    )
+
+    assert _array_sha256(result.left_image) == (
+        "48f5e73497d9adea81c5a0dc1444dfa23776f71af291c4a8995470435052d0ce"
+    )
+    assert _array_sha256(result.right_image) == (
+        "5fbd0cb67a9a31f7f18957d597979a0c88db49d5df7b29e2ce731bfd7e3aae05"
+    )
+    assert _array_sha256(result.left_valid_mask) == (
+        "2be1e207cb3c363ebec163e3de22b4b60a5357f10f7e3afc1e10a7e47c4dc03a"
+    )
+    assert _array_sha256(result.right_valid_mask) == (
+        "2be1e207cb3c363ebec163e3de22b4b60a5357f10f7e3afc1e10a7e47c4dc03a"
+    )
+    assert _array_sha256(result.left_hole_mask) == (
+        "57ffc9ca3beb6ee6226c28248ab9c77b2076ef6acffba839cec21fac28a8fd1f"
+    )
+    assert _array_sha256(result.right_hole_mask) == (
+        "57ffc9ca3beb6ee6226c28248ab9c77b2076ef6acffba839cec21fac28a8fd1f"
     )
 
 
