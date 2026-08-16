@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from src.depth_surge_3d.inference.depth.types import DepthBatch, DepthRepresentation
+from src.depth_surge_3d.inference.depth.types import (
+    DepthBatch,
+    DepthRepresentation,
+    PinholeCameraBatch,
+)
 from src.depth_surge_3d.inference.depth.video_depth_estimator import VideoDepthEstimator
 from src.depth_surge_3d.inference.depth.video_depth_estimator_da3 import VideoDepthEstimatorDA3
 from src.depth_surge_3d.inference.depth.video_depth_estimator_see_through import (
@@ -47,6 +51,32 @@ def test_depth_batch_requires_rank_three_float32_values() -> None:
         DepthBatch(values.astype(np.float64), DepthRepresentation.INVERSE_DEPTH)
     with pytest.raises(ValueError, match=r"\[N,H,W\]"):
         DepthBatch(values[0], DepthRepresentation.INVERSE_DEPTH)
+
+
+def test_existing_depth_batch_remains_camera_free() -> None:
+    batch = DepthBatch(
+        np.ones((2, 3, 4), dtype=np.float32),
+        DepthRepresentation.RELATIVE_DEPTH,
+    )
+    assert batch.camera is None
+
+
+def test_pinhole_camera_requires_positive_finite_float32_values() -> None:
+    with pytest.raises(TypeError, match="float32"):
+        PinholeCameraBatch(np.array([1.0], dtype=np.float64))
+    with pytest.raises(ValueError, match="positive"):
+        PinholeCameraBatch(np.array([0.0], dtype=np.float32))
+    with pytest.raises(ValueError, match="finite"):
+        PinholeCameraBatch(np.array([np.nan], dtype=np.float32))
+
+
+def test_depth_batch_camera_count_matches_depth_count() -> None:
+    with pytest.raises(ValueError, match="batch length"):
+        DepthBatch(
+            np.ones((2, 3, 4), dtype=np.float32),
+            DepthRepresentation.METRIC_DEPTH,
+            camera=PinholeCameraBatch(np.array([0.8], dtype=np.float32)),
+        )
 
 
 @pytest.mark.parametrize(

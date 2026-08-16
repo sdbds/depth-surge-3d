@@ -63,7 +63,7 @@ class DepthBackendSpec:
     availability_probe: Callable[[], BackendAvailability]
 
 
-_RELATIVE_ONLY = frozenset({"relative"})
+_RELATIVE_ONLY: frozenset[StereoGeometryMode] = frozenset({"relative"})
 
 
 def _available() -> BackendAvailability:
@@ -118,7 +118,7 @@ def _create_moge2(request: EstimatorRequest) -> Any:
     """Defer the optional adapter import until MoGe-2 is selected."""
     availability = _moge_availability()
     if not availability.available:
-        raise RuntimeError(availability.reason)
+        raise RuntimeError(f"{availability.reason}. Install with: {availability.install_command}")
     variant = resolve_model_variant("moge2", request.model_size)
     from .video_depth_estimator_moge2 import create_video_depth_estimator_moge2
 
