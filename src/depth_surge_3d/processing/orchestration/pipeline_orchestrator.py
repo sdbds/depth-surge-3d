@@ -69,6 +69,7 @@ class ProcessingOrchestrator:
         self.verbose = verbose
         self._settings_file: Path | None = None  # Track settings file for error handling
         self._start_time: float = 0.0  # Track processing start time
+        self._metric_clamp_summary: dict[str, Any] | None = None
 
     def process(
         self,
@@ -223,6 +224,7 @@ class ProcessingOrchestrator:
             - Progress updates
         """
         num_frames = len(frame_files)
+        self._metric_clamp_summary = None
 
         # Step 3: Create stereo pairs (delegated to stereo_generator)
         if not self.stereo_generator.create_stereo_pairs_from_files(
@@ -237,6 +239,16 @@ class ProcessingOrchestrator:
         self._print_saved_to(directories.get("left_frames"), "Left frames")
         self._print_saved_to(directories.get("right_frames"), "Right frames")
         print()  # Blank line after left/right pair
+        if settings.get("stereo_geometry_mode", "relative") == "metric_camera":
+            summary = self.stereo_generator.last_metric_clamp_summary
+            if isinstance(summary, dict):
+                self._metric_clamp_summary = dict(summary)
+                print(
+                    "Metric disparity clamp summary: "
+                    f"affected_frames={int(summary['affected_frame_count'])}, "
+                    f"mean={float(summary['mean_clamped_fraction']):.4%}, "
+                    f"max={float(summary['max_clamped_fraction']):.4%}"
+                )
 
         # Step 4: Apply fisheye distortion (optional - delegated to distortion_processor)
         if settings.get("apply_distortion", True):
@@ -440,14 +452,17 @@ class ProcessingOrchestrator:
 
             # Update settings file
             if self._settings_file:
+                runtime_info = {
+                    "final_output": output_file_path,
+                    "frames_processed": num_frames,
+                    "processing_time_seconds": elapsed_time,
+                }
+                if self._metric_clamp_summary is not None:
+                    runtime_info["metric_clamp_summary"] = dict(self._metric_clamp_summary)
                 update_processing_status(
                     self._settings_file,
                     "completed",
-                    {
-                        "final_output": output_file_path,
-                        "frames_processed": num_frames,
-                        "processing_time_seconds": elapsed_time,
-                    },
+                    runtime_info,
                 )
 
             if not settings.get("keep_intermediates", True):

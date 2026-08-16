@@ -3,6 +3,7 @@
 import inspect
 import tempfile
 import os
+from pathlib import Path
 from src.depth_surge_3d.utils.path_utils import (
     parse_time_string,
     calculate_frame_range,
@@ -14,9 +15,25 @@ from src.depth_surge_3d.utils.path_utils import (
     format_time_duration,
 )
 from src.depth_surge_3d.io.operations import (
+    cleanup_intermediate_files,
     validate_video_file,
     validate_image_file,
 )
+
+
+def test_successful_cleanup_removes_both_stage3_directories(tmp_path: Path) -> None:
+    relative = tmp_path / "03_disparity_maps"
+    metric = tmp_path / "03_metric_geometry"
+    relative.mkdir()
+    metric.mkdir()
+    (relative / "frame_000001.png").write_bytes(b"relative")
+    (metric / "frame_000001.npz").write_bytes(b"metric")
+
+    removed = cleanup_intermediate_files(tmp_path)
+
+    assert removed == 2
+    assert not any(relative.iterdir())
+    assert not any(metric.iterdir())
 
 
 class TestParseTimeString:
