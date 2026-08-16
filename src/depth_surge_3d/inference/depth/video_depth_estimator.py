@@ -19,6 +19,14 @@ import numpy as np
 
 from ...utils.system.console import success as console_success, error as console_error
 from .types import DepthBatch, DepthRepresentation
+from .v2_temporal_contract import (
+    VDA_FRAME_STEP,
+    VDA_INFERENCE_ALGORITHM,
+    VDA_INFER_LEN,
+    VDA_INTERP_LEN,
+    VDA_KEYFRAMES,
+    VDA_OVERLAP,
+)
 from ...core.constants import (
     DEFAULT_MODEL_PATH,
     VIDEO_DEPTH_ANYTHING_REPO_DIR,
@@ -27,14 +35,6 @@ from ...core.constants import (
     DEPTH_MODEL_INPUT_SIZE,
     DEPTH_MODEL_DEFAULT_FPS,
 )
-
-
-VDA_INFER_LEN = 32
-VDA_OVERLAP = 10
-VDA_KEYFRAMES = (0, 12, 24, 25, 26, 27, 28, 29, 30, 31)
-VDA_INTERP_LEN = 8
-VDA_FRAME_STEP = VDA_INFER_LEN - VDA_OVERLAP
-VDA_INFERENCE_ALGORITHM = "vda-offline-shot-v1"
 
 
 class _VDASequenceDepthIterator(Iterator[tuple[int, DepthBatch]]):
@@ -104,9 +104,14 @@ class _VDASequenceDepthIterator(Iterator[tuple[int, DepthBatch]]):
                         self._pending_start,
                         self._pending_depth[:visible_count],
                     )
-            self._finished = True
-            self._release_state()
+            self.close()
             raise StopIteration
+
+    def close(self) -> None:
+        """Release retained temporal state when iteration ends or is abandoned."""
+
+        self._finished = True
+        self._release_state()
 
     def _load(self, indexes: Sequence[int]) -> np.ndarray:
         values = self._load_frames(indexes)
@@ -168,6 +173,17 @@ class _VDASequenceDepthIterator(Iterator[tuple[int, DepthBatch]]):
     def _select_retained_input(current_input: torch.Tensor) -> torch.Tensor:
         return current_input[:, list(VDA_KEYFRAMES), ...].detach()
 
+    @staticmethod
+    def _refresh_retained_input(
+        current_input: torch.Tensor,
+        retained_input: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reuse the ten-frame state buffer instead of allocating a second one."""
+        retained_input[:, 0].copy_(current_input[:, VDA_KEYFRAMES[0]])
+        retained_input[:, 1].copy_(current_input[:, VDA_KEYFRAMES[1]])
+        retained_input[:, 2:].copy_(current_input[:, VDA_KEYFRAMES[2] : VDA_KEYFRAMES[-1] + 1])
+        return retained_input.detach()
+
     def _advance_first_window(self) -> tuple[int, DepthBatch]:
         indexes = list(range(min(VDA_INFER_LEN, self._frame_count)))
         frames = self._load(indexes)
@@ -205,18 +221,16 @@ class _VDASequenceDepthIterator(Iterator[tuple[int, DepthBatch]]):
         )
         assert self._pending_depth is not None
         assert self._alignment_refs is not None
-        finalized, next_pending, next_references = self._estimator._finalize_window(
+        finalized, next_pending, next_reference = self._estimator._finalize_window(
             self._pending_depth,
             depths,
             self._alignment_refs,
         )
 
-        self._retained_input = None
-        del carried_input
-        retained = self._select_retained_input(current_input)
+        retained = self._refresh_retained_input(current_input, carried_input)
+        self._alignment_refs[1] = next_reference
         self._transform = transform
         self._retained_input = retained
-        self._alignment_refs = next_references
         self._pending_depth = next_pending
         self._pending_start = window_start + VDA_INFER_LEN - VDA_INTERP_LEN
         self._next_window_start = window_start + VDA_FRAME_STEP
@@ -231,7 +245,7 @@ class _VDASequenceDepthIterator(Iterator[tuple[int, DepthBatch]]):
         return self._batch(finalized_start, finalized[:visible_count])
 
     def _batch(self, start: int, values: np.ndarray) -> tuple[int, DepthBatch]:
-        return start, DepthBatch(np.asarray(values, dtype=np.float32).copy(), self._representation)
+        return start, DepthBatch(np.asarray(values, dtype=np.float32), self._representation)
 
     def _release_state(self) -> None:
         self._transform = None
@@ -508,7 +522,7 @@ class VideoDepthEstimator:
         ratio = max(frame_height, frame_width) / min(frame_height, frame_width)
         if ratio > 1.78:
             input_size = int(input_size * 1.777 / ratio)
-        input_size = round(input_size / 14) * 14
+            input_size = round(input_size / 14) * 14
         return Compose(
             [
                 Resize(
@@ -633,13 +647,10 @@ class VideoDepthEstimator:
         return float(scale), float(shift)
 
     @staticmethod
-    def _interpolate_depths(previous: np.ndarray, current: np.ndarray) -> np.ndarray:
+    def _interpolate_depths(previous: np.ndarray, current: np.ndarray) -> list[np.ndarray]:
         from utils.util import get_interpolate_frames  # type: ignore[import-not-found]
 
-        return np.asarray(
-            get_interpolate_frames(list(previous.copy()), list(current.copy())),
-            dtype=np.float32,
-        )
+        return list(get_interpolate_frames(list(previous), list(current)))
 
     def _finalize_window(
         self,
@@ -656,27 +667,33 @@ class VideoDepthEstimator:
             raise ValueError("VDA finalization requires 8 pending and 32 current depth maps")
         if references.shape[0] != VDA_OVERLAP - VDA_INTERP_LEN:
             raise ValueError("VDA finalization requires two alignment references")
+        if not current.flags.writeable:
+            raise ValueError("VDA current-window depth must be writable")
 
         if self.metric:
             scale, shift = 1.0, 0.0
         else:
             scale, shift = self._compute_scale_and_shift(current[:2], references)
-        aligned = current[2:].copy()
+        aligned = current[2:]
         aligned *= scale
         aligned += shift
         np.maximum(aligned, 0, out=aligned)
 
         blended = self._interpolate_depths(previous, aligned[:VDA_INTERP_LEN])
-        if blended.shape != previous.shape:
+        if len(blended) != VDA_INTERP_LEN:
             raise ValueError("VDA overlap interpolation returned an unexpected shape")
-        finalized = np.concatenate(
-            [blended, aligned[VDA_INTERP_LEN:VDA_FRAME_STEP]],
-            axis=0,
-        ).astype(np.float32, copy=False)
-        next_pending = aligned[VDA_FRAME_STEP:].copy()
-        next_reference = aligned[VDA_KEYFRAMES[1] - (VDA_OVERLAP - VDA_INTERP_LEN)].copy()
-        next_references = np.stack([references[0], next_reference]).astype(np.float32, copy=False)
-        return finalized, next_pending, next_references
+        for index, value in enumerate(blended):
+            frame = np.asarray(value, dtype=np.float32)
+            if frame.shape != previous.shape[1:]:
+                raise ValueError("VDA overlap interpolation returned an unexpected shape")
+            current[index] = frame
+
+        finalized_tail_length = VDA_FRAME_STEP - VDA_INTERP_LEN
+        for index in range(finalized_tail_length):
+            current[VDA_INTERP_LEN + index] = current[VDA_OVERLAP + index]
+        next_pending = current[VDA_INFER_LEN - VDA_INTERP_LEN :].copy()
+        next_reference = current[VDA_KEYFRAMES[1] - (VDA_OVERLAP - VDA_INTERP_LEN)]
+        return current[:VDA_FRAME_STEP], next_pending, next_reference
 
     def get_model_info(self) -> dict[str, Any]:
         """Get information about the loaded model."""

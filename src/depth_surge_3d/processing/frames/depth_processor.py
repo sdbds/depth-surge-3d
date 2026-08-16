@@ -16,7 +16,7 @@ import sys
 import torch
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from ...core.constants import (
     DEFAULT_FALLBACK_FPS,
@@ -24,10 +24,6 @@ from ...core.constants import (
     RESOLUTION_1440P,
     RESOLUTION_1080P,
     RESOLUTION_720P,
-    RESOLUTION_SD,
-    MEGAPIXELS_4K,
-    MEGAPIXELS_1080P,
-    MEGAPIXELS_720P,
     CHUNK_SIZE_4K,
     CHUNK_SIZE_1440P,
     CHUNK_SIZE_1080P_MANUAL,
@@ -46,6 +42,12 @@ from ...utils import (
 )
 from ...utils import calculate_optimal_chunk_size, get_vram_info
 from ...inference.depth.types import DepthBatch, DepthRepresentation
+from ...inference.depth.v2_temporal_contract import (
+    build_v2_execution_plan,
+    is_compatible_v2_execution_plan,
+    next_v2_input_size,
+)
+from .depth_resolution import auto_depth_input_size
 from .depth_normalizer import (
     SceneDepthBounds,
     canonicalize_depth,
@@ -76,8 +78,6 @@ from .source_frame_manifest import frame_sequence_fingerprint
 
 DEPTH_BOUNDS_SCHEMA_VERSION = 2
 DEPTH_SAMPLES_SCHEMA_VERSION = 2
-V2_FALLBACK_POLICY = "v2-uniform-halving-v1"
-V2_MINIMUM_INPUT_SIZE = 384
 _V2_SEQUENCE_END = object()
 
 
@@ -131,9 +131,16 @@ class DepthMapProcessor:
 
         execution_plan = None
         requested_plan_fingerprint = None
+        v2_source_geometry = None
         if self._supports_sequence_depth():
             self._warn_ignored_v2_temporal_settings(settings, progress_tracker)
-            requested_plan = self._requested_v2_execution_plan(frame_files, settings)
+            v2_source_geometry = self._read_source_frame_geometry(frame_files[0])
+            frame_height, frame_width = v2_source_geometry
+            requested_plan = self._requested_v2_execution_plan(
+                frame_width,
+                frame_height,
+                settings,
+            )
             requested_semantic = self._raw_semantic_fingerprint(
                 frame_files,
                 settings,
@@ -175,19 +182,17 @@ class DepthMapProcessor:
                     canonical_dir,
                     semantic_fingerprint,
                     progress_tracker,
+                    source_geometry=v2_source_geometry,
                     skip_global_cache=model_fingerprint == requested_plan_fingerprint,
                 )
             except _V2ResolutionFallback as error:
-                if execution_plan is None:
-                    raise RuntimeError(
-                        "V2 resolution fallback requires an execution plan"
-                    ) from error
+                active_plan = cast(dict[str, Any], execution_plan)
                 current_size = error.effective_input_size
                 error.__traceback__ = None
                 error.__cause__ = None
                 self._clear_cuda_oom_state()
                 next_size = self._next_v2_input_size(current_size)
-                requested_size = int(execution_plan["requested_input_size"])
+                requested_size = int(active_plan["requested_input_size"])
                 if next_size is None:
                     raise RuntimeError(
                         "V2 CUDA OOM with requested input size "
@@ -196,7 +201,11 @@ class DepthMapProcessor:
                     ) from None
                 self._reset_stage_directory(raw_dir)
                 self._reset_stage_directory(canonical_dir)
-                execution_plan = self._v2_execution_plan(requested_size, next_size)
+                execution_plan = self._v2_execution_plan(
+                    requested_size,
+                    next_size,
+                    fp32=active_plan["precision"] == "fp32",
+                )
                 self._report_v2_resolution_fallback(
                     requested_size,
                     next_size,
@@ -213,6 +222,7 @@ class DepthMapProcessor:
         semantic_fingerprint: dict[str, Any],
         progress_tracker,
         *,
+        source_geometry: tuple[int, int] | None,
         skip_global_cache: bool,
     ) -> list[Path]:
         """Run one immutable raw-depth identity through the canonical barrier."""
@@ -278,6 +288,7 @@ class DepthMapProcessor:
             manifest,
             raw_store,
             progress_tracker,
+            source_geometry,
         )
         raw_files = [raw_store.path_for(name) for name in frame_names]
         if not all(path.is_file() for path in raw_files):
@@ -510,48 +521,44 @@ class DepthMapProcessor:
 
     def _requested_v2_execution_plan(
         self,
-        frame_files: list[Path],
+        frame_width: int,
+        frame_height: int,
         settings: dict[str, Any],
     ) -> dict[str, Any]:
-        sample_frame = cv2.imread(str(frame_files[0]))
-        if sample_frame is None:
-            raise OSError(f"Could not load source frame: {frame_files[0]}")
-        frame_height, frame_width = sample_frame.shape[:2]
-        _chunk_size, requested_size = self._determine_chunk_params(
+        megapixels = (frame_height * frame_width) / 1_000_000
+        print(f"  Frame resolution: {frame_width}x{frame_height} ({megapixels:.1f}MP)")
+        requested_size = self._determine_input_size(
             frame_width,
             frame_height,
             settings.get("depth_resolution", "auto"),
+            megapixels,
         )
         return self._v2_execution_plan(requested_size, requested_size)
+
+    @staticmethod
+    def _read_source_frame_geometry(frame_file: Path) -> tuple[int, int]:
+        sample_frame = cv2.imread(str(frame_file))
+        if sample_frame is None:
+            raise OSError(f"Could not load source frame: {frame_file}")
+        frame_height, frame_width = sample_frame.shape[:2]
+        return int(frame_height), int(frame_width)
 
     @staticmethod
     def _v2_execution_plan(
         requested_input_size: int,
         effective_input_size: int,
+        *,
+        fp32: bool = False,
     ) -> dict[str, Any]:
-        if requested_input_size < 1 or effective_input_size < 1:
-            raise ValueError("V2 execution-plan input sizes must be positive")
-        return {
-            "requested_input_size": int(requested_input_size),
-            "effective_input_size": int(effective_input_size),
-            "precision": "fp16",
-            "fallback_policy": V2_FALLBACK_POLICY,
-        }
+        return build_v2_execution_plan(
+            requested_input_size,
+            effective_input_size,
+            fp32=fp32,
+        )
 
     @staticmethod
     def _next_v2_input_size(current_size: int) -> int | None:
-        if current_size <= V2_MINIMUM_INPUT_SIZE:
-            return None
-        return max(V2_MINIMUM_INPUT_SIZE, current_size // 2)
-
-    @classmethod
-    def _valid_v2_input_sizes(cls, requested_size: int) -> set[int]:
-        sizes = {requested_size}
-        current = requested_size
-        while (next_size := cls._next_v2_input_size(current)) is not None:
-            sizes.add(next_size)
-            current = next_size
-        return sizes
+        return next_v2_input_size(current_size)
 
     def _adopt_persisted_v2_execution_plan(
         self,
@@ -580,6 +587,7 @@ class DepthMapProcessor:
         return self._v2_execution_plan(
             int(requested_plan["requested_input_size"]),
             effective_size,
+            fp32=requested_plan["precision"] == "fp32",
         )
 
     @classmethod
@@ -588,30 +596,7 @@ class DepthMapProcessor:
         persisted_plan: Any,
         requested_plan: dict[str, Any],
     ) -> bool:
-        expected_keys = {
-            "requested_input_size",
-            "effective_input_size",
-            "precision",
-            "fallback_policy",
-        }
-        if not isinstance(persisted_plan, dict) or set(persisted_plan) != expected_keys:
-            return False
-        requested_size = persisted_plan.get("requested_input_size")
-        effective_size = persisted_plan.get("effective_input_size")
-        if (
-            isinstance(requested_size, bool)
-            or not isinstance(requested_size, int)
-            or isinstance(effective_size, bool)
-            or not isinstance(effective_size, int)
-        ):
-            return False
-        if requested_size != requested_plan["requested_input_size"]:
-            return False
-        if persisted_plan.get("precision") != requested_plan["precision"]:
-            return False
-        if persisted_plan.get("fallback_policy") != requested_plan["fallback_policy"]:
-            return False
-        return effective_size in cls._valid_v2_input_sizes(requested_size)
+        return is_compatible_v2_execution_plan(persisted_plan, requested_plan)
 
     @staticmethod
     def _report_v2_resolution_fallback(
@@ -624,14 +609,12 @@ class DepthMapProcessor:
             f"{effective_size} instead of requested size {requested_size}; "
             "the lower size applies to the whole V2 raw stage."
         )
+        print(message, file=sys.stderr)
         if progress_tracker:
             progress_tracker.update_progress(
                 message,
                 phase="depth_estimation",
-                step_name="Depth Map Generation",
             )
-        else:
-            print(message, file=sys.stderr)
 
     @staticmethod
     def _warn_ignored_v2_temporal_settings(
@@ -647,14 +630,12 @@ class DepthMapProcessor:
             f"temporal_window_overlap={overlap} are retained for compatibility but ignored; "
             "VDA uses fixed window 32 and overlap 10 within each detected shot."
         )
+        print(message, file=sys.stderr)
         if progress_tracker:
             progress_tracker.update_progress(
                 message,
                 phase="depth_estimation",
-                step_name="Depth Map Generation",
             )
-        else:
-            print(message, file=sys.stderr)
 
     @staticmethod
     def _open_raw_store_if_present(
@@ -710,6 +691,7 @@ class DepthMapProcessor:
         manifest: dict[str, Any],
         raw_store: RawDepthStore | None,
         progress_tracker,
+        source_geometry: tuple[int, int] | None,
     ) -> RawDepthStore:
         chunk_size, input_size, target_fps, requested_dtype = self._prepare_raw_depth_stage(
             frame_files,
@@ -717,6 +699,7 @@ class DepthMapProcessor:
             raw_dir,
             raw_store,
             semantic_fingerprint.get("execution_plan"),
+            source_geometry,
         )
         frame_names = [path.name for path in frame_files]
         if self._supports_sequence_depth():
@@ -873,44 +856,50 @@ class DepthMapProcessor:
             load_frames,
             target_fps=target_fps,
             input_size=input_size,
-            fp32=False,
+            fp32=semantic_fingerprint["execution_plan"]["precision"] == "fp32",
         )
         expected_start = 0
-        while True:
-            item = self._next_v2_sequence_item(
-                iterator,
-                input_size,
-                has_successful_window,
-            )
-            if item is _V2_SEQUENCE_END:
-                break
-            has_successful_window = True
-            local_start, result = self._validate_v2_sequence_item(
-                item,
-                expected_start,
-                shot_end - shot_start,
-            )
-            batch_length = len(result.values)
-            global_start = shot_start + local_start
-            batch_names = frame_names[global_start : global_start + batch_length]
-            raw_store = self._write_v2_raw_batch(
-                result,
-                batch_names,
-                frame_names,
-                settings,
-                raw_dir,
-                semantic_fingerprint,
-                raw_store,
-                requested_dtype,
-            )
-            expected_start += batch_length
-            self._report_raw_sequence_progress(
-                progress_tracker,
-                shot_number,
-                shot_count,
-                shot_start + expected_start,
-                len(frame_files),
-            )
+        try:
+            while True:
+                item = self._next_v2_sequence_item(
+                    iterator,
+                    input_size,
+                    has_successful_window,
+                )
+                if item is _V2_SEQUENCE_END:
+                    break
+                has_successful_window = True
+                local_start, result = self._validate_v2_sequence_item(
+                    item,
+                    expected_start,
+                    shot_end - shot_start,
+                )
+                batch_length = len(result.values)
+                global_start = shot_start + local_start
+                batch_names = frame_names[global_start : global_start + batch_length]
+                raw_store = self._write_v2_raw_batch(
+                    result,
+                    batch_names,
+                    frame_names,
+                    settings,
+                    raw_dir,
+                    semantic_fingerprint,
+                    raw_store,
+                    requested_dtype,
+                )
+                expected_start += batch_length
+                self._report_raw_sequence_progress(
+                    progress_tracker,
+                    shot_number,
+                    shot_count,
+                    shot_start + expected_start,
+                    len(frame_files),
+                )
+                del item, result
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
         if expected_start != shot_end - shot_start:
             raise ValueError("V2 sequence iterator did not yield the complete shot")
         if raw_store is None:
@@ -935,6 +924,8 @@ class DepthMapProcessor:
                 raise _V2ResolutionFallback(input_size) from error
             try:
                 return next(iterator)
+            except StopIteration:
+                return _V2_SEQUENCE_END
             except Exception as retry_error:
                 if not self._is_cuda_oom(retry_error):
                     raise
@@ -1060,11 +1051,12 @@ class DepthMapProcessor:
         raw_dir: Path,
         raw_store: RawDepthStore | None,
         execution_plan: Any,
+        source_geometry: tuple[int, int] | None,
     ) -> tuple[int, int, Any, str]:
-        sample_frame = cv2.imread(str(frame_files[0]))
-        if sample_frame is None:
-            raise OSError(f"Could not load source frame: {frame_files[0]}")
-        frame_height, frame_width = sample_frame.shape[:2]
+        if source_geometry is None:
+            frame_height, frame_width = self._read_source_frame_geometry(frame_files[0])
+        else:
+            frame_height, frame_width = source_geometry
         if self._supports_sequence_depth():
             requested_size = (
                 execution_plan.get("requested_input_size")
@@ -1073,7 +1065,11 @@ class DepthMapProcessor:
             )
             if isinstance(requested_size, bool) or not isinstance(requested_size, int):
                 raise ValueError("V2 raw-depth identity requires a valid execution plan")
-            requested_plan = self._v2_execution_plan(requested_size, requested_size)
+            requested_plan = self._v2_execution_plan(
+                requested_size,
+                requested_size,
+                fp32=execution_plan.get("precision") == "fp32",
+            )
             if not self._is_compatible_v2_execution_plan(execution_plan, requested_plan):
                 raise ValueError("V2 raw-depth identity requires a valid execution plan")
             chunk_size = 1
@@ -1579,16 +1575,12 @@ class DepthMapProcessor:
                 f"  GPU VRAM: {vram_info['available']:.1f}GB available / {vram_info['total']:.1f}GB total"
             )
 
-        # Determine input size (depth resolution)
-        if depth_resolution != "auto":
-            try:
-                input_size = int(depth_resolution)
-                print(f"  Using manual depth resolution: {input_size}px")
-            except (ValueError, TypeError):
-                print(f"  Warning: Invalid depth_resolution '{depth_resolution}', using auto")
-                input_size = self._auto_determine_input_size(frame_w, frame_h, megapixels)
-        else:
-            input_size = self._auto_determine_input_size(frame_w, frame_h, megapixels)
+        input_size = self._determine_input_size(
+            frame_w,
+            frame_h,
+            depth_resolution,
+            megapixels,
+        )
 
         # Get model information
         model_version = "v3" if hasattr(self.depth_estimator, "model_type") else "v2"
@@ -1618,6 +1610,25 @@ class DepthMapProcessor:
 
         return chunk_size, input_size
 
+    def _determine_input_size(
+        self,
+        frame_w: int,
+        frame_h: int,
+        depth_resolution: str,
+        megapixels: float,
+    ) -> int:
+        """Resolve a requested depth size without consulting VRAM or batch sizing."""
+        if depth_resolution != "auto":
+            try:
+                input_size = int(depth_resolution)
+                print(f"  Using manual depth resolution: {input_size}px")
+            except (ValueError, TypeError):
+                print(f"  Warning: Invalid depth_resolution '{depth_resolution}', using auto")
+                input_size = self._auto_determine_input_size(frame_w, frame_h, megapixels)
+        else:
+            input_size = self._auto_determine_input_size(frame_w, frame_h, megapixels)
+        return input_size
+
     def _auto_determine_input_size(self, frame_w: int, frame_h: int, megapixels: float) -> int:
         """
         Determine input size automatically based on frame resolution.
@@ -1630,17 +1641,8 @@ class DepthMapProcessor:
         Returns:
             Optimal input size for depth estimation
         """
-        # Auto mode: Match depth resolution to actual frame size
-        # Never exceed source frame resolution - upscaling depth is pointless
-        if megapixels > MEGAPIXELS_4K:  # >8MP (4K is ~8.3MP)
-            input_size = min(max(frame_w, frame_h), RESOLUTION_4K)
-        elif megapixels > MEGAPIXELS_1080P:  # >2MP (1080p is 2.1MP)
-            input_size = min(max(frame_w, frame_h), RESOLUTION_1080P)
-        elif megapixels > MEGAPIXELS_720P:  # >1MP (720p is 0.9MP)
-            input_size = min(max(frame_w, frame_h), RESOLUTION_720P)
-        else:
-            input_size = min(max(frame_w, frame_h), RESOLUTION_SD)
-
+        del megapixels
+        input_size = auto_depth_input_size(frame_w, frame_h)
         print(f"  Auto depth resolution: {input_size}px")
         return input_size
 

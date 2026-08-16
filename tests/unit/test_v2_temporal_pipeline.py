@@ -13,6 +13,7 @@ import torch
 
 from src.depth_surge_3d.core.depth_contract import canonical_json_hash
 from src.depth_surge_3d.inference.depth.types import DepthBatch, DepthRepresentation
+from src.depth_surge_3d.processing.frames import depth_processor as depth_processor_module
 from src.depth_surge_3d.processing.frames.depth_processor import DepthMapProcessor
 from src.depth_surge_3d.processing.frames.scene_analyzer import (
     SCENE_ALGORITHM_VERSION,
@@ -30,6 +31,7 @@ class FakeSequenceEstimator:
         self.loader_requests: list[list[int]] = []
         self.loaded_markers: list[list[int]] = []
         self.input_sizes: list[int] = []
+        self.fp32_values: list[bool] = []
 
     @staticmethod
     def get_model_info() -> dict[str, object]:
@@ -51,9 +53,10 @@ class FakeSequenceEstimator:
         input_size,
         fp32,
     ):
-        del target_fps, fp32
+        del target_fps
         self.shot_lengths.append(frame_count)
         self.input_sizes.append(input_size)
+        self.fp32_values.append(fp32)
         requested = list(range(frame_count))
         frames = load_frames(requested)
         markers = [int(frame[0, 0, 0]) for frame in frames]
@@ -135,6 +138,35 @@ class EventSequenceEstimator(FakeSequenceEstimator):
         return super().iter_sequence_depth(*args, **kwargs)
 
 
+class ClosingFailureEstimator(FakeSequenceEstimator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+
+    def iter_sequence_depth(self, frame_count, load_frames, **_kwargs):
+        estimator = self
+
+        class ClosingIterator:
+            def __init__(self) -> None:
+                self.position = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.position:
+                    raise RuntimeError("sequence failed")
+                frame = load_frames([0])[0]
+                self.position = 1
+                value = np.asarray([[[frame[0, 0, 0]]]], dtype=np.float32)
+                return 0, DepthBatch(value, DepthRepresentation.INVERSE_DEPTH)
+
+            def close(self):
+                estimator.closed = True
+
+        return ClosingIterator()
+
+
 class RecordingProgress:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -203,15 +235,21 @@ def _run_v2_pipeline(
     directories: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
     progress_tracker=None,
+    fp32_plan: bool = False,
 ) -> list[Path]:
     processor = DepthMapProcessor(estimator)
     manifest = _candidate_manifest(frame_files)
     requested_size = int(str(settings["depth_resolution"]))
-    monkeypatch.setattr(
-        processor,
-        "_determine_chunk_params",
-        lambda *_args: (2, requested_size),
-    )
+    if fp32_plan:
+        monkeypatch.setattr(
+            processor,
+            "_requested_v2_execution_plan",
+            lambda *_args: processor._v2_execution_plan(
+                requested_size,
+                requested_size,
+                fp32=True,
+            ),
+        )
     monkeypatch.setattr(processor, "_clear_gpu_memory", lambda: None)
     monkeypatch.setattr(processor, "_load_or_analyze_scenes", lambda *_args: manifest)
     result = processor.generate_depth_map_files(
@@ -259,6 +297,31 @@ def test_v2_pipeline_partitions_candidate_shots_and_maps_local_indexes(
         "precision": "fp16",
         "fallback_policy": "v2-uniform-halving-v1",
     }
+    assert estimator.fp32_values == [False, False, False]
+
+
+def test_v2_execution_plan_precision_drives_the_estimator_argument(
+    v2_frames: list[Path],
+    v2_directories: dict[str, Path],
+    v2_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    estimator = FakeSequenceEstimator()
+
+    _run_v2_pipeline(
+        estimator,
+        v2_frames,
+        v2_settings,
+        v2_directories,
+        monkeypatch,
+        fp32_plan=True,
+    )
+
+    assert estimator.fp32_values == [True, True, True]
+    metadata = json.loads(
+        (v2_directories["depth_raw"] / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["semantic_fingerprint"]["execution_plan"]["precision"] == "fp32"
 
 
 def test_v2_resume_reuses_complete_shots_and_recomputes_the_whole_partial_shot(
@@ -331,6 +394,44 @@ def test_v2_failure_leaves_partial_shot_and_next_run_restarts_that_shot(
     assert resumed.shot_lengths == [4, 2]
     assert resumed.loaded_markers == [[4, 5, 6, 7], [8, 9]]
     assert len(list(raw_dir.glob("*.npz"))) == len(v2_frames)
+
+
+def test_v2_processor_closes_sequence_state_after_an_exception(
+    v2_frames: list[Path],
+    v2_directories: dict[str, Path],
+    v2_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    estimator = ClosingFailureEstimator()
+
+    with pytest.raises(RuntimeError, match="sequence failed"):
+        _run_v2_pipeline(
+            estimator,
+            v2_frames,
+            v2_settings,
+            v2_directories,
+            monkeypatch,
+        )
+
+    assert estimator.closed is True
+
+
+def test_v2_retry_converts_unexpected_iterator_exhaustion_to_sequence_end() -> None:
+    class OomThenStop:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __next__(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise torch.cuda.OutOfMemoryError("late OOM")
+            raise StopIteration
+
+    processor = DepthMapProcessor(FakeSequenceEstimator())
+
+    item = processor._next_v2_sequence_item(OomThenStop(), 518, True)
+
+    assert item is depth_processor_module._V2_SEQUENCE_END
 
 
 def test_v2_first_window_oom_selects_one_lower_resolution_for_the_whole_stage(
@@ -530,7 +631,7 @@ def test_v2_nondefault_compatibility_windows_warn_once_before_cache_or_inference
     assert len(warnings) == 1
     assert events.index(warnings[0]) < events.index("cache lookup")
     assert events.index(warnings[0]) < events.index("inference")
-    assert capsys.readouterr().err == ""
+    assert capsys.readouterr().err.count("fixed window 32") == 1
 
 
 def test_v2_cli_compatibility_warning_is_written_once_to_stderr(
@@ -620,3 +721,22 @@ def test_v2_persisted_execution_plan_requires_exact_compatible_structure() -> No
         {key: value for key, value in fallback.items() if key != "precision"},
         requested,
     )
+
+
+def test_v2_requested_plan_does_not_run_frame_batch_or_vram_sizing(
+    v2_frames: list[Path],
+    v2_settings: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    processor = DepthMapProcessor(FakeSequenceEstimator())
+    monkeypatch.setattr(
+        processor,
+        "_determine_chunk_params",
+        lambda *_args: pytest.fail("V2 requested resolution must not run batch sizing"),
+    )
+
+    plan = processor._requested_v2_execution_plan(3, 2, v2_settings)
+
+    assert plan["requested_input_size"] == 518
+    assert "frames/chunk" not in capsys.readouterr().out
