@@ -179,7 +179,9 @@ _BACKEND_SPECS = (
         backend_id="see_through",
         display_name="See-Through Marigold",
         default_model_size="vitl",
-        variants=_variants(ModelVariantSpec("vitl", "See-Through")),
+        variants=_variants(
+            ModelVariantSpec("vitl", "See-Through", repo_id=DEFAULT_SEE_THROUGH_REPO)
+        ),
         capabilities=BackendCapabilities(False, False, _RELATIVE_ONLY),
         factory=_create_see_through,
         availability_probe=_available,
@@ -259,13 +261,12 @@ def build_effective_depth_run_report(settings: Mapping[str, Any], estimator: Any
     """Describe only the artifact and projection values active for this run."""
     backend_id = str(settings["depth_model_version"])
     spec = get_backend_spec(backend_id)
-    custom_path = cast(str | None, settings.get("model_path"))
-    variant = None
-    if not custom_path:
-        variant = resolve_model_variant(
-            backend_id,
-            cast(str | None, settings.get("model_size")),
-        )
+    model_path = cast(str | None, settings.get("model_path"))
+    variant = _registered_artifact_variant(
+        backend_id,
+        model_path=model_path,
+        model_size=cast(str | None, settings.get("model_size")),
+    )
     mode = cast(StereoGeometryMode, settings["stereo_geometry_mode"])
     if mode == "metric_camera":
         projection = {
@@ -280,12 +281,11 @@ def build_effective_depth_run_report(settings: Mapping[str, Any], estimator: Any
             "occlusion_fill": settings["occlusion_fill"],
         }
 
-    if custom_path:
+    if variant is None:
         model_size = "custom"
-        repository = getattr(estimator, "repo_id", None) or custom_path
+        repository = getattr(estimator, "repo_id", None) or model_path
         revision = getattr(estimator, "revision", None)
     else:
-        assert variant is not None
         model_size = variant.setting
         repository = (
             variant.repo_id
@@ -333,12 +333,31 @@ def resolve_model_variant(backend_id: str, model_size: str | None) -> ModelVaria
         raise ValueError(f"Unknown model size for {backend_id}: {selected_size}") from exc
 
 
+def _registered_artifact_variant(
+    backend_id: str, *, model_path: str | None, model_size: str | None
+) -> ModelVariantSpec | None:
+    """Return the registry variant when the requested artifact is registered."""
+    normalized_size = (
+        _LEGACY_MODEL_SIZE_ALIASES.get(model_size, model_size) if model_size is not None else None
+    )
+    if not model_path:
+        return resolve_model_variant(backend_id, normalized_size)
+
+    for variant in get_backend_spec(backend_id).variants.values():
+        registered_names = (variant.backend_value, variant.repo_id)
+        if model_path in registered_names:
+            return variant
+    return None
+
+
 def normalize_model_size(backend_id: str, *, model_path: str | None, model_size: str | None) -> str:
     """Return the canonical registry size for a default, variant, or custom artifact."""
-    if model_path:
-        return "custom"
-    normalized_size = _LEGACY_MODEL_SIZE_ALIASES.get(model_size, model_size)
-    return resolve_model_variant(backend_id, normalized_size).setting
+    variant = _registered_artifact_variant(
+        backend_id,
+        model_path=model_path,
+        model_size=model_size,
+    )
+    return variant.setting if variant is not None else "custom"
 
 
 def create_registered_depth_estimator(backend_id: str, request: EstimatorRequest) -> Any:

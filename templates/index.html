@@ -1881,6 +1881,13 @@
             });
         }
 
+        function clearEffectiveProcessingConfig() {
+            const container = document.getElementById('effectiveProcessingConfig');
+            const values = document.getElementById('effectiveProcessingConfigValues');
+            values.replaceChildren();
+            container.hidden = true;
+        }
+
         // Drag and Drop functionality
         const dropZone = document.getElementById('dropZone');
         const fileInput = document.getElementById('videoFile');
@@ -2207,6 +2214,7 @@
 
         // Start processing
         document.getElementById('processBtn').addEventListener('click', function() {
+            clearEffectiveProcessingConfig();
             if (!uploadedFilename || !uploadedOutputDir) {
                 alert('Please upload a video first');
                 return;
@@ -2300,6 +2308,7 @@
         
         // Resume processing
         document.getElementById('resumeBtn').addEventListener('click', function() {
+            clearEffectiveProcessingConfig();
             const resumeDirectory = document.getElementById('resumeDirectory').value.trim();
             
             if (!resumeDirectory) {

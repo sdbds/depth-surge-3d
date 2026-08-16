@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import math
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -152,3 +153,92 @@ def test_cli_has_no_public_moge_resolution_level_flag(cli_module) -> None:
 
     assert "moge-resolution" not in help_text
     assert "resolution-level" not in help_text
+
+
+@pytest.mark.parametrize(
+    ("invalid_settings", "sample_aspect_ratio"),
+    [
+        ({}, (4, 3)),
+        ({"vr_format": "over_under"}, (1, 1)),
+        ({"apply_distortion": True}, (1, 1)),
+    ],
+)
+def test_cli_resume_rejects_metric_constraints_before_load_or_migration(
+    cli_module, monkeypatch, tmp_path, invalid_settings, sample_aspect_ratio
+) -> None:
+    import importlib
+
+    projector_module = importlib.import_module("depth_surge_3d.rendering.stereo_projector")
+    estimator = MagicMock()
+    estimator.get_model_size.return_value = "vitb"
+    estimator.device = "cpu"
+    estimator.metric = True
+    estimator.repo_id = "Ruicheng/moge-2-vitb-normal"
+    estimator.revision = "54ad3a693e61907ea4633d13dec6ee682fa09419"
+    estimator.inference_precision = "float32"
+    monkeypatch.setattr(
+        projector_module,
+        "create_registered_depth_estimator",
+        lambda *_args, **_kwargs: estimator,
+    )
+    monkeypatch.setattr(projector_module, "validate_video_file", lambda _path: True)
+    monkeypatch.setattr(
+        projector_module,
+        "get_video_properties",
+        lambda _path: {
+            "width": 1920,
+            "height": 1080,
+            "fps": 24.0,
+            "frame_count": 1,
+            "sample_aspect_ratio_numerator": sample_aspect_ratio[0],
+            "sample_aspect_ratio_denominator": sample_aspect_ratio[1],
+        },
+    )
+    projector = projector_module.StereoProjector(
+        device="cpu",
+        metric=True,
+        depth_model_version="moge2",
+        model_size="vitb",
+    )
+    settings = {
+        "depth_model_version": "moge2",
+        "model_size": "vitb",
+        "stereo_geometry_mode": "metric_camera",
+        "vr_format": "side_by_side",
+        "apply_distortion": False,
+        **invalid_settings,
+    }
+    resume_info = {
+        "can_resume": True,
+        "batch_name": "metric",
+        "status": "in_progress",
+        "progress_info": None,
+        "recommendations": [],
+        "settings_file": tmp_path / "job-settings.json",
+    }
+    build_resume = MagicMock()
+    build_fingerprint = MagicMock()
+    migrate = MagicMock()
+    monkeypatch.setattr(cli_module.sys, "argv", ["depth_surge_3d.py", "--resume", str(tmp_path)])
+    monkeypatch.setattr(cli_module, "can_resume_processing", lambda _path: resume_info)
+    monkeypatch.setattr(
+        cli_module,
+        "load_processing_settings",
+        lambda _path: {
+            "metadata": {"source_video": "source.mp4"},
+            "processing_settings": settings,
+        },
+    )
+    monkeypatch.setattr(cli_module, "_backend_is_available", lambda _backend: True)
+    monkeypatch.setattr(cli_module, "create_stereo_projector", lambda **_kwargs: projector)
+    monkeypatch.setattr(cli_module, "build_resume_report", build_resume)
+    monkeypatch.setattr(cli_module, "build_current_model_fingerprint", build_fingerprint)
+    monkeypatch.setattr(cli_module, "apply_legacy_migration", migrate)
+
+    result = cli_module.main()
+
+    assert result == 1
+    estimator.load_model.assert_not_called()
+    build_fingerprint.assert_not_called()
+    build_resume.assert_not_called()
+    migrate.assert_not_called()

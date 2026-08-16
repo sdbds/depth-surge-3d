@@ -377,3 +377,70 @@ def test_web_emits_configuration_before_model_load(monkeypatch, tmp_path) -> Non
         )
 
     assert events.index("processing_configuration") < events.index("load_model")
+
+
+def test_join_after_process_response_replays_exact_processing_configuration(
+    client, monkeypatch, tmp_path
+) -> None:
+    import app as web_app
+
+    output_dir = _prepare_process_request(web_app, monkeypatch, tmp_path)
+    estimator = MagicMock()
+    estimator.repo_id = "Ruicheng/moge-2-vitb-normal"
+    estimator.revision = "54ad3a693e61907ea4633d13dec6ee682fa09419"
+    estimator.device = "cpu"
+    estimator.inference_precision = "float32"
+    estimator.resolution_level = 9
+    projector = MagicMock(depth_estimator=estimator)
+    projector.load_model.return_value = False
+    monkeypatch.setattr(web_app, "create_stereo_projector", lambda *_args, **_kwargs: projector)
+
+    def run_synchronously(target, *args):
+        target(*args)
+        return object()
+
+    monkeypatch.setattr(web_app.socketio, "start_background_task", run_synchronously)
+    response = client.post("/process", json=_metric_payload(output_dir))
+    session_id = response.get_json()["session_id"]
+    socket_client = web_app.socketio.test_client(web_app.app, flask_test_client=client)
+    try:
+        socket_client.emit("join_session", {"session_id": session_id})
+        configurations = [
+            event["args"][0]
+            for event in socket_client.get_received()
+            if event["name"] == "processing_configuration"
+        ]
+    finally:
+        socket_client.disconnect()
+
+    assert configurations == [
+        {
+            "backend": "moge2",
+            "model_size": "vitb",
+            "repository": "Ruicheng/moge-2-vitb-normal",
+            "revision": "54ad3a693e61907ea4633d13dec6ee682fa09419",
+            "device": "cpu",
+            "precision": "float32",
+            "depth_resolution": 1080,
+            "adapter_resolution_level": 9,
+            "camera_capability": "pinhole_fx",
+            "geometry_mode": "metric_camera",
+            "projection": {
+                "virtual_baseline_mm": 63.0,
+                "metric_convergence_distance": "auto",
+                "max_disparity_percent": 2.0,
+            },
+        }
+    ]
+
+
+def test_new_runs_clear_stale_effective_configuration(client) -> None:
+    html = client.get("/").get_data(as_text=True)
+
+    assert "function clearEffectiveProcessingConfig()" in html
+    process_handler = html[html.index("// Start processing") : html.index("// Resume processing")]
+    resume_handler = html[html.index("// Resume processing") : html.index("// Stop processing")]
+    assert "clearEffectiveProcessingConfig();" in process_handler
+    assert "clearEffectiveProcessingConfig();" in resume_handler
+    assert "values.replaceChildren();" in html
+    assert "container.hidden = true;" in html

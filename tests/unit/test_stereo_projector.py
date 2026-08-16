@@ -8,10 +8,17 @@ import pytest
 
 from src.depth_surge_3d.inference.depth.types import DepthBatch, DepthRepresentation
 from src.depth_surge_3d.core.settings import validate_settings
+from src.depth_surge_3d.core.constants import DEFAULT_DA3_MODEL
 from src.depth_surge_3d.inference.depth.backend_registry import (
     EstimatorRequest,
     TEMPORAL_STABILITY_WARNING,
     build_effective_depth_run_report,
+)
+from src.depth_surge_3d.inference.depth.video_depth_estimator import VideoDepthEstimator
+from src.depth_surge_3d.inference.depth.video_depth_estimator_da3 import VideoDepthEstimatorDA3
+from src.depth_surge_3d.inference.depth.video_depth_estimator_see_through import (
+    DEFAULT_SEE_THROUGH_REPO,
+    SeeThroughDepthEstimator,
 )
 from src.depth_surge_3d.rendering import stereo_projector
 from src.depth_surge_3d.rendering import (
@@ -141,6 +148,123 @@ def test_custom_model_report_does_not_claim_a_registry_revision() -> None:
     assert report["revision"] is None
 
 
+@pytest.mark.parametrize(
+    ("backend_id", "model_path", "estimator", "model_size", "repository"),
+    [
+        (
+            "v3",
+            DEFAULT_DA3_MODEL,
+            VideoDepthEstimatorDA3(model_name=DEFAULT_DA3_MODEL, device="cpu"),
+            "vitl",
+            DEFAULT_DA3_MODEL,
+        ),
+        (
+            "see_through",
+            DEFAULT_SEE_THROUGH_REPO,
+            SeeThroughDepthEstimator(device="cpu"),
+            "vitl",
+            DEFAULT_SEE_THROUGH_REPO,
+        ),
+    ],
+)
+def test_registered_default_artifact_identity_is_not_reported_as_custom(
+    backend_id, model_path, estimator, model_size, repository
+) -> None:
+    settings = validate_settings(
+        {
+            "depth_model_version": backend_id,
+            "model_path": model_path,
+            "model_size": model_size,
+            "device": "cpu",
+            "depth_resolution": 1080,
+        },
+        source="explicit",
+    )
+
+    report = build_effective_depth_run_report(settings, estimator)
+
+    assert report["model_size"] == model_size
+    assert report["repository"] == repository
+    assert report["revision"] is None
+
+
+@pytest.mark.parametrize(
+    ("backend_id", "model_path", "estimator"),
+    [
+        ("v3", "owner/custom-da3", VideoDepthEstimatorDA3("owner/custom-da3", "cpu")),
+        (
+            "see_through",
+            "owner/custom-see-through",
+            SeeThroughDepthEstimator("owner/custom-see-through", "cpu"),
+        ),
+    ],
+)
+def test_actual_custom_artifact_does_not_claim_registered_revision(
+    backend_id, model_path, estimator
+) -> None:
+    settings = validate_settings(
+        {
+            "depth_model_version": backend_id,
+            "model_path": model_path,
+            "model_size": "custom",
+            "device": "cpu",
+            "depth_resolution": 1080,
+        },
+        source="explicit",
+    )
+
+    report = build_effective_depth_run_report(settings, estimator)
+
+    assert report["model_size"] == "custom"
+    assert report["repository"] == model_path
+    assert report["revision"] is None
+
+
+@pytest.mark.parametrize(
+    ("backend_id", "model_size", "estimator"),
+    [
+        (
+            "v2",
+            "vitl",
+            VideoDepthEstimator("models/video_depth_anything_vitl.pth", device="cpu"),
+        ),
+        ("v3", "vitl", VideoDepthEstimatorDA3(DEFAULT_DA3_MODEL, device="cpu")),
+    ],
+)
+def test_real_legacy_estimators_reach_report_and_model_load_without_get_model_size(
+    monkeypatch, tmp_path, capsys, backend_id, model_size, estimator
+) -> None:
+    estimator.load_model = MagicMock(return_value=False)
+    monkeypatch.setattr(
+        stereo_projector,
+        "create_registered_depth_estimator",
+        lambda *_args, **_kwargs: estimator,
+    )
+    monkeypatch.setattr(stereo_projector, "validate_video_file", lambda _path: True)
+    get_properties = MagicMock(
+        return_value={
+            "width": 1920,
+            "height": 1080,
+            "fps": 24.0,
+            "frame_count": 1,
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+        }
+    )
+    monkeypatch.setattr(stereo_projector, "get_video_properties", get_properties)
+    projector = StereoProjector(
+        device="cpu",
+        depth_model_version=backend_id,
+        model_size=model_size,
+    )
+
+    ok = projector.process_video("clip.mp4", str(tmp_path / "out"), {})
+
+    assert ok is False
+    estimator.load_model.assert_called_once_with()
+    assert f"model_size: {model_size}" in capsys.readouterr().out
+
+
 def test_metric_sar_is_rejected_before_model_load_or_output_creation(monkeypatch, tmp_path) -> None:
     estimator = MagicMock()
     estimator.get_model_size.return_value = "vitb"
@@ -201,18 +325,17 @@ def test_metric_projector_prints_one_warning_and_loads_after_report(
         lambda *_args, **_kwargs: estimator,
     )
     monkeypatch.setattr(stereo_projector, "validate_video_file", lambda _path: True)
-    monkeypatch.setattr(
-        stereo_projector,
-        "get_video_properties",
-        lambda _path: {
+    get_properties = MagicMock(
+        return_value={
             "width": 1920,
             "height": 1080,
             "fps": 24.0,
             "frame_count": 2,
             "sample_aspect_ratio_numerator": 1,
             "sample_aspect_ratio_denominator": 1,
-        },
+        }
     )
+    monkeypatch.setattr(stereo_projector, "get_video_properties", get_properties)
     processor = MagicMock()
     processor.process.side_effect = lambda **_kwargs: events.append("process") or True
     monkeypatch.setattr(stereo_projector, "VideoProcessor", lambda *_args, **_kwargs: processor)
@@ -223,10 +346,19 @@ def test_metric_projector_prints_one_warning_and_loads_after_report(
         model_size="vitb",
     )
 
-    ok = projector.process_video("clip.mp4", str(tmp_path / "out"), _metric_settings())
+    output_dir = str(tmp_path / "out")
+    preflight = projector.preflight_video("clip.mp4", output_dir, _metric_settings())
+    assert preflight is not None
+    ok = projector.process_video(
+        "clip.mp4",
+        output_dir,
+        _metric_settings(),
+        preflight=preflight,
+    )
 
     assert ok is True
     assert events == ["load", "process"]
+    get_properties.assert_called_once_with("clip.mp4")
     output = capsys.readouterr().out
     assert output.count(TEMPORAL_STABILITY_WARNING) == 1
     assert output.index("backend: moge2") < output.index(TEMPORAL_STABILITY_WARNING)
@@ -355,7 +487,7 @@ class TestStereoProjector:
     def test_process_video_signature_uses_final_controls(self):
         parameter_names = list(inspect.signature(StereoProjector.process_video).parameters)
 
-        assert parameter_names == ["self", "video_path", "output_dir", "settings"]
+        assert parameter_names == ["self", "video_path", "output_dir", "settings", "preflight"]
 
     def test_duplicate_pipeline_apis_are_removed(self):
         assert {

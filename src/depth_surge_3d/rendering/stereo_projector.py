@@ -10,6 +10,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -19,6 +20,7 @@ from ..inference.depth.backend_registry import (
     build_effective_depth_run_report,
     create_registered_depth_estimator,
     get_backend_spec,
+    normalize_model_size,
     validate_backend_geometry_request,
 )
 from ..inference.depth.types import DepthBatch
@@ -38,6 +40,17 @@ from ..processing.frames.depth_normalizer import canonicalize_single_scene
 from ..core.settings import validate_settings
 from .stereo_geometry import build_relative_geometry
 from .stereo_renderer import StereoRenderer, StereoSplatSettings
+
+
+@dataclass(frozen=True)
+class VideoRunPreflight:
+    """Validated, resolved video inputs that are safe to execute."""
+
+    video_path: str
+    output_dir: str
+    settings: dict[str, Any]
+    video_properties: dict[str, Any]
+    report: dict[str, Any]
 
 
 class StereoProjector:
@@ -94,6 +107,8 @@ class StereoProjector:
         video_path: str,
         output_dir: str,
         settings: dict[str, Any],
+        *,
+        preflight: VideoRunPreflight | None = None,
     ) -> bool:
         """
         Process video to create 3D VR version.
@@ -107,32 +122,12 @@ class StereoProjector:
             True if processing completed successfully
         """
         try:
-            requested_settings = validate_settings(dict(settings), source="explicit")
-            requested_settings["video_path"] = video_path
-            depth_settings = self._get_depth_settings()
-            if "depth_resolution" in requested_settings:
-                depth_settings["depth_resolution"] = requested_settings["depth_resolution"]
-            requested_settings.update(depth_settings)
-
-            # Validate paths without creating output state.
-            if not self._validate_inputs(video_path, output_dir, requested_settings):
+            if preflight is None:
+                preflight = self.preflight_video(video_path, output_dir, settings)
+            elif preflight.video_path != video_path or preflight.output_dir != output_dir:
+                raise ValueError("Video preflight does not match the requested input and output")
+            if preflight is None:
                 return False
-
-            video_props = get_video_properties(video_path)
-            if not video_props:
-                print(f"Error: Cannot read video properties from {video_path}")
-                return False
-
-            resolved_settings = self._resolve_settings(requested_settings, video_props)
-            validate_backend_geometry_request(resolved_settings, video_props)
-
-            report = build_effective_depth_run_report(
-                resolved_settings,
-                self.depth_estimator,
-            )
-            self._print_effective_run_report(report)
-            if resolved_settings["stereo_geometry_mode"] == "metric_camera":
-                print(TEMPORAL_STABILITY_WARNING)
 
             if not self._ensure_model_loaded():
                 return False
@@ -141,20 +136,63 @@ class StereoProjector:
 
             # Create video processor (always uses temporal consistency)
             processor = VideoProcessor(
-                self.depth_estimator, verbose=resolved_settings.get("verbose", False)
+                self.depth_estimator, verbose=preflight.settings.get("verbose", False)
             )
 
             # Process the video
             return processor.process(
                 video_path=video_path,
                 output_dir=output_dir,
-                video_properties=video_props,
-                settings=resolved_settings,
+                video_properties=preflight.video_properties,
+                settings=preflight.settings,
             )
 
         except Exception as e:
             print(f"Error during video processing: {e}")
             return False
+
+    def preflight_video(
+        self,
+        video_path: str,
+        output_dir: str,
+        settings: dict[str, Any],
+    ) -> VideoRunPreflight | None:
+        """Validate and resolve a video run without loading models or mutating files."""
+        try:
+            requested_settings = validate_settings(dict(settings), source="explicit")
+            requested_settings["video_path"] = video_path
+            depth_settings = self._get_depth_settings()
+            if "depth_resolution" in requested_settings:
+                depth_settings["depth_resolution"] = requested_settings["depth_resolution"]
+            requested_settings.update(depth_settings)
+
+            if not self._validate_inputs(video_path, output_dir, requested_settings):
+                return None
+
+            video_properties = get_video_properties(video_path)
+            if not video_properties:
+                print(f"Error: Cannot read video properties from {video_path}")
+                return None
+
+            resolved_settings = self._resolve_settings(requested_settings, video_properties)
+            validate_backend_geometry_request(resolved_settings, video_properties)
+            report = build_effective_depth_run_report(
+                resolved_settings,
+                self.depth_estimator,
+            )
+            self._print_effective_run_report(report)
+            if resolved_settings["stereo_geometry_mode"] == "metric_camera":
+                print(TEMPORAL_STABILITY_WARNING)
+            return VideoRunPreflight(
+                video_path=video_path,
+                output_dir=output_dir,
+                settings=resolved_settings,
+                video_properties=video_properties,
+                report=report,
+            )
+        except Exception as error:
+            print(f"Error during video preflight: {error}")
+            return None
 
     def process_image(self, image_path: str, output_dir: str, **kwargs) -> bool:
         """
@@ -308,19 +346,15 @@ class StereoProjector:
 
     def _get_depth_settings(self) -> dict[str, Any]:
         """Describe the effective estimator inputs used to isolate depth caches."""
-        model_path = self.model_path
-        if self.depth_model_version == "see_through":
-            model_path = getattr(self.depth_estimator, "repo_id", model_path)
-        elif self.depth_model_version == "v3":
-            model_path = getattr(self.depth_estimator, "model_name", model_path)
-
         processing_resolution = getattr(self.depth_estimator, "processing_resolution", None)
-        reported_model_size = self.depth_estimator.get_model_size()
-        if not isinstance(reported_model_size, str):
-            reported_model_size = self.model_size
+        reported_model_size = normalize_model_size(
+            self.depth_model_version,
+            model_path=self.model_path,
+            model_size=self.model_size,
+        )
         return {
             "depth_model_version": self.depth_model_version,
-            "model_path": model_path,
+            "model_path": self.model_path,
             "model_size": reported_model_size,
             "depth_resolution": processing_resolution or "auto",
             "use_metric_depth": bool(getattr(self.depth_estimator, "metric", self.metric)),

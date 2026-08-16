@@ -100,6 +100,8 @@ from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
 VERBOSE = False
 SHUTDOWN_FLAG = False
 ACTIVE_PROCESSES = set()
+PENDING_PROCESSING_CONFIGURATIONS: dict[str, dict[str, Any]] = {}
+MAX_PENDING_PROCESSING_CONFIGURATIONS = 128
 
 
 def _validate_web_settings(settings: dict[str, Any], *, source: str) -> dict[str, Any]:
@@ -1005,6 +1007,10 @@ def process_video_async(  # noqa: C901
         )
 
         report = build_effective_depth_run_report(settings, projector.depth_estimator)
+        if len(PENDING_PROCESSING_CONFIGURATIONS) >= MAX_PENDING_PROCESSING_CONFIGURATIONS:
+            oldest_session = next(iter(PENDING_PROCESSING_CONFIGURATIONS))
+            PENDING_PROCESSING_CONFIGURATIONS.pop(oldest_session, None)
+        PENDING_PROCESSING_CONFIGURATIONS[session_id] = report
         socketio.emit("processing_configuration", report, room=session_id)
         if settings["stereo_geometry_mode"] == "metric_camera":
             print(TEMPORAL_STABILITY_WARNING)
@@ -1829,6 +1835,10 @@ def handle_join_session(data):
 
         join_room(session_id)
         vprint(f"Client {request.sid} joined session {session_id[:SESSION_ID_DISPLAY_LENGTH]}...")
+
+        report = PENDING_PROCESSING_CONFIGURATIONS.pop(session_id, None)
+        if report is not None:
+            socketio.emit("processing_configuration", report, room=request.sid)
 
         # Send initial status to joined client
         try:

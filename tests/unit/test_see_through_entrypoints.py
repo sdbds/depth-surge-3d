@@ -628,6 +628,11 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
         "model_size": "custom",
         "verbose": False,
     }
+    projector.preflight_video.assert_called_once_with(
+        "source.mkv",
+        str(tmp_path),
+        preflight_settings,
+    )
     build_fingerprint.assert_called_once_with(projector.depth_estimator, preflight_settings)
     build_report.assert_called_once_with(
         tmp_path,
@@ -640,6 +645,7 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
     resume_kwargs = projector.process_video.call_args.kwargs
     assert resume_kwargs["video_path"] == "source.mkv"
     assert resume_kwargs["output_dir"] == str(tmp_path)
+    assert resume_kwargs["preflight"] is projector.preflight_video.return_value
     assert resume_kwargs["settings"]["stereo_strength"] == 3.0
     assert resume_kwargs["settings"]["keep_intermediates"] is False
     for metadata_key in (
@@ -709,5 +715,5 @@ def test_cli_resume_infers_see_through_for_legacy_settings(tmp_path, monkeypatch
         device="cuda",
         metric=False,
         depth_model_version="see_through",
-        model_size="custom",
+        model_size="vitl",
     )

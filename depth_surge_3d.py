@@ -559,6 +559,13 @@ def main():  # noqa: C901
             depth_model_version=processing_settings.get("depth_model_version", "v2"),
             model_size=processing_settings.get("model_size"),
         )
+        preflight = projector.preflight_video(
+            video_path,
+            args.resume,
+            processing_settings,
+        )
+        if preflight is None:
+            return 1
         if not projector.load_model():
             print("Could not load depth estimation model")
             return 1
@@ -590,6 +597,7 @@ def main():  # noqa: C901
             video_path=video_path,
             output_dir=args.resume,
             settings=processing_settings,
+            preflight=preflight,
         )
 
         if success:
