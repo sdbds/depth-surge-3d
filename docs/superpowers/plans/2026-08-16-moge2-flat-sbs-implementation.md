@@ -1821,7 +1821,10 @@ git commit -m "refactor: feed stereo renderer common geometry"
 
 ```python
 def test_metric_frame_derives_finite_inverse_depth_and_explicit_validity() -> None:
-    depth = np.array([[2.0, 0.0, np.inf], [4.0, -1.0, np.finfo(np.float32).tiny]], dtype=np.float32)
+    smallest_subnormal = np.nextafter(
+        np.float32(0.0), np.float32(1.0), dtype=np.float32
+    )
+    depth = np.array([[2.0, 0.0, np.inf], [4.0, -1.0, smallest_subnormal]], dtype=np.float32)
     frame = metric_frame_from_depth(depth, np.float32(0.8))
     assert frame.valid.tolist() == [[True, False, False], [True, False, False]]
     np.testing.assert_array_equal(
