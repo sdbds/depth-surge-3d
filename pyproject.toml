@@ -47,6 +47,11 @@ dependencies = [
     "depth-anything-3",
 ]
 
+[project.optional-dependencies]
+moge2 = [
+    "moge @ git+https://github.com/microsoft/MoGe.git@925b8ed835a7a9cdb7578ba15c658a0afc969030",
+]
+
 [project.scripts]
 depth-surge-3d = "depth_surge_3d:main"
 
@@ -58,6 +63,9 @@ Issues = "https://github.com/Tok/depth-surge-3d/issues"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.uv]
 dev-dependencies = [
