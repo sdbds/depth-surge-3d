@@ -9,6 +9,9 @@ import pytest
 from src.depth_surge_3d.core.settings import (
     PROCESSING_SETTINGS_SCHEMA_VERSION,
     REMOVED_SETTING_NAMES,
+    UnsupportedSettingsSchemaError,
+    parse_saved_processing_settings,
+    resolve_temporal_postprocessor,
     validate_settings,
 )
 from src.depth_surge_3d.core.constants import DEFAULT_SETTINGS
@@ -33,8 +36,100 @@ def test_direct_vr_encode_accepts_booleans(value: bool) -> None:
     )
 
 
-def test_direct_vr_encode_does_not_bump_settings_schema() -> None:
-    assert PROCESSING_SETTINGS_SCHEMA_VERSION == 2
+def test_temporal_postprocessor_bumps_settings_schema() -> None:
+    assert PROCESSING_SETTINGS_SCHEMA_VERSION == 3
+
+
+def test_temporal_postprocessor_defaults_off() -> None:
+    assert DEFAULT_SETTINGS["temporal_postprocessor"] == "off"
+    assert validate_settings({}, source="explicit")["temporal_postprocessor"] == "off"
+
+
+@pytest.mark.parametrize("value", ["", "raft", "VDPP", None, False])
+def test_temporal_postprocessor_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValueError, match="temporal_postprocessor"):
+        validate_settings({"temporal_postprocessor": value}, source="explicit")
+
+
+@pytest.mark.parametrize("value", ["off", "vdpp"])
+def test_temporal_postprocessor_accepts_supported_values(value: str) -> None:
+    assert (
+        validate_settings({"temporal_postprocessor": value}, source="explicit")[
+            "temporal_postprocessor"
+        ]
+        == value
+    )
+
+
+@pytest.mark.parametrize("saved_version", [None, 1, 2])
+def test_known_legacy_settings_migrate_upward(saved_version: int | None) -> None:
+    loaded = parse_saved_processing_settings(
+        {"stereo_strength": 3.0},
+        saved_version=saved_version,
+    )
+
+    assert loaded.settings["stereo_strength"] == 3.0
+    assert loaded.settings["temporal_postprocessor"] == "off"
+    assert loaded.source_version == (1 if saved_version is None else saved_version)
+    assert loaded.migrated is True
+
+
+def test_v2_prerelease_temporal_postprocessor_is_preserved() -> None:
+    loaded = parse_saved_processing_settings(
+        {"temporal_postprocessor": "vdpp"},
+        saved_version=2,
+    )
+
+    assert loaded.settings["temporal_postprocessor"] == "vdpp"
+
+
+def test_v3_requires_temporal_postprocessor_field() -> None:
+    with pytest.raises(ValueError, match="temporal_postprocessor"):
+        parse_saved_processing_settings({}, saved_version=3)
+
+
+def test_v3_rejects_unknown_fields_instead_of_filtering_them() -> None:
+    with pytest.raises(ValueError, match="unknown setting.*future_knob"):
+        parse_saved_processing_settings(
+            {"temporal_postprocessor": "off", "future_knob": True},
+            saved_version=3,
+        )
+
+
+def test_future_schema_fails_without_mutating_input() -> None:
+    raw = {"temporal_postprocessor": "vdpp", "future_knob": True}
+    original = dict(raw)
+
+    with pytest.raises(UnsupportedSettingsSchemaError, match="newer settings schema 4"):
+        parse_saved_processing_settings(raw, saved_version=4)
+
+    assert raw == original
+
+
+@pytest.mark.parametrize(
+    ("persisted", "override", "is_resume", "expected"),
+    [
+        (None, None, False, "off"),
+        ("vdpp", None, False, "off"),
+        ("vdpp", None, True, "vdpp"),
+        ("vdpp", "off", True, "off"),
+        ("off", "vdpp", True, "vdpp"),
+    ],
+)
+def test_temporal_postprocessor_presence_aware_resolution(
+    persisted: str | None,
+    override: str | None,
+    is_resume: bool,
+    expected: str,
+) -> None:
+    assert (
+        resolve_temporal_postprocessor(
+            persisted=persisted,
+            override=override,
+            is_resume=is_resume,
+        )
+        == expected
+    )
 
 
 def test_final_defaults_cover_depth_dibr_and_migration_controls() -> None:

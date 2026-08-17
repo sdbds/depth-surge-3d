@@ -13,7 +13,11 @@ from src.depth_surge_3d.core.file_identity import (
     FILE_IDENTITY_ALGORITHM_VERSION,
     file_sample_fingerprint,
 )
-from src.depth_surge_3d.core.settings import validate_settings
+from src.depth_surge_3d.core.settings import (
+    PROCESSING_SETTINGS_SCHEMA_VERSION,
+    UnsupportedSettingsSchemaError,
+    validate_settings,
+)
 from src.depth_surge_3d.processing.frames.depth_storage import (
     RAW_DEPTH_SCHEMA_VERSION,
     RawDepthStore,
@@ -70,7 +74,7 @@ def _write_settings(
         metadata["source_video_fingerprint_algorithm"] = FILE_IDENTITY_ALGORITHM_VERSION
         metadata["source_video_fingerprint"] = file_sample_fingerprint(source_video)
     if current_schema:
-        metadata["settings_schema_version"] = 2
+        metadata["settings_schema_version"] = PROCESSING_SETTINGS_SCHEMA_VERSION
     payload = {
         "metadata": metadata,
         "video_properties": {"frame_count": 2, "width": 6, "height": 4, "fps": 30.0},
@@ -358,6 +362,54 @@ def test_report_preserves_original_frames_and_lists_legacy_stages(tmp_path):
     assert "stereo" in report.invalidated_stage_names
     assert "legacy_final" in report.invalidated_stage_names
     assert set(report.removed_settings) == {"baseline", "focal_length", "hole_fill_quality"}
+
+
+def test_resume_rejects_future_schema_before_any_mutation(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _write_frames(tmp_path)
+    settings_file = _write_settings(tmp_path, _current_settings(), current_schema=True)
+    payload = json.loads(settings_file.read_text(encoding="utf-8"))
+    payload["metadata"]["settings_schema_version"] = PROCESSING_SETTINGS_SCHEMA_VERSION + 1
+    payload["processing_settings"]["future_knob"] = True
+    settings_file.write_text(json.dumps(payload), encoding="utf-8")
+    original_bytes = settings_file.read_bytes()
+
+    with pytest.raises(UnsupportedSettingsSchemaError, match="newer settings schema"):
+        build_resume_report(tmp_path, _current_settings())
+
+    assert settings_file.read_bytes() == original_bytes
+    assert not (tmp_path / "settings.legacy.json").exists()
+
+
+def test_resume_rejects_unknown_field_in_current_schema(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _write_frames(tmp_path)
+    settings_file = _write_settings(tmp_path, _current_settings(), current_schema=True)
+    payload = json.loads(settings_file.read_text(encoding="utf-8"))
+    payload["processing_settings"]["future_knob"] = True
+    settings_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unknown setting.*future_knob"):
+        build_resume_report(tmp_path, _current_settings())
+
+
+def test_resume_migrates_v2_missing_temporal_postprocessor_to_off(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _write_frames(tmp_path)
+    settings = _current_settings()
+    settings.pop("temporal_postprocessor")
+    settings_file = _write_settings(tmp_path, settings)
+    payload = json.loads(settings_file.read_text(encoding="utf-8"))
+    payload["metadata"]["settings_schema_version"] = 2
+    settings_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = build_resume_report(tmp_path, _current_settings())
+
+    assert report.migrated_settings["temporal_postprocessor"] == "off"
+    assert report.settings_backup_required is True
 
 
 def test_candidate_manifest_resumes_finalization_but_cannot_reuse_canonical(tmp_path):

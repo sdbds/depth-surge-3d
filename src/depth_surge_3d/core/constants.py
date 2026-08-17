@@ -54,6 +54,7 @@ DEFAULT_SETTINGS = {
     "scene_cut_threshold": 0.55,
     "min_scene_frames": 8,
     "raw_storage_dtype": "auto",
+    "temporal_postprocessor": "off",
     "stereo_io_workers": min(4, max(1, (os.cpu_count() or 1) - 2)),
     "migrate_legacy": "archive",
     "vr_format": "side_by_side",
@@ -272,6 +273,7 @@ INTERMEDIATE_DIRS = {
     "scene_data": "01_scene_data",  # Candidate/final scene manifests and bounds
     "depth_raw": "02_depth_raw",  # Native model output with explicit representation
     "disparity_maps": "03_disparity_maps",  # Canonical relative-disparity maps
+    "disparity_stabilized": "03_disparity_stabilized",  # Optional VDPP output
     "left_frames": "04_left_frames",  # Step 3: Stereo pair - left eye
     "right_frames": "04_right_frames",  # Step 3: Stereo pair - right eye
     "left_distorted": "05_left_distorted",  # Step 4: Fisheye distortion - left (optional)

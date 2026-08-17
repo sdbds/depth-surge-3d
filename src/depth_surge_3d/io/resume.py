@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 from ..core.settings import (
     PROCESSING_SETTINGS_SCHEMA_VERSION,
-    REMOVED_SETTING_NAMES,
+    parse_saved_processing_settings,
     validate_settings,
 )
 from ..core.file_identity import (
@@ -1078,14 +1078,20 @@ def build_resume_report(
     raw_saved = (settings_data or {}).get("processing_settings", {})
     if not isinstance(raw_saved, dict):
         raw_saved = {}
-    removed = tuple(sorted(REMOVED_SETTING_NAMES.intersection(raw_saved)))
-    saved_settings = validate_settings(raw_saved, source="legacy_disk")
-    migrated_settings = validate_settings(current_settings, source="explicit")
     settings_metadata = (settings_data or {}).get("metadata", {})
-    settings_schema_current = (
-        isinstance(settings_metadata, dict)
-        and settings_metadata.get("settings_schema_version") == PROCESSING_SETTINGS_SCHEMA_VERSION
+    saved_version = (
+        settings_metadata.get("settings_schema_version")
+        if isinstance(settings_metadata, dict)
+        else None
     )
+    saved_result = parse_saved_processing_settings(
+        raw_saved,
+        saved_version=saved_version,
+    )
+    removed = saved_result.removed_settings
+    saved_settings = saved_result.settings
+    migrated_settings = validate_settings(current_settings, source="explicit")
+    settings_schema_current = not saved_result.migrated
 
     frames, frame_files, source_fingerprint = _validate_frame_stage(
         root, settings_data, saved_settings
