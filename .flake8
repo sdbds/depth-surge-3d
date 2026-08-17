@@ -11,7 +11,9 @@ exclude =
     *.egg-info,
     .pytest_cache,
     htmlcov,
-    video_depth_anything_repo
+    video_depth_anything_repo,
+    src/depth_surge_3d/_vendor/vdpp,
+    src/depth_surge_3d/_vendor/vdpp_utils
 per-file-ignores =
     __init__.py:F401,F403,F405,E402
 max-complexity = 10

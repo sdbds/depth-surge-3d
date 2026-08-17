@@ -12,6 +12,7 @@ source video
   -> 02_depth_raw (native model output and representation metadata)
   -> global barrier: all raw inference complete
   -> 03_disparity_maps (canonical relative disparity)
+  -> optional 03_disparity_stabilized (VDPP, one transaction per final shot)
   -> 04_left_frames + 04_right_frames (forward-splat DIBR)
   -> optional projection, crop, and upscale stages
   -> 99_vr_frames
@@ -23,6 +24,14 @@ metadata. `00_original_frames/metadata.json` anchors the exact encoded PNG
 bytes to the source-video SHA-256 after extraction completes. A stage is reused
 only when its schema, frame manifest, settings, model identity, and upstream
 fingerprints match.
+
+VDPP is a derived artifact stage, not an estimator backend. It consumes the
+same canonical uint16 relative disparity produced by V2, V3, and See-Through.
+The fixed adapter uses 32-frame windows, four retained observations, stride 28,
+FP32, and the upstream affine continuation rule. A window never crosses a final
+scene boundary. The depth-model owner is released before VDPP construction,
+and VDPP is released before stereo rendering, so both neural models are never
+resident together.
 
 ## Depth Contract
 
@@ -133,6 +142,19 @@ additionally requires the exact fingerprint of the loaded estimator and
 validates every persisted NPZ. Canonical and stereo PNGs are decoded and checked
 for their declared dtype and shape before reuse.
 
+Settings schema v3 adds `temporal_postprocessor`. V1/v2 jobs migrate upward
+with the missing value set to `off`; v3 is parsed strictly, and future schemas
+fail before any job mutation. Resume distinguishes an omitted override from an
+explicit `off`.
+
+Every writer takes a fail-fast OS lock before the authoritative audit and holds
+it through migration, model execution, downstream writes, and cleanup. A
+complete stabilized artifact is validated from stored identities, shot
+manifests, and per-file SHA-256 values before any CUDA or model probe. It can
+therefore render on a machine without CUDA, the VDPP checkpoint, or the
+historical base estimator. Incomplete VDPP work resumes at shot granularity;
+an interrupted long shot is recomputed from its beginning.
+
 A depth or stereo schema change does not by itself invalidate valid
 `00_original_frames`. Raw model changes invalidate raw depth and every
 downstream stage. Canonical changes invalidate canonical disparity and
@@ -164,6 +186,11 @@ rollback.
 - `processing/frames/depth_normalizer.py`: representation conversion and pure
   scene canonicalization.
 - `processing/frames/stereo_generator.py`: bounded stereo I/O pipeline.
+- `processing/frames/temporal_stabilizer.py`: VDPP artifact audit, shot resume,
+  disk/device preflight, and file-backed generation.
+- `inference/depth/vdpp_temporal_postprocessor.py`: exact bounded 32/4 neural
+  recurrence and explicit model lifecycle.
+- `core/render_disparity.py`: strict base/stabilized producer validation.
 - `rendering/forward_splat.py`: packed 16-lane z-buffer for one row band.
 - `rendering/stereo_renderer.py`: host geometry, fine-grid fill, downsampling,
   and bounded eye rendering.

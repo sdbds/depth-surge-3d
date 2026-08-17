@@ -82,6 +82,22 @@ manifest, and bounds.
 - `--no-distortion`: keep rectilinear stereo images.
 - `--crop-factor` and `--fisheye-crop-factor`: post-render crop controls.
 
+## Temporal Post-Processing
+
+- `--temporal-postprocessor`: `off` (default for new jobs) or `vdpp`.
+
+VDPP is an experimental depth-only pass after canonicalization. It works with
+all current depth backends, but V2 usually benefits less because V2 already has
+model-native shot-aware temporal inference. Generating missing VDPP artifacts
+requires CUDA, downloads the pinned 116,485,370-byte v1.0 checkpoint on first
+use, adds one uint16 PNG per selected frame, and adds processing time. A fully
+validated stabilized cache can be rendered without CUDA.
+
+The released checkpoint fixes window 32, overlap 4, stride 28, downsize mode,
+and FP32 precision. These are not user controls. On resume, omitting the option
+keeps the saved mode; explicitly passing `off` or `vdpp` changes the requested
+artifact and invalidates only affected downstream stages.
+
 ## Tuning
 
 Start with the defaults. Reduce `--stereo-strength` when depth edges feel

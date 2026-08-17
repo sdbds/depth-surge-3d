@@ -41,6 +41,9 @@ from depth_surge_3d.io.resume import (  # noqa: E402
 from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
     build_current_model_fingerprint,
 )
+from depth_surge_3d.processing.orchestration.execution_plan import (  # noqa: E402
+    build_artifact_execution_plan,
+)
 from depth_surge_3d.io.job_lock import JobWriterLock  # noqa: E402
 
 
@@ -543,7 +546,13 @@ def main():  # noqa: C901
                 resume_report,
                 processing_settings["temporal_postprocessor"],
             )
-            if selected_artifact is None:
+            selected_source = selected_artifact[1] if selected_artifact is not None else None
+            execution_plan = build_artifact_execution_plan(
+                temporal_postprocessor=processing_settings["temporal_postprocessor"],
+                base_artifact_valid=lambda: selected_source == "base",
+                stabilized_artifact_valid=lambda: selected_source == "stabilized",
+            )
+            if execution_plan.needs_base_depth_model:
                 projector = create_stereo_projector(
                     model_path=processing_settings.get("model_path"),
                     device=processing_settings.get("device", "auto"),
@@ -588,10 +597,7 @@ def main():  # noqa: C901
 
                 selected_files, selected_source = selected_artifact
                 temporal_stabilizer = None
-                if (
-                    processing_settings["temporal_postprocessor"] == "vdpp"
-                    and selected_source == "base"
-                ):
+                if execution_plan.needs_vdpp_model:
                     temporal_stabilizer = TemporalDepthStabilizer(
                         effective_device=_effective_vdpp_device(
                             processing_settings.get("device", "auto")

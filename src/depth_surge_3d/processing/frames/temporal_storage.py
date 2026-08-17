@@ -175,7 +175,7 @@ class StabilizedDepthStore:
         unhashed = {key: value for key, value in metadata.items() if key != "metadata_fingerprint"}
         return isinstance(fingerprint, str) and fingerprint == canonical_json_hash(unhashed)
 
-    def _shot_record_valid(
+    def _shot_record_valid(  # noqa: C901
         self,
         shot: dict[str, int],
         record: object,
@@ -231,7 +231,7 @@ class StabilizedDepthStore:
             and record.get("shot_payload_sha256") == shot_payload
         )
 
-    def audit(self) -> StabilizedStageAudit:
+    def audit(self) -> StabilizedStageAudit:  # noqa: C901
         """Inspect existing state without changing a byte."""
 
         all_ids = tuple(shot["shot_id"] for shot in self.shot_plan)
@@ -370,10 +370,9 @@ class StabilizedDepthStore:
     def _shot(self, shot_id: int) -> dict[str, int]:
         if isinstance(shot_id, bool) or not isinstance(shot_id, int):
             raise ValueError("shot_id must be an integer")
-        try:
-            return self.shot_plan[shot_id]
-        except IndexError as exc:
-            raise ValueError(f"Unknown stabilized shot: {shot_id}") from exc
+        if shot_id < 0 or shot_id >= len(self.shot_plan):
+            raise ValueError(f"Unknown stabilized shot: {shot_id}")
+        return self.shot_plan[shot_id]
 
     @staticmethod
     def _atomic_write_png(path: Path, values: np.ndarray) -> None:
@@ -382,7 +381,7 @@ class StabilizedDepthStore:
             raise OSError(f"Could not write stabilized disparity: {path}")
         os.replace(temporary, path)
 
-    def commit_shot(
+    def commit_shot(  # noqa: C901
         self,
         shot_id: int,
         outputs: Iterable[tuple[int, np.ndarray]],
@@ -443,10 +442,12 @@ class StabilizedDepthStore:
                 "manifest_sha256": self._sha256(manifest_path),
                 "shot_payload_sha256": shot_payload,
             }
-            self._metadata["completed_shots"].append(record)
-            self._metadata["completed_shots"].sort(key=lambda value: value["shot_id"])
-            self._refresh_metadata_fingerprints(self._metadata)
-            self._atomic_write_json(self.metadata_path, self._metadata)
+            completed = [*self._metadata["completed_shots"], record]
+            completed.sort(key=lambda value: value["shot_id"])
+            next_metadata = {**self._metadata, "completed_shots": completed}
+            self._refresh_metadata_fingerprints(next_metadata)
+            self._atomic_write_json(self.metadata_path, next_metadata)
+            self._metadata = next_metadata
         except BaseException:
             self._delete_shot_payloads(shot)
             raise

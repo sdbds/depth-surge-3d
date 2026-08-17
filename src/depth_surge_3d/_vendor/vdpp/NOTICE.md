@@ -12,3 +12,8 @@ under the Apache License 2.0.
 Packaging changes are limited to package markers and relative imports recorded
 in `UPSTREAM.json`. The demo, assets, image-depth model, and visualization code
 are not included.
+
+The integration adapter outside this vendored directory registers an inert
+`shift_head` slot for two zero-valued tensors present in the released v1.0
+checkpoint but absent from the pinned public class. The vendored forward path
+is unchanged and does not call that slot.

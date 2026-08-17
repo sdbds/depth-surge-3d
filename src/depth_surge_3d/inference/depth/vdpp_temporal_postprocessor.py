@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Generator
 
 import numpy as np
 import torch
@@ -52,6 +52,7 @@ class VDPPTemporalPostprocessor:
                 raise ValueError("VDPP checkpoint path is required")
             factory = model_factory or (lambda: VDPP(**VDPP_MODEL_CONFIG))
             loaded_model = factory()
+            self._register_release_checkpoint_state(loaded_model)
             state_dict = torch.load(
                 Path(checkpoint_path),
                 map_location="cpu",
@@ -63,6 +64,14 @@ class VDPPTemporalPostprocessor:
             evaluated = self._model.eval()
             if evaluated is not None:
                 self._model = evaluated
+
+    @staticmethod
+    def _register_release_checkpoint_state(model: Any) -> None:
+        """Register the released checkpoint's inert key absent from public source."""
+
+        if hasattr(model, "shift_head"):
+            raise RuntimeError("Pinned VDPP source unexpectedly defines shift_head")
+        model.shift_head = torch.nn.Sequential(torch.nn.Conv2d(1, 1, kernel_size=1))
 
     @property
     def retained_frame_count(self) -> int:
@@ -113,6 +122,17 @@ class VDPPTemporalPostprocessor:
             end=end,
             native_shape=native_shape,
         )
+        return self._to_padded(
+            loaded,
+            padded_shape=padded_shape,
+        )
+
+    def _to_padded(
+        self,
+        loaded: np.ndarray,
+        *,
+        padded_shape: tuple[int, int],
+    ) -> torch.Tensor:
         tensor = (
             torch.from_numpy(np.ascontiguousarray(loaded))
             .unsqueeze(0)
@@ -121,7 +141,7 @@ class VDPPTemporalPostprocessor:
                 dtype=torch.float32,
             )
         )
-        if padded_shape != native_shape:
+        if tuple(loaded.shape[-2:]) != padded_shape:
             tensor = (
                 F.interpolate(
                     tensor.flatten(0, 1).unsqueeze(1),
@@ -130,7 +150,7 @@ class VDPPTemporalPostprocessor:
                     align_corners=True,
                 )
                 .squeeze(1)
-                .unflatten(0, (1, end - start))
+                .unflatten(0, (1, loaded.shape[0]))
             )
         return tensor
 
@@ -193,11 +213,11 @@ class VDPPTemporalPostprocessor:
                 ).view(*native_shape)
             return frame.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy().copy()
 
-    def process_shot(
+    def process_shot(  # noqa: C901
         self,
         frame_count: int,
         load_window: Callable[[int, int], np.ndarray],
-    ) -> Iterator[tuple[int, np.ndarray]]:
+    ) -> Generator[tuple[int, np.ndarray], None, None]:
         """Yield ordered native-shape outputs before the storage-range clip."""
 
         if isinstance(frame_count, bool) or not isinstance(frame_count, int) or frame_count < 1:
@@ -226,18 +246,11 @@ class VDPPTemporalPostprocessor:
                 ceil_multiple(native_shape[1], 14),
             )
 
-            def first_loader(_start: int, _end: int) -> np.ndarray:
-                if (_start, _end) != (start, end):
-                    raise RuntimeError("Internal VDPP first-window loader mismatch")
-                return validated
-
-            inputs = self._load_padded(
-                first_loader,
-                start=start,
-                end=end,
-                native_shape=native_shape,
+            inputs = self._to_padded(
+                validated,
                 padded_shape=padded_shape,
             )
+            del validated, first_values
             current = self._forward_window(inputs)
             del inputs
             if end < frame_count:
@@ -312,7 +325,7 @@ class VDPPTemporalPostprocessor:
         finally:
             iterator.close()
         torch.cuda.synchronize(self.device)
-        result = {
+        result: dict[str, Any] = {
             "preflight_window_lengths": [min(VDPP_WINDOW_SIZE, trial_length)],
             "preflight_max_memory_allocated": int(torch.cuda.max_memory_allocated(self.device)),
             "preflight_max_memory_reserved": int(torch.cuda.max_memory_reserved(self.device)),

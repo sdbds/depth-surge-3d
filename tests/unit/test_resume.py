@@ -471,6 +471,69 @@ def test_vdpp_resume_selects_complete_content_addressed_stabilized_stage(tmp_pat
     assert report.stage("disparity_stabilized").disposition == "preserve"
 
 
+@pytest.mark.parametrize("changed_identity", ["model", "execution"])
+def test_vdpp_resume_rejects_internally_valid_but_obsolete_semantic_identity(
+    tmp_path,
+    changed_identity,
+):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings(temporal_postprocessor="vdpp")
+    _write_settings(tmp_path, settings, current_schema=True)
+    _manifest, _bounds, canonical = _write_current_depth_pipeline(
+        tmp_path,
+        frame_files,
+        fingerprint,
+    )
+    store = _write_complete_stabilized_stage(tmp_path, frame_files, canonical)
+    metadata = json.loads(store.metadata_path.read_text(encoding="utf-8"))
+    semantic = metadata["semantic_identity"]
+    if changed_identity == "model":
+        semantic["model_identity"]["checkpoint_sha256"] = "0" * 64
+    else:
+        semantic["execution_plan"]["downsize"] = False
+    metadata["semantic_fingerprint"] = canonical_json_hash(semantic)
+    metadata["artifact_fingerprint"] = canonical_json_hash(
+        {
+            "semantic_fingerprint": metadata["semantic_fingerprint"],
+            "payload_fingerprint": metadata["payload_fingerprint"],
+        }
+    )
+    metadata.pop("metadata_fingerprint")
+    metadata["metadata_fingerprint"] = canonical_json_hash(metadata)
+    store.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    report = build_resume_report(tmp_path, settings)
+
+    stage = report.stage("disparity_stabilized")
+    assert stage.disposition == "invalidate"
+    assert "identity" in stage.reason
+
+
+def test_vdpp_resume_rejects_tampered_building_metadata(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings(temporal_postprocessor="vdpp")
+    _write_settings(tmp_path, settings, current_schema=True)
+    _manifest, _bounds, canonical = _write_current_depth_pipeline(
+        tmp_path,
+        frame_files,
+        fingerprint,
+    )
+    store = _write_complete_stabilized_stage(tmp_path, frame_files, canonical)
+    metadata = json.loads(store.metadata_path.read_text(encoding="utf-8"))
+    metadata["status"] = "building"
+    store.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    report = build_resume_report(tmp_path, settings)
+
+    stage = report.stage("disparity_stabilized")
+    assert stage.disposition == "invalidate"
+    assert "metadata fingerprint" in stage.reason
+
+
 def test_off_resume_leaves_stabilized_stage_dormant_and_out_of_report(tmp_path):
     from src.depth_surge_3d.io.resume import build_resume_report
 

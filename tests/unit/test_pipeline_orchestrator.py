@@ -46,6 +46,27 @@ class TestProcessingOrchestratorInit:
         )
         assert orchestrator.verbose is True
 
+    @pytest.mark.parametrize(
+        ("files", "source"),
+        [
+            (None, "base"),
+            ([Path("frame_000001.png")], None),
+            ([Path("frame_000001.png")], "unknown"),
+        ],
+    )
+    def test_preselected_files_and_producer_must_be_supplied_together(self, files, source):
+        with pytest.raises(ValueError, match="preselected"):
+            ProcessingOrchestrator(
+                Mock(),
+                Mock(),
+                Mock(),
+                Mock(),
+                Mock(),
+                Mock(),
+                preselected_depth_files=files,
+                preselected_render_source=source,
+            )
+
 
 class TestFormatProcessingTime:
     """Test _format_processing_time pure function."""

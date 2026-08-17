@@ -480,6 +480,72 @@ def test_web_complete_stabilized_resume_skips_cuda_and_base_model(tmp_path):
     assert lock_states == [True]
 
 
+def test_web_cached_base_accepts_indexed_cuda_device_for_vdpp(tmp_path):
+    import app as web_app
+
+    output_dir = tmp_path / "job"
+    output_dir.mkdir()
+    source_video = output_dir / "source.mp4"
+    source_video.touch()
+    settings = web_app.validate_settings(
+        {
+            "temporal_postprocessor": "vdpp",
+            "device": "cuda:0",
+            "vr_format": "side_by_side",
+            "vr_resolution": "16x9-1080p",
+        },
+        source="legacy_disk",
+    )
+    report = MagicMock()
+    report.migrated_settings = settings
+    processor = MagicMock()
+    processor.process.return_value = True
+    base_files = [output_dir / "03_disparity_maps" / "frame_000001.png"]
+    stabilizer = MagicMock()
+
+    with (
+        patch.object(web_app, "build_resume_report", return_value=report),
+        patch.object(
+            web_app,
+            "_preserved_render_artifact",
+            return_value=(base_files, "base"),
+        ),
+        patch.object(
+            web_app,
+            "create_stereo_projector",
+            side_effect=AssertionError("base model must stay lazy"),
+        ),
+        patch("torch.cuda.is_available", return_value=True),
+        patch("torch.cuda.get_device_name", return_value="Test CUDA device"),
+        patch.object(
+            web_app,
+            "get_video_info",
+            return_value={"fps": 24.0, "frame_count": 1, "width": 64, "height": 48},
+        ),
+        patch.object(web_app, "VideoProcessor", return_value=processor),
+        patch(
+            "depth_surge_3d.processing.frames.temporal_stabilizer.TemporalDepthStabilizer",
+            return_value=stabilizer,
+        ) as stabilizer_class,
+        patch.object(web_app, "apply_legacy_migration"),
+        patch.object(web_app.socketio, "emit"),
+        patch.object(web_app.socketio, "sleep"),
+    ):
+        web_app.process_video_async(
+            "test-session",
+            source_video,
+            settings,
+            output_dir,
+            {"migration_mode": "archive", "settings_file": output_dir / "settings.json"},
+        )
+
+    stabilizer_class.assert_called_once_with(
+        effective_device="cuda:0",
+        models_dir=Path("models"),
+    )
+    processor.process.assert_called_once()
+
+
 def test_web_resume_rejects_output_directory_outside_managed_root(tmp_path, monkeypatch):
     import app as web_app
 

@@ -18,6 +18,7 @@ VDPP_STRIDE = VDPP_WINDOW_SIZE - VDPP_OVERLAP
 VDPP_DOWNSIZE = True
 VDPP_PRECISION = "fp32"
 VDPP_VENDOR_PORT_VERSION = 1
+VDPP_CHECKPOINT_COMPATIBILITY = "released-zero-shift-head-v1"
 
 VDPP_MODEL_CONFIG: dict[str, Any] = {
     "encoder": "vits",
@@ -45,6 +46,7 @@ def vdpp_model_identity() -> dict[str, Any]:
         "architecture": "vits-temporal-dpt",
         "model_config": dict(VDPP_MODEL_CONFIG),
         "vendor_port_version": VDPP_VENDOR_PORT_VERSION,
+        "checkpoint_compatibility": VDPP_CHECKPOINT_COMPATIBILITY,
     }
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import tomllib
 from pathlib import Path
 
 
@@ -42,3 +43,9 @@ def test_vendored_imports_are_package_relative_and_model_imports() -> None:
     module = importlib.import_module("src.depth_surge_3d._vendor.vdpp.vdpp_model")
     assert hasattr(module, "VDPP")
     assert hasattr(module, "compute_scale_and_shift")
+
+
+def test_source_distribution_excludes_downloaded_model_artifacts() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "/models" in project["tool"]["hatch"]["build"]["exclude"]

@@ -53,6 +53,28 @@ python depth_surge_3d.py input.mp4  # Auto-downloads if needed
 - **Base** (97.5M params) - Balanced performance and quality
 - **Large** (335.3M params) - Best quality (default)
 
+### Optional VDPP Checkpoint
+
+VDPP is disabled by default and needs no extra installation. The first run with
+`--temporal-postprocessor vdpp` verifies CUDA and disk capacity, then downloads
+the pinned v1.0 checkpoint to:
+
+```text
+models/VDPP/vdpp.pth
+```
+
+The expected file is 116,485,370 bytes with SHA-256
+`7368315b126093f0335147f42a1920f255d529613bfffc5c6cf4ef832deb73a7`.
+Downloads use a bounded timeout, temporary file, independent artifact lock,
+size check, and digest check before publication. VDPP generation is CUDA-only;
+CPU and MPS may still render an already complete, validated stabilized cache.
+The vendored inference source is pinned to upstream revision
+`73cc2b4dc6b3b5cfb2e37f51e452461e03fe26f5` and retains its Apache-2.0 license.
+The released checkpoint also contains two zero-valued legacy `shift_head`
+tensors absent from the public class. Depth Surge registers an inert matching
+slot so strict loading succeeds; it does not use those tensors during forward
+inference.
+
 ## Manual Installation
 
 If you prefer manual setup or if the automatic setup fails:

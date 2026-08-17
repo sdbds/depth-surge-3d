@@ -195,6 +195,50 @@ def test_complete_artifact_is_selected_without_cuda_checkpoint_runtime_or_model(
     assert len(result) == 2
 
 
+def test_all_committed_shots_finalize_without_reloading_checkpoint_or_model(
+    tmp_path: Path,
+) -> None:
+    depth_files, _frame_files, directories = _write_base(tmp_path, 2, [])
+    _coordinator(tmp_path, _FakePostprocessor()).generate_files(
+        depth_files,
+        {"temporal_postprocessor": "vdpp"},
+        directories,
+    )
+    metadata_path = directories["disparity_stabilized"] / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["status"] = "building"
+    metadata["payload_fingerprint"] = None
+    metadata["artifact_fingerprint"] = None
+    metadata["state_fingerprint"] = canonical_json_hash(
+        {
+            "status": metadata["status"],
+            "completed_shots": metadata["completed_shots"],
+        }
+    )
+    metadata.pop("metadata_fingerprint")
+    metadata["metadata_fingerprint"] = canonical_json_hash(metadata)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    resumed = _coordinator(
+        tmp_path,
+        _FakePostprocessor(),
+        checkpoint_resolver=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("checkpoint must not be resolved")
+        ),
+        factory=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("model must not be reconstructed")
+        ),
+    )
+    result = resumed.generate_files(
+        depth_files,
+        {"temporal_postprocessor": "vdpp"},
+        directories,
+    )
+
+    assert len(result) == 2
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["status"] == "complete"
+
+
 @pytest.mark.parametrize("device", ["cpu", "mps"])
 def test_generation_rejects_non_cuda_before_checkpoint_or_stage_mutation(
     tmp_path: Path,

@@ -48,6 +48,25 @@ The system will skip already-completed processing steps.
 - **Manual download**: Use the manual installation instructions in [INSTALLATION.md](INSTALLATION.md)
 - **Firewall/proxy**: Ensure Hugging Face URLs are not blocked
 
+### VDPP checkpoint or CUDA preflight fails
+
+VDPP generation is CUDA-only and performs a shape-faithful memory preflight
+before writing a new stabilized shot. Close other GPU applications if the
+preflight or a later window reports CUDA out of memory. The base files in
+`03_disparity_maps` remain valid after a VDPP failure.
+
+The checkpoint is stored at `models/VDPP/vdpp.pth`. A partial download uses a
+temporary `.part` file; an existing file with the wrong size or SHA-256 is
+rejected rather than loaded. Remove only the corrupt VDPP checkpoint and retry
+to download it. Do not remove the job's base canonical disparity.
+
+Resume is shot-atomic. Completed shots with matching semantic and runtime
+identity are reused, while the interrupted shot restarts at its first frame. A
+complete content-verified `03_disparity_stabilized` cache can render on CPU and
+does not need the checkpoint. To recover without VDPP, resume with an explicit
+`--temporal-postprocessor off`; this reuses valid raw/base depth and regenerates
+only stereo and downstream output from `03_disparity_maps`.
+
 ## Quality Expectations & Limitations
 
 ### When It Works Well

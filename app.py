@@ -94,6 +94,9 @@ from depth_surge_3d.io.job_lock import JobWriterLock  # noqa: E402
 from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
     build_current_model_fingerprint,
 )
+from depth_surge_3d.processing.orchestration.execution_plan import (  # noqa: E402
+    build_artifact_execution_plan,
+)
 
 # Global flags and state
 VERBOSE = False
@@ -959,10 +962,13 @@ def process_video_async(  # noqa: C901
         model_size = settings.get("model_size", "vitb")  # Default to Base for 16GB GPUs
         use_metric = settings.get("use_metric_depth", True)  # Default to metric depth
         selected_source = selected_artifact[1] if selected_artifact is not None else None
-        needs_base_model = selected_artifact is None
-        needs_vdpp_generation = (
-            settings.get("temporal_postprocessor") == "vdpp" and selected_source != "stabilized"
+        execution_plan = build_artifact_execution_plan(
+            temporal_postprocessor=settings.get("temporal_postprocessor", "off"),
+            base_artifact_valid=lambda: selected_source == "base",
+            stabilized_artifact_valid=lambda: selected_source == "stabilized",
         )
+        needs_base_model = execution_plan.needs_base_depth_model
+        needs_vdpp_generation = execution_plan.needs_vdpp_model
 
         device = str(settings.get("device", "auto"))
         cuda_available = False
@@ -976,11 +982,11 @@ def process_video_async(  # noqa: C901
                 print("CUDA not available, using CPU")
             if device == "auto":
                 device = "cuda" if cuda_available else "cpu"
-            if device == "cuda" and not cuda_available:
+            if device.startswith("cuda") and not cuda_available:
                 raise RuntimeError(
                     "GPU (CUDA) requested but not available. Please select Auto or CPU."
                 )
-            if needs_vdpp_generation and device != "cuda":
+            if needs_vdpp_generation and not device.startswith("cuda"):
                 raise RuntimeError("VDPP generation requires CUDA")
 
         if needs_base_model:

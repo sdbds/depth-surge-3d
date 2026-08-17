@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -128,6 +130,42 @@ def test_loader_failure_clears_retained_device_state() -> None:
     assert adapter.retained_frame_count == 0
 
 
+def test_decoded_window_is_released_before_loading_the_next_window() -> None:
+    source = _source(61, (14, 14))
+    adapter = VDPPTemporalPostprocessor(model=_FakeModel(), device="cpu")
+    previous: weakref.ReferenceType[np.ndarray] | None = None
+
+    def loader(start: int, end: int) -> np.ndarray:
+        nonlocal previous
+        if previous is not None:
+            gc.collect()
+            assert previous() is None
+        loaded = source[start:end].copy()
+        previous = weakref.ref(loaded)
+        return loaded
+
+    assert len(list(adapter.process_shot(61, loader))) == 61
+
+
+@pytest.mark.parametrize("frame_count", [64, 10_000])
+def test_retained_overlap_has_compact_storage_and_close_releases_it(frame_count: int) -> None:
+    first_window = _source(32, (14, 14))
+    adapter = VDPPTemporalPostprocessor(model=_FakeModel(), device="cpu")
+    iterator = adapter.process_shot(
+        frame_count,
+        lambda start, end: first_window[: end - start].copy(),
+    )
+
+    next(iterator)
+    retained = adapter._active_retained
+    assert retained is not None
+    assert retained.shape == (1, 4, 14, 14)
+    assert retained.untyped_storage().nbytes() == retained.numel() * retained.element_size()
+
+    iterator.close()
+    assert adapter.retained_frame_count == 0
+
+
 @pytest.mark.parametrize(
     ("bad", "message"),
     [
@@ -149,6 +187,7 @@ def test_execution_plan_comes_from_the_same_fixed_forward_contract() -> None:
     adapter = VDPPTemporalPostprocessor(model=_FakeModel(), device="cpu")
 
     plan = adapter.execution_plan((15, 17))
+    identity = adapter.model_identity()
 
     assert plan["window_size"] == 32
     assert plan["overlap"] == 4
@@ -158,6 +197,7 @@ def test_execution_plan_comes_from_the_same_fixed_forward_contract() -> None:
     assert plan["tail_padding"] is False
     assert plan["padded_input_shape"] == [28, 28]
     assert plan["working_shape"] == [224, 224]
+    assert identity["checkpoint_compatibility"] == "released-zero-shift-head-v1"
 
 
 def test_checkpoint_load_is_strict_and_never_uses_unsafe_pickle(
@@ -170,6 +210,9 @@ def test_checkpoint_load_is_strict_and_never_uses_unsafe_pickle(
 
     class Loadable(_FakeModel):
         def load_state_dict(self, state, *, strict: bool):
+            assert isinstance(self.shift_head, torch.nn.Sequential)
+            assert self.shift_head[0].weight.shape == (1, 1, 1, 1)
+            assert self.shift_head[0].bias.shape == (1,)
             assert state == {"weight": torch.tensor(1)}
             assert strict is True
 

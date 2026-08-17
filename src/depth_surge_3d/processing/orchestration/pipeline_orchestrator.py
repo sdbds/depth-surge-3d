@@ -80,7 +80,9 @@ class ProcessingOrchestrator:
             list(preselected_depth_files) if preselected_depth_files is not None else None
         )
         self.preselected_render_source = preselected_render_source
-        if self.preselected_depth_files is not None and preselected_render_source not in {
+        if (self.preselected_depth_files is None) != (preselected_render_source is None):
+            raise ValueError("preselected files and render source must be supplied together")
+        if preselected_render_source is not None and preselected_render_source not in {
             "base",
             "stabilized",
         }:

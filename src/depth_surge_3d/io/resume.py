@@ -26,12 +26,17 @@ from ..core.depth_contract import (
 )
 from ..core.render_disparity import (
     STABILIZED_DEPTH_ALGORITHM_VERSION,
+    STABILIZED_DEPTH_SCHEMA_VERSION,
     validate_render_disparity_input,
 )
 from ..inference.depth.v2_temporal_contract import (
     VDA_INFERENCE_ALGORITHM,
     build_v2_execution_plan,
     is_compatible_v2_execution_plan,
+)
+from ..inference.depth.vdpp_contract import (
+    build_vdpp_execution_plan,
+    vdpp_model_identity,
 )
 from ..processing.frames.depth_processor import (
     DEPTH_BOUNDS_SCHEMA_VERSION,
@@ -888,7 +893,7 @@ def _validate_canonical_stage(
     return stage, metadata
 
 
-def _validate_stabilized_stage(
+def _validate_stabilized_stage(  # noqa: C901
     output_dir: Path,
     frame_files: list[Path],
     canonical_metadata: dict[str, Any] | None,
@@ -926,6 +931,26 @@ def _validate_stabilized_stage(
             ),
             None,
         )
+    metadata_fingerprint = metadata.get("metadata_fingerprint")
+    unhashed_metadata = {
+        key: value for key, value in metadata.items() if key != "metadata_fingerprint"
+    }
+    if (
+        metadata.get("schema_version") != STABILIZED_DEPTH_SCHEMA_VERSION
+        or metadata.get("algorithm_version") != STABILIZED_DEPTH_ALGORITHM_VERSION
+        or metadata.get("status") not in {"building", "complete"}
+        or not isinstance(metadata_fingerprint, str)
+        or metadata_fingerprint != canonical_json_hash(unhashed_metadata)
+    ):
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "stabilized metadata fingerprint is invalid",
+            ),
+            None,
+        )
     semantic = metadata.get("semantic_identity")
     lineage_matches = (
         isinstance(semantic, dict)
@@ -943,6 +968,47 @@ def _validate_stabilized_stage(
                 paths,
                 "invalidate",
                 "stabilized semantic lineage changed",
+            ),
+            None,
+        )
+    assert isinstance(semantic, dict)
+    if metadata.get("semantic_fingerprint") != canonical_json_hash(semantic):
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "stabilized semantic fingerprint is invalid",
+            ),
+            None,
+        )
+    state = {
+        "status": metadata.get("status"),
+        "completed_shots": metadata.get("completed_shots"),
+    }
+    if metadata.get("state_fingerprint") != canonical_json_hash(state):
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "stabilized state fingerprint is invalid",
+            ),
+            None,
+        )
+    native_shape = _positive_shape(canonical_metadata, "native_shape")
+    identity_matches = (
+        native_shape is not None
+        and semantic.get("model_identity") == vdpp_model_identity()
+        and semantic.get("execution_plan") == build_vdpp_execution_plan(native_shape)
+    )
+    if not identity_matches:
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "stabilized VDPP identity changed",
             ),
             None,
         )

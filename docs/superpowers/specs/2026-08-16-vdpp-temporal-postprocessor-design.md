@@ -101,6 +101,16 @@ The constructor configuration is also fixed: `encoder="vits"`, `features=64`,
 Changing any value requires a new algorithm/model identity even if a checkpoint
 happens to load.
 
+Release verification found one upstream artifact discrepancy: the v1.0
+checkpoint contains zero-valued `shift_head.0.weight` and
+`shift_head.0.bias` tensors, while the pinned public model class does not
+declare or call `shift_head`. The integration registers an inert 1x1
+single-channel compatibility layer before `load_state_dict(strict=True)` so
+the released checkpoint is still loaded exactly. The layer is never used by
+forward inference. This policy is persisted as
+`checkpoint_compatibility="released-zero-shift-head-v1"`; changing or removing
+it invalidates stabilized caches.
+
 Primary references:
 
 - [VDPP v1.0 source](https://github.com/injun-baek/VDPP/tree/73cc2b4dc6b3b5cfb2e37f51e452461e03fe26f5)
@@ -645,7 +655,8 @@ shape is:
         "max_depth": 1.0,
         "pe": "ape"
       },
-      "vendor_port_version": 1
+      "vendor_port_version": 1,
+      "checkpoint_compatibility": "released-zero-shift-head-v1"
     },
     "execution_plan": {
       "batch_size": 1,

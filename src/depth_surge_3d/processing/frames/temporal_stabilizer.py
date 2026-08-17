@@ -19,6 +19,7 @@ from ...inference.depth.vdpp_contract import (
     build_vdpp_execution_plan,
     vdpp_model_identity,
 )
+from .depth_normalizer import decode_canonical_png
 from .temporal_storage import StabilizedDepthStore, build_final_shot_plan
 
 
@@ -222,12 +223,12 @@ class TemporalDepthStabilizer:
                         f"Canonical disparity shape {decoded.shape} does not match "
                         f"{native_shape}: {path}"
                     )
-                output[output_index] = decoded.astype(np.float32) / np.float32(65535.0)
+                output[output_index] = decode_canonical_png(decoded)
             return output
 
         return load_window
 
-    def generate_files(
+    def generate_files(  # noqa: C901
         self,
         base_files: list[Path],
         settings: dict[str, Any],
@@ -268,6 +269,10 @@ class TemporalDepthStabilizer:
             canonical_scene_fingerprint=scene_fingerprint,
         )
         cuts = manifest.get("final_cuts")
+        if not isinstance(cuts, list) or not all(
+            not isinstance(cut, bool) and isinstance(cut, int) for cut in cuts
+        ):
+            raise ValueError("Final scene manifest has invalid cut indexes")
         shot_plan = build_final_shot_plan(len(base_files), cuts)
         semantic_identity = self._semantic_identity(
             frame_names=frame_names,
@@ -319,6 +324,20 @@ class TemporalDepthStabilizer:
         if audit.complete:
             return store.depth_files
 
+        required_ids = set(audit.invalid_shot_ids) | set(audit.pending_shot_ids)
+        if audit.reset_required:
+            required_ids = {shot["shot_id"] for shot in shot_plan}
+        if not required_ids:
+            store.prepare(audit)
+            completed = store.finalize()
+            self._report_progress(
+                progress_tracker,
+                f"Reused {len(completed)} stabilized depth maps",
+                completed=len(completed),
+                total=len(completed),
+            )
+            return completed
+
         checkpoint = self._checkpoint_resolver(
             self.models_dir,
             progress_callback=lambda current, total: self._report_progress(
@@ -342,9 +361,6 @@ class TemporalDepthStabilizer:
             ):
                 raise RuntimeError("VDPP execution arguments do not match the persisted plan")
 
-            required_ids = set(audit.invalid_shot_ids) | set(audit.pending_shot_ids)
-            if audit.reset_required:
-                required_ids = {shot["shot_id"] for shot in shot_plan}
             longest_pending = max(
                 shot["end"] - shot["start"] for shot in shot_plan if shot["shot_id"] in required_ids
             )

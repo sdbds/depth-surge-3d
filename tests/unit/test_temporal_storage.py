@@ -181,3 +181,36 @@ def test_output_validation_rejects_wrong_index_shape_and_nonfinite_values(
         store.commit_shot(0, [(0, np.zeros((2, 5), dtype=np.float32))])
     with pytest.raises(ValueError, match="finite"):
         store.commit_shot(0, [(0, np.full((3, 5), np.nan, dtype=np.float32))])
+
+
+def test_commit_rejects_negative_shot_id(tmp_path: Path) -> None:
+    store = _store(tmp_path / "stable", count=2, cuts=[1])
+    store.prepare(store.audit())
+
+    with pytest.raises(ValueError, match="Unknown stabilized shot"):
+        store.commit_shot(-1, _outputs(1))
+
+
+def test_failed_metadata_publish_does_not_poison_in_memory_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path / "stable", count=1)
+    store.prepare(store.audit())
+    original_write = store._atomic_write_json
+    calls = 0
+
+    def fail_metadata_once(path: Path, payload: dict) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("metadata publish failed")
+        original_write(path, payload)
+
+    monkeypatch.setattr(store, "_atomic_write_json", fail_metadata_once)
+    with pytest.raises(OSError, match="metadata publish failed"):
+        store.commit_shot(0, _outputs(1))
+
+    monkeypatch.setattr(store, "_atomic_write_json", original_write)
+    store.commit_shot(0, _outputs(1))
+    assert len(store.finalize()) == 1

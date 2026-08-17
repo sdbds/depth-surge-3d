@@ -42,6 +42,10 @@ python depth_surge_3d.py input_video.mp4 --raw-storage-dtype float32
 
 # Remove restartable working files only after validated output
 python depth_surge_3d.py input_video.mp4 --no-intermediates
+
+# Stabilize framewise depth with experimental VDPP
+python depth_surge_3d.py input_video.mp4 --depth-model-version v3 \
+  --temporal-postprocessor vdpp
 ```
 
 Run `python depth_surge_3d.py --help` for every option and its current default.
@@ -60,6 +64,7 @@ output/video_timestamp/
 |   `-- depth_bounds.json
 |-- 02_depth_raw/
 |-- 03_disparity_maps/
+|-- 03_disparity_stabilized/  # present only when VDPP is requested
 |-- 04_left_frames/
 |-- 04_right_frames/
 |-- 05_left_distorted/
@@ -112,8 +117,27 @@ python depth_surge_3d.py --resume ./output/old_job/ --migrate-legacy delete
 ```
 
 The resume report lists every preserved, resumed, invalidated, archived, or
-deleted stage. Destructive migration starts only after the configured estimator
-loads and its exact fingerprint has been checked.
+deleted stage. Destructive migration starts only after the writer lock and
+authoritative artifact audit; the estimator is loaded only when that audit says
+base depth must be generated.
+
+An omitted `--temporal-postprocessor` keeps the job's saved mode. Use an
+explicit value only to change it:
+
+```bash
+# Keep the persisted VDPP/off choice
+python depth_surge_3d.py --resume ./output/video_timestamp/
+
+# Explicitly stop selecting the stabilized artifact
+python depth_surge_3d.py --resume ./output/video_timestamp/ \
+  --temporal-postprocessor off
+```
+
+VDPP commits complete final-scene shots. Earlier completed shots survive an
+interruption, but the current incomplete shot restarts from its first frame.
+When a complete stabilized artifact passes all file digests, resume skips CUDA,
+the checkpoint, VDPP import, and the base depth model and proceeds directly to
+stereo/downstream work.
 
 Stereo renderer v3 invalidates v1 left/right metadata and all tracked
 downstream frame stages while preserving valid source, scene, raw-depth, and

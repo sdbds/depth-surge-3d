@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Optional experimental VDPP depth-only temporal stabilization for every depth
+  backend, with fixed shot-aware 32/4 inference, bounded memory, content-addressed
+  artifacts, and shot-atomic resume.
+- Web and CLI controls, lazy integrity-checked checkpoint download, cache-only CPU
+  rendering, and a deterministic quality-gate harness.
+
+### Changed
+- Processing settings schema is now v3. Older jobs migrate to VDPP `off`; current
+  jobs preserve omission separately from an explicit resume override.
+- Source distributions explicitly exclude downloaded model and runtime artifacts.
+
 ## [0.9.2] - 2026-01-19
 
 ### Fixed

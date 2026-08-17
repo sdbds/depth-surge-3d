@@ -439,7 +439,7 @@ class StereoProjector:
         first_error: BaseException | None = None
         estimator_device = str(getattr(self.depth_estimator, "device", self.device))
         cuda_cleanup = estimator_device.startswith("cuda")
-        torch_module = None
+        torch_module: Any = None
         try:
             if cuda_cleanup:
                 import torch
@@ -459,7 +459,9 @@ class StereoProjector:
             if cuda_cleanup:
                 try:
                     if torch_module is None:
-                        import torch as torch_module
+                        import torch
+
+                        torch_module = torch
                     if torch_module.cuda.is_available():
                         torch_module.cuda.empty_cache()
                 except BaseException as exc:

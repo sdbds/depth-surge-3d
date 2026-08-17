@@ -8,7 +8,7 @@ import sys
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
-from typing import BinaryIO, Callable, Iterator
+from typing import Any, BinaryIO, Callable, Iterator, cast
 
 
 VDPP_UPSTREAM_REPOSITORY = "https://github.com/injun-baek/VDPP"
@@ -82,7 +82,7 @@ def _open_url(url: str, *, timeout: float):
     return urllib.request.urlopen(request, timeout=timeout)
 
 
-def ensure_vdpp_checkpoint(
+def ensure_vdpp_checkpoint(  # noqa: C901
     models_dir: Path | str,
     *,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -108,7 +108,10 @@ def ensure_vdpp_checkpoint(
         part_path.unlink(missing_ok=True)
         selected_opener = opener or _open_url
         try:
-            response_context = selected_opener(VDPP_CHECKPOINT_URL, timeout=timeout)
+            response_context = cast(
+                Any,
+                selected_opener(VDPP_CHECKPOINT_URL, timeout=timeout),
+            )
             with response_context as response:
                 headers = getattr(response, "headers", {})
                 content_length = headers.get("Content-Length") if headers is not None else None

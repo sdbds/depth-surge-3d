@@ -157,7 +157,7 @@ def _validate_shot_plan(shot_plan: object, num_frames: int) -> list[dict[str, in
     return normalized
 
 
-def _validate_stabilized_shots(
+def _validate_stabilized_shots(  # noqa: C901
     root: Path,
     metadata: dict[str, Any],
     frame_names: list[str],
