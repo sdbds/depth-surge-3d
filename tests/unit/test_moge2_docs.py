@@ -54,6 +54,22 @@ EXPECTED_VARIANTS = (
     ),
 )
 
+MOGE_COMMIT = "925b8ed835a7a9cdb7578ba15c658a0afc969030"
+MOGE_SOURCE_URL = f"https://github.com/microsoft/MoGe/tree/{MOGE_COMMIT}"
+MOGE_LICENSE_URL = f"https://github.com/microsoft/MoGe/blob/{MOGE_COMMIT}/LICENSE"
+DINOV2_BUNDLED_URL = f"{MOGE_SOURCE_URL}/moge/model/dinov2"
+DINOV2_SOURCE_URL = "https://github.com/facebookresearch/dinov2"
+DINOV2_LICENSE_URL = "https://github.com/facebookresearch/dinov2/blob/main/LICENSE"
+EXPECTED_MOGE_NOTICE_LINKS = (
+    ("Microsoft MoGe at the pinned commit", MOGE_SOURCE_URL),
+    ("MIT License in the pinned source", MOGE_LICENSE_URL),
+)
+EXPECTED_DINOV2_NOTICE_LINKS = (
+    ("DINOv2 directory in pinned MoGe", DINOV2_BUNDLED_URL),
+    ("Meta Platforms DINOv2", DINOV2_SOURCE_URL),
+    ("Apache License 2.0", DINOV2_LICENSE_URL),
+)
+
 
 def _variant_contract_matches(text: str) -> bool:
     """Keep every variant fact bound to its complete Markdown table row."""
@@ -84,18 +100,13 @@ def _markdown_section(text: str, heading: str) -> str:
 
 
 def _notice_contract_matches(text: str) -> bool:
-    """Keep each upstream source and license in its own notice section."""
+    """Bind every upstream link label and target to its notice section."""
     moge = _markdown_section(text, "Microsoft MoGe")
     dinov2 = _markdown_section(text, "DINOv2")
-    return all(
-        (
-            "github.com/microsoft/MoGe" in moge,
-            "MIT License" in moge,
-            "Apache License 2.0" not in moge,
-            "github.com/facebookresearch/dinov2" in dinov2,
-            "Apache License 2.0" in dinov2,
-            "MIT License" not in dinov2,
-        )
+    link_pattern = re.compile(r"\[([^\]\n]+)\]\(([^)\n]+)\)")
+    return (
+        tuple(link_pattern.findall(moge)) == EXPECTED_MOGE_NOTICE_LINKS
+        and tuple(link_pattern.findall(dinov2)) == EXPECTED_DINOV2_NOTICE_LINKS
     )
 
 
@@ -184,6 +195,44 @@ def test_notice_contract_rejects_swapped_license_associations() -> None:
 - License: MIT License
 """
     assert not _notice_contract_matches(swapped)
+
+
+def test_notice_contract_requires_pinned_dinov2_bundled_source_link() -> None:
+    notices = Path("THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    without_bundled_source = notices.replace(
+        f"- Bundled source: [DINOv2 directory in pinned MoGe]({DINOV2_BUNDLED_URL})\n",
+        "",
+    )
+
+    assert without_bundled_source != notices
+    assert not _notice_contract_matches(without_bundled_source)
+
+
+def test_notice_contract_rejects_swapped_license_link_targets() -> None:
+    notices = Path("THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    swapped = notices.replace(MOGE_LICENSE_URL, "NOTICE_LICENSE_PLACEHOLDER")
+    swapped = swapped.replace(DINOV2_LICENSE_URL, MOGE_LICENSE_URL)
+    swapped = swapped.replace("NOTICE_LICENSE_PLACEHOLDER", DINOV2_LICENSE_URL)
+
+    assert not _notice_contract_matches(swapped)
+
+
+def test_notice_contract_rejects_unpinned_moge_source_url() -> None:
+    notices = Path("THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    unpinned = notices.replace(MOGE_SOURCE_URL, "https://github.com/microsoft/MoGe", 1)
+
+    assert unpinned != notices
+    assert not _notice_contract_matches(unpinned)
+
+
+def test_notice_contract_rejects_link_moved_to_wrong_section() -> None:
+    notices = Path("THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    bundled_line = f"- Bundled source: [DINOv2 directory in pinned MoGe]({DINOV2_BUNDLED_URL})\n"
+    moved = notices.replace(bundled_line, "")
+    moved = moved.replace("## DINOv2", f"{bundled_line}\n## DINOv2")
+
+    assert moved != notices
+    assert not _notice_contract_matches(moved)
 
 
 def test_example_settings_use_safe_metric_defaults_without_internal_level() -> None:
