@@ -61,6 +61,21 @@ def _validate_focal(focal: np.float32) -> None:
         raise ValueError("Metric focal_x_normalized must be positive")
 
 
+def metric_source_valid(depth: np.ndarray) -> np.ndarray:
+    """Return elementwise metric validity after a float32 reciprocal probe."""
+
+    if not isinstance(depth, np.ndarray):
+        raise TypeError("Metric depth must be a numpy array")
+    if depth.dtype != np.float32:
+        raise TypeError("Metric depth must use float32")
+    valid = np.isfinite(depth) & (depth > np.float32(0.0))
+    reciprocal = np.zeros(depth.shape, dtype=np.float32)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        np.divide(np.float32(1.0), depth, out=reciprocal, where=valid)
+    valid &= np.isfinite(reciprocal)
+    return valid
+
+
 @dataclass(frozen=True)
 class MetricGeometryFrame:
     """Owned immutable metric inverse depth, validity, and pinhole focal data."""
@@ -103,8 +118,11 @@ class ClipConvergence:
     def __post_init__(self) -> None:
         if not isinstance(self.distance_m, np.float32):
             raise TypeError("Clip convergence distance_m must use float32")
-        if not np.isfinite(self.distance_m) or self.distance_m <= np.float32(0.0):
-            raise ValueError("Clip convergence distance_m must be finite and positive")
+        if not bool(metric_source_valid(np.asarray(self.distance_m)).item()):
+            raise ValueError(
+                "Clip convergence distance_m must be finite and positive with a finite "
+                "float32 reciprocal"
+            )
         if not isinstance(self.selected_frame_indexes, tuple):
             raise TypeError("Clip convergence frame indexes must be a tuple")
         if any(
@@ -157,12 +175,10 @@ def metric_frame_from_depth(
         raise TypeError("Metric depth must use float32")
     if depth.ndim != 2:
         raise ValueError("Metric depth must be 2D")
-    valid = np.isfinite(depth) & (depth > np.float32(0.0))
+    valid = metric_source_valid(depth)
     inverse = np.zeros(depth.shape, dtype=np.float32)
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         np.divide(np.float32(1.0), depth, out=inverse, where=valid)
-    valid &= np.isfinite(inverse)
-    inverse[~valid] = np.float32(0.0)
     return MetricGeometryFrame(inverse, valid, focal_x_normalized)
 
 
@@ -204,17 +220,18 @@ def sample_clip_convergence(
         if len(batch.values) != 1:
             raise ValueError("Clip convergence raw loads must contain one frame")
         depth = batch.values[0]
+        source_valid = metric_source_valid(depth)
         row_indexes = _grid_indexes(depth.shape[0])
         column_indexes = _grid_indexes(depth.shape[1])
         grid = depth[np.ix_(row_indexes, column_indexes)].reshape(-1)
-        valid = np.isfinite(grid) & (grid > np.float32(0.0))
+        valid = source_valid[np.ix_(row_indexes, column_indexes)].reshape(-1)
         if np.any(valid):
             samples.append(grid[valid].astype(np.float32, copy=False))
     if not samples:
         raise ValueError("No valid positive metric depth samples for clip convergence")
     combined = np.concatenate(samples).astype(np.float32, copy=False)
     distance = np.float32(np.median(combined))
-    if not np.isfinite(distance) or distance <= np.float32(0.0):
+    if not bool(metric_source_valid(np.asarray(distance)).item()):
         raise ValueError("No valid positive metric depth median for clip convergence")
     return ClipConvergence(distance, selected_indexes, int(combined.size))
 
@@ -753,12 +770,13 @@ class MetricGeometryStore:
         if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count <= 0:
             raise ValueError("Metric geometry convergence sample count is invalid")
         distance = convergence.get("resolved_auto_distance_m")
-        invalid_distance = (
-            isinstance(distance, bool)
-            or not isinstance(distance, (int, float))
-            or not np.isfinite(distance)
-            or distance <= 0.0
-        )
+        numeric_distance = not isinstance(distance, bool) and isinstance(distance, (int, float))
+        if numeric_distance:
+            with np.errstate(over="ignore", invalid="ignore"):
+                distance_array = np.asarray(distance, dtype=np.float32)
+            invalid_distance = not bool(metric_source_valid(distance_array).item())
+        else:
+            invalid_distance = True
         if invalid_distance:
             raise ValueError("Metric geometry resolved auto distance is invalid")
 

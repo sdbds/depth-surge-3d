@@ -206,6 +206,25 @@ def test_clamped_offsets_do_not_replace_unclamped_inverse_depth_z_order() -> Non
     assert geometry.total_disparity_fraction[0, 0] == geometry.total_disparity_fraction[0, 1]
 
 
+@pytest.mark.parametrize("convergence_distance_m", [0.05, 1001.0])
+def test_metric_projection_accepts_finite_positive_resolved_auto_convergence(
+    convergence_distance_m: float,
+) -> None:
+    geometry, stats = build_metric_geometry(
+        inverse_depth=np.array([[1.0]], dtype=np.float32),
+        valid=np.ones((1, 1), dtype=np.bool_),
+        focal_x_normalized=np.float32(0.8),
+        render_shape=(1, 1),
+        virtual_baseline_mm=63.0,
+        convergence_distance_m=convergence_distance_m,
+        max_disparity_percent=2.0,
+        retained_crop_width=1,
+    )
+
+    assert np.isfinite(geometry.total_disparity_fraction).all()
+    assert stats.valid_pixel_count == 1
+
+
 def _project_one_valid(*, focal: float, baseline_mm: float):
     return build_metric_geometry(
         inverse_depth=np.array([[1.0]], dtype=np.float32),
@@ -285,6 +304,7 @@ def test_metric_projection_stats_reject_boolean_fraction() -> None:
         ({"focal_x_normalized": np.float32(0.0)}, "focal"),
         ({"virtual_baseline_mm": -0.1}, "baseline"),
         ({"convergence_distance_m": float("nan")}, "convergence"),
+        ({"convergence_distance_m": 0.0}, "convergence"),
         ({"max_disparity_percent": -1.0}, "disparity"),
         ({"retained_crop_width": 0}, "crop width"),
         ({"retained_crop_width": 3}, "crop width"),

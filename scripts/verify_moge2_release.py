@@ -406,6 +406,15 @@ def release_variants(
     return observed
 
 
+def _metric_source_valid(depth: np.ndarray) -> np.ndarray:
+    """Load the canonical metric-depth predicate only on an inference path."""
+
+    _ensure_project_import_path()
+    from depth_surge_3d.processing.frames.metric_geometry import metric_source_valid
+
+    return metric_source_valid(depth)
+
+
 def _validate_fixed_depth(result: FixedDepth) -> tuple[np.ndarray, np.ndarray, np.float32]:
     if not isinstance(result, FixedDepth):
         raise TypeError("fixed inference must return FixedDepth")
@@ -418,11 +427,14 @@ def _validate_fixed_depth(result: FixedDepth) -> tuple[np.ndarray, np.ndarray, n
         raise TypeError("fixed valid mask must be Boolean and match depth")
     if not isinstance(focal, np.float32) or not np.isfinite(focal) or focal <= 0:
         raise ValueError("fixed focal must be a positive finite float32 scalar")
-    metric_valid = valid & np.isfinite(depth) & (depth > 0)
+    metric_valid = valid & _metric_source_valid(depth)
     if not np.any(metric_valid):
         raise ValueError("fixed image must contain at least one valid metric-depth pixel")
     if np.any(valid & ~metric_valid):
-        raise ValueError("fixed valid metric-depth pixels must be finite and positive")
+        raise ValueError(
+            "fixed valid metric-depth pixels must be finite and positive with a finite "
+            "float32 reciprocal"
+        )
     sanitized = np.zeros(depth.shape, dtype=np.float32)
     sanitized[valid] = depth[valid]
     return sanitized, np.array(valid, copy=True), focal
@@ -474,8 +486,10 @@ def validate_fixed_image_artifact(path: Path) -> dict[str, Any]:  # noqa: C901
     if not np.isfinite(depth).all() or np.any(depth < 0) or np.any(depth[~valid] != 0):
         raise ValueError("fixed image depth must be finite, nonnegative, and zero where invalid")
     valid_count = int(np.count_nonzero(valid))
-    if valid_count == 0 or np.any(depth[valid] <= 0):
-        raise ValueError("fixed image must contain positive valid metric depth")
+    if valid_count == 0 or np.any(~_metric_source_valid(depth)[valid]):
+        raise ValueError(
+            "fixed image must contain valid metric depth with a finite float32 reciprocal"
+        )
     return {
         "native_shape": [int(depth.shape[0]), int(depth.shape[1])],
         "focal_x_normalized": focal,
@@ -557,8 +571,10 @@ def _validate_raw_clip(raw: RawClip) -> None:
         raise ValueError("raw focal values must be positive finite float32 [N]")
     if len(raw.frame_names) != len(raw.depth) or len(set(raw.frame_names)) != len(raw.frame_names):
         raise ValueError("raw frame names must be unique and match depth frames")
-    if np.any(raw.valid & (~np.isfinite(raw.depth) | (raw.depth <= 0))):
-        raise ValueError("valid raw metric depth must be finite and positive")
+    if np.any(raw.valid & ~_metric_source_valid(raw.depth)):
+        raise ValueError(
+            "valid raw metric depth must be finite and positive with a finite float32 reciprocal"
+        )
 
 
 def _validate_raw_stage(raw: RawClip) -> None:
@@ -687,7 +703,7 @@ def compute_clip_measurements(
     depth_means: list[float] = []
     for frame_depth, frame_valid in zip(raw.depth, raw.valid):
         depth_roi = frame_depth[y0:y1, x0:x1]
-        valid_roi = frame_valid[y0:y1, x0:x1] & np.isfinite(depth_roi) & (depth_roi > 0)
+        valid_roi = frame_valid[y0:y1, x0:x1] & _metric_source_valid(depth_roi)
         samples = depth_roi[valid_roi]
         if samples.size == 0:
             raise ValueError("ROI has no valid metric-depth samples after mapping")
@@ -2262,7 +2278,7 @@ class ProductionVariantSession:
         if batch.camera is None or len(batch.values) != 1:
             raise ValueError("fixed MoGe inference did not return one pinhole camera frame")
         depth = np.asarray(batch.values[0], dtype=np.float32)
-        valid = np.isfinite(depth) & (depth > 0)
+        valid = _metric_source_valid(depth)
         return FixedDepth(
             depth,
             np.asarray(valid, dtype=np.bool_),
@@ -2427,7 +2443,7 @@ class ProductionVariantSession:
         if batch.camera is None:
             raise ValueError("production raw stage is missing pinhole camera values")
         depth = np.asarray(batch.values, dtype=np.float32)
-        valid = np.asarray(np.isfinite(depth) & (depth > 0), dtype=np.bool_)
+        valid = np.asarray(_metric_source_valid(depth), dtype=np.bool_)
         self._states[clip.clip_id] = _ProductionClipState(
             workspace, relative_output, renderer, settings
         )

@@ -161,6 +161,15 @@ def _validate_metric_scalar(
     return result
 
 
+def _validate_finite_positive_metric_scalar(name: str, value: object) -> np.float64:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.number)):
+        raise TypeError(f"{name} must be numeric")
+    result = np.float64(value)
+    if not np.isfinite(result) or result <= np.float64(0.0):
+        raise ValueError(f"{name} must be finite and positive")
+    return result
+
+
 def build_metric_geometry(
     inverse_depth: np.ndarray,
     valid: np.ndarray,
@@ -189,11 +198,8 @@ def build_metric_geometry(
         minimum=0.0,
         maximum=100.0,
     )
-    convergence_m = _validate_metric_scalar(
-        "convergence_distance_m",
-        convergence_distance_m,
-        minimum=0.1,
-        maximum=1000.0,
+    convergence_m = _validate_finite_positive_metric_scalar(
+        "convergence_distance_m", convergence_distance_m
     )
     disparity_percent = _validate_metric_scalar(
         "max_disparity_percent",

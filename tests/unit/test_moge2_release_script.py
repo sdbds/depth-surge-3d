@@ -342,6 +342,27 @@ def test_fixed_image_artifact_exact_npz_contract_and_invalid_rejection(tmp_path:
             FixedDepth(np.ones((2, 2), np.float32), np.ones((2, 2), bool), np.float32(0)),
         )
 
+    smallest_subnormal = np.nextafter(np.float32(0.0), np.float32(1.0), dtype=np.float32)
+    with pytest.raises(ValueError, match="valid metric"):
+        write_fixed_image_artifact(
+            tmp_path / "reciprocal-overflow.npz",
+            FixedDepth(
+                np.array([[smallest_subnormal]], np.float32),
+                np.ones((1, 1), np.bool_),
+                np.float32(1.0),
+            ),
+        )
+    smallest_normal = tmp_path / "smallest-normal.npz"
+    write_fixed_image_artifact(
+        smallest_normal,
+        FixedDepth(
+            np.array([[np.finfo(np.float32).tiny]], np.float32),
+            np.ones((1, 1), np.bool_),
+            np.float32(1.0),
+        ),
+    )
+    assert validate_fixed_image_artifact(smallest_normal)["valid_metric_pixels"] == 1
+
 
 def test_fixed_image_validator_rejects_extra_member_and_object_array(tmp_path: Path) -> None:
     extra = tmp_path / "extra.npz"

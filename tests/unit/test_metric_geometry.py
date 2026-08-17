@@ -30,6 +30,7 @@ from src.depth_surge_3d.processing.frames.metric_geometry import (
     sample_clip_convergence,
     select_convergence_frame_indexes,
 )
+from src.depth_surge_3d.rendering.stereo_geometry import build_metric_geometry
 
 
 FRAME_NAMES = ["frame_000001.png", "frame_000002.png"]
@@ -68,6 +69,22 @@ def _disk_full_failure(kind: str) -> OSError:
     failure = OSError("windows disk full")
     failure.winerror = 112  # type: ignore[attr-defined]
     return failure
+
+
+def _raw_store_for_depths(directory: Path, depths: np.ndarray) -> RawDepthStore:
+    values = np.asarray(depths, dtype=np.float32).reshape(-1, 1, 1)
+    camera = PinholeCameraBatch(np.full(len(values), 0.8, dtype=np.float32))
+    batch = DepthBatch(values, DepthRepresentation.METRIC_DEPTH, camera=camera)
+    names = [f"frame_{index:06d}.png" for index in range(len(values))]
+    store = RawDepthStore.create(
+        directory,
+        frame_names=names,
+        semantic_fingerprint={"camera_model": "pinhole_fx"},
+        requested_dtype="float32",
+        first_batch=batch,
+    )
+    store.write_batch(names, batch)
+    return store
 
 
 @pytest.fixture
@@ -135,6 +152,26 @@ def test_smallest_normal_metric_depth_retains_its_finite_reciprocal() -> None:
     assert frame.valid.tolist() == [[True]]
     assert np.isfinite(frame.inverse_depth).all()
     assert frame.inverse_depth.item() == np.float32(1.0) / depth.item()
+
+
+def test_metric_source_valid_predicate_uses_float32_reciprocal_boundary() -> None:
+    smallest_subnormal = np.nextafter(np.float32(0.0), np.float32(1.0), dtype=np.float32)
+    depth = np.array(
+        [[np.finfo(np.float32).tiny, smallest_subnormal], [0.0, np.inf]],
+        dtype=np.float32,
+    )
+
+    valid = metric_geometry.metric_source_valid(depth)
+
+    assert valid.dtype == np.bool_
+    assert valid.tolist() == [[True, False], [False, False]]
+
+
+def test_clip_convergence_rejects_reciprocal_overflow_distance() -> None:
+    smallest_subnormal = np.nextafter(np.float32(0.0), np.float32(1.0), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="finite float32 reciprocal"):
+        ClipConvergence(smallest_subnormal, (0,), 1)
 
 
 def test_metric_geometry_frame_rejects_nonzero_invalid_scores() -> None:
@@ -216,6 +253,43 @@ def test_no_valid_metric_sample_is_a_hard_error(
             raw_store_with_only_invalid_depth.complete_files,
             candidate_scene_ids=[0],
         )
+
+
+def test_reciprocal_overflow_metric_sample_is_a_hard_error(tmp_path: Path) -> None:
+    smallest_subnormal = np.nextafter(np.float32(0.0), np.float32(1.0), dtype=np.float32)
+    store = _raw_store_for_depths(tmp_path / "overflow-raw", np.array([smallest_subnormal]))
+
+    with pytest.raises(ValueError, match="No valid positive metric depth"):
+        sample_clip_convergence(store, store.complete_files, candidate_scene_ids=[0])
+
+
+@pytest.mark.parametrize(
+    "distance_m",
+    [np.float32(0.05), np.float32(1001.0), np.float32(np.finfo(np.float32).tiny)],
+    ids=["below-explicit-minimum", "above-explicit-maximum", "smallest-normal"],
+)
+def test_source_valid_auto_convergence_flows_from_stage3_into_stage4(
+    tmp_path: Path, distance_m: np.float32
+) -> None:
+    store = _raw_store_for_depths(tmp_path / "auto-raw", np.array([distance_m]))
+
+    convergence = sample_clip_convergence(store, store.complete_files, candidate_scene_ids=[0])
+    frame = metric_frame_from_depth(np.array([[distance_m]], np.float32), np.float32(0.8))
+    geometry, stats = build_metric_geometry(
+        frame.inverse_depth,
+        frame.valid,
+        frame.focal_x_normalized,
+        (1, 1),
+        virtual_baseline_mm=63.0,
+        convergence_distance_m=float(convergence.distance_m),
+        max_disparity_percent=2.0,
+        retained_crop_width=1,
+    )
+
+    assert convergence.distance_m == distance_m
+    assert geometry.source_valid.tolist() == [[True]]
+    assert np.isfinite(geometry.total_disparity_fraction).all()
+    assert stats.valid_pixel_count == 1
 
 
 def test_convergence_rejects_manifest_length_mismatch(raw_metric_store: RawDepthStore) -> None:
