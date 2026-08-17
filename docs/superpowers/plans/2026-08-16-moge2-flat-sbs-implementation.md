@@ -3450,6 +3450,9 @@ git commit -m "test: cover MoGe metric pipeline and previews"
 ### Task 15: Document the Experimental Contract and Third-Party Licenses
 
 **Files:**
+- Modify: `pyproject.toml`
+- Modify: `depth_surge_3d.py`
+- Create: `src/depth_surge_3d/cli.py`
 - Modify: `README.md`
 - Modify: `docs/INSTALLATION.md`
 - Modify: `docs/PARAMETERS.md`
@@ -3460,6 +3463,7 @@ git commit -m "test: cover MoGe metric pipeline and previews"
 - Modify: `CHANGELOG.md`
 - Create: `THIRD_PARTY_NOTICES.md`
 - Create: `tests/unit/test_moge2_docs.py`
+- Modify: CLI tests that currently load the repository-root script directly
 
 **Interfaces:**
 - Consumes: the shipped commands, settings, pins, stage names, warnings, and failure behavior.
@@ -3543,6 +3547,15 @@ uv sync --extra moge2
 List Small `vits` 35M, Base `vitb` 104M default, and Large `vitl` 326M with their exact repository/revision pairs. Explain immutable source/weight resolution, offline-cache behavior, the concrete `model.pt` requirement, CPU float32 versus CUDA float16, and explicit OOM failure without fallback. Retain pip-oriented `requirements-moge2.txt` as a separate manual-install path, not as an alternative uv command.
 
 - [ ] **Step 4: Update parameters, usage, and example settings**
+
+Human-approved correction (2026-08-17): the documented `uv run depth-surge-3d`
+command must be a working installed console entrypoint. Move the canonical CLI
+implementation into importable package module `depth_surge_3d.cli`, point the
+project script at `depth_surge_3d.cli:main`, and retain the repository-root
+`depth_surge_3d.py` only as a thin backward-compatible launcher. Update CLI tests
+to exercise the package module and add a real installed-entrypoint `--help` smoke
+test. Do not replace the shipped command with a repository-only Python-script
+workaround, because the wheel does not contain the root launcher.
 
 Document the six CLI flags from the design, all four geometry settings with exact defaults/bounds, and two complete commands:
 
