@@ -1008,14 +1008,18 @@ def _input_report(corpus: CorpusConfig) -> dict[str, Any]:
     }
 
 
-def _expected_evidence_paths() -> set[Path]:
-    expected: set[Path] = set()
+def _expected_evidence_path_sequence() -> tuple[Path, ...]:
+    expected: list[Path] = []
     for model_size, _repository, _revision in RELEASE_VARIANT_PINS:
-        expected.add(Path(model_size) / "fixed-image-depth.npz")
+        expected.append(Path(model_size) / "fixed-image-depth.npz")
         for clip_id in CANONICAL_CLIP_IDS:
-            expected.add(Path(model_size) / f"{clip_id}-relative.mp4")
-            expected.add(Path(model_size) / f"{clip_id}-metric-camera.mp4")
-    return expected
+            expected.append(Path(model_size) / f"{clip_id}-relative.mp4")
+            expected.append(Path(model_size) / f"{clip_id}-metric-camera.mp4")
+    return tuple(expected)
+
+
+def _expected_evidence_paths() -> set[Path]:
+    return set(_expected_evidence_path_sequence())
 
 
 def _validated_media_properties(
@@ -1101,15 +1105,76 @@ def _prepare_output_record(
     return record
 
 
-def _verify_committed_record(output_dir: Path, record: Mapping[str, Any]) -> None:
-    destination = output_dir / str(record["path"])
-    _validate_evidence_target(output_dir, destination)
-    if (
-        _is_link_or_reparse(destination)
-        or not destination.is_file()
-        or _hash_file(destination) != record["sha256"]
+def _require_recorded_media_matches(
+    record: Mapping[str, Any], current: Mapping[str, int | float]
+) -> None:
+    recorded = record.get("media")
+    if not isinstance(recorded, dict) or set(recorded) != set(current):
+        raise ValueError(f"recorded media properties are incomplete: {record['path']}")
+    if any(
+        (
+            current[key] != recorded[key]
+            if key in {"width", "height", "frame_count"}
+            else abs(float(current[key]) - float(recorded[key])) > MEDIA_FPS_ABSOLUTE_TOLERANCE
+        )
+        for key in current
     ):
-        raise ValueError(f"post-promotion hash mismatch: {record['path']}")
+        raise ValueError(f"recorded media properties changed: {record['path']}")
+
+
+def _remove_unaccepted_target(destination: Path, primary_error: Exception) -> None:
+    try:
+        if os.path.lexists(destination):
+            destination.unlink()
+    except Exception as cleanup_error:
+        raise RuntimeError(
+            f"failed to remove rejected promoted artifact {destination}: {cleanup_error}"
+        ) from primary_error
+    if os.path.lexists(destination):
+        raise RuntimeError(
+            f"rejected promoted artifact still exists after removal: {destination}"
+        ) from primary_error
+
+
+def _verify_committed_record(
+    output_dir: Path,
+    record: Mapping[str, Any],
+    *,
+    media_probe: Callable[[Path], dict[str, Any]] | None = None,
+    expected_shape: tuple[int, int] | None = None,
+    expected_frame_count: int | None = None,
+    expected_fps: float | None = None,
+) -> None:
+    destination = output_dir / str(record["path"])
+    try:
+        _validate_evidence_target(output_dir, destination)
+        if (
+            _is_link_or_reparse(destination)
+            or not destination.is_file()
+            or _hash_file(destination) != record["sha256"]
+        ):
+            raise ValueError(f"post-promotion hash mismatch: {record['path']}")
+        if record.get("kind") == "fixed_image":
+            validate_fixed_image_artifact(destination)
+        else:
+            if (
+                media_probe is None
+                or expected_shape is None
+                or expected_frame_count is None
+                or expected_fps is None
+            ):
+                raise ValueError("video post-promotion validation expectations are missing")
+            current = _validated_media_properties(
+                destination,
+                expected_shape=expected_shape,
+                expected_frame_count=expected_frame_count,
+                expected_fps=expected_fps,
+                probe=media_probe,
+            )
+            _require_recorded_media_matches(record, current)
+    except Exception as error:
+        _remove_unaccepted_target(destination, error)
+        raise
 
 
 def _variant_output_records(report: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1184,10 +1249,11 @@ def _validate_complete_evidence(  # noqa: C901
         raise ValueError("complete evidence is missing the canonical clip order")
     records = _committed_artifacts(report)
     variant_records = _variant_output_records(report)
-    expected = _expected_evidence_paths()
-    observed = {Path(record["path"]) for record in records}
-    if len(records) != 21 or observed != expected:
-        raise ValueError("complete evidence ledger must contain exactly all 21 media/NPZ outputs")
+    expected_sequence = _expected_evidence_path_sequence()
+    observed_sequence = tuple(Path(str(record.get("path", ""))) for record in records)
+    if observed_sequence != expected_sequence:
+        raise ValueError("complete evidence ledger must contain all 21 outputs in canonical order")
+    expected = set(expected_sequence)
     ledger_by_path = {record["path"]: record for record in records}
     if (
         len(variant_records) != 21
@@ -1254,19 +1320,7 @@ def _validate_complete_evidence(  # noqa: C901
                     expected_fps=clip["input_fps"],
                     probe=media_probe,
                 )
-                recorded = record.get("media")
-                if not isinstance(recorded, dict) or set(recorded) != set(current):
-                    raise ValueError(f"recorded media properties are incomplete: {record['path']}")
-                if any(
-                    (
-                        current[key] != recorded[key]
-                        if key in {"width", "height", "frame_count"}
-                        else abs(float(current[key]) - float(recorded[key]))
-                        > MEDIA_FPS_ABSOLUTE_TOLERANCE
-                    )
-                    for key in current
-                ):
-                    raise ValueError(f"recorded media properties changed: {record['path']}")
+                _require_recorded_media_matches(record, current)
     if report.get("failures") != []:
         raise ValueError("complete evidence cannot contain failures")
     _validate_complete_tree(output_dir)
@@ -1537,6 +1591,166 @@ class ReleaseRunner:
             clips.append(replace(clip, path=snapshot_path))
         return replace(corpus, fixed_image=fixed, clips=tuple(clips))
 
+    def _run_clip(  # noqa: C901
+        self,
+        *,
+        report: dict[str, Any],
+        variant_report: dict[str, Any],
+        session: ReleaseSession,
+        clip: ClipInput,
+        model_size: str,
+        output_dir: Path,
+        private_root: Path,
+        device: str,
+        depth_resolution: int,
+        set_stage: Callable[[str], None],
+    ) -> None:
+        clip_report: dict[str, Any] = {
+            "id": clip.clip_id,
+            "input_sha256": clip.sha256,
+            "input_fps": clip.fps,
+            "input_frame_count": clip.frame_count,
+        }
+        variant_report["clips"].append(clip_report)
+        raw: RawClip | None = None
+        rendered: ClipRender | None = None
+        renders: dict[str, ClipRender] = {}
+        measurements: dict[str, Any] | None = None
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=f"moge2-release-{model_size}-{clip.clip_id}-",
+                dir=private_root,
+            ) as temporary_directory:
+                workspace = Path(temporary_directory)
+                set_stage("clip_inference")
+
+                def infer_current_clip() -> RawClip:
+                    return session.infer_clip(clip, depth_resolution, workspace)
+
+                raw, measured_seconds, inference_peak = self._measure(device, infer_current_clip)
+                assert raw is not None
+                variant_report["peak_vram_bytes"] = max(
+                    variant_report["peak_vram_bytes"], inference_peak
+                )
+                _validate_raw_clip(raw)
+                _validate_raw_stage(raw)
+                inference_seconds = (
+                    measured_seconds
+                    if raw.inference_seconds is None
+                    else _require_finite_number(
+                        raw.inference_seconds,
+                        "session inference seconds",
+                        minimum=0.0,
+                    )
+                )
+                raw_hash = _hash_tree(raw.directory)
+                clip_report.update(
+                    {
+                        "adapter_inference_call_count": raw.inference_calls,
+                        "inferred_frame_count": raw.inferred_frame_count,
+                        "inference_peak_vram_bytes": inference_peak,
+                        "raw_stage_sha256": raw_hash,
+                    }
+                )
+                for mode, suffix in (
+                    ("relative", "relative"),
+                    ("metric_camera", "metric-camera"),
+                ):
+                    set_stage(f"render_{mode}")
+                    destination = output_dir / model_size / f"{clip.clip_id}-{suffix}.mp4"
+                    temporary = self.dependencies.publisher.temporary_path(
+                        destination, root=output_dir
+                    )
+                    try:
+                        rendered = session.render_clip(
+                            clip,
+                            raw,
+                            mode,
+                            temporary,
+                            dict(PROJECTION_SETTINGS),
+                        )
+                        if Path(rendered.output_path).resolve() != temporary.resolve():
+                            raise ValueError(
+                                "session rendered output does not match requested sibling temporary"
+                            )
+                        _validate_output_shape(rendered)
+                        output_shape = cast(tuple[int, int], rendered.output_shape)
+                        set_stage(f"validate_{mode}_media")
+                        media = _validated_media_properties(
+                            temporary,
+                            expected_shape=output_shape,
+                            expected_frame_count=clip.frame_count,
+                            expected_fps=clip.fps,
+                            probe=self.dependencies.media_probe,
+                        )
+                        if _hash_tree(raw.directory) != raw_hash:
+                            raise ValueError("raw stage changed while reusing it across modes")
+                        record = _prepare_output_record(
+                            output_dir,
+                            destination,
+                            temporary,
+                            kind="video",
+                            variant=model_size,
+                            clip=clip.clip_id,
+                            mode=mode,
+                            media=media,
+                        )
+                        set_stage(f"promote_{mode}_media")
+                        self.dependencies.publisher.commit_temporary(
+                            temporary, destination, root=output_dir
+                        )
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    set_stage(f"accept_{mode}_media")
+                    _verify_committed_record(
+                        output_dir,
+                        record,
+                        media_probe=self.dependencies.media_probe,
+                        expected_shape=output_shape,
+                        expected_frame_count=clip.frame_count,
+                        expected_fps=clip.fps,
+                    )
+                    renders[mode] = rendered
+                    output_field = "relative_output" if mode == "relative" else "metric_output"
+                    clip_report[output_field] = record
+                    report["committed_artifacts"].append(record)
+                    hook_mode = "relative" if mode == "relative" else "metric"
+                    set_stage(f"after_{hook_mode}_promotion")
+                    self.dependencies.stage_hook(
+                        f"after_{hook_mode}_promotion:{model_size}:{clip.clip_id}"
+                    )
+                    set_stage(f"refresh_{hook_mode}_report")
+                    self._write_reports(report, output_dir)
+                    self.dependencies.stage_hook(
+                        f"after_{hook_mode}_report_refresh:{model_size}:{clip.clip_id}"
+                    )
+                set_stage("measure_clip")
+                if renders["relative"].output_shape != renders["metric_camera"].output_shape:
+                    raise ValueError(
+                        "relative and metric modes must use identical final output shapes"
+                    )
+                measurements = compute_clip_measurements(
+                    raw,
+                    renders["relative"],
+                    renders["metric_camera"],
+                    source_shape=(clip.height, clip.width),
+                    source_roi_xywh=clip.static_roi_xywh,
+                    inference_seconds=inference_seconds,
+                )
+                clip_report.update(
+                    {
+                        "output_shape": list(
+                            cast(tuple[int, int], renders["relative"].output_shape)
+                        ),
+                        **measurements,
+                    }
+                )
+        finally:
+            raw = None
+            rendered = None
+            renders.clear()
+            measurements = None
+
     def run(  # noqa: C901
         self,
         corpus: CorpusConfig,
@@ -1576,6 +1790,11 @@ class ReleaseRunner:
         current_clip: str | None = None
         current_stage = "preflight"
         session: ReleaseSession | None = None
+
+        def set_stage(stage: str) -> None:
+            nonlocal current_stage
+            current_stage = stage
+
         try:
             self._reject_stale_outputs(output_dir)
             current_stage = "git_probe"
@@ -1667,6 +1886,7 @@ class ReleaseRunner:
                         )
                     finally:
                         fixed_temporary.unlink(missing_ok=True)
+                    current_stage = "accept_fixed_image"
                     _verify_committed_record(output_dir, fixed_record)
                     variant_report.update(
                         {
@@ -1685,149 +1905,18 @@ class ReleaseRunner:
 
                     for clip in authenticated.clips:
                         current_clip = clip.clip_id
-                        clip_report: dict[str, Any] = {
-                            "id": clip.clip_id,
-                            "input_sha256": clip.sha256,
-                            "input_fps": clip.fps,
-                            "input_frame_count": clip.frame_count,
-                        }
-                        variant_report["clips"].append(clip_report)
-                        with tempfile.TemporaryDirectory(
-                            prefix=f"moge2-release-{model_size}-{clip.clip_id}-",
-                            dir=private_root,
-                        ) as temporary_directory:
-                            workspace = Path(temporary_directory)
-                            current_stage = "clip_inference"
-                            active_session = cast(ReleaseSession, session)
-
-                            def infer_current_clip() -> RawClip:
-                                return active_session.infer_clip(clip, depth_resolution, workspace)
-
-                            raw, measured_seconds, inference_peak = self._measure(
-                                device, infer_current_clip
-                            )
-                            variant_report["peak_vram_bytes"] = max(
-                                variant_report["peak_vram_bytes"], inference_peak
-                            )
-                            _validate_raw_clip(raw)
-                            _validate_raw_stage(raw)
-                            inference_seconds = (
-                                measured_seconds
-                                if raw.inference_seconds is None
-                                else _require_finite_number(
-                                    raw.inference_seconds,
-                                    "session inference seconds",
-                                    minimum=0.0,
-                                )
-                            )
-                            raw_hash = _hash_tree(raw.directory)
-                            clip_report.update(
-                                {
-                                    "adapter_inference_call_count": raw.inference_calls,
-                                    "inferred_frame_count": raw.inferred_frame_count,
-                                    "inference_peak_vram_bytes": inference_peak,
-                                    "raw_stage_sha256": raw_hash,
-                                }
-                            )
-                            renders: dict[str, ClipRender] = {}
-                            for mode, suffix in (
-                                ("relative", "relative"),
-                                ("metric_camera", "metric-camera"),
-                            ):
-                                current_stage = f"render_{mode}"
-                                destination = (
-                                    output_dir / model_size / f"{clip.clip_id}-{suffix}.mp4"
-                                )
-                                temporary = self.dependencies.publisher.temporary_path(
-                                    destination, root=output_dir
-                                )
-                                try:
-                                    rendered = active_session.render_clip(
-                                        clip,
-                                        raw,
-                                        mode,
-                                        temporary,
-                                        dict(PROJECTION_SETTINGS),
-                                    )
-                                    if Path(rendered.output_path).resolve() != temporary.resolve():
-                                        raise ValueError(
-                                            "session rendered output does not match requested sibling temporary"
-                                        )
-                                    _validate_output_shape(rendered)
-                                    output_shape = cast(tuple[int, int], rendered.output_shape)
-                                    current_stage = f"validate_{mode}_media"
-                                    media = _validated_media_properties(
-                                        temporary,
-                                        expected_shape=output_shape,
-                                        expected_frame_count=clip.frame_count,
-                                        expected_fps=clip.fps,
-                                        probe=self.dependencies.media_probe,
-                                    )
-                                    if _hash_tree(raw.directory) != raw_hash:
-                                        raise ValueError(
-                                            "raw stage changed while reusing it across modes"
-                                        )
-                                    record = _prepare_output_record(
-                                        output_dir,
-                                        destination,
-                                        temporary,
-                                        kind="video",
-                                        variant=model_size,
-                                        clip=clip.clip_id,
-                                        mode=mode,
-                                        media=media,
-                                    )
-                                    current_stage = f"promote_{mode}_media"
-                                    self.dependencies.publisher.commit_temporary(
-                                        temporary, destination, root=output_dir
-                                    )
-                                finally:
-                                    temporary.unlink(missing_ok=True)
-                                _verify_committed_record(output_dir, record)
-                                renders[mode] = rendered
-                                output_field = (
-                                    "relative_output" if mode == "relative" else "metric_output"
-                                )
-                                clip_report[output_field] = record
-                                report["committed_artifacts"].append(record)
-                                hook_mode = "relative" if mode == "relative" else "metric"
-                                current_stage = f"after_{hook_mode}_promotion"
-                                self.dependencies.stage_hook(
-                                    f"after_{hook_mode}_promotion:{model_size}:{clip.clip_id}"
-                                )
-                                current_stage = f"refresh_{hook_mode}_report"
-                                self._write_reports(report, output_dir)
-                                self.dependencies.stage_hook(
-                                    f"after_{hook_mode}_report_refresh:"
-                                    f"{model_size}:{clip.clip_id}"
-                                )
-                            current_stage = "measure_clip"
-                            if (
-                                renders["relative"].output_shape
-                                != renders["metric_camera"].output_shape
-                            ):
-                                raise ValueError(
-                                    "relative and metric modes must use identical final output shapes"
-                                )
-                            measurements = compute_clip_measurements(
-                                raw,
-                                renders["relative"],
-                                renders["metric_camera"],
-                                source_shape=(clip.height, clip.width),
-                                source_roi_xywh=clip.static_roi_xywh,
-                                inference_seconds=inference_seconds,
-                            )
-                            clip_report.update(
-                                {
-                                    "output_shape": list(
-                                        cast(
-                                            tuple[int, int],
-                                            renders["relative"].output_shape,
-                                        )
-                                    ),
-                                    **measurements,
-                                }
-                            )
+                        self._run_clip(
+                            report=report,
+                            variant_report=variant_report,
+                            session=cast(ReleaseSession, session),
+                            clip=clip,
+                            model_size=model_size,
+                            output_dir=output_dir,
+                            private_root=private_root,
+                            device=device,
+                            depth_resolution=depth_resolution,
+                            set_stage=set_stage,
+                        )
                     current_stage = "unload_model"
                     session.unload()
                     session = None

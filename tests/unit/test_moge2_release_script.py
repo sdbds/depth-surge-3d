@@ -31,6 +31,7 @@ from scripts.verify_moge2_release import (
     ReleaseRunner,
     _ProductionClipState,
     _RecordingStereoRenderer,
+    _validate_complete_evidence,
     compute_clip_measurements,
     create_argument_parser,
     load_corpus_config,
@@ -540,7 +541,6 @@ class FakeSession:
         self.root = root
         self.events = events
         self.fail = fail
-        self.raw_by_clip: dict[str, RawClip] = {}
 
     def load(self) -> None:
         self.events.append(f"{self.model_size}.load")
@@ -595,7 +595,6 @@ class FakeSession:
             2,
             2,
         )
-        self.raw_by_clip[clip.clip_id] = raw
         return raw
 
     def render_clip(
@@ -1756,11 +1755,15 @@ def test_complete_revalidation_reprobes_every_media_property(
     message: str,
 ) -> None:
     config_path, _payload = _write_inputs(tmp_path)
+    final_probes = 0
 
     def changes_after_publication(path: Path) -> dict[str, Any]:
+        nonlocal final_probes
         properties = _output_media_probe(path)
-        if path.name == "indoor-near-relative.mp4":
-            properties[field] = changed
+        if path.parent.name == "vits" and path.name == "indoor-near-relative.mp4":
+            final_probes += 1
+            if final_probes > 1:
+                properties[field] = changed
         return properties
 
     runner, _events = _runner(tmp_path, media_probe=changes_after_publication)
@@ -1772,3 +1775,158 @@ def test_complete_revalidation_reprobes_every_media_property(
     assert caught.value.report["status"] == "incomplete"
     assert caught.value.report["failures"][0]["stage"] == "complete_revalidation"
     assert json.loads((output / "report.json").read_text())["status"] == "incomplete"
+
+
+def test_clip_arrays_are_collectible_before_next_clip_and_variant(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    runner, events = _runner(tmp_path)
+    pending_refs: list[weakref.ReferenceType[np.ndarray]] = []
+    checkpoints: list[str] = []
+
+    def assert_previous_clip_released(checkpoint: str) -> None:
+        gc.collect()
+        assert all(reference() is None for reference in pending_refs), checkpoint
+        pending_refs.clear()
+        checkpoints.append(checkpoint)
+
+    class LifetimeSession(FakeSession):
+        def load(self) -> None:
+            if self.model_size != "vits":
+                assert_previous_clip_released(f"before-load:{self.model_size}")
+            super().load()
+
+        def infer_clip(self, clip, resolution: int, workspace: Path) -> RawClip:
+            if pending_refs:
+                assert_previous_clip_released(f"before-infer:{self.model_size}:{clip.clip_id}")
+            raw = super().infer_clip(clip, resolution, workspace)
+            pending_refs.extend(
+                weakref.ref(array) for array in (raw.depth, raw.valid, raw.focal_x_normalized)
+            )
+            return raw
+
+        def render_clip(
+            self,
+            clip,
+            raw: RawClip,
+            mode: str,
+            output_path: Path,
+            settings: dict[str, Any],
+        ) -> ClipRender:
+            rendered = super().render_clip(clip, raw, mode, output_path, settings)
+            pending_refs.append(weakref.ref(rendered.hole_mask))
+            if rendered.total_disparity_pixels is not None:
+                pending_refs.append(weakref.ref(rendered.total_disparity_pixels))
+            if rendered.disparity_valid_mask is not None:
+                pending_refs.append(weakref.ref(rendered.disparity_valid_mask))
+            return rendered
+
+    runner.dependencies = replace(
+        runner.dependencies,
+        session_factory=lambda model_size, _repository, _revision, _device: LifetimeSession(
+            model_size, tmp_path, events, None
+        ),
+    )
+
+    report = runner.run(_load(config_path), tmp_path / "evidence", "cpu", 1080)
+
+    assert report["status"] == "complete"
+    assert "before-infer:vits:outdoor-far" in checkpoints
+    assert "before-load:vitb" in checkpoints
+    assert "before-load:vitl" in checkpoints
+    assert_previous_clip_released("after-run")
+
+
+def _disk_and_ledger_artifact_paths(output: Path) -> tuple[set[str], set[str]]:
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    ledger = {record["path"] for record in report["committed_artifacts"]}
+    disk = {
+        path.relative_to(output).as_posix()
+        for path in output.rglob("*")
+        if path.is_file() and path.suffix in {".npz", ".mp4"}
+    }
+    return disk, ledger
+
+
+def test_corrupt_fixed_target_is_removed_before_it_can_escape_the_ledger(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+
+    def corrupt_after_replace(source: Path, target: Path) -> None:
+        os.replace(source, target)
+        if Path(target).as_posix().endswith("vits/fixed-image-depth.npz"):
+            Path(target).write_bytes(b"corrupt-after-promotion")
+
+    runner, _events = _runner(tmp_path, replace_fn=corrupt_after_replace)
+    output = tmp_path / "evidence"
+
+    with pytest.raises(ReleaseRunFailed, match="post-promotion hash mismatch"):
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert _disk_and_ledger_artifact_paths(output) == (set(), set())
+
+
+def test_corrupt_video_target_is_removed_while_earlier_artifacts_remain(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+
+    def corrupt_after_replace(source: Path, target: Path) -> None:
+        os.replace(source, target)
+        if Path(target).as_posix().endswith("vits/indoor-near-relative.mp4"):
+            Path(target).write_bytes(b"corrupt-after-promotion")
+
+    runner, _events = _runner(tmp_path, replace_fn=corrupt_after_replace)
+    output = tmp_path / "evidence"
+
+    with pytest.raises(ReleaseRunFailed, match="post-promotion hash mismatch"):
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    expected = {"vits/fixed-image-depth.npz"}
+    assert _disk_and_ledger_artifact_paths(output) == (expected, expected)
+
+
+def test_final_video_probe_failure_removes_unaccepted_target(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+
+    def fail_only_final_target(path: Path) -> dict[str, Any]:
+        properties = _output_media_probe(path)
+        if path.name == "indoor-near-relative.mp4":
+            properties["width"] = 11
+        return properties
+
+    runner, _events = _runner(tmp_path, media_probe=fail_only_final_target)
+    output = tmp_path / "evidence"
+
+    with pytest.raises(ReleaseRunFailed, match="packed output"):
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    expected = {"vits/fixed-image-depth.npz"}
+    assert _disk_and_ledger_artifact_paths(output) == (expected, expected)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["reversed", "swapped", "duplicate", "missing", "extra"],
+)
+def test_complete_validation_rejects_every_noncanonical_ledger_sequence(
+    tmp_path: Path, mutation: str
+) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    runner, _events = _runner(tmp_path)
+    output = tmp_path / "evidence"
+    report = runner.run(_load(config_path), output, "cpu", 1080)
+    changed = copy.deepcopy(report)
+    ledger = changed["committed_artifacts"]
+
+    if mutation == "reversed":
+        ledger.reverse()
+    elif mutation == "swapped":
+        ledger[0], ledger[1] = ledger[1], ledger[0]
+    elif mutation == "duplicate":
+        ledger[-1] = copy.deepcopy(ledger[0])
+    elif mutation == "missing":
+        ledger.pop()
+    else:
+        extra = copy.deepcopy(ledger[-1])
+        extra["path"] = "vitl/unrecorded-extra.mp4"
+        ledger.append(extra)
+
+    with pytest.raises(ValueError, match="canonical order"):
+        _validate_complete_evidence(changed, output, _output_media_probe)
