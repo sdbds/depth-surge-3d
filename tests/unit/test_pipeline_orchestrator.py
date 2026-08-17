@@ -254,6 +254,79 @@ class TestFinalizeProcessing:
 
         cleanup.assert_called_once_with(Path("/output"))
 
+    @patch(
+        "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.cleanup_intermediate_files"
+    )
+    @patch(
+        "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.update_processing_status"
+    )
+    def test_failed_job_retains_all_committed_checkpoints(self, update_status, cleanup, tmp_path):
+        committed = {}
+        for name in (
+            "00_original_frames",
+            "02_depth_raw",
+            "03_disparity_maps",
+            "03_metric_geometry",
+        ):
+            directory = tmp_path / name
+            directory.mkdir()
+            payload = directory / "committed.bin"
+            payload.write_bytes(name.encode("ascii"))
+            committed[payload] = payload.read_bytes()
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator._settings_file = tmp_path / "job-settings.json"
+
+        orchestrator._finalize_processing(
+            False,
+            tmp_path,
+            str(tmp_path / "source.mp4"),
+            {"keep_intermediates": False},
+            2,
+        )
+
+        cleanup.assert_not_called()
+        assert {path: path.read_bytes() for path in committed} == committed
+        update_status.assert_called_once_with(
+            orchestrator._settings_file,
+            "failed",
+            {"error": "Video creation failed"},
+        )
+
+    @patch("src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.completion_banner")
+    @patch(
+        "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.update_processing_status"
+    )
+    def test_metric_clamp_summary_is_persisted_in_completed_runtime_info(
+        self, update_status, _banner, tmp_path
+    ):
+        summary = {
+            "affected_frame_count": 2,
+            "mean_clamped_fraction": 0.125,
+            "max_clamped_fraction": 0.25,
+        }
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator._settings_file = tmp_path / "job-settings.json"
+        orchestrator._metric_clamp_summary = summary
+
+        with patch(
+            "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time",
+            return_value=1.0,
+        ):
+            orchestrator._finalize_processing(
+                True,
+                tmp_path,
+                str(tmp_path / "source.mp4"),
+                {
+                    "vr_format": "side_by_side",
+                    "vr_resolution": "custom",
+                    "keep_intermediates": True,
+                },
+                2,
+            )
+
+        additional_info = update_status.call_args.args[2]
+        assert additional_info["metric_clamp_summary"] == summary
+
 
 class TestExecutePipeline:
     def test_releases_depth_model_before_starting_step_3(self, tmp_path):
@@ -400,6 +473,77 @@ class TestExecutePipeline:
         )
         assert "VR frames" not in capsys.readouterr().out
 
+    def test_metric_stereo_prints_exactly_one_clamp_summary_line(self, tmp_path, capsys):
+        (
+            orchestrator,
+            directories,
+            settings,
+            frame,
+            depth,
+            left,
+            right,
+            vr_assembler,
+            _video_encoder,
+        ) = self._direct_encoding_dependencies(tmp_path)
+        settings["stereo_geometry_mode"] = "metric_camera"
+        summary = {
+            "affected_frame_count": 2,
+            "mean_clamped_fraction": 0.125,
+            "max_clamped_fraction": 0.25,
+        }
+        orchestrator.stereo_generator.last_metric_clamp_summary = summary
+        vr_assembler.resolve_vr_source_files.return_value = ([left], [right])
+
+        with patch.object(orchestrator, "_finalize_processing"):
+            assert orchestrator._execute_remaining_steps(
+                directories,
+                settings,
+                [frame],
+                [depth],
+                24.0,
+                "source.mp4",
+                directories["base"],
+            )
+
+        expected = (
+            "Metric disparity clamp summary: affected_frames=2, " "mean=12.5000%, max=25.0000%"
+        )
+        assert capsys.readouterr().out.count(expected) == 1
+        assert orchestrator._metric_clamp_summary == summary
+
+    def test_relative_stereo_does_not_report_stale_metric_clamp_summary(self, tmp_path, capsys):
+        (
+            orchestrator,
+            directories,
+            settings,
+            frame,
+            depth,
+            left,
+            right,
+            vr_assembler,
+            _video_encoder,
+        ) = self._direct_encoding_dependencies(tmp_path)
+        orchestrator.stereo_generator.last_metric_clamp_summary = {
+            "affected_frame_count": 1,
+            "mean_clamped_fraction": 1.0,
+            "max_clamped_fraction": 1.0,
+        }
+        vr_assembler.resolve_vr_source_files.return_value = ([left], [right])
+
+        with patch.object(orchestrator, "_finalize_processing"):
+            assert orchestrator._execute_remaining_steps(
+                directories,
+                settings,
+                [frame],
+                [depth],
+                24.0,
+                "source.mp4",
+                directories["base"],
+            )
+
+        assert "Metric disparity clamp summary:" not in capsys.readouterr().out
+        assert orchestrator._metric_clamp_summary is None
+
     def test_direct_encoding_stops_when_stereo_sources_are_invalid(self, tmp_path):
         """Direct source validation failure never starts either video encoder path."""
         (
@@ -507,12 +651,21 @@ class TestExecutePipeline:
         assert result is False
         distortion_processor.apply_distortion.assert_not_called()
 
-    def test_pipeline_uses_disk_backed_depth_and_stereo_apis(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("geometry_mode", "stage_key", "suffix", "saved_label"),
+        [
+            ("relative", "disparity_maps", ".png", "Canonical disparity maps"),
+            ("metric_camera", "metric_geometry", ".npz", "Metric geometry frames"),
+        ],
+    )
+    def test_pipeline_uses_disk_backed_depth_and_stereo_apis(
+        self, tmp_path, geometry_mode, stage_key, suffix, saved_label
+    ):
         """The video path never builds whole-video frame or depth arrays."""
         frame_files = [tmp_path / "frame_000001.png"]
-        depth_files = [tmp_path / "depth_000001.png"]
+        geometry_files = [tmp_path / f"depth_000001{suffix}"]
         depth_processor = Mock()
-        depth_processor.generate_depth_map_files.return_value = depth_files
+        depth_processor.generate_depth_map_files.return_value = geometry_files
         depth_processor.generate_depth_maps.side_effect = AssertionError("array depth API used")
         stereo_generator = Mock()
         stereo_generator.create_stereo_pairs_from_files.return_value = True
@@ -528,6 +681,7 @@ class TestExecutePipeline:
             "base": tmp_path,
             "frames": tmp_path / "frames",
             "disparity_maps": tmp_path / "disparity",
+            "metric_geometry": tmp_path / "metric_geometry",
             "left_frames": tmp_path / "left",
             "right_frames": tmp_path / "right",
             "left_cropped": tmp_path / "left_cropped",
@@ -544,6 +698,7 @@ class TestExecutePipeline:
             "vr_output_height": 8,
             "vr_resolution": "custom",
             "keep_intermediates": True,
+            "stereo_geometry_mode": geometry_mode,
         }
         orchestrator = ProcessingOrchestrator(
             depth_processor,
@@ -570,7 +725,7 @@ class TestExecutePipeline:
         depth_processor.generate_depth_map_files.assert_called_once()
         stereo_generator.create_stereo_pairs_from_files.assert_called_once()
         video_encoder.create_video_from_stereo_sequences.assert_not_called()
-        saved_to.assert_any_call(directories["disparity_maps"], "Canonical disparity maps")
+        saved_to.assert_any_call(directories[stage_key], saved_label)
 
 
 class TestHandleStepError:

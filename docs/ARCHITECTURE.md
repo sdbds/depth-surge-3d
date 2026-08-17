@@ -11,7 +11,9 @@ source video
   -> 01_scene_data (candidate cuts, final segments, samples, bounds)
   -> 02_depth_raw (native model output and representation metadata)
   -> global barrier: all raw inference complete
-  -> 03_disparity_maps (canonical relative disparity)
+  -> selected Stage 3:
+       03_disparity_maps (canonical relative disparity), or
+       03_metric_geometry (metric inverse depth, validity, focal data)
   -> 04_left_frames + 04_right_frames (forward-splat DIBR)
   -> optional projection, crop, and upscale stages
   -> 99_vr_frames
@@ -36,12 +38,47 @@ explicit `DepthRepresentation`:
 Non-finite values are invalid. Non-positive values are invalid only for metric
 physical distance. Estimators never perform per-frame min/max normalization.
 
+The backend registry is the single owner of backend variants, capabilities,
+factories, availability, and report identity. A `DepthBatch` may also carry a
+typed `PinholeCameraBatch`; MoGe-2 supplies one normalized horizontal focal
+value per frame. Existing raw schema v2 depth-only data remains readable. New
+raw schema v3 writes exact depth payload membership plus camera-model metadata;
+`pinhole_fx` frames atomically store depth and a scalar float32 focal value.
+
 Raw output is stored at model-native resolution. The first inference chunk
 selects `float16` or `float32` storage for the whole raw directory and records
 the choice. A preflight estimate checks disk space before long inference.
 Remote DA3 and See-Through repositories are resolved to one immutable Hub
 snapshot before loading; that resolved artifact identity is part of the raw
 fingerprint.
+
+## Relative And Metric Geometry
+
+Relative mode remains the default and derives `03_disparity_maps`. Experimental
+metric-camera mode derives `03_metric_geometry`. These are independent Stage-3
+directories: only the selected missing stage is generated, and a valid inactive
+stage is preserved. The metric store holds native-resolution inverse depth,
+source validity, and normalized horizontal focal data.
+
+Both paths produce a common `StereoGeometryFrame` containing near-score,
+total-disparity fraction, and source-validity arrays. The common stereo
+renderer therefore does not branch on depth-model identity. Metric projection
+uses the virtual capture-camera baseline, focal estimate, depth, and one
+convergence distance. `virtual_baseline_mm` is not viewer IPD.
+
+The metric formula is evaluated in pre-crop source coordinates, transformed by
+the exact retained center-crop width, and clamped as total left-to-right
+disparity in retained final-output coordinates. It is then converted back to
+renderer coordinates. The common center crop and axis-aligned resize run later,
+so changing final output width does not alter the capped projection fraction.
+Unclamped inverse depth remains the z-order key.
+
+Every metric geometry build resolves and persists one deterministic
+clip-global automatic convergence value from valid positive metric samples,
+even when the active render requests an explicit distance. This finalized
+metadata is a barrier: metric stereo and live preview do not start before it
+exists. Baseline, explicit-versus-auto convergence, disparity cap, and render
+width are stereo settings rather than metric-stage identity.
 
 ## Scene Canonicalization
 
@@ -122,6 +159,26 @@ costs are reported explicitly.
 The legacy in-memory depth API rejects projected outputs over 512 MiB. The main
 video pipeline remains file-backed.
 
+Metric-camera disk preflight covers both missing raw payloads and the complete
+metric store. The native output estimate is checked before inference and the
+preflight is repeated after the first stored batch if its measured shape or
+selected dtype differs. The metric-stage bound does not assume compression:
+
+```text
+A              = max(4096, filesystem allocation unit)
+payload_bound  = sum(5 * height * width)
+metadata_bound = max(16 MiB, A * frame_count)
+atomic_overlap = ceil(1.25 * largest_frame_payload) + A
+required_bytes = ceil(1.25 * payload_bound) + metadata_bound + atomic_overlap
+```
+
+The five bytes per pixel are float32 inverse depth plus Boolean validity. A
+64-KiB allocation unit is used when the filesystem value cannot be queried.
+Preflight cannot reserve capacity against other writers. Post-preflight
+`ENOSPC` removes only the current temporary write, keeps prior committed frames
+and writing metadata resumable, withholds completion metadata, and reports the
+preflight bound, current free bytes, and failing path.
+
 ## Resume And Migration
 
 Resume decisions are deterministic and reported before mutation. The selected
@@ -138,6 +195,18 @@ A depth or stereo schema change does not by itself invalidate valid
 downstream stage. Canonical changes invalidate canonical disparity and
 downstream stages. Render-setting changes invalidate stereo output and
 downstream stages.
+
+Relative and metric Stage-3 fingerprints are independent. A mode switch
+selects the matching stage, preserves a compatible inactive stage, and
+invalidates stereo and downstream output without interpreting one geometry
+format as the other. Metric stereo fingerprints also include crop width, SAR,
+baseline, requested/effective convergence, and disparity cap.
+
+For `keep_intermediates=false`, raw frame NPZ files are removed only at the
+validated selected-Stage-3 barrier. A later render or encode failure keeps that
+completed Stage 3 for resume. Full successful-finalization cleanup removes all
+intermediate payloads, including payloads from both Stage-3 directories;
+cleanup does not run after a failed job.
 
 The 16-sample renderer changes the stereo algorithm identity from v1 to v3.
 Resuming v1 metadata preserves source, scene, raw-depth, and canonical stages,
@@ -161,10 +230,15 @@ rollback.
 - `app.py`: Flask and Socket.IO Web UI.
 - `processing/frames/depth_processor.py`: scene, raw-depth, canonical, and cache
   orchestration.
+- `inference/depth/backend_registry.py`: backend variants, capabilities,
+  construction, availability, and report identity.
+- `processing/frames/metric_geometry.py`: restartable metric Stage 3, disk
+  bound, and clip-global convergence.
 - `processing/frames/depth_normalizer.py`: representation conversion and pure
   scene canonicalization.
 - `processing/frames/stereo_generator.py`: bounded stereo I/O pipeline.
 - `rendering/forward_splat.py`: packed 16-lane z-buffer for one row band.
 - `rendering/stereo_renderer.py`: host geometry, fine-grid fill, downsampling,
   and bounded eye rendering.
+- `rendering/stereo_geometry.py`: common relative and metric renderer input.
 - `io/resume.py`: stage validation, reports, and legacy migration.

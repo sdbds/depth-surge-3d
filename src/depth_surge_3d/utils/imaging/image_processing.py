@@ -16,6 +16,19 @@ from PIL import Image
 from ...core.constants import MIN_DEPTH_VALUE, MAX_DEPTH_VALUE
 
 
+CENTER_CROP_ALGORITHM_VERSION = "integer-center-crop-v1"
+
+
+def calculate_center_crop_dimensions(
+    width: int, height: int, crop_factor: float
+) -> tuple[int, int]:
+    if width < 1 or height < 1:
+        raise ValueError("Image dimensions must be positive")
+    if crop_factor >= 1.0:
+        return width, height
+    return max(1, int(width * crop_factor)), max(1, int(height * crop_factor))
+
+
 def resize_image(
     image: np.ndarray,
     target_width: int,
@@ -67,14 +80,10 @@ def apply_center_crop(image: np.ndarray, crop_factor: float) -> np.ndarray:
     Returns:
         Cropped image array
     """
-    if crop_factor >= 1.0:
-        return image
-
     height, width = image.shape[:2]
-
-    # Calculate crop dimensions
-    crop_width = int(width * crop_factor)
-    crop_height = int(height * crop_factor)
+    crop_width, crop_height = calculate_center_crop_dimensions(width, height, crop_factor)
+    if (crop_width, crop_height) == (width, height):
+        return image
 
     # Calculate crop coordinates
     x_start = (width - crop_width) // 2

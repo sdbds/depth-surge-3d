@@ -271,6 +271,11 @@ class VideoDepthEstimator:
         self.model = None
         self.model_config: dict[str, object] | None = None
 
+    @property
+    def inference_precision(self) -> str:
+        """Report the dtype used by the fp32=False inference path."""
+        return "float16" if self.device == "cuda" else "float32"
+
     def _determine_device(self, device: str) -> str:
         """Determine the best device to use for inference."""
         if device == "auto":

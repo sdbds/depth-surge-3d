@@ -9,7 +9,36 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...core.constants import VR_RESOLUTIONS
+from ...core.constants import (
+    MEGAPIXELS_1080P,
+    MEGAPIXELS_4K,
+    MEGAPIXELS_720P,
+    RESOLUTION_1080P,
+    RESOLUTION_4K,
+    RESOLUTION_720P,
+    RESOLUTION_SD,
+    VR_RESOLUTIONS,
+)
+
+
+def resolve_depth_input_size(width: int, height: int, value: int | str) -> int:
+    """Resolve the numeric depth-input cap without probing or mutating state."""
+    if width < 1 or height < 1:
+        raise ValueError("Source dimensions must be positive")
+    if value != "auto":
+        resolved = int(value)
+        if resolved < 1:
+            raise ValueError("Depth resolution must be positive")
+        return resolved
+    megapixels = width * height / 1_000_000
+    longest = max(width, height)
+    if megapixels > MEGAPIXELS_4K:
+        return min(longest, RESOLUTION_4K)
+    if megapixels > MEGAPIXELS_1080P:
+        return min(longest, RESOLUTION_1080P)
+    if megapixels > MEGAPIXELS_720P:
+        return min(longest, RESOLUTION_720P)
+    return min(longest, RESOLUTION_SD)
 
 
 def parse_custom_resolution(resolution_string: str) -> tuple[int, int] | None:

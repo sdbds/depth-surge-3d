@@ -9,6 +9,9 @@ from .depth import (
     create_video_depth_estimator,
     create_video_depth_estimator_da3,
     SeeThroughDepthEstimator,
+    EstimatorRequest,
+    create_registered_depth_estimator,
+    get_backend_spec,
     create_see_through_depth_estimator,
 )
 
@@ -22,6 +25,9 @@ __all__ = [
     "create_video_depth_estimator_da3",
     "SeeThroughDepthEstimator",
     "create_see_through_depth_estimator",
+    "EstimatorRequest",
+    "create_registered_depth_estimator",
+    "get_backend_spec",
     # Upscaling
     "create_upscaler",
 ]

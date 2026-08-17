@@ -6,6 +6,8 @@ Basic tests to verify the modular architecture is working correctly.
 
 import unittest
 
+import pytest
+
 from src.depth_surge_3d.utils.domain.resolution import (
     parse_custom_resolution,
     get_resolution_dimensions,
@@ -13,7 +15,38 @@ from src.depth_surge_3d.utils.domain.resolution import (
     calculate_aspect_ratio,
     classify_aspect_ratio,
     auto_detect_resolution,
+    resolve_depth_input_size,
 )
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "expected"),
+    [
+        (640, 360, 640),
+        (1280, 720, 640),
+        (1920, 1080, 1080),
+        (3840, 2160, 2160),
+        (7680, 4320, 2160),
+    ],
+)
+def test_shared_auto_depth_size_preserves_existing_thresholds(
+    width: int, height: int, expected: int
+) -> None:
+    assert resolve_depth_input_size(width, height, "auto") == expected
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "value", "message"),
+    [
+        (0, 360, "auto", "Source dimensions must be positive"),
+        (640, 360, 0, "Depth resolution must be positive"),
+    ],
+)
+def test_shared_depth_size_rejects_nonpositive_inputs(
+    width: int, height: int, value: int | str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        resolve_depth_input_size(width, height, value)
 
 
 class TestResolutionUtils(unittest.TestCase):

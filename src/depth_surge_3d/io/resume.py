@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-
 from ..core.settings import (
     PROCESSING_SETTINGS_SCHEMA_VERSION,
     REMOVED_SETTING_NAMES,
@@ -34,12 +33,13 @@ from ..processing.frames.depth_processor import (
 )
 from ..processing.frames.depth_resolution import resolve_depth_input_size
 from ..processing.frames.depth_storage import (
-    RAW_DEPTH_SCHEMA_VERSION,
+    RAW_DEPTH_READABLE_SCHEMA_VERSIONS,
     RawDepthFingerprintError,
     RawDepthStore,
     depth_preprocessing_algorithm,
     select_depth_model_settings,
 )
+from ..processing.frames.metric_geometry import MetricGeometryStore
 from ..processing.frames.scene_analyzer import (
     SCENE_ALGORITHM_VERSION,
     SCENE_SCHEMA_VERSION,
@@ -51,8 +51,14 @@ from ..processing.frames.source_frame_manifest import (
 from ..processing.frames.stage_manifest import FRAME_STAGE_SCHEMA_VERSION
 from ..utils.imaging.png_header import png_header_matches, read_png_header
 from ..processing.frames.stereo_generator import (
+    METRIC_PROJECTION_ALGORITHM_VERSION,
     STEREO_STAGE_ALGORITHM_VERSION,
     STEREO_STAGE_SCHEMA_VERSION,
+)
+from .operations import get_video_properties, parse_sample_aspect_ratio
+from ..utils.imaging.image_processing import (
+    CENTER_CROP_ALGORITHM_VERSION,
+    calculate_center_crop_dimensions,
 )
 from ..utils.path_utils import calculate_frame_range
 
@@ -66,10 +72,21 @@ _DISTORTION_SETTING_KEYS = (
     "fisheye_projection",
     "fisheye_fov",
 )
-_CROP_SETTING_KEYS = ("crop_factor", "fisheye_crop_factor")
+_CROP_SETTING_KEYS = (
+    "crop_factor",
+    "fisheye_crop_factor",
+    "per_eye_width",
+    "per_eye_height",
+)
 _UPSCALE_SETTING_KEYS = ("upscale_model",)
-_VR_SETTING_KEYS = ("vr_format", "vr_resolution", "target_fps")
-_DEPTH_MODEL_VERSIONS = frozenset({"v2", "v3", "see_through"})
+_VR_SETTING_KEYS = (
+    "vr_format",
+    "vr_resolution",
+    "target_fps",
+    "vr_output_width",
+    "vr_output_height",
+)
+_DEPTH_MODEL_VERSIONS = frozenset({"v2", "v3", "see_through", "moge2"})
 _SEE_THROUGH_MARKERS = ("see_through", "seethrough")
 
 
@@ -283,14 +300,71 @@ def _source_video_mismatch_reason(
     saved_source = metadata.get("source_video") if isinstance(metadata, dict) else None
     source_value = source_video if source_video is not None else saved_source
     if not isinstance(source_value, (str, Path)):
-        return "source video path is missing"
+        return None if source_video is None else "source video path is missing"
     source_path = Path(source_value)
     if not source_path.is_file():
-        return "source video path is missing"
+        return None if source_video is None else "source video path is missing"
     saved_fingerprint = _current_source_fingerprint(metadata)
     if saved_fingerprint is not None and file_sample_fingerprint(source_path) != saved_fingerprint:
         return "source video fingerprint mismatch"
     return None
+
+
+def _canonical_sar_fields(properties: dict[str, Any]) -> tuple[int, int] | None:
+    numerator_present = "sample_aspect_ratio_numerator" in properties
+    denominator_present = "sample_aspect_ratio_denominator" in properties
+    if not numerator_present and not denominator_present:
+        return None
+    if not numerator_present or not denominator_present:
+        raise ValueError("Saved sample aspect ratio fields are incomplete")
+    numerator_value = properties["sample_aspect_ratio_numerator"]
+    denominator_value = properties["sample_aspect_ratio_denominator"]
+    if isinstance(numerator_value, bool) or isinstance(denominator_value, bool):
+        raise ValueError("Saved sample aspect ratio fields are invalid")
+    try:
+        numerator, denominator = parse_sample_aspect_ratio(f"{numerator_value}:{denominator_value}")
+    except ValueError as error:
+        raise ValueError("Saved sample aspect ratio fields are invalid") from error
+    if numerator_value != numerator or denominator_value != denominator:
+        raise ValueError("Saved sample aspect ratio fields are not canonical")
+    return numerator, denominator
+
+
+def _resume_properties_with_sar(
+    settings_data: dict[str, Any] | None,
+    source_video: Path | str | None,
+    geometry_mode: str,
+) -> dict[str, Any] | None:
+    if settings_data is None:
+        return None
+    properties = settings_data.get("video_properties")
+    if not isinstance(properties, dict):
+        properties = {}
+    normalized = _canonical_sar_fields(properties)
+    if normalized is not None or geometry_mode != "metric_camera":
+        return settings_data
+
+    metadata = settings_data.get("metadata")
+    saved_source = metadata.get("source_video") if isinstance(metadata, dict) else None
+    source_value = source_video if source_video is not None else saved_source
+    if not isinstance(source_value, (str, Path)) or not Path(source_value).is_file():
+        raise ValueError(
+            "Cannot re-probe sample aspect ratio because the original source video is missing"
+        )
+    probed = get_video_properties(str(source_value))
+    try:
+        probed_sar = _canonical_sar_fields(probed)
+    except ValueError as error:
+        raise ValueError("Could not re-probe a valid sample aspect ratio") from error
+    if probed_sar is None:
+        raise ValueError("Could not re-probe sample aspect ratio from the original source video")
+
+    merged_properties = dict(properties)
+    merged_properties["sample_aspect_ratio_numerator"] = probed_sar[0]
+    merged_properties["sample_aspect_ratio_denominator"] = probed_sar[1]
+    merged = dict(settings_data)
+    merged["video_properties"] = merged_properties
+    return merged
 
 
 def _expected_frame_shape(settings_data: dict[str, Any] | None) -> tuple[int, int] | None:
@@ -490,11 +564,13 @@ def _bind_final_scene_to_raw_depth(
     manifest: dict[str, Any] | None,
     bounds: dict[str, Any] | None,
     raw: ResumeStage,
-    raw_metadata: dict[str, Any] | None,
+    raw_identity_metadata: dict[str, Any] | None,
 ) -> tuple[ResumeStage, dict[str, Any] | None]:
     if scene.disposition != "preserve" or manifest is None or bounds is None:
         return scene, bounds
-    raw_fingerprint = raw_metadata.get("fingerprint") if raw_metadata is not None else None
+    raw_fingerprint = (
+        raw_identity_metadata.get("fingerprint") if raw_identity_metadata is not None else None
+    )
     if (
         raw.disposition not in {"preserve", "resume"}
         or not isinstance(raw_fingerprint, str)
@@ -696,6 +772,8 @@ def _raw_semantic_mismatch_reason(
 def _raw_storage_mismatch_reason(
     metadata: dict[str, Any], current_settings: dict[str, Any]
 ) -> str | None:
+    if metadata.get("schema_version") == 2 and metadata.get("storage_status") != "ready":
+        return "schema-v2 raw-depth storage transaction status is invalid"
     requested_dtype = current_settings.get("raw_storage_dtype", "auto")
     persisted_request = metadata.get("requested_dtype")
     promotes = metadata.get("selected_dtype") == "float16" and requested_dtype == "float32"
@@ -710,9 +788,12 @@ def _raw_storage_mismatch_reason(
 
 
 def _raw_promotion_pending(metadata: dict[str, Any], current_settings: dict[str, Any]) -> bool:
-    return metadata.get("storage_status") == "promoting" or (
-        metadata.get("selected_dtype") == "float16"
-        and current_settings.get("raw_storage_dtype", "auto") == "float32"
+    return metadata.get("schema_version") == 3 and (
+        metadata.get("storage_status") == "promoting"
+        or (
+            metadata.get("selected_dtype") == "float16"
+            and current_settings.get("raw_storage_dtype", "auto") == "float32"
+        )
     )
 
 
@@ -723,12 +804,32 @@ def _raw_mismatch_reason(
     source_fingerprint: str,
     current_model_fingerprint: dict[str, Any] | None,
 ) -> str | None:
-    if metadata.get("schema_version") != RAW_DEPTH_SCHEMA_VERSION:
+    schema_version = metadata.get("schema_version")
+    if schema_version not in RAW_DEPTH_READABLE_SCHEMA_VERSIONS:
         return "raw-depth schema mismatch"
     if metadata.get("frame_names") != [path.name for path in frame_files]:
         return "raw-depth frame manifest mismatch"
+    semantic = metadata.get("semantic_fingerprint")
+    semantic_camera_model = (
+        semantic.get("camera_model", "none") if isinstance(semantic, dict) else None
+    )
+    camera_model: object
+    if schema_version == 2:
+        if semantic_camera_model != "none":
+            return "schema-v2 raw depth must use camera_model none"
+        camera_model = "none"
+    else:
+        camera_model = metadata.get("camera_model")
+        if camera_model not in {"none", "pinhole_fx"}:
+            return "raw-depth camera_model is invalid"
+        if semantic_camera_model != camera_model:
+            return "raw-depth camera_model fingerprint mismatch"
+    if current_settings.get("depth_model_version") == "moge2" and (
+        schema_version != 3 or camera_model != "pinhole_fx"
+    ):
+        return "moge2 raw depth requires schema 3 camera_model pinhole_fx"
     semantic_reason = _raw_semantic_mismatch_reason(
-        metadata.get("semantic_fingerprint"),
+        semantic,
         current_settings,
         source_fingerprint,
         frame_files,
@@ -746,16 +847,18 @@ def _validate_raw_stage(
     source_fingerprint: str | None,
     upstream_reusable: bool,
     current_model_fingerprint: dict[str, Any] | None,
-) -> tuple[ResumeStage, dict[str, Any] | None]:
+) -> tuple[ResumeStage, dict[str, Any] | None, int]:
     raw_dir = output_dir / "02_depth_raw"
     paths = (raw_dir,)
     if not _has_payload(raw_dir):
-        return _stage("depth_raw", paths, "missing", "raw depth is absent"), None
+        return _stage("depth_raw", paths, "missing", "raw depth is absent"), None, 0
     if not upstream_reusable or source_fingerprint is None:
-        return _stage("depth_raw", paths, "invalidate", "scene or frame stage is invalid"), None
+        stage = _stage("depth_raw", paths, "invalidate", "scene or frame stage is invalid")
+        return stage, None, 0
     metadata = _read_json(raw_dir / "metadata.json")
     if metadata is None:
-        return _stage("depth_raw", paths, "invalidate", "raw-depth metadata is missing"), None
+        stage = _stage("depth_raw", paths, "invalidate", "raw-depth metadata is missing")
+        return stage, None, 0
     reason = _raw_mismatch_reason(
         metadata,
         current_settings,
@@ -764,20 +867,22 @@ def _validate_raw_stage(
         current_model_fingerprint,
     )
     if reason is not None:
-        return _stage("depth_raw", paths, "invalidate", reason), None
+        return _stage("depth_raw", paths, "invalidate", reason), None, 0
     try:
-        completed_count = RawDepthStore(raw_dir, metadata).validate_payloads()
+        completed_count = RawDepthStore(raw_dir, metadata).validate_payloads(
+            cleanup_temporaries=False
+        )
     except RawDepthFingerprintError as error:
         reason = f"raw-depth payload validation failed: {error}"
-        return _stage("depth_raw", paths, "invalidate", reason), None
+        return _stage("depth_raw", paths, "invalidate", reason), metadata, 0
     if _raw_promotion_pending(metadata, current_settings):
         reason = "raw-depth float16-to-float32 promotion will resume"
-        return _stage("depth_raw", paths, "resume", reason), None
+        return _stage("depth_raw", paths, "resume", reason), None, completed_count
     disposition: Disposition = "resume"
     if completed_count == len(frame_files):
         disposition = "preserve"
     reason = "raw-depth metadata and partial frame names are reusable"
-    return _stage("depth_raw", paths, disposition, reason), metadata
+    return _stage("depth_raw", paths, disposition, reason), metadata, completed_count
 
 
 def _canonical_mismatch_reason(
@@ -884,6 +989,77 @@ def _validate_canonical_stage(
     return stage, metadata
 
 
+def _candidate_scene_fingerprint(manifest: dict[str, Any]) -> str:
+    return canonical_json_hash(
+        {
+            "schema_version": manifest["schema_version"],
+            "algorithm_version": manifest["algorithm_version"],
+            "frame_names": manifest["frame_names"],
+            "scene_ids": manifest["scene_ids"],
+        }
+    )
+
+
+def _metric_raw_identity_reason(
+    metadata: dict[str, Any],
+    raw_identity_metadata: dict[str, Any] | None,
+) -> tuple[str | None, str | None]:
+    if not isinstance(raw_identity_metadata, dict):
+        return None, "current raw depth identity is incompatible or unavailable"
+    raw_fingerprint = raw_identity_metadata.get("fingerprint")
+    if not isinstance(raw_fingerprint, str) or not raw_fingerprint:
+        return None, "metric geometry source raw fingerprint is missing"
+    if metadata.get("native_shape") != raw_identity_metadata.get("native_shape"):
+        return None, "metric geometry native shape does not match raw depth"
+    if metadata.get("source_raw_fingerprint") != raw_identity_metadata.get("fingerprint"):
+        return None, "metric geometry source raw fingerprint mismatch"
+    return raw_fingerprint, None
+
+
+def _validate_metric_geometry_stage(
+    output_dir: Path,
+    frame_files: list[Path],
+    manifest: dict[str, Any] | None,
+    source_frame_fingerprint: str | None,
+    raw_identity_metadata: dict[str, Any] | None,
+    *,
+    frames_reusable: bool,
+) -> tuple[ResumeStage, dict[str, Any] | None]:
+    metric_dir = output_dir / "03_metric_geometry"
+    paths = (metric_dir,)
+    if not _has_payload(metric_dir):
+        return _stage("metric_geometry", paths, "missing", "metric geometry is absent"), None
+    if not frames_reusable or source_frame_fingerprint is None or manifest is None:
+        reason = "source frames or candidate scene metadata is invalid"
+        return _stage("metric_geometry", paths, "invalidate", reason), None
+
+    metadata = MetricGeometryStore.read_metadata(metric_dir)
+    if metadata is None:
+        reason = "metric geometry metadata is missing or malformed"
+        return _stage("metric_geometry", paths, "invalidate", reason), None
+    raw_fingerprint, raw_reason = _metric_raw_identity_reason(metadata, raw_identity_metadata)
+    if raw_fingerprint is None:
+        assert raw_reason is not None
+        return _stage("metric_geometry", paths, "invalidate", raw_reason), None
+
+    try:
+        store = MetricGeometryStore.open_existing(
+            metric_dir,
+            frame_names=[path.name for path in frame_files],
+            source_raw_fingerprint=raw_fingerprint,
+            source_frame_fingerprint=source_frame_fingerprint,
+            candidate_scene_fingerprint=_candidate_scene_fingerprint(manifest),
+            cleanup_temporaries=False,
+        )
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        reason = f"metric geometry validation failed: {error}"
+        return _stage("metric_geometry", paths, "invalidate", reason), None
+    return (
+        _stage("metric_geometry", paths, "preserve", "metric geometry metadata and files match"),
+        store.metadata,
+    )
+
+
 def _settings_changed(
     saved: dict[str, Any],
     current: dict[str, Any],
@@ -925,25 +1101,77 @@ def _validate_generated_stage(
 
 def _stereo_metadata_matches(
     metadata: dict[str, Any],
-    canonical_metadata: dict[str, Any],
+    geometry_metadata: dict[str, Any],
     frame_files: list[Path],
     current_settings: dict[str, Any],
+    video_properties: dict[str, Any],
+    geometry_mode: str,
 ) -> bool:
     fingerprint = metadata.get("fingerprint")
     unhashed = {key: value for key, value in metadata.items() if key != "fingerprint"}
-    expected_render_settings = {
-        "stereo_strength": current_settings.get("stereo_strength"),
-        "convergence": current_settings.get("convergence"),
-        "occlusion_fill": current_settings.get("occlusion_fill"),
-    }
-    checks = (
+    metadata_mode = metadata.get("geometry_mode")
+    if metadata_mode is None and "source_canonical_fingerprint" in metadata:
+        metadata_mode = "relative"
+    common_checks = (
         metadata.get("schema_version") == STEREO_STAGE_SCHEMA_VERSION,
         metadata.get("algorithm_version") == STEREO_STAGE_ALGORITHM_VERSION,
-        metadata.get("source_canonical_fingerprint") == canonical_metadata.get("fingerprint"),
+        metadata_mode == geometry_mode,
         metadata.get("frame_names") == [path.name for path in frame_files],
-        metadata.get("render_settings") == expected_render_settings,
         metadata.get("encoding") == "uint8_png",
         isinstance(fingerprint, str) and fingerprint == canonical_json_hash(unhashed),
+    )
+    if not all(common_checks):
+        return False
+
+    occlusion_fill = current_settings.get("occlusion_fill")
+    if geometry_mode == "relative":
+        if metadata.get("occlusion_fill", occlusion_fill) != occlusion_fill:
+            return False
+        expected_render_settings = {
+            "stereo_strength": current_settings.get("stereo_strength"),
+            "convergence": current_settings.get("convergence"),
+            "occlusion_fill": occlusion_fill,
+        }
+        return (
+            metadata.get("source_canonical_fingerprint") == geometry_metadata.get("fingerprint")
+            and metadata.get("render_settings") == expected_render_settings
+        )
+    if metadata.get("occlusion_fill") != occlusion_fill:
+        return False
+
+    render_shape = _positive_shape(metadata, "render_shape")
+    if render_shape is None:
+        return False
+    retained_width, _ = calculate_center_crop_dimensions(
+        render_shape[1],
+        render_shape[0],
+        float(current_settings.get("crop_factor", 1.0)),
+    )
+    requested_convergence = current_settings.get("metric_convergence_distance", "auto")
+    convergence = geometry_metadata.get("convergence")
+    if requested_convergence == "auto":
+        if not isinstance(convergence, dict):
+            return False
+        effective_convergence = convergence.get("resolved_auto_distance_m")
+    else:
+        effective_convergence = float(requested_convergence)
+    sar = _canonical_sar_fields(video_properties)
+    if sar is None:
+        return False
+    checks = (
+        metadata.get("source_metric_fingerprint") == geometry_metadata.get("fingerprint"),
+        metadata.get("projection_algorithm_version") == METRIC_PROJECTION_ALGORITHM_VERSION,
+        metadata.get("source_width") == render_shape[1],
+        metadata.get("retained_crop_width") == retained_width,
+        metadata.get("center_crop_algorithm_version") == CENTER_CROP_ALGORITHM_VERSION,
+        metadata.get("sample_aspect_ratio") == f"{sar[0]}:{sar[1]}",
+        metadata.get("virtual_baseline_mm")
+        == float(current_settings.get("virtual_baseline_mm", 63.0)),
+        metadata.get("requested_convergence_distance")
+        == ("auto" if requested_convergence == "auto" else float(requested_convergence)),
+        metadata.get("effective_convergence_distance_m") == effective_convergence,
+        metadata.get("max_disparity_percent")
+        == float(current_settings.get("max_disparity_percent", 2.0)),
     )
     return all(checks)
 
@@ -971,16 +1199,18 @@ def _validate_stereo_stage(
     output_dir: Path,
     frame_files: list[Path],
     current_settings: dict[str, Any],
-    canonical_metadata: dict[str, Any] | None,
+    geometry_metadata: dict[str, Any] | None,
+    video_properties: dict[str, Any],
+    geometry_mode: str,
     *,
     current_settings_schema: bool,
-    canonical_reusable: bool,
+    geometry_reusable: bool,
 ) -> ResumeStage:
     paths = (output_dir / "04_left_frames", output_dir / "04_right_frames")
     if not any(_has_payload(path) for path in paths):
         return _stage("stereo", paths, "missing", "stereo output is absent")
-    if not canonical_reusable or canonical_metadata is None:
-        return _stage("stereo", paths, "invalidate", "canonical disparity is invalid")
+    if not geometry_reusable or geometry_metadata is None:
+        return _stage("stereo", paths, "invalidate", "selected geometry stage is invalid")
     if not current_settings_schema:
         return _stage("stereo", paths, "invalidate", "legacy renderer schema")
 
@@ -989,9 +1219,11 @@ def _validate_stereo_stage(
         return _stage("stereo", paths, "invalidate", "stereo metadata is missing")
     if not _stereo_metadata_matches(
         metadata,
-        canonical_metadata,
+        geometry_metadata,
         frame_files,
         current_settings,
+        video_properties,
+        geometry_mode,
     ):
         return _stage("stereo", paths, "invalidate", "stereo stage fingerprint mismatch")
     render_shape = _positive_shape(metadata, "render_shape")
@@ -1008,18 +1240,22 @@ def _build_generated_stages(
     frame_files: list[Path],
     saved_settings: dict[str, Any],
     current_settings: dict[str, Any],
-    canonical_metadata: dict[str, Any] | None,
+    geometry_metadata: dict[str, Any] | None,
+    video_properties: dict[str, Any],
+    geometry_mode: str,
     *,
     current_settings_schema: bool,
-    canonical_reusable: bool,
+    geometry_reusable: bool,
 ) -> list[ResumeStage]:
     stereo = _validate_stereo_stage(
         output_dir,
         frame_files,
         current_settings,
-        canonical_metadata,
+        geometry_metadata,
+        video_properties,
+        geometry_mode,
         current_settings_schema=current_settings_schema,
-        canonical_reusable=canonical_reusable,
+        geometry_reusable=geometry_reusable,
     )
     distortion = _validate_generated_stage(
         "distortion",
@@ -1072,15 +1308,21 @@ def build_resume_report(
     settings_data = (
         _read_json(selected_settings_file) if selected_settings_file is not None else None
     )
-    source_reason = _source_video_mismatch_reason(settings_data, source_video)
-    if source_reason is not None:
-        raise ValueError(f"Cannot resume: {source_reason}")
     raw_saved = (settings_data or {}).get("processing_settings", {})
     if not isinstance(raw_saved, dict):
         raw_saved = {}
     removed = tuple(sorted(REMOVED_SETTING_NAMES.intersection(raw_saved)))
     saved_settings = validate_settings(raw_saved, source="legacy_disk")
     migrated_settings = validate_settings(current_settings, source="explicit")
+    geometry_mode = str(migrated_settings.get("stereo_geometry_mode", "relative"))
+    report_settings_data = _resume_properties_with_sar(
+        settings_data,
+        source_video,
+        geometry_mode,
+    )
+    source_reason = _source_video_mismatch_reason(report_settings_data, source_video)
+    if source_reason is not None:
+        raise ValueError(f"Cannot resume: {source_reason}")
     settings_metadata = (settings_data or {}).get("metadata", {})
     settings_schema_current = (
         isinstance(settings_metadata, dict)
@@ -1088,7 +1330,7 @@ def build_resume_report(
     )
 
     frames, frame_files, source_fingerprint = _validate_frame_stage(
-        root, settings_data, saved_settings
+        root, report_settings_data, saved_settings
     )
     frames_reusable = frames.disposition == "preserve"
 
@@ -1100,7 +1342,7 @@ def build_resume_report(
         migrated_settings,
     )
     scene_reusable = scene.disposition in {"preserve", "resume"}
-    raw, raw_metadata = _validate_raw_stage(
+    raw, raw_identity_metadata, raw_completed_count = _validate_raw_stage(
         root,
         migrated_settings,
         frame_files,
@@ -1113,7 +1355,7 @@ def build_resume_report(
         manifest,
         bounds,
         raw,
-        raw_metadata,
+        raw_identity_metadata,
     )
 
     stages: list[ResumeStage] = [frames, scene, raw]
@@ -1123,10 +1365,29 @@ def build_resume_report(
         frame_files,
         manifest,
         bounds,
-        raw_metadata,
+        raw_identity_metadata,
         scene.disposition == "preserve",
     )
     stages.append(canonical)
+    metric, metric_metadata = _validate_metric_geometry_stage(
+        root,
+        frame_files,
+        manifest,
+        source_fingerprint,
+        raw_identity_metadata,
+        frames_reusable=frames_reusable,
+    )
+    stages.append(metric)
+
+    selected_stage = canonical if geometry_mode == "relative" else metric
+    if selected_stage.disposition == "missing" and raw_completed_count == 0:
+        selected_stage = _stage(
+            selected_stage.name,
+            selected_stage.paths,
+            selected_stage.disposition,
+            "MoGe inference is required to build the selected geometry stage",
+        )
+        stages[-2 if geometry_mode == "relative" else -1] = selected_stage
 
     legacy_supersampled = root / "01_supersampled_frames"
     if _has_payload(legacy_supersampled):
@@ -1159,15 +1420,21 @@ def build_resume_report(
             )
         )
 
+    selected_metadata = canonical_metadata if geometry_mode == "relative" else metric_metadata
+    video_properties = (report_settings_data or {}).get("video_properties", {})
+    if not isinstance(video_properties, dict):
+        video_properties = {}
     stages.extend(
         _build_generated_stages(
             root,
             frame_files,
             saved_settings,
             migrated_settings,
-            canonical_metadata,
+            selected_metadata,
+            video_properties,
+            geometry_mode,
             current_settings_schema=settings_schema_current,
-            canonical_reusable=canonical.disposition in {"preserve", "resume"},
+            geometry_reusable=selected_stage.disposition in {"preserve", "resume"},
         )
     )
     backup_required = selected_settings_file is not None and (

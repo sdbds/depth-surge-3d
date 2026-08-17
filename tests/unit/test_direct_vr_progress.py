@@ -76,6 +76,7 @@ def test_app_stop_handler_emits_stopped_instead_of_error(tmp_path):
 
     with (
         patch("torch.cuda.is_available", return_value=False),
+        patch.object(web_app, "_acknowledge_processing_configuration"),
         patch.object(web_app, "create_stereo_projector", return_value=projector),
         patch.object(
             web_app,
@@ -88,6 +89,7 @@ def test_app_stop_handler_emits_stopped_instead_of_error(tmp_path):
     ):
         web_app.process_video_async(
             "test-session",
+            "requester-socket",
             tmp_path / "source.mp4",
             {
                 "device": "cpu",

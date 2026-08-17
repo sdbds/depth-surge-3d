@@ -633,8 +633,11 @@ class VideoEncoder:
             if stage_name == "frames":
                 continue
             stage_dir = directories.get(stage_name)
-            if stage_dir is not None and next(stage_dir.glob("*.png"), None) is not None:
-                return True
+            if stage_dir is not None:
+                if next(stage_dir.glob("*.png"), None) is not None:
+                    return True
+                if next(stage_dir.glob("*.npz"), None) is not None:
+                    return True
         return False
 
     def _check_nvenc_available(self) -> bool:

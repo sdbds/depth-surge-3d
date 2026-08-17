@@ -48,6 +48,60 @@ The system will skip already-completed processing steps.
 - **Manual download**: Use the manual installation instructions in [INSTALLATION.md](INSTALLATION.md)
 - **Firewall/proxy**: Ensure Hugging Face URLs are not blocked
 
+### MoGe-2 Optional Backend
+
+`MoGe-2 optional dependency is not installed` means the default environment is
+working but the optional source package is absent. Run:
+
+```bash
+uv sync --extra moge2
+```
+
+If a pinned snapshot cannot resolve, reconnect so the exact repository revision
+can be downloaded or populate the Hugging Face cache with that exact snapshot.
+Offline mode cannot substitute a branch tip or another revision. If the error
+names a missing `model.pt`, verify that the resolved pinned snapshot or local
+custom directory contains that concrete file.
+
+Metric camera accepts only flat `side_by_side` output with distortion disabled
+and canonical square source SAR `1:1`. Freshly probed missing or `N/A` SAR is
+normalized to `1:1`. A resume error about missing SAR metadata means the saved
+job lacks the canonical SAR fields; resume with the original source available
+for probing or start a new job. Malformed or explicit non-square SAR fails
+before model loading. Remux or re-encode with correct square-pixel metadata only
+when the stored image pixels are actually square.
+
+`No valid positive metric depth samples for clip convergence` means no sampled
+frame supplied usable positive metric depth. Inspect the source and model
+output; changing the convergence setting does not repair missing metric data.
+
+An `Insufficient disk space for metric geometry` error includes the conservative
+preflight byte bound, current free bytes, and target path. Free space on that
+filesystem, shorten the clip, or explicitly choose a smaller depth resolution,
+then resume. Preflight cannot reserve space against concurrent writers.
+
+A post-preflight `ENOSPC` reports the same bound plus the current free bytes and
+failing path. The current temporary file is removed and completion metadata is
+not published; earlier committed geometry frames remain resumable. Free space
+and resume rather than deleting the completed partial stage.
+
+MoGe CUDA OOM is explicit. There is no silent CPU, variant, resolution, backend,
+or geometry fallback. Choose a smaller variant, lower depth resolution, or CPU
+yourself and restart or resume with the resulting fingerprint change.
+
+A high metric clamp fraction means many valid pixels exceeded
+`--max-disparity-percent` before rendering. Inspect the persisted summary and
+the earliest warning frame, then adjust the virtual baseline, convergence, or
+cap deliberately. The cap is total left-to-right disparity in retained
+final-output coordinates.
+
+MoGe-2 performs per-frame depth and focal estimation. Temporal stability on video is not guaranteed; depth or focal drift may be visible across frames.
+
+Depth or focal drift may appear as scale pumping or changing disparity. The
+first release does not apply temporal stabilization. Letterbox bars are valid
+image samples and may bias automatic convergence even when SAR is `1:1`; crop
+the bars from the source or select an explicit metric convergence distance.
+
 ## Quality Expectations & Limitations
 
 ### When It Works Well

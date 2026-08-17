@@ -39,6 +39,15 @@ class TestVideoDepthEstimator:
         assert estimator.device == "cpu"
         assert estimator.metric is True
 
+    @pytest.mark.parametrize(
+        ("device", "precision"),
+        [("cpu", "float32"), ("cuda", "float16")],
+    )
+    def test_inference_precision_matches_fp32_false_execution(self, device, precision):
+        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device=device)
+
+        assert estimator.inference_precision == precision
+
     def test_determine_device_auto_with_cuda(self):
         """Test device determination when CUDA is available."""
         with patch("torch.cuda.is_available", return_value=True):

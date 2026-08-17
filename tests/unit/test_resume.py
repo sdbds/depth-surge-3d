@@ -13,11 +13,13 @@ from src.depth_surge_3d.core.file_identity import (
     FILE_IDENTITY_ALGORITHM_VERSION,
     file_sample_fingerprint,
 )
-from src.depth_surge_3d.core.settings import validate_settings
+from src.depth_surge_3d.core.settings import PROCESSING_SETTINGS_SCHEMA_VERSION, validate_settings
 from src.depth_surge_3d.processing.frames.depth_storage import (
+    RAW_DEPTH_READABLE_SCHEMA_VERSIONS,
     RAW_DEPTH_SCHEMA_VERSION,
     RawDepthStore,
     canonical_json_hash,
+    depth_preprocessing_algorithm,
     select_depth_model_settings,
 )
 from src.depth_surge_3d.processing.frames.depth_processor import (
@@ -25,17 +27,27 @@ from src.depth_surge_3d.processing.frames.depth_processor import (
     CANONICAL_DEPTH_SCHEMA_VERSION,
     DEPTH_BOUNDS_SCHEMA_VERSION,
 )
+from src.depth_surge_3d.processing.frames.metric_geometry import (
+    ClipConvergence,
+    MetricGeometryFrame,
+    MetricGeometryStore,
+)
 from src.depth_surge_3d.processing.frames.scene_analyzer import (
     SCENE_ALGORITHM_VERSION,
     SCENE_SCHEMA_VERSION,
 )
 from src.depth_surge_3d.processing.frames.stereo_generator import (
+    METRIC_PROJECTION_ALGORITHM_VERSION,
     STEREO_STAGE_ALGORITHM_VERSION,
     STEREO_STAGE_SCHEMA_VERSION,
 )
 from src.depth_surge_3d.processing.frames.source_frame_manifest import (
     frame_sequence_fingerprint,
     write_source_frame_manifest,
+)
+from src.depth_surge_3d.utils.imaging.image_processing import (
+    CENTER_CROP_ALGORITHM_VERSION,
+    calculate_center_crop_dimensions,
 )
 
 
@@ -70,7 +82,7 @@ def _write_settings(
         metadata["source_video_fingerprint_algorithm"] = FILE_IDENTITY_ALGORITHM_VERSION
         metadata["source_video_fingerprint"] = file_sample_fingerprint(source_video)
     if current_schema:
-        metadata["settings_schema_version"] = 2
+        metadata["settings_schema_version"] = PROCESSING_SETTINGS_SCHEMA_VERSION
     payload = {
         "metadata": metadata,
         "video_properties": {"frame_count": 2, "width": 6, "height": 4, "fps": 30.0},
@@ -118,20 +130,26 @@ def _write_raw_metadata(
     source_fingerprint: str,
     *,
     model_size: str,
+    settings: dict | None = None,
+    schema_version: int = RAW_DEPTH_SCHEMA_VERSION,
+    camera_model: str = "none",
 ) -> None:
     raw_dir = output_dir / "02_depth_raw"
     raw_dir.mkdir()
+    selected_settings = settings or _current_settings(model_size=model_size)
     semantic = {
         "backend": "test.Estimator",
         "model_info": {"revision": "immutable"},
-        "depth_settings": select_depth_model_settings(_current_settings(model_size=model_size)),
+        "depth_settings": select_depth_model_settings(selected_settings),
         "weight_sha256": None,
         "artifact_identity": "immutable",
         "source_frame_fingerprint": source_fingerprint,
-        "preprocessing_algorithm": "native-depth-adapter-v2",
+        "preprocessing_algorithm": depth_preprocessing_algorithm(selected_settings),
     }
+    if schema_version == 3:
+        semantic["camera_model"] = camera_model
     metadata = {
-        "schema_version": RAW_DEPTH_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "storage_status": "ready",
         "representation": "relative_depth",
         "frame_names": [path.name for path in frame_files],
@@ -144,6 +162,8 @@ def _write_raw_metadata(
         "completed_count": 0,
         "promoted_frame_count": 0,
     }
+    if schema_version == 3:
+        metadata["camera_model"] = camera_model
     metadata["fingerprint"] = RawDepthStore._fingerprint(metadata)
     (raw_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
@@ -209,9 +229,21 @@ def _write_current_depth_pipeline(
     output_dir: Path,
     frame_files: list[Path],
     source_fingerprint: str,
+    *,
+    settings: dict | None = None,
+    schema_version: int = RAW_DEPTH_SCHEMA_VERSION,
+    camera_model: str = "none",
 ) -> tuple[dict, dict, dict]:
     _write_candidate_manifest(output_dir, frame_files, source_fingerprint)
-    _write_raw_metadata(output_dir, frame_files, source_fingerprint, model_size="large")
+    _write_raw_metadata(
+        output_dir,
+        frame_files,
+        source_fingerprint,
+        model_size="large",
+        settings=settings,
+        schema_version=schema_version,
+        camera_model=camera_model,
+    )
     raw_dir = output_dir / "02_depth_raw"
     raw_metadata_path = raw_dir / "metadata.json"
     raw_metadata = json.loads(raw_metadata_path.read_text(encoding="utf-8"))
@@ -238,10 +270,10 @@ def _write_current_depth_pipeline(
 
     for index, frame in enumerate(frame_files):
         with (raw_dir / f"{frame.stem}.npz").open("wb") as handle:
-            np.savez_compressed(
-                handle,
-                values=np.full((4, 6), index, dtype=np.float16),
-            )
+            arrays = {"values": np.full((4, 6), index, dtype=np.float16)}
+            if camera_model == "pinhole_fx":
+                arrays["focal_x_normalized"] = np.array(0.8, dtype=np.float32)
+            np.savez_compressed(handle, **arrays)
     raw_metadata = json.loads(raw_metadata_path.read_text(encoding="utf-8"))
     raw_metadata["completed_count"] = len(frame_files)
     raw_metadata_path.write_text(json.dumps(raw_metadata), encoding="utf-8")
@@ -308,6 +340,123 @@ def _write_current_stereo_pipeline(
         assert cv2.imwrite(str(right_dir / f"{frame.stem}.png"), image)
 
 
+def _write_metric_geometry_pipeline(
+    output_dir: Path,
+    frame_files: list[Path],
+    source_fingerprint: str,
+    manifest: dict,
+) -> dict:
+    raw_metadata = RawDepthStore.read_metadata(output_dir / "02_depth_raw")
+    assert raw_metadata is not None
+    candidate_scene_fingerprint = canonical_json_hash(
+        {
+            "schema_version": manifest["schema_version"],
+            "algorithm_version": manifest["algorithm_version"],
+            "frame_names": manifest["frame_names"],
+            "scene_ids": manifest["scene_ids"],
+        }
+    )
+    store = MetricGeometryStore.open_or_create(
+        output_dir / "03_metric_geometry",
+        frame_names=[path.name for path in frame_files],
+        native_shape=(4, 6),
+        source_raw_fingerprint=raw_metadata["fingerprint"],
+        source_frame_fingerprint=source_fingerprint,
+        candidate_scene_fingerprint=candidate_scene_fingerprint,
+        preflight_required_bytes=0,
+    )
+    for frame in frame_files:
+        store.write_frame(
+            frame.name,
+            MetricGeometryFrame(
+                inverse_depth=np.ones((4, 6), dtype=np.float32),
+                valid=np.ones((4, 6), dtype=np.bool_),
+                focal_x_normalized=np.float32(0.8),
+            ),
+        )
+    return store.finalize(
+        ClipConvergence(
+            distance_m=np.float32(2.0),
+            selected_frame_indexes=(0,),
+            sample_count=24,
+        )
+    )
+
+
+def _write_metric_stereo_pipeline(
+    output_dir: Path,
+    frame_files: list[Path],
+    metric_metadata: dict,
+    settings: dict,
+) -> None:
+    left_dir = output_dir / "04_left_frames"
+    right_dir = output_dir / "04_right_frames"
+    left_dir.mkdir(exist_ok=True)
+    right_dir.mkdir(exist_ok=True)
+    retained_width, _ = calculate_center_crop_dimensions(6, 4, settings["crop_factor"])
+    metadata = {
+        "schema_version": STEREO_STAGE_SCHEMA_VERSION,
+        "algorithm_version": STEREO_STAGE_ALGORITHM_VERSION,
+        "geometry_mode": "metric_camera",
+        "frame_names": [path.name for path in frame_files],
+        "render_shape": [4, 6],
+        "occlusion_fill": settings["occlusion_fill"],
+        "renderer_device_type": "cpu",
+        "encoding": "uint8_png",
+        "source_metric_fingerprint": metric_metadata["fingerprint"],
+        "projection_algorithm_version": METRIC_PROJECTION_ALGORITHM_VERSION,
+        "source_width": 6,
+        "retained_crop_width": retained_width,
+        "center_crop_algorithm_version": CENTER_CROP_ALGORITHM_VERSION,
+        "sample_aspect_ratio": "1:1",
+        "virtual_baseline_mm": settings["virtual_baseline_mm"],
+        "requested_convergence_distance": settings["metric_convergence_distance"],
+        "effective_convergence_distance_m": 2.0,
+        "max_disparity_percent": settings["max_disparity_percent"],
+    }
+    metadata["fingerprint"] = canonical_json_hash(metadata)
+    (left_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+    for frame in frame_files:
+        image = np.zeros((4, 6, 3), dtype=np.uint8)
+        assert cv2.imwrite(str(left_dir / f"{frame.stem}.png"), image)
+        assert cv2.imwrite(str(right_dir / f"{frame.stem}.png"), image)
+
+
+def _metric_job(output_dir: Path, *, include_relative: bool = True) -> tuple[list[Path], dict]:
+    frame_files, source_fingerprint = _write_frames(output_dir)
+    settings = _current_settings(
+        depth_model_version="moge2",
+        stereo_geometry_mode="metric_camera",
+        apply_distortion=False,
+    )
+    settings_file = _write_settings(output_dir, settings, current_schema=True)
+    settings_data = json.loads(settings_file.read_text(encoding="utf-8"))
+    settings_data["video_properties"].update(
+        {
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+            "sample_aspect_ratio": "1:1",
+        }
+    )
+    settings_file.write_text(json.dumps(settings_data), encoding="utf-8")
+    manifest, _, _ = _write_current_depth_pipeline(
+        output_dir,
+        frame_files,
+        source_fingerprint,
+        settings=settings,
+        camera_model="pinhole_fx",
+    )
+    metric_metadata = _write_metric_geometry_pipeline(
+        output_dir, frame_files, source_fingerprint, manifest
+    )
+    if not include_relative:
+        disparity_dir = output_dir / "03_disparity_maps"
+        for path in disparity_dir.iterdir():
+            path.unlink()
+    _write_metric_stereo_pipeline(output_dir, frame_files, metric_metadata, settings)
+    return frame_files, settings
+
+
 def _write_downstream_placeholders(output_dir: Path, frame_name: str) -> None:
     image = np.zeros((4, 6, 3), dtype=np.uint8)
     for name in (
@@ -322,6 +471,26 @@ def _write_downstream_placeholders(output_dir: Path, frame_name: str) -> None:
         directory = output_dir / name
         directory.mkdir()
         assert cv2.imwrite(str(directory / frame_name), image)
+
+
+def _write_generated_stage(output_dir: Path, names: tuple[str, ...], frame_name: str) -> None:
+    image = np.zeros((4, 6, 3), dtype=np.uint8)
+    metadata = {"schema_version": 1, "stage": names[0]}
+    metadata["fingerprint"] = canonical_json_hash(metadata)
+    for index, name in enumerate(names):
+        directory = output_dir / name
+        directory.mkdir(exist_ok=True)
+        assert cv2.imwrite(str(directory / frame_name), image)
+        if index == 0:
+            (directory / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+
+def _directory_bytes(directory: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(directory)): path.read_bytes()
+        for path in sorted(directory.rglob("*"))
+        if path.is_file()
+    }
 
 
 def _legacy_job(tmp_path: Path):
@@ -389,6 +558,98 @@ def test_raw_model_fingerprint_mismatch_invalidates_raw_and_downstream(tmp_path)
 
     assert report.stage("depth_raw").disposition == "invalidate"
     assert "model_size" in report.stage("depth_raw").reason
+
+
+def test_raw_mismatch_accepts_schema_v2_for_camera_free_backend(tmp_path):
+    from src.depth_surge_3d.io.resume import _raw_mismatch_reason
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings()
+    _write_raw_metadata(
+        tmp_path,
+        frame_files,
+        fingerprint,
+        model_size="large",
+        settings=settings,
+        schema_version=2,
+    )
+    metadata = RawDepthStore.read_metadata(tmp_path / "02_depth_raw")
+
+    assert RAW_DEPTH_READABLE_SCHEMA_VERSIONS == frozenset({2, 3})
+    assert metadata is not None
+    assert _raw_mismatch_reason(metadata, settings, frame_files, fingerprint, None) is None
+
+
+def test_resume_preserves_valid_schema_v2_metadata_and_payload_bytes(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings()
+    _write_settings(tmp_path, settings, current_schema=True)
+    _write_current_depth_pipeline(
+        tmp_path,
+        frame_files,
+        fingerprint,
+        settings=settings,
+        schema_version=2,
+    )
+    raw_dir = tmp_path / "02_depth_raw"
+    metadata_before = (raw_dir / "metadata.json").read_bytes()
+    payloads_before = [path.read_bytes() for path in sorted(raw_dir.glob("*.npz"))]
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("depth_raw").disposition == "preserve"
+    assert (raw_dir / "metadata.json").read_bytes() == metadata_before
+    assert [path.read_bytes() for path in sorted(raw_dir.glob("*.npz"))] == payloads_before
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "camera_model"),
+    [(2, "none"), (3, "none")],
+)
+def test_moge_resume_requires_v3_pinhole_camera_metadata(tmp_path, schema_version, camera_model):
+    from src.depth_surge_3d.io.resume import _raw_mismatch_reason
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings()
+    settings["depth_model_version"] = "moge2"
+    _write_raw_metadata(
+        tmp_path,
+        frame_files,
+        fingerprint,
+        model_size="large",
+        settings=settings,
+        schema_version=schema_version,
+        camera_model=camera_model,
+    )
+    metadata = RawDepthStore.read_metadata(tmp_path / "02_depth_raw")
+
+    assert metadata is not None
+    reason = _raw_mismatch_reason(metadata, settings, frame_files, fingerprint, None)
+    assert reason is not None
+    assert "pinhole_fx" in reason
+
+
+def test_moge_resume_accepts_v3_pinhole_camera_metadata(tmp_path):
+    from src.depth_surge_3d.io.resume import _raw_mismatch_reason
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings()
+    settings["depth_model_version"] = "moge2"
+    _write_raw_metadata(
+        tmp_path,
+        frame_files,
+        fingerprint,
+        model_size="large",
+        settings=settings,
+        schema_version=3,
+        camera_model="pinhole_fx",
+    )
+    metadata = RawDepthStore.read_metadata(tmp_path / "02_depth_raw")
+
+    assert metadata is not None
+    assert _raw_mismatch_reason(metadata, settings, frame_files, fingerprint, None) is None
 
 
 def test_raw_model_fingerprint_mismatch_recomputes_depth_derived_scene_data(tmp_path):
@@ -1026,3 +1287,284 @@ def test_frame_stage_explicitly_invalidates_malformed_manifest(tmp_path, monkeyp
     assert stage.disposition == "invalidate"
     assert "manifest" in stage.reason
     assert fingerprint is None
+
+
+def test_resume_reports_both_valid_stage3_directories_without_deleting_inactive_one(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path)
+    relative_before = _directory_bytes(tmp_path / "03_disparity_maps")
+    metric_before = _directory_bytes(tmp_path / "03_metric_geometry")
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("disparity_maps").disposition == "preserve"
+    assert report.stage("metric_geometry").disposition == "preserve"
+    assert report.stage("stereo").disposition == "preserve"
+    assert _directory_bytes(tmp_path / "03_disparity_maps") == relative_before
+    assert _directory_bytes(tmp_path / "03_metric_geometry") == metric_before
+
+
+def test_mode_switch_preserves_both_valid_stage3_formats_and_invalidates_only_stereo(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path)
+    relative_before = _directory_bytes(tmp_path / "03_disparity_maps")
+    metric_before = _directory_bytes(tmp_path / "03_metric_geometry")
+
+    report = build_resume_report(tmp_path, {**settings, "stereo_geometry_mode": "relative"})
+
+    assert report.stage("depth_raw").disposition == "preserve"
+    assert report.stage("disparity_maps").disposition == "preserve"
+    assert report.stage("metric_geometry").disposition == "preserve"
+    assert report.stage("stereo").disposition == "invalidate"
+    assert _directory_bytes(tmp_path / "03_disparity_maps") == relative_before
+    assert _directory_bytes(tmp_path / "03_metric_geometry") == metric_before
+
+
+@pytest.mark.parametrize(
+    ("setting_name", "new_value"),
+    [
+        ("virtual_baseline_mm", 70.0),
+        ("metric_convergence_distance", 3.0),
+        ("max_disparity_percent", 1.5),
+    ],
+)
+def test_metric_stereo_settings_invalidate_only_stereo(tmp_path, setting_name, new_value):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path)
+
+    report = build_resume_report(tmp_path, {**settings, setting_name: new_value})
+
+    assert report.stage("depth_raw").disposition == "preserve"
+    assert report.stage("metric_geometry").disposition == "preserve"
+    assert report.stage("stereo").disposition == "invalidate"
+
+
+def test_depth_identity_change_invalidates_metric_geometry_and_stereo(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path)
+
+    report = build_resume_report(tmp_path, {**settings, "depth_resolution": 512})
+
+    assert report.stage("depth_raw").disposition == "invalidate"
+    assert "depth_resolution" in report.stage("depth_raw").reason
+    assert report.stage("metric_geometry").disposition == "invalidate"
+    assert report.stage("stereo").disposition == "invalidate"
+
+
+def test_completed_metric_geometry_reuses_compatible_ready_raw_identity_without_payloads(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path)
+    raw_dir = tmp_path / "02_depth_raw"
+    for path in raw_dir.glob("*.npz"):
+        path.unlink()
+    metadata_path = raw_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["completed_count"] = 0
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("depth_raw").disposition == "resume"
+    assert report.stage("metric_geometry").disposition == "preserve"
+    assert report.stage("stereo").disposition == "preserve"
+
+
+def test_corrupt_raw_payload_does_not_invalidate_completed_metric_stage(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path)
+    (tmp_path / "02_depth_raw" / "frame_000001.npz").write_bytes(b"corrupt raw payload")
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("depth_raw").disposition == "invalidate"
+    assert "payload validation failed" in report.stage("depth_raw").reason
+    assert report.stage("metric_geometry").disposition == "preserve"
+    assert report.stage("stereo").disposition == "preserve"
+
+
+def test_crop_change_invalidates_metric_stereo_but_not_relative_stereo(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    metric_dir = tmp_path / "metric"
+    metric_dir.mkdir()
+    frame_files, metric_settings = _metric_job(metric_dir)
+    _write_generated_stage(
+        metric_dir,
+        ("06_left_cropped", "06_right_cropped"),
+        frame_files[0].name,
+    )
+    metric_report = build_resume_report(metric_dir, {**metric_settings, "crop_factor": 0.8})
+
+    relative_dir = tmp_path / "relative"
+    relative_dir.mkdir()
+    frame_files, fingerprint = _write_frames(relative_dir)
+    relative_settings = _current_settings(apply_distortion=False)
+    _write_settings(relative_dir, relative_settings, current_schema=True)
+    _, _, canonical = _write_current_depth_pipeline(relative_dir, frame_files, fingerprint)
+    _write_current_stereo_pipeline(relative_dir, frame_files, canonical)
+    _write_generated_stage(
+        relative_dir,
+        ("06_left_cropped", "06_right_cropped"),
+        frame_files[0].name,
+    )
+    relative_report = build_resume_report(relative_dir, {**relative_settings, "crop_factor": 0.8})
+
+    assert metric_report.stage("metric_geometry").disposition == "preserve"
+    assert metric_report.stage("stereo").disposition == "invalidate"
+    assert relative_report.stage("stereo").disposition == "preserve"
+    assert relative_report.stage("crop").disposition == "invalidate"
+
+
+def test_final_output_width_change_reuses_metric_stereo(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, settings = _metric_job(tmp_path)
+    _write_generated_stage(
+        tmp_path,
+        ("06_left_cropped", "06_right_cropped"),
+        frame_files[0].name,
+    )
+    _write_generated_stage(tmp_path, ("99_vr_frames",), frame_files[0].name)
+
+    report = build_resume_report(
+        tmp_path,
+        {**settings, "per_eye_width": 2560, "vr_output_width": 5120},
+    )
+
+    assert report.stage("metric_geometry").disposition == "preserve"
+    assert report.stage("stereo").disposition == "preserve"
+    assert report.stage("crop").disposition == "invalidate"
+    assert report.stage("vr_frames").disposition == "invalidate"
+
+
+def test_no_raw_missing_selected_mode_reports_reinference_without_deletion(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path, include_relative=False)
+    raw_dir = tmp_path / "02_depth_raw"
+    for path in raw_dir.glob("*.npz"):
+        path.unlink()
+    metadata_path = raw_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["completed_count"] = 0
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    frames_before = _directory_bytes(tmp_path / "00_original_frames")
+    metric_before = _directory_bytes(tmp_path / "03_metric_geometry")
+
+    report = build_resume_report(tmp_path, {**settings, "stereo_geometry_mode": "relative"})
+
+    assert (
+        "MoGe inference is required to build the selected geometry stage"
+        in report.stage("disparity_maps").reason
+    )
+    assert report.stage("metric_geometry").disposition == "preserve"
+    assert _directory_bytes(tmp_path / "00_original_frames") == frames_before
+    assert _directory_bytes(tmp_path / "03_metric_geometry") == metric_before
+
+
+def test_resume_report_keeps_raw_and_metric_temporary_files(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path)
+    raw_temporary = tmp_path / "02_depth_raw" / "sentinel.npz.tmp"
+    metric_temporary = tmp_path / "03_metric_geometry" / "sentinel.tmp"
+    raw_temporary.write_bytes(b"raw temporary")
+    metric_temporary.write_bytes(b"metric temporary")
+    before = {
+        "raw": _directory_bytes(tmp_path / "02_depth_raw"),
+        "metric": _directory_bytes(tmp_path / "03_metric_geometry"),
+    }
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("depth_raw").disposition == "preserve"
+    assert report.stage("metric_geometry").disposition == "preserve"
+    assert _directory_bytes(tmp_path / "02_depth_raw") == before["raw"]
+    assert _directory_bytes(tmp_path / "03_metric_geometry") == before["metric"]
+
+
+def test_metric_stereo_manifest_requires_explicit_occlusion_fill(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _, settings = _metric_job(tmp_path)
+    metadata_path = tmp_path / "04_left_frames" / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("occlusion_fill")
+    metadata["fingerprint"] = canonical_json_hash(
+        {key: value for key, value in metadata.items() if key != "fingerprint"}
+    )
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("metric_geometry").disposition == "preserve"
+    assert report.stage("stereo").disposition == "invalidate"
+
+
+def test_legacy_metric_resume_reprobes_sar_before_report_construction(tmp_path, monkeypatch):
+    import src.depth_surge_3d.io.resume as resume
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings(depth_model_version="moge2", stereo_geometry_mode="relative")
+    settings_file = _write_settings(tmp_path, settings, current_schema=True)
+    _write_current_depth_pipeline(tmp_path, frame_files, fingerprint)
+    source = tmp_path / "source.mp4"
+    calls = []
+
+    def probe(path):
+        calls.append(path)
+        return {
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+            "sample_aspect_ratio": "1:1",
+        }
+
+    monkeypatch.setattr(resume, "get_video_properties", probe)
+
+    report = resume.build_resume_report(
+        tmp_path,
+        {**settings, "stereo_geometry_mode": "metric_camera"},
+        source_video=source,
+        settings_file=settings_file,
+    )
+
+    assert calls == [str(source)]
+    assert report.stage("frames").disposition == "preserve"
+
+
+def test_legacy_metric_resume_without_source_fails_without_invalidating_relative_data(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings(depth_model_version="moge2")
+    _write_settings(tmp_path, settings, current_schema=True)
+    _write_current_depth_pipeline(
+        tmp_path,
+        frame_files,
+        fingerprint,
+        settings=settings,
+        camera_model="pinhole_fx",
+    )
+    (tmp_path / "source.mp4").unlink()
+    relative_before = _directory_bytes(tmp_path / "03_disparity_maps")
+
+    with pytest.raises(ValueError, match="re-probe.*sample aspect ratio"):
+        build_resume_report(
+            tmp_path,
+            {**settings, "stereo_geometry_mode": "metric_camera"},
+            source_video=tmp_path / "missing.mp4",
+        )
+
+    assert _directory_bytes(tmp_path / "03_disparity_maps") == relative_before
+    relative = build_resume_report(
+        tmp_path,
+        {**settings, "stereo_geometry_mode": "relative"},
+        source_video=None,
+    )
+    assert relative.stage("disparity_maps").disposition == "preserve"

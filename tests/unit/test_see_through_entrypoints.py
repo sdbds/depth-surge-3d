@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import json
+import sys
 from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -38,13 +39,11 @@ class _DepthModelOptionParser(HTMLParser):
 
 
 def _load_cli_module():
-    spec = importlib.util.spec_from_file_location(
-        "depth_surge_3d_cli_for_test", PROJECT_ROOT / "depth_surge_3d.py"
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+    try:
+        return importlib.import_module("depth_surge_3d.cli")
+    finally:
+        sys.path.pop(0)
 
 
 def test_cli_accepts_see_through_model_version():
@@ -58,8 +57,10 @@ def test_cli_accepts_see_through_model_version():
 
 
 def test_web_ui_exposes_see_through_model_option():
+    import app as web_app
+
     parser = _DepthModelOptionParser()
-    parser.feed((PROJECT_ROOT / "templates" / "index.html").read_text(encoding="utf-8"))
+    parser.feed(web_app.app.test_client().get("/").get_data(as_text=True))
 
     assert "see_through" in parser.values
 
@@ -75,9 +76,6 @@ def test_web_ui_does_not_force_see_through_depth_resolution():
 
 def test_web_runner_uses_relative_see_through_repo(tmp_path):
     import app as web_app
-    from src.depth_surge_3d.inference.depth.video_depth_estimator_see_through import (
-        DEFAULT_SEE_THROUGH_REPO,
-    )
 
     projector = MagicMock()
     projector.load_model.return_value = False
@@ -85,12 +83,14 @@ def test_web_runner_uses_relative_see_through_repo(tmp_path):
     with (
         patch("torch.cuda.is_available", return_value=True),
         patch("torch.cuda.get_device_name", return_value="Test CUDA device"),
+        patch.object(web_app, "_acknowledge_processing_configuration"),
         patch.object(
             web_app, "create_stereo_projector", return_value=projector
         ) as create_projector,
     ):
         web_app.process_video_async(
             "test-session",
+            "requester-socket",
             tmp_path / "input.mp4",
             {
                 "depth_model_version": "see_through",
@@ -98,13 +98,23 @@ def test_web_runner_uses_relative_see_through_repo(tmp_path):
                 "use_metric_depth": True,
             },
             tmp_path / "output",
+            None,
+            {
+                "width": 1920,
+                "height": 1080,
+                "fps": 24.0,
+                "frame_count": 1,
+                "sample_aspect_ratio_numerator": 1,
+                "sample_aspect_ratio_denominator": 1,
+            },
         )
 
     create_projector.assert_called_once_with(
-        DEFAULT_SEE_THROUGH_REPO,
+        None,
         "cuda",
         metric=False,
         depth_model_version="see_through",
+        model_size="vitl",
     )
 
 
@@ -255,15 +265,37 @@ def test_web_process_validates_final_settings_before_starting(tmp_path):
 
     with (
         patch.object(web_app, "find_source_video", return_value=source_video),
+        patch.object(
+            web_app,
+            "get_video_properties",
+            return_value={
+                "width": 1920,
+                "height": 1080,
+                "fps": 24.0,
+                "frame_count": 1,
+                "sample_aspect_ratio_numerator": 1,
+                "sample_aspect_ratio_denominator": 1,
+            },
+        ),
         patch.object(web_app.socketio, "start_background_task", return_value=MagicMock()) as start,
     ):
-        response = web_app.app.test_client().post(
-            "/process",
-            json={"output_dir": str(output_dir), "settings": settings},
-        )
+        flask_client = web_app.app.test_client()
+        socket_client = web_app.socketio.test_client(web_app.app, flask_test_client=flask_client)
+        try:
+            socket_id = web_app.socketio.server.manager.sid_from_eio_sid(socket_client.eio_sid, "/")
+            response = flask_client.post(
+                "/process",
+                json={
+                    "output_dir": str(output_dir),
+                    "socket_id": socket_id,
+                    "settings": settings,
+                },
+            )
+        finally:
+            socket_client.disconnect()
 
     assert response.status_code == 200
-    validated = start.call_args.args[3]
+    validated = start.call_args.args[4]
     for key, value in settings.items():
         assert validated[key] == value
 
@@ -335,13 +367,20 @@ def test_web_resume_requires_current_request_to_authorize_legacy_delete(tmp_path
         patch.object(web_app, "apply_legacy_migration") as migrate,
         patch.object(web_app.socketio, "start_background_task", return_value=MagicMock()) as start,
     ):
-        response = web_app.app.test_client().post(
-            "/resume",
-            json={
-                "output_dir": str(output_dir),
-                "raw_storage_dtype": "float32",
-            },
-        )
+        flask_client = web_app.app.test_client()
+        socket_client = web_app.socketio.test_client(web_app.app, flask_test_client=flask_client)
+        try:
+            socket_id = web_app.socketio.server.manager.sid_from_eio_sid(socket_client.eio_sid, "/")
+            response = flask_client.post(
+                "/resume",
+                json={
+                    "output_dir": str(output_dir),
+                    "raw_storage_dtype": "float32",
+                    "socket_id": socket_id,
+                },
+            )
+        finally:
+            socket_client.disconnect()
 
     assert response.status_code == 200
     assert build.call_args.args[1]["migrate_legacy"] == "archive"
@@ -349,7 +388,7 @@ def test_web_resume_requires_current_request_to_authorize_legacy_delete(tmp_path
     assert build.call_args.kwargs["source_video"] == source_video
     assert build.call_args.kwargs["settings_file"] == settings_file
     migrate.assert_not_called()
-    resume_context = start.call_args.args[5]
+    resume_context = start.call_args.args[6]
     assert resume_context == {
         "migration_mode": "archive",
         "settings_file": settings_file,
@@ -379,6 +418,7 @@ def test_web_background_resume_validates_loaded_model_before_migration(tmp_path)
 
     with (
         patch("torch.cuda.is_available", return_value=False),
+        patch.object(web_app, "_acknowledge_processing_configuration"),
         patch.object(web_app, "create_stereo_projector", return_value=projector),
         patch.object(
             web_app,
@@ -391,16 +431,29 @@ def test_web_background_resume_validates_loaded_model_before_migration(tmp_path)
     ):
         web_app.process_video_async(
             "test-session",
+            "requester-socket",
             source_video,
             settings,
             output_dir,
             {"migration_mode": "archive", "settings_file": settings_file},
+            {
+                "width": 1920,
+                "height": 1080,
+                "fps": 24.0,
+                "frame_count": 1,
+                "sample_aspect_ratio_numerator": 1,
+                "sample_aspect_ratio_denominator": 1,
+            },
         )
 
-    build_fingerprint.assert_called_once_with(projector.depth_estimator, settings)
+    fingerprint_settings = build_fingerprint.call_args.args[1]
+    assert fingerprint_settings["depth_model_version"] == "v3"
+    assert fingerprint_settings["model_size"] == "vitl"
+    assert fingerprint_settings["model_path"] is None
+    assert fingerprint_settings["depth_resolution"] == 1080
     build_report.assert_called_once_with(
         output_dir,
-        settings,
+        fingerprint_settings,
         source_video=source_video,
         model_fingerprint=fingerprint,
         settings_file=settings_file,
@@ -475,13 +528,19 @@ def test_web_resume_accepts_legacy_settings_without_source_fingerprint(tmp_path,
         patch.object(web_app, "build_resume_report", return_value=report),
         patch.object(web_app.socketio, "start_background_task", return_value=MagicMock()) as start,
     ):
-        response = web_app.app.test_client().post(
-            "/resume",
-            json={"output_dir": str(output_dir)},
-        )
+        flask_client = web_app.app.test_client()
+        socket_client = web_app.socketio.test_client(web_app.app, flask_test_client=flask_client)
+        try:
+            socket_id = web_app.socketio.server.manager.sid_from_eio_sid(socket_client.eio_sid, "/")
+            response = flask_client.post(
+                "/resume",
+                json={"output_dir": str(output_dir), "socket_id": socket_id},
+            )
+        finally:
+            socket_client.disconnect()
 
     assert response.status_code == 200
-    assert start.call_args.args[2] == correct_source.resolve()
+    assert start.call_args.args[3] == correct_source.resolve()
 
 
 def test_web_resume_rejects_saved_source_fingerprint_mismatch(tmp_path, monkeypatch):
@@ -526,8 +585,8 @@ def test_web_resume_rejects_saved_source_fingerprint_mismatch(tmp_path, monkeypa
     start.assert_not_called()
 
 
-def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp_path, monkeypatch):
-    """CLI resume must rebuild the saved estimator and pass only process-video options."""
+def test_cli_resume_restores_depth_backend_with_owned_resolved_preflight(tmp_path, monkeypatch):
+    """CLI resume rebuilds the saved estimator and executes its resolved context."""
     cli = _load_cli_module()
     projector = MagicMock()
     projector.load_model.return_value = True
@@ -557,6 +616,16 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
     report.stages = ()
     report.removed_settings = ()
     report.migrated_settings = cli.validate_settings(saved_settings, source="legacy_disk")
+    preflight_settings = {
+        **report.migrated_settings,
+        "model_size": "custom",
+        "depth_resolution": 768,
+        "verbose": False,
+    }
+    projector.preflight_video.return_value.settings = preflight_settings
+    execution_preflight = MagicMock()
+    projector.revalidate_video_preflight.return_value = execution_preflight
+    projector.execute_video.return_value = True
     model_fingerprint = {"backend": "loaded.Estimator"}
     monkeypatch.setattr(cli.sys, "argv", ["depth_surge_3d.py", "--resume", str(tmp_path)])
 
@@ -587,9 +656,14 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
         device="cuda",
         metric=False,
         depth_model_version="see_through",
+        model_size="custom",
     )
     projector.load_model.assert_called_once_with()
-    preflight_settings = {**report.migrated_settings, "verbose": False}
+    projector.preflight_video.assert_called_once_with(
+        "source.mkv",
+        str(tmp_path),
+        {**preflight_settings, "depth_resolution": "768"},
+    )
     build_fingerprint.assert_called_once_with(projector.depth_estimator, preflight_settings)
     build_report.assert_called_once_with(
         tmp_path,
@@ -599,22 +673,12 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
         settings_file=resume_info["settings_file"],
     )
     migrate.assert_called_once_with(report, "archive")
-    resume_kwargs = projector.process_video.call_args.kwargs
-    assert resume_kwargs["video_path"] == "source.mkv"
-    assert resume_kwargs["output_dir"] == str(tmp_path)
-    assert resume_kwargs["settings"]["stereo_strength"] == 3.0
-    assert resume_kwargs["settings"]["keep_intermediates"] is False
-    for metadata_key in (
-        "depth_model_version",
-        "model_path",
-        "model_size",
-        "depth_resolution",
-        "use_metric_depth",
-        "device",
-        "denoising_steps",
-        "seed",
-    ):
-        assert metadata_key not in resume_kwargs
+    projector.revalidate_video_preflight.assert_called_once_with(
+        projector.preflight_video.return_value,
+        report.migrated_settings,
+    )
+    projector.execute_video.assert_called_once_with(execution_preflight)
+    projector.process_video.assert_not_called()
 
 
 def test_cli_resume_infers_see_through_for_legacy_settings(tmp_path, monkeypatch):
@@ -671,4 +735,5 @@ def test_cli_resume_infers_see_through_for_legacy_settings(tmp_path, monkeypatch
         device="cuda",
         metric=False,
         depth_model_version="see_through",
+        model_size="vitl",
     )

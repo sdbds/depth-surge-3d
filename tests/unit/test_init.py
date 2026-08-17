@@ -109,7 +109,7 @@ class TestExportedConstants:
 class TestStereoProjectorInstantiation:
     """Test that StereoProjector can be instantiated through package import."""
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_create_stereo_projector_from_package(self, mock_create):
         """Test creating StereoProjector instance from package level."""
         mock_create.return_value = MagicMock()

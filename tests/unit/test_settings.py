@@ -33,8 +33,34 @@ def test_direct_vr_encode_accepts_booleans(value: bool) -> None:
     )
 
 
-def test_direct_vr_encode_does_not_bump_settings_schema() -> None:
-    assert PROCESSING_SETTINGS_SCHEMA_VERSION == 2
+def test_metric_geometry_settings_bump_settings_schema() -> None:
+    assert PROCESSING_SETTINGS_SCHEMA_VERSION == 3
+
+
+def test_metric_geometry_defaults_are_explicit() -> None:
+    settings = validate_settings({}, source="explicit")
+    assert settings["stereo_geometry_mode"] == "relative"
+    assert settings["virtual_baseline_mm"] == 63.0
+    assert settings["metric_convergence_distance"] == "auto"
+    assert settings["max_disparity_percent"] == 2.0
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("virtual_baseline_mm", -0.01),
+        ("virtual_baseline_mm", 100.01),
+        ("virtual_baseline_mm", float("nan")),
+        ("metric_convergence_distance", 0.09),
+        ("metric_convergence_distance", 1000.01),
+        ("metric_convergence_distance", float("inf")),
+        ("max_disparity_percent", -0.01),
+        ("max_disparity_percent", 5.01),
+    ],
+)
+def test_metric_settings_reject_out_of_contract_values(name, value) -> None:
+    with pytest.raises(ValueError, match=name):
+        validate_settings({name: value}, source="explicit")
 
 
 def test_final_defaults_cover_depth_dibr_and_migration_controls() -> None:
@@ -140,3 +166,18 @@ def test_boolean_fields_do_not_accept_integer_surrogates() -> None:
 def test_invalid_source_is_rejected() -> None:
     with pytest.raises(ValueError, match="source"):
         validate_settings({}, source="resume")
+
+
+def test_moge2_is_a_valid_persisted_depth_backend() -> None:
+    settings = validate_settings(
+        {
+            "depth_model_version": "moge2",
+            "model_size": "vitb",
+            "model_path": None,
+            "depth_resolution": "auto",
+            "use_metric_depth": True,
+        },
+        source="explicit",
+    )
+
+    assert settings["depth_model_version"] == "moge2"

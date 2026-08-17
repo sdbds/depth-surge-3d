@@ -17,7 +17,12 @@ def _hash_directory(directory: Path) -> str:
     return hasher.hexdigest()
 
 
-def resolve_hf_snapshot(repo_id: str, *, cache_dir: Path | str | None = None) -> tuple[str, str]:
+def resolve_hf_snapshot(
+    repo_id: str,
+    *,
+    revision: str | None = None,
+    cache_dir: Path | str | None = None,
+) -> tuple[str, str]:
     """Return an immutable local load path and content-bound artifact identity."""
 
     local_path = Path(repo_id).expanduser()
@@ -28,6 +33,8 @@ def resolve_hf_snapshot(repo_id: str, *, cache_dir: Path | str | None = None) ->
     from huggingface_hub import snapshot_download
 
     kwargs: dict[str, Any] = {"repo_id": repo_id}
+    if revision is not None:
+        kwargs["revision"] = revision
     if cache_dir is not None:
         kwargs["cache_dir"] = str(cache_dir)
     try:
@@ -38,5 +45,7 @@ def resolve_hf_snapshot(repo_id: str, *, cache_dir: Path | str | None = None) ->
         except Exception:
             raise online_error
 
-    revision = snapshot.name if snapshot.parent.name == "snapshots" else _hash_directory(snapshot)
-    return str(snapshot), f"hf:{repo_id}@{revision}"
+    resolved_revision = (
+        snapshot.name if snapshot.parent.name == "snapshots" else _hash_directory(snapshot)
+    )
+    return str(snapshot), f"hf:{repo_id}@{resolved_revision}"

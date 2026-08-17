@@ -15,6 +15,7 @@ import argparse
 import sys
 import signal
 import base64
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -36,8 +37,6 @@ warnings.filterwarnings("ignore", category=SyntaxWarning)  # moviepy old regex p
 # Import our constants and utilities
 from depth_surge_3d.core.constants import (  # noqa: E402
     INTERMEDIATE_DIRS,
-    MODEL_PATHS,
-    MODEL_PATHS_METRIC,
     SOCKETIO_PING_TIMEOUT,
     SOCKETIO_PING_INTERVAL,
     SOCKETIO_SLEEP_YIELD,
@@ -67,13 +66,24 @@ from depth_surge_3d.core.constants import (  # noqa: E402
     SIGNAL_SHUTDOWN_TIMEOUT,
 )
 from depth_surge_3d.utils.system.console import warning as console_warning  # noqa: E402
-from depth_surge_3d.inference.depth.video_depth_estimator_see_through import (  # noqa: E402
-    DEFAULT_SEE_THROUGH_REPO,
+from depth_surge_3d.inference.depth.backend_registry import (  # noqa: E402
+    TEMPORAL_STABILITY_WARNING,
+    backend_availability,
+    build_effective_depth_run_report,
+    get_backend_spec,
+    list_backend_specs,
+    normalize_model_size,
+    validate_backend_geometry_request,
 )
 from depth_surge_3d.core.settings import validate_settings  # noqa: E402
+from depth_surge_3d.io.operations import get_video_properties  # noqa: E402
+from depth_surge_3d.utils.domain.resolution import resolve_depth_input_size  # noqa: E402
 
 from flask import Flask, render_template, request, jsonify  # noqa: E402
 from flask_socketio import SocketIO  # noqa: E402
+from socketio.exceptions import (  # type: ignore[import-untyped]  # noqa: E402
+    TimeoutError as SocketIOTimeoutError,
+)
 
 # NOTE: torch is imported later (line ~960) to avoid CUDA initialization issues
 
@@ -93,6 +103,7 @@ from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
 VERBOSE = False
 SHUTDOWN_FLAG = False
 ACTIVE_PROCESSES = set()
+PROCESSING_CONFIGURATION_ACK_TIMEOUT = 5.0
 
 
 def _validate_web_settings(settings: dict[str, Any], *, source: str) -> dict[str, Any]:
@@ -107,6 +118,71 @@ def _validate_web_settings(settings: dict[str, Any], *, source: str) -> dict[str
     if preserve_source_fps:
         validated["target_fps"] = None
     return validated
+
+
+def _active_requester_socket_id(data: Any) -> str:
+    """Return the connected Socket.IO client that owns an HTTP run request."""
+    socket_id = data.get("socket_id") if isinstance(data, dict) else None
+    if not isinstance(socket_id, str) or not socketio.server.manager.is_connected(socket_id, "/"):
+        raise ValueError("A connected Socket.IO client is required")
+    return socket_id
+
+
+def _normalize_depth_backend_settings(
+    settings: dict[str, Any], *, default_backend: str = "v3"
+) -> dict[str, Any]:
+    """Resolve product-facing depth selections into the shared settings schema."""
+    normalized = dict(settings)
+    backend_id = normalized.get("depth_model_version", default_backend)
+    spec = get_backend_spec(backend_id)
+    model_path = normalized.get("model_path")
+    normalized["depth_model_version"] = backend_id
+    normalized["model_size"] = normalize_model_size(
+        backend_id,
+        model_path=model_path,
+        model_size=normalized.get("model_size"),
+    )
+    normalized["model_path"] = model_path
+    normalized["depth_resolution"] = normalized.get("depth_resolution", "auto")
+    requested_metric = bool(normalized.get("use_metric_depth", False))
+    normalized["use_metric_depth"] = (
+        True if backend_id == "moge2" else requested_metric and spec.capabilities.metric_depth
+    )
+    return normalized
+
+
+def _normalize_available_depth_backend_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_depth_backend_settings(settings)
+    availability = backend_availability(normalized["depth_model_version"])
+    if availability.available:
+        return normalized
+    error = (
+        availability.reason or f"Depth backend {normalized['depth_model_version']} is unavailable"
+    )
+    if availability.install_command:
+        error = f"{error}. Install with: {availability.install_command}"
+    raise ValueError(error)
+
+
+def _depth_backend_options() -> list[dict[str, Any]]:
+    options = []
+    for spec in list_backend_specs():
+        availability = backend_availability(spec.backend_id)
+        options.append(
+            {
+                "id": spec.backend_id,
+                "label": spec.display_name,
+                "default_model_size": spec.default_model_size,
+                "variants": [asdict(value) for value in spec.variants.values()],
+                "capabilities": {
+                    "metric_depth": spec.capabilities.metric_depth,
+                    "pinhole_fx": spec.capabilities.pinhole_fx,
+                    "stereo_geometry_modes": sorted(spec.capabilities.stereo_geometry_modes),
+                },
+                "availability": asdict(availability),
+            }
+        )
+    return options
 
 
 def vprint(*args: Any, **kwargs: Any) -> None:
@@ -328,6 +404,43 @@ current_processing = {
     "stop_requested": False,
     "thread": None,
 }
+
+
+def _is_active_job_session_id(session_id: object) -> bool:
+    """Accept only the canonical UUID room issued for the active job."""
+    if not isinstance(session_id, str):
+        return False
+    try:
+        parsed = uuid.UUID(session_id)
+    except ValueError:
+        return False
+    return (
+        parsed.version == 4
+        and str(parsed) == session_id
+        and current_processing.get("active") is True
+        and current_processing.get("session_id") == session_id
+    )
+
+
+def _acknowledge_processing_configuration(requester_socket_id: str, report: dict[str, Any]) -> None:
+    """Deliver configuration privately and require a bounded positive acknowledgement."""
+    if not socketio.server.manager.is_connected(requester_socket_id, "/"):
+        raise RuntimeError("Processing configuration requester disconnected")
+    try:
+        acknowledgement = socketio.call(
+            "processing_configuration",
+            report,
+            to=requester_socket_id,
+            timeout=PROCESSING_CONFIGURATION_ACK_TIMEOUT,
+        )
+    except SocketIOTimeoutError as error:
+        raise RuntimeError("Processing configuration acknowledgement timed out") from error
+    if (
+        type(acknowledgement) is not dict
+        or set(acknowledgement) != {"accepted"}
+        or acknowledgement["accepted"] is not True
+    ):
+        raise RuntimeError("Processing configuration was not positively acknowledged")
 
 
 def ensure_directories() -> None:
@@ -863,10 +976,12 @@ class ProgressCallback:
 
 def process_video_async(  # noqa: C901
     session_id: str,
+    requester_socket_id: str,
     video_path: str | Path,
     settings: dict[str, Any],
     output_dir: str | Path,
     resume_context: dict[str, Any] | None = None,
+    video_properties: dict[str, Any] | None = None,
 ) -> None:
     """Process video in background thread"""
     import torch  # Import here to avoid CUDA initialization issues in main thread
@@ -892,9 +1007,14 @@ def process_video_async(  # noqa: C901
                 output_dir,
                 default="v3",
             )
-        depth_model_version = settings.get("depth_model_version", "v3")  # Default to V3
-        model_size = settings.get("model_size", "vitb")  # Default to Base for 16GB GPUs
-        use_metric = settings.get("use_metric_depth", True)  # Default to metric depth
+        settings = _validate_web_settings(
+            _normalize_depth_backend_settings(settings),
+            source="explicit",
+        )
+        depth_model_version = settings["depth_model_version"]
+        model_size = settings["model_size"]
+        model_path = settings["model_path"]
+        use_metric = settings["use_metric_depth"]
 
         device = settings.get("device", "auto")
         if device == "auto":
@@ -908,32 +1028,23 @@ def process_video_async(  # noqa: C901
             )
             raise Exception(error_msg)
 
-        # Resolve the model path or Hugging Face repository for the selected backend.
-        if depth_model_version == "v2":
-            if use_metric:
-                model_paths_dict = MODEL_PATHS_METRIC
-                depth_type = "Metric"
-            else:
-                model_paths_dict = MODEL_PATHS
-                depth_type = "Relative"
+        if video_properties is None:
+            video_properties = get_video_properties(str(video_path))
+            if not video_properties:
+                video_properties = get_video_info(video_path)
+        if not video_properties:
+            raise Exception("Could not read video file")
+        settings["depth_resolution"] = resolve_depth_input_size(
+            int(video_properties["width"]),
+            int(video_properties["height"]),
+            settings.get("depth_resolution", "auto"),
+        )
+        validate_backend_geometry_request(settings, video_properties)
 
-            model_path = settings.get(
-                "model_path",
-                model_paths_dict.get(model_size, MODEL_PATHS_METRIC["vitb"]),
-            )
-            print(
-                f"Loading Video-Depth-Anything V2: {model_size.upper()} {depth_type} from: {model_path}"
-            )
-        elif depth_model_version == "see_through":
-            model_path = settings.get("model_path", DEFAULT_SEE_THROUGH_REPO)
-            use_metric = False
-            print(f"Loading See-Through Marigold: {model_path} (relative anime depth)")
-        else:
-            # For V3, map model_size to DA3 model names
-            da3_model_map = {"vits": "small", "vitb": "base", "vitl": "large"}
-            model_path = da3_model_map.get(model_size, "large")
-            print(f"Loading Depth-Anything V3: {model_path.upper()} model (metric: {use_metric})")
-
+        print(
+            f"Loading {get_backend_spec(depth_model_version).display_name}: "
+            f"{model_size} (metric inference: {use_metric})"
+        )
         print(f"Using device: {device.upper()}")
 
         projector = create_stereo_projector(
@@ -941,7 +1052,13 @@ def process_video_async(  # noqa: C901
             device,
             metric=use_metric,
             depth_model_version=depth_model_version,
+            model_size=model_size,
         )
+
+        report = build_effective_depth_run_report(settings, projector.depth_estimator)
+        _acknowledge_processing_configuration(requester_socket_id, report)
+        if settings["stereo_geometry_mode"] == "metric_camera":
+            print(TEMPORAL_STABILITY_WARNING)
 
         # Ensure the model is loaded before processing
         if not projector.load_model():
@@ -963,10 +1080,7 @@ def process_video_async(  # noqa: C901
             apply_legacy_migration(resume_report, migration_mode)
             settings = resume_report.migrated_settings
 
-        # Get video info for progress tracking
-        video_info = get_video_info(video_path)
-        if not video_info:
-            raise Exception("Could not read video file")
+        video_info = video_properties
 
         # Calculate expected frame count based on time range and ORIGINAL fps (since we extract at original fps)
         start_time = settings.get("start_time")
@@ -1099,7 +1213,7 @@ def process_video_async(  # noqa: C901
 @app.route("/")
 def index():
     """Main page"""
-    return render_template("index.html")
+    return render_template("index.html", depth_backends=_depth_backend_options())
 
 
 @app.route("/upload", methods=["POST"])
@@ -1205,7 +1319,7 @@ def upload_video() -> tuple[dict[str, Any], int] | tuple[Any, int]:
 
 
 @app.route("/process", methods=["POST"])
-def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:
+def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:  # noqa: C901
     """Start video processing"""
     if current_processing["active"]:
         return jsonify({"error": "Processing already in progress"}), 400
@@ -1215,6 +1329,7 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:
     settings = data.get("settings", {})
 
     try:
+        settings = _normalize_available_depth_backend_settings(settings)
         settings = _validate_web_settings(settings, source="explicit")
     except (TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
@@ -1255,13 +1370,45 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:
             404,
         )
 
+    try:
+        video_properties = get_video_properties(str(video_path))
+        if not video_properties:
+            raise ValueError("Could not read video file")
+        settings["depth_resolution"] = resolve_depth_input_size(
+            int(video_properties["width"]),
+            int(video_properties["height"]),
+            settings.get("depth_resolution", "auto"),
+        )
+        validate_backend_geometry_request(settings, video_properties)
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    try:
+        requester_socket_id = _active_requester_socket_id(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
     # Generate session ID
     session_id = str(uuid.uuid4())
+    current_processing["active"] = True
+    current_processing["session_id"] = session_id
 
     # Start processing in background using socketio's method for proper context handling
-    thread = socketio.start_background_task(
-        process_video_async, session_id, video_path, settings, output_dir
-    )
+    try:
+        thread = socketio.start_background_task(
+            process_video_async,
+            session_id,
+            requester_socket_id,
+            video_path,
+            settings,
+            output_dir,
+            None,
+            video_properties,
+        )
+    except Exception:
+        current_processing["active"] = False
+        current_processing["session_id"] = None
+        raise
     current_processing["thread"] = thread
 
     return jsonify({"success": True, "session_id": session_id, "output_dir": str(output_dir)})
@@ -1327,7 +1474,7 @@ def _prepare_resume_request(data: Any) -> tuple[Path, str, str | None]:
 
 
 @app.route("/resume", methods=["POST"])
-def resume_processing():
+def resume_processing():  # noqa: C901
     """Resume processing from a previous interrupted batch"""
     if current_processing["active"]:
         return jsonify({"error": "Processing already in progress"}), 400
@@ -1369,18 +1516,31 @@ def resume_processing():
     except (OSError, TypeError, ValueError) as exc:
         return jsonify({"error": f"Could not migrate resume data: {exc}"}), 409
 
+    try:
+        requester_socket_id = _active_requester_socket_id(request.json)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
     # Generate session ID
     session_id = str(uuid.uuid4())
+    current_processing["active"] = True
+    current_processing["session_id"] = session_id
 
     # Start processing in background using socketio's method for proper context handling
-    thread = socketio.start_background_task(
-        process_video_async,
-        session_id,
-        source_video,
-        settings,
-        output_path,
-        {"migration_mode": migrate_legacy, "settings_file": settings_file},
-    )
+    try:
+        thread = socketio.start_background_task(
+            process_video_async,
+            session_id,
+            requester_socket_id,
+            source_video,
+            settings,
+            output_path,
+            {"migration_mode": migrate_legacy, "settings_file": settings_file},
+        )
+    except Exception:
+        current_processing["active"] = False
+        current_processing["session_id"] = None
+        raise
     current_processing["thread"] = thread
 
     return jsonify(
@@ -1747,8 +1907,8 @@ def handle_disconnect():
 
 @socketio.on("join_session")
 def handle_join_session(data):
-    session_id = data.get("session_id")
-    if session_id:
+    session_id = data.get("session_id") if isinstance(data, dict) else None
+    if _is_active_job_session_id(session_id):
         # Join the session room for progress updates
         from flask_socketio import join_room
 
@@ -1770,6 +1930,12 @@ def handle_join_session(data):
             socketio.emit("progress_update", initial_data, room=session_id)
         except Exception as e:
             print(console_warning(f"Error emitting initial progress: {e}"))
+    else:
+        socketio.emit(
+            "session_join_error",
+            {"error": "Invalid or inactive processing session"},
+            room=request.sid,
+        )
 
 
 if __name__ == "__main__":

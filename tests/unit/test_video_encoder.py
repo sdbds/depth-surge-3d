@@ -980,6 +980,14 @@ def test_extract_frames_tolerates_small_vfr_metadata_count_drift(tmp_path):
     run.assert_not_called()
 
 
+def test_metric_geometry_npz_counts_as_downstream_progress(tmp_path: Path) -> None:
+    metric_dir = tmp_path / "metric"
+    metric_dir.mkdir()
+    (metric_dir / "frame_000001.npz").write_bytes(b"metric")
+
+    assert VideoEncoder._has_downstream_progress({"metric_geometry": metric_dir})
+
+
 def test_extract_frames_reextracts_approximate_count_without_downstream_progress(tmp_path):
     """A near-complete frame count alone cannot prove that extraction finished."""
     frames_dir = tmp_path / "frames"

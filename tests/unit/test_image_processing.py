@@ -10,6 +10,7 @@ from src.depth_surge_3d.utils.imaging.image_processing import (
     normalize_depth_map,
     resize_image,
     apply_center_crop,
+    calculate_center_crop_dimensions,
     create_vr_frame,
     validate_image_array,
     calculate_image_statistics,
@@ -17,6 +18,15 @@ from src.depth_surge_3d.utils.imaging.image_processing import (
     apply_fisheye_distortion,
     apply_fisheye_square_crop,
 )
+
+
+def test_center_crop_pixels_and_metric_width_share_odd_integer_rounding() -> None:
+    image = np.arange(5 * 7 * 3, dtype=np.uint8).reshape(5, 7, 3)
+    crop_width, crop_height = calculate_center_crop_dimensions(7, 5, 0.5)
+    cropped = apply_center_crop(image, 0.5)
+    assert (crop_width, crop_height) == (3, 2)
+    assert cropped.shape[:2] == (crop_height, crop_width)
+    np.testing.assert_array_equal(cropped, image[1:3, 2:5])
 
 
 def test_legacy_inverse_remap_and_colour_hole_helpers_are_absent():

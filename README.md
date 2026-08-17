@@ -7,13 +7,15 @@
 
 **Convert 2D videos to 3D VR format using AI depth estimation.**
 
-Depth Surge 3D transforms flat videos into stereoscopic 3D for VR headsets using **Depth Anything V3** and **Video-Depth-Anything V2** neural networks. It predicts depth with the selected backend, then generates left and right eye views for immersive stereoscopic viewing. V2 applies model-native temporal inference independently within each detected shot.
+Depth Surge 3D transforms flat videos into stereoscopic 3D for VR headsets using **Depth Anything V3**, **Video-Depth-Anything V2**, or the optional **MoGe-2** backend. It predicts depth with the selected backend, then generates left and right eye views for immersive stereoscopic viewing. V2 applies model-native temporal inference independently within each detected shot.
 
 ## Key Features
 
 - **Dual Depth Models**:
   - **Depth Anything V3** (default): 50% lower VRAM, faster processing, optimized for modern GPUs
   - **Video-Depth-Anything V2**: Shot-aware temporal consistency with fixed 32-frame windows, 10-frame overlap, and state resets at detected cuts
+- **Optional MoGe-2 Backend**: Pinned Small, Base, and Large variants with metric
+  depth and focal output. Relative geometry remains the default.
 - **AI Upscaling**: Optional Real-ESRGAN enhancement (2x/4x) for higher output resolution
 - **CUDA Hardware Acceleration**: NVENC H.265 encoding and GPU-accelerated frame decoding
 - **Configurable Depth Quality**: Adjustable depth map resolution (518px to 4K) for quality vs. speed
@@ -77,6 +79,22 @@ uv run python depth_surge_3d.py input_video.mp4
 
 **See [Usage Guide](docs/USAGE.md) for comprehensive usage examples.**
 
+### Experimental MoGe-2 Metric Camera
+
+MoGe-2 can drive the existing relative geometry path or the Experimental
+`metric_camera` path. Flat rectilinear side-by-side output remains the main
+playback path. Metric camera mode is limited to `side_by_side` with distortion
+disabled and square-pixel (`1:1` sample-aspect-ratio) sources. It does not
+establish calibrated physical scale, physically correct reconstruction,
+improved stereo quality, viewing comfort or safety, or superiority over the
+relative default.
+
+MoGe-2 performs per-frame depth and focal estimation. Temporal stability on video is not guaranteed; depth or focal drift may be visible across frames.
+
+Install the optional backend with `uv sync --extra moge2`; see the
+[Installation Guide](docs/INSTALLATION.md) for the pinned artifacts and the
+[Parameters Reference](docs/PARAMETERS.md) for the projection controls.
+
 ## Requirements
 
 - Python 3.9, 3.10, 3.11, or 3.12 (Python 3.13+ not yet supported due to dependency limitations)
@@ -136,14 +154,18 @@ This project uses state-of-the-art depth estimation models:
 
 - **[Depth Anything V3](https://github.com/ByteDance-Seed/Depth-Anything-3)** - Default model with improved memory efficiency and performance
 - **[Video-Depth-Anything V2](https://github.com/DepthAnything/Video-Depth-Anything)** - Shot-aware temporal depth estimation with fixed 32-frame windows and 10-frame overlap
+- **[Microsoft MoGe](https://github.com/microsoft/MoGe)** - Optional pinned
+  MoGe-2 metric depth backend
 
-Both models are based on vision transformer architectures optimized for monocular depth prediction.
+These models use vision transformer architectures for monocular depth prediction.
 
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details.
 
-**Third-Party Components**: Please review the [Video-Depth-Anything license](https://github.com/DepthAnything/Video-Depth-Anything) for terms before commercial use.
+**Third-Party Components**: Please review the [third-party notices](THIRD_PARTY_NOTICES.md)
+and the [Video-Depth-Anything license](https://github.com/DepthAnything/Video-Depth-Anything)
+for the licenses that apply to upstream components.
 
 ## Quality Expectations, Parallax-Glitchwave and Z-Collapse Slopcore Aesthetics
 

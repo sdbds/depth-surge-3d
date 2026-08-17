@@ -49,6 +49,10 @@ MODEL_CONFIGS = {
 DEFAULT_SETTINGS = {
     "stereo_strength": 2.0,
     "convergence": 0.5,
+    "stereo_geometry_mode": "relative",
+    "virtual_baseline_mm": 63.0,
+    "metric_convergence_distance": "auto",
+    "max_disparity_percent": 2.0,
     "occlusion_fill": "background",
     "scene_detection": True,
     "scene_cut_threshold": 0.55,
@@ -272,6 +276,7 @@ INTERMEDIATE_DIRS = {
     "scene_data": "01_scene_data",  # Candidate/final scene manifests and bounds
     "depth_raw": "02_depth_raw",  # Native model output with explicit representation
     "disparity_maps": "03_disparity_maps",  # Canonical relative-disparity maps
+    "metric_geometry": "03_metric_geometry",  # Native metric inverse-depth geometry
     "left_frames": "04_left_frames",  # Step 3: Stereo pair - left eye
     "right_frames": "04_right_frames",  # Step 3: Stereo pair - right eye
     "left_distorted": "05_left_distorted",  # Step 4: Fisheye distortion - left (optional)

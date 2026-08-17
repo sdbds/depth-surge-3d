@@ -1,5 +1,6 @@
 """Immutable model artifact resolution tests."""
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from src.depth_surge_3d.inference.depth.model_artifact import resolve_hf_snapshot
@@ -20,6 +21,45 @@ def test_remote_model_identity_uses_resolved_snapshot_revision(tmp_path, monkeyp
         repo_id="owner/model",
         cache_dir=str(tmp_path / "cache"),
     )
+
+
+def test_resolve_hf_snapshot_forwards_immutable_revision(monkeypatch, tmp_path):
+    snapshot = tmp_path / "models--owner--repo" / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    calls = []
+
+    def fake_download(**kwargs):
+        calls.append(kwargs)
+        return str(snapshot)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_download)
+
+    path, identity = resolve_hf_snapshot("owner/repo", revision="pinned123")
+
+    assert Path(path) == snapshot.resolve()
+    assert calls == [{"repo_id": "owner/repo", "revision": "pinned123"}]
+    assert identity == "hf:owner/repo@abc123"
+
+
+def test_resolve_hf_snapshot_keeps_revision_during_offline_retry(monkeypatch, tmp_path):
+    snapshot = tmp_path / "models--owner--repo" / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    calls = []
+
+    def fake_download(**kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("local_files_only"):
+            raise ConnectionError("offline")
+        return str(snapshot)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_download)
+    resolve_hf_snapshot("owner/repo", revision="pinned123")
+
+    assert calls[1] == {
+        "repo_id": "owner/repo",
+        "revision": "pinned123",
+        "local_files_only": True,
+    }
 
 
 def test_local_model_identity_changes_with_artifact_bytes(tmp_path):

@@ -471,9 +471,12 @@ Run: `uv run pytest tests/unit/test_model_artifact.py -v`
 
 Expected: PASS.
 
-Run: `uv tree --no-dev --package depth-surge-3d`
+Run: `uv sync --no-dev`
 
-Expected: the default dependency tree does not contain `moge`.
+Run: `uv pip show moge`
+
+Expected: `uv pip show moge` exits nonzero and reports `Package(s) not found for: moge`,
+confirming that the default installation state excludes the optional dependency.
 
 - [ ] **Step 6: Commit dependency and resolver changes**
 
@@ -491,12 +494,19 @@ git commit -m "build: add pinned optional MoGe-2 dependency"
 - Modify: `src/depth_surge_3d/inference/__init__.py`
 - Modify: `src/depth_surge_3d/rendering/stereo_projector.py`
 - Modify: `src/depth_surge_3d/processing/frames/depth_processor.py`
-- Modify: `src/depth_surge_3d/utils/domain/resolution.py`
+- Modify: `tests/unit/test_depth_processor.py`
 - Modify: `tests/integration/test_end_to_end.py`
 
 **Interfaces:**
 - Consumes: existing V2, V3, and See-Through factory functions and constants.
-- Produces: all registry interfaces in **Shared Interfaces** and registry-based projector construction.
+- Produces: foundational registry dataclasses plus `get_backend_spec`,
+  `list_backend_specs`, `backend_availability`, `resolve_model_variant`, and
+  `create_registered_depth_estimator`, together with registry-based projector
+  construction.
+- Deferred ownership: Task 7 implements `validate_backend_geometry_request`;
+  Task 13 implements `TEMPORAL_STABILITY_WARNING` and
+  `build_effective_depth_run_report`. The global **Shared Interfaces** section
+  remains the eventual cross-task contract.
 
 - [ ] **Step 1: Write failing registry tests for identity, variants, capabilities, and unknown IDs**
 
@@ -622,7 +632,7 @@ def _create_see_through(request: EstimatorRequest) -> Any:
     )
 ```
 
-Register V2 defaults as `vitl`, V3 defaults as `vitl`, See-Through as the single `vitl` presentation variant, and MoGe as `vitb`. The MoGe factory imports `create_video_depth_estimator_moge2` inside the function so a default installation can import the registry.
+Register V2 defaults as `vitl`, V3 defaults as `vitl`, See-Through as the single `vitl` presentation variant, and MoGe as `vitb`. The MoGe entry is a lazy adapter handoff so a default installation can import the registry; Task 4 owns `video_depth_estimator_moge2.py`, selected-factory construction, and its focused adapter test.
 
 - [ ] **Step 5: Replace projector `if/elif/else` construction with one registry call**
 
@@ -666,14 +676,14 @@ def test_projector_rejects_unknown_backend_without_constructing_an_estimator(mon
 
 - [ ] **Step 6: Run registry and projector tests**
 
-Run: `uv run pytest tests/unit/test_backend_registry.py tests/unit/test_stereo_projector.py tests/integration/test_end_to_end.py -v`
+Run: `uv run pytest tests/unit/test_depth_processor.py tests/unit/test_backend_registry.py tests/unit/test_stereo_projector.py tests/integration/test_end_to_end.py -v`
 
 Expected: PASS without importing `moge` in tests that do not select it.
 
 - [ ] **Step 7: Commit the registry slice**
 
 ```bash
-git add src/depth_surge_3d/inference/depth/backend_registry.py src/depth_surge_3d/inference/depth/__init__.py src/depth_surge_3d/inference/__init__.py src/depth_surge_3d/rendering/stereo_projector.py tests/unit/test_backend_registry.py tests/unit/test_stereo_projector.py tests/integration/test_end_to_end.py
+git add docs/superpowers/plans/2026-08-16-moge2-flat-sbs-implementation.md src/depth_surge_3d/inference/depth/backend_registry.py src/depth_surge_3d/inference/depth/__init__.py src/depth_surge_3d/inference/__init__.py src/depth_surge_3d/rendering/stereo_projector.py src/depth_surge_3d/processing/frames/depth_processor.py tests/unit/test_backend_registry.py tests/unit/test_depth_processor.py tests/unit/test_stereo_projector.py tests/integration/test_end_to_end.py
 git commit -m "refactor: centralize depth backend dispatch"
 ```
 
@@ -1776,7 +1786,7 @@ def calculate_geometry_eye_sample_offsets(
 
 `StereoRenderer.render_geometry(frame, geometry, StereoSplatSettings)` validates that geometry already matches the source raster, computes offsets once, and passes `geometry.near_score` plus `geometry.source_valid` to every band. Fill width is `ceil(width * max_eye_shift_fraction) + 2`.
 
-Retain `StereoRenderer.render(frame, canonical, StereoRenderSettings)` as a relative-only compatibility wrapper that calls `build_relative_geometry` and `render_geometry` with `max_eye_shift_fraction=stereo_strength/200`. Keep the existing `calculate_eye_sample_offsets(canonical, settings)` wrapper for callers/tests.
+Human-approved compatibility exception (2026-08-16): retain `StereoRenderer.render(frame, canonical, StereoRenderSettings)` as a relative-only compatibility wrapper that calls `build_relative_geometry`, computes eye offsets with the legacy `calculate_eye_sample_offsets(canonical, settings)` float64 operation order, and delegates those offsets to the same private splat core used by `render_geometry`, with `max_eye_shift_fraction=stereo_strength/200`. It must not delegate offset calculation through public `render_geometry`: the common formula's required operation order differs at legal half-lane boundaries. `render_geometry` continues to use `calculate_geometry_eye_sample_offsets` exactly as specified above; do not expose legacy arithmetic through common/metric geometry fields or the public geometry path.
 
 - [ ] **Step 7: Run common renderer tests and the frozen hash**
 
@@ -1811,7 +1821,10 @@ git commit -m "refactor: feed stereo renderer common geometry"
 
 ```python
 def test_metric_frame_derives_finite_inverse_depth_and_explicit_validity() -> None:
-    depth = np.array([[2.0, 0.0, np.inf], [4.0, -1.0, np.finfo(np.float32).tiny]], dtype=np.float32)
+    smallest_subnormal = np.nextafter(
+        np.float32(0.0), np.float32(1.0), dtype=np.float32
+    )
+    depth = np.array([[2.0, 0.0, np.inf], [4.0, -1.0, smallest_subnormal]], dtype=np.float32)
     frame = metric_frame_from_depth(depth, np.float32(0.8))
     assert frame.valid.tolist() == [[True, False, False], [True, False, False]]
     np.testing.assert_array_equal(
@@ -2392,9 +2405,11 @@ def test_metric_projection_zero_near_far_sign_and_foreground_convention() -> Non
     assert geometry.total_disparity_fraction[0, 0] > 0.0
     assert geometry.total_disparity_fraction[0, 1] == 0.0
     assert geometry.total_disparity_fraction[0, 2] < 0.0
-    left, right = calculate_geometry_eye_sample_offsets(
-        geometry.total_disparity_fraction
-    )
+    # The three-pixel raster is below the frozen 1/16-pixel offset quantum.
+    # Repeat the same geometry to test the foreground eye sign without
+    # changing the projection formula or Task 8 rounding contract.
+    expanded = np.tile(geometry.total_disparity_fraction, (1, 100))
+    left, right = calculate_geometry_eye_sample_offsets(expanded)
     assert left[0, 0] > right[0, 0]
     assert stats.clamped_fraction == 0.0
 
@@ -2997,8 +3012,8 @@ def resolve_depth_input_size(width: int, height: int, value: int | str) -> int:
 @pytest.mark.parametrize(
     ("width", "height", "expected"),
     [
-        (640, 360, 518),
-        (1280, 720, 518),
+        (640, 360, 640),
+        (1280, 720, 640),
         (1920, 1080, 1080),
         (3840, 2160, 2160),
         (7680, 4320, 2160),
@@ -3435,6 +3450,9 @@ git commit -m "test: cover MoGe metric pipeline and previews"
 ### Task 15: Document the Experimental Contract and Third-Party Licenses
 
 **Files:**
+- Modify: `pyproject.toml`
+- Modify: `depth_surge_3d.py`
+- Create: `src/depth_surge_3d/cli.py`
 - Modify: `README.md`
 - Modify: `docs/INSTALLATION.md`
 - Modify: `docs/PARAMETERS.md`
@@ -3445,6 +3463,7 @@ git commit -m "test: cover MoGe metric pipeline and previews"
 - Modify: `CHANGELOG.md`
 - Create: `THIRD_PARTY_NOTICES.md`
 - Create: `tests/unit/test_moge2_docs.py`
+- Modify: CLI tests that currently load the repository-root script directly
 
 **Interfaces:**
 - Consumes: the shipped commands, settings, pins, stage names, warnings, and failure behavior.
@@ -3528,6 +3547,15 @@ uv sync --extra moge2
 List Small `vits` 35M, Base `vitb` 104M default, and Large `vitl` 326M with their exact repository/revision pairs. Explain immutable source/weight resolution, offline-cache behavior, the concrete `model.pt` requirement, CPU float32 versus CUDA float16, and explicit OOM failure without fallback. Retain pip-oriented `requirements-moge2.txt` as a separate manual-install path, not as an alternative uv command.
 
 - [ ] **Step 4: Update parameters, usage, and example settings**
+
+Human-approved correction (2026-08-17): the documented `uv run depth-surge-3d`
+command must be a working installed console entrypoint. Move the canonical CLI
+implementation into importable package module `depth_surge_3d.cli`, point the
+project script at `depth_surge_3d.cli:main`, and retain the repository-root
+`depth_surge_3d.py` only as a thin backward-compatible launcher. Update CLI tests
+to exercise the package module and add a real installed-entrypoint `--help` smoke
+test. Do not replace the shipped command with a repository-only Python-script
+workaround, because the wheel does not contain the root launcher.
 
 Document the six CLI flags from the design, all four geometry settings with exact defaults/bounds, and two complete commands:
 

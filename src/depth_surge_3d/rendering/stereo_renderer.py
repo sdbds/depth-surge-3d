@@ -10,12 +10,16 @@ from typing import Literal
 
 import numpy as np
 import torch
-import torch.nn.functional as functional
 
 from .forward_splat import (
     HORIZONTAL_SUBPIXELS,
     SubpixelSplatResult,
     forward_splat_band,
+)
+from .stereo_geometry import (
+    StereoGeometryFrame,
+    _resize_float32_bilinear,
+    build_relative_geometry,
 )
 
 
@@ -36,6 +40,20 @@ class StereoRenderSettings:
             raise ValueError("stereo_strength must be finite and within [0, 5]")
         if not math.isfinite(self.convergence) or not 0.0 <= self.convergence <= 1.0:
             raise ValueError("convergence must be finite and within [0, 1]")
+        if self.occlusion_fill not in {"none", "background"}:
+            raise ValueError("occlusion_fill must be 'none' or 'background'")
+
+
+@dataclass(frozen=True)
+class StereoSplatSettings:
+    """Geometry-independent controls for splatting and occlusion fill."""
+
+    max_eye_shift_fraction: float
+    occlusion_fill: Literal["none", "background"] = "background"
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.max_eye_shift_fraction) or self.max_eye_shift_fraction < 0.0:
+            raise ValueError("max_eye_shift_fraction must be finite and nonnegative")
         if self.occlusion_fill not in {"none", "background"}:
             raise ValueError("occlusion_fill must be 'none' or 'background'")
 
@@ -88,10 +106,12 @@ def calculate_eye_sample_offsets(
     canonical: torch.Tensor,
     settings: StereoRenderSettings,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build deterministic full-frame fine-lane offsets once on the host."""
+    """Build byte-compatible legacy relative-disparity offsets."""
 
     if canonical.device.type != "cpu" or canonical.ndim != 2:
         raise ValueError("Canonical disparity must be a host-resident 2D tensor")
+    if not isinstance(settings, StereoRenderSettings):
+        raise TypeError("settings must be StereoRenderSettings")
     canonical64 = np.asarray(canonical.detach().numpy(), dtype=np.float64)
     width = canonical.shape[1]
     scale64 = np.float64(width) * np.float64(settings.stereo_strength)
@@ -106,6 +126,21 @@ def calculate_eye_sample_offsets(
     right64 = np.ceil(-fine_shift64 - np.float64(0.5))
     right = _narrow_sample_offsets(right64)
     return left, right
+
+
+def calculate_geometry_eye_sample_offsets(
+    total_disparity_fraction: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build deterministic full-frame fine-lane offsets from common geometry."""
+
+    width = total_disparity_fraction.shape[1]
+    fine_shift = np.asarray(total_disparity_fraction, dtype=np.float64)
+    fine_shift = fine_shift * np.float64(width) * np.float64(0.5)
+    fine_shift = fine_shift * np.float64(HORIZONTAL_SUBPIXELS)
+    return (
+        _narrow_sample_offsets(np.ceil(fine_shift - np.float64(0.5))),
+        _narrow_sample_offsets(np.ceil(-fine_shift - np.float64(0.5))),
+    )
 
 
 def _nearest_valid_indexes(
@@ -266,7 +301,7 @@ class StereoRenderer:
         canonical: np.ndarray,
         settings: StereoRenderSettings | None = None,
     ) -> StereoRenderResult:
-        """Resize canonical disparity once, then render both eyes in row bands."""
+        """Render relative disparity with legacy-compatible offset arithmetic."""
 
         source = np.asarray(frame)
         canonical_values = np.asarray(canonical, dtype=np.float32)
@@ -274,10 +309,60 @@ class StereoRenderer:
         self._validate_inputs(source, canonical_values, settings)
         source = np.ascontiguousarray(source)
         height, width = int(source.shape[0]), int(source.shape[1])
-        resized_canonical = self._resize_canonical(canonical_values, (height, width))
+        geometry = build_relative_geometry(
+            canonical_values,
+            (height, width),
+            stereo_strength=settings.stereo_strength,
+            convergence=settings.convergence,
+        )
         geometry_started = time.perf_counter()
-        eye_offsets = calculate_eye_sample_offsets(resized_canonical, settings)
+        legacy_near_score = torch.from_numpy(np.array(geometry.near_score, copy=True, order="C"))
+        eye_offsets = calculate_eye_sample_offsets(legacy_near_score, settings)
         geometry_seconds = time.perf_counter() - geometry_started
+        return self._render_splat_core(
+            source,
+            geometry,
+            eye_offsets,
+            StereoSplatSettings(
+                max_eye_shift_fraction=settings.stereo_strength / 200.0,
+                occlusion_fill=settings.occlusion_fill,
+            ),
+            geometry_seconds,
+        )
+
+    def render_geometry(
+        self,
+        frame: np.ndarray,
+        geometry: StereoGeometryFrame,
+        settings: StereoSplatSettings,
+    ) -> StereoRenderResult:
+        """Render backend-neutral geometry that already matches the source raster."""
+
+        source = np.asarray(frame)
+        self._validate_geometry_inputs(source, geometry, settings)
+        source = np.ascontiguousarray(source)
+        geometry_started = time.perf_counter()
+        eye_offsets = calculate_geometry_eye_sample_offsets(geometry.total_disparity_fraction)
+        geometry_seconds = time.perf_counter() - geometry_started
+        return self._render_splat_core(
+            source,
+            geometry,
+            eye_offsets,
+            settings,
+            geometry_seconds,
+        )
+
+    def _render_splat_core(
+        self,
+        source: np.ndarray,
+        geometry: StereoGeometryFrame,
+        eye_offsets: tuple[np.ndarray, np.ndarray],
+        settings: StereoSplatSettings,
+        geometry_seconds: float,
+    ) -> StereoRenderResult:
+        """Render precomputed eye offsets through the shared banded splat path."""
+
+        height, width = int(source.shape[0]), int(source.shape[1])
         geometry_bytes = sum(values.nbytes for values in eye_offsets)
         self._offset_transfer_seconds = 0.0
         self._offset_transfer_bytes = 0
@@ -290,7 +375,7 @@ class StereoRenderer:
         try:
             result = self._render_with_band_height(
                 source,
-                resized_canonical,
+                geometry,
                 eye_offsets,
                 settings,
                 first_band_height,
@@ -301,7 +386,7 @@ class StereoRenderer:
             try:
                 result = self._render_with_band_height(
                     source,
-                    resized_canonical,
+                    geometry,
                     eye_offsets,
                     settings,
                     retry_band_height,
@@ -334,6 +419,30 @@ class StereoRenderer:
     ) -> None:
         if not isinstance(settings, StereoRenderSettings):
             raise TypeError("settings must be StereoRenderSettings")
+        StereoRenderer._validate_source(source)
+        if canonical.ndim != 2 or canonical.shape[0] <= 0 or canonical.shape[1] <= 0:
+            raise ValueError("Canonical disparity must be a non-empty 2D array")
+        if not np.isfinite(canonical).all():
+            raise ValueError("Canonical disparity must be finite")
+        if np.any(canonical < 0.0) or np.any(canonical > 1.0):
+            raise ValueError("Canonical disparity must lie within [0, 1]")
+
+    @staticmethod
+    def _validate_geometry_inputs(
+        source: np.ndarray,
+        geometry: StereoGeometryFrame,
+        settings: StereoSplatSettings,
+    ) -> None:
+        if not isinstance(geometry, StereoGeometryFrame):
+            raise TypeError("geometry must be StereoGeometryFrame")
+        if not isinstance(settings, StereoSplatSettings):
+            raise TypeError("settings must be StereoSplatSettings")
+        StereoRenderer._validate_source(source)
+        if geometry.near_score.shape != source.shape[:2]:
+            raise ValueError("Stereo geometry must match the source raster")
+
+    @staticmethod
+    def _validate_source(source: np.ndarray) -> None:
         if source.ndim != 3 or source.shape[-1] != 3:
             raise ValueError("Frame must have shape [H,W,3]")
         if source.shape[0] <= 0 or source.shape[1] <= 0:
@@ -346,51 +455,32 @@ class StereoRenderer:
             raise TypeError(f"Unsupported frame dtype: {source.dtype}")
         if np.issubdtype(source.dtype, np.floating) and not np.isfinite(source).all():
             raise ValueError("Frame values must be finite")
-        if canonical.ndim != 2 or canonical.shape[0] <= 0 or canonical.shape[1] <= 0:
-            raise ValueError("Canonical disparity must be a non-empty 2D array")
-        if not np.isfinite(canonical).all():
-            raise ValueError("Canonical disparity must be finite")
-        if np.any(canonical < 0.0) or np.any(canonical > 1.0):
-            raise ValueError("Canonical disparity must lie within [0, 1]")
 
     @staticmethod
     def _resize_canonical(
         canonical: np.ndarray,
         render_shape: tuple[int, int],
     ) -> torch.Tensor:
-        tensor = torch.from_numpy(np.ascontiguousarray(canonical)).view(
-            1,
-            1,
-            canonical.shape[0],
-            canonical.shape[1],
-        )
-        if canonical.shape != render_shape:
-            tensor = functional.interpolate(
-                tensor,
-                size=render_shape,
-                mode="bilinear",
-                align_corners=False,
-            )
-        return tensor[0, 0].contiguous()
+        return torch.from_numpy(_resize_float32_bilinear(canonical, render_shape))
 
     def _render_with_band_height(
         self,
         source: np.ndarray,
-        resized_canonical: torch.Tensor,
+        geometry: StereoGeometryFrame,
         eye_offsets: tuple[np.ndarray, np.ndarray],
-        settings: StereoRenderSettings,
+        settings: StereoSplatSettings,
         band_height: int,
     ) -> StereoRenderResult:
         left_image, left_valid, left_hole = self._render_eye(
             source,
-            resized_canonical,
+            geometry,
             eye_offsets[0],
             settings,
             band_height,
         )
         right_image, right_valid, right_hole = self._render_eye(
             source,
-            resized_canonical,
+            geometry,
             eye_offsets[1],
             settings,
             band_height,
@@ -407,16 +497,16 @@ class StereoRenderer:
     def _render_eye(
         self,
         source: np.ndarray,
-        resized_canonical: torch.Tensor,
+        geometry: StereoGeometryFrame,
         sample_offsets: np.ndarray,
-        settings: StereoRenderSettings,
+        settings: StereoSplatSettings,
         band_height: int,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         height, width = source.shape[:2]
         output = np.empty_like(source)
         valid_output = np.empty((height, width), dtype=np.bool_)
         hole_output = np.empty((height, width), dtype=np.bool_)
-        max_gap_width = math.ceil(width * settings.stereo_strength / 200.0) + 2
+        max_gap_width = math.ceil(width * settings.max_eye_shift_fraction) + 2
         max_gap_samples = HORIZONTAL_SUBPIXELS * max_gap_width
 
         with torch.inference_mode():
@@ -425,13 +515,19 @@ class StereoRenderer:
                 source_band = torch.from_numpy(np.ascontiguousarray(source[start_row:end_row])).to(
                     self.device
                 )
-                canonical_band = resized_canonical[start_row:end_row].to(self.device)
+                near_score_band = torch.from_numpy(
+                    np.array(geometry.near_score[start_row:end_row], copy=True, order="C")
+                ).to(self.device)
+                source_valid_band = torch.from_numpy(
+                    np.array(geometry.source_valid[start_row:end_row], copy=True, order="C")
+                ).to(self.device)
                 offset_band = self._transfer_offset_band(sample_offsets[start_row:end_row])
                 splat = forward_splat_band(
                     source_band,
-                    canonical_band,
+                    near_score_band,
                     offset_band,
                     source_index_offset=start_row * width,
+                    source_valid=source_valid_band,
                 )
                 if settings.occlusion_fill == "background":
                     rendered, hole_mask = _fill_background_band(
@@ -452,7 +548,8 @@ class StereoRenderer:
 
                 del (
                     source_band,
-                    canonical_band,
+                    near_score_band,
+                    source_valid_band,
                     offset_band,
                     splat,
                     rendered,

@@ -14,6 +14,11 @@ import pytest
 
 from src.depth_surge_3d.processing.frames import stereo_generator
 from src.depth_surge_3d.processing.frames.depth_storage import canonical_json_hash
+from src.depth_surge_3d.processing.frames.metric_geometry import (
+    ClipConvergence,
+    MetricGeometryFrame,
+    MetricGeometryStore,
+)
 from src.depth_surge_3d.processing.frames.stereo_generator import (
     HOST_SLOT_OVERHEAD,
     HOST_STEREO_BYTES_PER_PIXEL,
@@ -23,10 +28,12 @@ from src.depth_surge_3d.processing.frames.stereo_generator import (
     calculate_stereo_pipeline_capacity,
     validate_stereo_io_workers,
 )
+from src.depth_surge_3d.rendering.stereo_geometry import StereoGeometryFrame
 from src.depth_surge_3d.rendering.stereo_renderer import (
     StereoRenderResult,
     StereoRenderer,
     StereoRenderSettings,
+    StereoSplatSettings,
 )
 
 
@@ -105,7 +112,7 @@ def _settings(**overrides: object) -> dict[str, object]:
 class _FakeRenderer:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
-        self.calls: list[tuple[int, np.ndarray, StereoRenderSettings]] = []
+        self.calls: list[tuple[int, object, object]] = []
 
     def render(
         self,
@@ -113,7 +120,23 @@ class _FakeRenderer:
         canonical: np.ndarray,
         settings: StereoRenderSettings,
     ) -> StereoRenderResult:
-        self.calls.append((threading.get_ident(), canonical.copy(), settings))
+        return self._record(frame, canonical, settings)
+
+    def render_geometry(
+        self,
+        frame: np.ndarray,
+        geometry: object,
+        settings: StereoSplatSettings,
+    ) -> StereoRenderResult:
+        return self._record(frame, geometry, settings)
+
+    def _record(
+        self,
+        frame: np.ndarray,
+        render_input: object,
+        settings: object,
+    ) -> StereoRenderResult:
+        self.calls.append((threading.get_ident(), render_input, settings))
         if self.fail:
             raise RuntimeError("render failed")
         mask = np.ones(frame.shape[:2], dtype=np.bool_)
@@ -126,6 +149,198 @@ class _FakeRenderer:
             left_hole_mask=holes.copy(),
             right_hole_mask=holes.copy(),
         )
+
+
+class _RecordingCommonRenderer:
+    def __init__(self) -> None:
+        self.geometry_calls: list[tuple[int, StereoGeometryFrame, StereoSplatSettings]] = []
+        self.relative_calls: list[tuple[int, np.ndarray, StereoRenderSettings]] = []
+
+    def render(
+        self,
+        frame: np.ndarray,
+        canonical: np.ndarray,
+        settings: StereoRenderSettings,
+    ) -> StereoRenderResult:
+        self.relative_calls.append((threading.get_ident(), canonical, settings))
+        return self._result(frame)
+
+    def render_geometry(
+        self,
+        frame: np.ndarray,
+        geometry: StereoGeometryFrame,
+        settings: StereoSplatSettings,
+    ) -> StereoRenderResult:
+        self.geometry_calls.append((threading.get_ident(), geometry, settings))
+        return self._result(frame)
+
+    @staticmethod
+    def _result(frame: np.ndarray) -> StereoRenderResult:
+        mask = np.ones(frame.shape[:2], dtype=np.bool_)
+        holes = np.zeros(frame.shape[:2], dtype=np.bool_)
+        return StereoRenderResult(
+            left_image=frame.copy(),
+            right_image=frame.copy(),
+            left_valid_mask=mask.copy(),
+            right_valid_mask=mask.copy(),
+            left_hole_mask=holes.copy(),
+            right_hole_mask=holes.copy(),
+        )
+
+
+def _make_metric_inputs(
+    root: Path,
+    *,
+    inverse_values: list[float] | None = None,
+) -> tuple[list[Path], list[Path], dict[str, Path], float]:
+    inverse_values = inverse_values or [1.0, 0.5, 0.25]
+    count = len(inverse_values)
+    frame_dir = root / "frames"
+    metric_dir = root / "metric"
+    left_dir = root / "left"
+    right_dir = root / "right"
+    for directory in (frame_dir, metric_dir, left_dir, right_dir):
+        directory.mkdir(parents=True)
+
+    frame_files: list[Path] = []
+    for index in range(count):
+        frame_path = frame_dir / f"frame_{index:04d}.png"
+        assert cv2.imwrite(str(frame_path), np.full((4, 5, 3), index + 1, dtype=np.uint8))
+        frame_files.append(frame_path)
+    store = MetricGeometryStore.open_or_create(
+        metric_dir,
+        frame_names=[path.name for path in frame_files],
+        native_shape=(2, 3),
+        source_raw_fingerprint="raw-metric",
+        source_frame_fingerprint="frames",
+        candidate_scene_fingerprint="scenes",
+        preflight_required_bytes=0,
+    )
+    for frame_path, inverse_value in zip(frame_files, inverse_values):
+        inverse = np.full((2, 3), inverse_value, dtype=np.float32)
+        store.write_frame(
+            frame_path.name,
+            MetricGeometryFrame(
+                inverse,
+                np.ones((2, 3), dtype=np.bool_),
+                np.float32(0.5),
+            ),
+        )
+    resolved_auto_distance_m = 2.0
+    store.finalize(ClipConvergence(np.float32(resolved_auto_distance_m), (0,), 6))
+    return (
+        frame_files,
+        list(store.complete_files),
+        {"left_frames": left_dir, "right_frames": right_dir},
+        resolved_auto_distance_m,
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata_mutation",
+    [
+        {"status": "writing"},
+        {"fingerprint": "not-the-completed-stage-fingerprint"},
+        {"frame_names": ["frame_0000.png", "frame_0002.png", "frame_0001.png"]},
+        {"convergence": None},
+    ],
+    ids=["status", "fingerprint", "ordered-manifest", "convergence"],
+)
+def test_metric_stereo_rejects_incomplete_stage_before_constructing_renderer(
+    tmp_path: Path,
+    metadata_mutation: dict[str, object],
+) -> None:
+    frame_files, metric_files, directories, _ = _make_metric_inputs(tmp_path)
+    metadata_path = metric_files[0].parent / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.update(metadata_mutation)
+    if "fingerprint" not in metadata_mutation:
+        metadata.pop("fingerprint")
+        metadata["fingerprint"] = canonical_json_hash(metadata)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with patch.object(
+        stereo_generator,
+        "StereoRenderer",
+        side_effect=AssertionError("renderer constructed before metric barrier"),
+    ) as renderer_factory:
+        generator = StereoPairGenerator()
+        with pytest.raises(
+            ValueError,
+            match="^metric stereo requires completed clip-global convergence metadata$",
+        ):
+            generator.create_stereo_pairs_from_files(
+                frame_files,
+                metric_files,
+                directories,
+                _settings(stereo_geometry_mode="metric_camera"),
+            )
+
+    renderer_factory.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "metric_count"),
+    [(0, 0), (3, 0), (3, 2)],
+    ids=["empty", "missing-metric-payloads", "mismatched-manifest"],
+)
+def test_metric_stereo_rejects_invalid_payload_count_before_constructing_renderer(
+    tmp_path: Path,
+    frame_count: int,
+    metric_count: int,
+) -> None:
+    frame_files, metric_files, directories, _ = _make_metric_inputs(tmp_path)
+
+    with patch.object(
+        stereo_generator,
+        "StereoRenderer",
+        side_effect=AssertionError("renderer constructed before metric barrier"),
+    ) as renderer_factory:
+        generator = StereoPairGenerator()
+        with pytest.raises(
+            ValueError,
+            match="^metric stereo requires completed clip-global convergence metadata$",
+        ):
+            generator.create_stereo_pairs_from_files(
+                frame_files[:frame_count],
+                metric_files[:metric_count],
+                directories,
+                _settings(stereo_geometry_mode="metric_camera"),
+            )
+
+    renderer_factory.assert_not_called()
+
+
+def test_relative_stereo_preserves_legacy_count_mismatch_result(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=2)
+    renderer = _FakeRenderer()
+
+    assert not StereoPairGenerator(renderer=renderer).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files[:1],
+        directories,
+        _settings(stereo_geometry_mode="relative"),
+    )
+    assert renderer.calls == []
+
+
+def test_relative_stereo_setup_does_not_read_metric_metadata(tmp_path: Path) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=1)
+    renderer = _FakeRenderer()
+
+    with patch.object(
+        MetricGeometryStore,
+        "read_metadata",
+        side_effect=AssertionError("relative setup read metric metadata"),
+    ):
+        assert StereoPairGenerator(renderer=renderer).create_stereo_pairs_from_files(
+            frame_files,
+            depth_files,
+            directories,
+            _settings(stereo_geometry_mode="relative"),
+        )
+
+    assert len(renderer.calls) == 1
 
 
 @pytest.mark.parametrize("workers", [0, -1, 17, 100])
@@ -222,6 +437,66 @@ def test_file_pipeline_uses_corrected_stereo_sign_end_to_end(tmp_path: Path) -> 
     right = cv2.imread(str(directories["right_frames"] / frame_files[0].name))
     assert result is True
     assert int(np.argmax(left[2, :, 0])) > int(np.argmax(right[2, :, 0]))
+
+
+def test_relative_file_pipeline_matches_base_legacy_bytes_at_half_lane_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    width = 8950
+    canonical_value = np.float32(0.23064221441745758)
+    frame_files, depth_files, directories = _make_file_inputs(
+        tmp_path,
+        count=1,
+        frame_shape=(1, width),
+    )
+    frame = np.random.default_rng(20260817).integers(
+        0,
+        256,
+        size=(1, width, 3),
+        dtype=np.uint8,
+    )
+    assert cv2.imwrite(str(frame_files[0]), frame)
+    assert cv2.imwrite(str(depth_files[0]), np.ones((1, width), dtype=np.uint16))
+    metadata = json.loads((depth_files[0].parent / "metadata.json").read_text())
+    metadata["encoding_scale"] = 1.0 / float(canonical_value)
+    decoded_canonical = np.ones((1, width), dtype=np.float32)
+    decoded_canonical *= np.float32(1.0 / float(metadata["encoding_scale"]))
+    assert decoded_canonical[0, 0] == canonical_value
+    settings = _settings(
+        stereo_strength=0.473053267491137,
+        convergence=0.05202130106440961,
+        occlusion_fill="none",
+        stereo_io_workers=1,
+    )
+    expected = StereoRenderer(device="cpu").render(
+        frame,
+        decoded_canonical,
+        StereoRenderSettings(
+            stereo_strength=0.473053267491137,
+            convergence=0.05202130106440961,
+            occlusion_fill="none",
+        ),
+    )
+
+    generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+    monkeypatch.setattr(
+        generator,
+        "_get_canonical_metadata",
+        lambda _depth_files, _frame_files: metadata,
+    )
+    result = generator.create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        settings,
+    )
+
+    actual_left = cv2.imread(str(directories["left_frames"] / frame_files[0].name))
+    actual_right = cv2.imread(str(directories["right_frames"] / frame_files[0].name))
+    assert result is True
+    assert np.array_equal(actual_left, expected.left_image)
+    assert np.array_equal(actual_right, expected.right_image)
 
 
 def test_file_pipeline_uses_bounded_lifecycle_permits(tmp_path: Path) -> None:
@@ -509,3 +784,176 @@ def test_wrong_native_shape_is_rejected_before_rendering(tmp_path: Path) -> None
 
     assert result is False
     assert renderer.calls == []
+
+
+def test_relative_generator_retains_canonical_for_the_legacy_renderer(
+    tmp_path: Path,
+) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=1)
+    renderer = _RecordingCommonRenderer()
+
+    assert StereoPairGenerator(renderer=renderer).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(stereo_geometry_mode="relative"),
+    )
+
+    assert len(renderer.relative_calls) == 1
+    assert not renderer.geometry_calls
+    _, canonical, render_settings = renderer.relative_calls[0]
+    assert canonical.shape == (8, 8)
+    assert render_settings == StereoRenderSettings(
+        stereo_strength=2.0,
+        convergence=0.5,
+        occlusion_fill="background",
+    )
+
+
+def test_metric_generator_uses_resolved_auto_convergence_and_common_renderer(
+    tmp_path: Path,
+) -> None:
+    frame_files, metric_files, directories, resolved_auto_distance_m = _make_metric_inputs(tmp_path)
+    renderer = _RecordingCommonRenderer()
+    settings = _settings(
+        stereo_geometry_mode="metric_camera",
+        metric_convergence_distance="auto",
+        virtual_baseline_mm=63.0,
+        max_disparity_percent=2.0,
+        crop_factor=0.75,
+        apply_distortion=False,
+        vr_format="side_by_side",
+        per_eye_width=1920,
+        vr_output_width=3840,
+    )
+    generator = StereoPairGenerator(renderer=renderer)
+
+    assert generator.create_stereo_pairs_from_files(
+        frame_files, metric_files, directories, settings
+    )
+
+    assert len(renderer.geometry_calls) == len(frame_files)
+    assert not renderer.relative_calls
+    metadata = json.loads((directories["left_frames"] / "metadata.json").read_text())
+    assert metadata["geometry_mode"] == "metric_camera"
+    assert metadata["effective_convergence_distance_m"] == pytest.approx(resolved_auto_distance_m)
+    assert metadata["source_width"] == 5
+    assert metadata["retained_crop_width"] == 3
+    assert metadata["sample_aspect_ratio"] == "1:1"
+    assert "stereo_strength" not in json.dumps(metadata)
+    assert 'convergence"' not in json.dumps(metadata)
+    assert "per_eye_width" not in json.dumps(metadata)
+    assert "vr_output_width" not in json.dumps(metadata)
+
+
+def test_mode_specific_fingerprints_ignore_inactive_and_final_width_settings(
+    tmp_path: Path,
+) -> None:
+    frame_files, metric_files, directories, _ = _make_metric_inputs(tmp_path)
+    renderer = _RecordingCommonRenderer()
+    base = _settings(
+        stereo_geometry_mode="metric_camera",
+        metric_convergence_distance=3.0,
+        virtual_baseline_mm=63.0,
+        max_disparity_percent=2.0,
+        crop_factor=0.75,
+        apply_distortion=False,
+        vr_format="side_by_side",
+        stereo_strength=1.0,
+        convergence=0.1,
+        per_eye_width=7,
+        vr_output_width=14,
+    )
+    generator = StereoPairGenerator(renderer=renderer)
+    assert generator.create_stereo_pairs_from_files(frame_files, metric_files, directories, base)
+    first = json.loads((directories["left_frames"] / "metadata.json").read_text())
+
+    changed_inactive = {
+        **base,
+        "stereo_strength": 5.0,
+        "convergence": 0.9,
+        "per_eye_width": 3840,
+        "vr_output_width": 7680,
+    }
+    assert generator.create_stereo_pairs_from_files(
+        frame_files, metric_files, directories, changed_inactive
+    )
+    second = json.loads((directories["left_frames"] / "metadata.json").read_text())
+
+    assert second["fingerprint"] == first["fingerprint"]
+    assert len(renderer.geometry_calls) == len(frame_files)
+
+
+def test_metric_pair_and_stats_sidecar_are_one_failure_unit(tmp_path: Path) -> None:
+    frame_files, metric_files, directories, _ = _make_metric_inputs(tmp_path, inverse_values=[1.0])
+    stat_dir = directories["left_frames"] / "clamp_stats"
+    generator = StereoPairGenerator(renderer=_RecordingCommonRenderer())
+
+    original_atomic_write_json = stereo_generator._atomic_write_json
+
+    def fail_stat_write(path: Path, payload: dict[str, object]) -> None:
+        if path.parent.name == "clamp_stats":
+            raise OSError("disk full")
+        original_atomic_write_json(path, payload)
+
+    with patch.object(stereo_generator, "_atomic_write_json", side_effect=fail_stat_write):
+        result = generator.create_stereo_pairs_from_files(
+            frame_files,
+            metric_files,
+            directories,
+            _settings(
+                stereo_geometry_mode="metric_camera",
+                metric_convergence_distance="auto",
+                virtual_baseline_mm=63.0,
+                max_disparity_percent=2.0,
+                crop_factor=0.75,
+            ),
+        )
+
+    assert result is False
+    assert list(directories["left_frames"].glob("*.png")) == []
+    assert list(directories["right_frames"].glob("*.png")) == []
+    assert not stat_dir.exists() or list(stat_dir.glob("*.json")) == []
+
+
+def test_metric_sidecar_repair_summary_and_source_order_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    frame_files, metric_files, directories, _ = _make_metric_inputs(
+        tmp_path,
+        inverse_values=[0.5, 100.0, 200.0],
+    )
+    settings = _settings(
+        stereo_geometry_mode="metric_camera",
+        metric_convergence_distance="auto",
+        virtual_baseline_mm=100.0,
+        max_disparity_percent=1.0,
+        crop_factor=0.75,
+    )
+    first_renderer = _RecordingCommonRenderer()
+    first_generator = StereoPairGenerator(renderer=first_renderer)
+    assert first_generator.create_stereo_pairs_from_files(
+        frame_files, metric_files, directories, settings
+    )
+    captured = capsys.readouterr().out
+
+    assert captured.count("clamped") == 1
+    assert frame_files[1].stem in captured
+    summary = first_generator.last_metric_clamp_summary
+    assert summary is not None
+    assert summary["frame_names"] == [path.stem for path in frame_files]
+    assert summary["clamped_fractions"] == [0.0, 1.0, 1.0]
+    assert summary["affected_frame_count"] == 2
+    assert summary["mean_clamped_fraction"] == pytest.approx(2.0 / 3.0)
+    assert summary["max_clamped_fraction"] == 1.0
+
+    corrupt_sidecar = directories["left_frames"] / "clamp_stats" / "frame_0002.json"
+    corrupt_sidecar.write_text("{}", encoding="utf-8")
+    second_renderer = _RecordingCommonRenderer()
+    second_generator = StereoPairGenerator(renderer=second_renderer)
+    assert second_generator.create_stereo_pairs_from_files(
+        frame_files, metric_files, directories, settings
+    )
+    assert len(second_renderer.geometry_calls) == 1
+    repaired = json.loads(corrupt_sidecar.read_text(encoding="utf-8"))
+    assert repaired["frame_name"] == "frame_0002"
