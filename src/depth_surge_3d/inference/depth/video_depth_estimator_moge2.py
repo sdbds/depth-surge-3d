@@ -153,7 +153,7 @@ class VideoDepthEstimatorMoGe2:
         """Resolve immutable weights and load the optional upstream model."""
         checkpoint_path, artifact_identity = self._resolve_checkpoint()
         try:
-            from moge.model.v2 import MoGeModel
+            from moge.model.v2 import MoGeModel  # type: ignore[import-not-found]
         except ImportError as error:
             raise RuntimeError(
                 f"MoGe-2 optional dependency is not installed. "
@@ -219,10 +219,13 @@ class VideoDepthEstimatorMoGe2:
         rgb = np.ascontiguousarray(frame[..., ::-1], dtype=np.float32)
         rgb /= 255.0
         if (target_height, target_width) != (height, width):
-            rgb = cv2.resize(
-                rgb,
-                (target_width, target_height),
-                interpolation=cv2.INTER_AREA,
+            rgb = np.asarray(
+                cv2.resize(
+                    rgb,
+                    (target_width, target_height),
+                    interpolation=cv2.INTER_AREA,
+                ),
+                dtype=np.float32,
             )
         image = torch.from_numpy(np.ascontiguousarray(rgb.transpose(2, 0, 1)))
         return image.unsqueeze(0)

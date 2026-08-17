@@ -168,6 +168,31 @@ def _fits_float16(values: np.ndarray) -> bool:
     return bool(finite.min() >= -limit and finite.max() <= limit)
 
 
+def _read_npy_header(member: Any) -> tuple[tuple[int, ...], np.dtype]:
+    version = np.lib.format.read_magic(member)
+    if version == (1, 0):
+        shape, _fortran_order, dtype = np.lib.format.read_array_header_1_0(member)
+    elif version == (2, 0):
+        shape, _fortran_order, dtype = np.lib.format.read_array_header_2_0(member)
+    else:
+        raise ValueError(f"unsupported npy header version: {version}")
+    return tuple(int(value) for value in shape), np.dtype(dtype)
+
+
+def _validate_raw_focal_payload(payload: zipfile.ZipFile, path: Path) -> None:
+    with payload.open("focal_x_normalized.npy") as focal_file:
+        focal = np.load(focal_file, allow_pickle=False)
+    if focal.ndim != 0:
+        raise RawDepthFingerprintError(f"focal_x_normalized must be a scalar: {path}")
+    if focal.dtype != np.float32:
+        raise RawDepthFingerprintError(f"focal_x_normalized must use float32: {path}")
+    focal_value = float(focal.item())
+    if not np.isfinite(focal_value):
+        raise RawDepthFingerprintError(f"focal_x_normalized must be finite: {path}")
+    if focal_value <= 0.0:
+        raise RawDepthFingerprintError(f"focal_x_normalized must be positive: {path}")
+
+
 def estimate_depth_disk_bytes(
     *,
     frame_count: int,
@@ -403,8 +428,6 @@ class RawDepthStore:
             DepthRepresentation(self.metadata.get("representation"))
         except (TypeError, ValueError) as error:
             raise RawDepthFingerprintError("Raw-depth representation mismatch") from error
-        if not isinstance(self.metadata.get("representation"), str):
-            raise RawDepthFingerprintError("Raw-depth representation mismatch")
         if self.metadata.get("frame_names") != list(frame_names):
             raise RawDepthFingerprintError("Raw-depth source frame manifest mismatch")
 
@@ -458,7 +481,7 @@ class RawDepthStore:
         allowed_dtypes: set[np.dtype],
     ) -> None:
         expected_members = ["values.npy"]
-        if self.metadata.get("schema_version") == 3 and self.camera_model == "pinhole_fx":
+        if (self.metadata.get("schema_version"), self.camera_model) == (3, "pinhole_fx"):
             expected_members.append("focal_x_normalized.npy")
         try:
             with zipfile.ZipFile(path) as payload:
@@ -468,42 +491,16 @@ class RawDepthStore:
                         f"Raw-depth payload must contain exact members {expected}: {path}"
                     )
                 with payload.open("values.npy") as values_file:
-                    version = np.lib.format.read_magic(values_file)
-                    if version == (1, 0):
-                        shape, _fortran_order, dtype = np.lib.format.read_array_header_1_0(
-                            values_file
-                        )
-                    elif version == (2, 0):
-                        shape, _fortran_order, dtype = np.lib.format.read_array_header_2_0(
-                            values_file
-                        )
-                    else:
-                        raise ValueError(f"unsupported npy header version: {version}")
+                    shape, dtype = _read_npy_header(values_file)
                 if "focal_x_normalized.npy" in expected_members:
-                    with payload.open("focal_x_normalized.npy") as focal_file:
-                        focal = np.load(focal_file, allow_pickle=False)
-                    if focal.ndim != 0:
-                        raise RawDepthFingerprintError(
-                            f"focal_x_normalized must be a scalar: {path}"
-                        )
-                    if focal.dtype != np.float32:
-                        raise RawDepthFingerprintError(
-                            f"focal_x_normalized must use float32: {path}"
-                        )
-                    focal_value = float(focal.item())
-                    if not np.isfinite(focal_value):
-                        raise RawDepthFingerprintError(f"focal_x_normalized must be finite: {path}")
-                    if focal_value <= 0.0:
-                        raise RawDepthFingerprintError(
-                            f"focal_x_normalized must be positive: {path}"
-                        )
+                    _validate_raw_focal_payload(payload, path)
         except RawDepthFingerprintError:
             raise
         except Exception as error:
             raise RawDepthFingerprintError(f"Raw-depth payload is unreadable: {path}") from error
-        if len(shape) != 2 or list(shape) != native_shape:
+        if list(shape) != native_shape:
             raise RawDepthFingerprintError(f"Raw-depth payload shape mismatch: {path}")
-        if np.dtype(dtype) not in allowed_dtypes:
+        if dtype not in allowed_dtypes:
             raise RawDepthFingerprintError(f"Raw-depth payload dtype mismatch: {path}")
 
     def validate_payloads(self, *, cleanup_temporaries: bool = True) -> int:
