@@ -980,6 +980,11 @@ class ReleaseRunFailed(RuntimeError):
         self.report_error = report_error
 
 
+def _exception_message(error: Exception) -> str:
+    notes = getattr(error, "__notes__", ())
+    return str(error) if not notes else f"{error}; {'; '.join(notes)}"
+
+
 def _input_report(corpus: CorpusConfig) -> dict[str, Any]:
     return {
         "corpus_config": str(corpus.config_path),
@@ -1122,18 +1127,43 @@ def _require_recorded_media_matches(
         raise ValueError(f"recorded media properties changed: {record['path']}")
 
 
-def _remove_unaccepted_target(destination: Path, primary_error: Exception) -> None:
+def _remove_unaccepted_target(output_root: Path, destination: Path) -> str | None:  # noqa: C901
+    """Remove a rejected target only while its complete path remains trusted."""
+
     try:
-        if os.path.lexists(destination):
-            destination.unlink()
+        raw_root = Path(os.path.abspath(output_root))
+        _assert_existing_path_components_are_real(raw_root)
+        if _is_link_or_reparse(raw_root) or not raw_root.is_dir():
+            return f"cleanup refused: evidence root is not a real directory: {raw_root}"
+        canonical_root = raw_root.resolve(strict=True)
+        absolute = Path(os.path.abspath(destination))
+        try:
+            relative = absolute.relative_to(canonical_root)
+        except ValueError:
+            return f"cleanup refused: rejected target is outside evidence root: {destination}"
+        current = canonical_root
+        for component in relative.parts[:-1]:
+            current /= component
+            if not current.exists():
+                return f"cleanup refused: evidence parent is missing: {current}"
+            if _is_link_or_reparse(current) or not current.is_dir():
+                return f"cleanup refused: evidence parent is not a real directory: {current}"
+            resolved = current.resolve(strict=True)
+            try:
+                resolved.relative_to(canonical_root)
+            except ValueError:
+                return f"cleanup refused: evidence parent escaped output root: {current}"
+        if not os.path.lexists(absolute):
+            return None
+        status = absolute.lstat()
+        if _is_link_or_reparse(absolute) or not stat.S_ISREG(status.st_mode):
+            return f"cleanup refused: rejected target is not a real regular file: {absolute}"
+        absolute.unlink()
+        if os.path.lexists(absolute):
+            return f"cleanup failed: rejected target still exists after unlink: {absolute}"
     except Exception as cleanup_error:
-        raise RuntimeError(
-            f"failed to remove rejected promoted artifact {destination}: {cleanup_error}"
-        ) from primary_error
-    if os.path.lexists(destination):
-        raise RuntimeError(
-            f"rejected promoted artifact still exists after removal: {destination}"
-        ) from primary_error
+        return f"cleanup failed for rejected promoted artifact {destination}: {cleanup_error}"
+    return None
 
 
 def _verify_committed_record(
@@ -1146,13 +1176,11 @@ def _verify_committed_record(
     expected_fps: float | None = None,
 ) -> None:
     destination = output_dir / str(record["path"])
+    _validate_evidence_target(output_dir, destination)
+    if _is_link_or_reparse(destination):
+        raise ValueError(f"post-promotion target is a symlink or reparse point: {record['path']}")
     try:
-        _validate_evidence_target(output_dir, destination)
-        if (
-            _is_link_or_reparse(destination)
-            or not destination.is_file()
-            or _hash_file(destination) != record["sha256"]
-        ):
+        if not destination.is_file() or _hash_file(destination) != record["sha256"]:
             raise ValueError(f"post-promotion hash mismatch: {record['path']}")
         if record.get("kind") == "fixed_image":
             validate_fixed_image_artifact(destination)
@@ -1173,7 +1201,9 @@ def _verify_committed_record(
             )
             _require_recorded_media_matches(record, current)
     except Exception as error:
-        _remove_unaccepted_target(destination, error)
+        cleanup_issue = _remove_unaccepted_target(output_dir, destination)
+        if cleanup_issue is not None:
+            error.add_note(cleanup_issue)
         raise
 
 
@@ -1942,6 +1972,7 @@ class ReleaseRunner:
             )
             return completed
         except Exception as error:
+            primary_message = _exception_message(error)
             if session is not None:
                 try:
                     session.unload()
@@ -1963,7 +1994,7 @@ class ReleaseRunner:
                     "clip": current_clip,
                     "stage": current_stage,
                     "error_type": type(error).__name__,
-                    "message": str(error),
+                    "message": primary_message,
                 },
             )
             report_error: Exception | None = None
@@ -1977,9 +2008,11 @@ class ReleaseRunner:
                 except Exception as second_report_error:
                     report_error = second_report_error
             if report_error is not None:
-                message = f"{error}; failure report publication also failed: {report_error}"
+                message = (
+                    f"{primary_message}; failure report publication also failed: {report_error}"
+                )
                 raise ReleaseRunFailed(message, report, report_error=report_error) from error
-            raise ReleaseRunFailed(str(error), report) from error
+            raise ReleaseRunFailed(primary_message, report) from error
 
 
 class _RecordingStereoRenderer:

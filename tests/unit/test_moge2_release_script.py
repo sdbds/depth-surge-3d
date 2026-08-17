@@ -1847,6 +1847,189 @@ def _disk_and_ledger_artifact_paths(output: Path) -> tuple[set[str], set[str]]:
     return disk, ledger
 
 
+def _remove_directory_link(link: Path) -> None:
+    if os.name == "nt":
+        os.rmdir(link)
+    else:
+        link.unlink()
+
+
+def _create_directory_link(link: Path, target: Path) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return
+    except OSError as symlink_error:
+        if os.name != "nt":
+            raise symlink_error
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        "New-Item -ItemType Junction -Path $env:MOGE_TEST_LINK "
+        "-Target $env:MOGE_TEST_TARGET | Out-Null"
+    )
+    environment = {
+        **os.environ,
+        "MOGE_TEST_LINK": str(link),
+        "MOGE_TEST_TARGET": str(target),
+    }
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise OSError(completed.stderr.strip() or "could not create directory junction")
+
+
+def _require_directory_link_support(tmp_path: Path) -> None:
+    target = tmp_path / "link-probe-target"
+    link = tmp_path / "link-probe"
+    target.mkdir()
+    try:
+        _create_directory_link(link, target)
+    except OSError:
+        pytest.skip("directory symlinks and junctions are unavailable on this host")
+    finally:
+        if os.path.lexists(link):
+            _remove_directory_link(link)
+
+
+def _require_file_link_support(tmp_path: Path) -> None:
+    target = tmp_path / "file-link-probe-target"
+    link = tmp_path / "file-link-probe"
+    target.write_bytes(b"probe")
+    try:
+        os.symlink(target, link)
+    except OSError:
+        pytest.skip("file symlinks are unavailable on this host")
+    finally:
+        if os.path.lexists(link):
+            link.unlink()
+
+
+def test_parent_redirection_before_verification_never_deletes_external_files(
+    tmp_path: Path,
+) -> None:
+    _require_directory_link_support(tmp_path)
+    config_path, _payload = _write_inputs(tmp_path)
+    output = tmp_path / "evidence"
+    external = tmp_path / "external"
+    external.mkdir()
+    external_fixed = external / "fixed-image-depth.npz"
+    external_video = external / "indoor-near-relative.mp4"
+    external_fixed.write_bytes(b"external-fixed")
+    external_video.write_bytes(b"external-video")
+    displaced = tmp_path / "displaced-vits"
+    retained: dict[str, bytes] = {}
+
+    def redirect_parent(source: Path, target: Path) -> None:
+        os.replace(source, target)
+        if Path(target).as_posix().endswith("vits/indoor-near-relative.mp4"):
+            retained.update(
+                (path.name, path.read_bytes()) for path in Path(target).parent.iterdir()
+            )
+            os.replace(Path(target).parent, displaced)
+            _create_directory_link(Path(target).parent, external)
+
+    runner, _events = _runner(tmp_path, replace_fn=redirect_parent)
+
+    with pytest.raises(ReleaseRunFailed, match="symlink or reparse"):
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert external_fixed.read_bytes() == b"external-fixed"
+    assert external_video.read_bytes() == b"external-video"
+    assert {path.name: path.read_bytes() for path in displaced.iterdir()} == retained
+    assert set(retained) == {"fixed-image-depth.npz", "indoor-near-relative.mp4"}
+
+
+def test_variant_redirection_never_deletes_an_earlier_variants_artifact(
+    tmp_path: Path,
+) -> None:
+    _require_directory_link_support(tmp_path)
+    config_path, _payload = _write_inputs(tmp_path)
+    output = tmp_path / "evidence"
+    displaced = tmp_path / "displaced-vitb"
+    accepted_vits: dict[str, bytes] = {}
+
+    def redirect_to_vits(source: Path, target: Path) -> None:
+        os.replace(source, target)
+        if Path(target).as_posix().endswith("vitb/fixed-image-depth.npz"):
+            accepted_vits.update(
+                (path.name, path.read_bytes()) for path in (output / "vits").iterdir()
+            )
+            os.replace(Path(target).parent, displaced)
+            _create_directory_link(Path(target).parent, output / "vits")
+
+    runner, _events = _runner(tmp_path, replace_fn=redirect_to_vits)
+
+    with pytest.raises(ReleaseRunFailed, match="symlink or reparse"):
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert len(accepted_vits) == 7
+    assert {path.name: path.read_bytes() for path in (output / "vits").iterdir()} == accepted_vits
+    assert (displaced / "fixed-image-depth.npz").is_file()
+
+
+def test_destination_symlink_is_neither_followed_nor_deleted(tmp_path: Path) -> None:
+    _require_file_link_support(tmp_path)
+    config_path, _payload = _write_inputs(tmp_path)
+    output = tmp_path / "evidence"
+    external = tmp_path / "external-video.mp4"
+    external.write_bytes(b"external-video")
+    attacked_target: Path | None = None
+
+    def replace_with_link(source: Path, target: Path) -> None:
+        nonlocal attacked_target
+        os.replace(source, target)
+        if Path(target).as_posix().endswith("vits/indoor-near-relative.mp4"):
+            Path(target).unlink()
+            os.symlink(external, target)
+            attacked_target = Path(target)
+
+    runner, _events = _runner(tmp_path, replace_fn=replace_with_link)
+
+    with pytest.raises(ReleaseRunFailed, match="symlink or reparse"):
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert attacked_target is not None
+    assert os.path.lexists(attacked_target)
+    assert attacked_target.is_symlink()
+    assert external.read_bytes() == b"external-video"
+    assert (output / "vits" / "fixed-image-depth.npz").is_file()
+
+
+def test_cleanup_race_refuses_redirected_parent_and_preserves_primary_error(
+    tmp_path: Path,
+) -> None:
+    _require_directory_link_support(tmp_path)
+    config_path, _payload = _write_inputs(tmp_path)
+    output = tmp_path / "evidence"
+    external = tmp_path / "external-race"
+    external.mkdir()
+    external_video = external / "indoor-near-relative.mp4"
+    external_video.write_bytes(b"external-video")
+    displaced = tmp_path / "displaced-race-vits"
+
+    def redirect_during_final_probe(path: Path) -> dict[str, Any]:
+        properties = _output_media_probe(path)
+        if path.parent == output / "vits" and path.name == "indoor-near-relative.mp4":
+            os.replace(path.parent, displaced)
+            _create_directory_link(path.parent, external)
+            properties["width"] = 11
+        return properties
+
+    runner, _events = _runner(tmp_path, media_probe=redirect_during_final_probe)
+
+    with pytest.raises(ReleaseRunFailed, match="packed output") as caught:
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert "cleanup refused" in caught.value.report["failures"][0]["message"]
+    assert external_video.read_bytes() == b"external-video"
+    assert (displaced / "fixed-image-depth.npz").is_file()
+    assert (displaced / "indoor-near-relative.mp4").is_file()
+
+
 def test_corrupt_fixed_target_is_removed_before_it_can_escape_the_ledger(tmp_path: Path) -> None:
     config_path, _payload = _write_inputs(tmp_path)
 
