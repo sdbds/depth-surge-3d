@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -20,6 +21,7 @@ from scripts.verify_moge2_release import (
     AtomicPublisher,
     ClipRender,
     FixedDepth,
+    ProductionVariantSession,
     RawClip,
     ReleaseDependencies,
     ReleaseRunFailed,
@@ -79,6 +81,16 @@ def _video_probe(_path: Path) -> dict[str, Any]:
         "fps": 24.0,
         "frame_count": 2,
         "sample_aspect_ratio": "1:1",
+    }
+
+
+def _output_media_probe(_path: Path) -> dict[str, Any]:
+    return {
+        "width": 12,
+        "height": 4,
+        "fps": 24.0,
+        "frame_count": 2,
+        "duration": 2 / 24.0,
     }
 
 
@@ -502,8 +514,9 @@ def test_measurement_structural_validation(tmp_path: Path, change, match: str) -
 
 
 class FakeCuda:
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: list[str], peaks: list[int] | None = None) -> None:
         self.events = events
+        self.peaks = iter(peaks) if peaks is not None else None
 
     def synchronize(self) -> None:
         self.events.append("cuda.sync")
@@ -513,7 +526,7 @@ class FakeCuda:
 
     def max_memory_allocated(self) -> int:
         self.events.append("cuda.max")
-        return 4096
+        return 4096 if self.peaks is None else next(self.peaks)
 
 
 class FakeSession:
@@ -531,6 +544,9 @@ class FakeSession:
 
     def infer_fixed(self, _path: Path, _resolution: int) -> FixedDepth:
         self.events.append(f"{self.model_size}.fixed")
+        self.events.append(f"{self.model_size}.fixed.path={_path}")
+        if self.fail == f"{self.model_size}.fixed":
+            raise RuntimeError("fixed boom")
         return FixedDepth(
             np.asarray([[1.0, np.inf], [2.0, 3.0]], np.float32),
             np.asarray([[True, False], [True, True]], bool),
@@ -539,6 +555,9 @@ class FakeSession:
 
     def infer_clip(self, clip, _resolution: int, workspace: Path) -> RawClip:
         self.events.append(f"{self.model_size}.{clip.clip_id}.infer")
+        self.events.append(f"{self.model_size}.{clip.clip_id}.path={clip.path}")
+        if self.fail == f"{self.model_size}.{clip.clip_id}.infer":
+            raise RuntimeError("clip inference boom")
         raw_dir = workspace / "02_depth_raw"
         raw_dir.mkdir(parents=True)
         (raw_dir / "metadata.json").write_text(
@@ -589,8 +608,10 @@ class FakeSession:
                 output_shape=(4, 12),
             )
         sidecars = []
+        sidecar_directory = raw.directory.parent / "clamp_stats"
+        sidecar_directory.mkdir()
         for index, fraction in enumerate((0.0, 0.25)):
-            sidecar = output_path.parent / f"{clip.clip_id}-{index}.json"
+            sidecar = sidecar_directory / f"{clip.clip_id}-{index}.json"
             sidecar.write_text(
                 json.dumps(
                     {
@@ -619,7 +640,14 @@ class FakeSession:
         self.events.append(f"{self.model_size}.unload")
 
 
-def _runner(tmp_path: Path, *, fail: str | None = None, replace_fn=os.replace):
+def _runner(
+    tmp_path: Path,
+    *,
+    fail: str | None = None,
+    replace_fn=os.replace,
+    media_probe=_output_media_probe,
+    peaks: list[int] | None = None,
+):
     events: list[str] = []
 
     def factory(model_size: str, _repository: str, _revision: str, _device: str):
@@ -638,10 +666,113 @@ def _runner(tmp_path: Path, *, fail: str | None = None, replace_fn=os.replace):
             "gpu": "fake-gpu",
         },
         git_probe=lambda: ("f" * 40, False),
-        cuda=FakeCuda(events),
+        media_probe=media_probe,
+        cuda=FakeCuda(events, peaks),
         publisher=AtomicPublisher(replace_fn=replace_fn, token_factory=lambda: "token"),
     )
     return ReleaseRunner(dependencies), events
+
+
+def test_production_settings_keep_fractional_source_fps_as_original(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    clip = replace(_load(config_path).clips[0], fps=24000 / 1001)
+    session = object.__new__(ProductionVariantSession)
+    session.model_size = "vits"
+    session.device = "cpu"
+
+    settings = session._resolved_settings(clip, 1080, "relative")
+
+    assert settings["target_fps"] == "original"
+
+
+@pytest.mark.parametrize(
+    "failure_kind, expected_stage",
+    [
+        ("git", "git_probe"),
+        ("system", "system_probe"),
+        ("cuda", "load_model"),
+        ("construct", "construct_model"),
+        ("vits.load", "load_model"),
+        ("vits.fixed", "fixed_image_inference"),
+        ("vits.indoor-near.infer", "clip_inference"),
+        ("vits.indoor-near.relative", "render_relative"),
+    ],
+)
+def test_every_runner_stage_failure_publishes_partial_safe_incomplete_reports(
+    tmp_path: Path,
+    failure_kind: str,
+    expected_stage: str,
+) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    runner, _events = _runner(tmp_path, fail=failure_kind)
+    if failure_kind == "git":
+        runner.dependencies = replace(
+            runner.dependencies,
+            git_probe=lambda: (_ for _ in ()).throw(RuntimeError("git boom")),
+        )
+    elif failure_kind == "system":
+        runner.dependencies = replace(
+            runner.dependencies,
+            system_probe=lambda _device: (_ for _ in ()).throw(RuntimeError("system boom")),
+        )
+    elif failure_kind == "cuda":
+
+        class FailingCuda:
+            def synchronize(self) -> None:
+                raise RuntimeError("cuda probe boom")
+
+            def reset_peak_memory_stats(self) -> None:
+                raise AssertionError("reset must follow synchronize")
+
+            def max_memory_allocated(self) -> int:
+                raise AssertionError("max must follow synchronize")
+
+        runner.dependencies = replace(runner.dependencies, cuda=FailingCuda())
+    elif failure_kind == "construct":
+        runner.dependencies = replace(
+            runner.dependencies,
+            session_factory=lambda *_args: (_ for _ in ()).throw(RuntimeError("construct boom")),
+        )
+    output = tmp_path / f"evidence-{failure_kind.replace('.', '-')}"
+
+    with pytest.raises(ReleaseRunFailed) as caught:
+        runner.run(_load(config_path), output, "cuda" if failure_kind == "cuda" else "cpu", 1080)
+
+    assert caught.value.report["status"] == "incomplete"
+    assert caught.value.report["failures"][0]["stage"] == expected_stage
+    assert (
+        json.loads((output / "report.json").read_text(encoding="utf-8"))["status"] == "incomplete"
+    )
+    assert "Status: `incomplete`" in (output / "report.md").read_text(encoding="utf-8")
+
+
+def test_markdown_renders_a_variant_before_fixed_image_fields_exist() -> None:
+    report = {
+        "tool_schema_version": 1,
+        "timestamp_utc": None,
+        "status": "incomplete",
+        "project_git": {"commit": None, "dirty": None},
+        "system": {"os": None, "python": None, "pytorch": None, "cuda": None, "gpu": None},
+        "moge_source_commit": "a" * 40,
+        "adapter_resolution_level": 9,
+        "requested_depth_resolution": 1080,
+        "inputs": {"corpus_config": "corpus.json", "fixed_image": {}, "clips": []},
+        "settings": {"device": "cpu"},
+        "variants": [
+            {
+                "model_size": "vits",
+                "repository": "repository",
+                "revision": "b" * 40,
+                "clips": [],
+            }
+        ],
+        "failures": [],
+    }
+
+    markdown = render_markdown_report(report)
+
+    assert "Status: `incomplete`" in markdown
+    assert "### vits" in markdown
 
 
 def test_fake_runner_loads_once_reuses_raw_for_modes_and_unloads_in_order(tmp_path: Path) -> None:
@@ -660,6 +791,80 @@ def test_fake_runner_loads_once_reuses_raw_for_modes_and_unloads_in_order(tmp_pa
     assert report["status"] == "complete"
 
 
+def test_models_receive_authenticated_snapshots_and_private_workspace_is_cleaned(
+    tmp_path: Path,
+) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    corpus = _load(config_path)
+    originals = {corpus.fixed_image.path, *(clip.path for clip in corpus.clips)}
+    runner, events = _runner(tmp_path)
+    output = tmp_path / "evidence"
+
+    report = runner.run(corpus, output, "cpu", 1080)
+
+    seen_paths = {Path(event.split(".path=", 1)[1]) for event in events if ".path=" in event}
+    assert seen_paths
+    assert seen_paths.isdisjoint(originals)
+    assert all(path.suffix in {".png", ".mp4"} for path in seen_paths)
+    assert all(not path.exists() for path in seen_paths)
+    assert all(output not in path.parents for path in seen_paths)
+    serialized = json.dumps(report)
+    assert all(str(path) not in serialized for path in seen_paths)
+    assert Path(report["inputs"]["fixed_image"]["path"]) == corpus.fixed_image.path
+    assert {Path(item["path"]) for item in report["inputs"]["clips"]} == {
+        clip.path for clip in corpus.clips
+    }
+
+
+def test_snapshot_copy_is_rehashed_before_any_model_work(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    runner, events = _runner(tmp_path)
+
+    def corrupting_copy(source: Path, destination: Path) -> None:
+        shutil.copyfile(source, destination)
+        if source.name == "outdoor-far.mp4":
+            destination.write_bytes(b"changed while copying")
+
+    runner.dependencies = replace(runner.dependencies, snapshot_copy=corrupting_copy)
+    output = tmp_path / "evidence"
+
+    with pytest.raises(ReleaseRunFailed, match="snapshot checksum mismatch") as caught:
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert caught.value.report["failures"][0]["stage"] == "snapshot_inputs"
+    assert not any(event.endswith(".load") for event in events)
+    assert json.loads((output / "report.json").read_text())["status"] == "incomplete"
+
+
+def test_original_mutation_after_snapshot_does_not_change_model_inputs(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    corpus = _load(config_path)
+    original_hashes = {
+        corpus.fixed_image.path: corpus.fixed_image.sha256,
+        **{clip.path: clip.sha256 for clip in corpus.clips},
+    }
+    runner, _events = _runner(tmp_path)
+    copied = 0
+
+    def mutate_after_last_copy(source: Path, destination: Path) -> None:
+        nonlocal copied
+        shutil.copyfile(source, destination)
+        copied += 1
+        if copied == 4:
+            for original in original_hashes:
+                original.write_bytes(b"changed after authenticated snapshot")
+
+    runner.dependencies = replace(runner.dependencies, snapshot_copy=mutate_after_last_copy)
+
+    report = runner.run(corpus, tmp_path / "evidence", "cpu", 1080)
+
+    assert report["status"] == "complete"
+    assert report["inputs"]["fixed_image"]["sha256"] == original_hashes[corpus.fixed_image.path]
+    assert [item["sha256"] for item in report["inputs"]["clips"]] == [
+        original_hashes[clip.path] for clip in corpus.clips
+    ]
+
+
 def test_cuda_measurement_call_order_and_cpu_zero_peak(tmp_path: Path) -> None:
     config_path, _payload = _write_inputs(tmp_path)
     runner, events = _runner(tmp_path)
@@ -668,11 +873,32 @@ def test_cuda_measurement_call_order_and_cpu_zero_peak(tmp_path: Path) -> None:
     assert events[load_index - 3 : load_index] == ["cuda.sync", "cuda.reset", "cuda.sync"]
     assert events[load_index + 1 : load_index + 3] == ["cuda.sync", "cuda.max"]
     assert report["variants"][0]["peak_vram_bytes"] == 4096
+    assert events.count("cuda.max") == 15
 
     runner, cpu_events = _runner(tmp_path)
     cpu_report = runner.run(_load(config_path), tmp_path / "cpu-evidence", "cpu", 1080)
     assert not any(event.startswith("cuda.") for event in cpu_events)
     assert cpu_report["variants"][0]["peak_vram_bytes"] == 0
+    assert cpu_report["variants"][0]["load_peak_vram_bytes"] == 0
+    assert cpu_report["variants"][0]["fixed_image_peak_vram_bytes"] == 0
+    assert all(
+        clip["inference_peak_vram_bytes"] == 0 for clip in cpu_report["variants"][0]["clips"]
+    )
+
+
+def test_variant_peak_vram_is_max_of_load_fixed_and_every_clip(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    peaks = [10, 20, 30, 50, 40] + [1] * 10
+    runner, events = _runner(tmp_path, peaks=peaks)
+
+    report = runner.run(_load(config_path), tmp_path / "evidence", "cuda", 1080)
+
+    first = report["variants"][0]
+    assert first["load_peak_vram_bytes"] == 10
+    assert first["fixed_image_peak_vram_bytes"] == 20
+    assert [clip["inference_peak_vram_bytes"] for clip in first["clips"]] == [30, 50, 40]
+    assert first["peak_vram_bytes"] == 50
+    assert events.count("cuda.reset") == 15
 
 
 def test_complete_report_schema_numeric_values_and_all_21_hashes(tmp_path: Path) -> None:
@@ -699,7 +925,10 @@ def test_complete_report_schema_numeric_values_and_all_21_hashes(tmp_path: Path)
         "repository",
         "revision",
         "load_seconds",
+        "load_peak_vram_bytes",
         "peak_vram_bytes",
+        "fixed_image_inference_seconds",
+        "fixed_image_peak_vram_bytes",
         "fixed_image_native_shape",
         "fixed_image_focal_x_normalized",
         "fixed_image_valid_metric_pixels",
@@ -723,6 +952,11 @@ def test_complete_report_schema_numeric_values_and_all_21_hashes(tmp_path: Path)
         "relative_output",
         "metric_output",
         "raw_stage_sha256",
+        "input_fps",
+        "input_frame_count",
+        "adapter_inference_call_count",
+        "inferred_frame_count",
+        "inference_peak_vram_bytes",
         "output_shape",
     }
     records = []
@@ -734,14 +968,27 @@ def test_complete_report_schema_numeric_values_and_all_21_hashes(tmp_path: Path)
         for clip in variant["clips"]:
             assert required_clip <= clip.keys()
             records.extend((clip["relative_output"], clip["metric_output"]))
+            assert clip["adapter_inference_call_count"] == clip["inferred_frame_count"] == 2
     assert len(records) == 21
     for record in records:
         path = output / record["path"]
         assert path.is_file()
         assert record["sha256"] == _sha(path)
         assert not Path(record["path"]).is_absolute()
+        if path.suffix == ".mp4":
+            assert record["media"] == _output_media_probe(path)
+    assert report["inputs"]["corpus_config_sha256"] == _sha(config_path)
+    assert report["inputs"]["authenticated_private_snapshot"] is True
     assert json.loads((output / "report.json").read_text(encoding="utf-8")) == report
     assert not list(output.rglob("*.tmp*"))
+    assert {path.name for path in output.iterdir()} == {
+        "report.json",
+        "report.md",
+        "vits",
+        "vitb",
+        "vitl",
+    }
+    assert all(len(list((output / model).iterdir())) == 7 for model in ("vits", "vitb", "vitl"))
 
 
 def test_markdown_is_deterministic_complete_and_has_unchecked_inspection_rows(
@@ -752,20 +999,37 @@ def test_markdown_is_deterministic_complete_and_has_unchecked_inspection_rows(
     report = runner.run(_load(config_path), tmp_path / "evidence", "cpu", 1080)
     first = render_markdown_report(report)
     assert first == render_markdown_report(copy.deepcopy(report))
-    for label in (
+    labels = (
         "edge tearing",
         "foreground sign",
         "scale pumping",
         "focal breathing",
         "convergence placement",
         "viewing discomfort",
-    ):
-        assert f"| [ ] | {label} |" in first
+    )
+    assert first.count("| [ ] |") == 54
+    for variant in ("vits", "vitb", "vitl"):
+        for clip_id in CANONICAL_CLIP_IDS:
+            assert first.count(f"| [ ] | {variant}/{clip_id} |") == len(labels)
+    for label in labels:
+        assert label in first
     assert "not portable thresholds" in first
     assert "do not establish physical calibration" in first
     assert "temporal stability" in first
     assert "6x4" in first
     assert "1:1" in first
+    assert report["inputs"]["corpus_config_sha256"] in first
+    for variant in report["variants"]:
+        for clip in variant["clips"]:
+            assert clip["raw_stage_sha256"] in first
+            assert str(clip["adapter_inference_call_count"]) in first
+            assert str(clip["inferred_frame_count"]) in first
+            assert str(clip["input_fps"]) in first
+            assert str(clip["input_frame_count"]) in first
+            for field in ("relative_output", "metric_output"):
+                assert clip[field]["sha256"] in first
+                for measured in clip[field]["media"].values():
+                    assert str(measured) in first
 
 
 def test_runner_rejects_non_v3_or_incomplete_raw_stage_before_render(tmp_path: Path) -> None:
@@ -831,6 +1095,121 @@ def test_failure_unloads_writes_noncomplete_reports_and_preserves_earlier_eviden
     assert (output / "vitb" / "indoor-near-relative.mp4").is_file()
     assert not (output / "vitb" / "outdoor-far-metric-camera.mp4").exists()
     assert json.loads((output / "report.json").read_text())["status"] != "complete"
+    assert "Status: `incomplete`" in (output / "report.md").read_text(encoding="utf-8")
+
+
+def test_fixed_npz_validation_and_promotion_failures_keep_atomic_reports(
+    tmp_path: Path,
+) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    runner, _events = _runner(tmp_path)
+    original_factory = runner.dependencies.session_factory
+
+    class InvalidFixedSession:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+
+        def __getattr__(self, name: str):
+            return getattr(self.inner, name)
+
+        def infer_fixed(self, path, resolution):
+            self.inner.infer_fixed(path, resolution)
+            return FixedDepth(
+                np.zeros((2, 2), np.float32),
+                np.zeros((2, 2), np.bool_),
+                np.float32(1.0),
+            )
+
+    runner.dependencies = replace(
+        runner.dependencies,
+        session_factory=lambda *args: InvalidFixedSession(original_factory(*args)),
+    )
+    invalid_output = tmp_path / "invalid-fixed"
+    with pytest.raises(ReleaseRunFailed) as invalid:
+        runner.run(_load(config_path), invalid_output, "cpu", 1080)
+    assert invalid.value.report["failures"][0]["stage"] == "fixed_image_npz"
+    assert json.loads((invalid_output / "report.json").read_text())["status"] == "incomplete"
+
+    def reject_fixed_promotion(source: Path, target: Path) -> None:
+        if Path(target).name == "fixed-image-depth.npz":
+            raise OSError("fixed promotion boom")
+        os.replace(source, target)
+
+    runner, _events = _runner(tmp_path, replace_fn=reject_fixed_promotion)
+    promotion_output = tmp_path / "promotion-fixed"
+    with pytest.raises(ReleaseRunFailed, match="fixed promotion boom") as promotion:
+        runner.run(_load(config_path), promotion_output, "cpu", 1080)
+    assert promotion.value.report["failures"][0]["stage"] == "fixed_image_promotion"
+    assert not (promotion_output / "vits" / "fixed-image-depth.npz").exists()
+    assert json.loads((promotion_output / "report.json").read_text())["status"] == "incomplete"
+
+
+def test_report_publication_failure_is_recorded_and_retried_atomically(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    failed = False
+
+    def fail_once(source: Path, target: Path) -> None:
+        nonlocal failed
+        if Path(target).name == "report.json" and not failed:
+            failed = True
+            raise OSError("report boom")
+        os.replace(source, target)
+
+    runner, _events = _runner(tmp_path, replace_fn=fail_once)
+    output = tmp_path / "evidence"
+
+    with pytest.raises(ReleaseRunFailed, match="report boom") as caught:
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert caught.value.report["failures"][0]["stage"] == "initial_report"
+    assert json.loads((output / "report.json").read_text())["status"] == "incomplete"
+    assert "Status: `incomplete`" in (output / "report.md").read_text(encoding="utf-8")
+
+
+def test_complete_report_failure_restores_both_reports_to_incomplete(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    json_publications = 0
+
+    def fail_complete_json(source: Path, target: Path) -> None:
+        nonlocal json_publications
+        if Path(target).name == "report.json":
+            json_publications += 1
+            if json_publications == 3:
+                raise OSError("complete report boom")
+        os.replace(source, target)
+
+    runner, _events = _runner(tmp_path, replace_fn=fail_complete_json)
+    output = tmp_path / "evidence"
+
+    with pytest.raises(ReleaseRunFailed, match="complete report boom") as caught:
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert caught.value.report["failures"][0]["stage"] == "publish_complete_reports"
+    assert json.loads((output / "report.json").read_text())["status"] == "incomplete"
+    assert "Status: `incomplete`" in (output / "report.md").read_text(encoding="utf-8")
+
+
+def test_last_report_publication_error_is_surfaced_without_destroying_old_reports(
+    tmp_path: Path,
+) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    output = tmp_path / "evidence"
+    output.mkdir()
+    (output / "report.json").write_text('{"status":"incomplete"}\n', encoding="utf-8")
+    (output / "report.md").write_text("Status: `incomplete`\n", encoding="utf-8")
+
+    def reject_reports(source: Path, target: Path) -> None:
+        if Path(target).name in {"report.json", "report.md"}:
+            raise OSError("reports unavailable")
+        os.replace(source, target)
+
+    runner, _events = _runner(tmp_path, replace_fn=reject_reports)
+
+    with pytest.raises(ReleaseRunFailed, match="publication also failed") as caught:
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert isinstance(caught.value.report_error, OSError)
+    assert json.loads((output / "report.json").read_text())["status"] == "incomplete"
     assert "Status: `incomplete`" in (output / "report.md").read_text(encoding="utf-8")
 
 
@@ -910,6 +1289,84 @@ def test_unexpected_nonreport_file_is_rejected_but_failure_reports_can_be_update
     assert json.loads((output / "report.json").read_text())["status"] == "incomplete"
 
 
+def test_stale_empty_directory_is_rejected_before_model_work(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    output = tmp_path / "evidence"
+    (output / "empty").mkdir(parents=True)
+    runner, events = _runner(tmp_path)
+
+    with pytest.raises(ReleaseRunFailed, match="stale or unrecorded"):
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert not any(event.endswith(".load") for event in events)
+    assert (output / "empty").is_dir()
+
+
+@pytest.mark.parametrize("extra_kind", ["file", "directory", "nested"])
+def test_complete_tree_rejects_every_unrecorded_entry(tmp_path: Path, extra_kind: str) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    published = 0
+
+    def add_extra_after_last_artifact(source: Path, target: Path) -> None:
+        nonlocal published
+        os.replace(source, target)
+        if Path(target).suffix in {".mp4", ".npz"}:
+            published += 1
+            if published == 21:
+                root = Path(target).parents[1]
+                if extra_kind == "file":
+                    (root / "notes.txt").write_text("extra", encoding="utf-8")
+                elif extra_kind == "directory":
+                    (root / "empty").mkdir()
+                else:
+                    nested = root / "vits" / "nested"
+                    nested.mkdir()
+                    (nested / "extra.bin").write_bytes(b"extra")
+
+    runner, _events = _runner(tmp_path, replace_fn=add_extra_after_last_artifact)
+    output = tmp_path / f"evidence-{extra_kind}"
+
+    with pytest.raises(ReleaseRunFailed, match="missing or unrecorded") as caught:
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert caught.value.report["status"] == "incomplete"
+    assert json.loads((output / "report.json").read_text())["status"] == "incomplete"
+
+
+def test_atomic_publisher_rejects_escape_and_linked_parent(tmp_path: Path) -> None:
+    root = tmp_path / "evidence"
+    root.mkdir()
+    publisher = AtomicPublisher(token_factory=lambda: "token")
+    with pytest.raises(ValueError, match="escaped"):
+        publisher.write_bytes(tmp_path / "outside.bin", b"bad", root=root)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = root / "vits"
+    try:
+        os.symlink(outside, linked_parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this Windows host")
+    with pytest.raises(ValueError, match="symlink or reparse"):
+        publisher.write_bytes(linked_parent / "escaped.bin", b"bad", root=root)
+    assert not (outside / "escaped.bin").exists()
+
+
+def test_runner_rejects_symlink_output_root_where_supported(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    real_output = tmp_path / "real-output"
+    real_output.mkdir()
+    linked_output = tmp_path / "linked-output"
+    try:
+        os.symlink(real_output, linked_output, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this Windows host")
+    runner, _events = _runner(tmp_path)
+
+    with pytest.raises(ValueError, match="symlink or reparse"):
+        runner.run(_load(config_path), linked_output, "cpu", 1080)
+
+
 def test_complete_status_requires_revalidation_of_all_recorded_hashes(tmp_path: Path) -> None:
     config_path, _payload = _write_inputs(tmp_path)
     replaced_media = 0
@@ -927,3 +1384,55 @@ def test_complete_status_requires_revalidation_of_all_recorded_hashes(tmp_path: 
     with pytest.raises(ReleaseRunFailed, match="recorded hash mismatch") as caught:
         runner.run(_load(config_path), tmp_path / "evidence", "cpu", 1080)
     assert caught.value.report["status"] == "incomplete"
+
+
+def test_media_is_probed_before_atomic_promotion(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+
+    def wrong_width(_path: Path) -> dict[str, Any]:
+        return {**_output_media_probe(_path), "width": 11}
+
+    runner, _events = _runner(tmp_path, media_probe=wrong_width)
+    output = tmp_path / "evidence"
+
+    with pytest.raises(ReleaseRunFailed, match="packed output") as caught:
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert caught.value.report["failures"][0]["stage"] == "validate_relative_media"
+    assert not (output / "vits" / "indoor-near-relative.mp4").exists()
+    assert json.loads((output / "report.json").read_text())["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    "field, changed, message",
+    [
+        ("width", 11, "packed output"),
+        ("height", 3, "packed output"),
+        ("frame_count", 1, "frame count"),
+        ("fps", 23.0, "fps"),
+        ("duration", 1.0, "duration"),
+    ],
+)
+def test_complete_revalidation_reprobes_every_media_property(
+    tmp_path: Path,
+    field: str,
+    changed: int | float,
+    message: str,
+) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+
+    def changes_after_publication(path: Path) -> dict[str, Any]:
+        properties = _output_media_probe(path)
+        if path.name == "indoor-near-relative.mp4":
+            properties[field] = changed
+        return properties
+
+    runner, _events = _runner(tmp_path, media_probe=changes_after_publication)
+    output = tmp_path / f"evidence-{field}"
+
+    with pytest.raises(ReleaseRunFailed, match=message) as caught:
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert caught.value.report["status"] == "incomplete"
+    assert caught.value.report["failures"][0]["stage"] == "complete_revalidation"
+    assert json.loads((output / "report.json").read_text())["status"] == "incomplete"

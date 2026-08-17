@@ -14,6 +14,7 @@ import os
 import platform
 import shutil
 import statistics
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar, cast
@@ -77,6 +78,8 @@ EXPECTED_FIXED_MEMBERS = (
 _SHA256_PATTERN = __import__("re").compile(r"[0-9a-f]{64}", flags=__import__("re").ASCII)
 _SAR_PATTERN = __import__("re").compile(r"([0-9]+):([0-9]+)", flags=__import__("re").ASCII)
 _SAR_COMPONENT_MAX = 2_147_483_647
+MEDIA_FPS_ABSOLUTE_TOLERANCE = 1e-3
+MEDIA_DURATION_FRAME_TOLERANCE = 0.5
 
 
 def _positive_int(text: str) -> int:
@@ -123,6 +126,7 @@ class ClipInput:
 @dataclass(frozen=True)
 class CorpusConfig:
     config_path: Path
+    config_sha256: str
     fixed_image: FixedImageInput
     clips: tuple[ClipInput, ...]
 
@@ -298,7 +302,8 @@ def load_corpus_config(  # noqa: C901
 
     config_path = Path(config_path).expanduser().resolve()
     try:
-        root = json.loads(config_path.read_text(encoding="utf-8"))
+        config_bytes = config_path.read_bytes()
+        root = json.loads(config_bytes.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(
             f"corpus JSON is missing, unreadable, or malformed: {config_path}"
@@ -373,6 +378,7 @@ def load_corpus_config(  # noqa: C901
         )
     return CorpusConfig(
         config_path=config_path,
+        config_sha256=hashlib.sha256(config_bytes).hexdigest(),
         fixed_image=FixedImageInput(fixed_path, fixed_hash, width, height),
         clips=tuple(clips),
     )
@@ -747,6 +753,59 @@ def compute_clip_measurements(
     }
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        status = path.lstat()
+    except FileNotFoundError:
+        return False
+    attributes = int(getattr(status, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return stat.S_ISLNK(status.st_mode) or bool(attributes & reparse_flag)
+
+
+def _assert_existing_path_components_are_real(path: Path) -> None:
+    absolute = Path(os.path.abspath(path))
+    for component in reversed((absolute, *absolute.parents)):
+        if component.exists() or component.is_symlink():
+            if _is_link_or_reparse(component):
+                raise ValueError(f"evidence path uses a symlink or reparse point: {component}")
+
+
+def _prepare_output_root(output_dir: Path) -> Path:
+    absolute = Path(os.path.abspath(Path(output_dir).expanduser()))
+    _assert_existing_path_components_are_real(absolute)
+    absolute.mkdir(parents=True, exist_ok=True)
+    _assert_existing_path_components_are_real(absolute)
+    if not absolute.is_dir():
+        raise ValueError(f"evidence output root must be a real directory: {absolute}")
+    return absolute.resolve(strict=True)
+
+
+def _validate_evidence_target(output_root: Path, destination: Path) -> Path:
+    raw_root = Path(os.path.abspath(output_root))
+    _assert_existing_path_components_are_real(raw_root)
+    root = raw_root.resolve(strict=True)
+    absolute = Path(os.path.abspath(destination))
+    try:
+        absolute.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"evidence output escaped output directory: {destination}") from error
+    _assert_existing_path_components_are_real(absolute.parent)
+    absolute.parent.mkdir(parents=True, exist_ok=True)
+    _assert_existing_path_components_are_real(absolute.parent)
+    resolved_parent = absolute.parent.resolve(strict=True)
+    try:
+        resolved_parent.relative_to(root)
+    except ValueError as error:
+        raise ValueError(
+            f"evidence output parent escaped output directory: {destination}"
+        ) from error
+    if absolute.exists() or absolute.is_symlink():
+        if _is_link_or_reparse(absolute):
+            raise ValueError(f"evidence target is a symlink or reparse point: {destination}")
+    return absolute
+
+
 class AtomicPublisher:
     """Publish one complete file through a unique same-directory temporary."""
 
@@ -759,42 +818,61 @@ class AtomicPublisher:
         self._replace = replace_fn
         self._token_factory = token_factory
 
-    def temporary_path(self, destination: Path) -> Path:
-        destination = Path(destination)
+    def temporary_path(self, destination: Path, *, root: Path | None = None) -> Path:
+        destination = (
+            _validate_evidence_target(root, destination) if root is not None else Path(destination)
+        )
         token = self._token_factory()
         return destination.with_name(f".{destination.stem}.{token}.tmp{destination.suffix}")
 
-    def commit_temporary(self, temporary: Path, destination: Path) -> None:
+    def commit_temporary(
+        self, temporary: Path, destination: Path, *, root: Path | None = None
+    ) -> None:
         temporary = Path(temporary)
-        destination = Path(destination)
+        destination = (
+            _validate_evidence_target(root, destination) if root is not None else Path(destination)
+        )
         if temporary.parent != destination.parent or temporary == destination:
             raise ValueError("atomic temporary must be a unique sibling of its destination")
-        if not temporary.is_file():
+        if _is_link_or_reparse(temporary) or not temporary.is_file():
             raise ValueError(f"atomic temporary is missing: {temporary}")
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        if root is not None:
+            _validate_evidence_target(root, temporary)
+            _validate_evidence_target(root, destination)
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._replace(temporary, destination)
         finally:
             temporary.unlink(missing_ok=True)
 
-    def write_bytes(self, destination: Path, payload: bytes) -> None:
-        destination = Path(destination)
+    def write_bytes(self, destination: Path, payload: bytes, *, root: Path | None = None) -> None:
+        destination = (
+            _validate_evidence_target(root, destination) if root is not None else Path(destination)
+        )
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.temporary_path(destination)
+        temporary = self.temporary_path(destination, root=root)
         try:
             temporary.write_bytes(payload)
-            self.commit_temporary(temporary, destination)
+            self.commit_temporary(temporary, destination, root=root)
         finally:
             temporary.unlink(missing_ok=True)
 
-    def write_text(self, destination: Path, payload: str) -> None:
-        self.write_bytes(Path(destination), payload.encode("utf-8"))
+    def write_text(self, destination: Path, payload: str, *, root: Path | None = None) -> None:
+        self.write_bytes(Path(destination), payload.encode("utf-8"), root=root)
 
-    def write_json(self, destination: Path, payload: Mapping[str, Any]) -> None:
+    def write_json(
+        self,
+        destination: Path,
+        payload: Mapping[str, Any],
+        *,
+        root: Path | None = None,
+    ) -> None:
         _validate_json_numbers(payload)
         self.write_text(
             Path(destination),
             json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            root=root,
         )
 
 
@@ -867,6 +945,10 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _default_snapshot_copy(source: Path, destination: Path) -> None:
+    shutil.copyfile(source, destination)
+
+
 @dataclass(frozen=True)
 class ReleaseDependencies:
     session_factory: Callable[[str, str, str, str], ReleaseSession]
@@ -874,19 +956,30 @@ class ReleaseDependencies:
     utc_now: Callable[[], str] = _utc_now
     system_probe: Callable[[str], dict[str, Any]] = _default_system_probe
     git_probe: Callable[[], tuple[str, bool]] = _default_git_probe
+    media_probe: Callable[[Path], dict[str, Any]] = _default_video_probe
+    snapshot_copy: Callable[[Path, Path], None] = _default_snapshot_copy
     cuda: CudaProbe | None = None
     publisher: AtomicPublisher = AtomicPublisher()
 
 
 class ReleaseRunFailed(RuntimeError):
-    def __init__(self, message: str, report: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        message: str,
+        report: dict[str, Any],
+        *,
+        report_error: Exception | None = None,
+    ) -> None:
         super().__init__(message)
         self.report = report
+        self.report_error = report_error
 
 
 def _input_report(corpus: CorpusConfig) -> dict[str, Any]:
     return {
         "corpus_config": str(corpus.config_path),
+        "corpus_config_sha256": corpus.config_sha256,
+        "authenticated_private_snapshot": False,
         "fixed_image": {
             "path": str(corpus.fixed_image.path),
             "sha256": corpus.fixed_image.sha256,
@@ -920,31 +1013,127 @@ def _expected_evidence_paths() -> set[Path]:
     return expected
 
 
-def _output_record(output_dir: Path, path: Path) -> dict[str, str]:
+def _validated_media_properties(
+    path: Path,
+    *,
+    expected_shape: tuple[int, int],
+    expected_frame_count: int,
+    expected_fps: float,
+    probe: Callable[[Path], dict[str, Any]],
+) -> dict[str, int | float]:
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise ValueError(f"rendered evidence video is missing or empty: {path}")
+    properties = probe(path)
+    if not isinstance(properties, dict) or not properties:
+        raise ValueError(f"rendered evidence video properties are missing: {path}")
+    width = _probe_dimension(properties.get("width"), "rendered video width")
+    height = _probe_dimension(properties.get("height"), "rendered video height")
+    frame_count = _probe_dimension(properties.get("frame_count"), "rendered video frame_count")
+    fps = _require_finite_number(properties.get("fps"), "rendered video fps", minimum=0.0)
+    duration = _require_finite_number(
+        properties.get("duration"), "rendered video duration", minimum=0.0
+    )
+    expected_height, expected_width = expected_shape
+    if (height, width) != (expected_height, expected_width):
+        raise ValueError(
+            "rendered video dimensions do not match packed output: "
+            f"expected {expected_width}x{expected_height}, got {width}x{height}"
+        )
+    if frame_count != expected_frame_count:
+        raise ValueError(
+            "rendered video frame count does not match source: "
+            f"expected {expected_frame_count}, got {frame_count}"
+        )
+    if abs(fps - expected_fps) > MEDIA_FPS_ABSOLUTE_TOLERANCE:
+        raise ValueError(
+            "rendered video fps does not match source: " f"expected {expected_fps}, got {fps}"
+        )
+    expected_duration = expected_frame_count / expected_fps
+    duration_tolerance = MEDIA_DURATION_FRAME_TOLERANCE / expected_fps
+    if abs(duration - expected_duration) > duration_tolerance:
+        raise ValueError(
+            "rendered video duration does not match source timing: "
+            f"expected {expected_duration}, got {duration}"
+        )
+    return {
+        "width": width,
+        "height": height,
+        "frame_count": frame_count,
+        "fps": fps,
+        "duration": duration,
+    }
+
+
+def _output_record(
+    output_dir: Path,
+    path: Path,
+    *,
+    media: Mapping[str, int | float] | None = None,
+) -> dict[str, Any]:
     resolved_output = output_dir.resolve()
     resolved_path = path.resolve()
     try:
         relative = resolved_path.relative_to(resolved_output)
     except ValueError as error:
         raise ValueError(f"evidence output escaped output directory: {path}") from error
-    return {"path": relative.as_posix(), "sha256": _hash_file(path)}
+    record: dict[str, Any] = {"path": relative.as_posix(), "sha256": _hash_file(path)}
+    if media is not None:
+        record["media"] = dict(media)
+    return record
 
 
-def _recorded_outputs(report: Mapping[str, Any]) -> list[dict[str, str]]:
-    records: list[dict[str, str]] = []
+def _recorded_outputs(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
     for variant in cast(list[dict[str, Any]], report.get("variants", [])):
         fixed = variant.get("fixed_image_output")
         if isinstance(fixed, dict):
-            records.append(cast(dict[str, str], fixed))
+            records.append(cast(dict[str, Any], fixed))
         for clip in cast(list[dict[str, Any]], variant.get("clips", [])):
             for field in ("relative_output", "metric_output"):
                 record = clip.get(field)
                 if isinstance(record, dict):
-                    records.append(cast(dict[str, str], record))
+                    records.append(cast(dict[str, Any], record))
     return records
 
 
-def _validate_complete_evidence(report: Mapping[str, Any], output_dir: Path) -> None:
+def _validate_complete_tree(output_dir: Path) -> None:
+    _assert_existing_path_components_are_real(output_dir)
+    expected_root = {"report.json", "report.md", *(pin[0] for pin in RELEASE_VARIANT_PINS)}
+    observed_root = {entry.name for entry in os.scandir(output_dir)}
+    if observed_root != expected_root:
+        raise ValueError("complete evidence tree contains missing or unrecorded root entries")
+    for report_name in ("report.json", "report.md"):
+        report_path = output_dir / report_name
+        if _is_link_or_reparse(report_path) or not report_path.is_file():
+            raise ValueError(f"complete evidence report is not a real file: {report_name}")
+    for model_size, _repository, _revision in RELEASE_VARIANT_PINS:
+        directory = output_dir / model_size
+        if _is_link_or_reparse(directory) or not directory.is_dir():
+            raise ValueError(f"complete evidence variant is not a real directory: {model_size}")
+        expected_names = {
+            "fixed-image-depth.npz",
+            *(
+                f"{clip_id}-{suffix}.mp4"
+                for clip_id in CANONICAL_CLIP_IDS
+                for suffix in ("relative", "metric-camera")
+            ),
+        }
+        entries = list(os.scandir(directory))
+        if {entry.name for entry in entries} != expected_names:
+            raise ValueError(
+                f"complete evidence variant contains missing or unrecorded entries: {model_size}"
+            )
+        for entry in entries:
+            path = Path(entry.path)
+            if _is_link_or_reparse(path) or not entry.is_file(follow_symlinks=False):
+                raise ValueError(f"complete evidence entry is not a real file: {path}")
+
+
+def _validate_complete_evidence(  # noqa: C901
+    report: Mapping[str, Any],
+    output_dir: Path,
+    media_probe: Callable[[Path], dict[str, Any]],
+) -> None:
     variants = report.get("variants")
     if not isinstance(variants, list) or [item.get("model_size") for item in variants] != [
         pin[0] for pin in RELEASE_VARIANT_PINS
@@ -961,30 +1150,76 @@ def _validate_complete_evidence(report: Mapping[str, Any], output_dir: Path) -> 
     observed = {Path(record["path"]) for record in records}
     if len(records) != 21 or observed != expected:
         raise ValueError("complete evidence must record exactly all 21 media/NPZ outputs")
-    actual_candidates = {
-        path.relative_to(output_dir)
-        for path in output_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in {".mp4", ".npz"}
-    }
-    if actual_candidates != expected:
-        raise ValueError("evidence directory contains missing or unrecorded media/NPZ output")
     for record in records:
         path = output_dir / record["path"]
-        if not path.is_file() or _hash_file(path) != record["sha256"]:
+        _validate_evidence_target(output_dir, path)
+        if _is_link_or_reparse(path) or not path.is_file() or _hash_file(path) != record["sha256"]:
             raise ValueError(f"recorded hash mismatch: {record['path']}")
         if path.suffix == ".npz":
             validate_fixed_image_artifact(path)
+    for variant in cast(list[dict[str, Any]], variants):
+        for clip in cast(list[dict[str, Any]], variant["clips"]):
+            shape = clip.get("output_shape")
+            if (
+                not isinstance(shape, list)
+                or len(shape) != 2
+                or any(isinstance(item, bool) or not isinstance(item, int) for item in shape)
+            ):
+                raise ValueError("complete evidence clip has invalid output shape")
+            for field in ("relative_output", "metric_output"):
+                record = cast(dict[str, Any], clip[field])
+                current = _validated_media_properties(
+                    output_dir / record["path"],
+                    expected_shape=(shape[0], shape[1]),
+                    expected_frame_count=clip["input_frame_count"],
+                    expected_fps=clip["input_fps"],
+                    probe=media_probe,
+                )
+                recorded = record.get("media")
+                if not isinstance(recorded, dict) or set(recorded) != set(current):
+                    raise ValueError(f"recorded media properties are incomplete: {record['path']}")
+                if any(
+                    (
+                        current[key] != recorded[key]
+                        if key in {"width", "height", "frame_count"}
+                        else abs(float(current[key]) - float(recorded[key]))
+                        > MEDIA_FPS_ABSOLUTE_TOLERANCE
+                    )
+                    for key in current
+                ):
+                    raise ValueError(f"recorded media properties changed: {record['path']}")
     if report.get("failures") != []:
         raise ValueError("complete evidence cannot contain failures")
+    _validate_complete_tree(output_dir)
 
 
-def _format_output(record: Mapping[str, str]) -> str:
-    return f"`{record['path']}` (`{record['sha256']}`)"
+def _format_output(record: Mapping[str, Any]) -> str:
+    media = record.get("media")
+    suffix = f"; media `{media}`" if media is not None else ""
+    return f"`{record.get('path')}` (`{record.get('sha256')}`{suffix})"
 
 
-def render_markdown_report(report: Mapping[str, Any]) -> str:
+def _report_mapping(item: object) -> Mapping[str, Any]:
+    return cast(Mapping[str, Any], item) if isinstance(item, dict) else {}
+
+
+def _report_list(item: object) -> list[Any]:
+    return cast(list[Any], item) if isinstance(item, list) else []
+
+
+def render_markdown_report(report: Mapping[str, Any]) -> str:  # noqa: C901
     """Render the JSON evidence identities and observations without thresholds."""
 
+    def value(item: object) -> str:
+        if isinstance(item, (dict, list, tuple)):
+            rendered = json.dumps(item, sort_keys=True, allow_nan=False)
+        else:
+            rendered = str(item)
+        return rendered.replace("|", "\\|").replace("\n", " ")
+
+    project_git = _report_mapping(report.get("project_git"))
+    system = _report_mapping(report.get("system"))
+    inputs = _report_mapping(report.get("inputs"))
     lines = [
         "# MoGe-2 Three-Variant Release Evidence",
         "",
@@ -994,34 +1229,42 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
         "",
         "| Field | Value |",
         "|---|---|",
-        f"| Tool schema | `{report['tool_schema_version']}` |",
-        f"| UTC timestamp | `{report['timestamp_utc']}` |",
-        f"| Git commit | `{report['project_git']['commit']}` |",
-        f"| Git dirty | `{str(report['project_git']['dirty']).lower()}` |",
-        f"| OS | `{report['system']['os']}` |",
-        f"| Python | `{report['system']['python']}` |",
-        f"| PyTorch | `{report['system']['pytorch']}` |",
-        f"| CUDA | `{report['system']['cuda']}` |",
-        f"| GPU | `{report['system']['gpu']}` |",
-        f"| MoGe source commit | `{report['moge_source_commit']}` |",
-        f"| Adapter resolution level | `{report['adapter_resolution_level']}` |",
-        f"| Requested depth resolution | `{report['requested_depth_resolution']}` |",
+        f"| Tool schema | `{value(report.get('tool_schema_version'))}` |",
+        f"| UTC timestamp | `{value(report.get('timestamp_utc'))}` |",
+        f"| Git commit | `{value(project_git.get('commit'))}` |",
+        f"| Git dirty | `{value(project_git.get('dirty'))}` |",
+        f"| OS | `{value(system.get('os'))}` |",
+        f"| Python | `{value(system.get('python'))}` |",
+        f"| PyTorch | `{value(system.get('pytorch'))}` |",
+        f"| CUDA | `{value(system.get('cuda'))}` |",
+        f"| GPU | `{value(system.get('gpu'))}` |",
+        f"| MoGe source commit | `{value(report.get('moge_source_commit'))}` |",
+        f"| Adapter resolution level | `{value(report.get('adapter_resolution_level'))}` |",
+        f"| Requested depth resolution | `{value(report.get('requested_depth_resolution'))}` |",
         "",
         "## Inputs",
         "",
-        "| Kind/ID | Path | SHA-256 | Dimensions | SAR | ROI |",
-        "|---|---|---|---|---|---|",
+        "| Kind/ID | Path | SHA-256 | Dimensions | FPS | Frames | SAR | ROI |",
+        "|---|---|---|---|---:|---:|---|---|",
+        f"| corpus config | `{value(inputs.get('corpus_config'))}` | "
+        f"`{value(inputs.get('corpus_config_sha256'))}` | n/a | n/a | n/a | n/a | "
+        f"authenticated snapshot: `{value(inputs.get('authenticated_private_snapshot'))}` |",
     ]
-    fixed = report["inputs"]["fixed_image"]
-    lines.append(
-        f"| fixed image | `{fixed['path']}` | `{fixed['sha256']}` | "
-        f"{fixed['width']}x{fixed['height']} | n/a | n/a |"
-    )
-    for clip in report["inputs"]["clips"]:
+    fixed = _report_mapping(inputs.get("fixed_image"))
+    if fixed:
         lines.append(
-            f"| {clip['id']} | `{clip['path']}` | `{clip['sha256']}` | "
-            f"{clip['width']}x{clip['height']} | {clip['sample_aspect_ratio']} | "
-            f"`{clip['static_roi_xywh']}` |"
+            f"| fixed image | `{value(fixed.get('path'))}` | `{value(fixed.get('sha256'))}` | "
+            f"{value(fixed.get('width'))}x{value(fixed.get('height'))} | n/a | n/a | n/a | n/a |"
+        )
+    for clip in _report_list(inputs.get("clips")):
+        if not isinstance(clip, dict):
+            continue
+        lines.append(
+            f"| {value(clip.get('id'))} | `{value(clip.get('path'))}` | "
+            f"`{value(clip.get('sha256'))}` | {value(clip.get('width'))}x"
+            f"{value(clip.get('height'))} | {value(clip.get('fps'))} | "
+            f"{value(clip.get('frame_count'))} | {value(clip.get('sample_aspect_ratio'))} | "
+            f"`{value(clip.get('static_roi_xywh'))}` |"
         )
     lines.extend(
         [
@@ -1032,50 +1275,74 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             "|---|---|",
         ]
     )
-    for key, value in report["settings"].items():
-        lines.append(f"| {key} | `{value}` |")
+    settings = _report_mapping(report.get("settings"))
+    for key, setting_value in settings.items():
+        lines.append(f"| {key} | `{value(setting_value)}` |")
     lines.extend(["", "## Measurements and Outputs", ""])
-    for variant in report["variants"]:
+    variants = _report_list(report.get("variants"))
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
         lines.extend(
             [
-                f"### {variant['model_size']}",
+                f"### {value(variant.get('model_size'))}",
                 "",
-                f"Repository/revision: `{variant['repository']}@{variant['revision']}`  ",
-                f"Load seconds: `{variant['load_seconds']}`  ",
-                f"Peak VRAM bytes: `{variant['peak_vram_bytes']}`  ",
-                f"Fixed native shape: `{variant['fixed_image_native_shape']}`  ",
-                f"Fixed focal: `{variant['fixed_image_focal_x_normalized']}`  ",
-                f"Fixed valid metric pixels: `{variant['fixed_image_valid_metric_pixels']}`  ",
-                f"Fixed output: {_format_output(variant['fixed_image_output'])}",
+                f"Repository/revision: `{value(variant.get('repository'))}@"
+                f"{value(variant.get('revision'))}`  ",
+                f"Load seconds: `{value(variant.get('load_seconds'))}`  ",
+                f"Load peak VRAM bytes: `{value(variant.get('load_peak_vram_bytes'))}`  ",
+                f"Variant peak VRAM bytes: `{value(variant.get('peak_vram_bytes'))}`  ",
+                f"Fixed inference seconds: `{value(variant.get('fixed_image_inference_seconds'))}`  ",
+                f"Fixed peak VRAM bytes: `{value(variant.get('fixed_image_peak_vram_bytes'))}`  ",
+                f"Fixed native shape: `{value(variant.get('fixed_image_native_shape'))}`  ",
+                f"Fixed focal: `{value(variant.get('fixed_image_focal_x_normalized'))}`  ",
+                f"Fixed valid metric pixels: `{value(variant.get('fixed_image_valid_metric_pixels'))}`  ",
+                f"Fixed output: {_format_output(variant.get('fixed_image_output', {}))}",
                 "",
-                "| Clip | Output HxW | sec/frame | focal min/max/stddev | ROI depth means/stddev | "
-                "ROI disparity means/stddev | holes relative/metric | clamp fractions | Outputs |",
-                "|---|---|---:|---|---|---|---|---|---|",
+                "| Clip/input SHA | FPS/frames | Calls/inferred | Raw SHA | Inference peak | Output HxW | "
+                "sec/frame | focal min/max/stddev | ROI depth means/stddev | ROI disparity "
+                "means/stddev | holes relative/metric | clamp fractions | Outputs + media probe |",
+                "|---|---|---|---|---:|---|---:|---|---|---|---|---|---|",
             ]
         )
-        for clip in variant["clips"]:
+        clips = _report_list(variant.get("clips"))
+        for clip in clips:
+            if not isinstance(clip, dict):
+                continue
             outputs = (
-                f"relative {_format_output(clip['relative_output'])}; "
-                f"metric {_format_output(clip['metric_output'])}"
+                f"relative {_format_output(clip.get('relative_output', {}))}; "
+                f"metric {_format_output(clip.get('metric_output', {}))}"
             )
             lines.append(
-                f"| {clip['id']} | {clip['output_shape']} | "
-                f"{clip['inference_seconds_per_frame']} | "
-                f"{clip['focal_min']} / {clip['focal_max']} / {clip['focal_stddev']} | "
-                f"{clip['roi_metric_depth_mean_per_frame']} / "
-                f"{clip['roi_metric_depth_stddev']} | "
-                f"{clip['roi_output_disparity_mean_per_frame']} / "
-                f"{clip['roi_output_disparity_stddev']} | "
-                f"{clip['relative_hole_fraction']} / {clip['metric_hole_fraction']} | "
-                f"{clip['metric_clamped_fraction_per_frame']} | {outputs} |"
+                f"| {value(clip.get('id'))} / `{value(clip.get('input_sha256'))}` | "
+                f"{value(clip.get('input_fps'))} / {value(clip.get('input_frame_count'))} | "
+                f"{value(clip.get('adapter_inference_call_count'))} / "
+                f"{value(clip.get('inferred_frame_count'))} | "
+                f"`{value(clip.get('raw_stage_sha256'))}` | "
+                f"{value(clip.get('inference_peak_vram_bytes'))} | "
+                f"{value(clip.get('output_shape'))} | "
+                f"{value(clip.get('inference_seconds_per_frame'))} | "
+                f"{value(clip.get('focal_min'))} / {value(clip.get('focal_max'))} / "
+                f"{value(clip.get('focal_stddev'))} | "
+                f"{value(clip.get('roi_metric_depth_mean_per_frame'))} / "
+                f"{value(clip.get('roi_metric_depth_stddev'))} | "
+                f"{value(clip.get('roi_output_disparity_mean_per_frame'))} / "
+                f"{value(clip.get('roi_output_disparity_stddev'))} | "
+                f"{value(clip.get('relative_hole_fraction'))} / "
+                f"{value(clip.get('metric_hole_fraction'))} | "
+                f"{value(clip.get('metric_clamped_fraction_per_frame'))} | {outputs} |"
             )
     lines.extend(["", "## Failures", ""])
-    if report["failures"]:
+    failures = _report_list(report.get("failures"))
+    if failures:
         lines.extend(["| Variant | Clip | Stage | Type | Message |", "|---|---|---|---|---|"])
-        for failure in report["failures"]:
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
             lines.append(
-                f"| {failure['variant'] or ''} | {failure['clip'] or ''} | "
-                f"{failure['stage']} | {failure['error_type']} | {failure['message']} |"
+                f"| {value(failure.get('variant') or '')} | {value(failure.get('clip') or '')} | "
+                f"{value(failure.get('stage'))} | {value(failure.get('error_type'))} | "
+                f"{value(failure.get('message'))} |"
             )
     else:
         lines.append("None recorded.")
@@ -1084,14 +1351,30 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             "",
             "## Human Inspection",
             "",
-            "| Sign-off | Observation | Notes |",
-            "|---|---|---|",
-            "| [ ] | edge tearing | |",
-            "| [ ] | foreground sign | |",
-            "| [ ] | scale pumping | |",
-            "| [ ] | focal breathing | |",
-            "| [ ] | convergence placement | |",
-            "| [ ] | viewing discomfort | |",
+            "| Sign-off | Variant/clip A/B group | Observation | Notes |",
+            "|---|---|---|---|",
+        ]
+    )
+    inspection_labels = (
+        "edge tearing",
+        "foreground sign",
+        "scale pumping",
+        "focal breathing",
+        "convergence placement",
+        "viewing discomfort",
+    )
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        clips = _report_list(variant.get("clips"))
+        for clip in clips:
+            if not isinstance(clip, dict):
+                continue
+            group = f"{value(variant.get('model_size'))}/{value(clip.get('id'))}"
+            for label in inspection_labels:
+                lines.append(f"| [ ] | {group} | {label} | |")
+    lines.extend(
+        [
             "",
             "These unit metrics are structural observations, not portable thresholds. They do not "
             "establish physical calibration, better quality, comfort, or temporal stability.",
@@ -1130,23 +1413,34 @@ class ReleaseRunner:
 
     @staticmethod
     def _reject_stale_outputs(output_dir: Path) -> None:
-        if not output_dir.exists():
-            return
-        candidates = [
-            path
-            for path in output_dir.rglob("*")
-            if path.is_file()
-            and path.relative_to(output_dir).as_posix() not in {"report.json", "report.md"}
-        ]
-        if candidates:
-            relative = candidates[0].relative_to(output_dir).as_posix()
-            raise ValueError(f"stale or unrecorded evidence output exists: {relative}")
+        _assert_existing_path_components_are_real(output_dir)
+        for entry in os.scandir(output_dir):
+            path = Path(entry.path)
+            if entry.name not in {"report.json", "report.md"}:
+                raise ValueError(f"stale or unrecorded evidence output exists: {entry.name}")
+            if _is_link_or_reparse(path) or not entry.is_file(follow_symlinks=False):
+                raise ValueError(f"failure report path is not a real file: {entry.name}")
 
     def _write_reports(self, report: dict[str, Any], output_dir: Path) -> None:
         self.dependencies.publisher.write_text(
-            output_dir / "report.md", render_markdown_report(report)
+            output_dir / "report.md", render_markdown_report(report), root=output_dir
         )
-        self.dependencies.publisher.write_json(output_dir / "report.json", report)
+        self.dependencies.publisher.write_json(output_dir / "report.json", report, root=output_dir)
+
+    def _snapshot_corpus(self, corpus: CorpusConfig, workspace: Path) -> CorpusConfig:
+        fixed_path = workspace / f"fixed-image{corpus.fixed_image.path.suffix}"
+        self.dependencies.snapshot_copy(corpus.fixed_image.path, fixed_path)
+        if _hash_file(fixed_path) != corpus.fixed_image.sha256:
+            raise ValueError("authenticated fixed-image snapshot checksum mismatch")
+        fixed = replace(corpus.fixed_image, path=fixed_path)
+        clips: list[ClipInput] = []
+        for clip in corpus.clips:
+            snapshot_path = workspace / f"{clip.clip_id}{clip.path.suffix}"
+            self.dependencies.snapshot_copy(clip.path, snapshot_path)
+            if _hash_file(snapshot_path) != clip.sha256:
+                raise ValueError(f"authenticated {clip.clip_id} snapshot checksum mismatch")
+            clips.append(replace(clip, path=snapshot_path))
+        return replace(corpus, fixed_image=fixed, clips=tuple(clips))
 
     def run(  # noqa: C901
         self,
@@ -1161,14 +1455,19 @@ class ReleaseRunner:
             raise TypeError("depth resolution must be an integer")
         if depth_resolution <= 0:
             raise ValueError("depth resolution must be positive")
-        output_dir = Path(output_dir).expanduser().resolve()
-        commit, dirty = self.dependencies.git_probe()
+        output_dir = _prepare_output_root(output_dir)
         report: dict[str, Any] = {
             "tool_schema_version": TOOL_SCHEMA_VERSION,
-            "timestamp_utc": self.dependencies.utc_now(),
+            "timestamp_utc": None,
             "status": "incomplete",
-            "project_git": {"commit": commit, "dirty": bool(dirty)},
-            "system": self.dependencies.system_probe(device),
+            "project_git": {"commit": None, "dirty": None},
+            "system": {
+                "os": None,
+                "python": None,
+                "pytorch": None,
+                "cuda": None,
+                "gpu": None,
+            },
             "moge_source_commit": MOGE_SOURCE_COMMIT,
             "adapter_resolution_level": ADAPTER_RESOLUTION_LEVEL,
             "requested_depth_resolution": depth_resolution,
@@ -1179,157 +1478,235 @@ class ReleaseRunner:
         }
         current_variant: str | None = None
         current_clip: str | None = None
-        current_stage = "preflight"
+        current_stage = "initial_report"
         session: ReleaseSession | None = None
         try:
+            self._write_reports(report, output_dir)
+            current_stage = "preflight"
             self._reject_stale_outputs(output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            for model_size, repository, revision in release_variants():
-                current_variant = model_size
-                current_clip = None
-                current_stage = "construct_model"
-                session = self.dependencies.session_factory(
-                    model_size, repository, revision, device
-                )
-                current_stage = "load_model"
-                _unused, load_seconds, peak_vram_bytes = self._measure(device, session.load)
-                variant_report: dict[str, Any] = {
-                    "model_size": model_size,
-                    "repository": repository,
-                    "revision": revision,
-                    "load_seconds": load_seconds,
-                    "peak_vram_bytes": peak_vram_bytes,
-                    "clips": [],
-                }
-                report["variants"].append(variant_report)
-
-                current_stage = "fixed_image_inference"
-                fixed = session.infer_fixed(corpus.fixed_image.path, depth_resolution)
-                fixed_destination = output_dir / model_size / "fixed-image-depth.npz"
-                fixed_destination.parent.mkdir(parents=True, exist_ok=True)
-                fixed_temporary = self.dependencies.publisher.temporary_path(fixed_destination)
+            current_stage = "timestamp_probe"
+            report["timestamp_utc"] = self.dependencies.utc_now()
+            current_stage = "git_probe"
+            commit, dirty = self.dependencies.git_probe()
+            report["project_git"] = {"commit": commit, "dirty": bool(dirty)}
+            current_stage = "system_probe"
+            report["system"] = self.dependencies.system_probe(device)
+            current_stage = "snapshot_inputs"
+            with tempfile.TemporaryDirectory(
+                prefix=f".{output_dir.name}-authenticated-", dir=output_dir.parent
+            ) as snapshot_directory:
+                private_root = Path(snapshot_directory).resolve(strict=True)
                 try:
-                    write_fixed_image_artifact(fixed_temporary, fixed)
-                    fixed_values = validate_fixed_image_artifact(fixed_temporary)
-                    self.dependencies.publisher.commit_temporary(fixed_temporary, fixed_destination)
-                finally:
-                    fixed_temporary.unlink(missing_ok=True)
-                variant_report.update(
-                    {
-                        "fixed_image_native_shape": fixed_values["native_shape"],
-                        "fixed_image_focal_x_normalized": fixed_values["focal_x_normalized"],
-                        "fixed_image_valid_metric_pixels": fixed_values["valid_metric_pixels"],
-                        "fixed_image_output": _output_record(output_dir, fixed_destination),
+                    private_root.relative_to(output_dir)
+                except ValueError:
+                    pass
+                else:
+                    raise ValueError("authenticated input workspace must be outside evidence tree")
+                authenticated = self._snapshot_corpus(corpus, private_root)
+                report["inputs"]["authenticated_private_snapshot"] = True
+
+                for model_size, repository, revision in release_variants():
+                    current_variant = model_size
+                    current_clip = None
+                    variant_report: dict[str, Any] = {
+                        "model_size": model_size,
+                        "repository": repository,
+                        "revision": revision,
+                        "load_seconds": None,
+                        "load_peak_vram_bytes": None,
+                        "peak_vram_bytes": 0,
+                        "clips": [],
                     }
-                )
+                    report["variants"].append(variant_report)
+                    current_stage = "construct_model"
+                    session = self.dependencies.session_factory(
+                        model_size, repository, revision, device
+                    )
+                    current_stage = "load_model"
+                    _unused, load_seconds, load_peak = self._measure(device, session.load)
+                    variant_report.update(
+                        {
+                            "load_seconds": load_seconds,
+                            "load_peak_vram_bytes": load_peak,
+                            "peak_vram_bytes": load_peak,
+                        }
+                    )
 
-                for clip in corpus.clips:
-                    current_clip = clip.clip_id
-                    with tempfile.TemporaryDirectory(
-                        prefix=f"moge2-release-{model_size}-{clip.clip_id}-"
-                    ) as temporary_directory:
-                        workspace = Path(temporary_directory)
-                        current_stage = "clip_inference"
-                        active_session = session
-                        assert active_session is not None
-
-                        def infer_current_clip() -> RawClip:
-                            return active_session.infer_clip(clip, depth_resolution, workspace)
-
-                        raw, measured_seconds, _inference_peak = self._measure(
-                            device,
-                            infer_current_clip,
+                    current_stage = "fixed_image_inference"
+                    fixed, fixed_seconds, fixed_peak = self._measure(
+                        device,
+                        lambda: cast(ReleaseSession, session).infer_fixed(
+                            authenticated.fixed_image.path, depth_resolution
+                        ),
+                    )
+                    variant_report["fixed_image_inference_seconds"] = fixed_seconds
+                    variant_report["fixed_image_peak_vram_bytes"] = fixed_peak
+                    variant_report["peak_vram_bytes"] = max(
+                        variant_report["peak_vram_bytes"], fixed_peak
+                    )
+                    fixed_destination = output_dir / model_size / "fixed-image-depth.npz"
+                    fixed_temporary = self.dependencies.publisher.temporary_path(
+                        fixed_destination, root=output_dir
+                    )
+                    try:
+                        current_stage = "fixed_image_npz"
+                        write_fixed_image_artifact(fixed_temporary, fixed)
+                        fixed_values = validate_fixed_image_artifact(fixed_temporary)
+                        current_stage = "fixed_image_promotion"
+                        self.dependencies.publisher.commit_temporary(
+                            fixed_temporary, fixed_destination, root=output_dir
                         )
-                        _validate_raw_clip(raw)
-                        _validate_raw_stage(raw)
-                        inference_seconds = (
-                            measured_seconds
-                            if raw.inference_seconds is None
-                            else _require_finite_number(
-                                raw.inference_seconds,
-                                "session inference seconds",
-                                minimum=0.0,
+                    finally:
+                        fixed_temporary.unlink(missing_ok=True)
+                    variant_report.update(
+                        {
+                            "fixed_image_native_shape": fixed_values["native_shape"],
+                            "fixed_image_focal_x_normalized": fixed_values["focal_x_normalized"],
+                            "fixed_image_valid_metric_pixels": fixed_values["valid_metric_pixels"],
+                            "fixed_image_output": _output_record(output_dir, fixed_destination),
+                        }
+                    )
+
+                    for clip in authenticated.clips:
+                        current_clip = clip.clip_id
+                        with tempfile.TemporaryDirectory(
+                            prefix=f"moge2-release-{model_size}-{clip.clip_id}-",
+                            dir=private_root,
+                        ) as temporary_directory:
+                            workspace = Path(temporary_directory)
+                            current_stage = "clip_inference"
+                            active_session = cast(ReleaseSession, session)
+
+                            def infer_current_clip() -> RawClip:
+                                return active_session.infer_clip(clip, depth_resolution, workspace)
+
+                            raw, measured_seconds, inference_peak = self._measure(
+                                device, infer_current_clip
                             )
-                        )
-                        raw_hash = _hash_tree(raw.directory)
-                        renders: dict[str, ClipRender] = {}
-                        output_records: dict[str, dict[str, str]] = {}
-                        for mode, suffix in (
-                            ("relative", "relative"),
-                            ("metric_camera", "metric-camera"),
-                        ):
-                            current_stage = f"render_{mode}"
-                            destination = output_dir / model_size / f"{clip.clip_id}-{suffix}.mp4"
-                            temporary = self.dependencies.publisher.temporary_path(destination)
-                            try:
-                                rendered = session.render_clip(
-                                    clip,
-                                    raw,
-                                    mode,
-                                    temporary,
-                                    dict(PROJECTION_SETTINGS),
+                            variant_report["peak_vram_bytes"] = max(
+                                variant_report["peak_vram_bytes"], inference_peak
+                            )
+                            _validate_raw_clip(raw)
+                            _validate_raw_stage(raw)
+                            inference_seconds = (
+                                measured_seconds
+                                if raw.inference_seconds is None
+                                else _require_finite_number(
+                                    raw.inference_seconds,
+                                    "session inference seconds",
+                                    minimum=0.0,
                                 )
-                                if Path(rendered.output_path).resolve() != temporary.resolve():
-                                    raise ValueError(
-                                        "session rendered output does not match requested sibling temporary"
-                                    )
-                                if not temporary.is_file() or temporary.stat().st_size <= 0:
-                                    raise ValueError("rendered evidence video is missing or empty")
-                                _validate_output_shape(rendered)
-                                if _hash_tree(raw.directory) != raw_hash:
-                                    raise ValueError(
-                                        "raw stage changed while reusing it across modes"
-                                    )
-                                self.dependencies.publisher.commit_temporary(temporary, destination)
-                            finally:
-                                temporary.unlink(missing_ok=True)
-                            renders[mode] = rendered
-                            output_records[mode] = _output_record(output_dir, destination)
-                        current_stage = "measure_clip"
-                        if (
-                            renders["relative"].output_shape
-                            != renders["metric_camera"].output_shape
-                        ):
-                            raise ValueError(
-                                "relative and metric modes must use identical final output shapes"
                             )
-                        measurements = compute_clip_measurements(
-                            raw,
-                            renders["relative"],
-                            renders["metric_camera"],
-                            source_shape=(clip.height, clip.width),
-                            source_roi_xywh=clip.static_roi_xywh,
-                            inference_seconds=inference_seconds,
-                        )
-                        variant_report["clips"].append(
-                            {
-                                "id": clip.clip_id,
-                                "input_sha256": clip.sha256,
-                                "raw_stage_sha256": raw_hash,
-                                "output_shape": list(
-                                    cast(tuple[int, int], renders["relative"].output_shape)
-                                ),
-                                **measurements,
-                                "relative_output": output_records["relative"],
-                                "metric_output": output_records["metric_camera"],
-                            }
-                        )
-                current_stage = "unload_model"
-                session.unload()
-                session = None
+                            raw_hash = _hash_tree(raw.directory)
+                            renders: dict[str, ClipRender] = {}
+                            output_records: dict[str, dict[str, Any]] = {}
+                            for mode, suffix in (
+                                ("relative", "relative"),
+                                ("metric_camera", "metric-camera"),
+                            ):
+                                current_stage = f"render_{mode}"
+                                destination = (
+                                    output_dir / model_size / f"{clip.clip_id}-{suffix}.mp4"
+                                )
+                                temporary = self.dependencies.publisher.temporary_path(
+                                    destination, root=output_dir
+                                )
+                                try:
+                                    rendered = active_session.render_clip(
+                                        clip,
+                                        raw,
+                                        mode,
+                                        temporary,
+                                        dict(PROJECTION_SETTINGS),
+                                    )
+                                    if Path(rendered.output_path).resolve() != temporary.resolve():
+                                        raise ValueError(
+                                            "session rendered output does not match requested sibling temporary"
+                                        )
+                                    _validate_output_shape(rendered)
+                                    output_shape = cast(tuple[int, int], rendered.output_shape)
+                                    current_stage = f"validate_{mode}_media"
+                                    media = _validated_media_properties(
+                                        temporary,
+                                        expected_shape=output_shape,
+                                        expected_frame_count=clip.frame_count,
+                                        expected_fps=clip.fps,
+                                        probe=self.dependencies.media_probe,
+                                    )
+                                    if _hash_tree(raw.directory) != raw_hash:
+                                        raise ValueError(
+                                            "raw stage changed while reusing it across modes"
+                                        )
+                                    current_stage = f"promote_{mode}_media"
+                                    self.dependencies.publisher.commit_temporary(
+                                        temporary, destination, root=output_dir
+                                    )
+                                finally:
+                                    temporary.unlink(missing_ok=True)
+                                renders[mode] = rendered
+                                output_records[mode] = _output_record(
+                                    output_dir, destination, media=media
+                                )
+                            current_stage = "measure_clip"
+                            if (
+                                renders["relative"].output_shape
+                                != renders["metric_camera"].output_shape
+                            ):
+                                raise ValueError(
+                                    "relative and metric modes must use identical final output shapes"
+                                )
+                            measurements = compute_clip_measurements(
+                                raw,
+                                renders["relative"],
+                                renders["metric_camera"],
+                                source_shape=(clip.height, clip.width),
+                                source_roi_xywh=clip.static_roi_xywh,
+                                inference_seconds=inference_seconds,
+                            )
+                            variant_report["clips"].append(
+                                {
+                                    "id": clip.clip_id,
+                                    "input_sha256": clip.sha256,
+                                    "input_fps": clip.fps,
+                                    "input_frame_count": clip.frame_count,
+                                    "adapter_inference_call_count": raw.inference_calls,
+                                    "inferred_frame_count": raw.inferred_frame_count,
+                                    "inference_peak_vram_bytes": inference_peak,
+                                    "raw_stage_sha256": raw_hash,
+                                    "output_shape": list(
+                                        cast(
+                                            tuple[int, int],
+                                            renders["relative"].output_shape,
+                                        )
+                                    ),
+                                    **measurements,
+                                    "relative_output": output_records["relative"],
+                                    "metric_output": output_records["metric_camera"],
+                                }
+                            )
+                    current_stage = "unload_model"
+                    session.unload()
+                    session = None
 
             current_variant = None
             current_clip = None
             current_stage = "complete_revalidation"
-            _validate_complete_evidence(report, output_dir)
+            _validate_complete_evidence(report, output_dir, self.dependencies.media_probe)
+            current_stage = "publish_incomplete_reports"
             self._write_reports(report, output_dir)
-            _validate_complete_evidence(report, output_dir)
+            current_stage = "complete_revalidation"
+            _validate_complete_evidence(report, output_dir, self.dependencies.media_probe)
             completed = dict(report)
             completed["status"] = "complete"
+            current_stage = "publish_complete_reports"
             self.dependencies.publisher.write_text(
-                output_dir / "report.md", render_markdown_report(completed)
+                output_dir / "report.md",
+                render_markdown_report(completed),
+                root=output_dir,
             )
-            self.dependencies.publisher.write_json(output_dir / "report.json", completed)
+            self.dependencies.publisher.write_json(
+                output_dir / "report.json", completed, root=output_dir
+            )
             return completed
         except Exception as error:
             if session is not None:
@@ -1356,11 +1733,19 @@ class ReleaseRunner:
                     "message": str(error),
                 },
             )
+            report_error: Exception | None = None
             try:
-                output_dir.mkdir(parents=True, exist_ok=True)
                 self._write_reports(report, output_dir)
-            except Exception:
-                pass
+            except Exception as first_report_error:
+                report_error = first_report_error
+                try:
+                    self._write_reports(report, output_dir)
+                    report_error = None
+                except Exception as second_report_error:
+                    report_error = second_report_error
+            if report_error is not None:
+                message = f"{error}; failure report publication also failed: {report_error}"
+                raise ReleaseRunFailed(message, report, report_error=report_error) from error
             raise ReleaseRunFailed(str(error), report) from error
 
 
@@ -1443,6 +1828,7 @@ class ProductionVariantSession:
     def _resolved_settings(
         self, clip: ClipInput, depth_resolution: int, mode: str
     ) -> dict[str, Any]:
+        _ensure_project_import_path()
         from depth_surge_3d.core.settings import validate_settings
         from depth_surge_3d.inference.depth.backend_registry import (
             validate_backend_geometry_request,
@@ -1462,7 +1848,7 @@ class ProductionVariantSession:
                 "keep_intermediates": True,
                 "preserve_audio": False,
                 "direct_vr_encode": False,
-                "target_fps": clip.fps,
+                "target_fps": "original",
                 "raw_storage_dtype": "float32",
             },
             source="explicit",

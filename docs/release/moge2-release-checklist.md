@@ -66,19 +66,24 @@ uv run --extra moge2 python scripts/verify_moge2_release.py `
 - [ ] Confirm the runner processes exactly `vits`, `vitb`, and `vitl` in that order.
 - [ ] Confirm each model is loaded once, used for the fixed image and all three clips/two modes, then unloaded before the next model.
 - [ ] Confirm the command exits zero and `report.json` has top-level `status: "complete"` with an empty failures list.
+- [ ] Confirm the report records the immutable `corpus.json` SHA-256 and that processing used authenticated private input snapshots; no temporary snapshot path may appear in either report.
 
 ## 5. Verify Machine Evidence
 
 - [ ] Confirm all 18 A/B videos exist: three clips times two modes times three variants.
+- [ ] Confirm the output root contains exactly `report.json`, `report.md`, the three real variant directories, and their 21 expected artifacts. Reject any extra file, directory, temporary, symlink, junction, or nested entry.
 - [ ] Confirm all three `fixed-image-depth.npz` files exist and each contains only `depth.npy`, `valid.npy`, and `focal_x_normalized.npy`.
 - [ ] Confirm `report.json` records every input hash, all 21 output hashes, the three exact repositories/revisions, MoGe source commit `925b8ed835a7a9cdb7578ba15c658a0afc969030`, adapter level `9`, and depth resolution `1080`.
 - [ ] Recompute SHA-256 for every reported video and NPZ and compare it with the complete JSON hash set.
 - [ ] Confirm every relative/metric pair used identical output, crop, packing, and distortion settings and that each clip reports one inference pass reused by both modes.
+- [ ] Confirm each video record includes probed packed width/height, source frame count, native source FPS, and duration, and independently re-probe those values before sign-off.
+- [ ] Confirm each variant's peak VRAM is the maximum of its separately recorded load, fixed-image inference, and three clip-inference peaks.
+- [ ] Confirm every clip records source FPS/frame count, raw-stage SHA-256, adapter inference-call count, and inferred-frame count.
 - [ ] Confirm `report.md` contains the same machine, input, setting, measurement, output, and failure identities as `report.json`.
 
 ## 6. Human Inspection and Sign-Off
 
-Review every A/B pair for every variant and clip. Complete every unchecked row in `report.md`:
+Review every A/B pair for every variant and clip. `report.md` contains six unchecked rows for each of the nine variant/clip A/B groups (54 rows total). Complete every row:
 
 - [ ] Edge tearing
 - [ ] Foreground sign
