@@ -44,6 +44,16 @@ class TestVideoProcessorInit:
         assert processor.depth_processor.verbose is True
         assert processor.stereo_generator.verbose is True
 
+    def test_init_wires_temporal_stabilizer_without_constructing_a_model(self):
+        temporal_stabilizer = Mock()
+
+        processor = VideoProcessor(
+            Mock(),
+            temporal_stabilizer=temporal_stabilizer,
+        )
+
+        assert processor.orchestrator.temporal_stabilizer is temporal_stabilizer
+
 
 class TestVideoProcessorProcess:
     """Test VideoProcessor.process delegation."""
@@ -106,9 +116,22 @@ class TestVideoProcessorProcess:
         settings = {"vr_format": "side_by_side"}
         progress_callback = None
 
+        job_lock = object()
         result = processor.process(
-            video_path, output_dir, video_properties, settings, progress_callback
+            video_path,
+            output_dir,
+            video_properties,
+            settings,
+            progress_callback,
+            job_lock=job_lock,
         )
 
         assert result is True
-        processor.orchestrator.process.assert_called_once()
+        processor.orchestrator.process.assert_called_once_with(
+            video_path,
+            output_dir,
+            video_properties,
+            settings,
+            progress_tracker=progress_callback,
+            job_lock=job_lock,
+        )

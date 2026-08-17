@@ -195,6 +195,17 @@ PROGRESS_STEP_WEIGHTS = [
     0.08,  # Step 7: VR Assembly (moderate - side-by-side combining)
     0.07,  # Step 8: Video Creation (moderate - FFmpeg encoding)
 ]  # Weighted progress distribution (sums to 1.00)
+VDPP_PROGRESS_STEP_WEIGHTS = [
+    0.02,  # Frame Extraction
+    0.28,  # Depth Map Generation
+    0.07,  # Temporal Depth Stabilization
+    0.20,  # Stereo Pair Creation
+    0.08,  # Fisheye Distortion
+    0.02,  # Crop Frames
+    0.18,  # AI Upscaling
+    0.08,  # VR Assembly
+    0.07,  # Video Creation
+]
 # Threading configuration
 MAX_WORKERS_DEFAULT = 4
 MAX_WORKERS_GPU = 2  # Limited for GPU memory

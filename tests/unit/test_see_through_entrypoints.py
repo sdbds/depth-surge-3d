@@ -6,7 +6,7 @@ import importlib.util
 import json
 from html.parser import HTMLParser
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from src.depth_surge_3d.core.file_identity import (
     FILE_IDENTITY_ALGORITHM_VERSION,
@@ -398,7 +398,14 @@ def test_web_background_resume_validates_loaded_model_before_migration(tmp_path)
         )
 
     build_fingerprint.assert_called_once_with(projector.depth_estimator, settings)
-    build_report.assert_called_once_with(
+    assert build_report.call_count == 2
+    build_report.assert_any_call(
+        output_dir,
+        settings,
+        source_video=source_video,
+        settings_file=settings_file,
+    )
+    build_report.assert_called_with(
         output_dir,
         settings,
         source_video=source_video,
@@ -406,6 +413,71 @@ def test_web_background_resume_validates_loaded_model_before_migration(tmp_path)
         settings_file=settings_file,
     )
     migrate.assert_called_once_with(report, "archive")
+
+
+def test_web_complete_stabilized_resume_skips_cuda_and_base_model(tmp_path):
+    import app as web_app
+
+    output_dir = tmp_path / "job"
+    output_dir.mkdir()
+    source_video = output_dir / "source.mp4"
+    source_video.touch()
+    settings = web_app.validate_settings(
+        {
+            "temporal_postprocessor": "vdpp",
+            "device": "cpu",
+            "vr_format": "side_by_side",
+            "vr_resolution": "16x9-1080p",
+        },
+        source="legacy_disk",
+    )
+    report = MagicMock()
+    report.migrated_settings = settings
+    processor = MagicMock()
+    lock_states = []
+
+    def observe_lock(**kwargs):
+        lock_states.append(kwargs["job_lock"].is_acquired)
+        return True
+
+    processor.process.side_effect = observe_lock
+    stable_files = [output_dir / "03_disparity_stabilized" / "frame_000001.png"]
+
+    with (
+        patch.object(web_app, "build_resume_report", return_value=report),
+        patch.object(
+            web_app,
+            "_preserved_render_artifact",
+            return_value=(stable_files, "stabilized"),
+        ),
+        patch.object(
+            web_app,
+            "create_stereo_projector",
+            side_effect=AssertionError("base model must stay lazy"),
+        ) as create_projector,
+        patch("torch.cuda.is_available", side_effect=AssertionError("CUDA must not be probed")),
+        patch.object(
+            web_app,
+            "get_video_info",
+            return_value={"fps": 24.0, "frame_count": 1, "width": 64, "height": 48},
+        ),
+        patch.object(web_app, "VideoProcessor", return_value=processor) as processor_class,
+        patch.object(web_app, "apply_legacy_migration"),
+        patch.object(web_app.socketio, "emit"),
+        patch.object(web_app.socketio, "sleep"),
+    ):
+        web_app.process_video_async(
+            "test-session",
+            source_video,
+            settings,
+            output_dir,
+            {"migration_mode": "archive", "settings_file": output_dir / "settings.json"},
+        )
+
+    create_projector.assert_not_called()
+    processor_class.assert_called_once()
+    assert processor_class.call_args.args[0] is None
+    assert lock_states == [True]
 
 
 def test_web_resume_rejects_output_directory_outside_managed_root(tmp_path, monkeypatch):
@@ -591,13 +663,21 @@ def test_cli_resume_restores_depth_backend_without_forwarding_cache_metadata(tmp
     projector.load_model.assert_called_once_with()
     preflight_settings = {**report.migrated_settings, "verbose": False}
     build_fingerprint.assert_called_once_with(projector.depth_estimator, preflight_settings)
-    build_report.assert_called_once_with(
-        tmp_path,
-        preflight_settings,
-        source_video="source.mkv",
-        model_fingerprint=model_fingerprint,
-        settings_file=resume_info["settings_file"],
-    )
+    assert build_report.call_args_list == [
+        call(
+            tmp_path,
+            preflight_settings,
+            source_video="source.mkv",
+            settings_file=resume_info["settings_file"],
+        ),
+        call(
+            tmp_path,
+            preflight_settings,
+            source_video="source.mkv",
+            model_fingerprint=model_fingerprint,
+            settings_file=resume_info["settings_file"],
+        ),
+    ]
     migrate.assert_called_once_with(report, "archive")
     resume_kwargs = projector.process_video.call_args.kwargs
     assert resume_kwargs["video_path"] == "source.mkv"
@@ -672,3 +752,73 @@ def test_cli_resume_infers_see_through_for_legacy_settings(tmp_path, monkeypatch
         metric=False,
         depth_model_version="see_through",
     )
+
+
+def test_cli_complete_stabilized_resume_skips_cuda_and_base_model(tmp_path, monkeypatch):
+    cli = _load_cli_module()
+    source_video = tmp_path / "source.mp4"
+    source_video.touch()
+    saved_settings = {
+        "temporal_postprocessor": "vdpp",
+        "device": "cpu",
+        "vr_format": "side_by_side",
+        "vr_resolution": "16x9-1080p",
+    }
+    resume_info = {
+        "can_resume": True,
+        "batch_name": "cached",
+        "status": "in_progress",
+        "progress_info": None,
+        "recommendations": [],
+        "settings_file": tmp_path / "job-settings.json",
+    }
+    report = MagicMock()
+    report.stages = ()
+    report.removed_settings = ()
+    report.migrated_settings = cli.validate_settings(saved_settings, source="legacy_disk")
+    processor = MagicMock()
+    observed_locks = []
+
+    def observe_lock(**kwargs):
+        observed_locks.append(kwargs["job_lock"].is_acquired)
+        return True
+
+    processor.process.side_effect = observe_lock
+    stable_files = [tmp_path / "03_disparity_stabilized" / "frame_000001.png"]
+    monkeypatch.setattr(cli.sys, "argv", ["depth_surge_3d.py", "--resume", str(tmp_path)])
+
+    with (
+        patch.object(cli, "can_resume_processing", return_value=resume_info),
+        patch.object(
+            cli,
+            "load_processing_settings",
+            return_value={
+                "metadata": {"source_video": str(source_video)},
+                "processing_settings": saved_settings,
+                "video_properties": {"fps": 24.0, "frame_count": 1},
+            },
+        ),
+        patch.object(cli, "build_resume_report", return_value=report),
+        patch.object(
+            cli,
+            "_preserved_render_artifact",
+            return_value=(stable_files, "stabilized"),
+        ),
+        patch.object(
+            cli,
+            "create_stereo_projector",
+            side_effect=AssertionError("base model must stay lazy"),
+        ) as create_projector,
+        patch("torch.cuda.is_available", side_effect=AssertionError("CUDA must not be probed")),
+        patch.object(cli, "apply_legacy_migration"),
+        patch(
+            "depth_surge_3d.processing.orchestration.video_processor.VideoProcessor",
+            return_value=processor,
+        ) as processor_class,
+    ):
+        assert cli.main() == 0
+
+    create_projector.assert_not_called()
+    processor_class.assert_called_once()
+    assert processor_class.call_args.args[0] is None
+    assert observed_locks == [True]

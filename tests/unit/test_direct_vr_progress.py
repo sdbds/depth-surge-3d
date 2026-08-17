@@ -42,6 +42,21 @@ def test_direct_vr_progress_aliases_to_final_weighted_step_without_regressing():
     assert web_app.current_processing["progress"] >= crop_progress
 
 
+def test_vdpp_progress_inserts_stabilization_without_changing_off_layout():
+    off = web_app.ProgressCallback("off-session", total_frames=2)
+    vdpp = web_app.ProgressCallback(
+        "vdpp-session",
+        total_frames=2,
+        temporal_postprocessor="vdpp",
+    )
+
+    assert len(off.steps) == len(off.step_weights) == 8
+    assert "Temporal Depth Stabilization" not in off.steps
+    assert len(vdpp.steps) == len(vdpp.step_weights) == 9
+    assert vdpp.steps[2] == "Temporal Depth Stabilization"
+    assert sum(vdpp.step_weights) == pytest.approx(1.0)
+
+
 @pytest.mark.parametrize("source_kind", ["file", "array"])
 def test_preview_downsampling_uses_inter_area(tmp_path, source_kind):
     callback = web_app.ProgressCallback(

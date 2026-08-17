@@ -24,6 +24,10 @@ from ..core.depth_contract import (
     CANONICAL_DEPTH_SCHEMA_VERSION,
     canonical_json_hash,
 )
+from ..core.render_disparity import (
+    STABILIZED_DEPTH_ALGORITHM_VERSION,
+    validate_render_disparity_input,
+)
 from ..inference.depth.v2_temporal_contract import (
     VDA_INFERENCE_ALGORITHM,
     build_v2_execution_plan,
@@ -884,6 +888,103 @@ def _validate_canonical_stage(
     return stage, metadata
 
 
+def _validate_stabilized_stage(
+    output_dir: Path,
+    frame_files: list[Path],
+    canonical_metadata: dict[str, Any] | None,
+) -> tuple[ResumeStage, dict[str, Any] | None]:
+    stabilized_dir = output_dir / "03_disparity_stabilized"
+    paths = (stabilized_dir,)
+    if not _has_payload(stabilized_dir):
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "missing",
+                "stabilized disparity is absent",
+            ),
+            None,
+        )
+    if canonical_metadata is None:
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "base canonical disparity is invalid",
+            ),
+            None,
+        )
+    metadata = _read_json(stabilized_dir / "metadata.json")
+    if metadata is None:
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "stabilized metadata is missing",
+            ),
+            None,
+        )
+    semantic = metadata.get("semantic_identity")
+    lineage_matches = (
+        isinstance(semantic, dict)
+        and semantic.get("source_canonical_fingerprint") == canonical_metadata.get("fingerprint")
+        and semantic.get("scene_manifest_fingerprint")
+        == canonical_metadata.get("scene_manifest_fingerprint")
+        and semantic.get("frame_names") == [path.name for path in frame_files]
+        and semantic.get("native_shape") == canonical_metadata.get("native_shape")
+        and semantic.get("postprocessor_settings") == {"temporal_postprocessor": "vdpp"}
+    )
+    if not lineage_matches:
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "stabilized semantic lineage changed",
+            ),
+            None,
+        )
+    depth_files = [stabilized_dir / f"{path.stem}.png" for path in frame_files]
+    try:
+        artifact = validate_render_disparity_input(depth_files, frame_files)
+    except ValueError as exc:
+        if (
+            metadata.get("algorithm_version") == STABILIZED_DEPTH_ALGORITHM_VERSION
+            and metadata.get("status") == "building"
+        ):
+            return (
+                _stage(
+                    "disparity_stabilized",
+                    paths,
+                    "resume",
+                    "stabilized stage has resumable shot state",
+                ),
+                metadata,
+            )
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                f"stabilized artifact is invalid: {exc}",
+            ),
+            None,
+        )
+    selected_metadata = dict(artifact.metadata)
+    selected_metadata["fingerprint"] = artifact.fingerprint
+    return (
+        _stage(
+            "disparity_stabilized",
+            paths,
+            "preserve",
+            "stabilized artifact and payload digests match",
+        ),
+        selected_metadata,
+    )
+
+
 def _settings_changed(
     saved: dict[str, Any],
     current: dict[str, Any],
@@ -1134,6 +1235,18 @@ def build_resume_report(
     )
     stages.append(canonical)
 
+    render_metadata = canonical_metadata
+    render_reusable = canonical.disposition in {"preserve", "resume"}
+    if migrated_settings.get("temporal_postprocessor") == "vdpp":
+        stabilized, stabilized_metadata = _validate_stabilized_stage(
+            root,
+            frame_files,
+            canonical_metadata,
+        )
+        stages.append(stabilized)
+        render_metadata = stabilized_metadata
+        render_reusable = stabilized.disposition == "preserve"
+
     legacy_supersampled = root / "01_supersampled_frames"
     if _has_payload(legacy_supersampled):
         stages.append(
@@ -1171,9 +1284,9 @@ def build_resume_report(
             frame_files,
             saved_settings,
             migrated_settings,
-            canonical_metadata,
+            render_metadata,
             current_settings_schema=settings_schema_current,
-            canonical_reusable=canonical.disposition in {"preserve", "resume"},
+            canonical_reusable=render_reusable,
         )
     )
     backup_required = selected_settings_file is not None and (

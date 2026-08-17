@@ -41,6 +41,11 @@ from src.depth_surge_3d.processing.frames.source_frame_manifest import (
     frame_sequence_fingerprint,
     write_source_frame_manifest,
 )
+from src.depth_surge_3d.inference.depth.vdpp_contract import (
+    build_vdpp_execution_plan,
+    vdpp_model_identity,
+)
+from src.depth_surge_3d.processing.frames.temporal_storage import StabilizedDepthStore
 
 
 def _write_frames(output_dir: Path, count: int = 2) -> tuple[list[Path], str]:
@@ -278,6 +283,41 @@ def _write_current_depth_pipeline(
     return manifest, bounds, canonical
 
 
+def _write_complete_stabilized_stage(
+    output_dir: Path,
+    frame_files: list[Path],
+    canonical: dict,
+) -> StabilizedDepthStore:
+    shot_plan = [{"shot_id": 0, "start": 0, "end": len(frame_files)}]
+    semantic = {
+        "frame_names": [path.name for path in frame_files],
+        "native_shape": canonical["native_shape"],
+        "source_canonical_fingerprint": canonical["fingerprint"],
+        "scene_manifest_fingerprint": canonical["scene_manifest_fingerprint"],
+        "postprocessor_settings": {"temporal_postprocessor": "vdpp"},
+        "model_identity": vdpp_model_identity(),
+        "execution_plan": build_vdpp_execution_plan(tuple(canonical["native_shape"])),
+        "shot_plan": shot_plan,
+    }
+    store = StabilizedDepthStore(
+        output_dir / "03_disparity_stabilized",
+        frame_files=frame_files,
+        semantic_identity=semantic,
+        runtime_identity={"runtime": "test"},
+        execution_provenance={"runtime": "test"},
+    )
+    store.prepare(store.audit())
+    store.commit_shot(
+        0,
+        (
+            (index, np.full((4, 6), index / 10.0, dtype=np.float32))
+            for index in range(len(frame_files))
+        ),
+    )
+    store.finalize()
+    return store
+
+
 def _write_current_stereo_pipeline(
     output_dir: Path,
     frame_files: list[Path],
@@ -410,6 +450,65 @@ def test_resume_migrates_v2_missing_temporal_postprocessor_to_off(tmp_path):
 
     assert report.migrated_settings["temporal_postprocessor"] == "off"
     assert report.settings_backup_required is True
+
+
+def test_vdpp_resume_selects_complete_content_addressed_stabilized_stage(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings(temporal_postprocessor="vdpp")
+    _write_settings(tmp_path, settings, current_schema=True)
+    _manifest, _bounds, canonical = _write_current_depth_pipeline(
+        tmp_path,
+        frame_files,
+        fingerprint,
+    )
+    _write_complete_stabilized_stage(tmp_path, frame_files, canonical)
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("disparity_maps").disposition == "preserve"
+    assert report.stage("disparity_stabilized").disposition == "preserve"
+
+
+def test_off_resume_leaves_stabilized_stage_dormant_and_out_of_report(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings(temporal_postprocessor="off")
+    _write_settings(tmp_path, settings, current_schema=True)
+    _manifest, _bounds, canonical = _write_current_depth_pipeline(
+        tmp_path,
+        frame_files,
+        fingerprint,
+    )
+    _write_complete_stabilized_stage(tmp_path, frame_files, canonical)
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert "disparity_stabilized" not in [stage.name for stage in report.stages]
+    assert (tmp_path / "03_disparity_stabilized").is_dir()
+
+
+def test_corrupt_stabilized_payload_invalidates_only_derived_render_source(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings(temporal_postprocessor="vdpp")
+    _write_settings(tmp_path, settings, current_schema=True)
+    _manifest, _bounds, canonical = _write_current_depth_pipeline(
+        tmp_path,
+        frame_files,
+        fingerprint,
+    )
+    store = _write_complete_stabilized_stage(tmp_path, frame_files, canonical)
+    store.depth_files[0].write_bytes(b"corrupt")
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("depth_raw").disposition == "preserve"
+    assert report.stage("disparity_maps").disposition == "preserve"
+    assert report.stage("disparity_stabilized").disposition == "invalidate"
 
 
 def test_candidate_manifest_resumes_finalization_but_cannot_reuse_canonical(tmp_path):

@@ -16,6 +16,8 @@ from ...io.operations import (
     save_processing_settings,
     update_processing_status,
 )
+from ...io.job_lock import JobWriterLock
+from ...core.render_disparity import validate_render_disparity_input
 from ...utils.path_utils import generate_output_filename
 from ...utils import (
     step_complete,
@@ -48,6 +50,9 @@ class ProcessingOrchestrator:
         video_encoder,
         verbose: bool = False,
         release_depth_model: Callable[[], None] | None = None,
+        temporal_stabilizer=None,
+        preselected_depth_files: list[Path] | None = None,
+        preselected_render_source: str | None = None,
     ):
         """
         Initialize processing orchestrator.
@@ -70,6 +75,16 @@ class ProcessingOrchestrator:
         self.video_encoder = video_encoder
         self.verbose = verbose
         self._release_depth_model_callback = release_depth_model
+        self.temporal_stabilizer = temporal_stabilizer
+        self.preselected_depth_files = (
+            list(preselected_depth_files) if preselected_depth_files is not None else None
+        )
+        self.preselected_render_source = preselected_render_source
+        if self.preselected_depth_files is not None and preselected_render_source not in {
+            "base",
+            "stabilized",
+        }:
+            raise ValueError("preselected render source must be base or stabilized")
         self._depth_model_released = False
         self._settings_file: Path | None = None  # Track settings file for error handling
         self._start_time: float = 0.0  # Track processing start time
@@ -81,6 +96,7 @@ class ProcessingOrchestrator:
         video_properties: dict[str, Any],
         settings: dict[str, Any],
         progress_tracker=None,
+        job_lock: JobWriterLock | None = None,
     ) -> bool:
         """
         Main processing pipeline entry point.
@@ -101,9 +117,18 @@ class ProcessingOrchestrator:
             - Delegates to all processor modules
         """
         self._depth_model_released = False
+        owns_job_lock = job_lock is None
         try:
             # Start timer
             self._start_time = time.time()
+
+            if job_lock is None:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                job_lock = JobWriterLock(output_dir).acquire()
+            elif not job_lock.is_acquired:
+                raise ValueError("The supplied job writer lock is not acquired")
+            elif job_lock.output_dir.resolve() != output_dir.resolve():
+                raise ValueError("The supplied job writer lock belongs to another output directory")
 
             # Setup processing environment
             output_path, directories, self._settings_file = self._setup_processing(
@@ -130,9 +155,13 @@ class ProcessingOrchestrator:
                 update_processing_status(self._settings_file, "failed", {"error": str(e)})
             return False
         finally:
-            self._release_depth_model()
+            try:
+                self._release_depth_model()
+            finally:
+                if owns_job_lock and job_lock is not None:
+                    job_lock.release()
 
-    def _execute_pipeline(
+    def _execute_pipeline(  # noqa: C901
         self,
         video_path: str,
         output_path: Path,
@@ -172,25 +201,62 @@ class ProcessingOrchestrator:
 
         fps = video_properties.get("fps", 30.0)
 
-        # Step 2: Generate canonical disparity maps (delegated to depth_processor)
-        try:
-            depth_files = self.depth_processor.generate_depth_map_files(
-                frame_files, settings, directories, progress_tracker
+        selected_is_stabilized = self.preselected_render_source == "stabilized"
+        if self.preselected_depth_files is not None:
+            artifact = validate_render_disparity_input(
+                self.preselected_depth_files,
+                frame_files,
             )
-        finally:
+            if artifact.producer != self.preselected_render_source:
+                raise ValueError("Preselected render-disparity producer changed")
+            depth_files = list(self.preselected_depth_files)
             self._release_depth_model()
-        if depth_files is None:
-            return False
-        print(step_complete(f"Step 2: Prepared {len(depth_files)} canonical disparity maps"))
-        self._print_saved_to(directories.get("disparity_maps"), "Canonical disparity maps")
+            print(step_complete(f"Step 2: Reused {len(depth_files)} render disparity maps"))
+        else:
+            if self.depth_processor is None:
+                raise RuntimeError("Depth generation requires a configured estimator")
+            # Step 2: Generate canonical disparity maps (delegated to depth_processor)
+            try:
+                depth_files = self.depth_processor.generate_depth_map_files(
+                    frame_files, settings, directories, progress_tracker
+                )
+            finally:
+                self._release_depth_model()
+            if depth_files is None:
+                return False
+            print(step_complete(f"Step 2: Prepared {len(depth_files)} canonical disparity maps"))
+            self._print_saved_to(directories.get("disparity_maps"), "Canonical disparity maps")
         print()  # Blank line after step
+
+        effective_depth_files = depth_files
+        if settings.get("temporal_postprocessor", "off") == "vdpp" and not selected_is_stabilized:
+            if self.temporal_stabilizer is None:
+                raise RuntimeError("VDPP was requested but no temporal stabilizer is configured")
+            effective_depth_files = self.temporal_stabilizer.generate_files(
+                depth_files,
+                settings,
+                directories,
+                progress_tracker,
+            )
+            if not effective_depth_files:
+                return False
+            print(
+                step_complete(f"Temporal stabilization: Prepared {len(effective_depth_files)} maps")
+            )
+            self._print_saved_to(
+                directories.get("disparity_stabilized"),
+                "Stabilized disparity maps",
+            )
+            print()
+        elif selected_is_stabilized and settings.get("temporal_postprocessor") != "vdpp":
+            raise ValueError("Stabilized render input cannot satisfy temporal_postprocessor=off")
 
         # Execute steps 3-8
         return self._execute_remaining_steps(
             directories,
             settings,
             frame_files,
-            depth_files,
+            effective_depth_files,
             fps,
             video_path,
             output_path,
@@ -388,11 +454,16 @@ class ProcessingOrchestrator:
             - Console output
         """
         output_path = Path(output_dir)
+        omitted_intermediates: set[str] = set()
+        if settings.get("temporal_postprocessor", "off") != "vdpp":
+            omitted_intermediates.add("disparity_stabilized")
         if settings.get("direct_vr_encode", False):
+            omitted_intermediates.add("vr_frames")
+        if omitted_intermediates:
             directories = create_output_directories(
                 output_path,
                 settings["keep_intermediates"],
-                omitted_intermediates={"vr_frames"},
+                omitted_intermediates=omitted_intermediates,
             )
         else:
             directories = create_output_directories(output_path, settings["keep_intermediates"])

@@ -8,6 +8,7 @@ import pytest
 from src.depth_surge_3d.processing.orchestration.pipeline_orchestrator import (
     ProcessingOrchestrator,
 )
+from src.depth_surge_3d.io.job_lock import JobWriterLock
 
 
 class TestProcessingOrchestratorInit:
@@ -107,7 +108,11 @@ class TestSetupProcessing:
         assert output_path == Path("/output/dir")
         assert directories == {"base": Path("/output/dir")}
         assert settings_file == Path("/output/dir/settings.json")
-        mock_create_dirs.assert_called_once_with(Path("/output/dir"), True)
+        mock_create_dirs.assert_called_once_with(
+            Path("/output/dir"),
+            True,
+            omitted_intermediates={"disparity_stabilized"},
+        )
 
     def test_setup_processing_omits_vr_directory_in_direct_mode(self):
         """Direct encoding does not create the unused assembled-frame directory."""
@@ -131,7 +136,7 @@ class TestSetupProcessing:
         create_dirs.assert_called_once_with(
             Path("/output/dir"),
             True,
-            omitted_intermediates={"vr_frames"},
+            omitted_intermediates={"disparity_stabilized", "vr_frames"},
         )
 
     def test_setup_processing_keeps_legacy_directory_call_when_direct_mode_is_false(self):
@@ -150,6 +155,34 @@ class TestSetupProcessing:
                 "/input/video.mp4",
                 "/output/dir",
                 {"keep_intermediates": True, "direct_vr_encode": False},
+                {"fps": 30, "frame_count": 1},
+            )
+
+        create_dirs.assert_called_once_with(
+            Path("/output/dir"),
+            True,
+            omitted_intermediates={"disparity_stabilized"},
+        )
+
+    def test_setup_processing_creates_stabilized_directory_only_when_requested(self):
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        with (
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.create_output_directories",
+                return_value={"base": Path("/output/dir")},
+            ) as create_dirs,
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.save_processing_settings"
+            ),
+        ):
+            orchestrator._setup_processing(
+                "/input/video.mp4",
+                "/output/dir",
+                {
+                    "keep_intermediates": True,
+                    "direct_vr_encode": False,
+                    "temporal_postprocessor": "vdpp",
+                },
                 {"fps": 30, "frame_count": 1},
             )
 
@@ -305,6 +338,84 @@ class TestExecutePipeline:
         assert result is False
         assert model.loaded is False
         assert stereo_generator.model_loaded_at_step_3 is False
+
+    def test_vdpp_runs_after_owner_release_and_before_stereo(self, tmp_path):
+        events = []
+        frame = tmp_path / "frame_000001.png"
+        base = tmp_path / "base_000001.png"
+        stable = tmp_path / "stable_000001.png"
+
+        depth_processor = Mock()
+        depth_processor.generate_depth_map_files.return_value = base_files = [base]
+        temporal = Mock()
+
+        def stabilize(*args):
+            events.append("vdpp")
+            assert events == ["release", "vdpp"]
+            assert args[0] == base_files
+            return [stable]
+
+        temporal.generate_files.side_effect = stabilize
+        stereo = Mock()
+
+        def render(_frames, depth_files, *_args):
+            events.append("stereo")
+            assert depth_files == [stable]
+            return False
+
+        stereo.create_stereo_pairs_from_files.side_effect = render
+        encoder = Mock()
+        encoder.extract_frames.return_value = [frame]
+        orchestrator = ProcessingOrchestrator(
+            depth_processor,
+            stereo,
+            Mock(),
+            Mock(),
+            Mock(),
+            encoder,
+            release_depth_model=lambda: events.append("release"),
+            temporal_stabilizer=temporal,
+        )
+
+        assert not orchestrator._execute_pipeline(
+            "source.mp4",
+            tmp_path,
+            {"base": tmp_path, "frames": tmp_path / "frames"},
+            {"fps": 30.0, "frame_count": 1},
+            {"temporal_postprocessor": "vdpp"},
+        )
+
+        assert events == ["release", "vdpp", "stereo"]
+
+    def test_vdpp_failure_never_starts_stereo(self, tmp_path):
+        depth_processor = Mock()
+        depth_processor.generate_depth_map_files.return_value = [tmp_path / "base.png"]
+        temporal = Mock()
+        temporal.generate_files.side_effect = RuntimeError("VDPP failed")
+        stereo = Mock()
+        encoder = Mock()
+        encoder.extract_frames.return_value = [tmp_path / "frame.png"]
+        orchestrator = ProcessingOrchestrator(
+            depth_processor,
+            stereo,
+            Mock(),
+            Mock(),
+            Mock(),
+            encoder,
+            release_depth_model=Mock(),
+            temporal_stabilizer=temporal,
+        )
+
+        with pytest.raises(RuntimeError, match="VDPP failed"):
+            orchestrator._execute_pipeline(
+                "source.mp4",
+                tmp_path,
+                {"base": tmp_path, "frames": tmp_path / "frames"},
+                {"fps": 30.0, "frame_count": 1},
+                {"temporal_postprocessor": "vdpp"},
+            )
+
+        stereo.create_stereo_pairs_from_files.assert_not_called()
 
     @staticmethod
     def _direct_encoding_dependencies(tmp_path):
@@ -666,6 +777,34 @@ class TestProcessMethod:
         assert result is False
         assert model.loaded is False
         assert model.unload_count == 1
+
+    def test_process_reuses_preacquired_writer_lock_without_releasing_it(self, tmp_path):
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        lock = JobWriterLock(tmp_path).acquire()
+        try:
+            with (
+                patch.object(
+                    orchestrator,
+                    "_setup_processing",
+                    return_value=(tmp_path, {"base": tmp_path}, None),
+                ),
+                patch.object(orchestrator, "_execute_pipeline", return_value=True),
+                patch(
+                    "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.JobWriterLock",
+                    side_effect=AssertionError("must reuse the authoritative lock"),
+                ),
+            ):
+                assert orchestrator.process(
+                    video_path=tmp_path / "source.mp4",
+                    output_dir=tmp_path,
+                    video_properties={"fps": 30, "frame_count": 1},
+                    settings={"keep_intermediates": True},
+                    job_lock=lock,
+                )
+
+            assert lock.is_acquired is True
+        finally:
+            lock.release()
 
     @patch("src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time")
     def test_process_exception_handling(self, mock_time):
