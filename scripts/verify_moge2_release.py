@@ -2191,13 +2191,14 @@ class _RecordingStereoRenderer:
         self.total_disparity_fractions: list[np.ndarray] = []
         self.source_valid_masks: list[np.ndarray] = []
 
+    def render(self, frame: np.ndarray, canonical: np.ndarray, settings: Any) -> Any:
+        result = self._renderer.render(frame, canonical, settings)
+        self._record_holes(result)
+        return result
+
     def render_geometry(self, frame: np.ndarray, geometry: Any, settings: Any) -> Any:
         result = self._renderer.render_geometry(frame, geometry, settings)
-        self.hole_masks.append(
-            np.concatenate((result.left_hole_mask, result.right_hole_mask), axis=1).astype(
-                np.bool_, copy=True
-            )
-        )
+        self._record_holes(result)
         if self.capture_geometry:
             self.total_disparity_fractions.append(
                 np.array(geometry.total_disparity_fraction, dtype=np.float64, copy=True)
@@ -2206,6 +2207,13 @@ class _RecordingStereoRenderer:
                 np.array(geometry.source_valid, dtype=np.bool_, copy=True)
             )
         return result
+
+    def _record_holes(self, result: Any) -> None:
+        self.hole_masks.append(
+            np.concatenate((result.left_hole_mask, result.right_hole_mask), axis=1).astype(
+                np.bool_, copy=True
+            )
+        )
 
     def consume_holes(self) -> np.ndarray:
         if not self.hole_masks:

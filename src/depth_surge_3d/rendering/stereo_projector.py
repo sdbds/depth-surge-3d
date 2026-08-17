@@ -40,8 +40,7 @@ from ..io.operations import (
 from ..processing import VideoProcessor
 from ..processing.frames.depth_normalizer import canonicalize_single_scene
 from ..core.settings import validate_settings
-from .stereo_geometry import build_relative_geometry
-from .stereo_renderer import StereoRenderer, StereoSplatSettings
+from .stereo_renderer import StereoRenderer, StereoRenderSettings
 
 
 def _freeze_snapshot(value: Any) -> Any:
@@ -366,22 +365,17 @@ class StereoProjector:
             per_eye_height = settings.get("per_eye_height", 1080)
 
             stereo_strength = float(settings.get("stereo_strength", 2.0))
-            geometry = build_relative_geometry(
-                canonical,
-                (int(image.shape[0]), int(image.shape[1])),
+            render_settings = StereoRenderSettings(
                 stereo_strength=stereo_strength,
                 convergence=float(settings.get("convergence", 0.5)),
-            )
-            render_settings = StereoSplatSettings(
-                max_eye_shift_fraction=stereo_strength / 200.0,
                 occlusion_fill=cast(
                     Literal["none", "background"],
                     str(settings.get("occlusion_fill", "background")),
                 ),
             )
-            stereo = self._get_stereo_renderer().render_geometry(
+            stereo = self._get_stereo_renderer().render(
                 image,
-                geometry,
+                canonical,
                 render_settings,
             )
             left_img = stereo.left_image

@@ -33,10 +33,10 @@ from ...rendering.stereo_geometry import (
     MetricProjectionStats,
     StereoGeometryFrame,
     build_metric_geometry,
-    build_relative_geometry,
 )
 from ...rendering.stereo_renderer import (
     StereoRenderer,
+    StereoRenderSettings,
     StereoSplatSettings,
 )
 from .frame_stage_parallelism import png_headers_match
@@ -218,7 +218,7 @@ class _FileWorkItem:
 
 _DecodeFrame = Callable[
     [_FileWorkItem],
-    tuple[np.ndarray, StereoGeometryFrame, MetricProjectionStats | None],
+    tuple[np.ndarray, np.ndarray | StereoGeometryFrame, MetricProjectionStats | None],
 ]
 
 
@@ -227,7 +227,7 @@ class _StereoStagePlan:
     geometry_mode: str
     source_metadata: dict[str, Any]
     decode: _DecodeFrame
-    splat_settings: StereoSplatSettings
+    render_settings: StereoRenderSettings | StereoSplatSettings
     retained_crop_width: int | None = None
     effective_convergence: float | None = None
 
@@ -236,7 +236,7 @@ class _StereoStagePlan:
 class _DecodedMessage:
     work: _FileWorkItem
     frame: np.ndarray | None = None
-    geometry: StereoGeometryFrame | None = None
+    render_input: np.ndarray | StereoGeometryFrame | None = None
     projection_stats: MetricProjectionStats | None = None
     error: Exception | None = None
 
@@ -322,9 +322,7 @@ def _decode_relative_work_item(
     *,
     encoding_scale: float,
     render_shape: tuple[int, int],
-    stereo_strength: float,
-    convergence: float,
-) -> tuple[np.ndarray, StereoGeometryFrame, None]:
+) -> tuple[np.ndarray, np.ndarray, None]:
     frame = cv2.imread(str(work.frame_path), cv2.IMREAD_COLOR)
     encoded = cv2.imread(str(work.depth_path), cv2.IMREAD_UNCHANGED)
     if frame is None:
@@ -340,13 +338,7 @@ def _decode_relative_work_item(
         raise TypeError(f"Canonical disparity must be uint16: {work.depth_path}")
     canonical = encoded.astype(np.float32)
     canonical *= np.float32(1.0 / encoding_scale)
-    geometry = build_relative_geometry(
-        canonical,
-        render_shape,
-        stereo_strength=stereo_strength,
-        convergence=convergence,
-    )
-    return frame, geometry, None
+    return frame, canonical, None
 
 
 def _decode_metric_work_item(
@@ -390,7 +382,7 @@ class _StereoFilePipeline:
         renderer: StereoRenderer,
         work_items: list[_FileWorkItem],
         decode: _DecodeFrame,
-        splat_settings: StereoSplatSettings,
+        render_settings: StereoRenderSettings | StereoSplatSettings,
         workers: int,
         capacity: int,
         completed: int,
@@ -400,7 +392,7 @@ class _StereoFilePipeline:
         self.renderer = renderer
         self.work_items = work_items
         self.decode = decode
-        self.splat_settings = splat_settings
+        self.render_settings = render_settings
         self.workers = workers
         self.completed = completed
         self.total_frames = total_frames
@@ -491,7 +483,7 @@ class _StereoFilePipeline:
 
     def _decode(self, work: _FileWorkItem) -> _DecodedMessage:
         try:
-            frame, geometry, projection_stats = self.decode(work)
+            frame, render_input, projection_stats = self.decode(work)
         except Exception as error:
             self.permits.release()
             return _DecodedMessage(work=work, error=error)
@@ -499,7 +491,7 @@ class _StereoFilePipeline:
         return _DecodedMessage(
             work=work,
             frame=frame,
-            geometry=geometry,
+            render_input=render_input,
             projection_stats=projection_stats,
         )
 
@@ -510,13 +502,22 @@ class _StereoFilePipeline:
         if self.first_error is not None:
             self.permits.release()
             return None
-        assert message.frame is not None and message.geometry is not None
+        assert message.frame is not None and message.render_input is not None
         try:
-            result = self.renderer.render_geometry(
-                message.frame,
-                message.geometry,
-                self.splat_settings,
-            )
+            if isinstance(self.render_settings, StereoRenderSettings):
+                assert isinstance(message.render_input, np.ndarray)
+                result = self.renderer.render(
+                    message.frame,
+                    message.render_input,
+                    self.render_settings,
+                )
+            else:
+                assert isinstance(message.render_input, StereoGeometryFrame)
+                result = self.renderer.render_geometry(
+                    message.frame,
+                    message.render_input,
+                    self.render_settings,
+                )
         except Exception as error:
             self.permits.release()
             self._record_error("render", message.work, error)
@@ -673,16 +674,15 @@ class StereoPairGenerator:
                 work,
                 encoding_scale=float(metadata["encoding_scale"]),
                 render_shape=render_shape,
-                stereo_strength=stereo_strength,
-                convergence=convergence,
             )
 
         return _StereoStagePlan(
             geometry_mode="relative",
             source_metadata=metadata,
             decode=decode,
-            splat_settings=StereoSplatSettings(
-                max_eye_shift_fraction=stereo_strength / 200.0,
+            render_settings=StereoRenderSettings(
+                stereo_strength=stereo_strength,
+                convergence=convergence,
                 occlusion_fill=occlusion_fill,
             ),
         )
@@ -725,7 +725,7 @@ class StereoPairGenerator:
             geometry_mode="metric_camera",
             source_metadata=metadata,
             decode=decode,
-            splat_settings=StereoSplatSettings(
+            render_settings=StereoSplatSettings(
                 max_eye_shift_fraction=(
                     max_disparity_percent / 100.0 * (retained_crop_width / render_shape[1]) / 2.0
                 ),
@@ -815,7 +815,7 @@ class StereoPairGenerator:
             self._run_file_pipeline(
                 work_items,
                 decode=plan.decode,
-                splat_settings=plan.splat_settings,
+                render_settings=plan.render_settings,
                 workers=workers,
                 capacity=capacity,
                 completed=completed,
@@ -938,7 +938,7 @@ class StereoPairGenerator:
         work_items: list[_FileWorkItem],
         *,
         decode: _DecodeFrame,
-        splat_settings: StereoSplatSettings,
+        render_settings: StereoRenderSettings | StereoSplatSettings,
         workers: int,
         capacity: int,
         completed: int,
@@ -949,7 +949,7 @@ class StereoPairGenerator:
             renderer=self.renderer,
             work_items=work_items,
             decode=decode,
-            splat_settings=splat_settings,
+            render_settings=render_settings,
             workers=workers,
             capacity=capacity,
             completed=completed,

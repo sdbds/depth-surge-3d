@@ -1,6 +1,7 @@
 """Unit tests for StereoProjector."""
 
 import inspect
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
@@ -26,7 +27,10 @@ from src.depth_surge_3d.rendering import (
     StereoProjector,
     create_stereo_projector,
 )
-from src.depth_surge_3d.rendering.stereo_renderer import StereoSplatSettings
+from src.depth_surge_3d.rendering.stereo_renderer import (
+    StereoRenderer,
+    StereoRenderSettings,
+)
 
 
 def _stereo_result(image: np.ndarray) -> StereoRenderResult:
@@ -1012,7 +1016,7 @@ class TestProcessImage:
         mock_imread.return_value = image
         mock_imwrite.return_value = True
         renderer = MagicMock()
-        renderer.render_geometry.return_value = _stereo_result(image)
+        renderer.render.return_value = _stereo_result(image)
 
         projector = StereoProjector(device="cpu", stereo_renderer=renderer)
         result = projector.process_image("test.jpg", "/tmp/output")
@@ -1020,13 +1024,13 @@ class TestProcessImage:
         assert result is True
         mock_estimator.load_model.assert_called_once()
         mock_estimator.estimate_depth_batch.assert_called_once()
-        render_image, geometry, render_settings = renderer.render_geometry.call_args.args
+        render_image, canonical, render_settings = renderer.render.call_args.args
         assert render_image is image
-        assert geometry.near_score.dtype == np.float32
-        assert geometry.near_score[0, 0] == 0.0
-        assert geometry.near_score[-1, -1] == 1.0
-        assert isinstance(render_settings, StereoSplatSettings)
-        renderer.render.assert_not_called()
+        assert canonical.dtype == np.float32
+        assert canonical[0, 0] == 0.0
+        assert canonical[-1, -1] == 1.0
+        assert isinstance(render_settings, StereoRenderSettings)
+        renderer.render_geometry.assert_not_called()
         # Should save 4 images: left, right, vr, depth
         assert mock_imwrite.call_count == 4
 
@@ -1091,7 +1095,7 @@ class TestProcessImage:
         image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
         mock_imread.return_value = image
         renderer = MagicMock()
-        renderer.render_geometry.return_value = _stereo_result(image)
+        renderer.render.return_value = _stereo_result(image)
 
         projector = StereoProjector(device="cpu", stereo_renderer=renderer)
 
@@ -1109,14 +1113,95 @@ class TestProcessImage:
         assert result is True
         # Verify custom depth resolution was used (batch estimation called)
         mock_estimator.estimate_depth_batch.assert_called_once()
-        geometry = renderer.render_geometry.call_args.args[1]
-        render_settings = renderer.render_geometry.call_args.args[2]
-        assert geometry.near_score[0, 0] == 1.0
-        assert geometry.near_score[-1, -1] == 0.0
-        assert render_settings == StereoSplatSettings(
-            max_eye_shift_fraction=0.02,
+        canonical = renderer.render.call_args.args[1]
+        render_settings = renderer.render.call_args.args[2]
+        assert canonical[0, 0] == 1.0
+        assert canonical[-1, -1] == 0.0
+        assert render_settings == StereoRenderSettings(
+            stereo_strength=4.0,
+            convergence=0.25,
             occlusion_fill="none",
         )
+
+    def test_process_image_matches_base_legacy_bytes_at_half_lane_boundary(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        width = 8950
+        canonical = np.full(
+            (1, width),
+            np.float32(0.23064221441745758),
+            dtype=np.float32,
+        )
+        frame = np.random.default_rng(20260817).integers(
+            0,
+            256,
+            size=(1, width, 3),
+            dtype=np.uint8,
+        )
+        render_settings = StereoRenderSettings(
+            stereo_strength=0.473053267491137,
+            convergence=0.05202130106440961,
+            occlusion_fill="none",
+        )
+        expected = StereoRenderer(device="cpu").render(
+            frame,
+            canonical,
+            render_settings,
+        )
+        estimator = MagicMock()
+        estimator.load_model.return_value = True
+        estimator.estimate_depth_batch.return_value = DepthBatch(
+            np.zeros((1, 1, 1), dtype=np.float32),
+            DepthRepresentation.RELATIVE_DEPTH,
+        )
+        monkeypatch.setattr(
+            stereo_projector,
+            "create_registered_depth_estimator",
+            lambda *_args, **_kwargs: estimator,
+        )
+        monkeypatch.setattr(
+            stereo_projector,
+            "canonicalize_single_scene",
+            lambda _batch: canonical[None],
+        )
+        monkeypatch.setattr(stereo_projector.cv2, "imread", lambda _path: frame.copy())
+        writes: dict[str, np.ndarray] = {}
+
+        def record_write(path: str, values: np.ndarray) -> bool:
+            writes[Path(path).name] = values.copy()
+            return True
+
+        monkeypatch.setattr(stereo_projector.cv2, "imwrite", record_write)
+        projector = StereoProjector(
+            device="cpu",
+            stereo_renderer=StereoRenderer(device="cpu"),
+        )
+        resolved = {
+            "stereo_geometry_mode": "relative",
+            "stereo_strength": render_settings.stereo_strength,
+            "convergence": render_settings.convergence,
+            "occlusion_fill": render_settings.occlusion_fill,
+            "depth_resolution": "auto",
+            "crop_factor": 1.0,
+            "per_eye_width": width,
+            "per_eye_height": 1,
+            "vr_format": "side_by_side",
+        }
+        monkeypatch.setattr(projector, "_apply_default_settings", lambda _params: resolved.copy())
+
+        result = projector.process_image(
+            "test.png",
+            str(tmp_path / "output"),
+            stereo_strength=render_settings.stereo_strength,
+            convergence=render_settings.convergence,
+            occlusion_fill=render_settings.occlusion_fill,
+        )
+
+        assert result is True
+        assert np.array_equal(writes["test_left.png"], expected.left_image)
+        assert np.array_equal(writes["test_right.png"], expected.right_image)
 
     @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_process_image_rejects_metric_geometry_without_loading_model(

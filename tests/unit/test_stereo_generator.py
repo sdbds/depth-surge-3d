@@ -32,6 +32,7 @@ from src.depth_surge_3d.rendering.stereo_geometry import StereoGeometryFrame
 from src.depth_surge_3d.rendering.stereo_renderer import (
     StereoRenderResult,
     StereoRenderer,
+    StereoRenderSettings,
     StereoSplatSettings,
 )
 
@@ -111,7 +112,15 @@ def _settings(**overrides: object) -> dict[str, object]:
 class _FakeRenderer:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
-        self.calls: list[tuple[int, object, StereoSplatSettings]] = []
+        self.calls: list[tuple[int, object, object]] = []
+
+    def render(
+        self,
+        frame: np.ndarray,
+        canonical: np.ndarray,
+        settings: StereoRenderSettings,
+    ) -> StereoRenderResult:
+        return self._record(frame, canonical, settings)
 
     def render_geometry(
         self,
@@ -119,7 +128,15 @@ class _FakeRenderer:
         geometry: object,
         settings: StereoSplatSettings,
     ) -> StereoRenderResult:
-        self.calls.append((threading.get_ident(), geometry, settings))
+        return self._record(frame, geometry, settings)
+
+    def _record(
+        self,
+        frame: np.ndarray,
+        render_input: object,
+        settings: object,
+    ) -> StereoRenderResult:
+        self.calls.append((threading.get_ident(), render_input, settings))
         if self.fail:
             raise RuntimeError("render failed")
         mask = np.ones(frame.shape[:2], dtype=np.bool_)
@@ -137,11 +154,16 @@ class _FakeRenderer:
 class _RecordingCommonRenderer:
     def __init__(self) -> None:
         self.geometry_calls: list[tuple[int, StereoGeometryFrame, StereoSplatSettings]] = []
-        self.legacy_relative_calls: list[object] = []
+        self.relative_calls: list[tuple[int, np.ndarray, StereoRenderSettings]] = []
 
-    def render(self, *args: object, **kwargs: object) -> StereoRenderResult:
-        self.legacy_relative_calls.append((args, kwargs))
-        raise AssertionError("the file pipeline must not call the legacy wrapper")
+    def render(
+        self,
+        frame: np.ndarray,
+        canonical: np.ndarray,
+        settings: StereoRenderSettings,
+    ) -> StereoRenderResult:
+        self.relative_calls.append((threading.get_ident(), canonical, settings))
+        return self._result(frame)
 
     def render_geometry(
         self,
@@ -150,6 +172,10 @@ class _RecordingCommonRenderer:
         settings: StereoSplatSettings,
     ) -> StereoRenderResult:
         self.geometry_calls.append((threading.get_ident(), geometry, settings))
+        return self._result(frame)
+
+    @staticmethod
+    def _result(frame: np.ndarray) -> StereoRenderResult:
         mask = np.ones(frame.shape[:2], dtype=np.bool_)
         holes = np.zeros(frame.shape[:2], dtype=np.bool_)
         return StereoRenderResult(
@@ -411,6 +437,66 @@ def test_file_pipeline_uses_corrected_stereo_sign_end_to_end(tmp_path: Path) -> 
     right = cv2.imread(str(directories["right_frames"] / frame_files[0].name))
     assert result is True
     assert int(np.argmax(left[2, :, 0])) > int(np.argmax(right[2, :, 0]))
+
+
+def test_relative_file_pipeline_matches_base_legacy_bytes_at_half_lane_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    width = 8950
+    canonical_value = np.float32(0.23064221441745758)
+    frame_files, depth_files, directories = _make_file_inputs(
+        tmp_path,
+        count=1,
+        frame_shape=(1, width),
+    )
+    frame = np.random.default_rng(20260817).integers(
+        0,
+        256,
+        size=(1, width, 3),
+        dtype=np.uint8,
+    )
+    assert cv2.imwrite(str(frame_files[0]), frame)
+    assert cv2.imwrite(str(depth_files[0]), np.ones((1, width), dtype=np.uint16))
+    metadata = json.loads((depth_files[0].parent / "metadata.json").read_text())
+    metadata["encoding_scale"] = 1.0 / float(canonical_value)
+    decoded_canonical = np.ones((1, width), dtype=np.float32)
+    decoded_canonical *= np.float32(1.0 / float(metadata["encoding_scale"]))
+    assert decoded_canonical[0, 0] == canonical_value
+    settings = _settings(
+        stereo_strength=0.473053267491137,
+        convergence=0.05202130106440961,
+        occlusion_fill="none",
+        stereo_io_workers=1,
+    )
+    expected = StereoRenderer(device="cpu").render(
+        frame,
+        decoded_canonical,
+        StereoRenderSettings(
+            stereo_strength=0.473053267491137,
+            convergence=0.05202130106440961,
+            occlusion_fill="none",
+        ),
+    )
+
+    generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+    monkeypatch.setattr(
+        generator,
+        "_get_canonical_metadata",
+        lambda _depth_files, _frame_files: metadata,
+    )
+    result = generator.create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        settings,
+    )
+
+    actual_left = cv2.imread(str(directories["left_frames"] / frame_files[0].name))
+    actual_right = cv2.imread(str(directories["right_frames"] / frame_files[0].name))
+    assert result is True
+    assert np.array_equal(actual_left, expected.left_image)
+    assert np.array_equal(actual_right, expected.right_image)
 
 
 def test_file_pipeline_uses_bounded_lifecycle_permits(tmp_path: Path) -> None:
@@ -700,7 +786,9 @@ def test_wrong_native_shape_is_rejected_before_rendering(tmp_path: Path) -> None
     assert renderer.calls == []
 
 
-def test_relative_generator_decodes_geometry_before_the_common_renderer(tmp_path: Path) -> None:
+def test_relative_generator_retains_canonical_for_the_legacy_renderer(
+    tmp_path: Path,
+) -> None:
     frame_files, depth_files, directories = _make_file_inputs(tmp_path, count=1)
     renderer = _RecordingCommonRenderer()
 
@@ -711,11 +799,15 @@ def test_relative_generator_decodes_geometry_before_the_common_renderer(tmp_path
         _settings(stereo_geometry_mode="relative"),
     )
 
-    assert len(renderer.geometry_calls) == 1
-    assert not renderer.legacy_relative_calls
-    _, geometry, splat_settings = renderer.geometry_calls[0]
-    assert geometry.near_score.shape == (8, 8)
-    assert splat_settings.max_eye_shift_fraction == pytest.approx(0.01)
+    assert len(renderer.relative_calls) == 1
+    assert not renderer.geometry_calls
+    _, canonical, render_settings = renderer.relative_calls[0]
+    assert canonical.shape == (8, 8)
+    assert render_settings == StereoRenderSettings(
+        stereo_strength=2.0,
+        convergence=0.5,
+        occlusion_fill="background",
+    )
 
 
 def test_metric_generator_uses_resolved_auto_convergence_and_common_renderer(
@@ -741,7 +833,7 @@ def test_metric_generator_uses_resolved_auto_convergence_and_common_renderer(
     )
 
     assert len(renderer.geometry_calls) == len(frame_files)
-    assert not renderer.legacy_relative_calls
+    assert not renderer.relative_calls
     metadata = json.loads((directories["left_frames"] / "metadata.json").read_text())
     assert metadata["geometry_mode"] == "metric_camera"
     assert metadata["effective_convergence_distance_m"] == pytest.approx(resolved_auto_distance_m)

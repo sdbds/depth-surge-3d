@@ -720,8 +720,16 @@ def _synthetic_recording_renderer(*, capture_geometry: bool) -> _RecordingStereo
     class SyntheticRenderer:
         device = "cpu"
 
+        def render(self, frame, _canonical, _settings):
+            height, width = frame.shape[:2]
+            return self._result(height, width)
+
         def render_geometry(self, _frame, geometry, _settings):
             height, width = geometry.source_valid.shape
+            return self._result(height, width)
+
+        @staticmethod
+        def _result(height, width):
             return SimpleNamespace(
                 left_image=np.full((height, width, 3), 1, np.uint8),
                 right_image=np.full((height, width, 3), 2, np.uint8),
@@ -763,6 +771,21 @@ def test_recording_renderer_never_retains_full_rgb_results() -> None:
     assert len(recorder.source_valid_masks) == 1
 
 
+def test_recording_renderer_forwards_relative_wrapper_and_records_holes() -> None:
+    recorder = _synthetic_recording_renderer(capture_geometry=False)
+
+    result = recorder.render(
+        np.zeros((2, 3, 3), np.uint8),
+        np.ones((2, 3), np.float32),
+        object(),
+    )
+
+    assert result.left_image.shape == (2, 3, 3)
+    assert len(recorder.hole_masks) == 1
+    assert not recorder.total_disparity_fractions
+    assert not recorder.source_valid_masks
+
+
 def _synthetic_production_clip(
     tmp_path: Path, clip_id: str
 ) -> tuple[ProductionVariantSession, Any, RawClip, _RecordingStereoRenderer]:
@@ -788,11 +811,15 @@ def _synthetic_production_clip(
         1,
     )
     relative_renderer = _synthetic_recording_renderer(capture_geometry=False)
+    relative_renderer.render(
+        np.zeros((2, 3, 3), np.uint8),
+        np.ones((2, 3), np.float32),
+        object(),
+    )
     geometry = SimpleNamespace(
         total_disparity_fraction=np.ones((2, 3), np.float64),
         source_valid=np.ones((2, 3), np.bool_),
     )
-    relative_renderer.render_geometry(np.zeros((2, 3, 3), np.uint8), geometry, object())
     session = object.__new__(ProductionVariantSession)
     session.device = "cpu"
     session.model_size = "vits"
