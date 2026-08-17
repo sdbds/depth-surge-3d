@@ -44,7 +44,7 @@ from .metric_geometry import MetricGeometryStore
 
 STEREO_STAGE_SCHEMA_VERSION = 1
 STEREO_STAGE_ALGORITHM_VERSION = "torch-horizontal-16x-zbuffer-v3"
-METRIC_PROJECTION_ALGORITHM_VERSION = "crop-aware-metric-pinhole-v1"
+METRIC_PROJECTION_ALGORITHM_VERSION = "crop-aware-metric-pinhole-v2"
 METRIC_CLAMP_STATS_SCHEMA_VERSION = 1
 METRIC_STEREO_COMPLETION_ERROR = "metric stereo requires completed clip-global convergence metadata"
 STEREO_HOST_BUDGET = 512 * 1024 * 1024

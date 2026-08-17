@@ -148,6 +148,15 @@ With `--occlusion-fill none`, partially unresolved pixels are composited over
 black by design and may form a dark one-pixel contour. This is distinct from a
 wide light/dark halo in `background` mode.
 
+#### Metric output looks like the background was cut out
+
+MoGe's mask describes metric-depth confidence; it is not an image alpha mask.
+Current metric projection retains masked source pixels on an infinite-distance
+background layer. Resume an older job to rebuild stereo frames with the current
+projection algorithm. The existing raw and metric-depth payloads remain
+reusable, so model inference does not need to run again when their fingerprints
+still match.
+
 #### Processing time
 Can be significant for long/high-resolution videos:
 - Typical speed: ~2-4 seconds per output frame on modern GPU (RTX 4070+)

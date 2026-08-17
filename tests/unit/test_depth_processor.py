@@ -250,6 +250,7 @@ def test_metric_preflight_sums_raw_and_exact_selected_stage_before_inference(
     ) + estimate_metric_geometry_disk_bytes(
         [native_shape] * len(frame_files),
         allocation_unit=filesystem_allocation_unit(tmp_path),
+        include_visual_previews=True,
     )
     assert events[0] == ("preflight", expected)
     assert next(index for index, event in enumerate(events) if event[0] == "inference") > 0
@@ -290,6 +291,42 @@ def test_complete_metric_stage_reuse_makes_zero_estimator_calls(metric_job: Metr
         metric_job.directories,
         None,
     )
+
+
+def test_metric_preview_repair_preflights_before_writing(
+    metric_job: MetricJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preview = next(metric_job.directories["metric_geometry"].glob("*.png"))
+    preview.unlink()
+    events: list[tuple[str, int | None]] = []
+    real_write = DepthMapProcessor._atomic_write_png
+
+    monkeypatch.setattr(
+        depth_processor,
+        "require_metric_geometry_disk_space",
+        lambda _path, required: events.append(("preflight", required)),
+    )
+
+    def recording_write(path: Path, values: np.ndarray) -> None:
+        events.append(("write", None))
+        real_write(path, values)
+
+    monkeypatch.setattr(DepthMapProcessor, "_atomic_write_png", staticmethod(recording_write))
+
+    assert metric_job.processor.generate_depth_map_files(
+        metric_job.frame_files,
+        metric_job.settings,
+        metric_job.directories,
+        None,
+    )
+
+    shape = (8, 6)
+    allocation = filesystem_allocation_unit(metric_job.directories["metric_geometry"])
+    expected = estimate_metric_geometry_disk_bytes(
+        [shape], allocation_unit=allocation, include_visual_previews=True
+    ) - estimate_metric_geometry_disk_bytes([shape], allocation_unit=allocation)
+    assert events == [("preflight", expected), ("write", None)]
+    assert preview.is_file()
 
 
 def test_no_retention_removes_raw_only_after_metric_finalize(
@@ -354,7 +391,7 @@ def test_candidate_scene_assignment_change_rebuilds_metric_without_inference(
     assert hash_directory(metric_job.directories["metric_geometry"]) != before
 
 
-def test_metric_derivation_emits_only_visual_depth_previews(
+def test_metric_derivation_persists_the_visual_depth_previews(
     fresh_metric_job: MetricJob, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tracker = SimpleNamespace(
@@ -379,6 +416,18 @@ def test_metric_derivation_emits_only_visual_depth_previews(
     ]
     for call in preview_calls:
         assert call.args[0].dtype == np.uint8
+
+    preview_files = sorted(fresh_metric_job.directories["metric_geometry"].glob("*.png"))
+    assert [path.stem for path in preview_files] == [path.stem for path in files]
+    for metric_file, preview_file in zip(files, preview_files):
+        with np.load(metric_file) as payload:
+            expected = DepthMapProcessor._metric_depth_preview(
+                payload["inverse_depth"], payload["valid"]
+            )
+        actual = cv2.imread(str(preview_file), cv2.IMREAD_UNCHANGED)
+        assert actual is not None
+        assert actual.dtype == np.uint8
+        np.testing.assert_array_equal(actual, expected)
 
 
 def test_metric_stage_resume_keeps_committed_payload_bytes(

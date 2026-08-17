@@ -90,7 +90,7 @@ output/video_timestamp/
 |   `-- depth_bounds.json
 |-- 02_depth_raw/
 |-- 03_disparity_maps/
-|-- 03_metric_geometry/
+|-- 03_metric_geometry/       # metric NPZ plus viewable PNGs when retained
 |-- 04_left_frames/
 |-- 04_right_frames/
 |-- 05_left_distorted/
@@ -111,6 +111,10 @@ the selected Stage 3 payloads and metadata validate. If later rendering fails,
 that completed Stage 3 remains available for resume. Full intermediate cleanup,
 including payloads from both Stage-3 directories, runs only after final output
 is successfully finalized.
+
+The PNG files in `03_metric_geometry` are 8-bit per-frame visualizations for
+inspection and match the live depth-preview normalization. Metric rendering
+continues to consume the lossless NPZ geometry, not these visualization files.
 
 ## Resume
 

@@ -251,7 +251,7 @@ def test_metric_disparity_scales_linearly_with_focal_and_baseline() -> None:
     )
 
 
-def test_metric_invalid_and_zero_valid_pixels_do_not_count_or_shift() -> None:
+def test_metric_invalid_depth_uses_infinite_background_without_counting() -> None:
     geometry, stats = build_metric_geometry(
         inverse_depth=np.array([[10.0, 0.0]], dtype=np.float32),
         valid=np.array([[False, False]], dtype=np.bool_),
@@ -263,8 +263,14 @@ def test_metric_invalid_and_zero_valid_pixels_do_not_count_or_shift() -> None:
         retained_crop_width=2,
     )
 
-    assert not geometry.source_valid.any()
-    assert np.count_nonzero(geometry.total_disparity_fraction) == 0
+    assert geometry.source_valid.all()
+    np.testing.assert_array_equal(geometry.near_score, np.zeros((1, 2), dtype=np.float32))
+    np.testing.assert_allclose(
+        geometry.total_disparity_fraction,
+        np.full((1, 2), -0.01, dtype=np.float64),
+        rtol=0.0,
+        atol=0.0,
+    )
     assert stats == MetricProjectionStats(0, 0, 0.0)
 
 

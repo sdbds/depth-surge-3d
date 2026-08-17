@@ -241,9 +241,12 @@ def _ceil_five_quarters(value: int) -> int:
 
 
 def estimate_metric_geometry_disk_bytes(
-    frame_shapes: Sequence[tuple[int, int]], *, allocation_unit: int
+    frame_shapes: Sequence[tuple[int, int]],
+    *,
+    allocation_unit: int,
+    include_visual_previews: bool = False,
 ) -> int:
-    """Return the exact conservative uncompressed metric-stage disk bound."""
+    """Return the conservative uncompressed metric-stage disk bound."""
 
     if not frame_shapes:
         return 0
@@ -263,7 +266,8 @@ def estimate_metric_geometry_disk_bytes(
         ):
             raise ValueError("Metric frame dimensions must be positive integers")
         normalized_shapes.append((int(height), int(width)))
-    frame_payloads = [5 * height * width for height, width in normalized_shapes]
+    bytes_per_pixel = 6 if include_visual_previews else 5
+    frame_payloads = [bytes_per_pixel * height * width for height, width in normalized_shapes]
     payload_bound = sum(frame_payloads)
     metadata_bound = max(16 * 1024 * 1024, allocation * len(normalized_shapes))
     atomic_overlap = _ceil_five_quarters(max(frame_payloads)) + allocation

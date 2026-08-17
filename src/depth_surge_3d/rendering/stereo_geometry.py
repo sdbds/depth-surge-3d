@@ -227,7 +227,9 @@ def build_metric_geometry(
     )
     clamped_output_fraction = np.clip(raw_output_fraction, -limit, limit)
     render_fraction = clamped_output_fraction * retained_fraction
-    render_fraction[~resized_valid] = np.float64(0.0)
+
+    # Model validity is depth confidence, not source alpha. Zero inverse depth
+    # places uncertain pixels on the infinite-background plane at the lowest rank.
 
     valid_pixel_count = int(np.count_nonzero(resized_valid))
     clamped_pixel_count = int(
@@ -240,7 +242,7 @@ def build_metric_geometry(
         StereoGeometryFrame(
             near_score=np.ascontiguousarray(resized_inverse, dtype=np.float32),
             total_disparity_fraction=np.ascontiguousarray(render_fraction, dtype=np.float64),
-            source_valid=np.ascontiguousarray(resized_valid, dtype=np.bool_),
+            source_valid=np.ones(resized_valid.shape, dtype=np.bool_),
         ),
         MetricProjectionStats(valid_pixel_count, clamped_pixel_count, clamped_fraction),
     )

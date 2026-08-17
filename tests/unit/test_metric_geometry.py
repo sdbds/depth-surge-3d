@@ -303,6 +303,14 @@ def test_convergence_rejects_manifest_length_mismatch(raw_metric_store: RawDepth
 
 def test_metric_disk_bound_uses_exact_uncompressed_formula() -> None:
     assert estimate_metric_geometry_disk_bytes([(2, 3), (4, 5)], allocation_unit=4096) == 16_781_600
+    assert (
+        estimate_metric_geometry_disk_bytes(
+            [(2, 3), (4, 5)],
+            allocation_unit=4096,
+            include_visual_previews=True,
+        )
+        == 16_781_657
+    )
     assert estimate_metric_geometry_disk_bytes([], allocation_unit=4096) == 0
 
 

@@ -77,6 +77,7 @@ from .scene_analyzer import (
 )
 from .source_frame_manifest import frame_sequence_fingerprint
 from .metric_geometry import (
+    MetricGeometryFrame,
     MetricGeometryStore,
     estimate_metric_geometry_disk_bytes,
     filesystem_allocation_unit,
@@ -528,7 +529,36 @@ class DepthMapProcessor:
             )
         except (OSError, KeyError, TypeError, ValueError):
             return None
-        return list(store.complete_files)
+        files = list(store.complete_files)
+        if settings.get("keep_intermediates", False):
+            native_shape = cast(
+                tuple[int, int],
+                tuple(int(value) for value in store.metadata["native_shape"]),
+            )
+            missing_previews = [
+                metric_file
+                for metric_file in files
+                if not png_headers_match(
+                    [metric_file.with_suffix(".png")],
+                    shape=native_shape,
+                    bit_depth=8,
+                )
+            ]
+            if missing_previews:
+                allocation = filesystem_allocation_unit(store.directory)
+                shapes = [native_shape] * len(missing_previews)
+                preview_required = estimate_metric_geometry_disk_bytes(
+                    shapes,
+                    allocation_unit=allocation,
+                    include_visual_previews=True,
+                ) - estimate_metric_geometry_disk_bytes(
+                    shapes,
+                    allocation_unit=allocation,
+                )
+                require_metric_geometry_disk_space(store.directory, preview_required)
+            for metric_file in missing_previews:
+                self._ensure_metric_depth_preview(store, metric_file)
+        return files
 
     @staticmethod
     def _report_geometry_generation_start(
@@ -1326,6 +1356,7 @@ class DepthMapProcessor:
                 missing_raw_count=missing_raw_count,
                 native_shape=estimated_shape,
                 storage_bytes=storage_bytes,
+                keep_intermediates=bool(settings.get("keep_intermediates", False)),
             )
         else:
             self._require_depth_disk_space(
@@ -1374,6 +1405,7 @@ class DepthMapProcessor:
         missing_raw_count: int,
         native_shape: tuple[int, int],
         storage_bytes: int,
+        keep_intermediates: bool,
     ) -> None:
         native_height, native_width = native_shape
         raw_required = estimate_raw_depth_only_bytes(
@@ -1386,6 +1418,7 @@ class DepthMapProcessor:
         metric_required = estimate_metric_geometry_disk_bytes(
             [native_shape] * frame_count,
             allocation_unit=filesystem_allocation_unit(metric_dir),
+            include_visual_previews=keep_intermediates,
         )
         require_disk_space(raw_dir, raw_required + metric_required)
 
@@ -1473,6 +1506,7 @@ class DepthMapProcessor:
                     missing_raw_count=len(frame_names) - len(raw_store.complete_files),
                     native_shape=cast(tuple[int, int], actual_shape),
                     storage_bytes=selected_bytes,
+                    keep_intermediates=bool(settings.get("keep_intermediates", False)),
                 )
         return raw_store
 
@@ -1482,11 +1516,12 @@ class DepthMapProcessor:
         settings: dict[str, Any],
         progress_tracker,
     ) -> list[Path]:
-        del settings
+        keep_intermediates = bool(settings.get("keep_intermediates", False))
         native_shape = tuple(int(value) for value in context.raw_store.metadata["native_shape"])
         required = estimate_metric_geometry_disk_bytes(
             [cast(tuple[int, int], native_shape)] * len(context.frame_names),
             allocation_unit=filesystem_allocation_unit(context.metric_dir),
+            include_visual_previews=keep_intermediates,
         )
         require_metric_geometry_disk_space(context.metric_dir, required)
         store = self._open_or_reset_metric_store(context, native_shape, required)
@@ -1505,6 +1540,8 @@ class DepthMapProcessor:
                     )
                 frame = metric_frame_from_depth(batch.values[0], batch.camera.focal_x_normalized[0])
                 store.write_frame(name, frame)
+            if keep_intermediates:
+                self._ensure_metric_depth_preview(store, output, frame)
             self._report_metric_progress(
                 progress_tracker,
                 index,
@@ -1567,6 +1604,28 @@ class DepthMapProcessor:
         else:
             preview[finite_valid] = np.uint8(255)
         return preview
+
+    @classmethod
+    def _ensure_metric_depth_preview(
+        cls,
+        store: MetricGeometryStore,
+        metric_file: Path,
+        frame: MetricGeometryFrame | None = None,
+    ) -> Path:
+        preview_file = metric_file.with_suffix(".png")
+        if frame is None:
+            native_shape = tuple(int(value) for value in store.metadata["native_shape"])
+        else:
+            native_shape = frame.inverse_depth.shape
+        if png_headers_match([preview_file], shape=native_shape, bit_depth=8):
+            return preview_file
+        if frame is None:
+            frame = store.load(metric_file)
+        cls._atomic_write_png(
+            preview_file,
+            cls._metric_depth_preview(frame.inverse_depth, frame.valid),
+        )
+        return preview_file
 
     @classmethod
     def _report_metric_progress(
@@ -1945,7 +2004,7 @@ class DepthMapProcessor:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f"{path.stem}.tmp{path.suffix}")
         if not cv2.imwrite(str(temporary), values):
-            raise OSError(f"Could not write canonical depth map: {path}")
+            raise OSError(f"Could not write depth PNG: {path}")
         temporary.replace(path)
 
     @staticmethod

@@ -58,7 +58,9 @@ Relative mode remains the default and derives `03_disparity_maps`. Experimental
 metric-camera mode derives `03_metric_geometry`. These are independent Stage-3
 directories: only the selected missing stage is generated, and a valid inactive
 stage is preserved. The metric store holds native-resolution inverse depth,
-source validity, and normalized horizontal focal data.
+depth validity, and normalized horizontal focal data. When intermediates are
+retained, it also holds one viewable uint8 depth-preview PNG per frame; these
+PNGs are diagnostics and are not projection inputs.
 
 Both paths produce a common `StereoGeometryFrame` containing near-score,
 total-disparity fraction, and source-validity arrays. The common stereo
@@ -79,6 +81,12 @@ even when the active render requests an explicit distance. This finalized
 metadata is a barrier: metric stereo and live preview do not start before it
 exists. Baseline, explicit-versus-auto convergence, disparity cap, and render
 width are stereo settings rather than metric-stage identity.
+
+MoGe's predicted mask is depth confidence, not source-image alpha. Metric
+projection excludes masked pixels from convergence and clamp statistics, gives
+them the lowest visibility rank, and projects them on the infinite-background
+plane. Their source colors therefore remain available to fill the background
+instead of being replaced with black.
 
 ## Scene Canonicalization
 

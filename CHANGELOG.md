@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relative and metric Stage-3 stores.
 - Third-party notices for Microsoft MoGe and its bundled/derived DINOv2 code.
 
+### Fixed
+
+- Metric-camera rendering no longer treats MoGe's depth-confidence mask as
+  image transparency. Pixels without trusted metric depth are retained as an
+  infinite-background layer instead of becoming black cutouts.
+- Metric jobs that keep intermediate files now persist the same viewable
+  8-bit depth visualizations used by the live Web preview alongside the metric
+  geometry payloads.
+
 The [MoGe-2 release-evidence checklist](docs/release/moge2-release-checklist.md)
 defines the separate three-variant evidence process that will be added with the
 release tooling. This changelog entry does not claim that real-model evidence
