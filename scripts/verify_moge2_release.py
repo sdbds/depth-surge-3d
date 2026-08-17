@@ -949,6 +949,10 @@ def _default_snapshot_copy(source: Path, destination: Path) -> None:
     shutil.copyfile(source, destination)
 
 
+def _noop_stage_hook(_stage: str) -> None:
+    return None
+
+
 @dataclass(frozen=True)
 class ReleaseDependencies:
     session_factory: Callable[[str, str, str, str], ReleaseSession]
@@ -958,6 +962,7 @@ class ReleaseDependencies:
     git_probe: Callable[[], tuple[str, bool]] = _default_git_probe
     media_probe: Callable[[Path], dict[str, Any]] = _default_video_probe
     snapshot_copy: Callable[[Path, Path], None] = _default_snapshot_copy
+    stage_hook: Callable[[str], None] = _noop_stage_hook
     cuda: CudaProbe | None = None
     publisher: AtomicPublisher = AtomicPublisher()
 
@@ -1064,25 +1069,50 @@ def _validated_media_properties(
     }
 
 
-def _output_record(
+def _prepare_output_record(
     output_dir: Path,
-    path: Path,
+    destination: Path,
+    validated_temporary: Path,
     *,
+    kind: Literal["fixed_image", "video"],
+    variant: str,
+    clip: str | None,
+    mode: str | None,
     media: Mapping[str, int | float] | None = None,
 ) -> dict[str, Any]:
-    resolved_output = output_dir.resolve()
-    resolved_path = path.resolve()
+    resolved_output = output_dir.resolve(strict=True)
+    resolved_path = _validate_evidence_target(output_dir, destination)
     try:
         relative = resolved_path.relative_to(resolved_output)
     except ValueError as error:
-        raise ValueError(f"evidence output escaped output directory: {path}") from error
-    record: dict[str, Any] = {"path": relative.as_posix(), "sha256": _hash_file(path)}
+        raise ValueError(f"evidence output escaped output directory: {destination}") from error
+    if _is_link_or_reparse(validated_temporary) or not validated_temporary.is_file():
+        raise ValueError(f"validated evidence temporary is missing: {validated_temporary}")
+    record: dict[str, Any] = {
+        "kind": kind,
+        "variant": variant,
+        "clip": clip,
+        "mode": mode,
+        "path": relative.as_posix(),
+        "sha256": _hash_file(validated_temporary),
+    }
     if media is not None:
         record["media"] = dict(media)
     return record
 
 
-def _recorded_outputs(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _verify_committed_record(output_dir: Path, record: Mapping[str, Any]) -> None:
+    destination = output_dir / str(record["path"])
+    _validate_evidence_target(output_dir, destination)
+    if (
+        _is_link_or_reparse(destination)
+        or not destination.is_file()
+        or _hash_file(destination) != record["sha256"]
+    ):
+        raise ValueError(f"post-promotion hash mismatch: {record['path']}")
+
+
+def _variant_output_records(report: Mapping[str, Any]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for variant in cast(list[dict[str, Any]], report.get("variants", [])):
         fixed = variant.get("fixed_image_output")
@@ -1094,6 +1124,13 @@ def _recorded_outputs(report: Mapping[str, Any]) -> list[dict[str, Any]]:
                 if isinstance(record, dict):
                     records.append(cast(dict[str, Any], record))
     return records
+
+
+def _committed_artifacts(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    ledger = report.get("committed_artifacts")
+    if not isinstance(ledger, list) or any(not isinstance(item, dict) for item in ledger):
+        return []
+    return cast(list[dict[str, Any]], ledger)
 
 
 def _validate_complete_tree(output_dir: Path) -> None:
@@ -1145,11 +1182,53 @@ def _validate_complete_evidence(  # noqa: C901
         for item in variants
     ):
         raise ValueError("complete evidence is missing the canonical clip order")
-    records = _recorded_outputs(report)
+    records = _committed_artifacts(report)
+    variant_records = _variant_output_records(report)
     expected = _expected_evidence_paths()
     observed = {Path(record["path"]) for record in records}
     if len(records) != 21 or observed != expected:
-        raise ValueError("complete evidence must record exactly all 21 media/NPZ outputs")
+        raise ValueError("complete evidence ledger must contain exactly all 21 media/NPZ outputs")
+    ledger_by_path = {record["path"]: record for record in records}
+    if (
+        len(variant_records) != 21
+        or {Path(record.get("path", "")) for record in variant_records} != expected
+        or any(ledger_by_path.get(record.get("path")) != record for record in variant_records)
+    ):
+        raise ValueError("variant output references differ from the committed-artifact ledger")
+    for model_size, _repository, _revision in RELEASE_VARIANT_PINS:
+        fixed_path = f"{model_size}/fixed-image-depth.npz"
+        fixed_record = ledger_by_path[fixed_path]
+        if set(fixed_record) != {"kind", "variant", "clip", "mode", "path", "sha256"} or (
+            fixed_record["kind"],
+            fixed_record["variant"],
+            fixed_record["clip"],
+            fixed_record["mode"],
+        ) != ("fixed_image", model_size, None, None):
+            raise ValueError(f"fixed artifact ledger identity is invalid: {fixed_path}")
+        for clip_id in CANONICAL_CLIP_IDS:
+            for mode, suffix in (("relative", "relative"), ("metric_camera", "metric-camera")):
+                video_path = f"{model_size}/{clip_id}-{suffix}.mp4"
+                video_record = ledger_by_path[video_path]
+                if set(video_record) != {
+                    "kind",
+                    "variant",
+                    "clip",
+                    "mode",
+                    "path",
+                    "sha256",
+                    "media",
+                } or (
+                    video_record["kind"],
+                    video_record["variant"],
+                    video_record["clip"],
+                    video_record["mode"],
+                ) != (
+                    "video",
+                    model_size,
+                    clip_id,
+                    mode,
+                ):
+                    raise ValueError(f"video artifact ledger identity is invalid: {video_path}")
     for record in records:
         path = output_dir / record["path"]
         _validate_evidence_target(output_dir, path)
@@ -1231,6 +1310,7 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:  # noqa: C901
         "|---|---|",
         f"| Tool schema | `{value(report.get('tool_schema_version'))}` |",
         f"| UTC timestamp | `{value(report.get('timestamp_utc'))}` |",
+        f"| Git identity available | `{value(project_git.get('available'))}` |",
         f"| Git commit | `{value(project_git.get('commit'))}` |",
         f"| Git dirty | `{value(project_git.get('dirty'))}` |",
         f"| OS | `{value(system.get('os'))}` |",
@@ -1278,6 +1358,21 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:  # noqa: C901
     settings = _report_mapping(report.get("settings"))
     for key, setting_value in settings.items():
         lines.append(f"| {key} | `{value(setting_value)}` |")
+    lines.extend(
+        [
+            "",
+            "## Committed Artifact Ledger",
+            "",
+            "| Variant | Clip | Mode | Kind | Output |",
+            "|---|---|---|---|---|",
+        ]
+    )
+    for artifact in _committed_artifacts(report):
+        lines.append(
+            f"| {value(artifact.get('variant'))} | {value(artifact.get('clip'))} | "
+            f"{value(artifact.get('mode'))} | {value(artifact.get('kind'))} | "
+            f"{_format_output(artifact)} |"
+        )
     lines.extend(["", "## Measurements and Outputs", ""])
     variants = _report_list(report.get("variants"))
     for variant in variants:
@@ -1460,7 +1555,7 @@ class ReleaseRunner:
             "tool_schema_version": TOOL_SCHEMA_VERSION,
             "timestamp_utc": None,
             "status": "incomplete",
-            "project_git": {"commit": None, "dirty": None},
+            "project_git": {"available": False, "commit": None, "dirty": None},
             "system": {
                 "os": None,
                 "python": None,
@@ -1474,21 +1569,26 @@ class ReleaseRunner:
             "inputs": _input_report(corpus),
             "settings": {"device": device, **REPORT_SETTINGS},
             "variants": [],
+            "committed_artifacts": [],
             "failures": [],
         }
         current_variant: str | None = None
         current_clip: str | None = None
-        current_stage = "initial_report"
+        current_stage = "preflight"
         session: ReleaseSession | None = None
         try:
-            self._write_reports(report, output_dir)
-            current_stage = "preflight"
             self._reject_stale_outputs(output_dir)
-            current_stage = "timestamp_probe"
-            report["timestamp_utc"] = self.dependencies.utc_now()
             current_stage = "git_probe"
             commit, dirty = self.dependencies.git_probe()
-            report["project_git"] = {"commit": commit, "dirty": bool(dirty)}
+            report["project_git"] = {
+                "available": True,
+                "commit": commit,
+                "dirty": bool(dirty),
+            }
+            current_stage = "initial_report"
+            self._write_reports(report, output_dir)
+            current_stage = "timestamp_probe"
+            report["timestamp_utc"] = self.dependencies.utc_now()
             current_stage = "system_probe"
             report["system"] = self.dependencies.system_probe(device)
             current_stage = "snapshot_inputs"
@@ -1552,23 +1652,46 @@ class ReleaseRunner:
                         current_stage = "fixed_image_npz"
                         write_fixed_image_artifact(fixed_temporary, fixed)
                         fixed_values = validate_fixed_image_artifact(fixed_temporary)
+                        fixed_record = _prepare_output_record(
+                            output_dir,
+                            fixed_destination,
+                            fixed_temporary,
+                            kind="fixed_image",
+                            variant=model_size,
+                            clip=None,
+                            mode=None,
+                        )
                         current_stage = "fixed_image_promotion"
                         self.dependencies.publisher.commit_temporary(
                             fixed_temporary, fixed_destination, root=output_dir
                         )
                     finally:
                         fixed_temporary.unlink(missing_ok=True)
+                    _verify_committed_record(output_dir, fixed_record)
                     variant_report.update(
                         {
                             "fixed_image_native_shape": fixed_values["native_shape"],
                             "fixed_image_focal_x_normalized": fixed_values["focal_x_normalized"],
                             "fixed_image_valid_metric_pixels": fixed_values["valid_metric_pixels"],
-                            "fixed_image_output": _output_record(output_dir, fixed_destination),
+                            "fixed_image_output": fixed_record,
                         }
                     )
+                    report["committed_artifacts"].append(fixed_record)
+                    current_stage = "after_fixed_promotion"
+                    self.dependencies.stage_hook(f"after_fixed_promotion:{model_size}")
+                    current_stage = "refresh_fixed_report"
+                    self._write_reports(report, output_dir)
+                    self.dependencies.stage_hook(f"after_fixed_report_refresh:{model_size}")
 
                     for clip in authenticated.clips:
                         current_clip = clip.clip_id
+                        clip_report: dict[str, Any] = {
+                            "id": clip.clip_id,
+                            "input_sha256": clip.sha256,
+                            "input_fps": clip.fps,
+                            "input_frame_count": clip.frame_count,
+                        }
+                        variant_report["clips"].append(clip_report)
                         with tempfile.TemporaryDirectory(
                             prefix=f"moge2-release-{model_size}-{clip.clip_id}-",
                             dir=private_root,
@@ -1598,8 +1721,15 @@ class ReleaseRunner:
                                 )
                             )
                             raw_hash = _hash_tree(raw.directory)
+                            clip_report.update(
+                                {
+                                    "adapter_inference_call_count": raw.inference_calls,
+                                    "inferred_frame_count": raw.inferred_frame_count,
+                                    "inference_peak_vram_bytes": inference_peak,
+                                    "raw_stage_sha256": raw_hash,
+                                }
+                            )
                             renders: dict[str, ClipRender] = {}
-                            output_records: dict[str, dict[str, Any]] = {}
                             for mode, suffix in (
                                 ("relative", "relative"),
                                 ("metric_camera", "metric-camera"),
@@ -1637,15 +1767,39 @@ class ReleaseRunner:
                                         raise ValueError(
                                             "raw stage changed while reusing it across modes"
                                         )
+                                    record = _prepare_output_record(
+                                        output_dir,
+                                        destination,
+                                        temporary,
+                                        kind="video",
+                                        variant=model_size,
+                                        clip=clip.clip_id,
+                                        mode=mode,
+                                        media=media,
+                                    )
                                     current_stage = f"promote_{mode}_media"
                                     self.dependencies.publisher.commit_temporary(
                                         temporary, destination, root=output_dir
                                     )
                                 finally:
                                     temporary.unlink(missing_ok=True)
+                                _verify_committed_record(output_dir, record)
                                 renders[mode] = rendered
-                                output_records[mode] = _output_record(
-                                    output_dir, destination, media=media
+                                output_field = (
+                                    "relative_output" if mode == "relative" else "metric_output"
+                                )
+                                clip_report[output_field] = record
+                                report["committed_artifacts"].append(record)
+                                hook_mode = "relative" if mode == "relative" else "metric"
+                                current_stage = f"after_{hook_mode}_promotion"
+                                self.dependencies.stage_hook(
+                                    f"after_{hook_mode}_promotion:{model_size}:{clip.clip_id}"
+                                )
+                                current_stage = f"refresh_{hook_mode}_report"
+                                self._write_reports(report, output_dir)
+                                self.dependencies.stage_hook(
+                                    f"after_{hook_mode}_report_refresh:"
+                                    f"{model_size}:{clip.clip_id}"
                                 )
                             current_stage = "measure_clip"
                             if (
@@ -1663,16 +1817,8 @@ class ReleaseRunner:
                                 source_roi_xywh=clip.static_roi_xywh,
                                 inference_seconds=inference_seconds,
                             )
-                            variant_report["clips"].append(
+                            clip_report.update(
                                 {
-                                    "id": clip.clip_id,
-                                    "input_sha256": clip.sha256,
-                                    "input_fps": clip.fps,
-                                    "input_frame_count": clip.frame_count,
-                                    "adapter_inference_call_count": raw.inference_calls,
-                                    "inferred_frame_count": raw.inferred_frame_count,
-                                    "inference_peak_vram_bytes": inference_peak,
-                                    "raw_stage_sha256": raw_hash,
                                     "output_shape": list(
                                         cast(
                                             tuple[int, int],
@@ -1680,8 +1826,6 @@ class ReleaseRunner:
                                         )
                                     ),
                                     **measurements,
-                                    "relative_output": output_records["relative"],
-                                    "metric_output": output_records["metric_camera"],
                                 }
                             )
                     current_stage = "unload_model"
@@ -1750,27 +1894,57 @@ class ReleaseRunner:
 
 
 class _RecordingStereoRenderer:
-    def __init__(self, device: str) -> None:
+    def __init__(self, device: str, *, capture_geometry: bool) -> None:
         _ensure_project_import_path()
         from depth_surge_3d.rendering.stereo_renderer import StereoRenderer
 
         self._renderer = StereoRenderer(device=device)
         self.device = self._renderer.device
-        self.results: list[Any] = []
-        self.geometries: list[Any] = []
+        self.capture_geometry = capture_geometry
+        self.hole_masks: list[np.ndarray] = []
+        self.total_disparity_fractions: list[np.ndarray] = []
+        self.source_valid_masks: list[np.ndarray] = []
 
     def render_geometry(self, frame: np.ndarray, geometry: Any, settings: Any) -> Any:
         result = self._renderer.render_geometry(frame, geometry, settings)
-        self.results.append(result)
-        self.geometries.append(geometry)
+        self.hole_masks.append(
+            np.concatenate((result.left_hole_mask, result.right_hole_mask), axis=1).astype(
+                np.bool_, copy=True
+            )
+        )
+        if self.capture_geometry:
+            self.total_disparity_fractions.append(
+                np.array(geometry.total_disparity_fraction, dtype=np.float64, copy=True)
+            )
+            self.source_valid_masks.append(
+                np.array(geometry.source_valid, dtype=np.bool_, copy=True)
+            )
         return result
+
+    def consume_holes(self) -> np.ndarray:
+        if not self.hole_masks:
+            raise ValueError("production renderer did not expose output masks")
+        holes = np.stack(self.hole_masks).astype(np.bool_, copy=False)
+        self.hole_masks.clear()
+        return holes
+
+    def consume_geometry(self) -> tuple[np.ndarray, np.ndarray]:
+        if not self.total_disparity_fractions or not self.source_valid_masks:
+            raise ValueError("production renderer did not expose metric geometry")
+        if len(self.total_disparity_fractions) != len(self.source_valid_masks):
+            raise ValueError("production renderer metric geometry is incomplete")
+        disparities = np.stack(self.total_disparity_fractions).astype(np.float64, copy=False)
+        source_valid = np.stack(self.source_valid_masks).astype(np.bool_, copy=False)
+        self.total_disparity_fractions.clear()
+        self.source_valid_masks.clear()
+        return disparities, source_valid
 
 
 @dataclass
 class _ProductionClipState:
     workspace: Path
     relative_output: Path
-    relative_renderer: _RecordingStereoRenderer
+    relative_renderer: _RecordingStereoRenderer | None
     relative_settings: dict[str, Any]
 
 
@@ -1901,7 +2075,10 @@ class ProductionVariantSession:
         from depth_surge_3d.processing.video.video_encoder import VideoEncoder
         from depth_surge_3d.utils.path_utils import generate_output_filename
 
-        renderer = _RecordingStereoRenderer(self.device)
+        renderer = _RecordingStereoRenderer(
+            self.device,
+            capture_geometry=settings["stereo_geometry_mode"] == "metric_camera",
+        )
         orchestrator = ProcessingOrchestrator(
             depth_processor=DepthMapProcessor(self.estimator),
             stereo_generator=StereoPairGenerator(renderer=cast(Any, renderer)),
@@ -1997,14 +2174,7 @@ class ProductionVariantSession:
 
     @staticmethod
     def _holes(renderer: _RecordingStereoRenderer) -> np.ndarray:
-        if not renderer.results:
-            raise ValueError("production renderer did not expose output masks")
-        return np.stack(
-            [
-                np.concatenate((result.left_hole_mask, result.right_hole_mask), axis=1)
-                for result in renderer.results
-            ]
-        ).astype(np.bool_, copy=False)
+        return renderer.consume_holes()
 
     def render_clip(
         self,
@@ -2019,66 +2189,74 @@ class ProductionVariantSession:
         if state is None or state.workspace != raw.directory.parent:
             raise ValueError("production clip state does not match the raw stage")
         if mode == "relative":
-            shutil.copyfile(state.relative_output, output_path)
+            try:
+                if state.relative_renderer is None:
+                    raise ValueError("production relative measurements were already consumed")
+                shutil.copyfile(state.relative_output, output_path)
+                result = ClipRender(
+                    "relative",
+                    output_path,
+                    self._holes(state.relative_renderer),
+                    output_shape=(
+                        int(state.relative_settings["vr_output_height"]),
+                        int(state.relative_settings["vr_output_width"]),
+                    ),
+                )
+                state.relative_renderer = None
+                return result
+            except Exception:
+                self._states.pop(clip.clip_id, None)
+                raise
+        if mode != "metric_camera":
+            self._states.pop(clip.clip_id, None)
+            raise ValueError(f"unsupported release render mode: {mode}")
+        try:
+            metric_settings = self._resolved_settings(
+                clip, int(state.relative_settings["depth_resolution"]), "metric_camera"
+            )
+            measured, inference_state = self._instrument_inference()
+            original = self.estimator.estimate_depth_batch
+            self.estimator.estimate_depth_batch = measured
+            try:
+                metric_output, renderer = self._run_mode(clip, state.workspace, metric_settings)
+            finally:
+                self.estimator.estimate_depth_batch = original
+            if inference_state["calls"] != 0 or inference_state["frames"] != 0:
+                raise ValueError("metric render reinferred frames instead of reusing raw schema v3")
+            shutil.copyfile(metric_output, output_path)
+            source_width = clip.width
+            crop_factor = float(metric_settings["crop_factor"])
+            retained_width = max(1, min(source_width, int(round(source_width * crop_factor))))
+            retained_height = max(1, min(clip.height, int(round(clip.height * crop_factor))))
+            retained_x0 = (source_width - retained_width) // 2
+            retained_y0 = (clip.height - retained_height) // 2
+            scale = metric_settings["per_eye_width"] / retained_width
+            disparity_fractions, source_valid = renderer.consume_geometry()
+            disparities = (disparity_fractions * source_width * scale).astype(
+                np.float64, copy=False
+            )
+            sidecar_dir = state.workspace / "04_left_frames" / "clamp_stats"
+            sidecars = tuple(sidecar_dir / f"{name}.json" for name in raw.frame_names)
             return ClipRender(
-                "relative",
+                "metric_camera",
                 output_path,
-                self._holes(state.relative_renderer),
-                output_shape=(
-                    int(state.relative_settings["vr_output_height"]),
-                    int(state.relative_settings["vr_output_width"]),
+                self._holes(renderer),
+                disparities,
+                (
+                    retained_x0,
+                    retained_y0,
+                    retained_x0 + retained_width,
+                    retained_y0 + retained_height,
+                ),
+                sidecars,
+                source_valid,
+                (
+                    int(metric_settings["vr_output_height"]),
+                    int(metric_settings["vr_output_width"]),
                 ),
             )
-        if mode != "metric_camera":
-            raise ValueError(f"unsupported release render mode: {mode}")
-        metric_settings = self._resolved_settings(
-            clip, int(state.relative_settings["depth_resolution"]), "metric_camera"
-        )
-        measured, inference_state = self._instrument_inference()
-        original = self.estimator.estimate_depth_batch
-        self.estimator.estimate_depth_batch = measured
-        try:
-            metric_output, renderer = self._run_mode(clip, state.workspace, metric_settings)
         finally:
-            self.estimator.estimate_depth_batch = original
-        if inference_state["calls"] != 0 or inference_state["frames"] != 0:
-            raise ValueError("metric render reinferred frames instead of reusing raw schema v3")
-        shutil.copyfile(metric_output, output_path)
-        source_width = clip.width
-        crop_factor = float(metric_settings["crop_factor"])
-        retained_width = max(1, min(source_width, int(round(source_width * crop_factor))))
-        retained_height = max(1, min(clip.height, int(round(clip.height * crop_factor))))
-        retained_x0 = (source_width - retained_width) // 2
-        retained_y0 = (clip.height - retained_height) // 2
-        scale = metric_settings["per_eye_width"] / retained_width
-        disparities = np.stack(
-            [
-                geometry.total_disparity_fraction * source_width * scale
-                for geometry in renderer.geometries
-            ]
-        ).astype(np.float64, copy=False)
-        sidecar_dir = state.workspace / "04_left_frames" / "clamp_stats"
-        sidecars = tuple(sidecar_dir / f"{name}.json" for name in raw.frame_names)
-        return ClipRender(
-            "metric_camera",
-            output_path,
-            self._holes(renderer),
-            disparities,
-            (
-                retained_x0,
-                retained_y0,
-                retained_x0 + retained_width,
-                retained_y0 + retained_height,
-            ),
-            sidecars,
-            np.stack([geometry.source_valid for geometry in renderer.geometries]).astype(
-                np.bool_, copy=False
-            ),
-            (
-                int(metric_settings["vr_output_height"]),
-                int(metric_settings["vr_output_width"]),
-            ),
-        )
+            self._states.pop(clip.clip_id, None)
 
     def unload(self) -> None:
         self.estimator.unload_model()

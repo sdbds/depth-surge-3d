@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import weakref
 import zipfile
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -26,6 +29,8 @@ from scripts.verify_moge2_release import (
     ReleaseDependencies,
     ReleaseRunFailed,
     ReleaseRunner,
+    _ProductionClipState,
+    _RecordingStereoRenderer,
     compute_clip_measurements,
     create_argument_parser,
     load_corpus_config,
@@ -632,7 +637,11 @@ class FakeSession:
             np.ones((2, 2, 3), np.float64),
             (0, 0, 6, 4),
             tuple(sidecars),
-            np.ones((2, 2, 3), np.bool_),
+            (
+                np.zeros((2, 2, 3), np.bool_)
+                if self.fail == f"{self.model_size}.{clip.clip_id}.measure"
+                else np.ones((2, 2, 3), np.bool_)
+            ),
             (4, 12),
         )
 
@@ -647,6 +656,7 @@ def _runner(
     replace_fn=os.replace,
     media_probe=_output_media_probe,
     peaks: list[int] | None = None,
+    stage_hook=lambda _stage: None,
 ):
     events: list[str] = []
 
@@ -667,6 +677,7 @@ def _runner(
         },
         git_probe=lambda: ("f" * 40, False),
         media_probe=media_probe,
+        stage_hook=stage_hook,
         cuda=FakeCuda(events, peaks),
         publisher=AtomicPublisher(replace_fn=replace_fn, token_factory=lambda: "token"),
     )
@@ -683,6 +694,163 @@ def test_production_settings_keep_fractional_source_fps_as_original(tmp_path: Pa
     settings = session._resolved_settings(clip, 1080, "relative")
 
     assert settings["target_fps"] == "original"
+
+
+def _synthetic_recording_renderer(*, capture_geometry: bool) -> _RecordingStereoRenderer:
+    class SyntheticRenderer:
+        device = "cpu"
+
+        def render_geometry(self, _frame, geometry, _settings):
+            height, width = geometry.source_valid.shape
+            return SimpleNamespace(
+                left_image=np.full((height, width, 3), 1, np.uint8),
+                right_image=np.full((height, width, 3), 2, np.uint8),
+                left_valid_mask=np.ones((height, width), np.bool_),
+                right_valid_mask=np.ones((height, width), np.bool_),
+                left_hole_mask=np.zeros((height, width), np.bool_),
+                right_hole_mask=np.zeros((height, width), np.bool_),
+            )
+
+    recorder = object.__new__(_RecordingStereoRenderer)
+    recorder._renderer = SyntheticRenderer()
+    recorder.device = "cpu"
+    recorder.capture_geometry = capture_geometry
+    recorder.hole_masks = []
+    recorder.total_disparity_fractions = []
+    recorder.source_valid_masks = []
+    return recorder
+
+
+def test_recording_renderer_never_retains_full_rgb_results() -> None:
+    recorder = _synthetic_recording_renderer(capture_geometry=True)
+    geometry = SimpleNamespace(
+        total_disparity_fraction=np.ones((2, 3), np.float64),
+        source_valid=np.ones((2, 3), np.bool_),
+    )
+    result = recorder.render_geometry(np.zeros((2, 3, 3), np.uint8), geometry, object())
+    left_ref = weakref.ref(result.left_image)
+    right_ref = weakref.ref(result.right_image)
+
+    del result
+    gc.collect()
+
+    assert left_ref() is None
+    assert right_ref() is None
+    assert not hasattr(recorder, "results")
+    assert not hasattr(recorder, "geometries")
+    assert len(recorder.hole_masks) == 1
+    assert len(recorder.total_disparity_fractions) == 1
+    assert len(recorder.source_valid_masks) == 1
+
+
+def _synthetic_production_clip(
+    tmp_path: Path, clip_id: str
+) -> tuple[ProductionVariantSession, Any, RawClip, _RecordingStereoRenderer]:
+    workspace = tmp_path / clip_id
+    raw_directory = workspace / "02_depth_raw"
+    raw_directory.mkdir(parents=True)
+    relative_source = workspace / "relative.mp4"
+    relative_source.write_bytes(b"relative")
+    clip = SimpleNamespace(
+        clip_id=clip_id,
+        width=6,
+        height=4,
+        frame_count=1,
+        fps=24.0,
+    )
+    raw = RawClip(
+        raw_directory,
+        np.ones((1, 2, 3), np.float32),
+        np.ones((1, 2, 3), np.bool_),
+        np.ones((1,), np.float32),
+        ("frame_000000",),
+        1,
+        1,
+    )
+    relative_renderer = _synthetic_recording_renderer(capture_geometry=False)
+    geometry = SimpleNamespace(
+        total_disparity_fraction=np.ones((2, 3), np.float64),
+        source_valid=np.ones((2, 3), np.bool_),
+    )
+    relative_renderer.render_geometry(np.zeros((2, 3, 3), np.uint8), geometry, object())
+    session = object.__new__(ProductionVariantSession)
+    session.device = "cpu"
+    session.model_size = "vits"
+    session.estimator = SimpleNamespace(estimate_depth_batch=lambda *_args, **_kwargs: None)
+    session._states = {
+        clip_id: _ProductionClipState(
+            workspace,
+            relative_source,
+            relative_renderer,
+            {
+                "depth_resolution": 1080,
+                "vr_output_height": 4,
+                "vr_output_width": 12,
+            },
+        )
+    }
+    metric_renderer = _synthetic_recording_renderer(capture_geometry=True)
+    metric_renderer.render_geometry(np.zeros((2, 3, 3), np.uint8), geometry, object())
+    metric_source = workspace / "metric.mp4"
+    metric_source.write_bytes(b"metric")
+    setattr(
+        session,
+        "_resolved_settings",
+        lambda _clip, _resolution, _mode: {
+            "depth_resolution": 1080,
+            "crop_factor": 1.0,
+            "per_eye_width": 3,
+            "vr_output_height": 4,
+            "vr_output_width": 12,
+        },
+    )
+    setattr(
+        session,
+        "_run_mode",
+        lambda _clip, _workspace, _settings: (metric_source, metric_renderer),
+    )
+    return session, clip, raw, relative_renderer
+
+
+def test_production_clip_state_discards_mode_data_and_pops_after_success(
+    tmp_path: Path,
+) -> None:
+    session: ProductionVariantSession | None = None
+    for clip_id in CANONICAL_CLIP_IDS:
+        prepared, clip, raw, relative_renderer = _synthetic_production_clip(tmp_path, clip_id)
+        if session is None:
+            session = prepared
+        else:
+            session._states.update(prepared._states)
+            setattr(session, "_resolved_settings", prepared.__dict__["_resolved_settings"])
+            setattr(session, "_run_mode", prepared.__dict__["_run_mode"])
+        assert len(session._states) == 1
+        relative = session.render_clip(
+            clip, raw, "relative", tmp_path / f"{clip_id}-relative.mp4", {}
+        )
+        assert relative.hole_mask.shape == (1, 2, 6)
+        assert session._states[clip_id].relative_renderer is None
+        assert relative_renderer.hole_masks == []
+
+        metric = session.render_clip(
+            clip, raw, "metric_camera", tmp_path / f"{clip_id}-metric.mp4", {}
+        )
+        assert metric.total_disparity_pixels is not None
+        assert session._states == {}
+
+
+def test_production_clip_failure_always_pops_state(tmp_path: Path) -> None:
+    session, clip, raw, _renderer = _synthetic_production_clip(tmp_path, "indoor-near")
+    setattr(
+        session,
+        "_run_mode",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("metric boom")),
+    )
+
+    with pytest.raises(RuntimeError, match="metric boom"):
+        session.render_clip(clip, raw, "metric_camera", tmp_path / "metric-failure.mp4", {})
+
+    assert session._states == {}
 
 
 @pytest.mark.parametrize(
@@ -773,6 +941,85 @@ def test_markdown_renders_a_variant_before_fixed_image_fields_exist() -> None:
 
     assert "Status: `incomplete`" in markdown
     assert "### vits" in markdown
+
+
+@pytest.mark.parametrize("dirty_source", [False, True])
+def test_git_identity_is_probed_before_outputs_pollute_a_real_repository(
+    tmp_path: Path, dirty_source: bool
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "release-test@example.invalid"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(["git", "config", "user.name", "Release Test"], cwd=repository, check=True)
+    config_path, _payload = _write_inputs(repository)
+    tracked = repository / "tracked.txt"
+    tracked.write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repository, check=True)
+    if dirty_source:
+        tracked.write_text("dirty\n", encoding="utf-8")
+
+    calls = 0
+
+    def real_git_probe() -> tuple[str, bool]:
+        nonlocal calls
+        calls += 1
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        return commit, bool(status)
+
+    runner, _events = _runner(tmp_path)
+    runner.dependencies = replace(runner.dependencies, git_probe=real_git_probe)
+
+    report = runner.run(_load(config_path), repository / "artifacts" / "evidence", "cpu", 1080)
+
+    assert calls == 1
+    assert report["project_git"]["available"] is True
+    assert report["project_git"]["dirty"] is dirty_source
+
+
+def test_git_probe_failure_is_not_retried_and_reports_identity_unavailable(
+    tmp_path: Path,
+) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    runner, _events = _runner(tmp_path)
+    calls = 0
+
+    def failing_git_probe() -> tuple[str, bool]:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("git identity unavailable")
+
+    runner.dependencies = replace(runner.dependencies, git_probe=failing_git_probe)
+    output = tmp_path / "evidence"
+
+    with pytest.raises(ReleaseRunFailed, match="git identity unavailable"):
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert calls == 1
+    failure_report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert failure_report["project_git"] == {
+        "available": False,
+        "commit": None,
+        "dirty": None,
+    }
 
 
 def test_fake_runner_loads_once_reuses_raw_for_modes_and_unloads_in_order(tmp_path: Path) -> None:
@@ -918,6 +1165,7 @@ def test_complete_report_schema_numeric_values_and_all_21_hashes(tmp_path: Path)
         "inputs",
         "settings",
         "variants",
+        "committed_artifacts",
         "failures",
     } <= report.keys()
     assert [item["model_size"] for item in report["variants"]] == ["vits", "vitb", "vitl"]
@@ -970,6 +1218,12 @@ def test_complete_report_schema_numeric_values_and_all_21_hashes(tmp_path: Path)
             records.extend((clip["relative_output"], clip["metric_output"]))
             assert clip["adapter_inference_call_count"] == clip["inferred_frame_count"] == 2
     assert len(records) == 21
+    assert len(report["committed_artifacts"]) == 21
+    assert {record["path"] for record in records} == {
+        record["path"] for record in report["committed_artifacts"]
+    }
+    for record in records:
+        assert record in report["committed_artifacts"]
     for record in records:
         path = output / record["path"]
         assert path.is_file()
@@ -1098,6 +1352,89 @@ def test_failure_unloads_writes_noncomplete_reports_and_preserves_earlier_eviden
     assert "Status: `incomplete`" in (output / "report.md").read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize(
+    "failure, hook_failure, expected_paths",
+    [
+        (
+            None,
+            "after_fixed_promotion:vits",
+            {"vits/fixed-image-depth.npz"},
+        ),
+        (
+            None,
+            "after_relative_promotion:vits:indoor-near",
+            {
+                "vits/fixed-image-depth.npz",
+                "vits/indoor-near-relative.mp4",
+            },
+        ),
+        (
+            "vits.indoor-near.metric_camera",
+            None,
+            {
+                "vits/fixed-image-depth.npz",
+                "vits/indoor-near-relative.mp4",
+            },
+        ),
+        (
+            "vits.indoor-near.measure",
+            None,
+            {
+                "vits/fixed-image-depth.npz",
+                "vits/indoor-near-relative.mp4",
+                "vits/indoor-near-metric-camera.mp4",
+            },
+        ),
+        (
+            None,
+            "after_metric_report_refresh:vits:indoor-near",
+            {
+                "vits/fixed-image-depth.npz",
+                "vits/indoor-near-relative.mp4",
+                "vits/indoor-near-metric-camera.mp4",
+            },
+        ),
+    ],
+)
+def test_every_committed_artifact_is_incrementally_ledged_on_later_failure(
+    tmp_path: Path,
+    failure: str | None,
+    hook_failure: str | None,
+    expected_paths: set[str],
+) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+
+    def stage_hook(stage: str) -> None:
+        if stage == hook_failure:
+            raise RuntimeError(f"stage hook boom: {stage}")
+
+    runner, _events = _runner(tmp_path, fail=failure, stage_hook=stage_hook)
+    output = tmp_path / "evidence"
+
+    with pytest.raises(ReleaseRunFailed):
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    disk_report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    ledger_paths = {item["path"] for item in disk_report["committed_artifacts"]}
+    actual_paths = {
+        path.relative_to(output).as_posix()
+        for path in output.rglob("*")
+        if path.is_file() and path.suffix in {".npz", ".mp4"}
+    }
+    assert actual_paths == ledger_paths == expected_paths
+    assert not any(".tmp" in item["path"] for item in disk_report["committed_artifacts"])
+    for item in disk_report["committed_artifacts"]:
+        assert item["sha256"] == _sha(output / item["path"])
+    variant = disk_report["variants"][0]
+    assert variant.get("fixed_image_output", {}).get("path") in expected_paths
+    if "vits/indoor-near-relative.mp4" in expected_paths:
+        assert variant["clips"][0]["relative_output"]["path"] in expected_paths
+    if "vits/indoor-near-metric-camera.mp4" in expected_paths:
+        assert variant["clips"][0]["metric_output"]["path"] in expected_paths
+    markdown = (output / "report.md").read_text(encoding="utf-8")
+    assert all(path in markdown for path in expected_paths)
+
+
 def test_fixed_npz_validation_and_promotion_failures_keep_atomic_reports(
     tmp_path: Path,
 ) -> None:
@@ -1168,14 +1505,13 @@ def test_report_publication_failure_is_recorded_and_retried_atomically(tmp_path:
 
 def test_complete_report_failure_restores_both_reports_to_incomplete(tmp_path: Path) -> None:
     config_path, _payload = _write_inputs(tmp_path)
-    json_publications = 0
 
     def fail_complete_json(source: Path, target: Path) -> None:
-        nonlocal json_publications
-        if Path(target).name == "report.json":
-            json_publications += 1
-            if json_publications == 3:
-                raise OSError("complete report boom")
+        if (
+            Path(target).name == "report.json"
+            and json.loads(Path(source).read_text(encoding="utf-8"))["status"] == "complete"
+        ):
+            raise OSError("complete report boom")
         os.replace(source, target)
 
     runner, _events = _runner(tmp_path, replace_fn=fail_complete_json)
