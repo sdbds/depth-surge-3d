@@ -3,7 +3,7 @@
 ## VDPP Boundaries
 
 VDPP is integrated at the canonical relative-disparity artifact boundary. Do
-not add backend-specific branches to V2, V3, or See-Through. The production
+not add backend-specific branches to V2, V3, See-Through, or relative MoGe-2. The production
 constants are fixed by the released checkpoint: batch 1, window 32, overlap 4,
 stride 28, `downsize=True`, FP32, and upstream affine continuation.
 

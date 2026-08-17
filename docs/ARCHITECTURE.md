@@ -28,7 +28,8 @@ only when its schema, frame manifest, settings, model identity, and upstream
 fingerprints match.
 
 VDPP is a derived artifact stage, not an estimator backend. It consumes the
-same canonical uint16 relative disparity produced by V2, V3, and See-Through.
+same canonical uint16 relative disparity produced by V2, V3, See-Through, and
+relative MoGe-2.
 The fixed adapter uses 32-frame windows, four retained observations, stride 28,
 FP32, and the upstream affine continuation rule. A window never crosses a final
 scene boundary. The depth-model owner is released before VDPP construction,

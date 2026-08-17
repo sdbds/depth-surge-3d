@@ -103,7 +103,7 @@
       "original_path": "vdpp/vdpp_model.py",
       "original_sha256": "d1c035cd45a66b708abd9f207b9abb2c9e88c56f88cc3413330f7d116bb67064",
       "vendored_path": "vdpp/vdpp_model.py",
-      "vendored_sha256": "c66353a37dfda5f10834209f7741d6b087fbbd9822dee84b6ca0cf9332355773"
+      "vendored_sha256": "b68667cf8caddf47b4fcad9dc23b993975b283ef5f339c7b2b886a95704a89c5"
     },
     {
       "original_path": "utils/normal_utils.py",

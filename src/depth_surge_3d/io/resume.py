@@ -1493,7 +1493,10 @@ def build_resume_report(
     migrated_settings = validate_settings(current_settings, source="explicit")
     settings_schema_current = not saved_result.migrated
     geometry_mode = str(migrated_settings.get("stereo_geometry_mode", "relative"))
-    if geometry_mode == "metric_camera" and migrated_settings.get("temporal_postprocessor") != "off":
+    if (
+        geometry_mode == "metric_camera"
+        and migrated_settings.get("temporal_postprocessor") != "off"
+    ):
         raise ValueError("VDPP is available only with relative stereo geometry")
     report_settings_data = _resume_properties_with_sar(
         settings_data,

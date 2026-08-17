@@ -918,7 +918,7 @@ class TestModelDelegation:
         assert projector._model_loaded is False
         mock_estimator.unload_model.assert_called_once()
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_unload_model_clears_owner_flag_even_when_estimator_cleanup_fails(self, mock_create):
         estimator = Mock()
         estimator.device = "cpu"
@@ -932,7 +932,7 @@ class TestModelDelegation:
 
         assert projector._model_loaded is False
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     def test_cuda_sync_failure_still_unloads_estimator_and_clears_allocator(self, mock_create):
         estimator = Mock()
         estimator.device = "cuda:0"
@@ -1017,7 +1017,7 @@ class TestProcessVideoErrorPaths:
         projector = StereoProjector(device="cpu")
         assert projector.process_video("test.mp4", str(output_dir), {}) is False
 
-    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
     @patch("src.depth_surge_3d.rendering.stereo_projector.get_video_properties")
     def test_process_video_invalid_video_properties(

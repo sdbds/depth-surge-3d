@@ -5,6 +5,7 @@ This is the main entry point using the new modular architecture.
 """
 
 import argparse
+import json
 import math
 import sys
 from pathlib import Path
@@ -14,7 +15,11 @@ from depth_surge_3d.core.constants import (
     FISHEYE_PROJECTIONS,
     VALIDATION_RANGES,
 )
-from depth_surge_3d.core.settings import validate_settings
+from depth_surge_3d.core.settings import (
+    parse_saved_processing_settings,
+    resolve_temporal_postprocessor,
+    validate_settings,
+)
 from depth_surge_3d.inference.depth.backend_registry import (
     backend_availability,
     get_backend_spec,
@@ -23,21 +28,73 @@ from depth_surge_3d.inference.depth.backend_registry import (
 )
 from depth_surge_3d.io.operations import (
     can_resume_processing,
+    get_video_properties,
     load_processing_settings,
     validate_video_file,
 )
+from depth_surge_3d.io.job_lock import JobWriterLock
 from depth_surge_3d.io.resume import (
     apply_legacy_migration,
     build_resume_report,
     resolve_resume_depth_model_version,
 )
 from depth_surge_3d.processing.frames.depth_storage import build_current_model_fingerprint
-from depth_surge_3d.rendering import create_stereo_projector
+from depth_surge_3d.processing.orchestration.execution_plan import build_artifact_execution_plan
 from depth_surge_3d.utils import (
     get_available_resolutions,
     warning as console_warning,
 )
 from depth_surge_3d.utils.domain.resolution import get_resolution_dimensions
+
+
+def create_stereo_projector(*args, **kwargs):
+    """Import depth backends only when artifact planning requires one."""
+
+    from depth_surge_3d.rendering import create_stereo_projector as factory
+
+    return factory(*args, **kwargs)
+
+
+def _preserved_render_artifact(report, mode: str) -> tuple[list[Path], str] | None:  # noqa: C901
+    stage_name = "disparity_stabilized" if mode == "vdpp" else "disparity_maps"
+    try:
+        stage = report.stage(stage_name)
+    except KeyError:
+        return None
+    if stage.disposition != "preserve":
+        if mode != "vdpp":
+            return None
+        try:
+            stage = report.stage("disparity_maps")
+        except KeyError:
+            return None
+        if stage.disposition != "preserve":
+            return None
+        stage_name = "disparity_maps"
+    directory = stage.paths[0]
+    try:
+        metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return None
+    if stage_name == "disparity_stabilized":
+        semantic = metadata.get("semantic_identity", {})
+        frame_names = semantic.get("frame_names") if isinstance(semantic, dict) else None
+        producer = "stabilized"
+    else:
+        frame_names = metadata.get("frame_names")
+        producer = "base"
+    if not isinstance(frame_names, list) or not all(isinstance(name, str) for name in frame_names):
+        return None
+    return [directory / f"{Path(name).stem}.png" for name in frame_names], producer
+
+
+def _effective_vdpp_device(requested: object) -> str:
+    device = str(requested or "auto")
+    if device != "auto":
+        return device
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _print_resume_report(report) -> None:
@@ -105,6 +162,11 @@ def _build_processing_settings(args: argparse.Namespace) -> dict[str, object]:
             "scene_cut_threshold": args.scene_cut_threshold,
             "min_scene_frames": args.min_scene_frames,
             "raw_storage_dtype": args.raw_storage_dtype,
+            "temporal_postprocessor": resolve_temporal_postprocessor(
+                persisted=None,
+                override=args.temporal_postprocessor,
+                is_resume=False,
+            ),
             "stereo_io_workers": args.stereo_io_workers,
             "migrate_legacy": args.migrate_legacy,
             "start_time": args.start,
@@ -272,6 +334,12 @@ Note: V2 uses fixed shot-aware temporal inference; V3, See-Through, and MoGe-2 i
         choices=["archive", "delete"],
         default=DEFAULT_SETTINGS["migrate_legacy"],
         help="How resume handles legacy generated stages (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--temporal-postprocessor",
+        choices=["off", "vdpp"],
+        default=None,
+        help="Optional depth temporal postprocessor (default: off for new jobs)",
     )
 
     # Distortion and projection
@@ -511,9 +579,21 @@ def main():  # noqa: C901
 
         # Extract video path and settings
         video_path = settings_data["metadata"]["source_video"]
-        processing_settings = validate_settings(
+        settings_metadata = settings_data.get("metadata", {})
+        saved_version = (
+            settings_metadata.get("settings_schema_version")
+            if isinstance(settings_metadata, dict)
+            else None
+        )
+        loaded_settings = parse_saved_processing_settings(
             settings_data["processing_settings"],
-            source="legacy_disk",
+            saved_version=saved_version,
+        )
+        processing_settings = loaded_settings.settings
+        processing_settings["temporal_postprocessor"] = resolve_temporal_postprocessor(
+            persisted=processing_settings.get("temporal_postprocessor"),
+            override=args.temporal_postprocessor,
+            is_resume=True,
         )
         processing_settings["migrate_legacy"] = args.migrate_legacy
         processing_settings["verbose"] = args.verbose
@@ -542,66 +622,157 @@ def main():  # noqa: C901
             else bool(processing_settings.get("use_metric_depth", False))
             and resume_spec.capabilities.metric_depth
         )
+        processing_settings = validate_settings(processing_settings, source="explicit")
 
-        if not _backend_is_available(processing_settings["depth_model_version"]):
-            return 1
-
-        projector = create_stereo_projector(
-            model_path=processing_settings.get("model_path"),
-            device=processing_settings.get("device", "auto"),
-            metric=bool(processing_settings.get("use_metric_depth", False)),
-            depth_model_version=processing_settings.get("depth_model_version", "v2"),
-            model_size=processing_settings.get("model_size"),
-        )
-        preflight = projector.preflight_video(
-            video_path,
-            args.resume,
-            processing_settings,
-        )
-        if preflight is None:
-            return 1
-        resolved_settings = preflight.settings
-        if not projector.load_model():
-            print("Could not load depth estimation model")
-            return 1
-        model_fingerprint = build_current_model_fingerprint(
-            projector.depth_estimator,
-            resolved_settings,
-        )
-
+        projector = None
+        job_lock = None
         try:
+            output_dir = Path(args.resume).resolve()
+            job_lock = JobWriterLock(output_dir).acquire()
+            preflight = None
+            execution_preflight = None
+            audit_settings = processing_settings
+            if processing_settings["stereo_geometry_mode"] == "metric_camera":
+                if not _backend_is_available(processing_settings["depth_model_version"]):
+                    return 1
+                projector = create_stereo_projector(
+                    model_path=processing_settings.get("model_path"),
+                    device=processing_settings.get("device", "auto"),
+                    metric=bool(processing_settings.get("use_metric_depth", False)),
+                    depth_model_version=processing_settings.get("depth_model_version", "v2"),
+                    model_size=processing_settings.get("model_size"),
+                )
+                preflight = projector.preflight_video(
+                    video_path,
+                    args.resume,
+                    processing_settings,
+                )
+                if preflight is None:
+                    return 1
+                audit_settings = preflight.settings
+
             resume_report = build_resume_report(
-                Path(args.resume).resolve(),
-                resolved_settings,
+                output_dir,
+                audit_settings,
                 source_video=video_path,
-                model_fingerprint=model_fingerprint,
                 settings_file=resume_info["settings_file"],
             )
+            selected_artifact = None
+            if processing_settings["stereo_geometry_mode"] == "relative":
+                selected_artifact = _preserved_render_artifact(
+                    resume_report,
+                    processing_settings["temporal_postprocessor"],
+                )
+            selected_source = selected_artifact[1] if selected_artifact is not None else None
+            execution_plan = build_artifact_execution_plan(
+                temporal_postprocessor=processing_settings["temporal_postprocessor"],
+                base_artifact_valid=lambda: selected_source == "base",
+                stabilized_artifact_valid=lambda: selected_source == "stabilized",
+            )
+
+            if execution_plan.needs_base_depth_model:
+                if projector is None:
+                    if not _backend_is_available(processing_settings["depth_model_version"]):
+                        return 1
+                    projector = create_stereo_projector(
+                        model_path=processing_settings.get("model_path"),
+                        device=processing_settings.get("device", "auto"),
+                        metric=bool(processing_settings.get("use_metric_depth", False)),
+                        depth_model_version=processing_settings.get("depth_model_version", "v2"),
+                        model_size=processing_settings.get("model_size"),
+                    )
+                    preflight = projector.preflight_video(
+                        video_path,
+                        args.resume,
+                        processing_settings,
+                    )
+                    if preflight is None:
+                        return 1
+                assert preflight is not None
+                resolved_settings = preflight.settings
+                if not projector.load_model():
+                    print("Could not load depth estimation model")
+                    return 1
+                model_fingerprint = build_current_model_fingerprint(
+                    projector.depth_estimator,
+                    resolved_settings,
+                )
+                resume_report = build_resume_report(
+                    output_dir,
+                    resolved_settings,
+                    source_video=video_path,
+                    model_fingerprint=model_fingerprint,
+                    settings_file=resume_info["settings_file"],
+                )
+
             _print_resume_report(resume_report)
             processing_settings = resume_report.migrated_settings
-            execution_preflight = projector.revalidate_video_preflight(
-                preflight,
-                processing_settings,
-            )
-            if execution_preflight is None:
-                return 1
+            if projector is not None:
+                assert preflight is not None
+                execution_preflight = projector.revalidate_video_preflight(
+                    preflight,
+                    processing_settings,
+                )
+                if execution_preflight is None:
+                    return 1
             apply_legacy_migration(resume_report, args.migrate_legacy)
-        except (OSError, TypeError, ValueError) as exc:
-            print(f"Cannot migrate resume data: {exc}")
-            return 1
 
-        print("Resuming processing...")
-        print(f"Input: {video_path}")
-        print(f"Output: {args.resume}")
+            print("Resuming processing...")
+            print(f"Input: {video_path}")
+            print(f"Output: {args.resume}")
 
-        success = projector.execute_video(execution_preflight)
+            if selected_artifact is not None:
+                from depth_surge_3d.processing.frames.temporal_stabilizer import (
+                    TemporalDepthStabilizer,
+                )
+                from depth_surge_3d.processing.orchestration.video_processor import VideoProcessor
 
-        if success:
-            print("Resume processing completed successfully!")
-            return 0
-        else:
+                selected_files, selected_source = selected_artifact
+                temporal_stabilizer = None
+                if execution_plan.needs_vdpp_model:
+                    temporal_stabilizer = TemporalDepthStabilizer(
+                        effective_device=_effective_vdpp_device(
+                            processing_settings.get("device", "auto")
+                        ),
+                        models_dir=Path("models"),
+                    )
+                video_properties = settings_data.get("video_properties")
+                if not isinstance(video_properties, dict):
+                    video_properties = get_video_properties(video_path)
+                if not video_properties:
+                    print("Could not read video properties for cached resume")
+                    return 1
+                processor = VideoProcessor(
+                    None,
+                    verbose=bool(processing_settings.get("verbose", False)),
+                    temporal_stabilizer=temporal_stabilizer,
+                    preselected_depth_files=selected_files,
+                    preselected_render_source=selected_source,
+                )
+                success = processor.process(
+                    video_path=video_path,
+                    output_dir=args.resume,
+                    video_properties=video_properties,
+                    settings=processing_settings,
+                    job_lock=job_lock,
+                )
+            else:
+                assert projector is not None and execution_preflight is not None
+                success = projector.execute_video(execution_preflight, job_lock=job_lock)
+
+            if success:
+                print("Resume processing completed successfully!")
+                return 0
             print("Resume processing failed. Check error messages above.")
             return 1
+        except Exception as exc:
+            print(f"Cannot migrate resume data: {exc}")
+            return 1
+        finally:
+            if projector is not None:
+                projector.unload_model()
+            if job_lock is not None:
+                job_lock.release()
 
     # Validate arguments for normal processing
     processing_settings = validate_arguments(args)

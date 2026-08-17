@@ -7,7 +7,7 @@ import json
 import sys
 from html.parser import HTMLParser
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 from src.depth_surge_3d.core.file_identity import (
     FILE_IDENTITY_ALGORITHM_VERSION,
@@ -522,6 +522,7 @@ def test_web_complete_stabilized_resume_skips_cuda_and_base_model(tmp_path):
     ):
         web_app.process_video_async(
             "test-session",
+            "requester-socket",
             source_video,
             settings,
             output_dir,
@@ -587,6 +588,7 @@ def test_web_cached_base_accepts_indexed_cuda_device_for_vdpp(tmp_path):
     ):
         web_app.process_video_async(
             "test-session",
+            "requester-socket",
             source_video,
             settings,
             output_dir,
@@ -807,7 +809,7 @@ def test_cli_resume_restores_depth_backend_with_owned_resolved_preflight(tmp_pat
     assert build_report.call_args_list == [
         call(
             tmp_path,
-            preflight_settings,
+            {**preflight_settings, "depth_resolution": "768"},
             source_video="source.mkv",
             settings_file=resume_info["settings_file"],
         ),
@@ -824,7 +826,7 @@ def test_cli_resume_restores_depth_backend_with_owned_resolved_preflight(tmp_pat
         projector.preflight_video.return_value,
         report.migrated_settings,
     )
-    projector.execute_video.assert_called_once_with(execution_preflight)
+    projector.execute_video.assert_called_once_with(execution_preflight, job_lock=ANY)
     projector.process_video.assert_not_called()
 
 

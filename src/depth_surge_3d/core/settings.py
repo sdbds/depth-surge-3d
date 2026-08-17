@@ -294,12 +294,16 @@ def validate_settings(
     for name, value in tuple(validated.items()):
         if name not in provided:
             validated[name] = _validate_value(name, value)
+    _validate_cross_setting_constraints(validated)
+    return validated
+
+
+def _validate_cross_setting_constraints(values: dict[str, Any]) -> None:
     if (
-        validated["stereo_geometry_mode"] == "metric_camera"
-        and validated["temporal_postprocessor"] != "off"
+        values["stereo_geometry_mode"] == "metric_camera"
+        and values["temporal_postprocessor"] != "off"
     ):
         raise ValueError("VDPP is available only with relative stereo geometry")
-    return validated
 
 
 def _normalize_saved_schema_version(saved_version: object) -> int:

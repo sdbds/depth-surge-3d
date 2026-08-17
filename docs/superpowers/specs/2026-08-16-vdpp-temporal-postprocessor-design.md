@@ -1355,8 +1355,9 @@ The implementation is accepted only when all of the following are true:
     show a non-regressing optional progress step.
 13. The pinned source license, source manifest, checkpoint size, and SHA-256 are
      shipped and verified as specified.
-14. Settings schema v3 migrates known older jobs upward, distinguishes omitted
-    resume values from explicit `off`, parses v3 strictly, and rejects future
+14. The integrated settings schema v4 migrates known v1-v3 jobs upward,
+    distinguishes omitted resume values from explicit `off`, parses v4
+    strictly, and rejects future
     versions without modifying the job.
 15. A complete hashed stabilized artifact can render without CUDA, VDPP import
     or checkpoint, or a loadable base estimator because planning precedes model
@@ -1366,7 +1367,7 @@ The implementation is accepted only when all of the following are true:
 
 ## Implementation Slices
 
-1. Add settings schema v3, one-way migration, omitted/explicit override
+1. Add integrated settings schema v4, one-way migration, omitted/explicit override
    semantics, CLI/Web control, and the dynamic default-off progress plan without
    constructing VDPP.
 2. Add the output-directory writer lock and artifact-first planner, then move
@@ -1448,7 +1449,7 @@ global PNG cache doubles storage and maintenance before reuse value is known.
 
 - `docs/ARCHITECTURE.md`: optional derived disparity stage, source selection,
   artifact-first planning, writer lock, and model ownership/lifetime order.
-- `docs/PARAMETERS.md`: the one setting, schema v3 boundary, default, CUDA
+- `docs/PARAMETERS.md`: the one setting, schema v4 boundary, default, CUDA
   requirement, and no tunable temporal parameters.
 - `docs/USAGE.md`: Web/CLI omission/override examples, old-client limitation,
   shot-atomic resume cost, and explicit off-mode recovery after OOM.

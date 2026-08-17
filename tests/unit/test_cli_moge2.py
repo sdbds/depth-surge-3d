@@ -6,7 +6,7 @@ import importlib
 import math
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 
@@ -310,5 +310,5 @@ def test_cli_resume_rebuilds_numeric_preflight_from_migrated_settings(
         initial_preflight,
         migrated_settings,
     )
-    projector.execute_video.assert_called_once_with(execution_preflight)
+    projector.execute_video.assert_called_once_with(execution_preflight, job_lock=ANY)
     projector.process_video.assert_not_called()

@@ -192,6 +192,8 @@ class StereoProjector:
             )
             output_path = Path(output_dir).resolve()
             if job_lock is None:
+                if not self._prepare_output_directory(output_dir):
+                    return False
                 job_lock = JobWriterLock(output_path).acquire()
                 owns_job_lock = True
             elif not job_lock.is_acquired:
@@ -204,20 +206,7 @@ class StereoProjector:
             if not self._prepare_output_directory(output_dir):
                 return False
 
-            temporal_stabilizer = None
-            if settings.get("temporal_postprocessor") == "vdpp":
-                effective_device = str(getattr(self.depth_estimator, "device", self.device))
-                temporal_stabilizer = TemporalDepthStabilizer(
-                    effective_device=effective_device,
-                    models_dir=Path("models"),
-                )
-
-            processor = VideoProcessor(
-                self.depth_estimator,
-                verbose=settings.get("verbose", False),
-                release_depth_model=self.unload_model,
-                temporal_stabilizer=temporal_stabilizer,
-            )
+            processor = self._create_video_processor(settings)
 
             # Process the video
             return processor.process(
@@ -234,6 +223,19 @@ class StereoProjector:
         finally:
             if owns_job_lock and job_lock is not None:
                 job_lock.release()
+
+    def _create_video_processor(self, settings: dict[str, Any]) -> VideoProcessor:
+        kwargs: dict[str, Any] = {
+            "verbose": settings.get("verbose", False),
+            "release_depth_model": self.unload_model,
+        }
+        if settings.get("temporal_postprocessor") == "vdpp":
+            effective_device = str(getattr(self.depth_estimator, "device", self.device))
+            kwargs["temporal_stabilizer"] = TemporalDepthStabilizer(
+                effective_device=effective_device,
+                models_dir=Path("models"),
+            )
+        return VideoProcessor(self.depth_estimator, **kwargs)
 
     def preflight_video(
         self,
@@ -304,11 +306,6 @@ class StereoProjector:
 
             resolved_settings = self._resolve_settings(requested_settings, video_properties)
             validate_backend_geometry_request(resolved_settings, video_properties)
-            if (
-                resolved_settings["stereo_geometry_mode"] == "metric_camera"
-                and resolved_settings.get("temporal_postprocessor", "off") != "off"
-            ):
-                raise ValueError("VDPP is available only with relative stereo geometry")
             report = build_effective_depth_run_report(
                 resolved_settings,
                 self.depth_estimator,

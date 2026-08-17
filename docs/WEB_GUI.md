@@ -16,7 +16,8 @@ the released checkpoint.
 Starting a new VDPP job requires an effective CUDA device. The first generation
 downloads roughly 111 MiB of weights and adds processing time and one uint16 PNG
 per source frame. V2 already has shot-aware model-native temporal inference, so
-VDPP is mainly intended for evaluating framewise V3 and See-Through output.
+VDPP is mainly intended for evaluating framewise V3, See-Through, and relative
+MoGe-2 output. It is not available with `metric_camera` geometry.
 
 ## Resume
 

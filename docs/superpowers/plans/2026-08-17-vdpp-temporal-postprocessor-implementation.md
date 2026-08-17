@@ -21,7 +21,7 @@
 
 ---
 
-### Task 1: Settings Schema V3 And Presence-Aware Overrides
+### Task 1: Settings Schema V4 And Presence-Aware Overrides
 
 **Files:**
 - Modify: `src/depth_surge_3d/core/constants.py`
@@ -35,14 +35,18 @@
 - Modify: `tests/unit/test_see_through_entrypoints.py`
 
 **Interfaces:**
-- Produces: `PROCESSING_SETTINGS_SCHEMA_VERSION = 3`.
+- Produces: `PROCESSING_SETTINGS_SCHEMA_VERSION = 4` after integration with the
+  independently introduced MoGe settings schema v3.
 - Produces: `load_processing_settings(raw_settings, saved_version) -> SettingsLoadResult` with schema-first, upward-only migration.
 - Produces: `resolve_temporal_postprocessor(*, persisted, override, is_resume) -> Literal["off", "vdpp"]`.
 - Preserves: `temporal_postprocessor` is excluded from depth-model and canonical-cache identity key sets.
 
 - [ ] **Step 1: Add failing migration and override matrix tests**
 
-Cover absent version/v1/v2 migration, prerelease v2 values, strict v3 required field and unknown-key rejection, future-version no-mutation failure, new-job omitted -> `off`, resume omitted -> persisted, and explicit resume `off`/`vdpp` overrides.
+Cover absent version/v1/v2/v3 migration, prerelease values, strict v4 required
+field and unknown-key rejection, future-version no-mutation failure, new-job
+omitted -> `off`, resume omitted -> persisted, and explicit resume `off`/`vdpp`
+overrides.
 
 - [ ] **Step 2: Run focused tests and confirm RED**
 
@@ -52,7 +56,10 @@ Cover absent version/v1/v2 migration, prerelease v2 values, strict v3 required f
 
 - [ ] **Step 3: Implement schema-first parsing and one-way migration**
 
-Read `metadata.settings_schema_version` before legacy filtering. Reject versions above 3 without backup writes or cleanup. Migrate only known lower versions, insert `temporal_postprocessor="off"` when absent, validate a present prerelease value, and parse v3 strictly.
+Read `metadata.settings_schema_version` before legacy filtering. Reject versions
+above 4 without backup writes or cleanup. Migrate only known lower versions,
+insert `temporal_postprocessor="off"` when absent, validate a present prerelease
+value, and parse v4 strictly.
 
 - [ ] **Step 4: Implement presence-aware CLI/Web resolution**
 
@@ -60,7 +67,8 @@ Add the CLI choice with `default=None`. Preserve property presence in Web JSON r
 
 - [ ] **Step 5: Verify default-off identities and commit**
 
-Assert toggling the setting does not alter raw/canonical identities. Commit: `feat: add schema v3 temporal postprocessor setting`.
+Assert toggling the setting does not alter raw/canonical identities. Commit:
+`feat: add schema v4 temporal postprocessor setting`.
 
 ---
 
@@ -356,7 +364,10 @@ The harness records source/checkpoint/runtime identities and computes the pinned
 
 - [ ] **Step 2: Document the experimental boundary and operational contract**
 
-Explain CUDA generation versus CPU cache reuse, added disk/time, fixed 32/4 semantics, shot resets, checkpoint location/license/hash, schema-v3 backward/forward boundary, interruption cost, error recovery, and why V2 usually needs VDPP less than framewise models.
+Explain CUDA generation versus CPU cache reuse, added disk/time, fixed 32/4
+semantics, shot resets, checkpoint location/license/hash, schema-v4
+backward/forward boundary, interruption cost, error recovery, and why V2 usually
+needs VDPP less than framewise models.
 
 - [ ] **Step 3: Build wheel and inspect vendored/package artifacts**
 

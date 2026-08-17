@@ -35,7 +35,6 @@ from ...rendering.stereo_renderer import (
     StereoRenderSettings,
     StereoSplatSettings,
 )
-from .frame_stage_parallelism import png_headers_match
 from .metric_geometry import MetricGeometryStore
 
 STEREO_STAGE_SCHEMA_VERSION = 1
