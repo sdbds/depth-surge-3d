@@ -53,7 +53,7 @@ moge2 = [
 ]
 
 [project.scripts]
-depth-surge-3d = "depth_surge_3d:main"
+depth-surge-3d = "depth_surge_3d.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/Tok/depth-surge-3d"

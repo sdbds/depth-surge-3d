@@ -1,7 +1,8 @@
 """Test that all entry points can import correctly."""
 
 import ast
-import importlib.util
+import importlib
+import subprocess
 import sys
 from pathlib import Path
 
@@ -10,35 +11,40 @@ import pytest
 
 def _load_cli_module():
     project_root = Path(__file__).parent.parent.parent
-    spec = importlib.util.spec_from_file_location(
-        "depth_surge_3d_cli",
-        project_root / "depth_surge_3d.py",
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    sys.path.insert(0, str(project_root / "src"))
+    try:
+        return importlib.import_module("depth_surge_3d.cli")
+    finally:
+        sys.path.pop(0)
 
 
 class TestEntryPointImports:
     """Test that all entry point files can import successfully."""
 
     def test_cli_imports(self):
-        """Test that CLI script (depth_surge_3d.py) imports work."""
-        # Add project root to path
-        project_root = Path(__file__).parent.parent.parent
-        sys.path.insert(0, str(project_root / "src"))
+        """Test that the packaged CLI imports without running it."""
+        assert callable(_load_cli_module().main)
 
-        # Test CLI imports (without actually running the script)
-        from depth_surge_3d.utils.domain.depth_cache import (
-            get_cache_size,
-            get_cache_dir,
-            clear_cache,
+    def test_legacy_root_launcher_help(self, tmp_path):
+        project_root = Path(__file__).parent.parent.parent
+        result = subprocess.run(
+            [sys.executable, str(project_root / "depth_surge_3d.py"), "--help"],
+            capture_output=True,
+            check=False,
+            cwd=tmp_path,
+            text=True,
         )
 
-        assert callable(get_cache_size)
-        assert callable(get_cache_dir)
-        assert callable(clear_cache)
+        assert result.returncode == 0, result.stderr
+        assert "Convert 2D videos to immersive 3D VR format" in result.stdout
+
+    def test_legacy_root_launcher_does_not_duplicate_cli_logic(self):
+        project_root = Path(__file__).parent.parent.parent
+        launcher = (project_root / "depth_surge_3d.py").read_text(encoding="utf-8")
+
+        assert "from depth_surge_3d.cli import main" in launcher
+        assert "def main(" not in launcher
+        assert "def create_argument_parser(" not in launcher
 
     def test_cli_exposes_only_final_stereo_controls(self):
         parser = _load_cli_module().create_argument_parser()

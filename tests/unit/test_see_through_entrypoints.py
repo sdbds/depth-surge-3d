@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import json
+import sys
 from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -38,13 +39,11 @@ class _DepthModelOptionParser(HTMLParser):
 
 
 def _load_cli_module():
-    spec = importlib.util.spec_from_file_location(
-        "depth_surge_3d_cli_for_test", PROJECT_ROOT / "depth_surge_3d.py"
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+    try:
+        return importlib.import_module("depth_surge_3d.cli")
+    finally:
+        sys.path.pop(0)
 
 
 def test_cli_accepts_see_through_model_version():
