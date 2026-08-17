@@ -58,6 +58,7 @@ DEFAULT_SETTINGS = {
     "scene_cut_threshold": 0.55,
     "min_scene_frames": 8,
     "raw_storage_dtype": "auto",
+    "temporal_postprocessor": "off",
     "stereo_io_workers": min(4, max(1, (os.cpu_count() or 1) - 2)),
     "migrate_legacy": "archive",
     "vr_format": "side_by_side",
@@ -198,6 +199,17 @@ PROGRESS_STEP_WEIGHTS = [
     0.08,  # Step 7: VR Assembly (moderate - side-by-side combining)
     0.07,  # Step 8: Video Creation (moderate - FFmpeg encoding)
 ]  # Weighted progress distribution (sums to 1.00)
+VDPP_PROGRESS_STEP_WEIGHTS = [
+    0.02,  # Frame Extraction
+    0.28,  # Depth Map Generation
+    0.07,  # Temporal Depth Stabilization
+    0.20,  # Stereo Pair Creation
+    0.08,  # Fisheye Distortion
+    0.02,  # Crop Frames
+    0.18,  # AI Upscaling
+    0.08,  # VR Assembly
+    0.07,  # Video Creation
+]
 # Threading configuration
 MAX_WORKERS_DEFAULT = 4
 MAX_WORKERS_GPU = 2  # Limited for GPU memory
@@ -277,6 +289,7 @@ INTERMEDIATE_DIRS = {
     "depth_raw": "02_depth_raw",  # Native model output with explicit representation
     "disparity_maps": "03_disparity_maps",  # Canonical relative-disparity maps
     "metric_geometry": "03_metric_geometry",  # Native metric inverse-depth geometry
+    "disparity_stabilized": "03_disparity_stabilized",  # Optional VDPP output
     "left_frames": "04_left_frames",  # Step 3: Stereo pair - left eye
     "right_frames": "04_right_frames",  # Step 3: Stereo pair - right eye
     "left_distorted": "05_left_distorted",  # Step 4: Fisheye distortion - left (optional)

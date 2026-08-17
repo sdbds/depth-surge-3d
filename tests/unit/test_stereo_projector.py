@@ -593,7 +593,13 @@ class TestStereoProjector:
     def test_process_video_signature_uses_final_controls(self):
         parameter_names = list(inspect.signature(StereoProjector.process_video).parameters)
 
-        assert parameter_names == ["self", "video_path", "output_dir", "settings"]
+        assert parameter_names == [
+            "self",
+            "video_path",
+            "output_dir",
+            "settings",
+            "job_lock",
+        ]
 
     def test_duplicate_pipeline_apis_are_removed(self):
         assert {
@@ -912,6 +918,40 @@ class TestModelDelegation:
         assert projector._model_loaded is False
         mock_estimator.unload_model.assert_called_once()
 
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    def test_unload_model_clears_owner_flag_even_when_estimator_cleanup_fails(self, mock_create):
+        estimator = Mock()
+        estimator.device = "cpu"
+        estimator.unload_model.side_effect = RuntimeError("unload failed")
+        mock_create.return_value = estimator
+        projector = StereoProjector(depth_model_version="v2")
+        projector._model_loaded = True
+
+        with pytest.raises(RuntimeError, match="unload failed"):
+            projector.unload_model()
+
+        assert projector._model_loaded is False
+
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
+    def test_cuda_sync_failure_still_unloads_estimator_and_clears_allocator(self, mock_create):
+        estimator = Mock()
+        estimator.device = "cuda:0"
+        mock_create.return_value = estimator
+        projector = StereoProjector(depth_model_version="v2")
+        projector._model_loaded = True
+
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.synchronize", side_effect=RuntimeError("sync failed")),
+            patch("torch.cuda.empty_cache") as empty_cache,
+            pytest.raises(RuntimeError, match="sync failed"),
+        ):
+            projector.unload_model()
+
+        estimator.unload_model.assert_called_once_with()
+        empty_cache.assert_called_once_with()
+        assert projector._model_loaded is False
+
 
 class TestProcessVideoErrorPaths:
     """Test error handling in process_video method."""
@@ -956,6 +996,28 @@ class TestProcessVideoErrorPaths:
         mock_estimator.load_model.assert_called_once()
 
     @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
+    def test_process_video_holds_writer_lock_before_model_load(
+        self, mock_validate, mock_create, tmp_path
+    ):
+        from src.depth_surge_3d.io.job_lock import JobAlreadyLockedError, JobWriterLock
+
+        output_dir = tmp_path / "output"
+        estimator = MagicMock()
+
+        def observe_lock():
+            with pytest.raises(JobAlreadyLockedError):
+                JobWriterLock(output_dir).acquire()
+            return False
+
+        estimator.load_model.side_effect = observe_lock
+        mock_create.return_value = estimator
+        mock_validate.return_value = True
+
+        projector = StereoProjector(device="cpu")
+        assert projector.process_video("test.mp4", str(output_dir), {}) is False
+
+    @patch("src.depth_surge_3d.rendering.stereo_projector.create_video_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
     @patch("src.depth_surge_3d.rendering.stereo_projector.get_video_properties")
     def test_process_video_invalid_video_properties(

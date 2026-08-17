@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from numbers import Integral, Real
 from os import PathLike
 from typing import Any, Literal
@@ -11,7 +12,8 @@ from .constants import DEFAULT_SETTINGS, VALIDATION_RANGES
 
 
 SettingsSource = Literal["explicit", "legacy_disk"]
-PROCESSING_SETTINGS_SCHEMA_VERSION = 3
+TemporalPostprocessor = Literal["off", "vdpp"]
+PROCESSING_SETTINGS_SCHEMA_VERSION = 4
 REMOVED_SETTING_NAMES = {
     "baseline",
     "focal_length",
@@ -58,6 +60,7 @@ _EXISTING_CHOICE_SETTINGS = {
     "fisheye_projection": {"equidistant", "equisolid", "orthogonal", "stereographic"},
     "super_sample": {"auto", "none", "1080p", "4k"},
     "upscale_model": {"none", "x2", "x4", "x4-conservative"},
+    "temporal_postprocessor": {"off", "vdpp"},
 }
 _OPTIONAL_INTEGER_SETTINGS = {
     "denoising_steps",
@@ -69,6 +72,20 @@ _OPTIONAL_INTEGER_SETTINGS = {
     "source_width",
     "source_height",
 }
+
+
+class UnsupportedSettingsSchemaError(ValueError):
+    """Raised before mutation when saved settings require a newer reader."""
+
+
+@dataclass(frozen=True)
+class SavedSettingsResult:
+    """Validated saved settings plus their one-way migration state."""
+
+    settings: dict[str, Any]
+    source_version: int
+    migrated: bool
+    removed_settings: tuple[str, ...]
 
 
 def _number(name: str, value: object, low: float, high: float) -> float:
@@ -277,4 +294,86 @@ def validate_settings(
     for name, value in tuple(validated.items()):
         if name not in provided:
             validated[name] = _validate_value(name, value)
+    if (
+        validated["stereo_geometry_mode"] == "metric_camera"
+        and validated["temporal_postprocessor"] != "off"
+    ):
+        raise ValueError("VDPP is available only with relative stereo geometry")
     return validated
+
+
+def _normalize_saved_schema_version(saved_version: object) -> int:
+    if saved_version is None:
+        return 1
+    if isinstance(saved_version, bool) or not isinstance(saved_version, Integral):
+        raise ValueError("settings schema version must be a positive integer")
+    normalized = int(saved_version)
+    if normalized < 1:
+        raise ValueError("settings schema version must be a positive integer")
+    return normalized
+
+
+def parse_saved_processing_settings(
+    values: dict[str, Any],
+    *,
+    saved_version: object,
+) -> SavedSettingsResult:
+    """Parse saved settings only after checking their schema version.
+
+    Known older schemas migrate upward. The current schema is strict so a
+    newer field cannot be silently discarded and then written back with an old
+    interpretation.
+    """
+
+    if not isinstance(values, dict):
+        raise TypeError("settings values must be a dictionary")
+    source_version = _normalize_saved_schema_version(saved_version)
+    if source_version > PROCESSING_SETTINGS_SCHEMA_VERSION:
+        raise UnsupportedSettingsSchemaError(
+            f"job uses newer settings schema {source_version}; "
+            f"this version supports up to {PROCESSING_SETTINGS_SCHEMA_VERSION}"
+        )
+
+    if source_version == PROCESSING_SETTINGS_SCHEMA_VERSION:
+        if "temporal_postprocessor" not in values:
+            raise ValueError(
+                "temporal_postprocessor is required by settings schema "
+                f"{PROCESSING_SETTINGS_SCHEMA_VERSION}"
+            )
+        return SavedSettingsResult(
+            settings=validate_settings(values, source="explicit"),
+            source_version=source_version,
+            migrated=False,
+            removed_settings=(),
+        )
+
+    removed = tuple(sorted(set(values) - _KNOWN_SETTING_NAMES))
+    return SavedSettingsResult(
+        settings=validate_settings(values, source="legacy_disk"),
+        source_version=source_version,
+        migrated=True,
+        removed_settings=removed,
+    )
+
+
+def resolve_temporal_postprocessor(
+    *,
+    persisted: object,
+    override: object,
+    is_resume: bool,
+) -> TemporalPostprocessor:
+    """Resolve omission separately from an explicit postprocessor choice."""
+
+    if override is not None:
+        return _choice(
+            "temporal_postprocessor",
+            override,
+            {"off", "vdpp"},
+        )  # type: ignore[return-value]
+    if is_resume and persisted is not None:
+        return _choice(
+            "temporal_postprocessor",
+            persisted,
+            {"off", "vdpp"},
+        )  # type: ignore[return-value]
+    return "off"

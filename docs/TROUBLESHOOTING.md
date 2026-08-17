@@ -97,10 +97,30 @@ final-output coordinates.
 
 MoGe-2 performs per-frame depth and focal estimation. Temporal stability on video is not guaranteed; depth or focal drift may be visible across frames.
 
-Depth or focal drift may appear as scale pumping or changing disparity. The
-first release does not apply temporal stabilization. Letterbox bars are valid
-image samples and may bias automatic convergence even when SAR is `1:1`; crop
-the bars from the source or select an explicit metric convergence distance.
+Depth or focal drift may appear as scale pumping or changing disparity.
+`metric_camera` does not apply VDPP stabilization. Relative MoGe-2 jobs may opt
+into VDPP. Letterbox bars are valid image samples and may bias automatic
+convergence even when SAR is `1:1`; crop the bars from the source or select an
+explicit metric convergence distance.
+
+### VDPP checkpoint or CUDA preflight fails
+
+VDPP generation is CUDA-only and performs a shape-faithful memory preflight
+before writing a new stabilized shot. Close other GPU applications if the
+preflight or a later window reports CUDA out of memory. The base files in
+`03_disparity_maps` remain valid after a VDPP failure.
+
+The checkpoint is stored at `models/VDPP/vdpp.pth`. A partial download uses a
+temporary `.part` file; an existing file with the wrong size or SHA-256 is
+rejected rather than loaded. Remove only the corrupt VDPP checkpoint and retry
+to download it. Do not remove the job's base canonical disparity.
+
+Resume is shot-atomic. Completed shots with matching semantic and runtime
+identity are reused, while the interrupted shot restarts at its first frame. A
+complete content-verified `03_disparity_stabilized` cache can render on CPU and
+does not need the checkpoint. To recover without VDPP, resume with an explicit
+`--temporal-postprocessor off`; this reuses valid raw/base depth and regenerates
+only stereo and downstream output from `03_disparity_maps`.
 
 ## Quality Expectations & Limitations
 

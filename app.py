@@ -16,6 +16,7 @@ import sys
 import signal
 import base64
 from dataclasses import asdict
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,7 @@ from depth_surge_3d.core.constants import (  # noqa: E402
     PROGRESS_UPDATE_INTERVAL,
     PROGRESS_DECIMAL_PLACES,
     PROGRESS_STEP_WEIGHTS,
+    VDPP_PROGRESS_STEP_WEIGHTS,
     PREVIEW_UPDATE_INTERVAL,
     PREVIEW_DOWNSCALE_WIDTH,
     FFMPEG_OVERWRITE_FLAG,
@@ -75,7 +77,11 @@ from depth_surge_3d.inference.depth.backend_registry import (  # noqa: E402
     normalize_model_size,
     validate_backend_geometry_request,
 )
-from depth_surge_3d.core.settings import validate_settings  # noqa: E402
+from depth_surge_3d.core.settings import (  # noqa: E402
+    parse_saved_processing_settings,
+    resolve_temporal_postprocessor,
+    validate_settings,
+)
 from depth_surge_3d.io.operations import get_video_properties  # noqa: E402
 from depth_surge_3d.utils.domain.resolution import resolve_depth_input_size  # noqa: E402
 
@@ -87,7 +93,6 @@ from socketio.exceptions import (  # type: ignore[import-untyped]  # noqa: E402
 
 # NOTE: torch is imported later (line ~960) to avoid CUDA initialization issues
 
-from depth_surge_3d.rendering import create_stereo_projector  # noqa: E402
 from depth_surge_3d.processing import VideoProcessor  # noqa: E402
 from depth_surge_3d.io.resume import (  # noqa: E402
     apply_legacy_migration,
@@ -95,8 +100,12 @@ from depth_surge_3d.io.resume import (  # noqa: E402
     resolve_resume_depth_model_version,
     resolve_resume_source_video,
 )
+from depth_surge_3d.io.job_lock import JobWriterLock  # noqa: E402
 from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
     build_current_model_fingerprint,
+)
+from depth_surge_3d.processing.orchestration.execution_plan import (  # noqa: E402
+    build_artifact_execution_plan,
 )
 
 # Global flags and state
@@ -104,6 +113,47 @@ VERBOSE = False
 SHUTDOWN_FLAG = False
 ACTIVE_PROCESSES = set()
 PROCESSING_CONFIGURATION_ACK_TIMEOUT = 5.0
+
+
+def create_stereo_projector(*args, **kwargs):
+    """Import depth backends only after artifact planning requires them."""
+
+    from depth_surge_3d.rendering import create_stereo_projector as factory
+
+    return factory(*args, **kwargs)
+
+
+def _preserved_render_artifact(report, mode: str) -> tuple[list[Path], str] | None:  # noqa: C901
+    stage_name = "disparity_stabilized" if mode == "vdpp" else "disparity_maps"
+    try:
+        stage = report.stage(stage_name)
+    except KeyError:
+        return None
+    if stage.disposition != "preserve":
+        if mode != "vdpp":
+            return None
+        try:
+            stage = report.stage("disparity_maps")
+        except KeyError:
+            return None
+        if stage.disposition != "preserve":
+            return None
+        stage_name = "disparity_maps"
+    directory = stage.paths[0]
+    try:
+        metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return None
+    if stage_name == "disparity_stabilized":
+        semantic = metadata.get("semantic_identity", {})
+        names = semantic.get("frame_names") if isinstance(semantic, dict) else None
+        source = "stabilized"
+    else:
+        names = metadata.get("frame_names")
+        source = "base"
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        return None
+    return [directory / f"{Path(name).stem}.png" for name in names], source
 
 
 def _validate_web_settings(settings: dict[str, Any], *, source: str) -> dict[str, Any]:
@@ -542,6 +592,7 @@ class ProgressCallback:
         total_frames: int,
         enable_live_preview: bool = True,
         preview_update_interval: float = PREVIEW_UPDATE_INTERVAL,
+        temporal_postprocessor: str = "off",
     ) -> None:
         self.session_id = session_id
         self.total_frames = total_frames
@@ -572,10 +623,18 @@ class ProgressCallback:
             "VR Assembly",  # Step 7: Assemble final VR frames
             "Video Creation",  # Step 8: FFmpeg creates video
         ]
+        if temporal_postprocessor == "vdpp":
+            self.steps.insert(2, "Temporal Depth Stabilization")
+        elif temporal_postprocessor != "off":
+            raise ValueError("temporal_postprocessor must be off or vdpp")
         self.step_aliases = {"Direct VR Encoding": "Video Creation"}
         # Weighted progress based on actual timing measurements
         # [2%, 35%, 20%, 8%, 2%, 18%, 8%, 7%] = 100%
-        self.step_weights = PROGRESS_STEP_WEIGHTS
+        self.step_weights = (
+            VDPP_PROGRESS_STEP_WEIGHTS
+            if temporal_postprocessor == "vdpp"
+            else PROGRESS_STEP_WEIGHTS
+        )
         self.current_step_index = 0
         self.step_progress = 0
         self.step_total = 0
@@ -984,22 +1043,18 @@ def process_video_async(  # noqa: C901
     video_properties: dict[str, Any] | None = None,
 ) -> None:
     """Process video in background thread"""
-    import torch  # Import here to avoid CUDA initialization issues in main thread
-
     projector = None
+    job_lock = None
     try:
         current_processing["active"] = True
         current_processing["session_id"] = session_id
         current_processing["stop_requested"] = False
+        resolved_output_dir = Path(output_dir).resolve()
+        resolved_output_dir.mkdir(parents=True, exist_ok=True)
+        job_lock = JobWriterLock(resolved_output_dir).acquire()
 
-        # Check CUDA availability in this thread
-        cuda_available = torch.cuda.is_available()
-        if cuda_available:
-            print(f"CUDA detected: {torch.cuda.get_device_name(0)}")
-        else:
-            print("CUDA not available, using CPU")
-
-        # Initialize projector with depth model
+        selected_artifact = None
+        resume_report = None
         if resume_context is not None:
             settings = dict(settings)
             settings["depth_model_version"] = resolve_resume_depth_model_version(
@@ -1016,18 +1071,6 @@ def process_video_async(  # noqa: C901
         model_path = settings["model_path"]
         use_metric = settings["use_metric_depth"]
 
-        device = settings.get("device", "auto")
-        if device == "auto":
-            device = "cuda" if cuda_available else "cpu"
-
-        # Fail fast if GPU requested but not available
-        if device == "cuda" and not cuda_available:
-            error_msg = (
-                "GPU (CUDA) requested but not available. "
-                "Please select 'Auto' or 'Force CPU' in Processing Device settings."
-            )
-            raise Exception(error_msg)
-
         if video_properties is None:
             video_properties = get_video_properties(str(video_path))
             if not video_properties:
@@ -1041,44 +1084,97 @@ def process_video_async(  # noqa: C901
         )
         validate_backend_geometry_request(settings, video_properties)
 
-        print(
-            f"Loading {get_backend_spec(depth_model_version).display_name}: "
-            f"{model_size} (metric inference: {use_metric})"
-        )
-        print(f"Using device: {device.upper()}")
-
-        projector = create_stereo_projector(
-            model_path,
-            device,
-            metric=use_metric,
-            depth_model_version=depth_model_version,
-            model_size=model_size,
-        )
-
-        report = build_effective_depth_run_report(settings, projector.depth_estimator)
-        _acknowledge_processing_configuration(requester_socket_id, report)
-        if settings["stereo_geometry_mode"] == "metric_camera":
-            print(TEMPORAL_STABILITY_WARNING)
-
-        # Ensure the model is loaded before processing
-        if not projector.load_model():
-            raise Exception("Failed to load depth estimation model")
+        if (
+            settings["stereo_geometry_mode"] == "metric_camera"
+            and settings.get("temporal_postprocessor", "off") != "off"
+        ):
+            raise ValueError("VDPP is available only with relative stereo geometry")
 
         if resume_context is not None:
-            model_fingerprint = build_current_model_fingerprint(
-                projector.depth_estimator,
-                settings,
-            )
             resume_report = build_resume_report(
                 output_dir,
                 settings,
                 source_video=video_path,
-                model_fingerprint=model_fingerprint,
                 settings_file=resume_context.get("settings_file"),
             )
+            if settings["stereo_geometry_mode"] == "relative":
+                selected_artifact = _preserved_render_artifact(
+                    resume_report,
+                    settings.get("temporal_postprocessor", "off"),
+                )
+
+        depth_model_version = settings.get("depth_model_version", "v3")  # Default to V3
+        model_size = settings.get("model_size", "vitb")  # Default to Base for 16GB GPUs
+        use_metric = settings.get("use_metric_depth", True)  # Default to metric depth
+        selected_source = selected_artifact[1] if selected_artifact is not None else None
+        execution_plan = build_artifact_execution_plan(
+            temporal_postprocessor=settings.get("temporal_postprocessor", "off"),
+            base_artifact_valid=lambda: selected_source == "base",
+            stabilized_artifact_valid=lambda: selected_source == "stabilized",
+        )
+        needs_base_model = execution_plan.needs_base_depth_model
+        needs_vdpp_generation = execution_plan.needs_vdpp_model
+
+        device = str(settings.get("device", "auto"))
+        cuda_available = False
+        if needs_base_model or needs_vdpp_generation:
+            import torch  # Delay CUDA/runtime initialization until planning requires it
+
+            cuda_available = bool(torch.cuda.is_available())
+            if cuda_available:
+                print(f"CUDA detected: {torch.cuda.get_device_name(0)}")
+            else:
+                print("CUDA not available, using CPU")
+            if device == "auto":
+                device = "cuda" if cuda_available else "cpu"
+            if device.startswith("cuda") and not cuda_available:
+                raise RuntimeError(
+                    "GPU (CUDA) requested but not available. Please select Auto or CPU."
+                )
+            if needs_vdpp_generation and not device.startswith("cuda"):
+                raise RuntimeError("VDPP generation requires CUDA")
+
+        if needs_base_model:
+            # Resolve the model only after a model-free artifact audit misses.
+            print(
+                f"Loading {get_backend_spec(depth_model_version).display_name}: "
+                f"{model_size} (metric inference: {use_metric})"
+            )
+            print(f"Using device: {device.upper()}")
+            projector = create_stereo_projector(
+                model_path,
+                device,
+                metric=use_metric,
+                depth_model_version=depth_model_version,
+                model_size=model_size,
+            )
+            report = build_effective_depth_run_report(settings, projector.depth_estimator)
+            _acknowledge_processing_configuration(requester_socket_id, report)
+            if settings["stereo_geometry_mode"] == "metric_camera":
+                print(TEMPORAL_STABILITY_WARNING)
+            if not projector.load_model():
+                raise RuntimeError("Failed to load depth estimation model")
+
+            if resume_context is not None:
+                model_fingerprint = build_current_model_fingerprint(
+                    projector.depth_estimator,
+                    settings,
+                )
+                resume_report = build_resume_report(
+                    output_dir,
+                    settings,
+                    source_video=video_path,
+                    model_fingerprint=model_fingerprint,
+                    settings_file=resume_context.get("settings_file"),
+                )
+
+        if resume_context is not None:
+            assert resume_report is not None
             migration_mode = resume_context.get("migration_mode", "archive")
             apply_legacy_migration(resume_report, migration_mode)
-            settings = resume_report.migrated_settings
+            resolved_temporal = settings.get("temporal_postprocessor", "off")
+            settings = dict(resume_report.migrated_settings)
+            settings.setdefault("temporal_postprocessor", resolved_temporal)
 
         video_info = video_properties
 
@@ -1104,15 +1200,37 @@ def process_video_async(  # noqa: C901
             expected_frames,
             enable_live_preview,
             preview_update_interval,
+            temporal_postprocessor=settings.get("temporal_postprocessor", "off"),
         )
 
         # Give client time to join the session room before starting processing
         socketio.sleep(INITIAL_PROCESSING_DELAY)
 
-        processor = VideoProcessor(
-            projector.depth_estimator,
-            release_depth_model=projector.unload_model,
-        )
+        temporal_stabilizer = None
+        if needs_vdpp_generation:
+            from depth_surge_3d.processing.frames.temporal_stabilizer import (
+                TemporalDepthStabilizer,
+            )
+
+            temporal_stabilizer = TemporalDepthStabilizer(
+                effective_device=device,
+                models_dir=Path("models"),
+            )
+        if selected_artifact is not None:
+            selected_files, selected_source = selected_artifact
+            processor = VideoProcessor(
+                None,
+                temporal_stabilizer=temporal_stabilizer,
+                preselected_depth_files=selected_files,
+                preselected_render_source=selected_source,
+            )
+        else:
+            assert projector is not None
+            processor = VideoProcessor(
+                projector.depth_estimator,
+                release_depth_model=projector.unload_model,
+                temporal_stabilizer=temporal_stabilizer,
+            )
 
         # Calculate resolution settings that VideoProcessor expects
         from depth_surge_3d.utils.domain.resolution import (
@@ -1155,6 +1273,7 @@ def process_video_async(  # noqa: C901
             video_properties=video_info,
             settings=settings,
             progress_callback=callback,
+            job_lock=job_lock,
         )
 
         if not success:
@@ -1204,6 +1323,8 @@ def process_video_async(  # noqa: C901
                 projector.unload_model()
             except Exception as cleanup_error:
                 print(console_warning(f"Error unloading depth model: {cleanup_error}"))
+        if job_lock is not None:
+            job_lock.release()
         current_processing["active"] = False
         current_processing["session_id"] = None
         current_processing["stop_requested"] = False
@@ -1333,6 +1454,11 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:  # noqa:
         settings = _validate_web_settings(settings, source="explicit")
     except (TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
+    if settings.get("temporal_postprocessor") == "vdpp":
+        import torch
+
+        if settings.get("device") == "cpu" or not torch.cuda.is_available():
+            return jsonify({"error": "VDPP generation requires CUDA"}), 400
 
     if not output_dir_str:
         return jsonify({"error": "No output directory provided"}), 400
@@ -1438,7 +1564,7 @@ class _ResumeRequestError(ValueError):
         self.status_code = status_code
 
 
-def _prepare_resume_request(data: Any) -> tuple[Path, str, str | None]:
+def _prepare_resume_request(data: Any) -> tuple[Path, str, str | None, str | None]:
     """Validate resume overrides and constrain the requested output directory."""
 
     if not isinstance(data, dict):
@@ -1447,9 +1573,13 @@ def _prepare_resume_request(data: Any) -> tuple[Path, str, str | None]:
     output_dir = data.get("output_dir")
     migrate_legacy = data.get("migrate_legacy", "archive")
     raw_storage_dtype = data.get("raw_storage_dtype")
+    temporal_present = "temporal_postprocessor" in data
+    temporal_override = data.get("temporal_postprocessor") if temporal_present else None
     resume_overrides = {"migrate_legacy": migrate_legacy}
     if raw_storage_dtype is not None:
         resume_overrides["raw_storage_dtype"] = raw_storage_dtype
+    if temporal_present:
+        resume_overrides["temporal_postprocessor"] = temporal_override
     try:
         validated = validate_settings(resume_overrides, source="explicit")
     except (TypeError, ValueError) as exc:
@@ -1470,7 +1600,8 @@ def _prepare_resume_request(data: Any) -> tuple[Path, str, str | None]:
         raise _ResumeRequestError("Output directory does not exist", 404)
 
     selected_dtype = validated.get("raw_storage_dtype") if raw_storage_dtype is not None else None
-    return output_path, validated["migrate_legacy"], selected_dtype
+    selected_temporal = validated["temporal_postprocessor"] if temporal_present else None
+    return output_path, validated["migrate_legacy"], selected_dtype, selected_temporal
 
 
 @app.route("/resume", methods=["POST"])
@@ -1480,7 +1611,9 @@ def resume_processing():  # noqa: C901
         return jsonify({"error": "Processing already in progress"}), 400
 
     try:
-        output_path, migrate_legacy, raw_storage_dtype = _prepare_resume_request(request.json)
+        output_path, migrate_legacy, raw_storage_dtype, temporal_override = _prepare_resume_request(
+            request.json
+        )
     except _ResumeRequestError as exc:
         return jsonify({"error": str(exc)}), exc.status_code
 
@@ -1495,7 +1628,10 @@ def resume_processing():  # noqa: C901
     except (OSError, TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 409
     # Try to detect settings from existing files/directories
-    settings = detect_resume_settings(output_path, settings_file=settings_file)
+    try:
+        settings = detect_resume_settings(output_path, settings_file=settings_file)
+    except (OSError, TypeError, ValueError) as exc:
+        return jsonify({"error": f"Could not read resume settings: {exc}"}), 409
     settings["depth_model_version"] = resolve_resume_depth_model_version(
         settings,
         output_path,
@@ -1504,6 +1640,12 @@ def resume_processing():  # noqa: C901
     settings["migrate_legacy"] = migrate_legacy
     if raw_storage_dtype is not None:
         settings["raw_storage_dtype"] = raw_storage_dtype
+    settings["temporal_postprocessor"] = resolve_temporal_postprocessor(
+        persisted=settings.get("temporal_postprocessor"),
+        override=temporal_override,
+        is_resume=True,
+    )
+    resolved_temporal = settings["temporal_postprocessor"]
 
     try:
         resume_report = build_resume_report(
@@ -1512,7 +1654,8 @@ def resume_processing():  # noqa: C901
             source_video=source_video,
             settings_file=settings_file,
         )
-        settings = resume_report.migrated_settings
+        settings = dict(resume_report.migrated_settings)
+        settings.setdefault("temporal_postprocessor", resolved_temporal)
     except (OSError, TypeError, ValueError) as exc:
         return jsonify({"error": f"Could not migrate resume data: {exc}"}), 409
 
@@ -1549,6 +1692,9 @@ def resume_processing():  # noqa: C901
             "session_id": session_id,
             "output_dir": str(output_path),
             "resume_report": resume_report.to_dict(),
+            "settings": {
+                "temporal_postprocessor": settings["temporal_postprocessor"],
+            },
         }
     )
 
@@ -1570,7 +1716,14 @@ def detect_resume_settings(output_path, *, settings_file=None):
         saved_data = load_processing_settings(settings_file)
         saved_settings = saved_data.get("processing_settings") if saved_data else None
         if isinstance(saved_settings, dict):
-            settings = _validate_web_settings(saved_settings, source="legacy_disk")
+            metadata = saved_data.get("metadata", {})
+            saved_version = (
+                metadata.get("settings_schema_version") if isinstance(metadata, dict) else None
+            )
+            settings = parse_saved_processing_settings(
+                saved_settings,
+                saved_version=saved_version,
+            ).settings
             settings["depth_model_version"] = resolve_resume_depth_model_version(
                 settings,
                 output_path,
@@ -1639,16 +1792,22 @@ def detect_resumable_jobs():
             if has_frames and not has_final_video:
                 # This is a resumable job
                 analysis = analyze_batch_directory(batch_dir)
-                resumable_jobs.append(
-                    {
-                        "path": str(batch_dir),
-                        "name": batch_dir.name,
-                        "highest_stage": analysis.get("highest_stage", "unknown"),
-                        "frame_count": analysis.get("frame_count", 0),
-                        "vr_format": analysis.get("vr_format", "unknown"),
-                        "resolution": analysis.get("resolution", "unknown"),
-                    }
-                )
+                job = {
+                    "path": str(batch_dir),
+                    "name": batch_dir.name,
+                    "highest_stage": analysis.get("highest_stage", "unknown"),
+                    "frame_count": analysis.get("frame_count", 0),
+                    "vr_format": analysis.get("vr_format", "unknown"),
+                    "resolution": analysis.get("resolution", "unknown"),
+                }
+                try:
+                    resume_settings = detect_resume_settings(batch_dir)
+                    job["temporal_postprocessor"] = resume_settings.get(
+                        "temporal_postprocessor", "off"
+                    )
+                except (OSError, TypeError, ValueError):
+                    pass
+                resumable_jobs.append(job)
 
         # Sort by modification time (most recent first)
         resumable_jobs.sort(key=lambda x: Path(x["path"]).stat().st_mtime, reverse=True)

@@ -1,0 +1,115 @@
+{
+  "repository": "https://github.com/injun-baek/VDPP",
+  "release": "v1.0",
+  "revision": "73cc2b4dc6b3b5cfb2e37f51e452461e03fe26f5",
+  "license": "Apache-2.0",
+  "vendor_port_version": 1,
+  "mechanical_changes": [
+    "Added Python package markers.",
+    "Changed vdpp_model.py imports to package-relative vendored imports."
+  ],
+  "files": [
+    {
+      "original_path": "vdpp/dinov2_layers/__init__.py",
+      "original_sha256": "c4a3e70c63d8c6c8c9e0c1b9e0eae5672ff73176146b7d2b10d36ae4974fa6d6",
+      "vendored_path": "vdpp/dinov2_layers/__init__.py",
+      "vendored_sha256": "c4a3e70c63d8c6c8c9e0c1b9e0eae5672ff73176146b7d2b10d36ae4974fa6d6"
+    },
+    {
+      "original_path": "vdpp/dinov2_layers/attention.py",
+      "original_sha256": "7b049ddbb65b9421e56645f5ca6f5edc0cc6739b6b1331f60883d6f4f2925c46",
+      "vendored_path": "vdpp/dinov2_layers/attention.py",
+      "vendored_sha256": "7b049ddbb65b9421e56645f5ca6f5edc0cc6739b6b1331f60883d6f4f2925c46"
+    },
+    {
+      "original_path": "vdpp/dinov2_layers/block.py",
+      "original_sha256": "a7218ff8350794efce37a010ac7d58d212e10a5b84b43a214a7b682cac656a62",
+      "vendored_path": "vdpp/dinov2_layers/block.py",
+      "vendored_sha256": "a7218ff8350794efce37a010ac7d58d212e10a5b84b43a214a7b682cac656a62"
+    },
+    {
+      "original_path": "vdpp/dinov2_layers/drop_path.py",
+      "original_sha256": "27abed4dd9dafa14157c9c7717bdca15fedb62702066f627b314bc91c06a1d53",
+      "vendored_path": "vdpp/dinov2_layers/drop_path.py",
+      "vendored_sha256": "27abed4dd9dafa14157c9c7717bdca15fedb62702066f627b314bc91c06a1d53"
+    },
+    {
+      "original_path": "vdpp/dinov2_layers/layer_scale.py",
+      "original_sha256": "a79f5b673c3f1fa60173b1905501ecfeb7fe77bed9b5e35881390c12baecbdfa",
+      "vendored_path": "vdpp/dinov2_layers/layer_scale.py",
+      "vendored_sha256": "a79f5b673c3f1fa60173b1905501ecfeb7fe77bed9b5e35881390c12baecbdfa"
+    },
+    {
+      "original_path": "vdpp/dinov2_layers/mlp.py",
+      "original_sha256": "9856d7274ca32428ff05dacf7adf8ad10fa81d7bb4e5d299ab57cf421dcc7620",
+      "vendored_path": "vdpp/dinov2_layers/mlp.py",
+      "vendored_sha256": "9856d7274ca32428ff05dacf7adf8ad10fa81d7bb4e5d299ab57cf421dcc7620"
+    },
+    {
+      "original_path": "vdpp/dinov2_layers/patch_embed.py",
+      "original_sha256": "2d949ea0eff33185d829995373c963cac6eaebf77b4808478a72934d89587e42",
+      "vendored_path": "vdpp/dinov2_layers/patch_embed.py",
+      "vendored_sha256": "2d949ea0eff33185d829995373c963cac6eaebf77b4808478a72934d89587e42"
+    },
+    {
+      "original_path": "vdpp/dinov2_layers/swiglu_ffn.py",
+      "original_sha256": "e1744aa9d29610c57d4fa153ec0aa545ef60da565d2aaac754d318fea0e30d7c",
+      "vendored_path": "vdpp/dinov2_layers/swiglu_ffn.py",
+      "vendored_sha256": "e1744aa9d29610c57d4fa153ec0aa545ef60da565d2aaac754d318fea0e30d7c"
+    },
+    {
+      "original_path": "vdpp/dinov2.py",
+      "original_sha256": "0505cf78bf0c88b97964cf973f34ab7e5574b7b63469d65abe55a7576bc8bb55",
+      "vendored_path": "vdpp/dinov2.py",
+      "vendored_sha256": "0505cf78bf0c88b97964cf973f34ab7e5574b7b63469d65abe55a7576bc8bb55"
+    },
+    {
+      "original_path": "vdpp/dpt_temporal.py",
+      "original_sha256": "6165888759bacddc71405d97f8aa837e1b8f9079524249dd00c38c98ca732732",
+      "vendored_path": "vdpp/dpt_temporal.py",
+      "vendored_sha256": "6165888759bacddc71405d97f8aa837e1b8f9079524249dd00c38c98ca732732"
+    },
+    {
+      "original_path": "vdpp/dpt.py",
+      "original_sha256": "952c5ad29b556aa3875ad34425bd0e5a582c4b58a8a35820e4ba1f5b7df62975",
+      "vendored_path": "vdpp/dpt.py",
+      "vendored_sha256": "952c5ad29b556aa3875ad34425bd0e5a582c4b58a8a35820e4ba1f5b7df62975"
+    },
+    {
+      "original_path": "vdpp/motion_module/attention.py",
+      "original_sha256": "33f883603b5bb30eff19d41362bc976f2816224466486cb069d99f7b9d232f35",
+      "vendored_path": "vdpp/motion_module/attention.py",
+      "vendored_sha256": "33f883603b5bb30eff19d41362bc976f2816224466486cb069d99f7b9d232f35"
+    },
+    {
+      "original_path": "vdpp/motion_module/motion_module.py",
+      "original_sha256": "13e89acc5e59bc26b98a5336e60c010a4b97e780ba50ae3be43f86c34a7f042b",
+      "vendored_path": "vdpp/motion_module/motion_module.py",
+      "vendored_sha256": "13e89acc5e59bc26b98a5336e60c010a4b97e780ba50ae3be43f86c34a7f042b"
+    },
+    {
+      "original_path": "vdpp/util/blocks.py",
+      "original_sha256": "35ac061b11de0dd6d556e5b72a386897088f4608b23581a37b0601bc4bd5f1c1",
+      "vendored_path": "vdpp/util/blocks.py",
+      "vendored_sha256": "35ac061b11de0dd6d556e5b72a386897088f4608b23581a37b0601bc4bd5f1c1"
+    },
+    {
+      "original_path": "vdpp/util/transform.py",
+      "original_sha256": "ad93afd07aee97a1c73aaa9217c1a8e80c097a861800c56e5425446ff3ecabaa",
+      "vendored_path": "vdpp/util/transform.py",
+      "vendored_sha256": "ad93afd07aee97a1c73aaa9217c1a8e80c097a861800c56e5425446ff3ecabaa"
+    },
+    {
+      "original_path": "vdpp/vdpp_model.py",
+      "original_sha256": "d1c035cd45a66b708abd9f207b9abb2c9e88c56f88cc3413330f7d116bb67064",
+      "vendored_path": "vdpp/vdpp_model.py",
+      "vendored_sha256": "c66353a37dfda5f10834209f7741d6b087fbbd9822dee84b6ca0cf9332355773"
+    },
+    {
+      "original_path": "utils/normal_utils.py",
+      "original_sha256": "9b9c7ba70e2e9d82ebe758d70d6b042100061c3ab197eadde85e5f5899a193ca",
+      "vendored_path": "vdpp_utils/normal_utils.py",
+      "vendored_sha256": "9b9c7ba70e2e9d82ebe758d70d6b042100061c3ab197eadde85e5f5899a193ca"
+    }
+  ]
+}

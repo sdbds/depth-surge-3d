@@ -8,7 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-
 - Optional MoGe-2 Small, Base, and Large backends with immutable source and
   weight revisions.
 - Experimental metric-camera geometry for flat rectilinear side-by-side output,
@@ -17,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Raw depth schema v3 camera/focal persistence and independent restartable
   relative and metric Stage-3 stores.
 - Third-party notices for Microsoft MoGe and its bundled/derived DINOv2 code.
+- Optional experimental VDPP depth-only temporal stabilization for every depth
+  backend in relative geometry mode, with fixed shot-aware 32/4 inference,
+  bounded memory, content-addressed artifacts, and shot-atomic resume.
+- Web and CLI controls, lazy integrity-checked checkpoint download, cache-only CPU
+  rendering, and a deterministic quality-gate harness.
 
 ### Fixed
 
@@ -31,6 +35,12 @@ The [MoGe-2 release-evidence checklist](docs/release/moge2-release-checklist.md)
 defines the separate three-variant evidence process that will be added with the
 release tooling. This changelog entry does not claim that real-model evidence
 has been executed.
+
+### Changed
+- Processing settings schema is now v4. Earlier jobs, including MoGe-era v3
+  jobs, migrate to VDPP `off`; current jobs preserve omission separately from
+  an explicit resume override.
+- Source distributions explicitly exclude downloaded model and runtime artifacts.
 
 ## [0.9.2] - 2026-01-19
 

@@ -37,8 +37,10 @@ from ..io.operations import (
     validate_video_file,
     get_video_properties,
 )
+from ..io.job_lock import JobWriterLock
 from ..processing import VideoProcessor
 from ..processing.frames.depth_normalizer import canonicalize_single_scene
+from ..processing.frames.temporal_stabilizer import TemporalDepthStabilizer
 from ..core.settings import validate_settings
 from .stereo_renderer import StereoRenderer, StereoRenderSettings
 
@@ -155,11 +157,12 @@ class StereoProjector:
         self._model_loaded = False
         self._preflight_owner = object()
 
-    def process_video(
+    def process_video(  # noqa: C901
         self,
         video_path: str,
         output_dir: str,
         settings: dict[str, Any],
+        job_lock: JobWriterLock | None = None,
     ) -> bool:
         """
         Process video to create 3D VR version.
@@ -173,24 +176,47 @@ class StereoProjector:
             True if processing completed successfully
         """
         preflight = self.preflight_video(video_path, output_dir, settings)
-        return False if preflight is None else self.execute_video(preflight)
+        return False if preflight is None else self.execute_video(preflight, job_lock=job_lock)
 
-    def execute_video(self, preflight: VideoRunPreflight) -> bool:
+    def execute_video(
+        self,
+        preflight: VideoRunPreflight,
+        *,
+        job_lock: JobWriterLock | None = None,
+    ) -> bool:
         """Execute one owned preflight without accepting competing settings."""
+        owns_job_lock = False
         try:
             video_path, output_dir, settings, video_properties, _report = preflight._snapshot_for(
                 self._preflight_owner
             )
+            output_path = Path(output_dir).resolve()
+            if job_lock is None:
+                job_lock = JobWriterLock(output_path).acquire()
+                owns_job_lock = True
+            elif not job_lock.is_acquired:
+                raise ValueError("The supplied job writer lock is not acquired")
+            elif job_lock.output_dir.resolve() != output_path:
+                raise ValueError("The supplied job writer lock belongs to another output directory")
+
             if not self._ensure_model_loaded():
                 return False
             if not self._prepare_output_directory(output_dir):
                 return False
 
-            # Create video processor (always uses temporal consistency)
+            temporal_stabilizer = None
+            if settings.get("temporal_postprocessor") == "vdpp":
+                effective_device = str(getattr(self.depth_estimator, "device", self.device))
+                temporal_stabilizer = TemporalDepthStabilizer(
+                    effective_device=effective_device,
+                    models_dir=Path("models"),
+                )
+
             processor = VideoProcessor(
                 self.depth_estimator,
                 verbose=settings.get("verbose", False),
                 release_depth_model=self.unload_model,
+                temporal_stabilizer=temporal_stabilizer,
             )
 
             # Process the video
@@ -199,11 +225,15 @@ class StereoProjector:
                 output_dir=output_dir,
                 video_properties=video_properties,
                 settings=settings,
+                job_lock=job_lock,
             )
 
         except Exception as e:
             print(f"Error during video processing: {e}")
             return False
+        finally:
+            if owns_job_lock and job_lock is not None:
+                job_lock.release()
 
     def preflight_video(
         self,
@@ -274,6 +304,11 @@ class StereoProjector:
 
             resolved_settings = self._resolve_settings(requested_settings, video_properties)
             validate_backend_geometry_request(resolved_settings, video_properties)
+            if (
+                resolved_settings["stereo_geometry_mode"] == "metric_camera"
+                and resolved_settings.get("temporal_postprocessor", "off") != "off"
+            ):
+                raise ValueError("VDPP is available only with relative stereo geometry")
             report = build_effective_depth_run_report(
                 resolved_settings,
                 self.depth_estimator,
@@ -583,9 +618,41 @@ class StereoProjector:
         return self.depth_estimator.get_model_info()
 
     def unload_model(self) -> None:
-        """Unload the model to free memory."""
-        self.depth_estimator.unload_model()
-        self._model_loaded = False
+        """Idempotently release owner state even when one cleanup step fails."""
+
+        first_error: BaseException | None = None
+        estimator_device = str(getattr(self.depth_estimator, "device", self.device))
+        cuda_cleanup = estimator_device.startswith("cuda")
+        torch_module: Any = None
+        try:
+            if cuda_cleanup:
+                import torch
+
+                torch_module = torch
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(estimator_device)
+        except BaseException as exc:
+            first_error = exc
+        try:
+            self.depth_estimator.unload_model()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        finally:
+            self._model_loaded = False
+            if cuda_cleanup:
+                try:
+                    if torch_module is None:
+                        import torch
+
+                        torch_module = torch
+                    if torch_module.cuda.is_available():
+                        torch_module.cuda.empty_cache()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+        if first_error is not None:
+            raise first_error
 
 
 def create_stereo_projector(

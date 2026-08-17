@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from ..core.settings import (
     PROCESSING_SETTINGS_SCHEMA_VERSION,
-    REMOVED_SETTING_NAMES,
+    parse_saved_processing_settings,
     validate_settings,
 )
 from ..core.file_identity import (
@@ -23,10 +23,19 @@ from ..core.depth_contract import (
     CANONICAL_DEPTH_SCHEMA_VERSION,
     canonical_json_hash,
 )
+from ..core.render_disparity import (
+    STABILIZED_DEPTH_ALGORITHM_VERSION,
+    STABILIZED_DEPTH_SCHEMA_VERSION,
+    validate_render_disparity_input,
+)
 from ..inference.depth.v2_temporal_contract import (
     VDA_INFERENCE_ALGORITHM,
     build_v2_execution_plan,
     is_compatible_v2_execution_plan,
+)
+from ..inference.depth.vdpp_contract import (
+    build_vdpp_execution_plan,
+    vdpp_model_identity,
 )
 from ..processing.frames.depth_processor import (
     DEPTH_BOUNDS_SCHEMA_VERSION,
@@ -1060,6 +1069,164 @@ def _validate_metric_geometry_stage(
     )
 
 
+def _validate_stabilized_stage(  # noqa: C901
+    output_dir: Path,
+    frame_files: list[Path],
+    canonical_metadata: dict[str, Any] | None,
+) -> tuple[ResumeStage, dict[str, Any] | None]:
+    stabilized_dir = output_dir / "03_disparity_stabilized"
+    paths = (stabilized_dir,)
+    if not _has_payload(stabilized_dir):
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "missing",
+                "stabilized disparity is absent",
+            ),
+            None,
+        )
+    if canonical_metadata is None:
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "base canonical disparity is invalid",
+            ),
+            None,
+        )
+    metadata = _read_json(stabilized_dir / "metadata.json")
+    if metadata is None:
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "stabilized metadata is missing",
+            ),
+            None,
+        )
+    metadata_fingerprint = metadata.get("metadata_fingerprint")
+    unhashed_metadata = {
+        key: value for key, value in metadata.items() if key != "metadata_fingerprint"
+    }
+    if (
+        metadata.get("schema_version") != STABILIZED_DEPTH_SCHEMA_VERSION
+        or metadata.get("algorithm_version") != STABILIZED_DEPTH_ALGORITHM_VERSION
+        or metadata.get("status") not in {"building", "complete"}
+        or not isinstance(metadata_fingerprint, str)
+        or metadata_fingerprint != canonical_json_hash(unhashed_metadata)
+    ):
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "stabilized metadata fingerprint is invalid",
+            ),
+            None,
+        )
+    semantic = metadata.get("semantic_identity")
+    lineage_matches = (
+        isinstance(semantic, dict)
+        and semantic.get("source_canonical_fingerprint") == canonical_metadata.get("fingerprint")
+        and semantic.get("scene_manifest_fingerprint")
+        == canonical_metadata.get("scene_manifest_fingerprint")
+        and semantic.get("frame_names") == [path.name for path in frame_files]
+        and semantic.get("native_shape") == canonical_metadata.get("native_shape")
+        and semantic.get("postprocessor_settings") == {"temporal_postprocessor": "vdpp"}
+    )
+    if not lineage_matches:
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "stabilized semantic lineage changed",
+            ),
+            None,
+        )
+    assert isinstance(semantic, dict)
+    if metadata.get("semantic_fingerprint") != canonical_json_hash(semantic):
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "stabilized semantic fingerprint is invalid",
+            ),
+            None,
+        )
+    state = {
+        "status": metadata.get("status"),
+        "completed_shots": metadata.get("completed_shots"),
+    }
+    if metadata.get("state_fingerprint") != canonical_json_hash(state):
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "stabilized state fingerprint is invalid",
+            ),
+            None,
+        )
+    native_shape = _positive_shape(canonical_metadata, "native_shape")
+    identity_matches = (
+        native_shape is not None
+        and semantic.get("model_identity") == vdpp_model_identity()
+        and semantic.get("execution_plan") == build_vdpp_execution_plan(native_shape)
+    )
+    if not identity_matches:
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                "stabilized VDPP identity changed",
+            ),
+            None,
+        )
+    depth_files = [stabilized_dir / f"{path.stem}.png" for path in frame_files]
+    try:
+        artifact = validate_render_disparity_input(depth_files, frame_files)
+    except ValueError as exc:
+        if (
+            metadata.get("algorithm_version") == STABILIZED_DEPTH_ALGORITHM_VERSION
+            and metadata.get("status") == "building"
+        ):
+            return (
+                _stage(
+                    "disparity_stabilized",
+                    paths,
+                    "resume",
+                    "stabilized stage has resumable shot state",
+                ),
+                metadata,
+            )
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "invalidate",
+                f"stabilized artifact is invalid: {exc}",
+            ),
+            None,
+        )
+    selected_metadata = dict(artifact.metadata)
+    selected_metadata["fingerprint"] = artifact.fingerprint
+    return (
+        _stage(
+            "disparity_stabilized",
+            paths,
+            "preserve",
+            "stabilized artifact and payload digests match",
+        ),
+        selected_metadata,
+    )
+
+
 def _settings_changed(
     saved: dict[str, Any],
     current: dict[str, Any],
@@ -1311,10 +1478,23 @@ def build_resume_report(
     raw_saved = (settings_data or {}).get("processing_settings", {})
     if not isinstance(raw_saved, dict):
         raw_saved = {}
-    removed = tuple(sorted(REMOVED_SETTING_NAMES.intersection(raw_saved)))
-    saved_settings = validate_settings(raw_saved, source="legacy_disk")
+    settings_metadata = (settings_data or {}).get("metadata", {})
+    saved_version = (
+        settings_metadata.get("settings_schema_version")
+        if isinstance(settings_metadata, dict)
+        else None
+    )
+    saved_result = parse_saved_processing_settings(
+        raw_saved,
+        saved_version=saved_version,
+    )
+    removed = saved_result.removed_settings
+    saved_settings = saved_result.settings
     migrated_settings = validate_settings(current_settings, source="explicit")
+    settings_schema_current = not saved_result.migrated
     geometry_mode = str(migrated_settings.get("stereo_geometry_mode", "relative"))
+    if geometry_mode == "metric_camera" and migrated_settings.get("temporal_postprocessor") != "off":
+        raise ValueError("VDPP is available only with relative stereo geometry")
     report_settings_data = _resume_properties_with_sar(
         settings_data,
         source_video,
@@ -1323,11 +1503,6 @@ def build_resume_report(
     source_reason = _source_video_mismatch_reason(report_settings_data, source_video)
     if source_reason is not None:
         raise ValueError(f"Cannot resume: {source_reason}")
-    settings_metadata = (settings_data or {}).get("metadata", {})
-    settings_schema_current = (
-        isinstance(settings_metadata, dict)
-        and settings_metadata.get("settings_schema_version") == PROCESSING_SETTINGS_SCHEMA_VERSION
-    )
 
     frames, frame_files, source_fingerprint = _validate_frame_stage(
         root, report_settings_data, saved_settings
@@ -1389,6 +1564,18 @@ def build_resume_report(
         )
         stages[-2 if geometry_mode == "relative" else -1] = selected_stage
 
+    render_metadata = canonical_metadata if geometry_mode == "relative" else metric_metadata
+    render_reusable = selected_stage.disposition in {"preserve", "resume"}
+    if geometry_mode == "relative" and migrated_settings.get("temporal_postprocessor") == "vdpp":
+        stabilized, stabilized_metadata = _validate_stabilized_stage(
+            root,
+            frame_files,
+            canonical_metadata,
+        )
+        stages.append(stabilized)
+        render_metadata = stabilized_metadata
+        render_reusable = stabilized.disposition == "preserve"
+
     legacy_supersampled = root / "01_supersampled_frames"
     if _has_payload(legacy_supersampled):
         stages.append(
@@ -1420,7 +1607,6 @@ def build_resume_report(
             )
         )
 
-    selected_metadata = canonical_metadata if geometry_mode == "relative" else metric_metadata
     video_properties = (report_settings_data or {}).get("video_properties", {})
     if not isinstance(video_properties, dict):
         video_properties = {}
@@ -1430,11 +1616,11 @@ def build_resume_report(
             frame_files,
             saved_settings,
             migrated_settings,
-            selected_metadata,
+            render_metadata,
             video_properties,
             geometry_mode,
             current_settings_schema=settings_schema_current,
-            geometry_reusable=selected_stage.disposition in {"preserve", "resume"},
+            geometry_reusable=render_reusable,
         )
     )
     backup_required = selected_settings_file is not None and (

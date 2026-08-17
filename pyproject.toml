@@ -70,6 +70,19 @@ build-backend = "hatchling.build"
 [tool.hatch.metadata]
 allow-direct-references = true
 
+[tool.hatch.build]
+exclude = [
+    "/.worktrees",
+    "/cache",
+    "/checkpoints",
+    "/models",
+    "/output",
+    "/outputs",
+    "/temp",
+    "/tmp",
+    "/uploads",
+]
+
 [tool.uv]
 dev-dependencies = [
     "pytest>=7.0.0",
@@ -118,6 +131,7 @@ extend-exclude = '''
   | buck-out
   | build
   | dist
+  | src/depth_surge_3d/_vendor/(vdpp|vdpp_utils)
 )/
 '''
 
@@ -132,3 +146,10 @@ exclude = [
     "build",
     "dist",
 ]
+
+[[tool.mypy.overrides]]
+module = [
+    "depth_surge_3d._vendor.vdpp.*",
+    "depth_surge_3d._vendor.vdpp_utils.*",
+]
+ignore_errors = true

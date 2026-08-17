@@ -122,6 +122,24 @@ or safety, or superiority over relative mode. The adapter level is fixed at
 | Base / `vitb` default | 104M | `Ruicheng/moge-2-vitb-normal` | `54ad3a693e61907ea4633d13dec6ee682fa09419` |
 | Large / `vitl` | 326M | `Ruicheng/moge-2-vitl` | `39c4d5e957afe587e04eec59dc2bcc3be5ecd968` |
 
+## Temporal Post-Processing
+
+- `--temporal-postprocessor`: `off` (default for new jobs) or `vdpp`.
+
+VDPP is an experimental depth-only pass after relative-disparity
+canonicalization. It works with all current depth backends in `relative`
+geometry mode, but V2 usually benefits less because V2 already has model-native
+shot-aware temporal inference. It is not applied to `metric_camera` geometry.
+Generating missing VDPP artifacts requires CUDA, downloads the pinned
+116,485,370-byte v1.0 checkpoint on first use, adds one uint16 PNG per selected
+frame, and adds processing time. A fully validated stabilized cache can be
+rendered without CUDA.
+
+The released checkpoint fixes window 32, overlap 4, stride 28, downsize mode,
+and FP32 precision. These are not user controls. On resume, omitting the option
+keeps the saved mode; explicitly passing `off` or `vdpp` changes the requested
+artifact and invalidates only affected downstream stages.
+
 ## Tuning
 
 Start with the defaults. Reduce `--stereo-strength` when depth edges feel

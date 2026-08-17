@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from src.depth_surge_3d.core.constants import INTERMEDIATE_DIRS
+from src.depth_surge_3d.core.settings import parse_saved_processing_settings
 from src.depth_surge_3d.utils.domain import depth_cache
 
 
@@ -57,3 +58,15 @@ def test_current_examples_and_docs_do_not_advertise_removed_stereo_controls():
         text = path.read_text(encoding="utf-8").lower()
         for control in removed_controls:
             assert control not in text, f"{path.name} still contains {control}"
+
+
+def test_example_settings_use_schema_v4_with_vdpp_disabled_by_default() -> None:
+    example = json.loads((PROJECT_ROOT / "example_settings.json").read_text(encoding="utf-8"))
+
+    assert example["metadata"]["settings_schema_version"] == 4
+    assert example["processing_settings"]["temporal_postprocessor"] == "off"
+    parsed = parse_saved_processing_settings(
+        example["processing_settings"],
+        saved_version=example["metadata"]["settings_schema_version"],
+    )
+    assert parsed.migrated is False

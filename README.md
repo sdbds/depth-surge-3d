@@ -7,7 +7,7 @@
 
 **Convert 2D videos to 3D VR format using AI depth estimation.**
 
-Depth Surge 3D transforms flat videos into stereoscopic 3D for VR headsets using **Depth Anything V3**, **Video-Depth-Anything V2**, or the optional **MoGe-2** backend. It predicts depth with the selected backend, then generates left and right eye views for immersive stereoscopic viewing. V2 applies model-native temporal inference independently within each detected shot.
+Depth Surge 3D transforms flat videos into stereoscopic 3D for VR headsets using **Depth Anything V3**, **Video-Depth-Anything V2**, **See-Through Marigold**, or the optional **MoGe-2** backend. It predicts depth with the selected backend, then generates left and right eye views for immersive stereoscopic viewing. V2 applies model-native temporal inference independently within each detected shot.
 
 ## Key Features
 
@@ -19,6 +19,7 @@ Depth Surge 3D transforms flat videos into stereoscopic 3D for VR headsets using
 - **AI Upscaling**: Optional Real-ESRGAN enhancement (2x/4x) for higher output resolution
 - **CUDA Hardware Acceleration**: NVENC H.265 encoding and GPU-accelerated frame decoding
 - **Configurable Depth Quality**: Adjustable depth map resolution (518px to 4K) for quality vs. speed
+- **Optional VDPP Stabilization**: Experimental depth-only temporal post-processing for any video depth backend
 - **Multiple VR Formats**: Side-by-side and over-under stereoscopic formats
 - **Flexible Resolutions**: Square (VR-optimized), 16:9 (standard), cinema, and custom resolutions up to 8K
 - **Resume Capability**: Intelligent step-level resume for interrupted processing
@@ -56,6 +57,9 @@ python depth_surge_3d.py input_video.mp4
 
 # Process specific time range with custom settings
 python depth_surge_3d.py input_video.mp4 -s 01:30 -e 03:45 -f over_under --resolution 4k
+
+# Add experimental generic temporal stabilization (CUDA generation only)
+python depth_surge_3d.py input_video.mp4 --temporal-postprocessor vdpp
 ```
 
 **UV Command Line**
@@ -100,7 +104,7 @@ Install the optional backend with `uv sync --extra moge2`; see the
 - Python 3.9, 3.10, 3.11, or 3.12 (Python 3.13+ not yet supported due to dependency limitations)
 - FFmpeg
 - CUDA 13.0+ (required for GPU acceleration)
-- CUDA-compatible GPU (optional but strongly recommended)
+- CUDA-compatible GPU (optional but strongly recommended; required to generate VDPP output)
 
 ## Documentation
 
@@ -110,10 +114,12 @@ Install the optional backend with `uv sync --extra moge2`; see the
 - **[Parameters Reference](docs/PARAMETERS.md)** - All command-line options and settings explained
 - **[VR Headset Compatibility](docs/VR_HEADSET_COMPATIBILITY.md)** - Specs and optimal settings for top 10 VR devices
 - **[Performance Benchmarks](docs/PERFORMANCE.md)** - GPU benchmarks, VRAM usage, and optimization guide
+- **[Web UI Guide](docs/WEB_GUI.md)** - VDPP controls, resume behavior, and progress
 - **[Troubleshooting](docs/TROUBLESHOOTING.md)** - Common issues and performance tips
 
 **Technical Documentation:**
 - **[Architecture](docs/ARCHITECTURE.md)** - Technical details and processing pipeline
+- **[Development Guide](docs/DEVELOPMENT.md)** - VDPP vendoring, tests, and quality gate
 - **[Contributing Guide](docs/CONTRIBUTING.md)** - Development workflow and CI/CD setup
 - **[Coding Standards](docs/CODING_GUIDE.md)** - Code quality requirements and best practices
 
@@ -130,8 +136,10 @@ output/
 └── timestamp_videoname_timestamp/
     ├── original_video.mp4      # Source video
     ├── original_audio.flac     # Pre-extracted audio
-    ├── frames/                 # Extracted frames
-    ├── vr_frames/             # Final VR frames
+    ├── 00_original_frames/    # Extracted frames
+    ├── 03_disparity_maps/     # Canonical relative disparity
+    ├── 03_disparity_stabilized/ # Optional VDPP artifact
+    ├── 99_vr_frames/          # Final VR frames
     └── videoname_3D_side_by_side.mp4  # Final 3D video
 ```
 
@@ -156,6 +164,7 @@ This project uses state-of-the-art depth estimation models:
 - **[Video-Depth-Anything V2](https://github.com/DepthAnything/Video-Depth-Anything)** - Shot-aware temporal depth estimation with fixed 32-frame windows and 10-frame overlap
 - **[Microsoft MoGe](https://github.com/microsoft/MoGe)** - Optional pinned
   MoGe-2 metric depth backend
+- **[VDPP](https://github.com/injun-baek/VDPP)** - Optional video depth post-processing; the pinned inference subset and Apache-2.0 notice ship under `src/depth_surge_3d/_vendor/vdpp`
 
 These models use vision transformer architectures for monocular depth prediction.
 

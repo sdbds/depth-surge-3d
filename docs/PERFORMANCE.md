@@ -50,6 +50,28 @@ Reference system: RTX 4070 Ti SUPER, 32GB RAM, AMD Ryzen 9 7950X
 - Higher VRAM usage (~8-12GB depending on resolution)
 - Better temporal consistency but slower
 
+#### Optional VDPP Post-Processing
+
+VDPP is a separate experimental stage after canonical disparity and can be
+selected for V3, See-Through, or V2. It uses fixed 32-frame windows with four
+retained observations and stride 28, resets at every final scene cut, runs in
+FP32, and adds one uint16 PNG per frame. V2 usually needs it less because V2
+already uses model-native temporal inference.
+
+The base estimator is released before VDPP is constructed, so their parameters
+are never resident together. CUDA preflight exercises both a first window and,
+for long pending shots, the continuation peak: four retained maps, a new
+32-frame output, out-of-place affine output, alignment scratch, and one native
+resize/transfer. Allocated and reserved peaks are recorded separately. Passing
+preflight is not a universal OOM guarantee because allocator fragmentation and
+other processes can still change later.
+
+Runtime depends on source resolution, scene lengths, GPU, and attention backend;
+no project benchmark is yet sufficient to advertise a fixed VDPP speedup or
+quality gain. Keep the Experimental label until the versioned quality gate in
+`scripts/evaluate_vdpp_quality.py` passes representative domains. A complete
+stabilized cache bypasses VDPP and the base estimator and can render on CPU.
+
 ### Typical Processing Times
 
 **1-minute 1080p video @ 30fps** (1800 output frames):

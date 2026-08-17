@@ -817,6 +817,14 @@
                             <input type="text" class="form-control" id="resumeDirectory" 
                                    placeholder="e.g., output/video_name_20231215_143022">
                         </div>
+                        <div class="mb-3">
+                            <label for="resumeTemporalPostprocessor" class="form-label">Temporal Post-Processing</label>
+                            <select class="form-select" id="resumeTemporalPostprocessor">
+                                <option value="saved" selected>Use saved setting</option>
+                                <option value="off">Off</option>
+                                <option value="vdpp">VDPP (Experimental)</option>
+                            </select>
+                        </div>
                         <button type="button" class="btn btn-secondary" id="resumeBtn">
                             <i class="fas fa-play"></i> Resume Processing
                         </button>
@@ -1026,6 +1034,18 @@
                                 <option value="float16">Float16</option>
                                 <option value="float32">Float32</option>
                             </select>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">
+                                Temporal Post-Processing
+                                <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="VDPP is a separate depth-only stabilization pass. Generating it requires CUDA, downloads a roughly 111 MB model on first use, and adds processing time. It is usually unnecessary with V2's native shot-aware temporal inference."></i>
+                            </label>
+                            <div class="btn-group w-100" role="group" aria-label="Temporal post-processing mode">
+                                <input type="radio" class="btn-check" name="temporalPostprocessor" id="temporalPostprocessorOff" value="off" autocomplete="off" checked>
+                                <label class="btn btn-outline-secondary" for="temporalPostprocessorOff">Off</label>
+                                <input type="radio" class="btn-check" name="temporalPostprocessor" id="temporalPostprocessorVdpp" value="vdpp" autocomplete="off">
+                                <label class="btn btn-outline-secondary" for="temporalPostprocessorVdpp">VDPP (Experimental)</label>
+                            </div>
                         </div>
                     </div>
 
@@ -2233,6 +2253,7 @@
                 scene_cut_threshold: parseFloat(document.getElementById('sceneCutThreshold').value),
                 min_scene_frames: parseInt(document.getElementById('minSceneFrames').value),
                 raw_storage_dtype: document.getElementById('rawStorageDtype').value,
+                temporal_postprocessor: getSelectedTemporalPostprocessor(),
                 stereo_io_workers: parseInt(document.getElementById('stereoIoWorkers').value),
                 migrate_legacy: document.getElementById('migrateLegacy').value,
                 preserve_audio: document.getElementById('preserveAudio').checked,
@@ -2304,6 +2325,10 @@
             const resumeRawStorageDtype = document.getElementById('rawStorageDtype').value;
             if (resumeRawStorageDtype === 'float32') {
                 resumePayload.raw_storage_dtype = resumeRawStorageDtype;
+            }
+            const resumeTemporalPostprocessor = document.getElementById('resumeTemporalPostprocessor').value;
+            if (resumeTemporalPostprocessor !== 'saved') {
+                resumePayload.temporal_postprocessor = resumeTemporalPostprocessor;
             }
 
             fetch('/resume', {
@@ -3041,6 +3066,15 @@
         });
 
         // Settings persistence functions
+        function getSelectedTemporalPostprocessor() {
+            return document.querySelector('input[name="temporalPostprocessor"]:checked').value;
+        }
+
+        function setSelectedTemporalPostprocessor(value) {
+            const input = document.querySelector(`input[name="temporalPostprocessor"][value="${value}"]`);
+            if (input) input.checked = true;
+        }
+
         function saveSettings() {
             const SETTINGS_VERSION = 3; // Must match version in loadSettings()
             const settings = {
@@ -3064,6 +3098,7 @@
                 sceneCutThreshold: document.getElementById('sceneCutThreshold').value,
                 minSceneFrames: document.getElementById('minSceneFrames').value,
                 rawStorageDtype: document.getElementById('rawStorageDtype').value,
+                temporalPostprocessor: getSelectedTemporalPostprocessor(),
                 stereoIoWorkers: document.getElementById('stereoIoWorkers').value,
                 migrateLegacy: document.getElementById('migrateLegacy').value,
                 
@@ -3130,6 +3165,10 @@
                 // Apply settings to form elements
                 Object.keys(settings).forEach(key => {
                     if (key === 'version') return; // Skip version metadata
+                    if (key === 'temporalPostprocessor') {
+                        setSelectedTemporalPostprocessor(settings[key]);
+                        return;
+                    }
                     const element = document.getElementById(key);
                     if (element) {
                         if (element.type === 'checkbox') {
@@ -3190,6 +3229,7 @@
                 sceneCutThreshold: '0.55',
                 minSceneFrames: '8',
                 rawStorageDtype: 'auto',
+                temporalPostprocessor: 'off',
                 stereoIoWorkers: '4',
                 migrateLegacy: 'archive',
                 resolution: 'original',
@@ -3214,6 +3254,10 @@
             };
             
             Object.keys(defaults).forEach(key => {
+                if (key === 'temporalPostprocessor') {
+                    setSelectedTemporalPostprocessor(defaults[key]);
+                    return;
+                }
                 const element = document.getElementById(key);
                 if (element) {
                     if (element.type === 'checkbox') {
@@ -3254,6 +3298,9 @@
                     element.addEventListener('change', saveSettings);
                     element.addEventListener('input', saveSettings);
                 }
+            });
+            document.querySelectorAll('input[name="temporalPostprocessor"]').forEach(element => {
+                element.addEventListener('change', saveSettings);
             });
         }
         
@@ -3341,7 +3388,7 @@
             const messageElement = toastContainer.querySelector('.resumable-job-message');
             messageElement.textContent = message;
             const resumeButton = toastContainer.querySelector('.resume-job-button');
-            resumeButton.addEventListener('click', () => resumeJob(job.path));
+            resumeButton.addEventListener('click', () => resumeJob(job));
             document.body.appendChild(toastContainer);
 
             const toastElement = toastContainer.querySelector('.toast');
@@ -3349,9 +3396,15 @@
             toast.show();
         }
 
-        function resumeJob(jobPath) {
+        function resumeJob(job) {
             // Pre-populate resume field and scroll to it
-            document.getElementById('resumeDirectory').value = jobPath;
+            document.getElementById('resumeDirectory').value = job.path;
+            const resumeTemporalSelect = document.getElementById('resumeTemporalPostprocessor');
+            if (job.temporal_postprocessor === 'off' || job.temporal_postprocessor === 'vdpp') {
+                resumeTemporalSelect.value = job.temporal_postprocessor;
+            } else {
+                resumeTemporalSelect.value = 'saved';
+            }
 
             // Dismiss any visible toasts
             document.querySelectorAll('.toast').forEach(t => {

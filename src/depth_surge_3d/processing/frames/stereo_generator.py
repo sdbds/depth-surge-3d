@@ -18,12 +18,8 @@ import cv2
 import numpy as np
 
 from ...core.constants import PREVIEW_FRAME_SAMPLE_RATE
-from ...core.depth_contract import (
-    CANONICAL_DEPTH_ALGORITHM_VERSION,
-    CANONICAL_DEPTH_SCHEMA_VERSION,
-    CANONICAL_METADATA_REQUIRED_FIELDS,
-    canonical_json_hash,
-)
+from ...core.depth_contract import canonical_json_hash
+from ...core.render_disparity import validate_render_disparity_input
 from ...utils.imaging.png_header import png_header_matches, read_png_header
 from ...utils.imaging.image_processing import (
     CENTER_CROP_ALGORITHM_VERSION,
@@ -1137,57 +1133,11 @@ class StereoPairGenerator:
         depth_files: list[Path],
         frame_files: list[Path],
     ) -> dict[str, Any]:
-        """Load and validate the required local canonical disparity contract."""
+        """Load either strict base or stabilized render-disparity metadata."""
 
-        if not depth_files:
-            raise ValueError("Canonical disparity files are required")
-        metadata_file = depth_files[0].parent / "metadata.json"
-        if not metadata_file.is_file():
-            raise ValueError(f"Canonical disparity metadata is missing: {metadata_file}")
-        try:
-            metadata = json.loads(metadata_file.read_text())
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise ValueError(f"Canonical disparity metadata is invalid: {metadata_file}") from error
-
-        fingerprint = metadata.get("fingerprint")
-        unhashed = {key: value for key, value in metadata.items() if key != "fingerprint"}
-        valid = (
-            CANONICAL_METADATA_REQUIRED_FIELDS.issubset(metadata)
-            and metadata.get("schema_version") == CANONICAL_DEPTH_SCHEMA_VERSION
-            and metadata.get("algorithm_version") == CANONICAL_DEPTH_ALGORITHM_VERSION
-            and metadata.get("representation") == "relative_disparity"
-            and metadata.get("near_value") == 1.0
-            and metadata.get("far_value") == 0.0
-            and metadata.get("encoding") == "uint16_png"
-            and metadata.get("encoding_scale") == 65535.0
-            and metadata.get("num_frames") == len(depth_files)
-            and metadata.get("frame_names") == [path.name for path in frame_files]
-            and isinstance(fingerprint, str)
-            and fingerprint == canonical_json_hash(unhashed)
-        )
-        if not valid:
-            raise ValueError("Canonical disparity metadata does not match this render input")
-
-        expected_paths = [
-            metadata_file.parent / f"{Path(frame_name).stem}.png"
-            for frame_name in metadata["frame_names"]
-        ]
-        if [path.resolve() for path in depth_files] != [path.resolve() for path in expected_paths]:
-            raise ValueError("Canonical disparity files do not match the metadata path manifest")
-
-        native_shape = tuple(int(value) for value in metadata["native_shape"])
-        if len(native_shape) != 2 or any(value < 1 for value in native_shape):
-            raise ValueError("Canonical disparity metadata has an invalid native shape")
-        if not png_headers_match(depth_files, shape=native_shape, bit_depth=16):
-            invalid_path = next(
-                (
-                    path
-                    for path in depth_files
-                    if not png_header_matches(path, shape=native_shape, bit_depth=16)
-                ),
-                depth_files[0],
-            )
-            raise ValueError(f"Canonical disparity payload does not match metadata: {invalid_path}")
+        artifact = validate_render_disparity_input(depth_files, frame_files)
+        metadata = dict(artifact.metadata)
+        metadata["fingerprint"] = artifact.fingerprint
         return metadata
 
     @staticmethod
