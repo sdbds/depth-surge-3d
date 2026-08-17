@@ -806,6 +806,83 @@ def _validate_evidence_target(output_root: Path, destination: Path) -> Path:
     return absolute
 
 
+@dataclass(frozen=True)
+class FileIdentity:
+    device: int
+    inode: int
+
+
+def _windows_file_identity(path: Path) -> FileIdentity:
+    import ctypes
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        0x0080,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0x00200000,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        error_code = ctypes.get_last_error()
+        raise OSError(error_code, os.strerror(error_code), str(path))
+    try:
+        information = ByHandleFileInformation()
+        if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+            error_code = ctypes.get_last_error()
+            raise OSError(error_code, os.strerror(error_code), str(path))
+        file_index = (int(information.file_index_high) << 32) | int(information.file_index_low)
+        if file_index == 0:
+            raise ValueError(f"stable Windows file index is unavailable: {path}")
+        return FileIdentity(int(information.volume_serial_number), file_index)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _file_identity(path: Path) -> FileIdentity:
+    status = path.lstat()
+    if _is_link_or_reparse(path):
+        raise ValueError(f"file identity target is a symlink or reparse point: {path}")
+    if not stat.S_ISREG(status.st_mode):
+        raise ValueError(f"file identity requires a real regular file: {path}")
+    inode = int(status.st_ino)
+    # CPython exposes the Windows file index as st_ino; unusual providers may report zero.
+    if inode != 0:
+        return FileIdentity(int(status.st_dev), inode)
+    if os.name == "nt":
+        return _windows_file_identity(path)
+    raise ValueError(f"stable file identity is unavailable: {path}")
+
+
 class AtomicPublisher:
     """Publish one complete file through a unique same-directory temporary."""
 
@@ -827,7 +904,7 @@ class AtomicPublisher:
 
     def commit_temporary(
         self, temporary: Path, destination: Path, *, root: Path | None = None
-    ) -> None:
+    ) -> FileIdentity:
         temporary = Path(temporary)
         destination = (
             _validate_evidence_target(root, destination) if root is not None else Path(destination)
@@ -841,8 +918,15 @@ class AtomicPublisher:
             _validate_evidence_target(root, destination)
         else:
             destination.parent.mkdir(parents=True, exist_ok=True)
+        source_identity = _file_identity(temporary)
         try:
             self._replace(temporary, destination)
+            if root is not None:
+                _validate_evidence_target(root, destination)
+            promoted_identity = _file_identity(destination)
+            if promoted_identity != source_identity:
+                raise ValueError("atomic promotion changed the source file identity")
+            return promoted_identity
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -1127,37 +1211,81 @@ def _require_recorded_media_matches(
         raise ValueError(f"recorded media properties changed: {record['path']}")
 
 
-def _remove_unaccepted_target(output_root: Path, destination: Path) -> str | None:  # noqa: C901
-    """Remove a rejected target only while its complete path remains trusted."""
+def _trusted_file_for_cleanup(output_root: Path, candidate: Path) -> tuple[Path, FileIdentity]:
+    raw_root = Path(os.path.abspath(output_root))
+    _assert_existing_path_components_are_real(raw_root)
+    if _is_link_or_reparse(raw_root) or not raw_root.is_dir():
+        raise ValueError(f"evidence root is not a real directory: {raw_root}")
+    canonical_root = raw_root.resolve(strict=True)
+    absolute = Path(os.path.abspath(candidate))
+    try:
+        relative = absolute.relative_to(canonical_root)
+    except ValueError as error:
+        raise ValueError(f"file is outside evidence root: {candidate}") from error
+    current = canonical_root
+    for component in relative.parts[:-1]:
+        current /= component
+        if not current.exists():
+            raise ValueError(f"evidence parent is missing: {current}")
+        if _is_link_or_reparse(current) or not current.is_dir():
+            raise ValueError(f"evidence parent is not a real directory: {current}")
+        resolved = current.resolve(strict=True)
+        try:
+            resolved.relative_to(canonical_root)
+        except ValueError as error:
+            raise ValueError(f"evidence parent escaped output root: {current}") from error
+    if not os.path.lexists(absolute):
+        raise ValueError(f"evidence file is missing: {absolute}")
+    return absolute, _file_identity(absolute)
+
+
+def _accepted_file_identities(
+    output_root: Path, committed_records: Sequence[Mapping[str, Any]]
+) -> set[FileIdentity]:
+    identities: set[FileIdentity] = set()
+    for record in committed_records:
+        record_path = record.get("path")
+        if not isinstance(record_path, str) or not record_path:
+            raise ValueError("accepted evidence ledger path is invalid")
+        try:
+            accepted, identity = _trusted_file_for_cleanup(output_root, output_root / record_path)
+        except Exception as error:
+            raise ValueError(
+                f"accepted evidence path is invalid: {record_path}: {error}"
+            ) from error
+        recorded_hash = record.get("sha256")
+        if not isinstance(recorded_hash, str) or _hash_file(accepted) != recorded_hash:
+            raise ValueError(f"accepted evidence hash changed: {record_path}")
+        identities.add(identity)
+    return identities
+
+
+def _remove_unaccepted_target(  # noqa: C901
+    output_root: Path,
+    destination: Path,
+    *,
+    promoted_identity: FileIdentity,
+    committed_records: Sequence[Mapping[str, Any]],
+) -> str | None:
+    """Remove a rejected target only while its path and object remain trusted."""
 
     try:
-        raw_root = Path(os.path.abspath(output_root))
-        _assert_existing_path_components_are_real(raw_root)
-        if _is_link_or_reparse(raw_root) or not raw_root.is_dir():
-            return f"cleanup refused: evidence root is not a real directory: {raw_root}"
-        canonical_root = raw_root.resolve(strict=True)
-        absolute = Path(os.path.abspath(destination))
-        try:
-            relative = absolute.relative_to(canonical_root)
-        except ValueError:
-            return f"cleanup refused: rejected target is outside evidence root: {destination}"
-        current = canonical_root
-        for component in relative.parts[:-1]:
-            current /= component
-            if not current.exists():
-                return f"cleanup refused: evidence parent is missing: {current}"
-            if _is_link_or_reparse(current) or not current.is_dir():
-                return f"cleanup refused: evidence parent is not a real directory: {current}"
-            resolved = current.resolve(strict=True)
-            try:
-                resolved.relative_to(canonical_root)
-            except ValueError:
-                return f"cleanup refused: evidence parent escaped output root: {current}"
-        if not os.path.lexists(absolute):
-            return None
-        status = absolute.lstat()
-        if _is_link_or_reparse(absolute) or not stat.S_ISREG(status.st_mode):
-            return f"cleanup refused: rejected target is not a real regular file: {absolute}"
+        absolute, initial_identity = _trusted_file_for_cleanup(output_root, destination)
+        if initial_identity != promoted_identity:
+            raise ValueError("promoted file identity changed before cleanup")
+        accepted_identities = _accepted_file_identities(output_root, committed_records)
+        if initial_identity in accepted_identities:
+            raise ValueError("rejected target aliases an accepted evidence object")
+        final_path, final_identity = _trusted_file_for_cleanup(output_root, destination)
+        if final_identity != promoted_identity:
+            raise ValueError("promoted file identity changed immediately before cleanup")
+        if final_identity in accepted_identities:
+            raise ValueError("rejected target aliases an accepted evidence object")
+        if final_path != absolute:
+            raise ValueError("rejected target path changed during cleanup validation")
+    except Exception as cleanup_error:
+        return f"cleanup refused: {cleanup_error}"
+    try:
         absolute.unlink()
         if os.path.lexists(absolute):
             return f"cleanup failed: rejected target still exists after unlink: {absolute}"
@@ -1170,6 +1298,8 @@ def _verify_committed_record(
     output_dir: Path,
     record: Mapping[str, Any],
     *,
+    promoted_identity: FileIdentity,
+    committed_records: Sequence[Mapping[str, Any]],
     media_probe: Callable[[Path], dict[str, Any]] | None = None,
     expected_shape: tuple[int, int] | None = None,
     expected_frame_count: int | None = None,
@@ -1201,7 +1331,12 @@ def _verify_committed_record(
             )
             _require_recorded_media_matches(record, current)
     except Exception as error:
-        cleanup_issue = _remove_unaccepted_target(output_dir, destination)
+        cleanup_issue = _remove_unaccepted_target(
+            output_dir,
+            destination,
+            promoted_identity=promoted_identity,
+            committed_records=committed_records,
+        )
         if cleanup_issue is not None:
             error.add_note(cleanup_issue)
         raise
@@ -1726,15 +1861,22 @@ class ReleaseRunner:
                             media=media,
                         )
                         set_stage(f"promote_{mode}_media")
-                        self.dependencies.publisher.commit_temporary(
+                        promoted_identity = self.dependencies.publisher.commit_temporary(
                             temporary, destination, root=output_dir
                         )
                     finally:
                         temporary.unlink(missing_ok=True)
+                    hook_mode = "relative" if mode == "relative" else "metric"
+                    set_stage(f"after_{hook_mode}_identity_capture")
+                    self.dependencies.stage_hook(
+                        f"after_{hook_mode}_identity_capture:{model_size}:{clip.clip_id}"
+                    )
                     set_stage(f"accept_{mode}_media")
                     _verify_committed_record(
                         output_dir,
                         record,
+                        promoted_identity=promoted_identity,
+                        committed_records=report["committed_artifacts"],
                         media_probe=self.dependencies.media_probe,
                         expected_shape=output_shape,
                         expected_frame_count=clip.frame_count,
@@ -1744,7 +1886,6 @@ class ReleaseRunner:
                     output_field = "relative_output" if mode == "relative" else "metric_output"
                     clip_report[output_field] = record
                     report["committed_artifacts"].append(record)
-                    hook_mode = "relative" if mode == "relative" else "metric"
                     set_stage(f"after_{hook_mode}_promotion")
                     self.dependencies.stage_hook(
                         f"after_{hook_mode}_promotion:{model_size}:{clip.clip_id}"
@@ -1911,13 +2052,20 @@ class ReleaseRunner:
                             mode=None,
                         )
                         current_stage = "fixed_image_promotion"
-                        self.dependencies.publisher.commit_temporary(
+                        fixed_identity = self.dependencies.publisher.commit_temporary(
                             fixed_temporary, fixed_destination, root=output_dir
                         )
                     finally:
                         fixed_temporary.unlink(missing_ok=True)
+                    current_stage = "after_fixed_identity_capture"
+                    self.dependencies.stage_hook(f"after_fixed_identity_capture:{model_size}")
                     current_stage = "accept_fixed_image"
-                    _verify_committed_record(output_dir, fixed_record)
+                    _verify_committed_record(
+                        output_dir,
+                        fixed_record,
+                        promoted_identity=fixed_identity,
+                        committed_records=report["committed_artifacts"],
+                    )
                     variant_report.update(
                         {
                             "fixed_image_native_shape": fixed_values["native_shape"],

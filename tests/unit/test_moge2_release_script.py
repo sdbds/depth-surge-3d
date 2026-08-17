@@ -2030,6 +2030,137 @@ def test_cleanup_race_refuses_redirected_parent_and_preserves_primary_error(
     assert (displaced / "indoor-near-relative.mp4").is_file()
 
 
+def test_real_directory_substitution_preserves_accepted_and_unaccepted_objects(
+    tmp_path: Path,
+) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    output = tmp_path / "evidence"
+    displaced = tmp_path / "displaced-vitb"
+    external = tmp_path / "external-sentinel.bin"
+    external.write_bytes(b"external")
+    accepted_vits: dict[str, bytes] = {}
+    displaced_before: dict[str, bytes] = {}
+
+    def substitute_directory(stage: str) -> None:
+        if stage == "after_relative_identity_capture:vitb:indoor-near":
+            accepted_vits.update(
+                (path.name, path.read_bytes()) for path in (output / "vits").iterdir()
+            )
+            displaced_before.update(
+                (path.name, path.read_bytes()) for path in (output / "vitb").iterdir()
+            )
+            os.replace(output / "vitb", displaced)
+            os.replace(output / "vits", output / "vitb")
+
+    runner, _events = _runner(tmp_path, stage_hook=substitute_directory)
+
+    with pytest.raises(ReleaseRunFailed, match="post-promotion hash mismatch") as caught:
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    message = caught.value.report["failures"][0]["message"]
+    assert "post-promotion hash mismatch" in message
+    assert "cleanup refused" in message
+    disk_report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert disk_report["failures"][0]["message"] == message
+    assert disk_report["committed_artifacts"] == caught.value.report["committed_artifacts"]
+    assert len(disk_report["committed_artifacts"]) == 8
+    assert not (output / "vits").exists()
+    assert {path.name: path.read_bytes() for path in (output / "vitb").iterdir()} == accepted_vits
+    assert {path.name: path.read_bytes() for path in displaced.iterdir()} == displaced_before
+    assert set(displaced_before) == {
+        "fixed-image-depth.npz",
+        "indoor-near-relative.mp4",
+    }
+    assert external.read_bytes() == b"external"
+
+
+def test_cleanup_refuses_when_an_accepted_file_was_moved(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    output = tmp_path / "evidence"
+    moved = tmp_path / "moved-accepted-fixed.npz"
+    accepted_bytes = b""
+
+    def move_accepted(stage: str) -> None:
+        nonlocal accepted_bytes
+        if stage == "after_relative_identity_capture:vits:outdoor-far":
+            accepted = output / "vits" / "fixed-image-depth.npz"
+            accepted_bytes = accepted.read_bytes()
+            os.replace(accepted, moved)
+            (output / "vits" / "outdoor-far-relative.mp4").write_bytes(b"same-object-corruption")
+
+    runner, _events = _runner(tmp_path, stage_hook=move_accepted)
+
+    with pytest.raises(ReleaseRunFailed, match="post-promotion hash mismatch") as caught:
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    assert "accepted evidence" in caught.value.report["failures"][0]["message"]
+    assert "cleanup refused" in caught.value.report["failures"][0]["message"]
+    assert moved.read_bytes() == accepted_bytes
+    assert (output / "vits" / "outdoor-far-relative.mp4").is_file()
+
+
+def test_cleanup_refuses_when_an_accepted_file_hash_changed_in_place(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    output = tmp_path / "evidence"
+
+    def change_accepted(stage: str) -> None:
+        if stage == "after_relative_identity_capture:vits:outdoor-far":
+            (output / "vits" / "fixed-image-depth.npz").write_bytes(b"accepted-in-place-change")
+            (output / "vits" / "outdoor-far-relative.mp4").write_bytes(b"same-object-corruption")
+
+    runner, _events = _runner(tmp_path, stage_hook=change_accepted)
+
+    with pytest.raises(ReleaseRunFailed, match="post-promotion hash mismatch") as caught:
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    message = caught.value.report["failures"][0]["message"]
+    assert "accepted evidence hash changed" in message
+    assert "cleanup refused" in message
+    assert (output / "vits" / "fixed-image-depth.npz").read_bytes() == (b"accepted-in-place-change")
+    assert (output / "vits" / "outdoor-far-relative.mp4").is_file()
+
+
+def test_cleanup_refuses_a_replacement_destination_object(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    output = tmp_path / "evidence"
+    replacement = tmp_path / "replacement.mp4"
+
+    def replace_destination(stage: str) -> None:
+        if stage == "after_relative_identity_capture:vits:indoor-near":
+            replacement.write_bytes(b"different-object-corruption")
+            os.replace(replacement, output / "vits" / "indoor-near-relative.mp4")
+
+    runner, _events = _runner(tmp_path, stage_hook=replace_destination)
+
+    with pytest.raises(ReleaseRunFailed, match="post-promotion hash mismatch") as caught:
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    message = caught.value.report["failures"][0]["message"]
+    assert "promoted file identity changed" in message
+    assert "cleanup refused" in message
+    assert (output / "vits" / "indoor-near-relative.mp4").read_bytes() == (
+        b"different-object-corruption"
+    )
+    assert (output / "vits" / "fixed-image-depth.npz").is_file()
+
+
+def test_same_identity_contained_corruption_is_still_removed(tmp_path: Path) -> None:
+    config_path, _payload = _write_inputs(tmp_path)
+    output = tmp_path / "evidence"
+
+    def corrupt_same_object(stage: str) -> None:
+        if stage == "after_relative_identity_capture:vits:indoor-near":
+            (output / "vits" / "indoor-near-relative.mp4").write_bytes(b"same-object-corruption")
+
+    runner, _events = _runner(tmp_path, stage_hook=corrupt_same_object)
+
+    with pytest.raises(ReleaseRunFailed, match="post-promotion hash mismatch"):
+        runner.run(_load(config_path), output, "cpu", 1080)
+
+    expected = {"vits/fixed-image-depth.npz"}
+    assert _disk_and_ledger_artifact_paths(output) == (expected, expected)
+
+
 def test_corrupt_fixed_target_is_removed_before_it_can_escape_the_ledger(tmp_path: Path) -> None:
     config_path, _payload = _write_inputs(tmp_path)
 
