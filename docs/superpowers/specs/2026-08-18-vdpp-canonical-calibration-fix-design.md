@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved direction, revised after five PRO reviews. The external whole-shot
+Approved direction, revised after six PRO reviews. The external whole-shot
 fixture payload hash must be recaptured before implementation sign-off. This
 document narrows and supersedes the v1 VDPP input and output range policy in
 `2026-08-16-vdpp-temporal-postprocessor-design.md`. It does not change depth
@@ -83,7 +83,8 @@ MODEL_MIDPOINT_VALUE = 0.5
 STATS_TILE_PIXELS = 262144
 MIN_PAIR_COUNT = 2
 VARIANCE_EPSILON = 1e-12
-PHYSICAL_BOUND_ULPS = 4
+PHYSICAL_BOUND_BASE_ULPS = 4
+PHYSICAL_BOUND_ULPS_PER_PLANNED_TILE = 64
 PHYSICAL_BOUND_REFERENCE_FLOOR = 1.0
 MIN_POSITIVE_SCALE = 1e-8
 MIN_CORRELATION = 0.50
@@ -203,6 +204,78 @@ the existing `encode_canonical_png(candidate_frame32)` only after the frame is
 complete, and then restores source midpoint-code pixels to uint16 `32768`.
 These conversions and their ordering are part of the execution identity.
 
+## Deterministic Tile Reducers
+
+Fixed tile boundaries do not by themselves define floating output. Producer and
+independent verifier implement these two behavioral interfaces without sharing
+code:
+
+```text
+reduce_pair_tile(x_f32, y_f32, eligible_mask) -> PairTileState
+reduce_scalar_tile(values_f32, eligible_mask) -> ScalarTileState
+```
+
+Inputs are one already flattened C-row-major tile of at most
+`STATS_TILE_PIXELS`. `eligible_mask` is a same-length boolean array. If
+`eligible_count == 0`, the reducer returns an explicit empty state and the caller
+does not invoke Chan merge. Empty tiles therefore never call a mean or division
+and cannot manufacture NaN. A one-value tile returns zero M2 and, for a pair,
+zero co-moment.
+
+For a non-empty pair tile, boolean selection happens while values are still
+float32. Each selected 1-D array is then converted exactly once to a C-contiguous
+float64 array. The tile state uses this exact two-pass NumPy sequence:
+
+```text
+count = int(np.count_nonzero(eligible_mask))
+x64 = np.ascontiguousarray(x_f32[eligible_mask], dtype=np.float64)
+y64 = np.ascontiguousarray(y_f32[eligible_mask], dtype=np.float64)
+
+mean_x = canonicalize_float(
+    float(np.sum(x64, dtype=np.float64)) / count
+)
+mean_y = canonicalize_float(
+    float(np.sum(y64, dtype=np.float64)) / count
+)
+centered_x = x64 - mean_x
+centered_y = y64 - mean_y
+M2_x = canonicalize_float(float(np.sum(
+    centered_x * centered_x, dtype=np.float64
+)))
+M2_y = canonicalize_float(float(np.sum(
+    centered_y * centered_y, dtype=np.float64
+)))
+C_xy = canonicalize_float(float(np.sum(
+    centered_x * centered_y, dtype=np.float64
+)))
+```
+
+The scalar reducer performs the same selected float32-to-float64 conversion,
+`np.sum(..., dtype=np.float64) / count` mean, centered subtraction, elementwise
+square, and second `np.sum(..., dtype=np.float64)`. It returns `count`, `mean`,
+and `M2`, canonicalizing every returned zero.
+
+The multiplication arrays are materialized before their corresponding sums.
+M2-x, M2-y, and co-moment products are formed and consumed sequentially so they
+do not coexist unnecessarily. `np.mean`, `np.var`, `np.dot`, BLAS reductions,
+one-pass sum-of-squares, Welford, and any alternative summation or centering path
+are forbidden. NumPy version remains part of partial-resume runtime identity.
+Tests include an odd 17-value float32 tile whose two-pass M2 differs by one ULP
+from elementwise Welford, plus empty and one-value tiles.
+
+```text
+v_f32 = [
+  0.2712900638580322, 0.7885109782218933, 0.9661115407943726,
+  0.8313783407211304, 0.8321383595466614, 0.8936092853546143,
+  0.4458301067352295, 0.4170106053352356, 0.8177664875984192,
+  0.1028597354888916, 0.7648928761482239, 0.16799843311309814,
+  0.09131741523742676, 0.8898534178733826, 0.634506344795227,
+  0.13384193181991577, 0.39620745182037354,
+]
+two-pass M2 = 0x1.9b2e1ef3e8a83p+0
+Welford M2 = 0x1.9b2e1ef3e8a82p+0
+```
+
 ## Stable Statistics And Fit
 
 Statistics use a Chan merge in float64, not raw sums followed by large-number
@@ -212,28 +285,65 @@ subtraction. The state is:
 count, mean_x, mean_y, M2_x, M2_y, C_xy
 ```
 
-For state `A` and the next fixed row-major tile `B`, with `n = n_a + n_b`:
+For state `A` and the next non-empty fixed row-major tile state `B`, use Python
+binary64 scalar operations in the shown parenthesization, with integer counts and
+`n = n_a + n_b`:
 
 ```text
-delta_x = mean_x_b - mean_x_a
-delta_y = mean_y_b - mean_y_a
-mean_x = mean_x_a + delta_x * n_b / n
-mean_y = mean_y_a + delta_y * n_b / n
-M2_x = M2_x_a + M2_x_b + delta_x^2 * n_a * n_b / n
-M2_y = M2_y_a + M2_y_b + delta_y^2 * n_a * n_b / n
-C_xy = C_xy_a + C_xy_b + delta_x * delta_y * n_a * n_b / n
+delta_x = canonicalize_float(mean_x_b - mean_x_a)
+delta_y = canonicalize_float(mean_y_b - mean_y_a)
+mean_x = canonicalize_float(mean_x_a + ((delta_x * n_b) / n))
+mean_y = canonicalize_float(mean_y_a + ((delta_y * n_b) / n))
+correction_x = (((delta_x * delta_x) * n_a) * n_b) / n
+correction_y = (((delta_y * delta_y) * n_a) * n_b) / n
+correction_xy = (((delta_x * delta_y) * n_a) * n_b) / n
+M2_x = canonicalize_float((M2_x_a + M2_x_b) + correction_x)
+M2_y = canonicalize_float((M2_y_a + M2_y_b) + correction_y)
+C_xy = canonicalize_float((C_xy_a + C_xy_b) + correction_xy)
 ```
 
-Derived values are:
+The first non-empty tile becomes `A` without a merge. Empty states are skipped.
+Scalar states use the exact x-only projection of these equations: canonicalized
+delta, mean, `(((delta * delta) * n_a) * n_b) / n` correction, then
+`canonicalize_float((M2_a + M2_b) + correction)`.
+No fused multiply-add, exponentiation helper, regrouping, vectorized cross-tile
+reduction, or balanced merge tree substitutes for these scalar operations.
+
+Final persisted moments are derived only after the last merge:
 
 ```text
-variance_x = M2_x / count
-variance_y = M2_y / count
-covariance = C_xy / count
-correlation = C_xy / sqrt(M2_x * M2_y)
-scale = covariance / variance_x
-shift = mean_y - scale * mean_x
+raw_mean = canonicalize_float(mean_x)
+source_mean = normalize_bounded_stat(
+    mean_y, 0.0, 1.0,
+    planned_tile_count=planned_tile_count,
+)
+raw_variance = normalize_bounded_stat(
+    M2_x / count, 0.0,
+    planned_tile_count=planned_tile_count,
+)
+source_variance = normalize_bounded_stat(
+    M2_y / count, 0.0, 0.25,
+    planned_tile_count=planned_tile_count,
+)
+covariance = canonicalize_float(C_xy / count)
 ```
+
+Correlation, scale, and shift are deliberately absent: they are derived only by
+the Canonical Derived Diagnostics graph after variance and covariance
+canonicalization. No producer path computes or persists
+`C_xy / sqrt(M2_x * M2_y)`.
+
+The pinned one-ULP regression fixture is:
+
+```text
+x_f32 = [0.6486990451812744, 0.6523162722587585, 0.3402478098869324]
+y_f32 = [0.3692907691001892, 0.03194546699523926, 0.4765521287918091]
+direct M2 path = -0x1.634d29d1cfb6ap-1
+canonical persisted-moment path = -0x1.634d29d1cfb6bp-1
+```
+
+Inputs are constructed with `dtype=np.float32`; tests require the canonical
+hex value and explicitly reject the direct-M2 value.
 
 Finite-precision Chan merges can leave a physically bounded result just outside
 its mathematical range. For example, the same Chan merge formula produces
@@ -249,14 +359,19 @@ canonicalize_float(value):
     if value == 0.0: return 0.0
     return value
 
-normalize_bounded_stat(value, low, high=None):
+normalize_bounded_stat(value, low, high=None, *, planned_tile_count):
     value = canonicalize_float(value)
+    require planned_tile_count is a non-bool positive Python int
     reference = max(
         PHYSICAL_BOUND_REFERENCE_FLOOR,
         abs(low),
         abs(high) if high is not None else 0.0,
     )
-    slack = PHYSICAL_BOUND_ULPS * math.ulp(reference)
+    budget_ulps = (
+        PHYSICAL_BOUND_BASE_ULPS
+        + PHYSICAL_BOUND_ULPS_PER_PLANNED_TILE * planned_tile_count
+    )
+    slack = budget_ulps * math.ulp(reference)
     if value < low:
         if low - value <= slack: return canonicalize_float(float(low))
         raise NumericalContractError
@@ -266,17 +381,49 @@ normalize_bounded_stat(value, low, high=None):
     return value
 ```
 
-The `PHYSICAL_BOUND_REFERENCE_FLOOR` deliberately defines ULP distance at
-canonical-unit scale, even for a zero lower bound; `math.ulp(0.0)` is not a
-useful tolerance for normalized statistics. `canonicalize_float` converts every
-negative zero to positive zero, including unbounded moments and fitted values;
-Python JSON writes `-0.0` and `0.0` differently even though ordinary float
-equality treats them as equal. The producer canonicalizes before every decision
-and persists only canonical values. A reader compares finite floats by exact
-`float.hex()` representation, not ordinary equality, so a self-hashed
-non-canonical one-ULP excursion or negative zero is rejected rather than silently
-rewritten. A finite excursion beyond the fixed slack is a hard
-numerical-contract failure, not `base_fallback`.
+For a shot, both writer and reader derive the same conservative upper bound from
+persisted structure:
+
+```text
+tiles_per_frame = ceil((H * W) / STATS_TILE_PIXELS)
+planned_tile_count = shot_length * tiles_per_frame
+```
+
+The budget counts every planned tile, including empty and flat-frame tiles, so a
+validator does not need source payloads or an untrusted persisted non-empty
+count. Its linear growth deliberately dominates the number of sequential Chan
+merges; this is a deterministic product policy, not a claim that arbitrary shot
+lengths remain within four ULPs. A finite excursion inside the computed budget
+snaps to the physical boundary. An excursion beyond it is a hard numerical
+contract failure.
+
+This explicitly chooses a planned-tile-count-scaled allowance. It preserves the
+constant-size streaming Chan state and avoids turning the demonstrated legal
+long-shot case into either whole-shot fallback or job failure; it does not switch
+to a tree reducer or silently downgrade every farther numerical violation.
+
+The production-scale pressure fixture is deterministic. With
+`rng = random.Random(70)`, generate 2,048 pairs by choosing
+`n = rng.randrange(2, STATS_TILE_PIXELS + 1)` and
+`k = rng.randrange(1, n)`, appending Bernoulli states `(n, k)` and
+`(n, n - k)`, then call `rng.shuffle(states)`. Construct each state with
+`mean = k / n` and
+`M2 = (n - k) * (mean * mean) + k * ((1.0 - mean) * (1.0 - mean))`, and use the
+specified sequential scalar Chan merge. The exact population is half zero and
+half one, while the raw merged variance is
+`0x1.0000000000011p-2` (`0.25000000000000094`). With
+`planned_tile_count=4096` it must normalize to exact `0.25`; the legacy fixed
+four-ULP policy must fail this regression test.
+
+`PHYSICAL_BOUND_REFERENCE_FLOOR` defines ULP distance at canonical-unit scale,
+even for a zero lower bound; `math.ulp(0.0)` is not useful for normalized
+statistics. `canonicalize_float` converts every negative zero to positive zero,
+including unbounded moments and fitted values; Python JSON writes `-0.0` and
+`0.0` differently even though ordinary float equality treats them as equal. The
+producer canonicalizes before every decision and persists only canonical values.
+A reader compares finite floats by exact `float.hex()` representation, not
+ordinary equality, so a self-hashed non-canonical boundary excursion or negative
+zero is rejected rather than silently rewritten.
 
 Apply the primitive to correlation `[-1, 1]`, source/candidate mean `[0, 1]`,
 source/candidate population variance `[0, 0.25]`, source/candidate standard
@@ -305,16 +452,19 @@ derived values in this exact order:
 expected_midpoint_fraction = canonicalize_float(midpoint_count / shot_pixels)
 
 expected_source_std = normalize_bounded_stat(
-    math.sqrt(source_variance), 0.0, 0.5
+    math.sqrt(source_variance), 0.0, 0.5,
+    planned_tile_count=planned_tile_count,
 )
 expected_raw_std = normalize_bounded_stat(
-    math.sqrt(raw_variance), 0.0
+    math.sqrt(raw_variance), 0.0,
+    planned_tile_count=planned_tile_count,
 )
 
 expected_correlation = normalize_bounded_stat(
     covariance / math.sqrt(raw_variance * source_variance),
     -1.0,
     1.0,
+    planned_tile_count=planned_tile_count,
 )
 expected_scale = canonicalize_float(covariance / raw_variance)
 expected_shift = canonicalize_float(
@@ -324,16 +474,19 @@ expected_shift = canonicalize_float(
 expected_contrast = normalize_bounded_stat(
     candidate_std / expected_source_std,
     0.0,
+    planned_tile_count=planned_tile_count,
 )
 expected_drift = normalize_bounded_stat(
     abs(candidate_mean - source_mean),
     0.0,
     1.0,
+    planned_tile_count=planned_tile_count,
 )
 expected_preclip_total = normalize_bounded_stat(
     preclip_low_fraction + preclip_high_fraction,
     0.0,
     1.0,
+    planned_tile_count=planned_tile_count,
 )
 ```
 
@@ -387,20 +540,39 @@ compute:
 
 ```text
 preclip64, candidate32 = candidate_tile(raw_tile_f32, scale64, shift64)
-preclip_low_fraction
-preclip_high_fraction
-candidate_mean
-candidate_std
-postclip_contrast_ratio = candidate_std / source_std
-postclip_mean_drift = abs(candidate_mean - source_mean)
+accumulate preclip_low_count and preclip_high_count over eligible values
+reduce_scalar_tile(candidate32, eligible_mask)
 ```
 
-Candidate variance is normalized to `[0, 0.25]` before its square root. The two
-pre-clip fractions are normalized separately; their binary64 sum is normalized
-again and that exact result is used by both the gate and diagnostics validator.
-Mean, standard deviation, contrast, and drift are likewise normalized before
-the following comparisons. No gate compares an unpersisted reconstruction of a
-different statistic.
+After the last scalar Chan merge, its count must equal `pair_count`; then use this
+single path:
+
+```text
+candidate_mean = normalize_bounded_stat(
+    scalar_state.mean, 0.0, 1.0,
+    planned_tile_count=planned_tile_count,
+)
+candidate_variance = normalize_bounded_stat(
+    scalar_state.M2 / scalar_state.count, 0.0, 0.25,
+    planned_tile_count=planned_tile_count,
+)
+candidate_std = normalize_bounded_stat(
+    math.sqrt(candidate_variance), 0.0, 0.5,
+    planned_tile_count=planned_tile_count,
+)
+preclip_low_fraction = normalize_bounded_stat(
+    preclip_low_count / pair_count, 0.0, 1.0,
+    planned_tile_count=planned_tile_count,
+)
+preclip_high_fraction = normalize_bounded_stat(
+    preclip_high_count / pair_count, 0.0, 1.0,
+    planned_tile_count=planned_tile_count,
+)
+```
+
+Contrast, drift, and the fraction sum come only from the Canonical Derived
+Diagnostics graph. Those exact values drive the following gates and are
+persisted; no second arithmetic path is permitted.
 
 Use OLS only when every condition holds:
 
@@ -408,7 +580,7 @@ Use OLS only when every condition holds:
 correlation >= 0.50
 postclip_contrast_ratio >= 0.50
 postclip_mean_drift <= 0.01
-preclip_low_fraction + preclip_high_fraction <= 0.01
+expected_preclip_total <= 0.01
 ```
 
 Otherwise the entire shot uses `base_fallback`. This quality scan is separate
@@ -521,6 +693,8 @@ scalar, NaN, or infinity. It also enforces:
 - `shot_length` and both native dimensions are non-bool positive Python
   integers;
 - `shot_pixels = shot_length * H * W` without overflow ambiguity;
+- `planned_tile_count = shot_length * ceil((H * W) / STATS_TILE_PIXELS)` using
+  integer arithmetic, and that value supplies every bounded-stat budget;
 - `0 <= midpoint_count <= shot_pixels` and
   `0 <= pair_count <= shot_pixels - midpoint_count`;
 - `0 <= flat_frame_count <= shot_length`;
@@ -530,8 +704,9 @@ scalar, NaN, or infinity. It also enforces:
 - every persisted non-null float is positive zero when numerically zero, and
   exact derived-field comparisons use `float.hex()` so `-0.0` cannot pass as
   `0.0`;
-- every fraction is canonical under `normalize_bounded_stat(..., 0, 1)`, and the
-  normalized binary64 sum of pre-clip low plus high is at most `1`;
+- every fraction is canonical under
+  `normalize_bounded_stat(..., 0, 1, planned_tile_count=...)`, and the normalized
+  binary64 sum of pre-clip low plus high is at most `1`;
 - correlation is canonical in `[-1, 1]`; source/candidate means are canonical in
   `[0, 1]`; source variance is canonical in `[0, 0.25]`;
   source/candidate standard deviations are canonical in `[0, 0.5]`; raw
@@ -786,6 +961,8 @@ as independent literals. The persisted plan is:
 input_normalization = "per-frame-minmax-excluding-midpoint-code-v2"
 input_arithmetic = "u16-extrema-float32-subtract-divide-v1"
 tile_iteration = "c-row-major-fixed-262144-v1"
+tile_reducer = "float64-two-pass-numpy-sum-centered-c-order-skip-empty-v1"
+chan_merge = "python-f64-sequential-nonempty-canonical-zero-v2"
 midpoint_code_policy = "preserve-u16-32768-heuristic-v2"
 calibration_fit = "positive-ols-chan-v1"
 degenerate_policy = "prescan-flat-frame-copy-u16-v1"
@@ -797,12 +974,13 @@ candidate_arithmetic = "raw-f32-to-f64-affine-clip-cast-f32-v1"
 candidate_statistics = "float64-chan-over-candidate-f32-v1"
 encoding_policy = "canonical-encoder-then-restore-midpoint-v1"
 calibration_precision = "float32-input-float64-fit-float32-candidate-v2"
-physical_bound_policy = "snap-outward-canonical-unit-ulps-v1"
+physical_bound_policy = "snap-outward-planned-tile-ulp-budget-v2"
+physical_bound_tile_count = "shot-length-times-ceil-frame-pixels-over-tile-v1"
 signed_zero_policy = "canonical-positive-zero-all-diagnostic-floats-v1"
 diagnostic_float_equality = "finite-binary64-float-hex-v1"
 derived_diagnostics_policy = "recompute-from-canonical-persisted-moments-v1"
 variance_diagnostics = "persist-compared-population-variance-v1"
-calibration_diagnostics_schema = "strict-exact-keys-derived-positive-zero-v4"
+calibration_diagnostics_schema = "strict-exact-keys-derived-tile-budget-v5"
 fallback_reason_order = [
   "source_no_range",
   "too_few_pairs",
@@ -821,7 +999,8 @@ model_midpoint_value = 0.5
 stats_tile_pixels = 262144
 min_pair_count = 2
 variance_epsilon = 1e-12
-physical_bound_ulps = 4
+physical_bound_base_ulps = 4
+physical_bound_ulps_per_planned_tile = 64
 physical_bound_reference_floor = 1.0
 min_positive_scale = 1e-8
 min_correlation = 0.50
@@ -844,16 +1023,21 @@ Automated tests must first fail against v1 behavior and then prove:
    last-bit fixtures reject a float64-first implementation.
 2. A legitimate source pixel quantized to `32768` demonstrates the documented
    heuristic collision: it is counted and preserved, never claimed as validity.
-3. Chan tile statistics match a direct float64 reference on low-variance and
-   long synthetic data without cancellation-induced gate changes. Fit and
-   candidate-statistics cases immediately below, equal to, and immediately above
-   every fixed threshold prove the inclusive boundary contract and reason order.
-   Physical-bound fixtures cover one ULP inside, exact boundary, each outward
-   distance through four canonical-unit ULPs, and the first value beyond the
-   allowance. The 19-zero/19-one three-value-tile standard deviation and an
-   above-one correlation roundoff case snap to their exact bounds; farther
-   excursions hard-fail. Writer fixtures feed negative zero through bounded,
-   unbounded, and derived fields and prove that only positive zero is persisted.
+3. Empty and one-value tiles return identity/zero states without warnings or
+   NaN. Pair and scalar reducers match the specified two-pass NumPy sequence;
+   the odd 17-value fixture differs from Welford by one ULP and rejects that
+   alternative. Chan statistics match a direct canonical reference on
+   low-variance and long synthetic data without cancellation-induced gate
+   changes. A correlation fixture whose direct-M2 and canonical persisted-moment
+   formulas differ by one ULP accepts only the latter at writer and reader.
+   Physical-bound fixtures cover one ULP inside, exact boundary, the computed
+   planned-tile budget boundary, and the first representable value outside it.
+   The 19-zero/19-one standard-deviation case and a 4,096-planned-tile Bernoulli
+   sequence whose sequential variance is `0.25000000000000094` snap to `0.5` and
+   `0.25` rather than aborting; beyond-budget excursions hard-fail. Writer
+   fixtures feed negative zero through bounded, unbounded, and derived fields
+   and prove that only positive zero is persisted. Threshold cases immediately
+   below, equal to, and above every gate prove inclusivity and reason order.
 4. A deterministic fake VDPP with a large positive residual produces an
    accepted, non-saturated affine result when quality gates pass.
 5. `count < 2`, source/raw variance immediately below, equal to, and above
@@ -893,10 +1077,10 @@ Automated tests must first fail against v1 behavior and then prove:
     Structural completed-record corruption requires a reset; resume text reports
     invalid shots as regeneration work and marks valid records provisional until
     runtime identity is checked.
-13. Shot diagnostics are self-hashed and strictly validated; threshold,
-    physical-bound, signed-zero, derived-diagnostic, variance-persistence,
-    NumPy, and OpenCV identity changes invalidate or prevent mixed partial resume
-    as specified.
+13. Shot diagnostics are self-hashed and strictly validated; threshold, tile
+    reducer, Chan merge, planned-tile ULP budget, signed-zero,
+    derived-diagnostic, variance-persistence, NumPy, and OpenCV identity changes
+    invalidate or prevent mixed partial resume as specified.
 14. A complete v1 artifact and a partial v1 artifact are invalidated; the base
     canonical artifact is preserved; complete and partial v2 OLS or fallback
     artifacts validate and resume according to their runtime identity.
@@ -985,13 +1169,14 @@ actual_endpoint_counts = output code-0/code-65535 counts and fractions
 The verifier implements its own fixed-order float64 Chan accumulator over the
 decoded final PNGs; it does not import the producer's fit, candidate, or
 diagnostic accumulator. Its independent implementation nevertheless follows the
-specified source decode, C-row-major tile boundaries, Chan merge order, and
-positive-zero/bounded-stat canonicalization. Therefore actual pair, midpoint,
-and flat-frame counts must exactly equal their diagnostics; actual midpoint
-fraction and actual source mean, population variance, and standard deviation
-must have the same `float.hex()` values as `midpoint_fraction`, `source_mean`,
-`source_variance`, and `source_std`. These are exact source-contract checks, not
-quality tolerances.
+specified source decode, C-row-major tile boundaries, two-pass NumPy tile
+reducer, empty-tile skip, scalar Chan merge order, and
+positive-zero/planned-tile-bound canonicalization. Therefore actual pair,
+midpoint, and flat-frame counts must exactly equal their diagnostics; actual
+midpoint fraction and actual source mean, population variance, and standard
+deviation must have the same `float.hex()` values as `midpoint_fraction`,
+`source_mean`, `source_variance`, and `source_std`. These are exact
+source-contract checks, not quality tolerances.
 
 The verifier requires actual correlation at least `0.50`, actual contrast ratio
 in `[0.50, 1.05]`, and actual mean drift at most
