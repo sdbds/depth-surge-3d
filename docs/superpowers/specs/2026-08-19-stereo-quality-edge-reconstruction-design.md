@@ -2,15 +2,12 @@
 
 ## Status
 
-The sectioned design was approved in chat on 2026-08-19. This written
-specification is committed for a separate user review before implementation
-planning begins. Approval of this document authorizes planning, not merge.
-
-PRO review found implementation-blocking ambiguities in the first written
-revision. `2026-08-19-stereo-quality-edge-reconstruction-revision-2.md`
-incorporates and supersedes its Quality data-flow and verification details. The
-two documents must be reviewed together, with Revision 2 controlling on every
-conflict.
+**SUPERSEDED IN FULL.** This file is retained only as review history. Do not use
+any section here as an implementation, test, or release requirement. The sole
+active baseline is
+`2026-08-19-stereo-quality-edge-reconstruction-canonical.md`, which consolidates
+the approved discussion and both PRO review rounds. No section-level fallback
+to this draft is permitted.
 
 This is one coherent stereo-stage revision. Geometry resampling, visibility
 coverage, disocclusion reconstruction, diagnostics, settings, and resume
