@@ -24,7 +24,12 @@ class TestProcessingOrchestratorInit:
         video_encoder = Mock()
 
         orchestrator = ProcessingOrchestrator(
-            depth_proc, stereo_gen, distortion_proc, upscaler, vr_assembler, video_encoder
+            depth_proc,
+            stereo_gen,
+            distortion_proc,
+            upscaler,
+            vr_assembler,
+            video_encoder,
         )
 
         assert orchestrator.depth_processor == depth_proc
@@ -160,7 +165,9 @@ class TestSetupProcessing:
             omitted_intermediates={"disparity_stabilized", "vr_frames"},
         )
 
-    def test_setup_processing_keeps_legacy_directory_call_when_direct_mode_is_false(self):
+    def test_setup_processing_keeps_legacy_directory_call_when_direct_mode_is_false(
+        self,
+    ):
         """Explicitly disabling direct mode preserves the legacy directory setup."""
         orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
         with (
@@ -979,6 +986,35 @@ class TestProcessMethod:
                 )
 
             assert lock.is_acquired is True
+        finally:
+            lock.release()
+
+    def test_process_removes_stale_vdpp_work_before_setup_with_supplied_lock(
+        self,
+        tmp_path,
+    ):
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        work = tmp_path / "03_disparity_stabilized/.vdpp-work"
+        work.mkdir(parents=True)
+        (work / "shot_0.raw.f32.mmap").write_bytes(b"stale")
+        lock = JobWriterLock(tmp_path).acquire()
+
+        def observe_setup(*_args, **_kwargs):
+            assert not work.exists()
+            return tmp_path, {"base": tmp_path}, None
+
+        try:
+            with (
+                patch.object(orchestrator, "_setup_processing", side_effect=observe_setup),
+                patch.object(orchestrator, "_execute_pipeline", return_value=True),
+            ):
+                assert orchestrator.process(
+                    video_path=tmp_path / "source.mp4",
+                    output_dir=tmp_path,
+                    video_properties={"fps": 30, "frame_count": 1},
+                    settings={"keep_intermediates": True},
+                    job_lock=lock,
+                )
         finally:
             lock.release()
 

@@ -17,6 +17,7 @@ from ...io.operations import (
     update_processing_status,
 )
 from ...io.job_lock import JobWriterLock
+from ...vdpp_work import cleanup_vdpp_private_work
 from ...core.render_disparity import validate_render_disparity_input
 from ...utils.path_utils import generate_output_filename
 from ...utils import (
@@ -132,6 +133,7 @@ class ProcessingOrchestrator:
                 raise ValueError("The supplied job writer lock is not acquired")
             elif job_lock.output_dir.resolve() != output_dir.resolve():
                 raise ValueError("The supplied job writer lock belongs to another output directory")
+            cleanup_vdpp_private_work(output_dir, job_lock)
 
             # Setup processing environment
             output_path, directories, self._settings_file = self._setup_processing(

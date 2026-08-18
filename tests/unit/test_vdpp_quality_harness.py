@@ -6,6 +6,7 @@ import json
 import hashlib
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
@@ -14,6 +15,12 @@ from scripts.evaluate_vdpp_quality import (
     aggregate_runs,
     compute_metrics,
     evaluate_manifest,
+)
+from scripts.verify_vdpp_calibration import (
+    REPORTED_FIXTURE,
+    compute_final_png_metrics,
+    verify_final_png_quality,
+    verify_reported_fixture,
 )
 
 
@@ -65,7 +72,9 @@ def test_aggregate_uses_repeat_then_sequence_medians_and_unrounded_gate() -> Non
     }
 
 
-def test_manifest_evaluation_preserves_identities_and_resolved_digest(tmp_path: Path) -> None:
+def test_manifest_evaluation_preserves_identities_and_resolved_digest(
+    tmp_path: Path,
+) -> None:
     ground_truth = np.array([[[1.0]], [[2.0]]], dtype=np.float64)
     baseline = np.array([[[1.0]], [[1.0]]], dtype=np.float64)
     candidate = np.array([[[1.0]], [[1.02]]], dtype=np.float64)
@@ -126,3 +135,96 @@ def test_manifest_rejects_missing_fixed_seed_repeat(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="run matrix"):
         evaluate_manifest(path)
+
+
+def _write_final_png_fixture(tmp_path: Path) -> tuple[list[Path], list[Path]]:
+    base_root = tmp_path / "base"
+    stable_root = tmp_path / "stable"
+    base_root.mkdir()
+    stable_root.mkdir()
+    sources = [
+        np.array(
+            [[10000, 20000, 30000, 32768], [40000, 50000, 60000, 15000]],
+            dtype=np.uint16,
+        ),
+        np.array(
+            [[12000, 22000, 32000, 32768], [42000, 52000, 62000, 17000]],
+            dtype=np.uint16,
+        ),
+    ]
+    eligible_values = np.concatenate(
+        [frame[frame != np.uint16(32768)].astype(np.float64) for frame in sources]
+    )
+    center = float(np.mean(eligible_values))
+    base_files: list[Path] = []
+    stable_files: list[Path] = []
+    for index, source in enumerate(sources):
+        output = np.rint(center + 0.9 * (source.astype(np.float64) - center)).astype(np.uint16)
+        output[source == np.uint16(32768)] = np.uint16(32768)
+        base_path = base_root / f"frame_{index + 1:06d}.png"
+        stable_path = stable_root / f"frame_{index + 1:06d}.png"
+        assert cv2.imwrite(str(base_path), source)
+        assert cv2.imwrite(str(stable_path), output)
+        base_files.append(base_path)
+        stable_files.append(stable_path)
+    return base_files, stable_files
+
+
+def test_final_png_verifier_recomputes_quality_and_source_diagnostics(
+    tmp_path: Path,
+) -> None:
+    base_files, stable_files = _write_final_png_fixture(tmp_path)
+    metrics = compute_final_png_metrics(
+        base_files,
+        stable_files,
+        native_shape=(2, 4),
+    )
+    calibration = {
+        "pair_count": metrics["actual_pair_count"],
+        "midpoint_count": metrics["actual_midpoint_count"],
+        "midpoint_fraction": metrics["actual_midpoint_fraction"],
+        "flat_frame_count": metrics["actual_flat_frame_count"],
+        "source_mean": metrics["actual_source_mean"],
+        "source_variance": metrics["actual_source_variance"],
+        "source_std": metrics["actual_source_std"],
+        "candidate_mean": metrics["actual_output_mean"],
+        "candidate_std": metrics["actual_output_std"],
+    }
+
+    verified = verify_final_png_quality(
+        base_files,
+        stable_files,
+        calibration,
+        native_shape=(2, 4),
+    )
+
+    assert verified["actual_output_to_source_correlation"] > 0.99
+    assert 0.89 < verified["actual_output_contrast_ratio"] < 0.91
+    assert verified["pixel_identical_to_base"] is False
+
+
+def test_final_png_verifier_detects_midpoint_change_and_saturated_output(
+    tmp_path: Path,
+) -> None:
+    base_files, stable_files = _write_final_png_fixture(tmp_path)
+    changed = cv2.imread(str(stable_files[0]), cv2.IMREAD_UNCHANGED)
+    changed[0, 3] = np.uint16(65535)
+    assert cv2.imwrite(str(stable_files[0]), changed)
+    with pytest.raises(ValueError, match="midpoint"):
+        compute_final_png_metrics(base_files, stable_files, native_shape=(2, 4))
+
+    for source_path, output_path in zip(base_files, stable_files, strict=True):
+        source = cv2.imread(str(source_path), cv2.IMREAD_UNCHANGED)
+        saturated = np.full(source.shape, 65535, dtype=np.uint16)
+        saturated[source == np.uint16(32768)] = np.uint16(32768)
+        assert cv2.imwrite(str(output_path), saturated)
+    with pytest.raises(ValueError, match="variance is zero"):
+        compute_final_png_metrics(base_files, stable_files, native_shape=(2, 4))
+
+
+def test_reported_fixture_refuses_pending_identity_before_touching_job(
+    tmp_path: Path,
+) -> None:
+    assert REPORTED_FIXTURE["ordered_source_payload_fingerprint"] == "PENDING_RECAPTURE"
+    with pytest.raises(RuntimeError, match="PENDING_RECAPTURE"):
+        verify_reported_fixture(tmp_path / "does-not-exist")

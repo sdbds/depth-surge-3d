@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -339,15 +340,84 @@ def _write_complete_stabilized_stage(
         execution_provenance={"runtime": "test"},
     )
     store.prepare(store.audit())
+    calibration = {
+        "mode": "base_fallback",
+        "pair_count": 0,
+        "midpoint_count": 0,
+        "midpoint_fraction": 0.0,
+        "flat_frame_count": len(frame_files),
+        "source_mean": None,
+        "source_variance": None,
+        "source_std": None,
+        "raw_mean": None,
+        "raw_variance": None,
+        "raw_std": None,
+        "covariance": None,
+        "correlation": None,
+        "scale": None,
+        "shift": None,
+        "candidate_mean": None,
+        "candidate_std": None,
+        "postclip_contrast_ratio": None,
+        "postclip_mean_drift": None,
+        "preclip_low_fraction": None,
+        "preclip_high_fraction": None,
+        "fallback_reason": "source_no_range",
+    }
     store.commit_shot(
         0,
         (
-            (index, np.full((4, 6), index / 10.0, dtype=np.float32))
+            (index, np.full((4, 6), index * 1000, dtype=np.uint16))
             for index in range(len(frame_files))
         ),
+        calibration=calibration,
     )
     store.finalize()
     return store
+
+
+def _publish_building_stabilized_metadata(store: StabilizedDepthStore) -> dict:
+    metadata = json.loads(store.metadata_path.read_text(encoding="utf-8"))
+    metadata["status"] = "building"
+    metadata["payload_fingerprint"] = None
+    metadata["artifact_fingerprint"] = None
+    metadata["state_fingerprint"] = canonical_json_hash(
+        {
+            "status": metadata["status"],
+            "completed_shots": metadata["completed_shots"],
+        }
+    )
+    metadata["metadata_fingerprint"] = canonical_json_hash(
+        {key: value for key, value in metadata.items() if key != "metadata_fingerprint"}
+    )
+    store.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    return metadata
+
+
+def _rehash_first_stabilized_manifest(store: StabilizedDepthStore) -> None:
+    manifest_path = store.manifest_dir / "shot_000000.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["manifest_fingerprint"] = canonical_json_hash(
+        {key: value for key, value in manifest.items() if key != "manifest_fingerprint"}
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    metadata = json.loads(store.metadata_path.read_text(encoding="utf-8"))
+    metadata["completed_shots"][0]["manifest_sha256"] = hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+    metadata["state_fingerprint"] = canonical_json_hash(
+        {
+            "status": metadata["status"],
+            "completed_shots": metadata["completed_shots"],
+        }
+    )
+    metadata["metadata_fingerprint"] = canonical_json_hash(
+        {key: value for key, value in metadata.items() if key != "metadata_fingerprint"}
+    )
+    store.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
 
 def _write_current_stereo_pipeline(
@@ -551,7 +621,12 @@ def _legacy_job(tmp_path: Path):
     legacy_depth = tmp_path / "02_depth_maps"
     legacy_depth.mkdir()
     (legacy_depth / "frame_000001.png").write_bytes(b"legacy-depth")
-    for name in ("04_left_frames", "04_right_frames", "08_left_final", "08_right_final"):
+    for name in (
+        "04_left_frames",
+        "04_right_frames",
+        "08_left_final",
+        "08_right_final",
+    ):
         directory = tmp_path / name
         directory.mkdir()
         (directory / frame_files[0].name).write_bytes(b"legacy-stereo")
@@ -570,7 +645,11 @@ def test_report_preserves_original_frames_and_lists_legacy_stages(tmp_path):
     assert "legacy_depth_maps" in report.invalidated_stage_names
     assert "stereo" in report.invalidated_stage_names
     assert "legacy_final" in report.invalidated_stage_names
-    assert set(report.removed_settings) == {"baseline", "focal_length", "hole_fill_quality"}
+    assert set(report.removed_settings) == {
+        "baseline",
+        "focal_length",
+        "hole_fill_quality",
+    }
 
 
 def test_resume_rejects_future_schema_before_any_mutation(tmp_path):
@@ -701,6 +780,65 @@ def test_vdpp_resume_rejects_tampered_building_metadata(tmp_path):
     stage = report.stage("disparity_stabilized")
     assert stage.disposition == "invalidate"
     assert "metadata fingerprint" in stage.reason
+
+
+def test_vdpp_building_resume_reports_invalid_diagnostics_as_regeneration_work(
+    tmp_path,
+):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings(temporal_postprocessor="vdpp")
+    _write_settings(tmp_path, settings, current_schema=True)
+    _manifest, _bounds, canonical = _write_current_depth_pipeline(
+        tmp_path,
+        frame_files,
+        fingerprint,
+    )
+    store = _write_complete_stabilized_stage(tmp_path, frame_files, canonical)
+    _publish_building_stabilized_metadata(store)
+    manifest_path = store.manifest_dir / "shot_000000.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["calibration"]["midpoint_fraction"] = -0.0
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _rehash_first_stabilized_manifest(store)
+
+    report = build_resume_report(tmp_path, settings)
+
+    stage = report.stage("disparity_stabilized")
+    assert stage.disposition == "resume"
+    assert "record-valid=0" in stage.reason
+    assert "invalid-to-regenerate=1" in stage.reason
+    assert "pending=0" in stage.reason
+
+
+def test_vdpp_building_resume_rejects_structural_completed_record_corruption(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings(temporal_postprocessor="vdpp")
+    _write_settings(tmp_path, settings, current_schema=True)
+    _manifest, _bounds, canonical = _write_current_depth_pipeline(
+        tmp_path,
+        frame_files,
+        fingerprint,
+    )
+    store = _write_complete_stabilized_stage(tmp_path, frame_files, canonical)
+    metadata = _publish_building_stabilized_metadata(store)
+    metadata["completed_shots"].append(dict(metadata["completed_shots"][0]))
+    metadata["state_fingerprint"] = canonical_json_hash(
+        {"status": "building", "completed_shots": metadata["completed_shots"]}
+    )
+    metadata["metadata_fingerprint"] = canonical_json_hash(
+        {key: value for key, value in metadata.items() if key != "metadata_fingerprint"}
+    )
+    store.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    report = build_resume_report(tmp_path, settings)
+
+    stage = report.stage("disparity_stabilized")
+    assert stage.disposition == "invalidate"
+    assert "sorted and unique" in stage.reason
 
 
 def test_off_resume_leaves_stabilized_stage_dormant_and_out_of_report(tmp_path):
@@ -1503,7 +1641,9 @@ def test_frame_stage_explicitly_invalidates_malformed_manifest(tmp_path, monkeyp
     assert fingerprint is None
 
 
-def test_resume_reports_both_valid_stage3_directories_without_deleting_inactive_one(tmp_path):
+def test_resume_reports_both_valid_stage3_directories_without_deleting_inactive_one(
+    tmp_path,
+):
     from src.depth_surge_3d.io.resume import build_resume_report
 
     _, settings = _metric_job(tmp_path)
@@ -1519,7 +1659,9 @@ def test_resume_reports_both_valid_stage3_directories_without_deleting_inactive_
     assert _directory_bytes(tmp_path / "03_metric_geometry") == metric_before
 
 
-def test_mode_switch_preserves_both_valid_stage3_formats_and_invalidates_only_stereo(tmp_path):
+def test_mode_switch_preserves_both_valid_stage3_formats_and_invalidates_only_stereo(
+    tmp_path,
+):
     from src.depth_surge_3d.io.resume import build_resume_report
 
     _, settings = _metric_job(tmp_path)
@@ -1569,7 +1711,9 @@ def test_depth_identity_change_invalidates_metric_geometry_and_stereo(tmp_path):
     assert report.stage("stereo").disposition == "invalidate"
 
 
-def test_completed_metric_geometry_reuses_compatible_ready_raw_identity_without_payloads(tmp_path):
+def test_completed_metric_geometry_reuses_compatible_ready_raw_identity_without_payloads(
+    tmp_path,
+):
     from src.depth_surge_3d.io.resume import build_resume_report
 
     _, settings = _metric_job(tmp_path)
@@ -1752,7 +1896,9 @@ def test_legacy_metric_resume_reprobes_sar_before_report_construction(tmp_path, 
     assert report.stage("frames").disposition == "preserve"
 
 
-def test_legacy_metric_resume_without_source_fails_without_invalidating_relative_data(tmp_path):
+def test_legacy_metric_resume_without_source_fails_without_invalidating_relative_data(
+    tmp_path,
+):
     from src.depth_surge_3d.io.resume import build_resume_report
 
     frame_files, fingerprint = _write_frames(tmp_path)

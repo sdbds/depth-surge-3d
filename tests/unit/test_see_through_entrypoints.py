@@ -206,7 +206,9 @@ def test_web_resume_preserves_direct_vr_setting_and_defaults_older_jobs_off(tmp_
     )
 
 
-def test_resume_depth_model_inference_uses_raw_metadata_and_preserves_explicit_value(tmp_path):
+def test_resume_depth_model_inference_uses_raw_metadata_and_preserves_explicit_value(
+    tmp_path,
+):
     from src.depth_surge_3d.io.resume import resolve_resume_depth_model_version
 
     assert resolve_resume_depth_model_version({}, tmp_path, default="v2") == "v2"
@@ -474,6 +476,9 @@ def test_web_complete_stabilized_resume_skips_cuda_and_base_model(tmp_path):
 
     output_dir = tmp_path / "job"
     output_dir.mkdir()
+    stale_work = output_dir / "03_disparity_stabilized/.vdpp-work"
+    stale_work.mkdir(parents=True)
+    (stale_work / "shot_0.raw.f32.mmap").write_bytes(b"stale")
     source_video = output_dir / "source.mp4"
     source_video.touch()
     settings = web_app.validate_settings(
@@ -498,7 +503,15 @@ def test_web_complete_stabilized_resume_skips_cuda_and_base_model(tmp_path):
     stable_files = [output_dir / "03_disparity_stabilized" / "frame_000001.png"]
 
     with (
-        patch.object(web_app, "build_resume_report", return_value=report),
+        patch.object(
+            web_app,
+            "build_resume_report",
+            side_effect=lambda *_args, **_kwargs: (
+                (_ for _ in ()).throw(AssertionError("stale work survived before resume audit"))
+                if stale_work.exists()
+                else report
+            ),
+        ),
         patch.object(
             web_app,
             "_preserved_render_artifact",
@@ -509,7 +522,10 @@ def test_web_complete_stabilized_resume_skips_cuda_and_base_model(tmp_path):
             "create_stereo_projector",
             side_effect=AssertionError("base model must stay lazy"),
         ) as create_projector,
-        patch("torch.cuda.is_available", side_effect=AssertionError("CUDA must not be probed")),
+        patch(
+            "torch.cuda.is_available",
+            side_effect=AssertionError("CUDA must not be probed"),
+        ),
         patch.object(
             web_app,
             "get_video_info",
@@ -526,7 +542,10 @@ def test_web_complete_stabilized_resume_skips_cuda_and_base_model(tmp_path):
             source_video,
             settings,
             output_dir,
-            {"migration_mode": "archive", "settings_file": output_dir / "settings.json"},
+            {
+                "migration_mode": "archive",
+                "settings_file": output_dir / "settings.json",
+            },
         )
 
     create_projector.assert_not_called()
@@ -592,7 +611,10 @@ def test_web_cached_base_accepts_indexed_cuda_device_for_vdpp(tmp_path):
             source_video,
             settings,
             output_dir,
-            {"migration_mode": "archive", "settings_file": output_dir / "settings.json"},
+            {
+                "migration_mode": "archive",
+                "settings_file": output_dir / "settings.json",
+            },
         )
 
     stabilizer_class.assert_called_once_with(
@@ -912,6 +934,9 @@ def test_cli_complete_stabilized_resume_skips_cuda_and_base_model(tmp_path, monk
     report.migrated_settings = cli.validate_settings(saved_settings, source="legacy_disk")
     processor = MagicMock()
     observed_locks = []
+    stale_work = tmp_path / "03_disparity_stabilized/.vdpp-work"
+    stale_work.mkdir(parents=True)
+    (stale_work / "shot_0.raw.f32.mmap").write_bytes(b"stale")
 
     def observe_lock(**kwargs):
         observed_locks.append(kwargs["job_lock"].is_acquired)
@@ -932,7 +957,15 @@ def test_cli_complete_stabilized_resume_skips_cuda_and_base_model(tmp_path, monk
                 "video_properties": {"fps": 24.0, "frame_count": 1},
             },
         ),
-        patch.object(cli, "build_resume_report", return_value=report),
+        patch.object(
+            cli,
+            "build_resume_report",
+            side_effect=lambda *_args, **_kwargs: (
+                (_ for _ in ()).throw(AssertionError("stale work survived before resume audit"))
+                if stale_work.exists()
+                else report
+            ),
+        ),
         patch.object(
             cli,
             "_preserved_render_artifact",
@@ -943,7 +976,10 @@ def test_cli_complete_stabilized_resume_skips_cuda_and_base_model(tmp_path, monk
             "create_stereo_projector",
             side_effect=AssertionError("base model must stay lazy"),
         ) as create_projector,
-        patch("torch.cuda.is_available", side_effect=AssertionError("CUDA must not be probed")),
+        patch(
+            "torch.cuda.is_available",
+            side_effect=AssertionError("CUDA must not be probed"),
+        ),
         patch.object(cli, "apply_legacy_migration"),
         patch(
             "depth_surge_3d.processing.orchestration.video_processor.VideoProcessor",

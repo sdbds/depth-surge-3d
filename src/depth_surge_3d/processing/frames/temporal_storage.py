@@ -17,10 +17,14 @@ from ...core.depth_contract import canonical_json_hash
 from ...core.render_disparity import (
     STABILIZED_DEPTH_ALGORITHM_VERSION,
     STABILIZED_DEPTH_SCHEMA_VERSION,
+    STABILIZED_SHOT_MANIFEST_SCHEMA_VERSION,
+    audit_stabilized_shot_records,
     validate_render_disparity_input,
 )
-from ...utils.imaging.png_header import png_header_matches
-from .depth_normalizer import encode_canonical_png
+from ...core.vdpp_calibration import (
+    canonicalize_vdpp_calibration_diagnostics,
+    validate_vdpp_calibration_diagnostics,
+)
 
 
 def build_final_shot_plan(num_frames: int, final_cuts: list[int]) -> list[dict[str, int]]:
@@ -114,7 +118,7 @@ class StabilizedDepthStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f"{path.name}.tmp")
         temporary.write_text(
-            json.dumps(payload, indent=2, sort_keys=True),
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False),
             encoding="utf-8",
         )
         os.replace(temporary, path)
@@ -174,62 +178,6 @@ class StabilizedDepthStore:
         fingerprint = metadata.get("metadata_fingerprint")
         unhashed = {key: value for key, value in metadata.items() if key != "metadata_fingerprint"}
         return isinstance(fingerprint, str) and fingerprint == canonical_json_hash(unhashed)
-
-    def _shot_record_valid(  # noqa: C901
-        self,
-        shot: dict[str, int],
-        record: object,
-    ) -> bool:
-        if not isinstance(record, dict) or record.get("shot_id") != shot["shot_id"]:
-            return False
-        relative = f"shot_manifests/shot_{shot['shot_id']:06d}.json"
-        if record.get("manifest") != relative:
-            return False
-        manifest_path = self.root / relative
-        try:
-            manifest_bytes = manifest_path.read_bytes()
-            manifest = json.loads(manifest_bytes.decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return False
-        if not isinstance(manifest, dict):
-            return False
-        if record.get("manifest_sha256") != hashlib.sha256(manifest_bytes).hexdigest():
-            return False
-        fingerprint = manifest.get("manifest_fingerprint")
-        unhashed = {key: value for key, value in manifest.items() if key != "manifest_fingerprint"}
-        if not isinstance(fingerprint, str) or fingerprint != canonical_json_hash(unhashed):
-            return False
-        if (
-            manifest.get("schema_version") != 1
-            or manifest.get("shot_id") != shot["shot_id"]
-            or manifest.get("start") != shot["start"]
-            or manifest.get("end") != shot["end"]
-        ):
-            return False
-
-        expected_names = [path.name for path in self.frame_files[shot["start"] : shot["end"]]]
-        files = manifest.get("files")
-        if not isinstance(files, list) or len(files) != len(expected_names):
-            return False
-        normalized: list[dict[str, str]] = []
-        try:
-            for name, file_record in zip(expected_names, files):
-                if not isinstance(file_record, dict) or file_record.get("name") != name:
-                    return False
-                path = self.root / f"{Path(name).stem}.png"
-                if not png_header_matches(path, shape=self.native_shape, bit_depth=16):
-                    return False
-                digest = self._sha256(path)
-                if file_record.get("sha256") != digest:
-                    return False
-                normalized.append({"name": name, "sha256": digest})
-        except OSError:
-            return False
-        shot_payload = canonical_json_hash(normalized)
-        return (
-            manifest.get("shot_payload_sha256") == shot_payload
-            and record.get("shot_payload_sha256") == shot_payload
-        )
 
     def audit(self) -> StabilizedStageAudit:  # noqa: C901
         """Inspect existing state without changing a byte."""
@@ -299,34 +247,30 @@ class StabilizedDepthStore:
                 metadata=metadata,
             )
 
-        records = metadata.get("completed_shots")
-        records_by_id = (
-            {
-                record.get("shot_id"): record
-                for record in records
-                if isinstance(record, dict) and isinstance(record.get("shot_id"), int)
-            }
-            if isinstance(records, list)
-            else {}
-        )
-        reusable: list[int] = []
-        invalid: list[int] = []
-        pending: list[int] = []
-        for shot in self.shot_plan:
-            shot_id = shot["shot_id"]
-            record = records_by_id.get(shot_id)
-            if record is None:
-                pending.append(shot_id)
-            elif self._shot_record_valid(shot, record):
-                reusable.append(shot_id)
-            else:
-                invalid.append(shot_id)
+        try:
+            shot_audit = audit_stabilized_shot_records(
+                self.root,
+                metadata=metadata,
+                frame_names=[path.name for path in self.frame_files],
+                shot_plan=self.shot_plan,
+                native_shape=self.native_shape,
+            )
+        except ValueError as exc:
+            return StabilizedStageAudit(
+                complete=False,
+                reset_required=True,
+                reusable_shot_ids=(),
+                invalid_shot_ids=(),
+                pending_shot_ids=all_ids,
+                reason=f"stabilized completed-shot structure is invalid: {exc}",
+                metadata=metadata,
+            )
         return StabilizedStageAudit(
             complete=False,
             reset_required=False,
-            reusable_shot_ids=tuple(reusable),
-            invalid_shot_ids=tuple(invalid),
-            pending_shot_ids=tuple(pending),
+            reusable_shot_ids=shot_audit.reusable_shot_ids,
+            invalid_shot_ids=shot_audit.invalid_shot_ids,
+            pending_shot_ids=shot_audit.pending_shot_ids,
             reason="stabilized stage requires shot generation",
             metadata=metadata,
         )
@@ -385,6 +329,8 @@ class StabilizedDepthStore:
         self,
         shot_id: int,
         outputs: Iterable[tuple[int, np.ndarray]],
+        *,
+        calibration: object,
     ) -> None:
         """Commit one complete shot; incomplete windows never enter metadata."""
 
@@ -394,6 +340,16 @@ class StabilizedDepthStore:
         completed_ids = {record["shot_id"] for record in self._metadata.get("completed_shots", [])}
         if shot_id in completed_ids:
             return
+        canonical_calibration = canonicalize_vdpp_calibration_diagnostics(
+            calibration,
+            shot_length=shot["end"] - shot["start"],
+            native_shape=self.native_shape,
+        )
+        validate_vdpp_calibration_diagnostics(
+            canonical_calibration,
+            shot_length=shot["end"] - shot["start"],
+            native_shape=self.native_shape,
+        )
         self._delete_shot_payloads(shot)
         expected_length = shot["end"] - shot["start"]
         file_records: list[dict[str, str]] = []
@@ -407,16 +363,16 @@ class StabilizedDepthStore:
                     raise ValueError("Stabilized shot outputs are not ordered and contiguous")
                 if expected_local >= expected_length:
                     raise ValueError("Stabilized shot emitted too many frames")
-                array = np.asarray(values, dtype=np.float32)
+                if not isinstance(values, np.ndarray) or values.dtype != np.uint16:
+                    raise TypeError("Stabilized output must be a uint16 NumPy array")
+                array = values
                 if array.shape != self.native_shape:
                     raise ValueError(
                         f"Stabilized output shape {array.shape} does not match {self.native_shape}"
                     )
-                if not np.isfinite(array).all():
-                    raise ValueError("Stabilized output must be finite")
                 frame = self.frame_files[shot["start"] + expected_local]
                 output_path = self.root / f"{frame.stem}.png"
-                self._atomic_write_png(output_path, encode_canonical_png(array))
+                self._atomic_write_png(output_path, array)
                 file_records.append({"name": frame.name, "sha256": self._sha256(output_path)})
                 consumed += 1
             if consumed != expected_length:
@@ -426,10 +382,11 @@ class StabilizedDepthStore:
 
             shot_payload = canonical_json_hash(file_records)
             manifest: dict[str, Any] = {
-                "schema_version": 1,
+                "schema_version": STABILIZED_SHOT_MANIFEST_SCHEMA_VERSION,
                 "shot_id": shot_id,
                 "start": shot["start"],
                 "end": shot["end"],
+                "calibration": canonical_calibration,
                 "files": file_records,
                 "shot_payload_sha256": shot_payload,
             }

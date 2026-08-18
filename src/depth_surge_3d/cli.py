@@ -33,6 +33,7 @@ from depth_surge_3d.io.operations import (
     validate_video_file,
 )
 from depth_surge_3d.io.job_lock import JobWriterLock
+from depth_surge_3d.vdpp_work import cleanup_vdpp_private_work
 from depth_surge_3d.io.resume import (
     apply_legacy_migration,
     build_resume_report,
@@ -629,6 +630,7 @@ def main():  # noqa: C901
         try:
             output_dir = Path(args.resume).resolve()
             job_lock = JobWriterLock(output_dir).acquire()
+            cleanup_vdpp_private_work(output_dir, job_lock)
             preflight = None
             execution_preflight = None
             audit_settings = processing_settings
