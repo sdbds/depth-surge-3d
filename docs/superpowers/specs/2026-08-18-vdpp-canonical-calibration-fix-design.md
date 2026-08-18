@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved direction, revised after two PRO reviews. The external whole-shot
+Approved direction, revised after three PRO reviews. The external whole-shot
 fixture payload hash must be recaptured before implementation sign-off. This
 document narrows and supersedes the v1 VDPP input and output range policy in
 `2026-08-16-vdpp-temporal-postprocessor-design.md`. It does not change depth
@@ -58,9 +58,10 @@ silently redefine `stereo_strength`.
 - `VDPPTemporalPostprocessor` continues to own only the pinned 32-frame,
   four-overlap model recurrence. Its output remains native-resolution float32
   with no canonical clipping.
-- `ProcessingOrchestrator` owns startup cleanup of stale VDPP private work. It
-  calls a standard-library-only helper before preselected, cache-hit, and
-  generated render-source paths diverge.
+- Job entrypoints own startup cleanup of stale VDPP private work. CLI, Web,
+  `StereoProjector`, and `ProcessingOrchestrator` call one idempotent lightweight
+  helper immediately after acquiring or first accepting the job writer lock and
+  before resume audit/migration, model loading, or pipeline setup.
 - `TemporalDepthStabilizer` owns base decoding, per-frame input normalization,
   pre-scan, stable statistics, shot fitting, quality gates, every active memmap
   lifecycle, encoded fallback, and progress.
@@ -110,6 +111,10 @@ and retain only scalar counts:
 - count individually flat frames: no non-midpoint pixels, or one unique
   non-midpoint code.
 
+The pre-scan uses masked reductions with `where` over the one full-frame boolean
+mask. It never materializes a full-frame boolean-compressed uint16 or float
+selection.
+
 If every pixel is midpoint-coded, commit a bit-exact copy with mode
 `all_midpoint`. If no frame has non-midpoint range, commit a bit-exact copy with
 mode `base_fallback` and reason `source_no_range`. Both decisions happen before
@@ -157,7 +162,10 @@ source32 /= float32(hi_code - lo_code)
 
 `lo_code` and `hi_code` are exact Python integers obtained from uint16 values.
 Subtraction and division use float32 operands and float32 destinations. The
-loader must not create a float64 input frame or window.
+loader assigns uint16 values directly into its preallocated float32 output
+slice, then subtracts and divides that slice in place. Extrema use `where` over
+the full-frame midpoint mask; the loader must not create a second float32 source
+frame, a float64 input frame/window, or a full-frame boolean-compressed array.
 
 Fit pairs also have one conversion path. Raw `x` begins as the emitted float32
 model output and is converted tile-wise to float64. Source `y` is first decoded
@@ -165,19 +173,33 @@ with `decode_canonical_png()` (`uint16 -> float32 / float32(65535)`), then
 converted tile-wise to float64. Direct uint16-to-float64 division is not an
 equivalent implementation.
 
-Both the quality pass and accepted commit pass call the same pure candidate
-helper, with no alternative fast path:
+Every fit, quality, and commit scan flattens frames in C row-major order and
+visits exact half-open tiles
+`[start:min(start + STATS_TILE_PIXELS, H * W))`. Source decoding calls
+`decode_canonical_png()` only on the uint16 tile. The midpoint/eligibility mask
+is built after slicing, and boolean compression is permitted only inside that
+tile.
+
+Both the quality pass and accepted commit pass call the same pure tile helper,
+with no frame-sized alternative fast path:
 
 ```text
-preclip64 = raw_float32.astype(float64) * scale64 + shift64
-candidate32 = clip(preclip64, float64(0), float64(1)).astype(float32)
+candidate_tile(raw_tile_f32, scale_f64, shift_f64):
+    require raw_tile_f32.size <= STATS_TILE_PIXELS
+    preclip64 = raw_tile_f32.astype(float64)
+    preclip64 *= scale_f64
+    preclip64 += shift_f64
+    candidate32 = empty(raw_tile_f32.shape, dtype=float32)
+    clip(preclip64, float64(0), float64(1), out=candidate32)
+    return preclip64, candidate32
 ```
 
 Pre-clip low/high counts inspect `preclip64`. Candidate mean and variance use
 float64 Chan merges over the float32 values in `candidate32`. Final accepted
-encoding calls the existing `encode_canonical_png(candidate32)` and only then
-restores source midpoint-code pixels to uint16 `32768`. These conversions and
-their ordering are part of the execution identity.
+commit preallocates one full `candidate_frame32`, fills it tile by tile, calls
+the existing `encode_canonical_png(candidate_frame32)` only after the frame is
+complete, and then restores source midpoint-code pixels to uint16 `32768`.
+These conversions and their ordering are part of the execution identity.
 
 ## Stable Statistics And Fit
 
@@ -231,8 +253,7 @@ never `sum`/`sum-of-squares` subtraction. Over the same fit-eligible pairs,
 compute:
 
 ```text
-preclip64 = float64(raw_float32) * scale64 + shift64
-candidate32 = clip(preclip64, 0, 1).astype(float32)
+preclip64, candidate32 = candidate_tile(raw_tile_f32, scale64, shift64)
 preclip_low_fraction
 preclip_high_fraction
 candidate_mean
@@ -320,6 +341,85 @@ in the shot manifest fingerprint but not the stage semantic fingerprint.
 `nonfinite_statistics` covers either fit-pass or quality-pass Chan state and
 outranks every later reason even when it is discovered during the quality scan.
 
+### Strict Diagnostics Schema
+
+Self-hash is not schema validation. A pure standard-library shared contract in
+`core/vdpp_calibration.py` owns the constants, exact key set, enums, nullability
+matrix, and:
+
+```text
+validate_vdpp_calibration_diagnostics(
+    calibration: object,
+    *,
+    shot_length: int,
+    native_shape: tuple[int, int],
+) -> dict[str, JSONScalar]
+```
+
+The validator rejects missing and unknown keys. `pair_count`, `midpoint_count`,
+and `flat_frame_count` must be non-bool Python integers in range. Every non-null
+numeric diagnostic must be a finite Python float, not a bool, integer, NumPy
+scalar, NaN, or infinity. It also enforces:
+
+- `shot_length` and both native dimensions are non-bool positive Python
+  integers;
+- `shot_pixels = shot_length * H * W` without overflow ambiguity;
+- `0 <= midpoint_count <= shot_pixels` and
+  `0 <= pair_count <= shot_pixels - midpoint_count`;
+- `0 <= flat_frame_count <= shot_length`;
+- `midpoint_fraction` is exactly the binary64 result of
+  `midpoint_count / shot_pixels`; Python JSON round-trip preserves that exact
+  float, so no tolerance or decimal rounding is allowed;
+- every fraction lies in `[0, 1]`, and pre-clip low plus high is at most `1`;
+- correlation lies in `[-1, 1]`; source/candidate means lie in `[0, 1]`;
+  source/candidate standard deviations lie in `[0, 0.5]`; raw standard deviation
+  and contrast ratio are non-negative; mean drift lies in `[0, 1]`;
+- mode, fallback reason, persisted threshold boundaries, and reason priority are
+  mutually consistent.
+
+For nullability, define moments `M` as source/raw mean and standard deviation
+plus covariance; fit `F` as correlation, scale, and shift; and quality `Q` as
+candidate mean/std, contrast, drift, and both pre-clip fractions. The exact
+matrix is:
+
+| Mode / reason | M | F | Q |
+| --- | --- | --- | --- |
+| `all_midpoint` | null | null | null |
+| fallback `source_no_range` | null | null | null |
+| fallback `too_few_pairs` | null | null | null |
+| fallback `nonfinite_statistics` | null | null | null |
+| fallback `source_variance` | required | null | null |
+| fallback `raw_variance` | required | null | null |
+| fallback `nonfinite_fit` | required | correlation only | null |
+| fallback `scale_below_minimum` | required | required | null |
+| fallback `correlation` | required | required | null |
+| fallback `contrast` | required | required | required |
+| fallback `mean_drift` | required | required | required |
+| fallback `preclip_out_of_range` | required | required | required |
+| `ols` | required | required | required |
+
+`mode="ols"` requires null fallback reason and all accepted gates.
+`mode="base_fallback"` requires exactly one listed reason and the causal
+condition for that reason while all earlier finite conditions pass.
+`mode="all_midpoint"` requires null reason, zero pairs, midpoint count equal to
+all shot pixels, midpoint fraction `1.0`, and every frame flat.
+`source_no_range` requires zero pairs and every frame flat. For
+`nonfinite_statistics` all derived diagnostics are deliberately normalized to
+null even if the failure occurred during the quality pass.
+
+The validator runs in all three trust boundaries:
+
+1. `StabilizedDepthStore.commit_shot()` before constructing or hashing a
+   manifest;
+2. `StabilizedDepthStore` partial audit before accepting a completed-shot
+   record;
+3. complete render-disparity validation before accepting a v2 shot manifest.
+
+Every stabilized JSON write uses `json.dumps(..., allow_nan=False)`. Read paths
+still validate finite diagnostics explicitly because Python's parser accepts
+non-standard NaN/Infinity tokens by default. A valid self-hash never substitutes
+for this schema validation.
+
 ## Work Files, Locking, And Cleanup
 
 Private files live only under
@@ -327,27 +427,60 @@ Private files live only under
 or deletes outside that named directory. The production pipeline already owns a
 job-level `JobWriterLock`; there is no independent stage writer lock.
 
-A new standard-library-only
-`processing/orchestration/vdpp_work.py::cleanup_vdpp_private_work()` validates
-that its resolved target is exactly the `.vdpp-work` child of the supplied
-stabilized root, removes only owned work payloads, and removes the directory when
-empty. It imports no Torch, model, NumPy, or OpenCV module. Cleanup failure is a
-hard orchestration error rather than a silently retained multi-gigabyte file.
+A new top-level lightweight helper avoids the eager imports under the
+`processing` package. Its only runtime dependencies are the standard library and
+the pure `core.constants` module:
 
-`ProcessingOrchestrator.process()` passes its acquired `JobWriterLock` into
-`_execute_pipeline()`. Immediately after output directories are resolved,
-`_execute_pipeline()` reasserts that the lock is acquired for the same output
-root and calls the cleanup helper before frame extraction or any preselected,
-cache-hit, or generated render-source branch. Consequently, CLI preselected
-stabilized resume cleans stale work before constructing
-`TemporalDepthStabilizer`; the cleanup helper and its import closure do not
-import Torch. Later stereo rendering may independently import Torch and is not
-part of this cleanup contract.
+```text
+depth_surge_3d/vdpp_work.py
+
+cleanup_vdpp_private_work(
+    output_root: Path,
+    job_lock: JobWriterLock,
+) -> None
+```
+
+`JobWriterLock` is imported only under `TYPE_CHECKING`; runtime validation uses
+its `is_acquired` and `output_dir` attributes. The helper imports no Torch,
+model, NumPy, OpenCV, `processing`, or `io` package. It derives the stabilized
+root from resolved `output_root` and
+`INTERMEDIATE_DIRS["disparity_stabilized"]`; callers cannot supply an arbitrary
+stage path and cleanup does not depend on the `directories` mapping.
+
+The helper requires an acquired lock whose resolved output root exactly matches
+the argument. Before following either derived child, `lstat`-based checks reject
+symbolic links, junctions, and any platform reparse point for both the stabilized
+root and `.vdpp-work`; when present, both must be ordinary directories. It
+performs a validation pass before deletion: every work entry must be a
+non-reparse regular file whose entire name matches
+`^shot_[0-9]+[.]raw[.]f32[.]mmap$`. An unknown file, directory, or special entry
+is retained and aborts cleanup without deleting any owned file. After successful
+validation it unlinks the known files and removes the now-empty work directory.
+Any cleanup failure is a hard job error rather than a silently archived or
+retained multi-gigabyte file.
+
+The cleanup invariant is: after a job lock is acquired or first accepted,
+cleanup is the first job-private workspace mutation, before resume report/audit,
+migration, model loading, or pipeline setup. Calls are explicit and idempotent:
+
+- CLI resume calls it immediately after `JobWriterLock.acquire()` and before
+  `build_resume_report()`.
+- Web `process_video_async()` calls it immediately after lock acquisition and
+  before resume report construction.
+- `StereoProjector.execute_video()` calls it immediately after acquiring or
+  validating a supplied lock and before `_ensure_model_loaded()`.
+- `ProcessingOrchestrator.process()` calls it immediately after acquiring or
+  validating a supplied lock and before `_setup_processing()`; this covers
+  direct API users.
+
+A fresh-interpreter import test for `depth_surge_3d.vdpp_work` proves that its
+import closure does not add Torch to `sys.modules`. Later stereo rendering may
+independently import Torch and is not part of this cleanup contract.
 
 Ordering is:
 
-1. Under the acquired job writer lock, the common orchestrator removes stale
-   private work before any render-source branch.
+1. Under the acquired job writer lock, the entrypoint removes stale private work
+   before resume migration, model loading, or any render-source branch.
 2. The selected path performs read-only base, scene, and lightweight stabilized
    audits.
 3. If the lightweight artifact is complete, return without CUDA checks.
@@ -401,12 +534,20 @@ The conservative host-resident array bound is:
 
 ```text
 normalized input window:          32 * H * W * 4
-decoded source uint16:             1 * H * W * 2
+source uint16 frame:               1 * H * W * 2
 midpoint boolean mask:             1 * H * W * 1
 native raw output:                 1 * H * W * 4
-calibrated float32 + uint16:       1 * H * W * (4 + 2)
-Chan tile scratch:                 at most 8 * STATS_TILE_PIXELS * 8 bytes
+candidate frame32:                 1 * H * W * 4
+canonical encoder conservative:   1 * H * W * (3 * 4 + 2)
+all tile scratch combined:         at most 8 * STATS_TILE_PIXELS * 8 bytes
 ```
+
+The encoder allowance covers up to three full float32 temporaries plus the
+uint16 result in addition to `candidate_frame32`. Source-decoded float32,
+float64 affine values, candidate tiles, eligibility masks, and boolean-compressed
+fit values all belong to the fixed tile-scratch allowance; none is a full-frame
+array. No owned float64 host array may contain more than
+`STATS_TILE_PIXELS` elements.
 
 The loader fills the normalized host window in place; an unnormalized float32
 window must not coexist with it. GPU memory retains the existing pinned VDPP
@@ -416,11 +557,16 @@ changes disk size, not peak resident array shape.
 ## Cache Identity
 
 The stabilized producer algorithm becomes `vdpp-canonical-shot-v2`. Its
-execution plan records all behavior-changing strings and constants:
+execution plan records all behavior-changing strings and constants.
+
+The values are imported from the shared `core/vdpp_calibration.py` contract by
+both execution-plan construction and runtime calibration; they are not repeated
+as independent literals. The persisted plan is:
 
 ```text
 input_normalization = "per-frame-minmax-excluding-midpoint-code-v2"
 input_arithmetic = "u16-extrema-float32-subtract-divide-v1"
+tile_iteration = "c-row-major-fixed-262144-v1"
 midpoint_code_policy = "preserve-u16-32768-heuristic-v2"
 calibration_fit = "positive-ols-chan-v1"
 degenerate_policy = "prescan-flat-frame-copy-u16-v1"
@@ -432,6 +578,7 @@ candidate_arithmetic = "raw-f32-to-f64-affine-clip-cast-f32-v1"
 candidate_statistics = "float64-chan-over-candidate-f32-v1"
 encoding_policy = "canonical-encoder-then-restore-midpoint-v1"
 calibration_precision = "float32-input-float64-fit-float32-candidate-v2"
+calibration_diagnostics_schema = "strict-exact-keys-null-matrix-v2"
 fallback_reason_order = [
   "source_no_range",
   "too_few_pairs",
@@ -489,14 +636,24 @@ Automated tests must first fail against v1 behavior and then prove:
    without a boundary jump. Existing recurrence-equivalence tests remain
    unchanged.
 9. Instrumentation proves the host bound above, memmaps close before Windows
-   unlink, and disk preflight uses pending shots plus the largest pending memmap.
-   Normal cache hits and CLI preselected stabilized resume cache hits both remove
-   stale `.vdpp-work` under `JobWriterLock` before constructing
-   `TemporalDepthStabilizer`. An isolated import-closure test proves the cleanup
-   helper itself does not import Torch; later stereo rendering is out of scope.
-10. Shot diagnostics are self-hashed; threshold, policy, NumPy, and OpenCV
-    identity changes invalidate or prevent mixed partial resume as specified.
-11. A complete v1 artifact and a partial v1 artifact are invalidated; the base
+   unlink, no owned float64 host array exceeds `STATS_TILE_PIXELS`, and disk
+   preflight uses pending shots plus the largest pending memmap.
+10. CLI, Web, `StereoProjector`, and direct orchestrator paths remove stale work
+    immediately after lock acquisition/acceptance. In particular, an invalid v1
+    stabilized stage with archive migration loses `.vdpp-work` before migration,
+    and `legacy_v1` never receives that directory. Complete/preselected cache
+    hits and `temporal_postprocessor=off` derive cleanup from the output root,
+    not the stage-directory mapping. Symlink/junction, unknown-entry, wrong-lock,
+    idempotence, and fresh-interpreter no-Torch-import cases are covered.
+11. Deleting `calibration`, adding an unknown key, inserting NaN/Infinity, or
+    writing an inconsistent mode/reason and then recomputing every self-hash
+    still invalidates partial audit and complete render validation. Commit
+    rejects the same payload before writing, and all stabilized JSON writers use
+    `allow_nan=False`.
+12. Shot diagnostics are self-hashed and strictly validated; threshold, policy,
+    NumPy, and OpenCV identity changes invalidate or prevent mixed partial resume
+    as specified.
+13. A complete v1 artifact and a partial v1 artifact are invalidated; the base
     canonical artifact is preserved; complete and partial v2 OLS or fallback
     artifacts validate and resume according to their runtime identity.
 
@@ -543,7 +700,11 @@ The previously inspected external job directory is no longer present, so its
 354 additional hashes cannot be reconstructed from the metadata or the recorded
 frame-500 hash. The placeholder must be replaced from a restored or regenerated
 byte-identical artifact before implementation sign-off; inventing a value would
-defeat the gate.
+defeat the gate. Recapture rechecks all 355 ordered file hashes, frame-500 hash,
+base/raw/scene fingerprints, shot range, native shape, source mean/std, and
+midpoint count/fraction as one indivisible fixture record. If regenerated bytes
+differ, every field is captured as a new fixture; only replacing the payload
+fingerprint is forbidden.
 
 The verifier hashes all 355 inputs and rejects a payload-fingerprint mismatch
 before loading VDPP. It then reads the shot diagnostics and requires: shot mean
