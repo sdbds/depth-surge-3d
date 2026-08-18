@@ -6,6 +6,12 @@ The sectioned design was approved in chat on 2026-08-19. This written
 specification is committed for a separate user review before implementation
 planning begins. Approval of this document authorizes planning, not merge.
 
+PRO review found implementation-blocking ambiguities in the first written
+revision. `2026-08-19-stereo-quality-edge-reconstruction-revision-2.md`
+incorporates and supersedes its Quality data-flow and verification details. The
+two documents must be reviewed together, with Revision 2 controlling on every
+conflict.
+
 This is one coherent stereo-stage revision. Geometry resampling, visibility
 coverage, disocclusion reconstruction, diagnostics, settings, and resume
 identity change together because each consumes the contract produced by the
