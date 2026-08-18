@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved direction, revised after four PRO reviews. The external whole-shot
+Approved direction, revised after five PRO reviews. The external whole-shot
 fixture payload hash must be recaptured before implementation sign-off. This
 document narrows and supersedes the v1 VDPP input and output range policy in
 `2026-08-16-vdpp-temporal-postprocessor-design.md`. It does not change depth
@@ -241,11 +241,16 @@ its mathematical range. For example, the same Chan merge formula produces
 three-value test tiles, and a valid correlation can become
 `1.0000000000000002`. Those values are not semantic input failures.
 
-The shared calibration module therefore owns this exact primitive:
+The shared calibration module therefore owns these exact primitives:
 
 ```text
-normalize_bounded_stat(value, low, high=None):
+canonicalize_float(value):
     require a finite built-in float
+    if value == 0.0: return 0.0
+    return value
+
+normalize_bounded_stat(value, low, high=None):
+    value = canonicalize_float(value)
     reference = max(
         PHYSICAL_BOUND_REFERENCE_FLOOR,
         abs(low),
@@ -253,29 +258,34 @@ normalize_bounded_stat(value, low, high=None):
     )
     slack = PHYSICAL_BOUND_ULPS * math.ulp(reference)
     if value < low:
-        if low - value <= slack: return float(low)
+        if low - value <= slack: return canonicalize_float(float(low))
         raise NumericalContractError
     if high is not None and value > high:
-        if value - high <= slack: return float(high)
+        if value - high <= slack: return canonicalize_float(float(high))
         raise NumericalContractError
     return value
 ```
 
 The `PHYSICAL_BOUND_REFERENCE_FLOOR` deliberately defines ULP distance at
 canonical-unit scale, even for a zero lower bound; `math.ulp(0.0)` is not a
-useful tolerance for normalized statistics. The producer normalizes before
-every decision and persists only the normalized value. A reader requires the
-stored value to equal its normalized form, so a self-hashed but non-canonical
-one-ULP excursion is rejected rather than silently rewritten. A finite excursion
-beyond the fixed slack is a hard numerical-contract failure, not
-`base_fallback`.
+useful tolerance for normalized statistics. `canonicalize_float` converts every
+negative zero to positive zero, including unbounded moments and fitted values;
+Python JSON writes `-0.0` and `0.0` differently even though ordinary float
+equality treats them as equal. The producer canonicalizes before every decision
+and persists only canonical values. A reader compares finite floats by exact
+`float.hex()` representation, not ordinary equality, so a self-hashed
+non-canonical one-ULP excursion or negative zero is rejected rather than silently
+rewritten. A finite excursion beyond the fixed slack is a hard
+numerical-contract failure, not `base_fallback`.
 
 Apply the primitive to correlation `[-1, 1]`, source/candidate mean `[0, 1]`,
 source/candidate population variance `[0, 0.25]`, source/candidate standard
 deviation `[0, 0.5]`, raw variance/standard deviation `[0, +inf)`, both pre-clip
 fractions and their sum `[0, 1]`, mean drift `[0, 1]`, and contrast ratio
-`[0, +inf)`. Raw mean, covariance, scale, and shift have no physical bound and
-remain subject only to finiteness and their explicit gates.
+`[0, +inf)`. Raw mean, covariance, scale, and shift have no physical bound, but
+still pass through `canonicalize_float` before any dependent calculation.
+`midpoint_fraction` and every other non-null diagnostic float use the same
+positive-zero rule.
 
 `source_variance` and `raw_variance` are the normalized population variances
 actually compared with `VARIANCE_EPSILON`; both are persisted. Their standard
@@ -283,6 +293,78 @@ deviations are then computed from those normalized variances and normalized
 again. Correlation is normalized before its gate. This makes the writer's
 variance branch exactly reproducible from the manifest instead of asking a
 validator to reconstruct it through `source_std ** 2` or `raw_std ** 2`.
+
+### Canonical Derived Diagnostics
+
+The manifest must describe one internally consistent calculation, not merely a
+set of individually plausible floats. After counts and all available
+re-derivation inputs have been canonicalized, one shared pure function evaluates
+derived values in this exact order:
+
+```text
+expected_midpoint_fraction = canonicalize_float(midpoint_count / shot_pixels)
+
+expected_source_std = normalize_bounded_stat(
+    math.sqrt(source_variance), 0.0, 0.5
+)
+expected_raw_std = normalize_bounded_stat(
+    math.sqrt(raw_variance), 0.0
+)
+
+expected_correlation = normalize_bounded_stat(
+    covariance / math.sqrt(raw_variance * source_variance),
+    -1.0,
+    1.0,
+)
+expected_scale = canonicalize_float(covariance / raw_variance)
+expected_shift = canonicalize_float(
+    source_mean - expected_scale * raw_mean
+)
+
+expected_contrast = normalize_bounded_stat(
+    candidate_std / expected_source_std,
+    0.0,
+)
+expected_drift = normalize_bounded_stat(
+    abs(candidate_mean - source_mean),
+    0.0,
+    1.0,
+)
+expected_preclip_total = normalize_bounded_stat(
+    preclip_low_fraction + preclip_high_fraction,
+    0.0,
+    1.0,
+)
+```
+
+The re-derivation inputs are counts, source/raw mean and population variance,
+covariance, candidate mean/std, and the two pre-clip fractions, subject to the
+nullability matrix below. Multiplication occurs before `sqrt`; multiplication
+occurs before subtraction in `expected_shift`. Implementations may not replace
+these expressions with algebraically equivalent paths such as
+`covariance / (raw_std * source_std)`.
+
+The producer uses these expected values for fallback ordering and every quality
+gate, and persists those same values. The writer canonicalizes each supplied
+derived value and requires its `float.hex()` to match the expected value before
+hashing; it does not silently accept a second floating path. The read-only
+validator independently re-derives the required fields from stored canonical
+inputs and applies the same exact representation comparison to
+`midpoint_fraction`, `source_std`, `raw_std`, `correlation`, `scale`, `shift`,
+`postclip_contrast_ratio`, and `postclip_mean_drift`.
+
+Derivation stops at the first unavailable or non-finite prerequisite according
+to the reason/nullability matrix. In particular, variance fallbacks do not
+derive fit fields; a non-finite scale or shift requires `nonfinite_fit`, retains
+only the finite derived correlation, and stores scale/shift as null. A finite
+physical-bound excursion beyond the ULP allowance remains a hard numerical
+contract failure.
+
+This proves algebraic coherence of the persisted tuple, not that its raw moments
+came from a now-deleted model-output memmap. Proving raw provenance would require
+retaining or separately hashing that private payload and is outside this repair;
+the independent final-PNG verifier below covers the durable source/output
+contract instead.
 
 Fallback is selected before fitting when `count < MIN_PAIR_COUNT`, or either
 variance is at most `VARIANCE_EPSILON`. After fitting, non-finite parameters or
@@ -443,8 +525,11 @@ scalar, NaN, or infinity. It also enforces:
   `0 <= pair_count <= shot_pixels - midpoint_count`;
 - `0 <= flat_frame_count <= shot_length`;
 - `midpoint_fraction` is exactly the binary64 result of
-  `midpoint_count / shot_pixels`; Python JSON round-trip preserves that exact
-  float, so no tolerance or decimal rounding is allowed;
+  `canonicalize_float(midpoint_count / shot_pixels)`; Python JSON round-trip
+  preserves that exact float, so no tolerance or decimal rounding is allowed;
+- every persisted non-null float is positive zero when numerically zero, and
+  exact derived-field comparisons use `float.hex()` so `-0.0` cannot pass as
+  `0.0`;
 - every fraction is canonical under `normalize_bounded_stat(..., 0, 1)`, and the
   normalized binary64 sum of pre-clip low plus high is at most `1`;
 - correlation is canonical in `[-1, 1]`; source/candidate means are canonical in
@@ -452,10 +537,10 @@ scalar, NaN, or infinity. It also enforces:
   source/candidate standard deviations are canonical in `[0, 0.5]`; raw
   variance/standard deviation and contrast ratio are canonically non-negative;
   mean drift is canonical in `[0, 1]`;
-- `source_std` and `raw_std` exactly equal the normalized binary64 square roots
-  of the persisted `source_variance` and `raw_variance`; the variance fallback
-  checks use those persisted variance values directly, never squared standard
-  deviations;
+- source/raw standard deviation, correlation, scale, shift, contrast, and mean
+  drift exactly equal the canonical derived-diagnostics graph above whenever
+  their nullability group is required; the variance fallback checks use the
+  persisted variance values directly, never squared standard deviations;
 - mode, fallback reason, persisted threshold boundaries, and reason priority are
   mutually consistent.
 
@@ -713,8 +798,11 @@ candidate_statistics = "float64-chan-over-candidate-f32-v1"
 encoding_policy = "canonical-encoder-then-restore-midpoint-v1"
 calibration_precision = "float32-input-float64-fit-float32-candidate-v2"
 physical_bound_policy = "snap-outward-canonical-unit-ulps-v1"
+signed_zero_policy = "canonical-positive-zero-all-diagnostic-floats-v1"
+diagnostic_float_equality = "finite-binary64-float-hex-v1"
+derived_diagnostics_policy = "recompute-from-canonical-persisted-moments-v1"
 variance_diagnostics = "persist-compared-population-variance-v1"
-calibration_diagnostics_schema = "strict-exact-keys-null-matrix-bounds-v3"
+calibration_diagnostics_schema = "strict-exact-keys-derived-positive-zero-v4"
 fallback_reason_order = [
   "source_no_range",
   "too_few_pairs",
@@ -764,7 +852,8 @@ Automated tests must first fail against v1 behavior and then prove:
    distance through four canonical-unit ULPs, and the first value beyond the
    allowance. The 19-zero/19-one three-value-tile standard deviation and an
    above-one correlation roundoff case snap to their exact bounds; farther
-   excursions hard-fail.
+   excursions hard-fail. Writer fixtures feed negative zero through bounded,
+   unbounded, and derived fields and prove that only positive zero is persisted.
 4. A deterministic fake VDPP with a large positive residual produces an
    accepted, non-saturated affine result when quality gates pass.
 5. `count < 2`, source/raw variance immediately below, equal to, and above
@@ -790,12 +879,14 @@ Automated tests must first fail against v1 behavior and then prove:
     hits and `temporal_postprocessor=off` derive cleanup from the output root,
     not the stage-directory mapping. Symlink/junction, unknown-entry, wrong-lock,
     idempotence, and fresh-interpreter no-Torch-import cases are covered.
-11. Deleting `calibration`, deleting either persisted variance, adding an unknown
-    key, inserting NaN/Infinity, storing a non-canonical bounded value, or writing
-    an inconsistent mode/reason and then recomputing every self-hash still
-    invalidates partial audit, resume preflight reuse, and complete render
-    validation. Commit rejects the same payload before writing, and all
-    stabilized JSON writers use `allow_nan=False`.
+11. Independently tampering with `correlation`, `scale`, `shift`,
+    `postclip_contrast_ratio`, or `postclip_mean_drift` rejects the supplied
+    object at commit. Recomputing every manifest/metadata hash after any one of
+    those changes still invalidates partial audit, resume preflight reuse, and
+    complete render validation. The same read paths reject a legal `0.0` changed
+    to `-0.0`, a deleted calibration/variance, unknown key, NaN/Infinity,
+    non-canonical bounded value, or inconsistent mode/reason. All stabilized
+    JSON writers use `allow_nan=False`.
 12. With matching runtime identity, a building artifact with valid,
     invalid-diagnostics, and missing shot records produces the same three-way
     shot classification in shared audit, resume preflight, and store audit.
@@ -803,8 +894,9 @@ Automated tests must first fail against v1 behavior and then prove:
     invalid shots as regeneration work and marks valid records provisional until
     runtime identity is checked.
 13. Shot diagnostics are self-hashed and strictly validated; threshold,
-    physical-bound, variance-persistence, NumPy, and OpenCV identity changes
-    invalidate or prevent mixed partial resume as specified.
+    physical-bound, signed-zero, derived-diagnostic, variance-persistence,
+    NumPy, and OpenCV identity changes invalidate or prevent mixed partial resume
+    as specified.
 14. A complete v1 artifact and a partial v1 artifact are invalidated; the base
     canonical artifact is preserved; complete and partial v2 OLS or fallback
     artifacts validate and resume according to their runtime identity.
@@ -875,7 +967,12 @@ Over the same fit-eligible population -- non-midpoint pixels from source frames
 with non-midpoint range -- it reports:
 
 ```text
+actual_pair_count
+actual_midpoint_count
+actual_midpoint_fraction
+actual_flat_frame_count
 actual_source_mean
+actual_source_variance
 actual_source_std
 actual_output_mean
 actual_output_std
@@ -887,8 +984,17 @@ actual_endpoint_counts = output code-0/code-65535 counts and fractions
 
 The verifier implements its own fixed-order float64 Chan accumulator over the
 decoded final PNGs; it does not import the producer's fit, candidate, or
-diagnostic accumulator. It requires actual correlation at least `0.50`, actual
-contrast ratio in `[0.50, 1.05]`, and actual mean drift at most
+diagnostic accumulator. Its independent implementation nevertheless follows the
+specified source decode, C-row-major tile boundaries, Chan merge order, and
+positive-zero/bounded-stat canonicalization. Therefore actual pair, midpoint,
+and flat-frame counts must exactly equal their diagnostics; actual midpoint
+fraction and actual source mean, population variance, and standard deviation
+must have the same `float.hex()` values as `midpoint_fraction`, `source_mean`,
+`source_variance`, and `source_std`. These are exact source-contract checks, not
+quality tolerances.
+
+The verifier requires actual correlation at least `0.50`, actual contrast ratio
+in `[0.50, 1.05]`, and actual mean drift at most
 `0.01 + PNG_QUANTIZATION_ALLOWANCE`, where the fixed conservative allowance is
 exactly `1.0 / 65535.0`. It also requires the final actual output mean and
 standard deviation to match diagnostic `candidate_mean` and `candidate_std`
