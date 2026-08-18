@@ -111,6 +111,8 @@ def build_vdpp_execution_plan(native_shape: tuple[int, int]) -> dict[str, Any]:
         "derived_diagnostics_policy": "recompute-from-canonical-persisted-moments-v1",
         "variance_diagnostics": "persist-compared-population-variance-v1",
         "calibration_diagnostics_schema": "strict-exact-keys-derived-tile-budget-v5",
+        "partial_resume_numeric_runtime_policy": ("interpreter-platform-versions-reducer-probe-v1"),
+        "opencv_runtime_policy": "version-bound-decoded-u16-semantics-v1",
         "fallback_reason_order": list(FALLBACK_REASON_ORDER),
         "midpoint_code": MIDPOINT_CODE,
         "model_midpoint_value": MODEL_MIDPOINT_VALUE,

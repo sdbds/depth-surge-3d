@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import platform
 from collections import namedtuple
 from pathlib import Path
+import sys
 
 import cv2
 import numpy as np
@@ -817,7 +819,9 @@ def test_flat_frame_inside_ranged_shot_is_model_fed_midpoint_and_copied_exactly(
     assert manifest["calibration"]["flat_frame_count"] == 1
 
 
-def test_runtime_identity_records_numpy_and_opencv_versions(tmp_path: Path) -> None:
+def test_runtime_identity_records_host_versions_and_numeric_behavior(
+    tmp_path: Path,
+) -> None:
     depth_files, _frame_files, directories = _write_base(tmp_path, 1, [])
     _coordinator(tmp_path, _FakePostprocessor()).generate_files(
         depth_files,
@@ -826,8 +830,76 @@ def test_runtime_identity_records_numpy_and_opencv_versions(tmp_path: Path) -> N
     )
     metadata = json.loads((directories["disparity_stabilized"] / "metadata.json").read_text())
     provenance = metadata["execution_provenance"]
+    assert provenance["python_implementation"] == platform.python_implementation()
+    assert provenance["python_version"] == platform.python_version()
+    assert provenance["platform_system"] == platform.system()
+    assert provenance["platform_machine"] == platform.machine()
+    assert provenance["sys_byteorder"] == sys.byteorder
     assert provenance["numpy_version"] == np.__version__
     assert provenance["opencv_version"] == cv2.__version__
+    assert provenance["numeric_reducer_probe"]["schema"] == ("vdpp-numeric-reducer-probe-v1")
+
+
+@pytest.mark.parametrize(
+    ("first_numpy", "first_probe", "second_numpy", "second_probe"),
+    [
+        ("same", "probe-a", "same", "probe-b"),
+        ("numpy-a", "same-probe", "numpy-b", "same-probe"),
+    ],
+)
+def test_partial_resume_resets_when_host_numeric_identity_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_numpy: str,
+    first_probe: str,
+    second_numpy: str,
+    second_probe: str,
+) -> None:
+    depth_files, _frame_files, directories = _write_base(tmp_path, 4, [2])
+
+    def host_identity(numpy_version: str, probe_value: str) -> dict[str, object]:
+        return {
+            "python_implementation": "CPython",
+            "python_version": "3.test",
+            "platform_system": "test-system",
+            "platform_machine": "test-machine",
+            "sys_byteorder": "little",
+            "numpy_version": numpy_version,
+            "opencv_version": "opencv-same",
+            "numeric_reducer_probe": {
+                "schema": "vdpp-numeric-reducer-probe-v1",
+                "value": probe_value,
+            },
+        }
+
+    monkeypatch.setattr(
+        temporal_stabilizer_module,
+        "collect_vdpp_host_runtime_identity",
+        lambda: host_identity(first_numpy, first_probe),
+        raising=False,
+    )
+    first = _FakePostprocessor(fail_shot=1)
+    with pytest.raises(RuntimeError, match="fake VDPP failure"):
+        _coordinator(tmp_path, first).generate_files(
+            depth_files,
+            {"temporal_postprocessor": "vdpp"},
+            directories,
+        )
+
+    monkeypatch.setattr(
+        temporal_stabilizer_module,
+        "collect_vdpp_host_runtime_identity",
+        lambda: host_identity(second_numpy, second_probe),
+        raising=False,
+    )
+    resumed = _FakePostprocessor()
+    _coordinator(tmp_path, resumed).generate_files(
+        depth_files,
+        {"temporal_postprocessor": "vdpp"},
+        directories,
+    )
+
+    assert resumed.shot_number == 2
 
 
 def test_61_frame_overlap_counts_each_pair_once_and_preserves_midpoints(

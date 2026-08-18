@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import math
+import platform
 import shutil
 import sys
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ from ...core.vdpp_calibration import (
     candidate_tile,
     canonical_derived_diagnostics,
     canonicalize_float,
+    collect_vdpp_numeric_runtime_probe,
     finalize_pair_moments,
     merge_pair_states,
     merge_scalar_states,
@@ -68,6 +70,21 @@ def _default_postprocessor_factory(checkpoint_path: Path, device: str):
     )
 
 
+def collect_vdpp_host_runtime_identity() -> dict[str, Any]:
+    """Describe the host and fingerprint the exact calibration operations."""
+
+    return {
+        "python_implementation": platform.python_implementation(),
+        "python_version": platform.python_version(),
+        "platform_system": platform.system(),
+        "platform_machine": platform.machine(),
+        "sys_byteorder": sys.byteorder,
+        "numpy_version": str(np.__version__),
+        "opencv_version": str(cv2.__version__),
+        "numeric_reducer_probe": collect_vdpp_numeric_runtime_probe(),
+    }
+
+
 def collect_vdpp_runtime_identity(
     device: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -94,8 +111,7 @@ def collect_vdpp_runtime_identity(
         except RuntimeError:
             pass
     identity = {
-        "numpy_version": str(np.__version__),
-        "opencv_version": str(cv2.__version__),
+        **collect_vdpp_host_runtime_identity(),
         "torch_version": str(torch.__version__),
         "xformers_version": xformers_version,
         "attention_backend": attention_backend,
@@ -914,15 +930,14 @@ class TemporalDepthStabilizer:
         runtime_identity, execution_provenance = self._runtime_identity_provider(
             self.effective_device
         )
+        host_runtime_identity = collect_vdpp_host_runtime_identity()
         runtime_identity = {
             **runtime_identity,
-            "numpy_version": str(np.__version__),
-            "opencv_version": str(cv2.__version__),
+            **host_runtime_identity,
         }
         execution_provenance = {
             **execution_provenance,
-            "numpy_version": str(np.__version__),
-            "opencv_version": str(cv2.__version__),
+            **host_runtime_identity,
         }
         store = StabilizedDepthStore(
             stable_root,

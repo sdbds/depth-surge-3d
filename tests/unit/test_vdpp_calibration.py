@@ -8,6 +8,7 @@ import random
 import numpy as np
 import pytest
 
+import src.depth_surge_3d.core.vdpp_calibration as vdpp_calibration_module
 from src.depth_surge_3d.core.vdpp_calibration import (
     MAX_POSTCLIP_MEAN_DRIFT,
     MAX_PRECLIP_OUT_OF_RANGE_FRACTION,
@@ -199,6 +200,33 @@ def test_fixed_constants_match_the_v2_execution_contract() -> None:
     assert MAX_PRECLIP_OUT_OF_RANGE_FRACTION == 0.01
 
 
+def test_numeric_runtime_probe_fingerprints_the_pinned_reducer_and_chan_paths() -> None:
+    collect_probe = getattr(
+        vdpp_calibration_module,
+        "collect_vdpp_numeric_runtime_probe",
+        None,
+    )
+    assert callable(collect_probe), "VDPP numeric runtime probe is missing"
+
+    assert collect_probe() == {
+        "schema": "vdpp-numeric-reducer-probe-v1",
+        "scalar_mean_hex": "0x1.1c77032d2d2d3p-1",
+        "scalar_m2_hex": "0x1.9b2e1ef3e8a83p+0",
+        "pair_mean_x_hex": "0x1.181be15555555p-1",
+        "pair_mean_y_hex": "0x1.2b9e515555555p-2",
+        "pair_m2_x_hex": "0x1.06e24c34790abp-4",
+        "pair_m2_y_hex": "0x1.b8fa5e68e8caap-4",
+        "pair_c_xy_hex": "-0x1.d88cb98467556p-5",
+        "chan_mean_hex": "0x1.71c71c71c71c8p-2",
+        "chan_variance_hex": "0x1.4a4587e6b74f1p-3",
+        "chan_pair_mean_x_hex": "0x1.71c71c71c71c8p-2",
+        "chan_pair_mean_y_hex": "0x1.2aaaaaaaaaaaap-1",
+        "chan_pair_m2_x_hex": "0x1.738e38e38e38fp+0",
+        "chan_pair_m2_y_hex": "0x1.0800000000000p+1",
+        "chan_pair_c_xy_hex": "-0x1.7111111111112p-1",
+    }
+
+
 def test_v2_execution_plan_persists_every_calibration_policy() -> None:
     plan = build_vdpp_execution_plan((608, 1080))
 
@@ -210,6 +238,10 @@ def test_v2_execution_plan_persists_every_calibration_policy() -> None:
     assert plan["midpoint_code_policy"] == "preserve-u16-32768-heuristic-v2"
     assert plan["derived_diagnostics_policy"] == ("recompute-from-canonical-persisted-moments-v1")
     assert plan["calibration_diagnostics_schema"] == ("strict-exact-keys-derived-tile-budget-v5")
+    assert plan["partial_resume_numeric_runtime_policy"] == (
+        "interpreter-platform-versions-reducer-probe-v1"
+    )
+    assert plan["opencv_runtime_policy"] == ("version-bound-decoded-u16-semantics-v1")
     assert plan["fallback_reason_order"] == [
         "source_no_range",
         "too_few_pairs",
@@ -243,6 +275,28 @@ def test_frame_normalization_is_float32_and_preserves_midpoint_model_value() -> 
     assert ranged is True
     assert target.dtype == np.float32
     assert np.array_equal(target, expected)
+
+
+def test_frame_normalization_reuses_its_only_full_frame_mask_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = np.array(
+        [[1000, MIDPOINT_CODE, 1001], [1003, 1002, MIDPOINT_CODE]],
+        dtype=np.uint16,
+    )
+    target = np.empty(source.shape, dtype=np.float32)
+    original_logical_not = np.logical_not
+    inverted_mask_ids: list[int] = []
+
+    def track_logical_not(values, *args, **kwargs):
+        assert kwargs.get("out") is values
+        inverted_mask_ids.append(id(values))
+        return original_logical_not(values, *args, **kwargs)
+
+    monkeypatch.setattr(vdpp_calibration_module.np, "logical_not", track_logical_not)
+
+    assert normalize_vdpp_input_frame(source, target) is True
+    assert len(inverted_mask_ids) == 1
 
 
 @pytest.mark.parametrize(

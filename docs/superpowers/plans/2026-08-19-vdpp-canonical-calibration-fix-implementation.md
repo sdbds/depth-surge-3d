@@ -108,3 +108,11 @@
 - [x] Run the complete unit suite and relevant static/format checks.
 - [x] Inspect `git diff --check`, status, and scoped diff; verify no base-depth/cache identities changed.
 - [x] Record the external fixture as the only remaining sign-off blocker unless it has been recaptured during implementation.
+
+### Task 9: Review Follow-Up For Runtime-Bound Partial Resume
+
+- [x] Add a deterministic numeric behavior probe covering the pinned two-pass reducers and sequential Chan merge, then persist it with interpreter/platform and NumPy/OpenCV identity.
+- [x] Prove a building artifact resets for the same NumPy version with a different probe and for a different NumPy version with the same probe.
+- [x] Document the conservative OpenCV version policy: decoded uint16 pixels are semantic, while PNG byte hashes provide integrity rather than cross-runtime encoder identity.
+- [x] Reuse one full-frame normalization mask and instrument its in-place reversal.
+- [x] Rerun focused and complete verification, then publish the review fix on the existing branch.

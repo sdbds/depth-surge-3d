@@ -297,6 +297,94 @@ def merge_pair_states(a: PairTileState, b: PairTileState) -> PairTileState:
     return PairTileState(n, mean_x, mean_y, m2_x, m2_y, c_xy)
 
 
+def collect_vdpp_numeric_runtime_probe() -> dict[str, str]:
+    """Fingerprint the exact NumPy reductions and Python Chan operations in use."""
+
+    scalar_values = np.array(
+        [
+            0.2712900638580322,
+            0.7885109782218933,
+            0.9661115407943726,
+            0.8313783407211304,
+            0.8321383595466614,
+            0.8936092853546143,
+            0.4458301067352295,
+            0.4170106053352356,
+            0.8177664875984192,
+            0.1028597354888916,
+            0.7648928761482239,
+            0.16799843311309814,
+            0.09131741523742676,
+            0.8898534178733826,
+            0.634506344795227,
+            0.13384193181991577,
+            0.39620745182037354,
+        ],
+        dtype=np.float32,
+    )
+    scalar = reduce_scalar_tile(
+        scalar_values,
+        np.ones(scalar_values.shape, dtype=np.bool_),
+    )
+
+    pair_x = np.array(
+        [0.6486990451812744, 0.6523162722587585, 0.3402478098869324],
+        dtype=np.float32,
+    )
+    pair_y = np.array(
+        [0.3692907691001892, 0.03194546699523926, 0.4765521287918091],
+        dtype=np.float32,
+    )
+    pair = reduce_pair_tile(pair_x, pair_y, np.ones(3, dtype=np.bool_))
+
+    chan_states = (
+        PairTileState(2, 0.25, 0.5, 0.125, 0.5, 0.25),
+        PairTileState(3, 0.75, 0.25, 0.375, 0.125, -0.125),
+        PairTileState(4, 0.125, 0.875, 0.25, 0.75, -0.2),
+    )
+    chan_pair = merge_pair_states(
+        merge_pair_states(chan_states[0], chan_states[1]),
+        chan_states[2],
+    )
+    chan_scalar = merge_scalar_states(
+        merge_scalar_states(
+            ScalarTileState(
+                chan_states[0].count,
+                chan_states[0].mean_x,
+                chan_states[0].m2_x,
+            ),
+            ScalarTileState(
+                chan_states[1].count,
+                chan_states[1].mean_x,
+                chan_states[1].m2_x,
+            ),
+        ),
+        ScalarTileState(
+            chan_states[2].count,
+            chan_states[2].mean_x,
+            chan_states[2].m2_x,
+        ),
+    )
+
+    return {
+        "schema": "vdpp-numeric-reducer-probe-v1",
+        "scalar_mean_hex": scalar.mean.hex(),
+        "scalar_m2_hex": scalar.m2.hex(),
+        "pair_mean_x_hex": pair.mean_x.hex(),
+        "pair_mean_y_hex": pair.mean_y.hex(),
+        "pair_m2_x_hex": pair.m2_x.hex(),
+        "pair_m2_y_hex": pair.m2_y.hex(),
+        "pair_c_xy_hex": pair.c_xy.hex(),
+        "chan_mean_hex": chan_scalar.mean.hex(),
+        "chan_variance_hex": (chan_scalar.m2 / chan_scalar.count).hex(),
+        "chan_pair_mean_x_hex": chan_pair.mean_x.hex(),
+        "chan_pair_mean_y_hex": chan_pair.mean_y.hex(),
+        "chan_pair_m2_x_hex": chan_pair.m2_x.hex(),
+        "chan_pair_m2_y_hex": chan_pair.m2_y.hex(),
+        "chan_pair_c_xy_hex": chan_pair.c_xy.hex(),
+    }
+
+
 def finalize_pair_moments(
     state: PairTileState,
     *,
@@ -348,13 +436,12 @@ def normalize_vdpp_input_frame(source_u16: np.ndarray, target_f32: np.ndarray) -
     ):
         raise TypeError("VDPP target frame must be a matching float32 NumPy array")
 
-    midpoint_mask = source_u16 == np.uint16(MIDPOINT_CODE)
-    non_midpoint = ~midpoint_mask
-    if not bool(np.any(non_midpoint)):
+    frame_mask = source_u16 != np.uint16(MIDPOINT_CODE)
+    if not bool(np.any(frame_mask)):
         target_f32.fill(np.float32(MODEL_MIDPOINT_VALUE))
         return False
-    lo_code = int(np.min(source_u16, where=non_midpoint, initial=np.iinfo(np.uint16).max))
-    hi_code = int(np.max(source_u16, where=non_midpoint, initial=np.iinfo(np.uint16).min))
+    lo_code = int(np.min(source_u16, where=frame_mask, initial=np.iinfo(np.uint16).max))
+    hi_code = int(np.max(source_u16, where=frame_mask, initial=np.iinfo(np.uint16).min))
     if lo_code == hi_code:
         target_f32.fill(np.float32(MODEL_MIDPOINT_VALUE))
         return False
@@ -362,7 +449,8 @@ def normalize_vdpp_input_frame(source_u16: np.ndarray, target_f32: np.ndarray) -
     target_f32[...] = source_u16
     target_f32 -= np.float32(lo_code)
     target_f32 /= np.float32(hi_code - lo_code)
-    target_f32[midpoint_mask] = np.float32(MODEL_MIDPOINT_VALUE)
+    np.logical_not(frame_mask, out=frame_mask)
+    target_f32[frame_mask] = np.float32(MODEL_MIDPOINT_VALUE)
     return True
 
 
