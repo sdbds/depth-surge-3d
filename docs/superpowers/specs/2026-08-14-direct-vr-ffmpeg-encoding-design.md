@@ -10,8 +10,9 @@ behavior.
 This document is partially superseded by
 `2026-08-19-stereo-quality-edge-reconstruction-canonical.md`. Its
 "Relationship to Final Encoding Specifications" authority map is controlling:
-this document retains the opt-in/source-selection/layout/encoder-quality/basic
-UX decisions, while the canonical specification replaces input validation,
+this document retains the decisions about opt-in behavior, source-selection
+policy, layout, encoder quality, and basic UX, but not the eager source-resolver
+return interface; the canonical specification replaces input validation,
 audio and `-shortest` policy, command normalization, publication/manifests,
 container validation, resume, and cleanup. The sentence above about unchanged
 recovery behavior does not override that later transaction contract.
