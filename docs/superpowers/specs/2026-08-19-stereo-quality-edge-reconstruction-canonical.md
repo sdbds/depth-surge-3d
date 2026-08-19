@@ -108,7 +108,8 @@ defects.
   or a new third-party dependency.
 - Optical-flow or sequential temporal stabilization in Quality v1.
 - Changing model resolution, calibration, strength, convergence, camera
-  equations, crop, distortion, upscaling, VR assembly, or encoding.
+  equations, crop, distortion, upscaling, or VR assembly. Encoding changes are
+  limited to the explicit N-frame/audio-duration and publication contracts.
 - Hiding artifacts by blurring colour or lowering stereo strength.
 - Making the fixed 16-lane sample count user-configurable.
 
@@ -177,6 +178,14 @@ defects.
 | Target Sobel could consume barrier or provisional values outside its 7x7 patch | Score a target gradient only when its reflected 3x3 support is entirely processed non-barrier context. |
 | Quality-none identity included an unused fill limit | Make all repair-limit identity and diagnostics fields null for Quality none, so a limit-only change preserves RGB and downstream stages. |
 | Public integer validation could accept booleans | Reject Python/NumPy booleans before the `Integral` check and normalize accepted values to Python `int`. |
+| Relative Quality reassociated the legacy eye-offset arithmetic | Split relative and geometry offset builders; relative displacement, q-jump, and splat offsets all use the exact current Fast operation order. |
+| A persisted prune path did not identify the audited directory object | Bind every prune entry to platform physical identity plus a durably committed random marker, and reject replacements or descendant mounts. |
+| Zero-retained one-sided interpolation had an unbounded linear search | Add a deterministic per-region implicit k-d index, fixed memory and visit cap, fatal overflow, diagnostics, and Task 0 gates. |
+| Quality guide and native geometry identity could reuse stat-only metadata | Add one retained source-ordered Quality content manifest over every guide and actual native geometry payload byte. |
+| Configured I/O workers could exceed lifecycle capacity | Derive and create only effective workers, charge their bounded thread envelope, and attest configured/effective/actual counts. |
+| Full-frame validation conflicted with output-level `-shortest` | Make the N-frame image sequence authoritative, remove audio `-shortest`, define audio selection/trimming, and fix normalized argument token grammar. |
+| Encoding identities recorded but did not constrain PNG headers | Require uniform RGB8 IHDRs per consumed sequence and exact expected assembled dimensions before FFmpeg. |
+| Pre/post hashing overstated protection against external ABA mutation | State the project-lock trust boundary explicitly and describe inputs as pre/post validated rather than absolutely observed bytes. |
 
 ## Public Settings Contract
 
@@ -294,7 +303,7 @@ The stereo RGB and diagnostics algorithm identities are:
 
 ```text
 Fast RGB schema/algorithm: 1 / torch-horizontal-16x-zbuffer-v3
-Quality RGB schema/algorithm: 2 / torch-horizontal-16x-rgb-geodesic-repair-v5
+Quality RGB schema/algorithm: 2 / torch-horizontal-16x-rgb-geodesic-repair-v6
 Diagnostics schema/algorithm: 1 / stereo-coverage-sidecar-v1
 ```
 
@@ -306,10 +315,11 @@ that exact case.
 
 Quality stage identity is constructed before rendering. It retains every
 output-affecting current stage field, including geometry mode, ordered frame
-names, render shape, `occlusion_fill`, encoding, upstream geometry identity,
-relative or metric projection settings, Quality RGB algorithm identity, and
-source RGB guide fingerprint. Its repair-policy fields are conditional but keep
-one strict key set:
+names, render shape, `occlusion_fill`, encoding, upstream geometry provenance,
+relative or metric projection settings, Quality RGB algorithm identity, and all
+three hashes from the Quality content manifest below. Upstream metadata is never
+a substitute for payload content identity. Its repair-policy fields are
+conditional but keep one strict key set:
 
 ```text
 Quality background:
@@ -328,6 +338,84 @@ Quality none:
 Quality none never computes a local limit. The saved user setting remains
 available as non-semantic job provenance but does not enter RGB or diagnostics
 identity.
+
+### Quality Input Content Manifest
+
+Before a Quality reuse decision or stage mutation, stream the prospective object
+and compare it with any retained
+`04_stereo_diagnostics/quality_input_manifest.json`. It has exactly:
+
+```text
+schema_version:                       1
+algorithm_version:                    "quality-input-content-v1"
+geometry_mode:                        "relative" | "metric"
+frame_names:                          list[string]
+guides:                               list[QualityGuideIdentity]
+geometry:                             list[RelativeGeometryIdentity] |
+                                      list[MetricGeometryIdentity]
+relative_encoding_scale_float32_bits: string | null
+source_guide_fingerprint:             string
+native_geometry_fingerprint:          string
+fingerprint:                          string
+```
+
+All three lists have the same positive source-order length and exact frame-name
+mapping. `QualityGuideIdentity` has exactly `frame_name`, output-root-relative
+`relative_path`, full-file `sha256`, `byte_count`, and `png_header`. The header
+has exact integer `width`, `height`, `bit_depth`, and `color_type`; every guide
+must be RGB PNG color type 2, bit depth 8, and render shape `[H,W]` before
+OpenCV's fixed `IMREAD_COLOR` BGR8 decode contract is allowed.
+
+`RelativeGeometryIdentity` has exactly `frame_name`, `relative_path`, `sha256`,
+`byte_count`, `payload_kind="canonical_png"`, and `png_header`. Every canonical
+payload is a grayscale PNG color type 0, bit depth 16, at the one validated
+native shape. `relative_encoding_scale_float32_bits` is its positive finite
+IEEE-754 binary32 bit pattern as exactly eight lowercase hexadecimal digits.
+
+`MetricGeometryIdentity` has exactly `frame_name`, `relative_path`, `sha256`,
+`byte_count`, `payload_kind="metric_npz"`, `native_shape`,
+`inverse_depth_dtype="float32"`, `valid_dtype="bool"`,
+`focal_x_normalized_float32_bits`, and
+`members=["inverse_depth.npy","valid.npy","focal_x_normalized.npy"]` in that
+order. The parsed arrays/scalar must satisfy the existing metric store contract;
+the focal bit pattern is exactly eight lowercase hexadecimal digits. Relative
+mode requires only relative entries and a non-null scale; metric mode requires
+only metric entries and a null scale.
+
+Every path is opened as a regular file beneath the acquired job root without
+following links or reparse points. Hash the complete raw PNG or NPZ bytes, not a
+sample, decoded-pixel subset, size/mtime tuple, upstream manifest, or parsed
+array summary. Define:
+
+```text
+source_guide_fingerprint = SHA256(canonical_json(guides))
+native_geometry_fingerprint = SHA256(canonical_json({
+    "geometry_mode": geometry_mode,
+    "relative_encoding_scale_float32_bits":
+        relative_encoding_scale_float32_bits,
+    "geometry": geometry,
+}))
+```
+
+The object self-fingerprint then binds both derived hashes. The Quality RGB
+identity includes `source_guide_fingerprint`, `native_geometry_fingerprint`, and
+the raw SHA-256 of the complete canonical manifest bytes. Diagnostics metadata
+stores those same three hashes. The embedded self-fingerprint is validated but
+is not a fourth stage-identity field. Fast v3 neither writes nor consumes this
+manifest and retains its existing identity unchanged.
+
+The manifest is streamed without an `O(N)` Python object tree. Header parsing and
+full hashing use the same non-following open handle for each file. A matching
+valid retained manifest is reused without rewrite. Otherwise, after disk
+preflight, publish the replacement atomically before `building` diagnostics
+metadata, which references its raw hash. Immediately before Quality aggregate
+consolidation, reopen every listed input and reproduce the complete manifest bytes and all
+three hashes; any mismatch fails the stage while it is still `building`. A crash
+leaving only an orphan manifest claims no stage. Missing, noncanonical, stale,
+or corrupt Quality content evidence forces `P=N` and normal downstream
+invalidation; a mask-only migration is allowed only after this validation and
+does not rewrite the manifest. The manifest remains with historical diagnostics
+after `payload_pruned` and is a forbidden cleanup target.
 
 `renderer_device_type` is not a Quality semantic identity field: CPU and CUDA
 must produce the same bytes and may reuse one another's valid Quality stage.
@@ -370,14 +458,27 @@ Quality primitive geometry + source-region labels
 visibility pass. It still emits compact coverage diagnostics. Fast retains the
 Revision 5 single-pass renderer exactly.
 
-### Quality Eye-offset Builder
+### Eye-offset Builders
 
 Quality never calls either current helper which returns both full-frame eye maps
 and materializes full-frame float64 expressions. It allocates one contiguous
-`int32[H,W]` output and one `float64[W]` row scratch, then invokes:
+`int32[H,W]` output and one `float64[W]` row scratch. Relative and geometry paths
+use different builders because their IEEE-754 operation order is not
+interchangeable:
 
 ```python
-def build_quality_eye_offsets_into(
+def build_relative_eye_offsets_into(
+    near_score: np.ndarray,
+    *,
+    stereo_strength: float,
+    convergence: float,
+    eye: Literal["left", "right"],
+    output_int32: np.ndarray,
+    row_float64_scratch: np.ndarray,
+) -> None:
+    ...
+
+def build_geometry_eye_offsets_into(
     total_disparity_fraction: np.ndarray,
     *,
     eye: Literal["left", "right"],
@@ -387,8 +488,23 @@ def build_quality_eye_offsets_into(
     ...
 ```
 
-Rows and columns are visited in ascending order. For each source binary64 value
-`f`, the scalar oracle performs these separately rounded binary64 operations:
+Rows and columns are visited in ascending order. Throughout both formulas and
+low-resolution region classification, `W` is always the final render width,
+never the native primitive width. Relative first computes the row-constant scale
+exactly as current Fast:
+
+```text
+scale = float64(float64(W) * float64(stereo_strength))
+scale = float64(scale / float64(200.0))
+shift = float64(float64(float32(near_score)) - float64(convergence))
+shift = float64(shift * scale)
+shift = float64(shift * float64(16.0))
+left  = ceil(float64( shift - float64(0.5)))
+right = ceil(float64(-shift - float64(0.5)))
+```
+
+Geometry paths preserve the current metric/full-geometry order for each source
+binary64 value `f`:
 
 ```text
 shift = float64(f * float64(W))
@@ -398,13 +514,27 @@ left  = ceil(float64( shift - float64(0.5)))
 right = ceil(float64(-shift - float64(0.5)))
 ```
 
-Select only the requested eye, range-check before narrowing, and store int32.
-A row-vectorized implementation is allowed only when it matches that scalar
-oracle exactly. The map is immutable through the current eye's analysis/repair
-passes and every CUDA OOM retry; it is never rebuilt after an OOM. Release it
-only after that eye commits in memory, then reuse the same allocation for the
-other eye. The row scratch is included in fixed runtime overhead. Host allocation
-or construction failure is fatal rather than a band-height retry.
+Relative Fast and Relative Quality use only the relative builder. Metric Fast
+and Metric Quality use only the geometry builder. Relative source-region
+displacement, four-neighbour q-jump, `predicted_gap_px`, and final splat offsets
+all derive from the same relative `near_score`, strength, convergence, and
+written operation order; `total_disparity_fraction` is not an alternate relative
+offset authority. Low-resolution classification invokes the same scalar sequence
+with final render `W`; it does not fake a native-size output map merely to call
+the full-resolution builder.
+
+Select only the requested eye, range-check before narrowing, and store int32. A
+row-vectorized implementation is allowed only when it matches its scalar oracle
+exactly. The map is immutable through the current eye's analysis/repair passes
+and every CUDA OOM retry; it is never rebuilt after an OOM. Release it only after
+that eye commits in memory, then reuse the same allocation for the other eye. The
+row scratch is included in fixed runtime overhead. Host allocation or
+construction failure is fatal rather than a band-height retry.
+
+The exact relative fixture `W=1920`, `stereo_strength=2.0`,
+`convergence=0.5`, and float32 `near_score=0.9052734375` must produce fine shift
+`124.5` and left offset `124`. The reassociated total-fraction result `125` is a
+test failure. One-ULP fixtures straddle both signs and every half-lane boundary.
 
 ### Native File-pipeline Input Boundary
 
@@ -538,16 +668,23 @@ recomputed from the selected primitives in their existing evaluation order.
 
 ### Relative Dependency Order
 
-The relative primitive is canonical near score `r`. The derived total disparity
-fraction is recomputed after one-sided resampling:
+The relative primitive is canonical float32 near score `r`. The compatibility
+geometry field is recomputed after one-sided resampling in the current
+`build_relative_geometry` order:
 
 ```text
-total_disparity_fraction = (float64(r) - float64(convergence))
-                           * float64(stereo_strength) / 100
+total = float64(float64(r) - float64(convergence))
+total = float64(total * float64(stereo_strength))
+total = float64(total / float64(100.0))
+total_disparity_fraction = total
 ```
 
 Outside edge bands, both `near_score` and `total_disparity_fraction` are copied
-from the exact Fast baseline rather than recomputed.
+from the exact Fast baseline rather than recomputed. This compatibility field is
+never multiplied back into a Relative eye offset. Low-resolution region
+displacement and full-resolution q-jumps instead stop the exact relative builder
+after `shift * scale`, before its fine-lane multiplication, so region splitting,
+limit prediction, and splatting cannot disagree by reassociation.
 
 ### Metric Dependency Order
 
@@ -631,8 +768,64 @@ distance2 = (dx * dx) + (dy * dy)
 
 Choose the lowest `distance2`, then lowest `iy`, then lowest `ix`. Production
 must disable fused multiply-add for this comparison or use the scalar oracle
-path. This fallback is rare and deliberately favors a unique numeric contract
-over vectorized throughput.
+path. It never linearly scans all region members per query.
+Metric retained-zero handling performs one location query and reads both
+primitive values from that selected native sample; it never counts or searches
+the same output coordinate twice.
+
+After low-resolution region IDs finalize, production releases union parent,
+canonical-key, and rank scratch while retaining only final IDs, then builds a
+separate exact per-region implicit two-dimensional k-d index. Let `R` be the
+positive region count and `G=SH*SW`; require checked `G+1 <= UINT32_MAX` (which
+also proves `R+1`) before
+allocation. The index owns exactly a uint32 `member_index[G]`, uint32
+`region_offsets[R+1]`, and fixed 64-entry construction/query stacks inside
+runtime overhead. It therefore adds at most `8*G+4` bytes and no pointer/object
+per sample.
+
+Build grouping is unique. Count region ID `r` into `region_offsets[r-1]`, prefix
+entries `0..R-1` in place to region ends, and set the untouched sentinel
+`region_offsets[R]=G`. Visit native samples in reverse row-major order,
+pre-decrement `region_offsets[r-1]`, and write the uint32 sample index there. The
+result is row-major members with starts in `0..R-1` and final sentinel `G`.
+Within each range, reuse the repair index's in-place deterministic
+median-of-medians partition: row axis first, alternate row/column by depth,
+choose the lower median by `(axis coordinate, other coordinate, sample_index)`,
+and use implicit child ranges.
+
+Query retained-zero pixels in output row-major order. Visit the nearer child
+first; an axis tie visits the lower child first. Visit the farther child exactly
+when the separately rounded squared split-plane distance is less than or equal
+to the current best distance, because an equal-distance point may win by
+`(iy,ix)`. Candidate comparison is exactly `(distance2,iy,ix)` from the scalar
+oracle. A selected region with no indexed member is an internal deterministic
+error.
+
+Because every partition uses its lower median, tree height is at most 32 for
+`G<=UINT32_MAX`; the fixed 64-entry build and query stacks therefore cannot
+overflow. Stack overflow is nevertheless checked and is an internal fatal error,
+never permission to recurse or allocate.
+
+Define:
+
+```text
+QUALITY_GEOMETRY_NEAREST_VISIT_CAP = 268_435_456
+```
+
+Each examined node increments one checked uint64 frame counter. Exceeding the
+cap raises `QualityGeometryQueryBudgetError` and discards all partial geometry;
+it never selects the current best, changes region, scans linearly, or falls back
+to Fast. Allocation/index-build failure is likewise fatal before any frame
+transaction commits. Release member/offset storage immediately after all
+relative primitive or both metric primitive resamples complete and before the
+full-resolution region solver.
+
+Frame diagnostics record `indexed_sample_count`, `query_count`,
+`visited_nodes_total`, and `visited_nodes_max`; Task 0 additionally records p95
+as non-semantic benchmark telemetry. Build work is `O(G log G)`, memory is
+`O(G)`, expected query work is `O(log G)`, exact worst-case work is `O(G)`, and
+the total examined-node cap is an explicit fatal resource boundary. Scalar
+brute force remains the independent correctness oracle, not a production path.
 
 ## Deterministic RGB-guided Region Solver
 
@@ -642,8 +835,8 @@ solver with sparse stable seeds.
 ### Low-resolution Region IDs
 
 For every primitive sample, derive its final one-eye displacement in output
-pixels through the selected relative or metric formula. Two four-neighbour
-samples are disconnected when either condition holds:
+pixels through the selected relative or metric builder order above. Two
+four-neighbour samples are disconnected when either condition holds:
 
 - their metric validity differs;
 - their absolute one-eye displacement difference is at least `1.0` output
@@ -1427,6 +1620,7 @@ with existing v3. Every path below is relative to the job output root:
 ```text
 04_stereo_diagnostics/
     metadata.json
+    quality_input_manifest.json  # Quality only
     stereo_coverage_frames.jsonl
     stereo_coverage_summary.json
     frames/frame_000089/
@@ -1478,7 +1672,7 @@ input files and stream the canonical representation for the future job-root
 
 ```text
 schema_version:    1
-algorithm_version: "encoding-input-sequence-v1"
+algorithm_version: "encoding-input-sequence-v2"
 mode:              "direct_stereo" | "assembled_vr"
 frame_names:       list[string]
 left:              list[EncodingImageIdentity] | null
@@ -1509,6 +1703,17 @@ The manifest contains only files FFmpeg reads as image inputs. Diagnostics masks
 stats, their manifests/fingerprints, mask-retention policy, mtimes, and semantic
 stage fingerprints are forbidden.
 
+The prepass validates every IHDR from the same open handle used for hashing.
+Every consumed image is PNG color type 2, bit depth 8. In direct mode every left
+header equals the first left header and every right header equals the first
+right header. If both first headers equal the configured positive per-eye
+dimensions, stack them without scaling; otherwise apply the existing
+`scale=<per_eye_width>:<per_eye_height>:flags=bicubic+accurate_rnd` filter to
+both inputs before stacking, even when only one input differed. In assembled
+mode every header must already equal the exact configured final VR width and
+height; assembled encoding never repairs a size mismatch in FFmpeg. Palette,
+grayscale, RGBA, non-8-bit, and intra-sequence shape changes fail before FFmpeg.
+
 `frame_names` are unique canonical stems `frame_<six-or-more-digits>` in
 gap-free numeric order; each identity path's filename is exactly its stem plus
 `.png`. For every selected parent, the complete `frame_*.png` directory listing
@@ -1523,10 +1728,47 @@ self-fingerprint. A diagnostics-only or mask true-to-false migration leaves it
 unchanged. Semantic stage identity may be recorded only in separate execution
 provenance which is not an input to this object or final-video identity.
 
-Audio has no entry in this image manifest. The normalized FFmpeg audio path token
-contains the complete raw audio/source-file SHA-256 and byte count actually used;
-sampled or stat-only fingerprints are forbidden. Clip selection and audio options
-remain authenticated by normalized executed arguments.
+Audio has no entry in this image manifest. When `preserve_audio=false`, neither
+encoder opens an audio source or emits an audio input, map, filter, or codec
+option. When it is true, select `original_audio.flac` if and only if that path is
+a non-link regular file; otherwise select the original-video path. There is no
+fallback from a selected FLAC to the original video after selection.
+The selected path itself must then open as a non-link regular file; otherwise
+audio preflight is fatal.
+
+Hash the selected source's complete raw bytes and pre-probe exactly its first
+audio stream `a:0` after applying the existing resolved input `-ss`/`-t` clip.
+No `a:0`, or a stream which decodes to zero PCM bytes for that clip, is
+`audio_absent`: omit the audio input and produce zero output audio streams. A
+probe error, malformed positive stream, or decode error is fatal rather than
+absence. A usable stream requires positive integer sample rate `S`, positive
+channel count, and successful full clipped-stream decode through fixed
+`pcm_s32le` to a drained pipe with a positive byte count divisible by
+`4*channels`; a fixed 1 MiB read buffer is the only retained PCM workspace and
+the decoded output is never accumulated.
+
+For usable audio, both encoder paths add exactly one audio input and explicitly
+map that input's `a:0`; optional-map `?` syntax is forbidden after preprobe. Let
+the reduced positive image rate be `fps_num/fps_den`, and compute with checked
+integers:
+
+```text
+audio_numerator  = checked_u64_mul(checked_u64_mul(N, S), fps_den)
+audio_end_sample = checked_u64_add(audio_numerator, fps_num - 1) // fps_num
+```
+
+Apply exactly `atrim=end_sample=<audio_end_sample>,asetpts=PTS-STARTPTS`, then
+encode one AAC stream. A shorter stream ends naturally; no `apad` or synthetic
+sample is allowed. A longer stream is trimmed at that sample boundary. Both
+paths explicitly map their image-derived video stream and always pass
+`-frames:v N`. Output-level `-shortest` is forbidden. Direct mode may retain
+only the video-stack-local `hstack|vstack=inputs=2:shortest=1`, because both
+validated image inputs have exactly N frames.
+
+The normalized FFmpeg audio token contains the pre/post-validated source's full
+raw SHA-256 and byte count; sampled or stat-only fingerprints are forbidden.
+Clip selection, `audio_end_sample`, maps, filter, and codec options remain
+authenticated by normalized executed arguments.
 
 The encoder streams one image identity at a time, so it never materializes an
 `O(N)` Python object tree. The pre-FFmpeg pass writes canonical bytes at the
@@ -1538,8 +1780,23 @@ length, raw hash, and self-fingerprint to match the pre-FFmpeg values. It also
 rehashes the audio source against its captured full identity. A changed file,
 header, order, or identity aborts publication; a match truncates the temporary
 to the canonical length and fsyncs it before publication.
-The job writer lock protects project mutations throughout. The committed manifest
-is retained as a final artifact, never intermediate cleanup input.
+The committed manifest is retained as a final artifact, never intermediate
+cleanup input.
+
+### Transaction Trust Boundary
+
+Content manifests, input revalidation, output validation, and the job writer
+lock authenticate project-controlled transactions, not hostile filesystem
+observation. The lock excludes every writer in this project. The operator must
+prevent external processes from mutating or replacing job-root inputs, selected
+source audio/video, encoder temporaries, and final output while a transaction is
+running. An external process which changes bytes after the prepass and restores
+them before the postpass is an unsupported ABA mutation and can evade this
+model. Consequently this specification says **pre/post-validated inputs**, not
+"the exact bytes FFmpeg consumed." A stronger adversarial model requires a
+separately reviewed immutable snapshot or handle-only media pipeline and its
+additional disk/resource contract. The same boundary applies to Quality guide
+and native-geometry reads and to full-decode/hash validation of the final video.
 
 ### Final Video Publication Manifest
 
@@ -1548,7 +1805,7 @@ Every successful final encode, regardless of `keep_intermediates`, retains
 
 ```text
 schema_version:                1
-algorithm_version:             "final-video-publication-v2"
+algorithm_version:             "final-video-publication-v3"
 relative_path:                 string
 sha256:                        string
 byte_count:                    integer
@@ -1562,11 +1819,35 @@ fingerprint:                   string
 vector passed to the successful FFmpeg process, including the actually selected
 encoder after `auto` resolution, frame rate, clip bounds, audio policy/options,
 filters, pixel format, VR format/resolution, and output options. Normalization
-replaces every input/output path token with a deterministic token containing its
-authenticated source, audio, encoding-input-manifest, or final relative-path
-identity.
-It does not include an absolute path, process ID, temporary UUID, wall time,
-hardware probe output, or a newly re-resolved setting. The fingerprint is:
+is whole-argument replacement only and has this closed ASCII grammar:
+
+```text
+argv[0] = "ffmpeg"
+@image-sequence:sha256=<64-lowercase-hex>:view=left
+@image-sequence:sha256=<64-lowercase-hex>:view=right
+@image-sequence:sha256=<64-lowercase-hex>:view=frames
+@audio:sha256=<64-lowercase-hex>:bytes=<canonical-decimal>:stream=a:0
+@output:path64=<unpadded-base64url>
+```
+
+Every image token's hash is the encoding-input manifest self-fingerprint.
+`canonical-decimal` is `0` or a nonzero digit followed by digits, although a
+selected usable audio file is necessarily positive. `path64` is unpadded RFC
+4648 base64url of UTF-8 bytes for the canonical nonempty output-root-relative
+POSIX final path. It normalizes the sibling temporary output to that intended
+final path; it never exposes a temporary name. Its grammar is one or more
+`[A-Za-z0-9_-]` characters, and decoding then canonical re-encoding must reproduce
+the token exactly.
+
+Assembled argv has image input 0 (`view=frames`) and optional audio input 1.
+Direct argv has image inputs 0/1 (`left`/`right`) and optional audio input 2.
+Only the complete path element immediately following each corresponding `-i`
+and the final output element may be replaced. Any embedded path, unrecognized
+path-bearing option, wrong input index, duplicate/missing token, absolute path,
+process ID, temporary UUID, wall time, hardware probe output, or newly
+re-resolved setting is fatal. Every other argv element and its order are copied
+byte-for-byte after strict ASCII validation; paths never undergo substring
+replacement or escaping. The fingerprint is:
 
 ```text
 encoding_settings_fingerprint = SHA256(canonical_json({
@@ -1579,8 +1860,9 @@ encoding_settings_fingerprint = SHA256(canonical_json({
 `..` components. `input_stage_fingerprint` is exactly the validated
 `EncodingInputSequenceManifest.fingerprint`; no diagnostics/RGB-stage manifest,
 generic mtime metadata, or independently selected hash may substitute. An audio
-path token likewise contains the complete raw authenticated audio/source identity
-actually used. A settings fingerprint alone is never an input identity.
+path token likewise contains the complete raw pre/post-validated audio/source
+identity selected above. A settings fingerprint alone is never an input
+identity.
 
 After resolving `auto`, the encoder constructs the runtime argument vector and
 its normalized copy together before execution, verifies their positional
@@ -1599,7 +1881,7 @@ recorded but do not permit skipping file flushes. The raw final-video manifest
 SHA-256 plus its bound input-manifest fingerprint are the only evidence accepted
 by a later prune.
 
-Container validation is `final-video-container-validation-v1` and has one
+Container validation is `final-video-container-validation-v2` and has one
 implementation. Run `ffprobe -v error -count_frames -show_streams -show_format
 -of json <sibling-temporary>` and reject malformed JSON or any probe/decode
 error. Require exactly one video stream, no data/subtitle/attachment streams, the
@@ -1609,10 +1891,10 @@ token validates. Require reduced `avg_frame_rate` equal to the resolved output
 rational and `nb_read_frames ==
 EncodingInputSequenceManifest.frame_names.length`. If
 `nb_read_frames` is unavailable or noninteger, validation fails rather than
-substituting duration. When resolved audio policy is absent, require zero audio
-streams. When it is present, pre-probe the authenticated audio source: require
-exactly one AAC output audio stream iff that source exposes a selected usable
-audio stream, otherwise zero. Finally run `ffmpeg -v error -xerror -i
+substituting duration. Require zero audio streams when normalized argv contains
+no audio token and exactly one `codec_name=aac` audio stream when it contains one;
+`preserve_audio=true` with no usable selected stream therefore still requires
+zero. Finally run `ffmpeg -v error -xerror -i
 <sibling-temporary> -map 0:v:0 -map 0:a? -f null -`; because all other stream
 types were rejected, this completely decodes every accepted stream. Require exit
 status zero with no error diagnostic. File existence or nonzero length alone is
@@ -1639,6 +1921,8 @@ status:                             "building" | "complete" |
                                     "payload_pruned"
 rgb_stage_fingerprint:              string
 source_guide_fingerprint:           string
+native_geometry_fingerprint:        string | null
+quality_input_manifest_sha256:      string | null
 frame_names:                        list[string]  # unique source-order stems
 render_shape:                       [H, W]
 render_mode:                        "fast" | "quality"
@@ -1667,8 +1951,38 @@ and nullable `metric_clamp_summary_sha256`. `previous_status` is `complete` or
 stage_key:                 string
 relative_path:             string
 operation:                 "delete_tree"
-cleanup_contract_version: 1
+cleanup_contract_version: 2
+directory_identity:        DirectoryIdentity
+marker:                    PruneMarker
 ```
+
+`DirectoryIdentity` is the strict platform union:
+
+```text
+POSIX:   {kind: "posix", st_dev: integer, st_ino: integer,
+          mount_identity: string}
+Windows: {kind: "windows", volume_serial: string, file_id: string}
+```
+
+POSIX integers are nonnegative uint64 values read from the already opened
+directory handle. `mount_identity` is the canonical decimal string, with no
+leading zero except `"0"`, of a kernel-provided non-path numeric mount ID; Linux
+uses `statx.stx_mnt_id`. A POSIX port without an equivalent stable numeric mount
+ID cannot prune. Windows uses `GetFileInformationByHandleEx` with
+`FileIdInfo`: volume serial is exactly 16 lowercase hexadecimal digits and the
+128-bit file ID is exactly 32. A platform/filesystem which cannot provide all
+required identity fields cannot prune and reports an actionable cleanup error.
+
+`PruneMarker` has exactly `name` and `sha256`. Immediately before the
+`payload_pruned` commit, create with create-new/no-follow semantics inside each
+opened target root a marker named
+`.depth-surge-prune-v2-<32-lowercase-hex>.marker`, where the token is 128 bits
+from the OS CSPRNG. Its bytes are canonical ASCII JSON plus LF with exactly the
+keys `cleanup_contract_version=2`, `relative_path=<the entry path>`, and
+`token=<the same 32-lowercase-hex suffix>`. Fsync the marker and containing
+directory, capture `DirectoryIdentity` from the still-open root
+handle, re-resolve the path without following links, and require the same
+identity. `sha256` hashes the complete marker bytes.
 
 `prune_entries` records the concrete paths approved by the read-only audit, in
 pipeline order with no duplicates. Each path is canonical output-root-relative
@@ -1678,19 +1992,40 @@ entry uses `stage_key="stereo_diagnostics_frames"` and
 `relative_path="04_stereo_diagnostics/frames"`. Stage keys are display/audit
 labels only; cleanup never resolves them through the current
 `INTERMEDIATE_DIRS` mapping.
+Each authorized root must also share the acquired job root's POSIX `st_dev` and
+mount ID or Windows volume serial; a stage mounted underneath the job root is
+not a prune target.
 
 Resume supports the committed `cleanup_contract_version` or performs no deletion
-and reports an actionable version error. It validates containment and a
-non-following directory identity for every entry, then deletes only the persisted
-relative paths. Mapping changes in a future release cannot redirect or omit a
-historical authorization. Final video, both final manifests, retained JSONL/root
-summary, and the diagnostics metadata root are forbidden prune targets.
+and reports an actionable version error. It validates containment, exact
+`DirectoryIdentity`, strict marker name/content/hash, and cleanup version for
+every present entry, then deletes only the persisted relative paths. A different
+ordinary directory at the same path is an identity mismatch, even when it is
+inside the job root and contains a copied filename. Mapping changes in a future
+release cannot redirect or omit a historical authorization. Final video, all
+retained content/publication manifests, retained JSONL/root summary, and the
+diagnostics metadata root are forbidden prune targets.
 An already-absent persisted path is an idempotent successful no-op. A symlink,
 junction, mount point, or other reparse-point replacement at that path is never
 followed or recursively deleted; it fails cleanup with an actionable identity
 error and leaves every other unprocessed entry untouched. Recursive traversal
 also never follows a descendant link or reparse point; it may unlink that entry
-itself but cannot visit or delete its target.
+itself but cannot visit or delete its target. Every POSIX descendant directory
+must match both the committed root `st_dev` and `mount_identity`; every Windows
+descendant must match the committed volume serial and must not be a reparse
+point. A mount/bind-mount, identity-read failure, missing/mismatching marker, or
+volume crossing preserves the residual tree and reports the offending path.
+Enumeration, identity checks, child opens, and unlink/remove operations are all
+handle-relative to the verified root; cleanup never switches back to recursive
+path-string APIs after authorization.
+
+A marker created before a crash but absent from committed `prune_entries` is an
+inert transaction temporary and never authorizes tree deletion. Its reserved
+name is excluded from ordinary payload listings; a later audit may unlink only
+that marker itself after strict name/content validation. During authorized
+cleanup, keep the committed marker until every other descendant has been
+removed. A crash after marker unlink but before root removal may leave an empty
+directory for manual/retried audit; absence of the marker is never waived.
 
 State-dependent nullability is exact:
 
@@ -1703,10 +2038,17 @@ State-dependent nullability is exact:
 
 `payload_pruned` always has `mask_payloads_enabled=false`; the previous policy
 is authenticated indirectly by `pruned_from.previous_diagnostics_fingerprint`.
+Quality requires `source_guide_fingerprint`, `native_geometry_fingerprint`, and
+`quality_input_manifest_sha256` to match its retained content manifest in every
+state. Fast retains its existing source provenance string and requires the latter
+two fields null. `payload_pruned` preserves the Quality values because that
+manifest remains a historical final artifact.
 
-Before any frame transaction, atomically write `building` metadata with the four
-aggregate hashes null and all three prune fields null. After every frame
-manifest validates, write JSONL, summary, and metric compatibility summary to
+Before any Quality frame transaction, the content manifest is already durable.
+Before any frame transaction in either mode, atomically write `building`
+metadata with the four aggregate hashes null and all three prune fields null.
+After every frame manifest validates, Quality first reproduces and revalidates
+its complete input content manifest. Then write JSONL, summary, and metric compatibility summary to
 same-directory temporaries, replace them, then atomically write `complete`
 metadata last with their hashes and prune fields null. Relative mode requires
 `metric_clamp_summary_sha256=null`; metric mode requires the hash of
@@ -1739,7 +2081,8 @@ stage, and finish as ordinary `available` diagnostics. A legacy stage also sets
 The current per-frame legacy repair behavior is not used after schema 5.
 
 After final video encoding and both durable final manifests validate,
-`keep_intermediates=false` first atomically transitions `complete` or
+`keep_intermediates=false` first creates and validates the prune markers and
+directory identities, then atomically transitions `complete` or
 `legacy_fast_unavailable` metadata to `payload_pruned`. The new object copies
 the prior hashes into `pruned_from`, retains the current JSONL and root summary
 hashes, sets the current ordered-manifest and metric-compatibility hashes null,
@@ -1752,9 +2095,11 @@ deleted. Their presence never makes them reusable.
 
 Finalization order is exact: durably publish and validate the final video,
 durably commit and validate `encoding_input_manifest.json`, durably commit and
-validate `final_video_manifest.json`, commit `payload_pruned`, run authorized
-cleanup from its persisted `prune_entries`, then mark the settings/runtime record
-completed. A crash after the prune commit resumes cleanup and final status only;
+validate `final_video_manifest.json`, create/fsync every prune marker and capture
+the matching open-handle directory identities, commit `payload_pruned`, run
+authorized cleanup from its persisted `prune_entries`, then mark the
+settings/runtime record completed. A crash after the prune commit resumes
+cleanup and final status only;
 it never reopens a render transaction or consults current stage mappings. A crash
 after both manifests commit but before prune validates their canonical bytes,
 fingerprints, normalized executed arguments, and video payload, then retries only
@@ -1764,8 +2109,9 @@ With `keep_intermediates=true`, finalization skips only prune and cleanup: the
 encoding-input and publication manifests still commit before the
 settings/runtime completion mark.
 
-A valid `payload_pruned` state authenticates only metadata, retained JSONL/root
-summary, the raw encoding-input/publication manifests, and the final video.
+A valid `payload_pruned` state authenticates only metadata, the applicable
+retained Quality content manifest, retained JSONL/root summary, the raw
+encoding-input/publication manifests, and the final video.
 Historical statistics remain readable but no stereo or upstream intermediate
 payload is reusable. Merely opening or auditing a completed job performs no
 render. Any requested processing resume, mask generation, or invalid final-video
@@ -1830,11 +2176,25 @@ occlusion_fill:     "none" | "background"
 render_shape:       [H, W]
 eyes:               {"left": EyeStats, "right": EyeStats}
 metric_projection:  null | MetricProjectionStats
+geometry_nearest:   null | GeometryNearestStats
 ```
 
 `MetricProjectionStats` has exactly `valid_pixel_count`,
 `clamped_pixel_count`, and `clamped_fraction`. It is null in relative mode and
-required in metric mode. `EyeStats` has exactly:
+required in metric mode. `GeometryNearestStats` has exactly:
+
+```text
+indexed_sample_count
+query_count
+visited_nodes_total
+visited_nodes_max
+```
+
+It is null for Fast and required for both Quality fill modes. Its indexed count
+is exactly the frame's native primitive count `G_i`; the other three values
+cover all retained-zero primitive queries in source output-row-major order. A
+frame with no such query uses integer zeros for all three query/visit fields.
+`EyeStats` has exactly:
 
 ```text
 pixel_count
@@ -1961,6 +2321,7 @@ frames_jsonl_sha256:                  string
 eyes:                                 {"left": EyeAggregate,
                                        "right": EyeAggregate} | null
 metric_projection:                    MetricProjectionAggregate | null
+geometry_nearest:                     GeometryNearestAggregate | null
 ```
 
 For available diagnostics, `EyeAggregate` has exactly `pixel_count`, summed
@@ -2013,6 +2374,12 @@ It is null for Fast. Quality background uses
 `max_clamped_fraction`. Global `clamped_fraction` divides summed clamped by
 summed valid; mean is the arithmetic mean of ordered per-frame fractions.
 
+`GeometryNearestAggregate` has exactly `indexed_sample_count`, `query_count`,
+`visited_nodes_total`, and `visited_nodes_max`. The first three are checked
+source-order sums and the last is the global maximum. It is required for
+available Quality diagnostics, null for available Fast, and null when
+`availability="legacy_fast_unavailable"`.
+
 ### Numeric JSON Types and Aggregation
 
 JSON integer means a non-boolean integer in `0..2**64-1`. JSON binary64 means a
@@ -2025,7 +2392,8 @@ The exact field types are:
 - JSON integers: dimensions, frame/pixel/run/count fields, every histogram
   value/count pair, `lane_count_max`, `touched_pixel_span_max`, non-null backend
   counts, `final_unresolved_lane_count`, `predicted_gap_px`, `local_limit_px`,
-  all non-null budget counters except visited-node p95, `byte_count`,
+  all non-null budget counters except visited-node p95, every non-null geometry
+  nearest counter, `byte_count`,
   `valid_pixel_count`, `clamped_pixel_count`, and `affected_frame_count`;
 - JSON binary64: all state ratios, `lane_count_p95`,
   `touched_pixel_span_p95`, both physical-width fields,
@@ -2066,14 +2434,20 @@ fallback indexed donors                     <= D_cap
 fallback queries                            <= R_cap
 fallback visited-node total                 <= R_cap*D_cap
 fallback visited-node maximum               <= D_cap
+geometry nearest indexed samples            <= G_i
+geometry nearest queries                    <= Q
+geometry nearest visited-node total         <= QUALITY_GEOMETRY_NEAREST_VISIT_CAP
+geometry nearest visited-node maximum       <= G_i
 metric valid/clamped pixels                 <= Q
 ```
 
 For every summed field in one root eye aggregate, use `N` times its applicable
-per-frame bound. Metric root counts use `N*Q`; frame and affected-frame counts use
-`N`. Histogram values use `16*W` for lane length and `W` for touched span, while
-their merged counts use `N*16*Q`. File/video/manifest `byte_count` values are
-checked directly from the nonnegative platform size and must also fit uint64.
+per-frame bound. Geometry-nearest root sums use checked `sum(G_i)`, `N*Q`, and
+`N*QUALITY_GEOMETRY_NEAREST_VISIT_CAP`; its maximum remains bounded by `G`.
+Metric root counts use `N*Q`; frame and affected-frame counts use `N`.
+Histogram values use `16*W` for lane length and `W` for touched span, while their
+merged counts use `N*16*Q`. File/video/manifest `byte_count` values are checked
+directly from the nonnegative platform size and must also fit uint64.
 
 The preflight first validates that `N`, `H`, `W`, `Q=H*W`, every `G_i`, every
 `F_i`, and every `J_frame_i` are nonnegative uint64 values, deriving each product
@@ -2266,6 +2640,7 @@ Define exact per-frame lifecycle bounds:
 STEREO_HOST_BUDGET        = 512 MiB
 FAST_SLOT_OVERHEAD        = 1 MiB
 FAST_JSON_STREAM_BYTES    = 1 MiB
+STEREO_IO_THREAD_BYTES    = 2 MiB
 
 fast_relative_item[i] = max(
     3*Q + 2*G_i + F_i,       # decoder
@@ -2279,15 +2654,31 @@ fast_metric_item[i] = max(
     25*Q,
     23*Q + J_frame_i,
 )
-fast_slot_bytes = max(item[i] for the selected geometry mode)
+fast_slot_bytes = max(item[i] for pending i in the selected geometry mode)
                 + FAST_SLOT_OVERHEAD
 fast_active_scratch = D_hist + FAST_JSON_STREAM_BYTES
-fast_capacity = min(2*workers,
-                    floor((512 MiB - fast_active_scratch) / fast_slot_bytes))
-require fast_active_scratch + fast_capacity*fast_slot_bytes <= 512 MiB
+candidate_capacity_max = min(2*configured_io_workers, P)
+effective_workers(c) = min(configured_io_workers, c)
+io_thread_bytes(c) = (1 + 2*effective_workers(c))*STEREO_IO_THREAD_BYTES
+eligible = {c in 1..candidate_capacity_max:
+            fast_active_scratch + io_thread_bytes(c)
+            + c*fast_slot_bytes <= 512 MiB}
+fast_capacity = max(eligible)
+effective_io_workers = effective_workers(fast_capacity)
+fast_io_thread_bytes = io_thread_bytes(fast_capacity)
+require fast_active_scratch + fast_io_thread_bytes
+        + fast_capacity*fast_slot_bytes <= 512 MiB
 fast_consolidation_peak = D_hist + J_frame + J_root + 1 MiB + 16 MiB
 require fast_consolidation_peak <= 512 MiB
 ```
+
+Here `P` is the pending render-item count from the lifecycle matrix and
+`configured_io_workers` is its validated 1..16 setting. When `P=0`, capacity,
+effective workers, and thread bytes are all zero and no pipeline thread is
+created; the pending-item maximum is not evaluated. When `P>0`, an empty
+`eligible` set raises the typed host-budget error
+before mutation. Selecting the largest eligible integer makes the apparent
+worker/capacity fixed point unique.
 
 The capacity charge deliberately repeats the single active construction peak in
 every slot rather than relying on a smaller empirical overlap estimate. Before
@@ -2296,17 +2687,44 @@ enqueue, the main thread serializes dense histogram results into that slot's
 both forms. Capacity below one raises the typed host-budget error before any
 stage mutation.
 
+The file pipeline creates exactly one feeder, `effective_io_workers` decoders,
+and the same number of writers. All four queues have `maxsize=fast_capacity`;
+queue nodes belonging to a lifecycle item are charged to that slot and fixed
+queue control is charged to the thread envelope. The implementation requests a
+512 KiB native stack for each of these threads. The remaining 1.5 MiB envelope
+covers its Python thread state, bounded queue control, and OpenCV/Torch TLS;
+frame arrays, codec buffers, and decoder workspaces remain charged to the
+lifecycle slot. A supported platform/runtime combination must attest this 2 MiB
+committed-memory envelope in Task 0. Failure to configure or attest it raises
+`StereoThreadBudgetError` before stage mutation rather than silently creating
+the configured count.
+
+Decode and write tasks may use existing library calls but may not create nested
+worker pools. Torch/OpenCV global pools are initialized and measured before the
+stage as process-baseline runtime state; the OS thread-count delta while the
+pipeline is live must be exactly `1 + 2*effective_io_workers`. Any lazy nested
+thread creation fails the supported-runtime gate.
+
+`StereoPipelineStats` records configured and effective workers, actual feeder,
+decoder, and writer thread counts, each queue capacity, calculated thread bytes,
+and the existing permit/timing counters. Pipeline teardown joins every thread
+before aggregate consolidation, so thread bytes are absent from the separate
+consolidation bound.
+
 Fast builds only one eye's int32 offset at a time with one float64 row scratch.
 Relative Fast follows its existing near-score/settings operation order; metric
 Fast follows its existing total-fraction order. Retain the fraction plane until
 the second eye map is complete, release it before second-eye rendering, and never
 overlap two eye maps.
 
-Quality v1 deliberately forces `quality_capacity=1`. Its lifecycle permit is
-held from decode through transaction write, so no second decoded/writing frame
-overlaps the active renderer. This is an offline-quality choice, not an estimate
-derived from the Fast floor-division formula. Parallel Quality frame lifecycle
-slots require a later measured design revision.
+Quality v1 deliberately forces `quality_capacity=1` and
+`quality_effective_io_workers=1` when `P>0`; both are zero when `P=0`. Its one
+feeder, one decoder, and one writer therefore add exactly 6 MiB under the same
+thread contract. The lifecycle permit is held from decode through transaction
+write, so no second decoded/writing frame overlaps the active renderer. This is
+an offline-quality choice, not an estimate derived from the Fast selection
+formula. Parallel Quality frame lifecycle slots require a later measured design
+revision.
 
 Quality fixed allocations are:
 
@@ -2335,7 +2753,7 @@ Every Quality-owned host phase must satisfy its corresponding byte bound:
 quality_relative_decode_peak = max_i(3*Q + 2*G_i + F_i) + 16 MiB
 quality_metric_decode_peak   = max_i(3*Q + 5*G_i + F_i) + 16 MiB
 quality_lowres_region_peak  = 3*Q + 22*G + 16 MiB
-quality_geometry_build_peak = 32*Q + 17*G + 16 MiB
+quality_geometry_build_peak = 32*Q + 25*G + 16 MiB
 quality_region_peak         = 40*Q + 13*G + 16 MiB
 quality_planning_peak       = 37*Q + D_hist + 64 MiB + 64 MiB + 64 MiB + 16 MiB
 quality_pass_b_peak         = 42*Q + D_hist + 64 MiB + 16 MiB
@@ -2345,8 +2763,17 @@ quality_consolidation_peak  = D_hist + J_frame + J_root + 1 MiB + 16 MiB
 quality_public_peak         = quality_pass_b_peak + 4*Q
 quality_none_public_peak    = quality_none_visibility_peak + 4*Q
 
-quality_active_peak = max(all applicable peaks)
-require quality_active_peak <= 512 MiB
+quality_io_thread_bytes = 6 MiB when P>0 else 0
+quality_lifecycle_peak = max(all applicable decode-through-writer peaks)
+quality_file_pipeline_peak = 0 when P=0 else
+                             quality_lifecycle_peak
+                             + quality_io_thread_bytes
+quality_stage_peak = max(quality_file_pipeline_peak,
+                         quality_consolidation_peak)
+quality_public_call_peak = max(applicable geometry-build, region, planning,
+                               Pass-B-or-none, and public-final peaks)
+require quality_stage_peak <= 512 MiB
+require quality_public_call_peak <= 512 MiB when public Quality is invoked
 ```
 
 Only the applicable relative or metric decode row participates. The native
@@ -2358,8 +2785,10 @@ displacement, uint32 union parent/canonical-key storage, uint8 rank, and final
 region IDs with the documented in-place reuse. Union work is released before
 the full-resolution solver.
 
-The metric geometry-build bound's `17*G` includes owned native inverse/valid,
-float32 valid-weight and weighted-inverse, plus low-resolution region IDs. Its
+The geometry-build bound's `25*G` includes the previous `17*G` of owned native
+inverse/valid, float32 valid-weight and weighted-inverse, and low-resolution
+region IDs, plus the exact per-region nearest index's worst-case `8*G+4` bytes;
+the four-byte constant is in runtime overhead. Its
 `32*Q` output
 slots are exactly source BGR 3, region map 4, three float32 primitive/resample
 planes 12, one float64 fraction plane 8, final float32 near-score 4, and final
@@ -2403,18 +2832,21 @@ or variable-cardinality Python object tree may be materialized. At most one
 `J_frame` input, one `J_root` canonical output, and the fixed 1 MiB serializer
 buffer coexist during consolidation; that phase is included above.
 
-At 4K with `G<=Q`, the fixed render/planning phases peak at about 501.7 MiB in
-planning. The public wrapper's applicable Pass-B phase, including its four
-concrete boolean masks, is about 444.9 MiB. Variable `J_frame`/`J_root` phases
-are evaluated separately and can reject a pathologically large job rather than
-invalidate this statement. The renderer constructs only one eye-offset map,
+At 4K with `G<=Q`, the file pipeline peaks at about 507.7 MiB in planning after
+its three thread envelopes; its indexed geometry-build phase is about 472.9 MiB.
+The threadless public call peaks at about 501.7 MiB in planning; its final
+Pass-B-plus-four-masks phase is about 444.9 MiB and its indexed geometry phase is
+about 466.9 MiB. Variable `J_frame`/`J_root` phases are evaluated separately and
+can reject a pathologically large job rather than invalidate this statement. The
+renderer constructs only one eye-offset map,
 reuses all three fixed arenas between eyes, and releases left-eye planning state
 before right-eye Pass A while retaining the completed left result.
 
 Before allocating or mutating stage state, calculate every applicable phase and
 raise `QualityHostBudgetError(phase, required_bytes, 512 MiB)` if any bound is
 too large. Reject `16*Q > UINT32_MAX` through the same preflight before
-evaluating record or heap indexes. The clean memory gate measures all
+evaluating record or heap indexes, and reject any checked `G_i+1 > UINT32_MAX`
+before a per-region offset array can be requested. The clean memory gate measures all
 stereo-owned NumPy, Python, OpenCV, and allocator-resident memory and must remain
 within both the formula
 and 512 MiB. Arena or later allocation failure is fatal, never an alternate
@@ -2458,6 +2890,11 @@ metadata_raw    = max_json_bytes(Metadata, N, all frame names,
                                  all concrete prune-entry strings)
 summary_raw     = max_json_bytes(RootSummary, 16*W, W, N, all frame names)
 clamp_raw       = max_json_bytes(ClampSummary, N, all frame names)  # metric only
+quality_input_manifest_raw = max_json_bytes(
+    QualityInputContentManifest,
+    N,
+    every guide/native-geometry relative path and parsed header,
+)  # Quality only; zero for Fast
 jsonl_raw       = sum(stats_raw[i] + 1 for i in source order)
 J_frame         = max({0}, {stats_raw[i] + manifest_raw[i] for all i})
 J_root          = max(metadata_raw, summary_raw,
@@ -2472,6 +2909,11 @@ final_video_manifest_raw = max_json_bytes(
     len(resolved_encoding_arguments),
     every normalized argument and final relative path,
 )
+prune_marker_raw[j] = max_json_bytes(
+    PruneMarkerPayload,
+    prune_entry[j].relative_path,
+    prune_entry[j].marker token,
+) + 1  # mandatory LF
 ```
 
 The preflight helper constructs and tests a maximum-token schema skeleton for
@@ -2491,6 +2933,7 @@ pending_json  = sum(alloc(stats_raw[i]) for i in P_set)
 
 root_final = alloc(metadata_raw) + alloc(jsonl_raw) + alloc(summary_raw)
            + (alloc(clamp_raw) when metric else 0)
+           + (alloc(quality_input_manifest_raw) when Quality else 0)
 root_atomic_reserve = 2 * root_final
 
 frame_atomic[i] = 2*rgb_bound + M*4*mask_bound
@@ -2499,15 +2942,23 @@ manifest_atomic[i] = alloc(manifest_raw[i])                     # i in R_set
 one_transaction_overlap = max({0}, all frame_atomic, all manifest_atomic)
 
 pending_file_count = P*(4 + 4*M) + R
-root_file_count = 3 + (1 when metric else 0)
+root_file_count = 3 + (1 when metric else 0) + (1 when Quality else 0)
 atomic_file_count = max((4 + 4*M) if P>0 else 0, 1 if R>0 else 0)
+prune_marker_reserve = sum(alloc(prune_marker_raw[j]) for planned prune entries)
+prune_marker_file_count = number of planned prune entries
 filesystem_slack = A * (pending_file_count + root_file_count
-                        + atomic_file_count)
+                        + atomic_file_count + prune_marker_file_count)
 
 required_bytes = pending_rgb + pending_masks + pending_json
                + root_atomic_reserve + one_transaction_overlap
+               + prune_marker_reserve
                + filesystem_slack
 ```
+
+Marker tokens are generated in memory during the read-only audit, so their exact
+fixed-width strings and schema bounds are known before disk preflight. Creating
+their files is still a later mutation. The reserve covers all markers coexisting
+between prune authorization and cleanup; successful cleanup releases it.
 
 The later final-encoding preflight is a separate transaction and deliberately
 makes no claim that free space can hold the complete CRF-compressed video. There
@@ -2518,28 +2969,31 @@ physically allocates/fsyncs before FFmpeg:
 ```text
 alloc(encoding_input_manifest_raw)
 + alloc(final_video_manifest_raw)
-+ 4*A
++ prune_marker_reserve
++ (4 + prune_marker_file_count)*A
 ```
 
-The two `alloc` terms are the future atomic manifest temporaries; an existing
-retained file already consumes blocks and is never counted as free. The `4*A`
-term is an additional non-sparse, fsynced reservation file, not an unprotected
-free-space estimate. Before FFmpeg, each manifest temporary is non-sparsely
-filled and fsynced to its schema-derived maximum. After input revalidation or
-video hashing, canonical bytes are streamed over the beginning of that same
-extent, checked not to exceed the bound, fsynced, and truncated. Immediately
-before each of the two manifest replacements, the reservation is shortened by
-exactly `2*A`; that replacement and its following directory sync complete before
-the next release. The empty reservation entry is removed only after both
-publications are durable. Thus publication needs no new payload
-blocks from ambient free space. Actual normalized FFmpeg arguments and all input
-paths are resolved before this check.
+The two leading `alloc` terms are the future atomic manifest temporaries; an
+existing retained file already consumes blocks and is never counted as free.
+Before FFmpeg, each manifest temporary is non-sparsely filled and fsynced to its
+schema-derived maximum. The remaining terms are held in a separate non-sparse,
+fsynced reservation file, not an unprotected free-space estimate. After input
+revalidation or video hashing, canonical manifest bytes are streamed over the
+beginning of their reserved extents, checked not to exceed the bound, fsynced,
+and truncated. Immediately before each manifest replacement, release exactly
+`2*A`; that replacement and its following directory sync complete before the
+next release. After both manifests are durable and immediately before each prune
+marker create-new, release exactly `alloc(prune_marker_raw[j])+A`, then create,
+fsync, and directory-sync that marker on the same volume. The empty reservation
+entry is removed only after all applicable publications and markers are durable.
+Thus these artifacts need no new payload blocks from ambient free space. Actual
+normalized FFmpeg arguments and all input paths are resolved before this check.
 
 Both assembled and direct encoding write only to a sibling temporary on the
 final-output volume. FFmpeg ENOSPC/Windows error 112, interruption, validation
 failure, or any error before publication removes that temporary and manifest
-temporaries and leaves the old final video plus both old retained manifests
-unchanged. Only a successfully closed and validated temporary may enter the
+temporaries plus the marker reservation and leaves the old final video plus both
+old retained manifests unchanged. Only a successfully closed and validated temporary may enter the
 publication sequence. Output-file size is reported from the failed temporary,
 but it is never presented as a preflight guarantee. When job root and output
 share a volume, the manifest reservation is still tested independently from the
@@ -2582,8 +3036,17 @@ delta. Directories themselves receive zero reclaim credit. These rules make the
 existing crop-stage `os.link` optimization conservative rather than double
 counting its stage paths.
 
-Preflight requires both `current_free >= alloc(metadata_raw) + A` for the first
-building-metadata transaction and
+Define the no-reclaim first-mutation requirement:
+
+```text
+first_mutation_reserve = alloc(metadata_raw) + A
+                       + (alloc(quality_input_manifest_raw) + A
+                          when Quality manifest publication is planned else 0)
+```
+
+Preflight requires both `current_free >= first_mutation_reserve` for the Quality
+content-manifest plus building-metadata transactions (or just the latter for
+Fast) and
 `current_free + reclaimable_bytes >= required_bytes` for the complete plan.
 Both inequalities are evaluated independently on every volume containing a
 planned temporary or final payload.
@@ -2599,16 +3062,19 @@ compute JSON/image bounds and Fast/Quality host phase bounds
 disk preflight using current_free + reclaimable_bytes
 revalidate every credited physical allocation; restart audit on any change
 then and only then:
-    write building metadata
     invalidate downstream when P > 0
     delete audited incompatible payload/clamp sidecars
+    publish Quality input content manifest when planned
+    write building metadata
     render or migrate manifests
     consolidate aggregates
 ```
 
 `_prepare_stereo_stage`, downstream reset, clamp deletion, and any payload
-replacement must move after preflight. Insufficient space leaves the old stage
-untouched and reports required, current free, and audited reclaimable bytes.
+replacement must move after preflight. An incompatible old diagnostics root is
+removed before the new Quality manifest is published, never after it.
+Insufficient space leaves the old stage untouched and reports required, current
+free, and audited reclaimable bytes.
 Re-evaluate if `P_set`, `R_set`, target mask policy, shape, names, geometry mode,
 or allocation unit changes. A later ENOSPC/Windows error 112 reports the
 persisted estimate, current free bytes, and failing path. With masks disabled,
@@ -2707,7 +3173,11 @@ It is not a setting, saved mode, resume identity, or production branch.
    overlap.
 4. An independent scalar binary64 oracle covers boundary clipping, all four
    corner masks, zero retained weight, one-ULP projected-lane changes, and exact
-   metric weight reuse.
+   metric weight reuse. The retained-zero production index matches exhaustive
+   `(distance2,iy,ix)` search across region ties, degenerate rows/columns, empty
+   query sets, and `G_i/Q` below, equal to, and above one. Its allocation is at
+   most `8*G_i+4`, its grouping/order is reproducible, and injected allocation,
+   stack, missing-region, and visit-cap failures are fatal with no partial frame.
 5. Adversarial union orders produce identical source-region IDs because IDs use
    minimum member index rather than the implementation's union root.
 6. The four boundary-movement fixtures and multi-edge fixture match an
@@ -2716,10 +3186,15 @@ It is not a setting, saved mode, resume identity, or production branch.
    equal-cost owner decrease-key is covered, maximum live entries equal the band
    population, and injected capacity corruption fails typed. No independent
    tiled oracle or gate is claimed.
-7. The one-eye offset builder matches the current full-map scalar arithmetic for
-   left/right, int32 limits, signed half-lane boundaries, and one-ULP inputs. Peak
-   live state is exactly one int32 map plus one float64 row; CUDA OOM retry
-   preserves its allocation and bytes instead of rebuilding it.
+7. The separate relative and geometry one-eye offset builders each match their
+   current full-map scalar arithmetic for left/right, int32 limits, signed
+   half-lane boundaries, and one-ULP inputs. The exact relative fixture
+   `(W,strength,convergence,near_score)=(1920,2.0,0.5,float32(0.9052734375))`
+   produces left offset 124; a reassociated total-fraction result of 125 fails.
+   Relative displacement, q-jump, gap prediction, and splat fixtures all use
+   that same builder order. Peak live state is exactly one int32 map plus one
+   float64 row; CUDA OOM retry preserves its allocation and bytes instead of
+   rebuilding it.
 8. Relative/metric native decode and owned geometry-builder oracles prove every
    array in the `G_i` formulas, no-copy construction, direct invalid-zero metric
    weighting, and release order. Fixtures cover `G_i<Q`, `G_i=Q`, and `G_i>Q`;
@@ -2803,18 +3278,21 @@ It is not a setting, saved mode, resume identity, or production branch.
    is null with the exact unavailable reason.
 2. Coverage/repair masks, run measures/histograms, ratios, backend
    pixel/component counts,
-   canonical JSON, positive zero, reserved bit 7, finite numbers, and hashes all
-   match independent synthetic expectations.
+   geometry-nearest frame/root counters, canonical JSON, positive zero, reserved
+   bit 7, finite numbers, and hashes all match independent synthetic
+   expectations. Fast/legacy nearest fields are null; both Quality fill modes
+   report exact integers including the all-zero-query case.
 3. Strict-key tests reject every missing, extra, integer-versus-binary64,
    nullable, noncanonical, bad path, self-fingerprint, payload-hash, and
-   state-transition mutation in metadata, frame/encoding-input/final-video
-   manifests, prune entries, JSONL, and summary. Scalar aggregation fixtures
+   state-transition mutation in metadata, Quality-input/frame/encoding-input/
+   final-video manifests, prune identities/markers, JSONL, and summary. Scalar aggregation fixtures
    cover source-order last-bit differences, positive zero, empty p95, and
    histogram rank lookup. Every counter-bound multiplication/addition tests
    `U64_MAX-1`, `U64_MAX`, and overflow; consolidation repeats checked addition.
 4. Fault injection after final-video close, file fsync, atomic publish,
-   encoding-input/publication-manifest fsync/replace, prune metadata, and every
-   cleanup step proves the exact recovery sequence. Missing/stale input or
+   encoding-input/publication-manifest fsync/replace, prune-marker create/fsync,
+   directory-identity capture, prune metadata, and every cleanup step proves the
+   exact recovery sequence. Missing/stale input or
    publication evidence always reencodes; two valid manifests after a crash
    permit prune without re-resolving `auto`; no state falsely claims reusable
    payload.
@@ -2828,8 +3306,9 @@ It is not a setting, saved mode, resume identity, or production branch.
 7. Disk preflight covers every lifecycle row and exact `P_set`/`R_set`, maximum
    per-frame/root histogram cardinalities, long escaped frame names, long metric
    fraction lists, masks on/off, metric/relative aggregates, allocation-unit
-   fallback, both retained-manifest reservations, and simultaneous old RGB plus
-   all new temporaries. It explicitly makes no video-size promise. Direct and
+   fallback, all retained-manifest and prune-marker reservations, and
+   simultaneous old RGB plus all new temporaries. It explicitly makes no
+   video-size promise. Direct and
    assembled FFmpeg ENOSPC tests leave an old final video and both old manifests
    byte-exact
    while removing sibling/reservation temporaries. Hard-link fixtures cover the
@@ -2845,8 +3324,12 @@ It is not a setting, saved mode, resume identity, or production branch.
    mask false-to-true, mask true-to-false, and pruned resume. Final-video or
    either retained-manifest damage cannot reinterpret `payload_pruned` as
    reusable stereo. Cleanup tests change `INTERMEDIATE_DIRS` after prune commit
-   and prove resume uses only contained, version-1 persisted paths; unknown
-   cleanup versions delete nothing.
+   and prove resume uses only contained version-2 paths whose directory identity
+   and durable marker both match. Replacing a target with a new ordinary
+   directory, copying a marker into it, removing/changing the marker, changing a
+   file ID, inserting a POSIX mount/bind-mount, or crossing a Windows volume
+   preserves the residual and reports the exact path. Unknown cleanup versions
+   and platforms without reliable identity delete nothing.
 9. A pruned job with valid final video but damaged JSONL/summary reports
    `(true, false, false)` for final-video, historical-diagnostics, and stereo
    reuse. Inspection neither writes nor renders, the final video remains
@@ -2855,10 +3338,26 @@ It is not a setting, saved mode, resume identity, or production branch.
 10. Encoding-input fixtures prove direct mode authenticates the actually resolved
     06 or 07 left/right bytes and assembled mode the actual 99 sequence. RGB
     byte/order/header/path changes alter its fingerprint; mask/stats changes and
-    true-to-false diagnostics migration do not. Audio tokens use full-file hashes.
-    ffprobe fixtures reject extra/missing streams, dimensions, pixel format,
-    codec, rational rate, frame count, audio-policy mismatch, and any full-decode
-    error; nonempty garbage never publishes.
+    true-to-false diagnostics migration do not. Direct per-eye header drift,
+    non-RGB8 input, and assembled dimension drift fail before FFmpeg; the direct
+    two-scale/no-scale branches match their declared header conditions.
+    Quality-input fixtures mutate one guide or native geometry byte while
+    preserving size and mtime and prove all applicable content/stage hashes
+    change while Fast v3 identity does not.
+11. Audio fixtures cover `preserve_audio=false`, no `a:0`, zero decoded samples,
+    short audio, long audio, malformed audio, and a valid non-first container
+    stream. Both encoder paths map exactly `a:0`, emit exactly N video frames,
+    omit or produce one AAC stream as specified, never pad short audio, and trim
+    long audio at the checked `audio_end_sample`. Runtime argv and normalized
+    argv have a positional bijection; every valid image/audio/output token and
+    every malformed grammar, path64, index, duplicate, and embedded-path case is
+    covered. Output-level `-shortest` is absent.
+12. ffprobe fixtures reject extra/missing streams, dimensions, pixel format,
+    codec, rational rate, frame count, audio-token mismatch, and any full-decode
+    error; nonempty garbage never publishes. Internal concurrent mutation is
+    blocked by the project writer lock and persistent pre/post changes fail
+    validation. Tests and documentation make no claim to detect the explicitly
+    unsupported external ABA restoration.
 
 ### Fast Compatibility
 
@@ -2908,19 +3407,31 @@ With five warmups and 30 measured frames on that clean CUDA environment:
 - a 4K synthetic frame routing at least 25 percent of pixels to fallback builds
   its at-most-48 MiB index and completes exact queries within 30.0 seconds;
   query p95 visits at most 4,096 nodes and diagnostics report all visits;
+- the separate geometry retained-zero index is exercised at `G/Q` 0.5, 1, 2,
+  and 4 with 25, 50, and 100 percent queried edge-band pixels. It matches brute
+  force, owns no more than `8*G+4` bytes, reports every visit, and either finishes
+  within 30.0 seconds at supported full-pipeline shapes or raises the specified
+  pre-mutation host/query budget error; an injected cap crossing never returns a
+  nearest sample;
 - full-pipeline Quality p95 including diagnostics is at most 6.0 seconds at
   1080p and 24.0 seconds at 4K;
 - GPU allocation plus 25 percent headroom fits 1,536 bytes per source pixel;
 - Quality lifecycle capacity is exactly one; geometry, region solver, planning,
   Pass B, writer, consolidation, and public-wrapper measurements each stay below
   their calculated phase bound and 512 MiB. The indexed heap never exceeds one
-  live entry per band pixel, and region scratch is absent during repair planning;
+  live entry per band pixel, region scratch is absent during repair planning,
+  and configured/effective/actual worker counts are respectively recorded and
+  equal to `configured/1/(1 feeder,1 decoder,1 writer)` when `P>0`; `P=0`
+  creates none;
 - Fast 1080p/4K runs at worker counts 1, 4, and 16, masks disabled/enabled, and
   native geometry ratios `G/Q` below, equal to, and above one. They verify each
   frame's compressed-byte/header-derived slot, calculated maximum capacity, and
   forced decoder plus active render plus writer overlap. Actual Python, NumPy,
   OpenCV, Torch, and allocator-resident memory remains within
-  `fast_active_scratch + capacity*fast_slot_bytes` and 512 MiB;
+  `fast_active_scratch + fast_io_thread_bytes +
+  capacity*fast_slot_bytes` and 512 MiB. Reports bind configured/effective/
+  actual thread counts, all four queue capacities, requested stack size, and the
+  supported-platform 2 MiB per-thread envelope;
 - total stage-04 disk use and transaction peak do not exceed preflight reserve;
 - Fast renderer and no-mask pipeline p95 regress at most 5 percent, and Fast
   pipeline p95 with masks enabled regresses at most 25 percent.
@@ -2948,19 +3459,25 @@ receives explicit user approval.
 ## Implementation Boundary
 
 The implementation plan must begin with Task 0, before production renderer
-changes. Prototype the exact indexed heap and exact implicit k-d lookup at 1080p
-and 4K with edge-band populations 25, 50, and 100 percent plus a separate
-25-percent-fallback case. Every run compares the independent scalar oracle and
-records output equality, maximum live heap entries, visited-node p95, wall time,
-and process RSS under the fixed arenas. Run both CPU and CUDA pipeline contexts;
-the host algorithms remain semantically identical.
+changes. Prototype the exact indexed geodesic heap, the repair-donor implicit
+k-d lookup, and the separate per-region geometry-nearest index at 1080p and 4K.
+Use edge-band/query populations 25, 50, and 100 percent, a separate
+25-percent-repair-fallback case, and native geometry ratios `G/Q` 0.5, 1, 2,
+and 4. Every run compares the applicable independent scalar brute-force oracle
+and records output equality, maximum live heap entries, exact index bytes,
+visited-node totals/max/p95, cap failures, wall time, and process RSS under the
+fixed arenas. Run both CPU and CUDA pipeline contexts; the host algorithms
+remain semantically identical.
 
 The same Task 0 also prototypes the no-copy relative/metric native decoders and
 serial Fast geometry builders at `G/Q` below, equal to, and above one. It records
 every live array, compressed input retention, allocator-resident peak, scalar
-output equality, and capacity for workers 1, 4, and 16. A hidden constructor copy
-or library workspace outside the fixed formula blocks production work just as a
-heap/k-d gate failure does.
+output equality, and capacity for configured workers 1, 4, and 16. It also
+records calculated effective workers, actual thread counts, every queue
+capacity, requested stack size, and committed-memory deltas with forced decoder,
+renderer, and writer overlap. A hidden constructor copy, uncharged thread/TLS
+state, or library workspace outside the fixed formula blocks production work
+just as a heap/k-d gate failure does.
 
 Task 0 first evaluates an implementation using only existing NumPy, Torch, and
 OpenCV facilities. If it misses any performance or RSS gate, this specification
@@ -2982,10 +3499,13 @@ second monolith. Update at least `docs/ARCHITECTURE.md`, `docs/PARAMETERS.md`,
 `docs/TROUBLESHOOTING.md`, and affected resume/performance documentation.
 
 Do not modify depth inference, canonicalization, scene analysis, temporal
-postprocessing, crop, distortion, upscaling, VR layout, or encoded media
-semantics. Content-only encoding-input identity, captured executed FFmpeg
+postprocessing, crop, distortion, upscaling, or VR layout. Encoded media
+semantics change only where this revision explicitly corrects the contradictory
+duration contract: the N image frames are authoritative, output-level
+`-shortest` is removed, and selected `a:0` audio follows the fixed no-padding and
+sample-trim policy. Content-only encoding-input identity, normalized executed FFmpeg
 arguments, sibling-temporary encoding for both paths, exact container validation,
-durable final-video publication, and versioned prune entries are explicitly
+durable final-video publication, and identity-plus-marker prune entries are also
 authorized transaction changes. No compressed-video size preflight guarantee is
 authorized or claimed.
 NumPy, Torch, and OpenCV are already production dependencies; no new external
@@ -3027,13 +3547,17 @@ Approval of this canonical specification accepts:
 8. No neural dependency, generic inpainting, or temporal state enters v1.
 9. Quality v1 serializes one decoded/rendered/written frame lifecycle. Fast uses
    geometry-aware relative/metric slot bounds over `Q`, every `G_i`, compressed
-   input bytes, JSON, and queue overlap. Either mode rejects a phase over 512 MiB
-   rather than assuming `G<=Q` or silently reducing quality.
-10. A retained content-only manifest authenticates the exact 06/07 or 99 image
-    bytes consumed by FFmpeg, independent of diagnostics and mask policy. A
+   input bytes, JSON, queue overlap, and only capacity-derived I/O threads under
+   their attested envelope. Either mode rejects a phase over 512 MiB rather than
+   assuming `G<=Q` or silently reducing quality.
+10. Retained content-only manifests authenticate pre/post-validated Quality
+    guide/native-geometry inputs and the resolved 06/07 or 99 image inputs,
+    independent of stat-only provenance, diagnostics, and mask policy. A
     durably fsynced manifest of the actually executed FFmpeg arguments binds that
     fingerprint after final-video publication and before `payload_pruned`;
-    missing evidence forces reencode, never inference.
+    missing evidence forces reencode, never inference. The project writer lock
+    excludes internal mutation; external ABA mutation is explicitly outside the
+    transaction trust model.
 11. With intermediates disabled, valid historical aggregates may remain readable
     after pruning, but deleted stereo payload is never claimed reusable and later
     aggregate damage is reported as irrecoverable without invalidating a valid
@@ -3042,11 +3566,15 @@ Approval of this canonical specification accepts:
     Quality defaulting belongs only to resolved CLI/Web jobs. Metric Quality uses
     explicit `QualityStereoControls` and a discriminated plan, while Quality none
     excludes the unused fill limit from semantic and diagnostics identity.
-13. Prune recovery deletes only committed versioned relative paths, strict uint64
-    cardinality is proved before mutation, and final encoding promises manifest
-    space plus sibling-temporary recovery rather than an invented video-size
-    reserve. Publication requires the exact ffprobe/full-decode validator.
-14. Task 0 must prove the exact heap/k-d performance path. A project-owned
+13. Prune recovery deletes only a committed version-2 relative path whose
+    physical directory identity and durable random marker both match, without
+    crossing descendant mounts. Strict uint64 cardinality is proved before
+    mutation, and final encoding promises manifest space plus sibling-temporary
+    recovery rather than an invented video-size reserve. Publication requires
+    the exact ffprobe/full-decode validator and all N image frames.
+14. Task 0 must prove the exact geodesic, geometry-nearest, and repair-donor
+    heap/k-d performance paths plus the configured/effective/actual thread
+    envelope. A project-owned
     prebuilt extension is permitted only under the fixed oracle and packaging
     constraints; it cannot weaken output or add a silent fallback.
 15. All deterministic, resource, transaction, seven-frame visual, temporal, and
