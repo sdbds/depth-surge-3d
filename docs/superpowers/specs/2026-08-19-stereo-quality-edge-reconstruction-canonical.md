@@ -3,8 +3,8 @@
 ## Status
 
 This is the only implementation baseline for the stereo edge-reconstruction
-change. It consolidates the chat-approved design and both PRO review rounds. It
-is pending user review before implementation planning. No production
+change. It consolidates the chat-approved design and all completed PRO review
+rounds. It is pending user review before implementation planning. No production
 implementation is authorized by this document alone.
 
 The earlier draft paths (the second now represented only in Git history)
@@ -138,6 +138,18 @@ defects.
 | Persisted summaries cannot prove lane-level provenance | Treat lane statistics as producer-attested and independently cross-checked during generation; resume verifies committed hashes only. |
 | A global Quality default was unsafe on CPU | Make the resolved new-job default device-aware: gated CUDA defaults to Quality, CPU defaults to Fast; explicit CPU Quality remains supported and warned. |
 | Multiple overlapping design files were unsafe | Consolidate every active rule into this canonical specification and mark all earlier drafts superseded. |
+| Local strip continuation and equal-depth behavior were non-unique | Split equal-depth pre-fill runs at the exact fine-lane midpoint and define a complete scalar strip oracle with bounded enumeration. |
+| `MemoryError` could change RGB under one identity | Preallocate fixed scratch before plan mutation and make every allocation failure fatal; only semantic budgets may select fallback. |
+| Metric Quality received geometry after bilinear damage | Carry native `MetricGeometryFrame` primitives into a Quality-only renderer entry point and compute projection statistics after one-sided resampling. |
+| Stage and per-frame fill limits were conflated | Fingerprint configured/scaled limits plus policy versions; store geometry-dependent limits only in frame diagnostics. |
+| Fast component counts had no graph | Mark Fast component counts explicitly unavailable and validate Fast lane/pixel counters without a Quality plan. |
+| Diagnostics lacked a strict state machine and schemas | Define exact metadata, frame manifest, stats, JSONL, summary, hashing, building/complete, and aggregate-rebuild contracts. |
+| Metric clamp sidecars were outside the transaction | Put new-render clamp statistics in committed frame stats and derive the legacy-compatible clamp summary from diagnostics. |
+| Disk reserve omitted RGB transaction overlap | Replace the mask-only estimate with allocation-rounded final payload, aggregate, and one-frame atomic-overlap bounds. |
+| Exemplar core ownership was ambiguous | Partition the target bbox into nonoverlapping half-open 384-pixel interiors; halos never own targets. |
+| Horizontal union could wrap between rows | Require equal rows and consecutive columns, with a dedicated row-boundary fixture. |
+| Fallback lookup had no capacity or complexity contract | Use a capped deterministic per-region implicit k-d index and add a high-fallback 4K stress gate. |
+| Tiled geodesic verification had no equivalent algorithm | Require one global host priority queue and remove the unsupported tiled-equivalence claim. |
 
 ## Public Settings Contract
 
@@ -203,12 +215,26 @@ fill limit. Migrated legacy jobs may reuse an existing valid Fast v3 stage.
 Resume replaces blanket legacy-schema invalidation with a semantic check for
 that exact case.
 
-Quality fingerprints include the resolved mode, configured and effective fill
-limits, Quality RGB algorithm identity, source RGB guide fingerprint, all
-projection settings, and upstream geometry fingerprints. Changing mode, the
-Quality limit, or Quality identity invalidates stage 04 and tracked downstream
-stages, but not source, depth, canonical disparity, stabilization, or metric
-geometry. A Fast limit-only change does not invalidate a Fast stage.
+Quality stage identity is constructed before rendering. It retains every
+output-affecting current stage field, including geometry mode, ordered frame
+names, render shape, `occlusion_fill`, renderer device type, encoding, upstream
+geometry identity, and relative or metric projection settings. Its
+Quality-specific portion contains exactly the resolved mode,
+`configured_limit_1080p`, `scaled_safe_limit_px`,
+`predicted_gap_policy="max-four-neighbour-eye-shift-v1"`,
+`local_limit_formula="min-scaled-safe-predicted-plus2-v1"`, Quality RGB
+algorithm identity, and source RGB guide fingerprint.
+
+`scaled_safe_limit_px` is stage-constant because render shape is stage-constant.
+Frame-dependent `predicted_gap_px` and `local_limit_px` are not stage fields;
+both eyes record them in frame stats and the frame manifest repeats those values
+as a transaction-level assertion. They are already determined by the upstream
+geometry fingerprint, guide, settings, and policy versions.
+
+Changing mode, the configured Quality limit, or Quality identity invalidates
+stage 04 and tracked downstream stages, but not source, depth, canonical
+disparity, stabilization, or metric geometry. A Fast limit-only change does not
+invalidate a Fast stage.
 
 Legacy reused Fast output has no reconstructable lane diagnostics and reports
 `legacy_fast_unavailable`; masks or counts must not be fabricated from final
@@ -233,6 +259,49 @@ Quality primitive geometry + source-region labels
 visibility pass. It still emits compact coverage diagnostics. Fast retains the
 Revision 5 single-pass renderer exactly.
 
+### Native Metric Input Boundary
+
+The current file pipeline bilinearly expands native metric primitives inside
+`_decode_metric_work_item` before calling `render_geometry`. Quality must enter
+before that irreversible step. Add this owned internal input without copying the
+arrays already owned by `MetricGeometryFrame`:
+
+```python
+@dataclass(frozen=True)
+class MetricStereoPrimitiveInput:
+    metric: MetricGeometryFrame
+    virtual_baseline_mm: np.float64
+    convergence_distance_m: np.float64
+    max_disparity_percent: np.float64
+    retained_crop_width: int
+```
+
+`metric` supplies native float32 `inverse_depth`, bool `valid`, and float32
+`focal_x_normalized`. Constructor validation is the existing metric scalar and
+crop validation; the render shape comes from the uint8 source frame.
+
+The internal decode/render union becomes:
+
+```text
+np.ndarray | StereoGeometryFrame | MetricStereoPrimitiveInput
+```
+
+- relative Fast and Quality continue receiving native canonical disparity;
+- metric Fast calls current `build_metric_geometry` in the decoder and sends the
+  resulting render-size `StereoGeometryFrame` plus `MetricProjectionStats` to
+  the current `render_geometry` path;
+- metric Quality sends `MetricStereoPrimitiveInput` with no precomputed stats to
+  `render_metric_primitives_compact`, which performs region solving, one-sided
+  primitive resampling, projection, clamping, and final stats in that order;
+- `render_geometry(frame, StereoGeometryFrame, settings)` is Fast-only and
+  raises when `settings.stereo_render_mode == "quality"`;
+- metric Quality never silently accepts a render-size `StereoGeometryFrame`.
+
+The compact Quality result carries its final `MetricProjectionStats` to the
+writer. `_DecodeFrame`, `_DecodedMessage`, `_WriteItem`, tests, and mocks update
+their unions accordingly. This keeps the old public Fast entry point compatible
+while making it impossible to implement only relative Quality correctly.
+
 ### Source-region Identity and Fine-lane Components
 
 Source geometry regions replace a retained global graph over fine-grid winners,
@@ -250,12 +319,15 @@ Target repair components are global and use one segment record as one graph
 node. Two nodes may union only when they have the same source-region ID and are
 fine-grid adjacent:
 
-- horizontal adjacency between pixels `p` and `p+1` requires bit 15 in the
-  left record and bit 0 in the right record;
+- horizontal adjacency requires equal rows, `left_column + 1 == right_column`,
+  bit 15 in the left record, and bit 0 in the right record; a row's last pixel
+  never connects to the next row's first pixel;
 - vertical adjacency between rows `y` and `y+1` requires a nonzero bitwise AND
   of their lane masks;
-- disjoint records inside one output pixel do not union merely because their
-  region IDs match.
+- records inside one output pixel union only when their masks contain adjacent
+  lane bits, exactly
+  `(((mask_a << 1) & mask_b) | ((mask_b << 1) & mask_a)) & 0xffff != 0`;
+  separated masks do not union merely because region IDs match.
 
 Connectivity is evaluated after all Pass A records are sorted, so components
 cross band boundaries and may span the full image height without retaining a
@@ -410,8 +482,8 @@ render pixel `(y,x)` chooses the low-resolution label at
 `clamp(floor(sy+0.5), 0, SH-1), clamp(floor(sx+0.5), 0, SW-1)`, where `(sy,sx)`
 is the exact unclipped output-to-source coordinate from the interpolation
 oracle. Thus no library-specific `nearest` versus `nearest-exact` behavior is
-implicit. A
-mapped boundary is any four-neighbour pair with different non-sentinel IDs. Its
+implicit. A mapped boundary is any four-neighbour pair with different
+non-sentinel IDs. Its
 four-connected dilation radius is:
 
 ```text
@@ -437,6 +509,13 @@ uint8 BGR pixels `p` and `q`, traversal cost is the exact uint64 integer:
 ```text
 256 + 8 * max(abs(Bp-Bq), abs(Gp-Gq), abs(Rp-Rq))
 ```
+
+Production owns the complete host region, distance, predecessor/tie state, and
+one global priority queue for the render frame. It is not an independent-tile
+algorithm and has no fixed-halo approximation. Implementations may chunk array
+storage, but every relaxation still enters the same global queue and follows
+the same priority order; no tile may finalize a pixel independently. The host
+budget already includes these full-frame arrays.
 
 Neighbour visitation order is up, left, right, down. Priority order is total
 cost, then descending region rank, then ascending region ID, row, and column.
@@ -509,14 +588,26 @@ be copied by local, exemplar, or fallback repair. The planner may materialize a
 temporary boolean safe-donor mask inside its 64 MiB scratch budget; it is not a
 fourth retained analysis array.
 
-Each contiguous invalid fine-lane run inspects the immediately adjacent valid
-left and right fine-lane winners. Select the farther winner using Revision 5
-near-score ordering; an exact depth tie chooses the nearer horizontal candidate
-and then the left candidate. If only the right candidate exists, the run must
-touch the left frame edge; if only left exists, it must touch the right edge. A
-row-wide run with no valid boundary is a typed no-donor error in background
-mode. Store the chosen boundary winner's source-region ID in every run record.
-The run is split at output-pixel boundaries into records with this fixed
+Each maximal contiguous invalid sequence is a **pre-fill run** with inclusive
+fine coordinates `[s,e]`. Inspect valid anchors `L=s-1` and `R=e+1` when they
+exist. Unequal near scores assign the complete run to the farther anchor using
+Revision 5 depth ordering. Equal near scores preserve the current per-lane
+distance/tie rule by splitting into at most two **repair runs**:
+
+```text
+left repair run  = every j in [s,e] where (j - L) <= (R - j)
+right repair run = every remaining j
+```
+
+Thus the left half has `ceil((e-s+1)/2)` lanes and the right half has the
+remainder; an exact midpoint lane belongs left. Each nonempty repair run stores
+the corresponding anchor's source-region ID and `far_side`. This is the only
+equal-depth policy. If only `R` exists, the pre-fill run must touch the left
+frame edge and becomes one right repair run; the symmetric rule applies to only
+`L`. A row-wide run with no valid anchor is a typed no-donor error in background
+mode.
+
+Each repair run is split at output-pixel boundaries into records with this fixed
 little-endian, unaligned 16-byte dtype:
 
 ```text
@@ -543,13 +634,17 @@ An unplanned record has zero `fill_bgr` and backend 0.
 Every record mask is nonzero and contiguous within its output pixel. Masks in
 one pixel are pairwise disjoint. Convert a record to its inclusive full-row
 fine-coordinate interval using output column and the least/greatest set bits.
-Two sorted records reconstruct one original run only when their intervals are
+Two sorted records reconstruct one repair run only when their intervals are
 fine-grid consecutive in the same row and both `region_id` and `far_side`
 match. Because construction splits only at output-pixel boundaries, two
-consecutive pieces of one run occupy adjacent output pixels. The selected
+consecutive pieces of one repair run occupy adjacent output pixels. The selected
 boundary anchor is then uniquely derived as `run_start - 1` for left and
 `run_end + 1` for right; it must be a valid lane. A one-sided candidate is legal
 only when the opposite run end touches the frame edge.
+
+Hole-run statistics continue to describe the original maximal pre-fill run,
+before an equal-depth split. Repair planning, backend statistics, records, and
+components operate on repair runs.
 
 For each eye and pixel, the bitwise OR of all record masks must equal the Pass A
 invalid mask, and the sum of record-mask popcounts must equal the invalid-lane
@@ -628,7 +723,7 @@ predicted_gap_px   = ceil(max_neighbour_abs_q_jump_px) + 2
 local_limit_px     = min(safe_limit_px, predicted_gap_px)
 ```
 
-Each reconstructed horizontal run tries local fill exactly when
+Each repair run tries local fill exactly when
 `run_lane_count <= 16 * local_limit_px`. For a run beginning at full-row fine
 column `start_fine` with positive length `L`, statistics derive:
 
@@ -639,18 +734,76 @@ touched_pixel_span = last_pixel - first_pixel + 1
 physical_width_px  = float64(L) / 16.0
 ```
 
-The cap uses lane count, not touched-pixel span. Donors must be `safe_donor`
-pixels with the run's exact region ID. Candidate strips use the same row or two
-rows above/below and extend away from the recorded far boundary. Every
-successive target output pixel uses a successive donor pixel; a boundary colour
-is never repeated across a run.
+The cap uses repair-run lane count, not touched-pixel span. The public pre-fill
+run statistics use the same formulas on the unsplit pre-fill run.
 
-Candidate context is the three nearest known pure proxies on the background side.
-Define uint8 luma as `(29*B + 150*G + 77*R + 128) >> 8`. Candidate score is
-int64 `2 * BGR_L1 + luma_first_difference_L1`. Compare the same context offsets
-for every candidate. Lowest score wins; ties use absolute row delta, donor row,
-then donor column. If no complete safe strip exists, retain backend 0 and enter
-exemplar repair.
+#### Scalar Local-strip Oracle
+
+For repair run `[s,e]` in row `y`, let `dir=-1` and `anchor_fine=s-1` for a left
+far side, or `dir=+1` and `anchor_fine=e+1` for right. Let
+`boundary_col=floor(anchor_fine/16)`. Enumerate unique touched target columns
+from the boundary into the hole:
+
+```text
+left far side:  first_pixel, first_pixel+1, ..., last_pixel
+right far side: last_pixel, last_pixel-1, ..., first_pixel
+```
+
+Call their count `P`. Target index `j` always receives donor index `j`; no
+target order reversal is permitted later.
+
+The actual boundary context is the exact sequence
+`context_col[i] = boundary_col + i*dir` for `i=0,1,2` in row `y`. All three
+coordinates must be in frame and be pure proxies of the repair run's region.
+Do not skip an intervening non-proxy and do not shorten context. Otherwise local
+repair is ineligible.
+
+The bounded horizontal search is:
+
+```text
+search_limit_px = max(1, floor(64 * H / 1080 + 0.5))
+row_deltas      = [0, -1, +1, -2, +2]
+```
+
+Enumerate candidate slots by `offset=1..search_limit_px` outermost and the five
+`row_deltas` innermost. Slot `(offset,k)` has row
+`cy=y+row_deltas[k]`, first donor column
+`cx=boundary_col+dir*offset`, and ordinal
+`(offset-1)*5+k`. Every slot consumes one of exactly
+`5*search_limit_px` per-run evaluation slots, including an immediately rejected
+out-of-frame slot; there is no pressure-dependent early termination.
+
+A slot is eligible only when `cy` and every
+`cx+j*dir`, `j=0..max(P,3)-1`, are in frame and are same-region `safe_donor`
+pixels. Define `C[i,c]` as boundary `pure_bgr[y,context_col[i],c]` and `D[i,c]`
+as donor `pure_bgr[cy,cx+i*dir,c]` for `i=0,1,2`, channels in B,G,R order.
+Compute in this exact integer order:
+
+```text
+bgr_l1 = int64(0)
+for i = 0..2:
+    for c = B,G,R:
+        bgr_l1 += int64(abs(int32(C[i,c]) - int32(D[i,c])))
+
+YC[i] = (29*int32(C[i,B]) + 150*int32(C[i,G])
+         + 77*int32(C[i,R]) + 128) >> 8
+YD[i] = (29*int32(D[i,B]) + 150*int32(D[i,G])
+         + 77*int32(D[i,R]) + 128) >> 8
+
+luma_first_difference_l1 = int64(0)
+for i = 0..1:
+    dc = int32(YC[i+1] - YC[i])
+    dd = int32(YD[i+1] - YD[i])
+    luma_first_difference_l1 += int64(abs(int32(dc - dd)))
+
+score = int64(2) * bgr_l1 + luma_first_difference_l1
+```
+
+Choose the smallest `(score, ordinal)`. Fill target column `j` from
+`pure_bgr[cy,cx+j*dir]`; only that target column's repair-run lane mask receives
+the colour. This supplies distinct donor pixels and never repeats the boundary
+colour. If no slot is eligible, retain backend 0 and enter exemplar repair. A
+standalone scalar implementation is the local-strip test oracle.
 
 ### Exemplar Input and ROI
 
@@ -662,12 +815,25 @@ clipped ROI as absence from the frame. It returns a full-level colour only for
 targets actually completed by exemplar iteration. Other targets remain backend
 0 for the outer planner.
 
-Expand the target bounding box by 128 actual output pixels and clip to the
-frame. A repair core is at most 384x384 pixels. Larger boxes split into row-major
-384x384 cores with a 64-pixel read-only halo, so each working ROI is at most
-512x512. A target pixel belongs to the lowest row-major core containing it. A
-core may read already completed earlier-core target colours as context but may
-never use a synthesized target pixel as a donor.
+Let the component target bbox be half-open `[y0,y1) x [x0,x1)`. Its read/search
+domain is that bbox expanded by 128 actual output pixels and clipped to frame.
+Partition the unexpanded bbox into nonoverlapping half-open interiors with
+origins `(y0+384*i, x0+384*j)` in row-major `(i,j)` order:
+
+```text
+interior_y = [origin_y, min(origin_y + 384, y1))
+interior_x = [origin_x, min(origin_x + 384, x1))
+```
+
+The last row or column is simply partial. A core working ROI expands its unique
+interior by 64 pixels on every side and clips to the component read/search
+domain and frame, so it is at most 512x512. Target owner is the unique core
+whose **interior** contains that target; halo overlap never affects ownership.
+
+A nonowned target in a halo is read-only. If an earlier row-major owner has
+completed it, it is processed context; otherwise it is a barrier for the
+current core. The current core never copies to it or marks it processed. A
+synthesized target, including earlier-core context, never becomes a donor.
 
 ### Exact Pyramid State
 
@@ -692,8 +858,9 @@ At full resolution:
 - `target_mask` is true only for targets owned by the current core;
 - `processed_mask` is true for all same-region pure proxies and completed
   earlier-core context, and false for current targets and barriers;
-- `barrier_mask` is false only for same-region pure proxies, current targets,
-  and completed same-component context.
+- `barrier_mask` is false only for same-region pure proxies, targets owned by
+  the current core, and completed earlier-core context; later/noncompleted halo
+  targets are barriers.
 
 These invariants always hold: donor and target are disjoint, target and barrier
 are disjoint, donor implies processed, and barrier implies not processed.
@@ -804,15 +971,50 @@ black hole.
 
 The scalar fallback oracle enumerates every same-region safe donor inside the
 clipped square search window in row-major order, rejects `distance2` above the
-squared limit, and applies the distance/row/column key. An optimized spatial
-index is legal only when it returns the same donor for every target.
+squared limit, and applies the distance/row/column key.
 
-Exemplar scratch is limited to 64 MiB per eye. A host `MemoryError` releases all
-exemplar scratch, disables exemplar for the rest of that eye, and applies the
-same full-frame fallback in canonical record order. Fallback lookup state is
-allocated before exemplar work and is part of the host budget. If that lookup
-or any required fallback fails, propagate an actionable render error.
-There is no unconstrained OpenCV inpaint path and no silent Fast downgrade.
+Production uses a deterministic per-region implicit two-dimensional k-d index:
+
+- collect row-major uint32 pixel indexes only for safe donors whose region is
+  referenced by at least one backend-0 record;
+- partition each region's contiguous range in place, starting with row axis and
+  alternating row/column by depth;
+- choose the lower median by the total key `(axis coordinate, other coordinate,
+  pixel_index)` using deterministic median-of-medians partitioning;
+- child ranges are implicit and require no pointer per donor;
+- the scalar query starts with no donor and `radius2=fallback_limit_px**2`. At
+  each nonempty range it visits and counts the median node first, accepts it only
+  when `distance2 <= radius2`, and keeps the smallest exact
+  `(distance2, row, column)` key;
+- let signed-int64 `delta = target_axis - node_axis`. The lower child is nearer
+  when `delta <= 0`, otherwise the upper child is nearer. Query the nearer child,
+  then query the farther child exactly when `delta*delta <= bound`, where `bound`
+  is the smaller of `radius2` and the selected donor's distance, or `radius2`
+  when none has been selected. Axis selection alternates exactly as in build.
+
+The index must return the scalar-oracle donor exactly. It has one fixed 48 MiB
+per-eye arena covering the uint32 donor array, region descriptors, construction
+stack, and query stack. Build complexity is `O(N log N)` over indexed donors,
+working memory is `O(N)`, expected query work is `O(log N)`, and exact worst case
+remains `O(N)`; queries are never truncated because that would change output.
+Diagnostics record indexed donor count, query count, total visited nodes,
+maximum, and p95 visited nodes. Query p95 applies NumPy linear interpolation to
+the source-order per-query visit counts and is `0.0` when there are no queries.
+Wall-clock build time is benchmark telemetry, never hashed frame diagnostics.
+The 4K fallback stress gate below constrains the practical case.
+
+Before any component changes a record's backend or `fill_bgr`, allocate the
+complete 64 MiB exemplar arena and complete 48 MiB fallback-index arena once.
+The index builder and queries use only their arena after that point. If either
+preallocation, index construction, or any later allocation raises
+`MemoryError`, fail the frame and commit no RGB or diagnostics. Earlier planned
+values are discarded. Runtime memory pressure never selects fallback and never
+changes output under one RGB identity. Only the fixed core/component/eye
+evaluation budgets may deterministically route records to backend 3.
+
+If no safe donor exists within the limit or required index state exceeds its
+fixed arena, propagate an actionable render error. There is no unconstrained
+OpenCV inpaint path and no silent Fast downgrade.
 
 ## Compact Coverage and Statistics
 
@@ -863,38 +1065,48 @@ NumPy linear interpolation; an empty run set reports integer maxima 0 and float
 p95 values `0.0`.
 
 Backend lane count is the number of lane bits assigned to that backend. Backend
-pixel count is the number of pixels with at least one such bit. Backend
-component count is the number of global sparse target components which used
-that backend at least once. `final_unresolved_lane_count` is the sum of
-unresolved lane bits after Pass B. Repair bit 6 is set for a pixel exactly when
-its unresolved lane count is nonzero. The public legacy `hole_mask` remains
-true only when all 16 lanes are finally unresolved.
+pixel count is the number of pixels with at least one such bit. In Quality,
+backend component count is the number of canonical sparse segment components
+which used that backend at least once. Fast does not construct source regions,
+segment records, or this graph, so all Fast backend component values are JSON
+`null` with `availability="unavailable_fast_no_segment_graph"`; they are not
+invented from coverage or final RGB.
 
-Statistics contain only integers, finite nonnegative floats, strings, lists,
-and dictionaries. Normalize negative floating zero to positive zero. Reject NaN
-and infinity. Canonical bytes are ASCII JSON with sorted keys,
+`final_unresolved_lane_count` is the sum of unresolved lane bits after final
+rendering. Repair bit 6 is set for a pixel exactly when its unresolved lane
+count is nonzero. The public legacy `hole_mask` remains true only when all 16
+lanes are finally unresolved.
+
+Statistics contain only integers, finite nonnegative floats, strings, booleans,
+lists, dictionaries, and JSON `null` at fields explicitly declared nullable by
+the strict schema below. Normalize negative floating zero to positive zero.
+Reject NaN and infinity. Canonical bytes are ASCII JSON with sorted keys,
 `separators=(",", ":")`, `ensure_ascii=True`, and `allow_nan=False`; SHA-256 of
 those bytes is the statistics fingerprint.
 
 Lane-level counts are producer-attested, not independently reconstructable from
-persisted PNG sidecars. During generation, one counter is accumulated from the
-final segment records and a separate Pass B counter is accumulated from actual
-scatter masks; lane totals, per-backend totals, mask OR, popcount, and final
-unresolved counts must agree before commit. Resume verifies committed hashes and
-PNG-derived pixel counts when masks exist, but does not claim to rederive
-backend lane or component membership. Documentation uses "committed
-diagnostics" rather than "independently auditable lane plan."
+persisted PNG sidecars. For Quality, one counter is accumulated from final
+segment records and a separate Pass B counter from actual scatter masks; lane
+totals, per-backend totals, mask OR, popcount, and final unresolved counts must
+agree before commit. Fast instead counts writes inside the existing fill helper
+and independently derives pre-fill, filled, and final lane totals from the
+active band's pre/post validity arrays before releasing them. It never runs the
+Quality planner for diagnostics. Resume verifies committed hashes and
+PNG-derived pixel counts when masks exist, but does not claim to rederive lane
+or component provenance. Documentation uses "committed diagnostics" rather than
+"independently auditable lane plan."
 
 ## Diagnostics Stage and Transaction
 
 Stereo RGB and diagnostics use the separate identities fixed in the Persistence
 and Identity Contract. Fast RGB metadata and fingerprint remain byte-compatible
-with existing v3.
-Diagnostics are rooted at:
+with existing v3. Every path below is relative to the job output root:
 
 ```text
 04_stereo_diagnostics/
     metadata.json
+    stereo_coverage_frames.jsonl
+    stereo_coverage_summary.json
     frames/frame_000089/
         left_coverage.png
         left_repair.png
@@ -904,48 +1116,285 @@ Diagnostics are rooted at:
         manifest.json
 ```
 
-Coverage and repair PNGs are single-channel uint8 at render shape. They are
-present only when `keep_intermediates=true`. `stats.json` is always present for
-a newly rendered frame. `manifest.json` is the frame commit marker and is
-written last. It records diagnostics identity, frame name, RGB dimensions, and
-SHA-256 for both final eye PNGs, `stats.json`, and every enabled mask PNG.
+Coverage and repair PNGs are single-channel uint8 at render shape and exist only
+when `keep_intermediates=true`. Per-frame `stats.json` and `manifest.json` exist
+for every new Fast or Quality render regardless of mask retention.
 
-For one frame, encode every file to a same-directory temporary path, replace
-left RGB, right RGB, enabled masks, and stats in that order, then atomically
-write the manifest. Any failure removes the manifest and every final file in
-that frame transaction, including both RGB images. Resume treats a frame as
-complete only when its manifest parses strictly and every recorded hash and
-PNG header matches.
+Diagnostics normalize the existing persisted `stereo_geometry_mode` value
+`metric_camera` to the JSON token `metric`; `relative` remains `relative`. This
+normalization is diagnostics-only and does not rename the existing RGB-stage
+field or public setting.
 
-An absent diagnostics root is `legacy_fast_unavailable` only when the saved
-settings source schema was 1 through 4 and a matching Fast v3 RGB stage already
-exists. Migration atomically writes a diagnostics metadata marker with that
-state. After that marker exists, or for any schema-v5 job, missing or invalid
-new diagnostics are damage and cause per-frame regeneration. This distinction
-does not alter the Fast RGB fingerprint.
+### Canonical JSON and Hashing
 
-Any diagnostics-triggered stereo rerender sets the same `repaired_outputs`
-condition as missing or damaged eye RGB and invalidates every tracked downstream
-frame stage before the replacement transaction begins. It does this even if the
-new eye hashes later equal the old ones; there is no temporary hash-comparison
-optimization in Quality v1.
+All JSON objects reject missing or extra keys. Canonical JSON is the ASCII byte
+encoding already defined for statistics. A 64-character lowercase hexadecimal
+SHA-256 hashes the exact stated bytes. Every self-fingerprinted object computes
+`fingerprint = SHA256(canonical_json(object without fingerprint))`.
 
-After all frame manifests are valid, enumerate them in the exact source
-`frame_names` order. Rebuild `stereo_coverage_frames.jsonl` and
-`stereo_coverage_summary.json` from per-frame stats into temporary files and
-atomically replace both root-level outputs. Writer threads never append JSONL.
-Duplicate or missing frame names fail consolidation. The summary records the
-ordered manifest hash and participates in the diagnostics fingerprint, not the
-RGB fingerprint.
+For source-ordered frame names, define:
 
-Stereo invalidation deletes `04_stereo_diagnostics` and both root summaries.
-For `keep_intermediates=false`, mask PNGs are never part of the transaction;
-per-frame `stats.json` and `manifest.json` remain after consolidation so resume
-can validate schema-5 diagnostics. For `keep_intermediates=true`, masks and
-their manifest entries remain. No normal cleanup deletes a manifest-recorded
-file. The two ordered root summaries are retained in both cases.
-Legacy-unavailable summaries state availability explicitly and contain no
-fabricated counts.
+```text
+ordered_frame_manifest_fingerprint = SHA256(canonical_json([
+  {"frame_name": name, "manifest_sha256": SHA256(raw_manifest_bytes)},
+  ...
+]))
+```
+
+The JSONL bytes are each validated `stats.json` object re-encoded canonically,
+followed by ASCII LF, in exact source order. Nonempty JSONL has a final LF; an
+empty sequence is zero bytes. `frames_jsonl_sha256` hashes those exact bytes.
+
+### Metadata State Machine
+
+`04_stereo_diagnostics/metadata.json` has exactly these keys:
+
+```text
+schema_version:                     1
+algorithm_version:                  "stereo-coverage-sidecar-v1"
+status:                             "building" | "complete" |
+                                    "legacy_fast_unavailable"
+rgb_stage_fingerprint:              string
+source_guide_fingerprint:           string
+frame_names:                        list[string]  # unique source-order stems
+render_shape:                       [H, W]
+render_mode:                        "fast" | "quality"
+geometry_mode:                      "relative" | "metric"
+mask_payloads_enabled:              bool
+stats_schema_version:               1
+frame_manifest_schema_version:      1
+ordered_frame_manifest_fingerprint: string | null
+frames_jsonl_sha256:                string | null
+summary_sha256:                     string | null
+metric_clamp_summary_sha256:        string | null
+fingerprint:                        string
+```
+
+Before any frame transaction, atomically write `building` metadata with the
+four aggregate hashes null and remove stale aggregate temporaries. After every
+frame manifest validates, write JSONL, summary, and metric compatibility summary
+to same-directory temporaries, replace them, then atomically write `complete`
+metadata last with their hashes. Relative mode requires
+`metric_clamp_summary_sha256=null`; metric mode requires the hash of
+`04_left_frames/clamp_summary.json`.
+The diagnostics stage fingerprint is the metadata `fingerprint`; because it is
+computed without itself but over all aggregate hashes, JSONL, summary, ordered
+manifests, and metric compatibility output participate without a recursive hash.
+
+A valid `building` resume validates and reuses committed frame manifests,
+rerenders only missing/invalid frames, and rebuilds aggregates. A valid
+`complete` stage with missing or corrupt JSONL, root summary, or metric clamp
+summary is atomically demoted to `building` and rebuilds those derived files
+without rerendering RGB when every frame transaction remains valid. A bad frame
+manifest or its payload requires that frame's stereo rerender.
+
+An absent diagnostics root may become `legacy_fast_unavailable` only for a
+saved schema 1 through 4 job with a matching reusable Fast v3 RGB stage. It
+writes no frame directories, an empty JSONL, and a strict root summary with
+`availability="legacy_fast_unavailable"`; ordered manifest hash is the hash of
+canonical `[]`. Its complete-like metadata hashes those two aggregate files and
+has `mask_payloads_enabled=false`. A legacy metric stage additionally hashes its
+already validated old clamp summary; legacy relative uses null. It never
+fabricates counts.
+
+### Frame Statistics Schema
+
+Each `stats.json` has exactly:
+
+```text
+schema_version:     1
+frame_name:         string
+render_mode:        "fast" | "quality"
+geometry_mode:      "relative" | "metric"
+render_shape:       [H, W]
+eyes:               {"left": EyeStats, "right": EyeStats}
+metric_projection:  null | MetricProjectionStats
+```
+
+`MetricProjectionStats` has exactly `valid_pixel_count`,
+`clamped_pixel_count`, and `clamped_fraction`. It is null in relative mode and
+required in metric mode. `EyeStats` has exactly:
+
+```text
+pixel_count
+state_pixel_counts
+state_pixel_ratios
+hole_runs
+backend_lane_counts
+backend_pixel_counts
+backend_component_counts
+final_unresolved_lane_count
+quality_limits
+quality_budgets
+```
+
+`state_pixel_counts` and `state_pixel_ratios` each have exactly
+`prefill_partial`, `prefill_full`, `local_filled`, `post_local_residual`,
+`exemplar_filled`, `fallback_filled`, and `final_unresolved`. Ratios use
+`pixel_count`.
+
+`hole_runs` has exactly `count`, `lane_count_histogram`,
+`touched_pixel_span_histogram`, `lane_count_max`, `lane_count_p95`,
+`touched_pixel_span_max`, `touched_pixel_span_p95`,
+`physical_width_px_max`, and `physical_width_px_p95`. A histogram is an
+ascending list of unique `[positive_value, positive_count]` pairs. Maxima and
+p95 are independently derived from histograms; physical width derives from the
+lane histogram divided by 16. Empty histograms use the zero rules above.
+
+`backend_lane_counts` and `backend_pixel_counts` each have exactly `local`,
+`exemplar`, and `fallback`. `backend_component_counts` has exactly
+`availability`, `local`, `exemplar`, and `fallback`. Quality availability is
+`quality_segment_graph` and all three counts are integers. Fast availability is
+`unavailable_fast_no_segment_graph` and all three values are null.
+
+`quality_limits` is null for Fast. For Quality it has exactly
+`max_neighbour_abs_q_jump_px`, `predicted_gap_px`, and `local_limit_px`.
+`quality_budgets` is null for Fast. For Quality it has exactly:
+
+```text
+segment_record_count
+segment_table_bytes
+exemplar_evaluations
+fallback_indexed_donor_count
+fallback_query_count
+fallback_visited_nodes_total
+fallback_visited_nodes_max
+fallback_visited_nodes_p95
+```
+
+### Frame Manifest and Transaction
+
+Each `manifest.json` has exactly:
+
+```text
+schema_version:                1
+algorithm_version:             "stereo-coverage-sidecar-v1"
+frame_name:                    string
+render_mode:                   "fast" | "quality"
+geometry_mode:                 "relative" | "metric"
+render_shape:                  [H, W]
+rgb_stage_fingerprint:         string
+mask_payloads_enabled:         bool
+quality_limits:                null | {"left": QualityLimits,
+                                       "right": QualityLimits}
+payloads:                      PayloadMap
+fingerprint:                   string
+```
+
+`QualityLimits` has exactly `max_neighbour_abs_q_jump_px`,
+`predicted_gap_px`, and `local_limit_px`. `quality_limits` is null for Fast. For
+Quality, its two objects must equal the corresponding `stats.json` eye values
+exactly; this repetition lets the manifest assert the geometry-dependent limits
+without placing a frame list in stage identity.
+
+`PayloadMap` has exactly `left_rgb`, `right_rgb`, `left_coverage`,
+`left_repair`, `right_coverage`, `right_repair`, and `stats`. RGB and stats
+entries are required objects; mask entries are objects exactly when enabled and
+otherwise null. Each object has exactly `relative_path`, `sha256`, and
+`byte_count`; paths are output-root-relative POSIX paths and cannot contain
+`..` or an absolute prefix.
+
+For one frame, encode every payload to a temporary in its destination
+directory. Replace left RGB, right RGB, enabled masks, and stats in that order,
+then write the canonical manifest last. Metric projection statistics are inside
+stats, so there is no new-render per-frame `04_left_frames/clamp_stats` file.
+Any failure removes the manifest and every final payload in that transaction,
+including both RGB images. Resume verifies manifest self-fingerprint, every raw
+payload hash/byte count, exact stats schema, path containment, and PNG header.
+
+Any frame rerender triggered by diagnostics sets the existing
+`repaired_outputs` condition and invalidates every tracked downstream frame
+stage before replacement begins, even if regenerated RGB later hashes equally.
+
+### Root Summary Schema
+
+`04_stereo_diagnostics/stereo_coverage_summary.json` has exactly:
+
+```text
+schema_version:                       1
+algorithm_version:                    "stereo-coverage-sidecar-v1"
+availability:                         "available" |
+                                      "legacy_fast_unavailable"
+frame_names:                          list[string]
+frame_count:                          int
+render_shape:                         [H, W]
+render_mode:                          "fast" | "quality"
+geometry_mode:                        "relative" | "metric"
+ordered_frame_manifest_fingerprint:   string
+frames_jsonl_sha256:                  string
+eyes:                                 {"left": EyeAggregate,
+                                       "right": EyeAggregate} | null
+metric_projection:                    MetricProjectionAggregate | null
+```
+
+For available diagnostics, `EyeAggregate` has exactly `pixel_count`, summed
+`state_pixel_counts`, recomputed `state_pixel_ratios`, merged `hole_runs`, summed
+`backend_lane_counts`, summed `backend_pixel_counts`, summed-or-null
+`backend_component_counts`, summed `final_unresolved_lane_count`,
+`quality_limit_ranges`, and `quality_budget_totals`. Merged hole histograms are
+sorted and all max/p95 fields are recomputed from them. Quality limit ranges
+contain min/max for each of the three per-frame limit fields; they and budget
+totals are null for Fast. Component availability and nullability must be the
+same in every frame.
+
+The nested `state_pixel_counts`, `state_pixel_ratios`, `hole_runs`,
+`backend_lane_counts`, `backend_pixel_counts`, and `backend_component_counts`
+use exactly the same key sets as `EyeStats`. `quality_limit_ranges` is either
+null or has exactly:
+
+```text
+max_neighbour_abs_q_jump_px_min
+max_neighbour_abs_q_jump_px_max
+predicted_gap_px_min
+predicted_gap_px_max
+local_limit_px_min
+local_limit_px_max
+```
+
+`quality_budget_totals` is either null or has exactly:
+
+```text
+segment_record_count                 # sum
+segment_table_bytes_max              # maximum eye/frame value
+exemplar_evaluations                 # sum
+fallback_indexed_donor_count         # sum
+fallback_query_count                 # sum
+fallback_visited_nodes_total         # sum
+fallback_visited_nodes_max           # global maximum
+fallback_visited_nodes_frame_p95_max # max of per-frame p95 values
+```
+
+`MetricProjectionAggregate` is required only for metric mode and has exactly
+`valid_pixel_count`, `clamped_pixel_count`, `clamped_fraction`, ordered
+`clamped_fractions`, `affected_frame_count`, `mean_clamped_fraction`, and
+`max_clamped_fraction`. Global `clamped_fraction` divides summed clamped by
+summed valid; mean is the arithmetic mean of ordered per-frame fractions.
+
+Legacy-unavailable summary uses the real frame names/count/shape/modes and
+hashes, with `eyes=null` and `metric_projection=null`. Duplicate, missing, or
+out-of-order names fail consolidation.
+
+For new metric renders, atomically derive the existing-compatible
+`04_left_frames/clamp_summary.json` from `MetricProjectionAggregate`; the
+orchestrator/runtime summary reads the same aggregate. Missing or corrupt
+derived clamp summary is aggregate damage and is rebuildable without RGB. A
+legacy reused Fast metric stage continues validating and trusting its existing
+per-frame clamp sidecars and summary. Starting any schema-5 metric rerender
+deletes its old `clamp_stats` directory and derived summary before writing, so
+old and new completion rules never coexist.
+
+The derived compatibility file retains exactly the current six keys:
+`schema_version`, `frame_names`, `clamped_fractions`, `affected_frame_count`,
+`mean_clamped_fraction`, and `max_clamped_fraction`. Their values are copied or
+derived from the corresponding aggregate fields; the diagnostics-only summed
+valid/clamped counts are not added to this legacy shape.
+
+Writer threads never append JSONL or update root aggregates. Stereo invalidation
+deletes `04_stereo_diagnostics`, both diagnostic aggregate files, and new-render
+derived clamp summary. With intermediates disabled, mask files are never
+created; stats/manifests and aggregates remain. With intermediates enabled,
+masks and manifest entries remain. No normal cleanup removes a
+manifest-recorded file.
 
 ## Settings Migration and Override Resolution
 
@@ -1035,11 +1484,13 @@ The generator uses the pipeline coefficient; the public `render()` wrapper uses
 the public coefficient, whose extra four bytes per pixel are the four concrete
 legacy boolean masks. At 4K, either Quality path admits exactly one lifecycle
 slot. The 64 MiB overhead includes exemplar working state; source regions,
-compact analysis, plans, output, diagnostics, and full-frame fallback lookup
-count in the appropriate coefficient. The clean memory gate measures all
-stereo-owned host allocations and requires them to remain within 512 MiB. It
-also verifies that left-eye planning state is released before right-eye Pass A
-begins.
+compact analysis, the capped 64 MiB segment table, output, diagnostics, global
+geodesic arrays/queue, and the at-most-48 MiB fallback index in the
+appropriate coefficient. The clean memory gate measures all stereo-owned host
+allocations and requires them to remain within 512 MiB. It also verifies that
+both fixed arenas are allocated before plan mutation and that left-eye planning
+state is released before right-eye Pass A begins. Allocation failure is fatal,
+never an alternate output path.
 
 At 4K, one eye's dense Pass A analysis is exactly 8 bytes per pixel, or about
 63.3 MiB. The full-resolution source-region map is 4 bytes per pixel, or about
@@ -1053,19 +1504,65 @@ separately; neither may rely on allocator reuse hidden from the accounting.
 
 ### Disk and I/O
 
-With masks enabled, diagnostics add four uint8 render-size images per frame.
-Preflight reserves this conservative uncompressed amount before stage 04:
+Preflight estimates the complete pending stage-04 transaction, not diagnostics
+alone. Reuse the metric-stage allocation-unit query and 64 KiB fallback. Define:
 
 ```text
-diagnostic_mask_reserve = ceil((frame_count + 1) * H * W * 4 * 1.01)
+A = max(4096, target filesystem allocation unit)
+alloc(n) = ceil(n / A) * A
+
+rgb_file_bound  = alloc(ceil(1.25 * H * W * 3))
+mask_file_bound = alloc(ceil(1.25 * H * W))
+json_file_bound = alloc(64 KiB)
+
+N = total source frame count
+P = frame transactions which are missing or require replacement
+M = 1 when mask payloads are enabled, otherwise 0
+
+pending_final_rgb_reserve  = P * 2 * rgb_file_bound
+pending_final_mask_reserve = P * M * 4 * mask_file_bound
+pending_stats_manifest_reserve = P * 2 * json_file_bound
+
+frames_jsonl_bound = alloc(N * 64 KiB)
+root_file_count = 3 + (1 when geometry_mode == metric else 0)
+root_aggregate_reserve = 2 * (
+    frames_jsonl_bound + (root_file_count - 1) * json_file_bound
+)
+
+one_frame_atomic_rgb_overlap  = (2 * rgb_file_bound) if P > 0 else 0
+one_frame_atomic_mask_overlap = (M * 4 * mask_file_bound) if P > 0 else 0
+one_frame_atomic_json_overlap = (2 * json_file_bound) if P > 0 else 0
+
+pending_file_count = P * (4 + M * 4)
+aggregate_file_count = root_file_count
+atomic_file_count = (4 + M * 4) if P > 0 else 0
+filesystem_allocation_overhead = A * (
+    pending_file_count + aggregate_file_count + atomic_file_count
+)
+
+required_bytes =
+    pending_final_rgb_reserve
+  + pending_final_mask_reserve
+  + pending_stats_manifest_reserve
+  + root_aggregate_reserve
+  + one_frame_atomic_rgb_overlap
+  + one_frame_atomic_mask_overlap
+  + one_frame_atomic_json_overlap
+  + filesystem_allocation_overhead
 ```
 
-Also reserve `4096 * frame_count + 1 MiB` for atomic stats/manifests and ordered
-summaries. The additional frame accounts for the largest simultaneous mask
-transaction; the 1 percent margin covers PNG/container overhead. If free space
-is below the reserve, fail before rendering with the required and available byte
-counts. With intermediates disabled, reserve only the stats/summary amount and
-retain per-frame stats/manifests plus the consolidated root files.
+The factor 1.25 is the same conservative payload multiplier as metric geometry;
+per-file allocation rounding and explicit filesystem slack are intentionally
+both retained. Root reserve is doubled because an existing aggregate and its
+replacement temporary coexist. The one-frame overlap separately covers old RGB,
+masks, and JSON while every replacement temporary is pre-encoded. Existing
+files already consume disk and are not treated as free.
+
+If free space is below `required_bytes`, fail before rendering with required and
+available bytes. Re-evaluate before a repaired-frame batch if `P`, mask policy,
+shape, or allocation unit changes. A later ENOSPC/Windows error 112 reports the
+persisted estimate, current free bytes, and failing path. With masks disabled,
+stats/manifests and root aggregates still remain.
 
 Benchmarks include PNG encode/write time and actual diagnostic bytes. Fast
 renderer-only p95 may regress at most 5 percent. Fast full-pipeline p95 with
@@ -1122,6 +1619,9 @@ It is not a setting, saved mode, resume identity, or production branch.
    path proves those arrays are not allocated.
 5. A diagnostics-triggered rerender always invalidates tracked downstream
    stages before writing, including when regenerated RGB hashes happen to match.
+6. Quality metadata fingerprints configured/scaled limits and both policy
+   versions but not frame-dependent limits; each frame manifest records both
+   eyes' recomputed values.
 
 ### Geometry and Numeric Oracles
 
@@ -1133,14 +1633,18 @@ It is not a setting, saved mode, resume identity, or production branch.
 3. Relative and metric fixtures prove primitive dependency order, validity,
    pinhole equations, clamping, convergence, and independently recounted clamp
    statistics.
+   Metric Quality receives native `MetricGeometryFrame` arrays, never calls the
+   old bilinear `build_metric_geometry`, and rejects a full-resolution
+   `StereoGeometryFrame`; metric Fast preserves the old call path exactly.
 4. An independent scalar binary64 oracle covers boundary clipping, all four
    corner masks, zero retained weight, one-ULP projected-lane changes, and exact
    metric weight reuse.
 5. Adversarial union orders produce identical source-region IDs because IDs use
    minimum member index rather than the implementation's union root.
 6. The four boundary-movement fixtures and multi-edge fixture match an
-   independent scalar integer-geodesic oracle exactly. Tiled and untiled host
-   geometry also match exactly.
+   independent scalar integer-geodesic oracle exactly. Production's one global
+   queue matches the scalar global queue; no independent tiled oracle or gate is
+   claimed.
 
 ### Visibility, Components, and Repair
 
@@ -1148,50 +1652,76 @@ It is not a setting, saved mode, resume identity, or production branch.
    full-frame, one-row, planned, and forced OOM-retry band heights. Record masks
    are nonzero, contiguous, disjoint, and preserve `far_side` under mirrored
    left/right fixtures.
+   Equal-depth runs of odd and even length split exactly by per-lane distance,
+   with the midpoint assigned left.
 2. Pass B RGB and compact diagnostics are byte-identical across band heights,
    CPU/CUDA, and I/O worker counts. Every changed lane was invalid before fill.
 3. A vertically full-height component proves cross-band planning without a
    dense fine grid. Horizontal lane-0/lane-15 and vertical disjoint-mask cases
-   prove nonadjacent segments do not union; overlapping vertical masks do.
+   prove nonadjacent segments do not union; overlapping vertical masks do. A
+   last-column/next-row fixture proves horizontal union cannot wrap rows, while
+   adjacent same-pixel masks do union.
 4. Different union-find strategies produce component IDs ordered by minimum
-   canonical fine index. Separate runs in one pixel remain separate.
+   canonical fine index. Separated same-pixel masks remain separate, while
+   immediately adjacent same-region masks union exactly once.
 5. A length-16 run starting at lane 8 reports lane count 16, touched span 2,
    and physical width 1.0; cap classification uses lane count only.
 6. Mixed-region pixels are not pure proxies. A same-region pixel with one valid,
    deliberately foreground-contaminated lane may be context but is rejected by
    local, exemplar, and fallback donor selection. Clearance-radius boundaries
    are rejected as donors.
-7. Local fills use recorded far side, distinct safe donors, exact cap scaling,
-   and no cross-region source. Over-cap or failed-local runs reach exemplar or
-   fallback instead of black output.
-8. Exact pyramid tests cover odd ROI sizes, target-plus-barrier parents,
+7. Local fills match the independent scalar oracle for both sides, odd/even
+   equal-depth splits, target traversal, all five row positions, search limit,
+   insufficient context, ineligible slots, exact BGR/first-difference scores,
+   integer order, ordinal ties, and evaluation-slot exhaustion. Over-cap or
+   failed-local runs reach exemplar or fallback instead of black output.
+8. Exact pyramid tests cover odd ROI sizes, nonoverlapping half-open core
+   interiors, partial last cores, clipped halos, unique ownership, read-only
+   later-core targets, target-plus-barrier parents,
    bottom-up working colour, target-only nearest replication for all children,
    unfinished coarse targets, no patch clipping, update visibility, earlier-core
    context, and full-level backend assignment.
 9. Core, component, and eye budget exhaustion each take the unique specified
-   fallback order. Candidate subsampling, 8,192-iteration termination,
-   `MemoryError`, no-donor failure, and 64 MiB scratch/table limits have exact
-   unit expectations.
+   fallback order. Candidate subsampling, 8,192-iteration termination, no-donor
+   failure, and segment/scratch/index limits have exact unit expectations.
+   Injected preallocation, index-build, mid-component, and post-component
+   `MemoryError` always fail with no committed frame; they never change backend
+   selection or retain earlier exemplar results.
 10. A legal donor 129 through 256 1080p-equivalent pixels outside the exemplar
-    ROI proves full-frame fallback lookup. A donor one pixel beyond the limit is
-    rejected. No synthesized value ever becomes a donor.
+     ROI proves full-frame fallback lookup. A donor one pixel beyond the limit is
+     rejected. Brute-force and implicit k-d queries agree across ties, degenerate
+     coordinates, regions, and radius boundaries. Arena overflow and index-build
+     failure are fatal. No synthesized value ever becomes a donor.
 11. `background + quality` returns zero final unresolved lanes or an explicit
     error. `none` retains Revision 5 black-lane behavior and mask semantics.
 
 ### Diagnostics and Transactions
 
-1. Generation-time plan and Pass B counters independently agree on OR masks,
-   popcounts, backend lanes, and final unresolved lanes. Persisted resume tests
-   verify the documented producer-attested trust boundary.
-2. Coverage/repair masks, run measures, ratios, backend pixel/component counts,
+1. Quality plan and Pass B counters independently agree on OR masks, popcounts,
+   backend lanes, and final unresolved lanes. Fast fill-helper and pre/post-band
+   counters agree without constructing Quality regions or records; every Fast
+   component count is null with the exact unavailable reason.
+2. Coverage/repair masks, run measures/histograms, ratios, backend
+   pixel/component counts,
    canonical JSON, positive zero, reserved bit 7, finite numbers, and hashes all
    match independent synthetic expectations.
-3. Fault injection after every replacement step leaves no commit manifest and
-   no partial RGB/mask/stat transaction. Resume distinguishes legacy unavailable
-   from damaged schema-5 diagnostics.
-4. Parallel frame completion produces source-ordered, duplicate-free JSONL and
-   the same summary hash as serial completion.
-5. Disk preflight is exact one byte below, equal to, and above its reserve. The
+3. Strict-key tests reject every missing, extra, wrong-type, noncanonical, bad
+   path, self-fingerprint, payload-hash, and state-transition mutation in
+   metadata, stats, manifests, JSONL, and summary.
+4. Fault injection after every frame and aggregate replacement leaves the
+   correct `building` state and no false commit. Resume distinguishes legacy
+   unavailable, rebuildable aggregate damage, and frame damage requiring RGB.
+5. Parallel frame completion produces source-ordered, duplicate-free JSONL and
+   the same ordered-manifest, JSONL, summary, metadata, and clamp-summary hashes
+   as serial completion.
+6. Relative stats require null metric projection. New Fast/Quality metric stats
+   replace per-frame clamp sidecars, rebuild the exact compatibility summary,
+   and preserve legacy Fast validation. Fault injection covers projection stats
+   and the derived clamp summary.
+7. Disk preflight covers missing and repaired frames, masks on/off, metric and
+   relative aggregates, allocation-unit fallback, and simultaneous old RGB plus
+   all new temporaries. It is exact one byte below, equal to, and above its
+   reserve. The
    verifier rejects mutation, wrong order, dtype, shape, fingerprint, or hash in
    any of the seven bound source/canonical fixtures before rendering.
 
@@ -1238,11 +1768,14 @@ With five warmups and 30 measured frames on that clean CUDA environment:
   3840x2160, and at most 12 times matching Fast p95;
 - a 4K synthetic component covering 25 percent of the image finishes within
   30.0 seconds, within budgets or with explicitly counted safe fallback;
+- a 4K synthetic frame routing at least 25 percent of pixels to fallback builds
+  its at-most-48 MiB index and completes exact queries within 30.0 seconds;
+  query p95 visits at most 4,096 nodes and diagnostics report all visits;
 - full-pipeline Quality p95 including diagnostics is at most 6.0 seconds at
   1080p and 24.0 seconds at 4K;
 - GPU allocation plus 25 percent headroom fits 1,536 bytes per source pixel;
 - compact pipeline and public-wrapper host peaks separately fit 512 MiB;
-- diagnostic disk use does not exceed preflight reserve;
+- total stage-04 disk use and transaction peak do not exceed preflight reserve;
 - Fast renderer and no-mask pipeline p95 regress at most 5 percent, and Fast
   pipeline p95 with masks enabled regresses at most 25 percent.
 
