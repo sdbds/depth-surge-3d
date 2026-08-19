@@ -7,6 +7,15 @@ The feature is an opt-in aggressive optimization. The existing assembled-PNG
 path remains the default and keeps its current output, preview, and recovery
 behavior.
 
+This document is partially superseded by
+`2026-08-19-stereo-quality-edge-reconstruction-canonical.md`. Its
+"Relationship to Final Encoding Specifications" authority map is controlling:
+this document retains the opt-in/source-selection/layout/encoder-quality/basic
+UX decisions, while the canonical specification replaces input validation,
+audio and `-shortest` policy, command normalization, publication/manifests,
+container validation, resume, and cleanup. The sentence above about unchanged
+recovery behavior does not override that later transaction contract.
+
 The accepted quality contract is visual and encoding quality parity, not
 bit-identical pixels. When resizing is required, FFmpeg bicubic scaling may
 differ numerically from OpenCV `INTER_CUBIC` without being treated as a
