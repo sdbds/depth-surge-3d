@@ -38,6 +38,7 @@ from ..io.operations import (
     get_video_properties,
 )
 from ..io.job_lock import JobWriterLock
+from ..vdpp_work import cleanup_vdpp_private_work
 from ..processing import VideoProcessor
 from ..processing.frames.depth_normalizer import canonicalize_single_scene
 from ..processing.frames.temporal_stabilizer import TemporalDepthStabilizer
@@ -200,6 +201,7 @@ class StereoProjector:
                 raise ValueError("The supplied job writer lock is not acquired")
             elif job_lock.output_dir.resolve() != output_path:
                 raise ValueError("The supplied job writer lock belongs to another output directory")
+            cleanup_vdpp_private_work(output_path, job_lock)
 
             if not self._ensure_model_loaded():
                 return False

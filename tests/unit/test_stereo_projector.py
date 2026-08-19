@@ -16,7 +16,9 @@ from src.depth_surge_3d.inference.depth.backend_registry import (
     build_effective_depth_run_report,
 )
 from src.depth_surge_3d.inference.depth.video_depth_estimator import VideoDepthEstimator
-from src.depth_surge_3d.inference.depth.video_depth_estimator_da3 import VideoDepthEstimatorDA3
+from src.depth_surge_3d.inference.depth.video_depth_estimator_da3 import (
+    VideoDepthEstimatorDA3,
+)
 from src.depth_surge_3d.inference.depth.video_depth_estimator_see_through import (
     DEFAULT_SEE_THROUGH_REPO,
     SeeThroughDepthEstimator,
@@ -46,7 +48,9 @@ def _stereo_result(image: np.ndarray) -> StereoRenderResult:
     )
 
 
-def test_projector_rejects_unknown_backend_without_constructing_an_estimator(monkeypatch) -> None:
+def test_projector_rejects_unknown_backend_without_constructing_an_estimator(
+    monkeypatch,
+) -> None:
     """Invalid backend IDs fail before the registry factory can create anything."""
     factory = Mock()
     monkeypatch.setattr(stereo_projector, "create_registered_depth_estimator", factory)
@@ -55,7 +59,9 @@ def test_projector_rejects_unknown_backend_without_constructing_an_estimator(mon
     factory.assert_not_called()
 
 
-def test_projector_preserves_four_positional_arguments_and_forwards_model_size(monkeypatch) -> None:
+def test_projector_preserves_four_positional_arguments_and_forwards_model_size(
+    monkeypatch,
+) -> None:
     factory = Mock(return_value=MagicMock())
     monkeypatch.setattr(stereo_projector, "create_registered_depth_estimator", factory)
 
@@ -1003,11 +1009,15 @@ class TestProcessVideoErrorPaths:
         from src.depth_surge_3d.io.job_lock import JobAlreadyLockedError, JobWriterLock
 
         output_dir = tmp_path / "output"
+        work = output_dir / "03_disparity_stabilized/.vdpp-work"
+        work.mkdir(parents=True)
+        (work / "shot_0.raw.f32.mmap").write_bytes(b"stale")
         estimator = MagicMock()
 
         def observe_lock():
             with pytest.raises(JobAlreadyLockedError):
                 JobWriterLock(output_dir).acquire()
+            assert not work.exists()
             return False
 
         estimator.load_model.side_effect = observe_lock
@@ -1353,7 +1363,12 @@ class TestProcessVideoSuccessPath:
     @patch("src.depth_surge_3d.rendering.stereo_projector.VideoProcessor")
     @patch("pathlib.Path.mkdir")
     def test_process_video_success(
-        self, mock_mkdir, mock_processor_class, mock_get_props, mock_validate, mock_create
+        self,
+        mock_mkdir,
+        mock_processor_class,
+        mock_get_props,
+        mock_validate,
+        mock_create,
     ):
         """Test successful video processing path."""
         mock_estimator = MagicMock()

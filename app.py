@@ -101,6 +101,7 @@ from depth_surge_3d.io.resume import (  # noqa: E402
     resolve_resume_source_video,
 )
 from depth_surge_3d.io.job_lock import JobWriterLock  # noqa: E402
+from depth_surge_3d.vdpp_work import cleanup_vdpp_private_work  # noqa: E402
 from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
     build_current_model_fingerprint,
 )
@@ -1052,6 +1053,7 @@ def process_video_async(  # noqa: C901
         resolved_output_dir = Path(output_dir).resolve()
         resolved_output_dir.mkdir(parents=True, exist_ok=True)
         job_lock = JobWriterLock(resolved_output_dir).acquire()
+        cleanup_vdpp_private_work(resolved_output_dir, job_lock)
 
         selected_artifact = None
         resume_report = None

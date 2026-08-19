@@ -26,6 +26,7 @@ from ..core.depth_contract import (
 from ..core.render_disparity import (
     STABILIZED_DEPTH_ALGORITHM_VERSION,
     STABILIZED_DEPTH_SCHEMA_VERSION,
+    audit_stabilized_shot_records,
     validate_render_disparity_input,
 )
 from ..inference.depth.v2_temporal_contract import (
@@ -1188,23 +1189,44 @@ def _validate_stabilized_stage(  # noqa: C901
             ),
             None,
         )
-    depth_files = [stabilized_dir / f"{path.stem}.png" for path in frame_files]
-    try:
-        artifact = validate_render_disparity_input(depth_files, frame_files)
-    except ValueError as exc:
-        if (
-            metadata.get("algorithm_version") == STABILIZED_DEPTH_ALGORITHM_VERSION
-            and metadata.get("status") == "building"
-        ):
+    if metadata.get("status") == "building":
+        try:
+            shot_audit = audit_stabilized_shot_records(
+                stabilized_dir,
+                metadata=metadata,
+                frame_names=[path.name for path in frame_files],
+                shot_plan=semantic.get("shot_plan"),
+                native_shape=native_shape,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
             return (
                 _stage(
                     "disparity_stabilized",
                     paths,
-                    "resume",
-                    "stabilized stage has resumable shot state",
+                    "invalidate",
+                    f"stabilized completed-shot structure is invalid: {exc}",
                 ),
-                metadata,
+                None,
             )
+        return (
+            _stage(
+                "disparity_stabilized",
+                paths,
+                "resume",
+                (
+                    "stabilized stage has provisional shot state: "
+                    f"record-valid={len(shot_audit.reusable_shot_ids)}, "
+                    f"invalid-to-regenerate={len(shot_audit.invalid_shot_ids)}, "
+                    f"pending={len(shot_audit.pending_shot_ids)}; "
+                    "record validity remains provisional until CUDA runtime identity is checked"
+                ),
+            ),
+            metadata,
+        )
+    depth_files = [stabilized_dir / f"{path.stem}.png" for path in frame_files]
+    try:
+        artifact = validate_render_disparity_input(depth_files, frame_files)
+    except ValueError as exc:
         return (
             _stage(
                 "disparity_stabilized",

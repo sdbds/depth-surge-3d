@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from .vdpp_calibration import validate_vdpp_calibration_diagnostics
 from .depth_contract import (
     CANONICAL_DEPTH_ALGORITHM_VERSION,
     CANONICAL_DEPTH_SCHEMA_VERSION,
@@ -18,7 +19,8 @@ from ..utils.imaging.png_header import png_header_matches
 
 
 STABILIZED_DEPTH_SCHEMA_VERSION = 1
-STABILIZED_DEPTH_ALGORITHM_VERSION = "vdpp-canonical-shot-v1"
+STABILIZED_DEPTH_ALGORITHM_VERSION = "vdpp-canonical-shot-v2"
+STABILIZED_SHOT_MANIFEST_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,16 @@ class RenderDisparityArtifact:
     metadata: dict[str, Any]
     fingerprint: str
     native_shape: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class StabilizedShotRecordAudit:
+    """Shared read-only classification of declared and missing shot records."""
+
+    reusable_shot_ids: tuple[int, ...]
+    invalid_shot_ids: tuple[int, ...]
+    pending_shot_ids: tuple[int, ...]
+    payload_records: tuple[dict[str, Any], ...]
 
 
 def _sha256(path: Path) -> str:
@@ -157,81 +169,159 @@ def _validate_shot_plan(shot_plan: object, num_frames: int) -> list[dict[str, in
     return normalized
 
 
-def _validate_stabilized_shots(  # noqa: C901
+def _audit_one_stabilized_shot(  # noqa: C901
     root: Path,
+    record: dict[str, Any],
+    frame_names: list[str],
+    shot: dict[str, int],
+    native_shape: tuple[int, int],
+) -> dict[str, Any]:
+    shot_id = shot["shot_id"]
+    relative_manifest = f"shot_manifests/shot_{shot_id:06d}.json"
+    if (
+        set(record)
+        != {
+            "shot_id",
+            "manifest",
+            "manifest_sha256",
+            "shot_payload_sha256",
+        }
+        or record.get("manifest") != relative_manifest
+    ):
+        raise ValueError("Stabilized disparity shot record is invalid")
+    manifest_path = root / relative_manifest
+    manifest, manifest_bytes = _read_json(
+        manifest_path,
+        "Stabilized disparity shot manifest",
+    )
+    if record.get("manifest_sha256") != hashlib.sha256(manifest_bytes).hexdigest():
+        raise ValueError(f"Stabilized disparity manifest SHA-256 mismatch: {manifest_path}")
+    if set(manifest) != {
+        "schema_version",
+        "shot_id",
+        "start",
+        "end",
+        "calibration",
+        "files",
+        "shot_payload_sha256",
+        "manifest_fingerprint",
+    }:
+        raise ValueError(f"Stabilized disparity shot manifest schema is invalid: {manifest_path}")
+    manifest_fingerprint = manifest.get("manifest_fingerprint")
+    manifest_unhashed = {
+        key: value for key, value in manifest.items() if key != "manifest_fingerprint"
+    }
+    if not isinstance(manifest_fingerprint, str) or manifest_fingerprint != canonical_json_hash(
+        manifest_unhashed
+    ):
+        raise ValueError(f"Stabilized disparity shot manifest self-hash mismatch: {manifest_path}")
+    if (
+        manifest.get("schema_version") != STABILIZED_SHOT_MANIFEST_SCHEMA_VERSION
+        or manifest.get("shot_id") != shot_id
+        or manifest.get("start") != shot["start"]
+        or manifest.get("end") != shot["end"]
+    ):
+        raise ValueError(f"Stabilized disparity shot manifest range mismatch: {manifest_path}")
+    validate_vdpp_calibration_diagnostics(
+        manifest.get("calibration"),
+        shot_length=shot["end"] - shot["start"],
+        native_shape=native_shape,
+    )
+
+    expected_names = frame_names[shot["start"] : shot["end"]]
+    files = manifest.get("files")
+    if not isinstance(files, list) or len(files) != len(expected_names):
+        raise ValueError(f"Stabilized disparity shot file manifest is invalid: {manifest_path}")
+    normalized_files: list[dict[str, str]] = []
+    for name, file_record in zip(expected_names, files):
+        if (
+            type(file_record) is not dict
+            or set(file_record) != {"name", "sha256"}
+            or file_record.get("name") != name
+            or not isinstance(file_record.get("sha256"), str)
+        ):
+            raise ValueError(f"Stabilized disparity shot file manifest is invalid: {manifest_path}")
+        payload_path = root / f"{Path(name).stem}.png"
+        if not png_header_matches(payload_path, shape=native_shape, bit_depth=16):
+            raise ValueError(f"Stabilized disparity payload shape is invalid: {payload_path}")
+        digest = _sha256(payload_path)
+        if file_record["sha256"] != digest:
+            raise ValueError(f"Stabilized disparity payload SHA-256 mismatch: {payload_path}")
+        normalized_files.append({"name": name, "sha256": digest})
+
+    shot_payload = canonical_json_hash(normalized_files)
+    if (
+        manifest.get("shot_payload_sha256") != shot_payload
+        or record.get("shot_payload_sha256") != shot_payload
+    ):
+        raise ValueError(f"Stabilized disparity shot payload SHA-256 mismatch: {manifest_path}")
+    return {"shot_id": shot_id, "shot_payload_sha256": shot_payload}
+
+
+def audit_stabilized_shot_records(
+    root: Path,
+    *,
     metadata: dict[str, Any],
     frame_names: list[str],
     shot_plan: list[dict[str, int]],
-) -> str:
+    native_shape: tuple[int, int],
+) -> StabilizedShotRecordAudit:
+    """Classify every shot through the shared strict manifest/payload contract."""
+
+    if (
+        not isinstance(frame_names, list)
+        or not frame_names
+        or not all(type(name) is str for name in frame_names)
+    ):
+        raise ValueError("Stabilized disparity frame manifest is invalid")
+    if _validate_shot_plan(shot_plan, len(frame_names)) != shot_plan:
+        raise ValueError("Stabilized disparity shot plan is not canonical")
+    _native_shape(list(native_shape))
     completed = metadata.get("completed_shots")
-    if not isinstance(completed, list) or len(completed) != len(shot_plan):
-        raise ValueError("Stabilized disparity is not complete")
+    if not isinstance(completed, list):
+        raise ValueError("Stabilized disparity completed_shots must be a list")
+    previous_id = -1
+    records_by_id: dict[int, dict[str, Any]] = {}
+    for record in completed:
+        if type(record) is not dict:
+            raise ValueError("Stabilized disparity completed-shot record is not an object")
+        shot_id = record.get("shot_id")
+        if type(shot_id) is not int or shot_id < 0 or shot_id >= len(shot_plan):
+            raise ValueError("Stabilized disparity completed-shot ID is invalid")
+        if shot_id <= previous_id:
+            raise ValueError("Stabilized disparity completed-shot IDs are not sorted and unique")
+        previous_id = shot_id
+        records_by_id[shot_id] = record
 
+    reusable: list[int] = []
+    invalid: list[int] = []
+    pending: list[int] = []
     payload_records: list[dict[str, Any]] = []
-    for shot, record in zip(shot_plan, completed):
-        if not isinstance(record, dict) or record.get("shot_id") != shot["shot_id"]:
-            raise ValueError("Stabilized disparity completed-shot state is invalid")
-        relative_manifest = f"shot_manifests/shot_{shot['shot_id']:06d}.json"
-        if record.get("manifest") != relative_manifest:
-            raise ValueError("Stabilized disparity shot manifest path is invalid")
-        manifest_path = root / Path(relative_manifest)
-        manifest, manifest_bytes = _read_json(
-            manifest_path,
-            "Stabilized disparity shot manifest",
-        )
-        manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
-        if record.get("manifest_sha256") != manifest_sha:
-            raise ValueError(f"Stabilized disparity manifest SHA-256 mismatch: {manifest_path}")
-        manifest_fingerprint = manifest.get("manifest_fingerprint")
-        manifest_unhashed = {
-            key: value for key, value in manifest.items() if key != "manifest_fingerprint"
-        }
-        if not isinstance(manifest_fingerprint, str) or manifest_fingerprint != canonical_json_hash(
-            manifest_unhashed
-        ):
-            raise ValueError(
-                f"Stabilized disparity shot manifest self-hash mismatch: {manifest_path}"
+    for shot in shot_plan:
+        shot_id = shot["shot_id"]
+        record = records_by_id.get(shot_id)
+        if record is None:
+            pending.append(shot_id)
+            continue
+        try:
+            payload_record = _audit_one_stabilized_shot(
+                root,
+                record,
+                frame_names,
+                shot,
+                native_shape,
             )
-        if (
-            manifest.get("schema_version") != 1
-            or manifest.get("shot_id") != shot["shot_id"]
-            or manifest.get("start") != shot["start"]
-            or manifest.get("end") != shot["end"]
-        ):
-            raise ValueError(f"Stabilized disparity shot manifest range mismatch: {manifest_path}")
-
-        expected_names = frame_names[shot["start"] : shot["end"]]
-        files = manifest.get("files")
-        if not isinstance(files, list) or len(files) != len(expected_names):
-            raise ValueError(f"Stabilized disparity shot file manifest is invalid: {manifest_path}")
-        normalized_files: list[dict[str, str]] = []
-        for name, file_record in zip(expected_names, files):
-            if (
-                not isinstance(file_record, dict)
-                or file_record.get("name") != name
-                or not isinstance(file_record.get("sha256"), str)
-            ):
-                raise ValueError(
-                    f"Stabilized disparity shot file manifest is invalid: {manifest_path}"
-                )
-            payload_path = root / f"{Path(name).stem}.png"
-            digest = _sha256(payload_path)
-            if file_record["sha256"] != digest:
-                raise ValueError(f"Stabilized disparity payload SHA-256 mismatch: {payload_path}")
-            normalized_files.append({"name": name, "sha256": digest})
-
-        shot_payload = canonical_json_hash(normalized_files)
-        if (
-            manifest.get("shot_payload_sha256") != shot_payload
-            or record.get("shot_payload_sha256") != shot_payload
-        ):
-            raise ValueError(f"Stabilized disparity shot payload SHA-256 mismatch: {manifest_path}")
-        payload_records.append({"shot_id": shot["shot_id"], "shot_payload_sha256": shot_payload})
-
-    payload_fingerprint = canonical_json_hash(payload_records)
-    if metadata.get("payload_fingerprint") != payload_fingerprint:
-        raise ValueError("Stabilized disparity payload fingerprint is invalid")
-    return payload_fingerprint
+        except (OSError, ValueError, TypeError):
+            invalid.append(shot_id)
+        else:
+            reusable.append(shot_id)
+            payload_records.append(payload_record)
+    return StabilizedShotRecordAudit(
+        reusable_shot_ids=tuple(reusable),
+        invalid_shot_ids=tuple(invalid),
+        pending_shot_ids=tuple(pending),
+        payload_records=tuple(payload_records),
+    )
 
 
 def _validate_stabilized(
@@ -277,12 +367,23 @@ def _validate_stabilized(
     }
     if metadata.get("state_fingerprint") != canonical_json_hash(state):
         raise ValueError("Stabilized disparity state fingerprint is invalid")
-    payload_fingerprint = _validate_stabilized_shots(
+    shot_audit = audit_stabilized_shot_records(
         root,
-        metadata,
-        frame_names,
-        shot_plan,
+        metadata=metadata,
+        frame_names=frame_names,
+        shot_plan=shot_plan,
+        native_shape=shape,
     )
+    expected_ids = tuple(shot["shot_id"] for shot in shot_plan)
+    if (
+        shot_audit.reusable_shot_ids != expected_ids
+        or shot_audit.invalid_shot_ids
+        or shot_audit.pending_shot_ids
+    ):
+        raise ValueError("Stabilized disparity is not complete and valid")
+    payload_fingerprint = canonical_json_hash(list(shot_audit.payload_records))
+    if metadata.get("payload_fingerprint") != payload_fingerprint:
+        raise ValueError("Stabilized disparity payload fingerprint is invalid")
     expected_artifact = canonical_json_hash(
         {
             "semantic_fingerprint": semantic_fingerprint,
