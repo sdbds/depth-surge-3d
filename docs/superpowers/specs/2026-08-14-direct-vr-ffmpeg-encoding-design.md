@@ -15,8 +15,9 @@ policy, layout, encoder quality, and basic UX, but not the eager source-resolver
 return interface; the canonical specification replaces input validation,
 audio and `-shortest` policy, command normalization, publication/manifests,
 container validation, bounded source-audio handling, the persisted final target
-and producer marker, resume, and cleanup. The sentence above about unchanged
-recovery behavior does not override that later transaction contract.
+and producer marker, schema-5 settings transactions, bounded final-validator
+lifecycles, resume, and cleanup. The sentence above about unchanged recovery
+behavior does not override that later transaction contract.
 Publication v4 applies only to orchestrated job final-media calls through
 `VideoEncoder.create_video` and
 `VideoEncoder.create_video_from_stereo_sequences`. The independent Web

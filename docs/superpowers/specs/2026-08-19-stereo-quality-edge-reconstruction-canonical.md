@@ -46,10 +46,11 @@ remains authoritative only for the following product and layout decisions:
 This canonical specification supersedes that document for input-sequence
 validation, audio source/stream selection, output-level `-shortest`, FFmpeg
 command normalization, final-video publication, retained encoding/final-video
-manifests, container validation, resume, and cleanup. On any conflict in one of
-those areas, this document is the sole authority. The older document's claim
-that assembled encoding and its recovery path remain unchanged is therefore no
-longer applicable to those transaction and validation concerns.
+manifests, portable persisted target naming, schema-5 settings transactions,
+bounded container-validation process lifecycles, resume, and cleanup. On any
+conflict in one of those areas, this document is the sole authority. The older
+document's claim that assembled encoding and its recovery path remain unchanged
+is therefore no longer applicable to those transaction and validation concerns.
 
 That authority is deliberately limited to job final-media encoding invoked by
 `ProcessingOrchestrator` through `VideoEncoder.create_video` or
@@ -236,7 +237,7 @@ defects.
 | Canonical U64 frame indexes exceeded the unspecified image2 domain | Fix the supported image2 maximum to signed-int max, use checked last-index arithmetic, and require boundary integration fixtures. |
 | Legacy final-media classification and states were not closed | Persist the pre-migration source settings schema, define `FinalMediaAuditDispositionV1` and its complete artifact-presence matrix, add `not_present`, and remove the redundant `final_video_valid` field. |
 | Metric NPZ acceptance delegated syntax to NumPy/ZIP readers | Define `MetricNpzPayloadContractV1`, exact owned plus CPython-dependent historical archive forms, strict ZIP/NPY grammar, a project-owned schema-5 writer, and malformed plus supported-runtime fixture gates. |
-| Parent-side FFprobe/decode capture was absent from the eight-MiB proof | Use exact `-show_entries`, byte-capped process drains, bounded JSON materialization, fixed diagnostic rings, phase-specific peaks, and typed overflow failure. |
+| Parent-side FFprobe/decode capture was absent from the eight-MiB proof | Use exact `-show_entries`, byte-capped process drains, bounded incremental JSON state, fixed diagnostic rings, phase-specific peaks, and typed overflow failure. |
 | A stereo provider could invent an unspecified directory fingerprint | Require one validated canonical upstream manifest for every schema-5 provider and confine manifest-less legacy Fast reuse to the existing read-only compatibility validator. |
 | Publication scope could accidentally absorb batch stitching | Limit publication v4 to the orchestrated assembled/direct job encoders and explicitly exclude `/stitch_video` and `*_stitched_*.mp4`. |
 | Quality identity requested provenance absent from its strict metadata | Make guide/native-geometry byte identity sufficient and remove the contradictory upstream-geometry-provenance requirement. |
@@ -245,6 +246,10 @@ defects.
 | Source-audio probe/decode escaped the encoding coordinator proof | Specify exact audio commands, bounded parsers and drains, checked PCM accounting, cancellation/reap behavior, typed overflow, and separate audio phase peaks. |
 | Final-media audit recomputed paths with a mutable naming helper | Persist one immutable expected relative path plus naming-algorithm version, migrate from retained output info, and make every encoder/manifest/token consume that path. |
 | The owned NPZ writer lacked implementation authority and workspace limits | Authorize only metric-payload storage changes, require incremental CRC/DEFLATE plus seek-patch publication, and cap writer scratch without changing metric arrays or equations. |
+| Legal FFprobe JSON section wrappers were rejected | Keep JSON, require authoritative top-level `streams`, accept bounded optional `programs`/`stream_groups` wrappers for audio, require them empty for generated MP4, and freeze FFmpeg 5/6/7 plus distributed-Windows goldens. |
+| Settings rewrites had no single byte/resource/durability contract | Make every schema-5 artifact canonical, add `SettingsArtifactTransactionV1`, charge three isolated coordinator phases, and physically reserve every remaining settings extent through terminal completion. |
+| Output naming bounded only source code-point count | Redefine the unimplemented v1 over the complete component with scalar/control validation, strict resolution tokens, 240-byte/UTF-16-unit limits, and deterministic hash truncation. |
+| Final validation processes could live forever | Give frame-count-aware FFprobe a bounded wall deadline and final full decode a semantic-progress stall deadline through the shared termination/reap state machine. |
 
 ## Public Settings Contract
 
@@ -263,6 +268,30 @@ payload contains:
 32, normalizes them to Python `int`, and controls only local Quality
 continuation. Python and NumPy booleans are rejected before the `Integral`
 test. It is a 1080p-equivalent distance. For render height `H`:
+
+Schema 5 also closes the existing `vr_resolution` string hole. It accepts only
+exact `auto`, an exact member of the frozen v1 preset set below, or exact
+`custom:<width>x<height>` where each decimal has no sign, whitespace, or leading
+zero and normalizes to `1..10000`. Every CLI, Web, migration-fallback, and resume
+path runs this same validator before target-name persistence. A retained legacy
+`expected_output_filename` remains authoritative only when its complete copied
+component passes `PortableFinalComponentV1`; its historical resolution spelling
+does not get appended again.
+
+```text
+JOB_OUTPUT_NAME_V1_RESOLUTION_PRESETS = {
+    "square-480", "square-720", "square-1k", "square-2k",
+    "square-3k", "square-4k", "square-5k",
+    "16x9-480p", "16x9-720p", "16x9-1080p", "16x9-1440p",
+    "16x9-4k", "16x9-5k", "16x9-8k",
+    "ultrawide", "wide-2k", "wide-4k", "cinema-2k", "cinema-4k",
+}
+```
+
+Every member is 1..32 ASCII bytes and matches
+`[a-z0-9]+(?:-[a-z0-9]+)*`. Adding a future resolution preset without a new
+output-name algorithm version is forbidden; already persisted targets are never
+rechecked against a later preset table.
 
 ```text
 safe_limit_px = max(1, floor(occlusion_fill_max_px * H / 1080 + 0.5))
@@ -315,15 +344,17 @@ The two producer fields are either both null or exactly `4` plus a 128-bit OS-
 CSPRNG value encoded as 32 lowercase hexadecimal characters. New schema-5 jobs
 and untouched schema-1-through-4 migrations start with the null pair. Immediately
 before the first publication-v4 FFmpeg launch attempt, atomically update and
-fsync the settings artifact to `4` plus a fresh generation. Failure to commit it
-before launch. Once non-null, both values are immutable across failed or later
-encode attempts, settings rewrites, resume, and cleanup. The marker records that
-current publication code has irrevocably entered its pre-launch attempt gate; it
-does not prove that FFmpeg launched, is not media-content identity, and is
-distinct from every `EncodingSequenceProvider` generation. A later failed
-reencode does not invalidate an older authenticated publication. Missing,
-crossed, malformed, or downgraded marker fields in schema 5 are unknown current
-provenance, never an implicit null pair.
+fsync the settings artifact to `4` plus a fresh generation through
+`SettingsArtifactTransactionV1` below. Failure to commit, directory-sync, or
+reopen-validate the producer marker is fatal and FFmpeg must not launch. Once
+non-null, both values are immutable across failed or later encode attempts,
+settings rewrites, resume, and cleanup. The marker records that current
+publication code has irrevocably entered its pre-launch attempt gate; it does
+not prove that FFmpeg launched, is not media-content identity, and is distinct
+from every `EncodingSequenceProvider` generation. A later failed reencode does
+not invalidate an older authenticated publication. Missing, crossed, malformed,
+or downgraded marker fields in schema 5 are unknown current provenance, never
+an implicit null pair.
 For a still-raw schema-1-through-4 artifact only, exact absence of both keys is
 the pre-contract null pair; presence of either key in such a schema is
 contradictory rather than trusted.
@@ -331,47 +362,69 @@ contradictory rather than trusted.
 `expected_final_relative_path` is a canonical nonempty output-root-relative
 POSIX path containing exactly one filename segment, no `.`/`..`, slash,
 backslash, drive, NUL, link, or reparse traversal, and ending in lowercase
-`.mp4`. It is immutable after job creation or legacy migration. New jobs compute
+`.mp4`. Its complete filename segment must satisfy
+`PortableFinalComponentV1`: every character is a Unicode scalar value, no scalar
+has Unicode General Category `Cc`, no scalar is in `<>:"/\|?*`, UTF-8 encoding
+is at most 240 bytes, and UTF-16 encoding is at most 240 code units excluding a
+BOM. The substring before its first dot, compared ASCII case-insensitively, is
+not `CON`, `PRN`, `AUX`, `NUL`, `COM1`..`COM9`, or `LPT1`..`LPT9`. The emitted
+suffix ensures that the segment ends in neither a space nor a dot. These
+deliberately platform-independent limits sit below both the project-supported 255-byte POSIX
+component boundary and the 255-UTF-16-code-unit Windows component boundary; an
+output volume unable to create this tested component class is unsupported rather
+than permission to change job identity.
+
+The path is immutable after job creation or legacy migration. New jobs compute
 it once with the frozen `job-output-name-v1` algorithm and persist it before any
-frame work. That algorithm is defined over Unicode code points, never calls
+frame work. That algorithm is defined over Unicode scalar values, never calls
 `Path`, `os.path`, `sanitize_filename`, or `generate_output_filename`, performs
 no Unicode normalization or case conversion, and has these exact steps:
 
-1. `metadata.source_video_name` must be a string containing no NUL or `/`.
-   An empty string selects base `output`. Otherwise, remove the final suffix only
-   when the last `.` has at least one code point before and after it; this frozen
-   stem rule leaves `.profile`, `name.`, `.` and `..` unchanged.
-2. In a nonempty source's stem, replace each code point in `<>:"/\|?*` with `_`,
-   collapse each maximal underscore run to one underscore, and strip leading/
-   trailing underscores. If the result exceeds 200 code points, apply the same
-   final-suffix rule to that result. When the suffix is at most 200 code points,
-   retain it and truncate the preceding part to `200-len(suffix)`; when the suffix
-   itself is longer, retain its first 200 code points and no preceding part. A
-   nonempty source which sanitizes to the empty string keeps that empty base; it
-   does not become `output`.
+1. `metadata.source_video_name` must be a string containing no `/`, surrogate,
+   or General-Category-`Cc` character. An empty string selects base `output`.
+   Otherwise, remove the final suffix only when the last `.` has at least one
+   scalar before and after it; this frozen stem rule leaves `.profile`, `name.`,
+   `.` and `..` unchanged.
+2. In a nonempty source's stem, replace each scalar in `<>:"/\|?*` with `_`,
+   collapse each maximal underscore run to one underscore, and strip leading and
+   trailing underscores. A nonempty source which sanitizes to the empty string
+   keeps that empty base; it does not become `output`. Do not truncate yet.
 3. `processing_settings.vr_format` must be exactly `side_by_side` or
-   `over_under` and has every `_` changed to `-`.
-   `processing_settings.vr_resolution` must be a string: append it exactly when
-   nonempty and omit the entire resolution part when empty. A missing, null, or
-   nonstring value is metadata failure rather than omission.
+   `over_under`; its filename token is respectively `side-by-side` or
+   `over-under`. The resolution must already pass the supported resolution
+   setting validator. Exact `auto` has filename token `auto`. Any preset must be
+   an exact `JOB_OUTPUT_NAME_V1_RESOLUTION_PRESETS` member and is used exactly.
+   A custom token must match
+   `custom:([1-9][0-9]{0,4})x([1-9][0-9]{0,4})`, both parsed integers must be at
+   most 10,000, and its filename token is
+   `custom-<canonical-width>x<canonical-height>` with no leading zero. Empty,
+   unsupported, non-ASCII, control-bearing, or otherwise arbitrary resolution
+   strings are metadata errors, not filename text.
+4. Form the untruncated candidate exactly as
+   `<sanitized-stem>_3D_<format-token>_<resolution-token>.mp4`. If it satisfies
+   `PortableFinalComponentV1`, emit it unchanged. Otherwise compute
+   `digest=SHA256(UTF8(untruncated candidate))`, take its first 32 lowercase hex
+   digits, and form
+   `<prefix>~<digest>_3D_<format-token>_<resolution-token>.mp4`, where `prefix`
+   is the longest scalar prefix of `sanitized-stem` for which both complete-name
+   limits hold. The fixed tail itself must fit or metadata validation fails. The
+   scan never splits a scalar; a non-BMP scalar counts as four UTF-8 bytes and
+   two UTF-16 code units.
 
-It then emits:
-
-```text
-<sanitized-stem>_3D_<format-with-hyphens>[_<nonempty-resolution>].mp4
-```
-
-The strict persisted format/resolution tokens are used without locale rewriting.
+The hash suffix makes truncation deterministic and collision-resistant while
+the persisted path, not a later recomputation, remains the identity authority.
 Golden fixtures freeze hidden names, terminal and repeated dots, an input which
 sanitizes to an empty base, invalid ASCII filename characters, repeated
-underscores, empty/nonempty resolutions, the 199/200/201-code-point boundaries
-with and without a suffix, an overlong suffix, and non-ASCII code points. A
-future helper change therefore creates a new algorithm version rather than
-reinterpreting v1.
+underscores, preset and custom resolutions, invalid/overlong resolution tokens,
+isolated surrogates, `Cc` controls, 60 non-BMP scalars, exact 239/240/241 UTF-8-
+byte and UTF-16-unit boundaries, and deterministic hash truncation. No production
+implementation of the earlier 200-code-point draft existed; this paragraph is
+the final definition of `job-output-name-v1`. A future helper change therefore
+creates a new algorithm version rather than reinterpreting v1.
 
 For schema-1-through-4 migration, first validate
 `output_info.expected_output_filename` as the same one-segment relative path. If
-present and valid, copy its exact code points to `expected_final_relative_path`
+present and valid, copy its exact scalar sequence to `expected_final_relative_path`
 and record `persisted-expected-output-filename-v1`; do not recompute it. If and
 only if the old field is absent, run the frozen `job-output-name-v1` once from
 the raw persisted `metadata.source_video_name`,
@@ -387,10 +440,114 @@ argument, `FinalVideoManifest.relative_path`, and normalized `@output:path64`
 must decode to it exactly. Final-media audit reads it directly and never invokes
 `generate_output_filename` or any successor.
 
-There is no persisted `auto` mode. The resolver receives the selected renderer
-device, writes the resolved two-mode value, and therefore never reinterprets a
-saved job because hardware changed. The Web UI exposes a two-value Fast/Quality
-segmented control and an advanced fill-limit control. CLI options are
+### Processing Settings Artifact V5
+
+Every newly written schema-5 settings artifact has one byte contract. Its bytes
+are exactly the canonical ASCII JSON defined below: sorted keys, no indentation,
+`separators=(",", ":")`, `ensure_ascii=True`, `allow_nan=False`, no BOM, and no
+trailing LF. JSON strings must decode to Unicode scalar values; an isolated
+surrogate is invalid even if written as an escape. The complete strict
+`ProcessingSettingsArtifactV5` schema rejects duplicate, missing, and extra keys
+at every owned object. Schema-1-through-4 input may retain the existing UTF-8
+pretty-JSON spelling while it is read through the strict migration parser, but
+its first schema-5 replacement uses these canonical bytes. A schema-5 artifact
+whose raw bytes differ from its canonical re-encoding is invalid rather than
+silently normalized during audit.
+
+The bounded artifact constants are:
+
+```text
+SETTINGS_ARTIFACT_MAX_RAW_BYTES    = 512 KiB
+SETTINGS_ARTIFACT_STREAM_BYTES     = 512 KiB
+SETTINGS_ARTIFACT_JSON_STATE_BYTES = 512 KiB
+SETTINGS_ARTIFACT_OBJECT_BYTES     = 1 MiB
+```
+
+Before a new-job write, migration, or rewrite, derive
+`settings_artifact_raw_max` with `max_json_bytes` from the complete strict
+schema, every retained concrete value, and the maximum spelling of every state,
+timestamp, runtime, target, producer, and cleanup field that the remaining job
+can write. Require both the current bounded input and that derived maximum to be
+at most `SETTINGS_ARTIFACT_MAX_RAW_BYTES`. Parsing is incremental and owns at
+most the stream, JSON-state, and typed-object bounds above; it may not use an
+unbounded `json.load`, retain both legacy and schema-5 object trees, or hold a
+complete old/new raw-byte pair. Canonical serialization streams from the one
+typed object. The encoded-byte counter must not exceed either the derived bound
+or the fixed raw cap.
+
+Every schema-5 string/list/map field has a fixed schema cardinality or a
+prevalidated concrete path/string whose escaped length is included in that
+maximum. `runtime_info` is a closed object, not an arbitrary
+`additional_info.update`: a terminal diagnostic uses a schema enum code of at
+most 64 ASCII bytes and an optional message of at most 1,024 UTF-8 bytes before
+canonical escaping; traceback text, child output, and nested exception objects
+are forbidden. Oversize or unknown runtime data is reported outside the artifact
+and cannot make a status transaction exceed its reserved extent.
+
+New-job creation and legacy migration each physically reserve and fsync one
+same-volume `alloc(settings_artifact_raw_max)+A` extent before their first
+settings mutation, using the allocation-unit definition in Disk and I/O below.
+They release it only into the same-directory temporary. Failure leaves any
+legacy authoritative artifact unchanged and starts no frame work. Final encoding
+uses the multi-transition reservation schedule defined later instead.
+
+`SettingsArtifactTransactionV1` is the only schema-5 creation or mutation API.
+Every caller, including creation and migration, uses the eight-MiB final-control
+budget and the six-MiB `producer_settings_commit_peak` formula below. Under the
+acquired job-writer lock it performs exactly this sequence:
+
+1. For new-job creation, require the settings name to be absent under the opened
+   parent-directory handle and construct the initial typed object. Otherwise
+   open the current artifact without following a link, enforce the raw cap while
+   streaming, strict-parse either its declared legacy schema for migration or
+   canonical schema 5, and capture the opened file identity.
+2. Apply one declared monotonic transition to a new typed schema-5 object and
+   preserve every field outside that transition exactly. Serialize canonical
+   bytes into a create-new, non-link temporary in the settings file's directory,
+   using one already reserved transaction extent. Flush and file-sync it.
+3. Reopen that temporary without following a link, require the same file
+   identity, strict-parse it within the same bounds, require its raw SHA-256 and
+   canonical bytes to equal the intended serialization, and verify the complete
+   typed object plus the transition-specific target fields.
+4. Atomically replace the settings path, durably sync its parent directory, then
+   reopen the final path without following a link. Require the expected ordinary
+   file identity, exact byte count, raw SHA-256, canonical re-encoding, complete
+   typed object, and transition-specific marker/target/status fields.
+
+Temporary create, write, flush, file sync, replace, directory sync, reopen, or
+validation failure is typed and never reported as a committed transition. Every
+supported POSIX volume uses `fsync` on the opened parent directory. The Windows
+adapter uses a write-through atomic replace (`ReplaceFileW`, or
+`MoveFileExW` with replace-existing plus write-through for creation), followed
+by `FlushFileBuffers` on the reopened target; this is the named Windows
+directory-sync-equivalent and is not confused with an unsupported directory-
+handle flush. Both adapters must pass the crash/reopen gate. Lack of a working
+adapter is not permission to launch FFmpeg after an unattested producer write.
+An orphan temporary is never read as settings and is removed only under the
+writer lock after the authoritative path has been validated. The existing
+direct-overwrite `save_processing_settings`/
+`update_processing_status` paths and the current pretty serializer are forbidden
+for schema 5. The current malformed minimal-fallback artifact is also forbidden;
+failure to create and reopen-validate initial schema-5 settings aborts the job
+before frame work.
+
+Finalization has a fixed transition schedule. The producer-marker transaction,
+when needed, occurs immediately before the first FFmpeg launch. After both final
+manifests are durable, `keep_intermediates=false` commits exactly one
+`cleanup_status="pending"` transaction before cleanup. One final transaction
+then commits the terminal cleanup value, `processing_status`, completion/failure
+timestamps, and bounded runtime information together. With intermediates kept,
+that single final transaction writes `cleanup_status="not_requested"`; it does
+not perform a separate pending write. A job is not reported completed until the
+terminal transaction is directory-synced and reopen-validated. If that commit
+fails, already authenticated media/manifests remain intact and resume retries
+only the missing settings/finalization transition from their persisted evidence;
+it does not infer settings success or destroy the publication.
+
+There is no persisted `auto` stereo-render mode. The resolver receives the
+selected renderer device, writes the resolved two-mode value, and therefore
+never reinterprets a saved job because hardware changed. The Web UI exposes a
+two-value Fast/Quality segmented control and an advanced fill-limit control. CLI options are
 `--stereo-render-mode {fast,quality}` and
 `--occlusion-fill-max-px 1..32`, both with parser default `None` so omission is
 distinguishable from override.
@@ -2425,11 +2582,24 @@ ffprobe -v error -select_streams a:0 \
 ```
 
 `BoundedProcessCaptureV1` applies the audio-specific stdout/stderr caps below.
-Its fixed-schema incremental parser permits exactly root key `streams`, zero or
-one stream object, and exactly the three requested stream keys. Invalid UTF-8,
-NUL, extra/missing keys, JSON depth greater than three, a scalar token longer
-than 32 bytes, a second stream, any stderr byte, nonzero exit, or cap/parser-
-state overflow is fatal. Zero streams is `audio_absent`. One stream requires
+Its fixed-schema incremental parser permits exactly the root keys `streams`,
+`programs`, and `stream_groups`, each at most once and in any order. `streams`
+is required and is an array of zero or one stream object with exactly the three
+requested stream keys. `programs` and `stream_groups` are optional arrays
+because supported FFprobe JSON writers emit those section wrappers even when
+their contents were not requested. For an arbitrary selected audio source they
+may be empty or contain JSON objects; any other element type fails. A bounded
+JSON value-skip state machine, not an object tree, consumes those objects with
+maximum depth 8, at most 256 aggregate container starts, and at most 128 bytes
+per ignored scalar token. Their duplicate stream
+descriptions are non-authoritative: only the top-level `streams` array can
+produce the zero/one audio result or contribute a count.
+
+Invalid UTF-8, NUL, an unknown/duplicate root key, an extra/missing authoritative
+stream key, JSON depth greater than eight, a requested-stream scalar token longer
+than 32 bytes, an ignored-wrapper token/count overflow, a second top-level
+stream, any stderr byte, nonzero exit, or cap/parser-state overflow is fatal.
+Zero top-level streams is `audio_absent`. One stream requires
 `codec_type="audio"`, `sample_rate` as a canonical nonzero decimal string which
 normalizes to `S <= U32_MAX`, and `channels` as a non-boolean JSON integer in
 `1..U32_MAX`; `N/A`, sign, whitespace, leading zero, float, or exponent forms
@@ -2547,12 +2717,18 @@ FINAL_PROBE_STDOUT_BYTES           = 64 KiB
 FINAL_PROBE_STDERR_BYTES           = 64 KiB
 FINAL_PROBE_JSON_STATE_BYTES       = 512 KiB
 FINAL_DECODE_DIAGNOSTIC_BYTES      = 256 KiB
+FINAL_DECODE_PROGRESS_STATE_BYTES  = 64 KiB
+FINAL_DECODE_LINE_BYTES            = 8 KiB
 FINAL_AUDIO_PROBE_STDOUT_BYTES     = 32 KiB
 FINAL_AUDIO_PROBE_STDERR_BYTES     = 32 KiB
 FINAL_AUDIO_PROBE_JSON_STATE_BYTES = 256 KiB
 FINAL_AUDIO_DECODE_DIAGNOSTIC_BYTES = 256 KiB
 FINAL_AUDIO_PROBE_TIMEOUT_SECONDS   = 30
 FINAL_AUDIO_DECODE_STALL_SECONDS    = 120
+FINAL_PROBE_TIMEOUT_BASE_SECONDS    = 30
+FINAL_PROBE_TIMEOUT_PER_1000_FRAMES_SECONDS = 2
+FINAL_PROBE_TIMEOUT_MAX_SECONDS     = 21_600
+FINAL_DECODE_STALL_SECONDS          = 120
 FINAL_PROCESS_TERMINATE_GRACE_SECONDS = 5
 
 encoding_manifest_peak = 4 MiB + 1 MiB + 1 MiB         = 6 MiB
@@ -2562,10 +2738,24 @@ audio_decode_peak      = 4 MiB + 1 MiB + 256 KiB       = 5.25 MiB
 encoding_process_peak  = 4 MiB + 256 KiB               = 4.25 MiB
 final_probe_peak       = 4 MiB + 64 KiB + 64 KiB
                          + 512 KiB                      = 4.625 MiB
-final_decode_peak      = 4 MiB + 256 KiB               = 4.25 MiB
-encoding_control_peak  = max(the six phase peaks)       = 6 MiB
+final_decode_peak      = 4 MiB + 256 KiB + 64 KiB      = 4.3125 MiB
+producer_settings_commit_peak = 4 MiB + 512 KiB + 512 KiB + 1 MiB = 6 MiB
+pending_settings_commit_peak  = producer_settings_commit_peak     = 6 MiB
+completion_settings_commit_peak = producer_settings_commit_peak   = 6 MiB
+encoding_control_peak  = max(the nine phase peaks)      = 6 MiB
 require 1 <= N <= ENCODING_CONTROL_FRAME_CAP
 require encoding_control_peak <= FINAL_ENCODING_CONTROL_BUDGET
+
+FINAL_PROBE_TIMEOUT_SECONDS = min(
+    FINAL_PROBE_TIMEOUT_MAX_SECONDS,
+    checked_u64_add(
+        FINAL_PROBE_TIMEOUT_BASE_SECONDS,
+        checked_u64_mul(
+            ceil_div(N, 1000),
+            FINAL_PROBE_TIMEOUT_PER_1000_FRAMES_SECONDS,
+        ),
+    ),
+)
 ```
 
 This bound includes replay/container objects, directory enumeration, image hash
@@ -2573,10 +2763,12 @@ and IHDR parsing, manifest serialization, and the existing drained audio PCM
 buffer. Image hashing plus manifest serialization may coexist only in
 `encoding_manifest_peak`; both are released before the isolated audio probe/
 decode phase. Audio rehash likewise runs after releasing image/JSON streams.
-Every stream/parser/ring is released before final-container probe. Encode,
+Every stream/parser/ring is released before final-container probe. Settings
+transactions are isolated phases: their one stream, JSON state, and typed object
+are released before FFmpeg/probe/decode or another settings transition. Encode,
 probe, and full-decode phases use the separate fixed byte caps above and may not
-retain a manifest/image/audio stream buffer. No additional variable-cardinality
-container is allowed.
+retain a manifest/image/audio/settings stream buffer. No additional variable-
+cardinality container is allowed.
 
 Encoding FFmpeg uses `-nostats -progress pipe:1` and one project-owned bounded
 byte drain. Recognized progress key/value lines are parsed within
@@ -2584,12 +2776,13 @@ byte drain. Recognized progress key/value lines are parsed within
 is not resident and is not charged as diagnostics. Unrecognized/error bytes are
 retained only in the fixed tail ring. An overlong line or diagnostic bytes
 beyond the diagnostic cap marks the encode failed while the drain continues
-until the process is terminated/reaped. Audio probe/PCM decode, final FFprobe,
-and final full-decode use the same `BoundedProcessCaptureV1` abstraction with
-their separate caps above. `subprocess.run(..., capture_output=True)` and
-`communicate()` into an unbounded bytes/string object, the current assembled-
-encoder capture path, and `get_video_info_ffprobe` are forbidden in final
-publication. The implementation
+until the process is terminated/reaped. Audio probe and final FFprobe use the
+finite-output mode of `BoundedProcessCaptureV1`; PCM and final full-decode use
+its streaming-drain mode. All four share its one cancel/terminate/grace/kill/
+reap state machine and the separate caps/timeouts above.
+`subprocess.run(..., capture_output=True)` and `communicate()` into an unbounded
+bytes/string object, the current assembled-encoder capture path, and
+`get_video_info_ffprobe` are forbidden in final publication. The implementation
 must drain all configured pipes without deadlock on Windows and POSIX and must
 count raw bytes before UTF-8 decoding. Any helper thread, event-loop object,
 pipe wrapper, decoder, or native stack used for that drain is charged to and
@@ -2711,16 +2904,25 @@ ffprobe -v error -count_frames \
   -of json <sibling-temporary>
 ```
 
-It never requests `format`, tags, programs, chapters, packets, or frames.
-`BoundedProcessCaptureV1` drains stdout and stderr concurrently into the exact
-64-KiB caps above. Exceeding either cap terminates/reaps the probe and raises
-`FinalContainerProbeBudgetError`; invalid UTF-8, a NUL, malformed JSON, a JSON
-nesting depth greater than four, a string longer than 128 bytes, more than two
-stream objects, or any key outside root `streams` and the requested stream-field
-allowlist fails validation. A fixed-schema incremental parser consumes stdout
-directly into at most two `FinalProbeStreamV1` scalar records and remains within
-`FINAL_PROBE_JSON_STATE_BYTES`; a general `json.loads` object tree is forbidden
-even after the byte cap. Nonzero exit or any stderr byte also fails.
+It never requests `format`, tags, program/stream-group contents, chapters,
+packets, or frames. Supported FFprobe JSON writers may nevertheless emit empty
+section wrappers. `BoundedProcessCaptureV1` drains stdout and stderr concurrently
+into the exact 64-KiB caps above. Exceeding either cap terminates/reaps the probe
+and raises `FinalContainerProbeBudgetError`; invalid UTF-8, a NUL, malformed
+JSON, a JSON nesting depth greater than four, a string longer than 128 bytes, or
+more than two authoritative stream objects fails validation.
+
+The root object permits exactly `streams`, `programs`, and `stream_groups`, each
+at most once and in any order. `streams` is required. For a project-generated
+final MP4, each optional wrapper must be an empty array; a first wrapper element
+fails immediately. Any other root key, missing `streams`, or key outside the
+requested top-level stream-field allowlist fails. A fixed-schema incremental
+parser consumes stdout directly into at most two `FinalProbeStreamV1` scalar
+records and remains within `FINAL_PROBE_JSON_STATE_BYTES`; a general
+`json.loads` object tree is forbidden even after the byte cap. Nonzero exit or
+any stderr byte also fails. The probe must exit within the derived
+`FINAL_PROBE_TIMEOUT_SECONDS`; timeout raises
+`FinalContainerProbeTimeoutError` after the common termination sequence.
 
 Require exactly one video stream, no data/subtitle/attachment streams, the
 resolved output width and height, `sample_aspect_ratio="1:1"`,
@@ -2736,14 +2938,36 @@ EncodingInputSequenceManifest.frame_names.length`. If
 substituting duration. Require zero audio streams when normalized argv contains
 no audio token and exactly one `codec_name=aac` audio stream when it contains one;
 `preserve_audio=true` with no usable selected stream therefore still requires
-zero. Finally run `ffmpeg -v error -xerror -i
-<sibling-temporary> -map 0:v:0 -map 0:a? -f null -`. Stdout is the null sink;
-stderr is continuously drained into the fixed
+zero. Finally run exactly:
+
+```text
+ffmpeg -v error -xerror -nostats -progress pipe:1 \
+  -i <sibling-temporary> -map 0:v:0 -map 0:a? -f null -
+```
+
+Stdout is a streaming progress channel, not a cumulative capture. Each ASCII
+`key=value` line is bounded by `FINAL_DECODE_LINE_BYTES`, parsed inside
+`FINAL_DECODE_PROGRESS_STATE_BYTES`, and immediately discarded. Keys are 1..32
+lowercase ASCII letters/digits/underscores and values are at most 256 bytes;
+malformed/overlong lines fail while drainage continues. Track canonical
+nonnegative decimal `frame`, `out_time_us`, and legacy-compatible `out_time_ms`
+values plus `progress=end`. The `FINAL_DECODE_STALL_SECONDS` clock resets only
+when `frame` or either time counter strictly increases, not for repeated or
+unrelated lines.
+There is no fixed total decode deadline because valid video duration is
+variable. A stall raises
+`FinalContainerDecodeTimeoutError`.
+
+Stderr is simultaneously drained into the fixed
 `FINAL_DECODE_DIAGNOSTIC_BYTES` tail ring. A byte beyond the cap sets overflow,
 continues draining through process termination/reap, and fails validation with
 `FinalContainerDecodeBudgetError`. Because all other stream types were rejected,
-this completely decodes every accepted stream. Require exit status zero with no
-stderr byte. File existence or nonzero length alone is never validation.
+this completely decodes every accepted stream. Require `progress=end`, exit
+status zero, and no stderr byte. Timeout, cancellation, progress/parser failure,
+pipe failure, and budget overflow all close stdin, terminate, continue bounded
+drainage, wait `FINAL_PROCESS_TERMINATE_GRACE_SECONDS`, kill if needed, and reap
+exactly once before returning. No failure may publish or authenticate the file.
+File existence or nonzero length alone is never validation.
 
 A stale, missing, malformed, or mismatching encoding-input or final-video
 manifest never authenticates an existing video. In particular, a crash after
@@ -2752,8 +2976,9 @@ a temporary and atomic replacement; resume must not inspect the container or
 re-resolve `auto` to guess provenance.
 Both manifests are retained final artifacts and are never listed for
 intermediate cleanup. Final-encoding disk preflight physically reserves their
-schema-derived temporary allocations plus the one-time producer-marker settings
-rewrite when needed before starting FFmpeg.
+schema-derived temporary allocations plus a separate maximum extent for every
+remaining producer, pending-cleanup, and terminal settings transaction before
+starting FFmpeg.
 
 ### Final Media Audit Disposition V1
 
@@ -3071,9 +3296,10 @@ Finalization order is exact: durably publish and validate the final video,
 durably commit and validate `encoding_input_manifest.json`, durably commit and
 validate `final_video_manifest.json`, create/fsync every prune marker and capture
 the matching open-handle directory identities, commit `payload_pruned`, run
-authorized cleanup from its persisted `prune_entries`, then mark the
-settings/runtime record completed. A crash after the prune commit resumes
-cleanup and final status only;
+`SettingsArtifactTransactionV1` for `cleanup_status="pending"`, run authorized
+cleanup from the persisted `prune_entries`, then commit one terminal settings
+transaction containing the cleanup result and processing completion fields. A
+crash after the prune commit resumes settings, cleanup, and final status only;
 it never reopens a render transaction or consults current stage mappings. A crash
 after both manifests commit but before prune validates their canonical bytes,
 fingerprints, normalized executed arguments, and video payload, then retries only
@@ -3097,6 +3323,15 @@ demote `payload_pruned` or reopen frame processing.
 `keep_intermediates=true` commits `not_requested`; the `payload_pruned` commit
 and any resumed cleanup first persist `pending`; each terminal result above is
 then atomically persisted without changing final-video success.
+
+A cleanup-only resume which does not enter final encoding performs its own
+read-only calculation and physical reservation of one settings transaction
+extent when `pending` is already durable, otherwise two extents for pending plus
+terminal. It reserves them before marker creation, `payload_pruned`, or deletion
+and consumes them in the same fixed order. Cleanup is forbidden when that
+reservation, the settings memory phase, or reopen validation cannot be proved;
+an authenticated final video remains successful but the job is not reported
+terminally completed.
 
 A valid `payload_pruned` state authenticates only metadata, the applicable
 retained Quality content manifest, retained JSONL/root summary, the raw
@@ -4137,12 +4372,12 @@ final_video_manifest_raw = max_json_bytes(
     len(resolved_encoding_arguments),
     every normalized argument and final relative path,
 )
-producer_marker_settings_raw = max_json_bytes(
+settings_artifact_raw_max = max_json_bytes(
     ProcessingSettingsArtifactV5,
     every retained metadata/video/output/settings value,
-    final_media_producer_contract_version=4,
-    final_media_publication_generation=32 lowercase hex,
-) when the producer marker is null else 0
+    the maximum remaining producer/status/cleanup/timestamp/runtime values,
+)
+require settings_artifact_raw_max <= SETTINGS_ARTIFACT_MAX_RAW_BYTES
 prune_marker_raw[j] = max_json_bytes(
     PruneMarkerPayload,
     prune_entry[j].relative_path,
@@ -4151,8 +4386,12 @@ prune_marker_raw[j] = max_json_bytes(
 ```
 
 `ProcessingSettingsArtifactV5` means the complete persisted settings JSON shape,
-including all preexisting schema-5 values and the additional metadata/output
-fields in the Public Settings Contract; it is not a marker-only projection.
+including all preexisting schema-5 values and the additional metadata/output,
+producer, runtime, status, and cleanup fields in the Public Settings Contract;
+it is not a marker-only projection. This formula uses the schema-5 canonical
+settings serializer, not the legacy pretty serializer. Its maximum is shared by
+every remaining settings transition, so later timestamps or terminal status
+cannot exceed the preflight bound.
 
 The preflight helper constructs and tests a maximum-token schema skeleton for
 every formula; an encoded object exceeding its bound is an internal error before
@@ -4202,42 +4441,76 @@ between prune authorization and cleanup; successful cleanup releases it.
 
 The later final-encoding preflight is a separate transaction and deliberately
 makes no claim that free space can hold the complete CRF-compressed video. There
-is no deterministic "existing video reserve". It guarantees only manifest and
-directory-entry publication space. On the job-root volume it requires and
-physically allocates/fsyncs before FFmpeg:
+is no deterministic "existing video reserve". It guarantees manifest,
+settings-transaction, and directory-entry publication space. Before allocation
+derive the exact maximum remaining settings transaction count along any path to
+a durable terminal state:
+
+```text
+settings_transaction_count =
+      (1 when the producer pair is null else 0)
+    + (1 when keep_intermediates is false else 0)  # cleanup pending
+    + 1                                             # terminal success/failure
+settings_transaction_extent = alloc(settings_artifact_raw_max) + A
+settings_transaction_reserve =
+    settings_transaction_count * settings_transaction_extent
+```
+
+The addition, allocation rounding, and multiplication above use checked uint64
+arithmetic; the count is exactly `1..3` for an encode invocation.
+
+On the job-root volume preflight then requires and physically allocates/fsyncs
+before FFmpeg:
 
 ```text
 alloc(encoding_input_manifest_raw)
 + alloc(final_video_manifest_raw)
-+ alloc(producer_marker_settings_raw)
++ settings_transaction_reserve
 + prune_marker_reserve
 + (5 + prune_marker_file_count)*A
 ```
 
-The first two `alloc` terms are the future atomic manifest temporaries and the
-third is the one-time settings rewrite before first v4 launch; an
-existing retained file already consumes blocks and is never counted as free.
-Before FFmpeg, each nonzero temporary is non-sparsely filled and fsynced to its
-schema-derived maximum. The marker rewrite consumes its reserved extent and
-commits before launch; the manifest reservations remain. The remaining terms
-are held in a separate non-sparse,
-fsynced reservation file, not an unprotected free-space estimate. After input
-revalidation or video hashing, canonical manifest bytes are streamed over the
-beginning of their reserved extents, checked not to exceed the bound, fsynced,
-and truncated. Immediately before each manifest replacement, release exactly
-`2*A`; that replacement and its following directory sync complete before the
-next release. After both manifests are durable and immediately before each prune
-marker create-new, release exactly `alloc(prune_marker_raw[j])+A`, then create,
-fsync, and directory-sync that marker on the same volume. The empty reservation
-entry is removed only after all applicable publications and markers are durable.
-Thus these artifacts need no new payload blocks from ambient free space. Actual
-normalized FFmpeg arguments and all input paths are resolved before this check.
+The first two `alloc` terms are the future atomic manifest temporaries. The
+settings term reserves one independent maximum-sized extent plus one directory
+entry for every write still possible, including the terminal write even when
+`keep_intermediates=true`; an existing retained settings file already consumes
+blocks and is never counted as free. All extents and marker terms are held in
+non-sparse, fsynced reservation files, not an unprotected free-space estimate.
+
+Immediately before each declared settings transition, release exactly one
+`settings_transaction_extent` and consume it through
+`SettingsArtifactTransactionV1`. A consumed slice is never assumed to be
+replenished from the replaced old settings file. Unused slices remain physically
+reserved across FFmpeg growth, video publication, both manifest commits, and
+cleanup until the one terminal settings transaction is durable. Thus a producer
+write cannot spend the space needed for `cleanup_status="pending"`, and neither
+that pending write nor a large video can spend the terminal-completion extent.
+The producer slice commits before launch; pending and terminal slices are used
+in the fixed finalization order above. If processing fails before pending, the
+terminal failure write still has its own slice and every unused slice is released
+only after that terminal transition is reopen-validated.
+
+Before FFmpeg, each nonzero manifest temporary is non-sparsely filled and fsynced
+to its schema-derived maximum. After input revalidation or video hashing,
+canonical manifest bytes are streamed over the beginning of their reserved
+extents, checked not to exceed the bound, fsynced, and truncated. Immediately
+before each manifest replacement, release exactly `2*A`; that replacement and
+its following directory sync complete before the next release. After both
+manifests are durable and immediately before each prune marker create-new,
+release exactly `alloc(prune_marker_raw[j])+A`, then create, fsync, and
+directory-sync that marker on the same volume. The reservation entry is removed
+only after all applicable publications, markers, and terminal settings are
+durable. Thus these artifacts need no new payload blocks from ambient free
+space. Actual normalized FFmpeg arguments, all input paths, and every settings
+maximum are resolved before this check.
 
 Both assembled and direct encoding write only to a sibling temporary on the
 final-output volume. FFmpeg ENOSPC/Windows error 112, interruption, validation
 failure, or any error before publication removes that temporary and manifest
-temporaries plus the marker reservation and leaves the old final video plus both
-old retained manifests unchanged. Only a successfully closed and validated temporary may enter the
+temporaries plus the prune-marker reservation, retains one settings extent until
+the terminal failure transition is durable, then removes unused settings
+reservations. It leaves the old final video plus both old retained manifests
+unchanged. Only a successfully closed and validated temporary may enter the
 publication sequence. Output-file size is reported from the failed temporary,
 but it is never presented as a preflight guarantee. When job root and output
 share a volume, the manifest reservation is still tested independently from the
@@ -4556,7 +4829,8 @@ It is not a setting, saved mode, resume identity, or production branch.
    report exact integers including the all-zero-query case.
 3. Strict-key tests reject every missing, extra, integer-versus-binary64,
    nullable, noncanonical, bad path, self-fingerprint, payload-hash, and
-   state-transition mutation in diagnostics metadata, Quality RGB metadata,
+   state-transition mutation in `ProcessingSettingsArtifactV5`, diagnostics
+   metadata, Quality RGB metadata,
    Quality-input/frame/encoding-input/final-video manifests, prune
    identities/markers, JSONL, and summary. Scalar aggregation fixtures
    cover source-order last-bit differences, positive zero, empty p95, and
@@ -4642,16 +4916,29 @@ It is not a setting, saved mode, resume identity, or production branch.
     overflow, partial PCM frames, invalid UTF-8/NUL/extra keys, stdout/stderr/
     parser/ring boundaries, 30-second probe timeout, decode stall, cancellation,
     terminate/kill/reap, and no generic helper call. Every audio phase remains
-    within its independent peak. Output-level `-shortest` is absent.
+    within its independent peak. Root-wrapper fixtures accept absent, empty, and
+    bounded nonempty `programs`/`stream_groups`, reject unknown/duplicate roots
+    and every skip-state bound crossing, and prove duplicated wrapper streams do
+    not change the authoritative top-level zero/one result. Raw golden outputs
+    from FFmpeg 5.x, 6.x, 7.1.5, and the project-resolved Windows distribution
+    (currently n8.0.1-52-geef9672b02-20260203) all parse. Output-level
+    `-shortest` is absent.
 12. ffprobe fixtures reject extra/missing streams, dimensions, pixel format,
     codec, rational rate, frame count, non-1:1 SAR, missing or wrong reduced DAR,
     audio-token mismatch, and any full-decode error; nonempty garbage never
     publishes. Probe fixtures assert the exact `-show_entries` command and reject
     format/tags, invalid UTF-8/JSON, over-depth/overlong tokens, a third stream,
     stdout/stderr one byte over cap, and parser-state overflow with the exact
-    typed error. Full-decode and encoding diagnostic rings test cap-minus-one,
-    cap, and cap-plus-one while proving every child is drained and reaped. The
-    publication path never calls either generic capture helper. Direct
+    typed error. FFmpeg 5.x/6.x/7.1.5 and the same Windows-distribution goldens
+    accept absent or empty `programs`/`stream_groups`; a nonempty final wrapper
+    and every unknown/duplicate root fail. Probe tests exercise the derived wall
+    timeout at its boundary. Full-decode progress fixtures prove monotonic
+    `frame`/`out_time_us`/`out_time_ms` resets the stall clock while repeated or
+    unrelated lines do not, require `progress=end`, and exercise the 120-second
+    timeout.
+    Full-decode and encoding diagnostic rings test cap-minus-one, cap, and cap-
+    plus-one while proving every child follows the one terminate/grace/kill/reap
+    path. The publication path never calls either generic capture helper. Direct
     scale/no-scale and assembled fixtures all contain their exact `setsar=1`
     filter and produce square-pixel output. Internal concurrent mutation is
     blocked by the project writer lock and persistent pre/post changes fail
@@ -4700,9 +4987,11 @@ It is not a setting, saved mode, resume identity, or production branch.
     and `ENCODING_CONTROL_FRAME_CAP` prove O(1) provider state, exact streamed
     directory completeness, same-generation prepass/argv/postpass, and at most
     six MiB coordinator residency across the distinct manifest, audio-probe,
-    audio-decode, encode, final-probe, and final-decode phase peaks, including
-    bounded parent-process output and JSON state. No source resolver or assembled frame-list
-    interface is called. Pre-launch changes restart only after temporary cleanup;
+    audio-decode, encode, final-probe, final-decode, producer-settings, pending-
+    settings, and completion-settings phase peaks, including bounded parent-
+    process output and JSON/settings state. No source resolver or assembled
+    frame-list interface is called. Pre-launch changes restart only after
+    temporary cleanup;
     post-launch changes terminate/reap FFmpeg, remove the sibling temporary, and
     publish nothing. The supported FFmpeg boundary fixture decodes indexes
     2,147,483,645..2,147,483,646 without error; checked U64 overflow, a two-frame
@@ -4724,12 +5013,27 @@ It is not a setting, saved mode, resume identity, or production branch.
     Deleting both manifests afterward yields incomplete evidence, never legacy,
     including after a failed later encode. Target-path fixtures prove new jobs,
     retained `expected_output_filename`, and frozen-v1 fallback each persist one
-    immutable path; helper changes, Unicode, suffix, token, and sanitization
-    changes cannot redirect audit, argv, manifest, or `path64`.
+    immutable portable component; helper changes cannot redirect audit, argv,
+    manifest, or `path64`. Naming goldens cover invalid scalar/control input,
+    preset/custom resolution grammar, multi-byte and non-BMP stems, both 240-unit
+    limits and their adjacent values, exact deterministic hash truncation, and
+    rejection before any filesystem create when the fixed tail cannot fit.
 18. Batch-stitching fixtures create `_stitched_*.mp4` beside missing, legacy,
     current, and pruned job artifacts. The job audit and cleanup result are
     unchanged, neither publication manifest is created or consumed, and only
     the two orchestrated `VideoEncoder` entry points can enter publication v4.
+19. Settings fixtures accept bounded legacy pretty JSON only through migration
+    and require exact canonical schema-5 bytes thereafter. They inject raw,
+    parser, typed-object, serializer, temporary-create/write/fsync, replace,
+    directory-sync, and both reopen-validation failures at producer, pending,
+    terminal-success, and terminal-failure transitions. Producer failure never
+    launches FFmpeg. Disk-full fixtures consume the unknown video space while
+    proving independent extents remain for pending and terminal writes with
+    intermediates off, and for the terminal write with intermediates kept.
+    Cleanup-only resume reserves one or two extents from persisted state. No
+    direct pretty-JSON overwrite runs, every phase remains at six MiB or less,
+    and no job reports completion before the terminal canonical settings bytes
+    are directory-synced and reopen-validated.
 
 ### Fast Compatibility
 
@@ -4822,8 +5126,9 @@ With five warmups and 30 measured frames on that clean CUDA environment:
 - direct and assembled final-encoding providers at the same cardinalities up to
   `ENCODING_CONTROL_FRAME_CAP` remain at or below the independent six-MiB
   calculated peak and eight-MiB cap through directory audit, manifest prepass,
-  source-audio probe/decode, argv construction, final validation, and postpass,
-  with no eager path/name collection;
+  source-audio probe/decode, argv construction, final validation, postpass, and
+  isolated producer/pending/terminal settings commits, with no eager path/name
+  collection or uncapped settings object;
 - simultaneous stereo jobs repeatedly create and tear down threads while a
   third project thread creator contends for the global creation lock. Every run
   restores the previous process stack setting on success and each injected
@@ -4919,12 +5224,18 @@ coordinator at N up to `ENCODING_CONTROL_FRAME_CAP`, exercises both sides of the
 FFmpeg-launch mutation boundary and the signed-int image2 endpoint, and proves
 the same generation supplies streamed manifest bytes, scalar argv construction,
 and postpass. It separately measures manifest, source-audio probe, clipped PCM
-decode, encode, exact final ffprobe, and final full-decode phases with capped
-stdout/stderr/JSON/ring state and injected overflow, timeout, cancellation, and
-reap paths on Windows and POSIX. It also proves immutable target-path use and the
-first-v4-attempt marker across failed/repeated encodes. Any eager resolver call,
-generic capture helper, over-cap RSS, mixed generation, leaked process/thread,
-or publication after mismatch blocks production implementation.
+decode, encode, exact final ffprobe, final full-decode, and all three settings-
+commit phases with capped stdout/stderr/JSON/settings/ring state and injected
+overflow, timeout, cancellation, sync, reopen, and reap paths on Windows and
+POSIX. It freezes legal FFprobe wrapper output from FFmpeg 5/6/7 and the resolved
+Windows distribution, proves top-level stream authority, and gives full decode
+observable monotonic progress. It also proves portable deterministic target-name
+generation, immutable target-path use, every physically retained settings
+extent through terminal status, and the first-v4-attempt marker across failed/
+repeated encodes. Any eager resolver call, generic capture helper, direct pretty-
+settings overwrite, over-cap RSS, mixed generation, leaked process/thread,
+unreserved status write, or publication after mismatch blocks production
+implementation.
 
 Task 0 first evaluates an implementation using only existing NumPy, Torch, and
 OpenCV facilities. If it misses any performance or RSS gate, this specification
@@ -4959,7 +5270,11 @@ resulting SAR/DAR. Content-only encoding-input identity, normalized executed FFm
 arguments, sibling-temporary encoding for both paths, exact container validation,
 durable final-video publication, and identity-plus-marker prune entries are also
 authorized transaction changes for the two orchestrated job encoder entry
-points only. `/stitch_video` remains unchanged and outside job publication. No
+points only. Schema-5 settings creation/migration/status writes may replace the
+pretty serializer only with `SettingsArtifactTransactionV1`; raw schema-1-
+through-4 files remain byte-untouched until an authorized migration. Output-name
+generation may change only to the frozen portable v1 contract above.
+`/stitch_video` remains unchanged and outside job publication. No
 compressed-video size preflight guarantee is authorized or claimed.
 NumPy, Torch, and OpenCV are already production dependencies; no new external
 runtime dependency is authorized.
@@ -5057,10 +5372,15 @@ Approval of this canonical specification accepts:
     authority over the older Direct VR transaction rules. Direct and assembled
     sources use one O(1) replayable encoding provider under an eight-MiB
     coordinator cap which includes bounded parent-process output and parser
-    state for source-audio probe/decode as well as final validation. A persisted
-    immutable target path, checked last-index arithmetic, and the fixed signed-
-    int image2 endpoint prevent historical reinterpretation. Batch stitching
-    remains outside this publication and audit scope.
+    state for source-audio probe/decode, final validation, and every settings
+    commit. Legal FFprobe section wrappers never override authoritative top-level
+    streams; final probe has a frame-derived deadline and full decode has a
+    semantic-progress stall deadline. One canonical settings transaction owns
+    producer/pending/terminal durability and their physical extents through
+    completion. A persisted immutable target path whose complete component meets
+    both 240-byte and 240-UTF-16-unit limits, checked last-index arithmetic, and
+    the fixed signed-int image2 endpoint prevent historical reinterpretation.
+    Batch stitching remains outside this publication and audit scope.
 14. Task 0 must prove the exact geodesic, geometry-nearest, and repair-donor
     heap/k-d performance paths, local/fallback semantic caps, ten-step allocation
     order, no-copy Quality content audit, bounded replayable stereo and encoding
@@ -5068,9 +5388,10 @@ Approval of this canonical specification accepts:
     the configured/effective/actual/restored-stack thread envelope. Schema-5
     stereo providers require canonical upstream manifests and never synthesize
     a directory fingerprint. It also proves both CPython historical ZIP forms,
-    the bounded owned metric writer, audio process lifecycles, immutable final
-    targets, and the monotonic publication marker. A project-owned
-    prebuilt extension is permitted only under the fixed oracle and packaging
+    the bounded owned metric writer, audio/final process lifecycles, FFprobe
+    version goldens, portable immutable final targets, the canonical settings
+    transaction/reservation schedule, and the monotonic publication marker. A
+    project-owned prebuilt extension is permitted only under the fixed oracle and packaging
     constraints; it cannot weaken output or add a silent fallback.
 15. All deterministic, resource, transaction, seven-frame visual, temporal, and
     Fast compatibility gates pass before implementation is considered releasable.
