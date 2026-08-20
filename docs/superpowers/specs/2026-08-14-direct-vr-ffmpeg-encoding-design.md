@@ -16,8 +16,10 @@ return interface; the canonical specification replaces input validation,
 audio and `-shortest` policy, command normalization, publication/manifests,
 container validation, bounded source-audio handling, the persisted final target
 and producer marker, the closed schema-5 settings/job-control locator,
-lifecycle-spanning target-parent reservation extents, fixed write-ahead indexes,
-shared file identities, new-versus-legacy target validation, bounded encoder/
+lifecycle-spanning target-parent reservation extents, replayable settings intents,
+fixed write-ahead indexes, persisted-versus-invocation file identities, the
+reserved diagnostics payload-pruned commit, transaction-first audit order,
+new-versus-legacy target validation, bounded encoder/
 final-validator lifecycles, work-unit FFprobe
 deadlines, resume, and cleanup. The sentence above about unchanged recovery
 behavior does not override that later transaction contract.
