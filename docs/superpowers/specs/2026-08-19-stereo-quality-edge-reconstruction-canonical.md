@@ -46,8 +46,9 @@ remains authoritative only for the following product and layout decisions:
 This canonical specification supersedes that document for input-sequence
 validation, audio source/stream selection, output-level `-shortest`, FFmpeg
 command normalization, final-video publication, retained encoding/final-video
-manifests, portable persisted target naming, schema-5 settings transactions,
-bounded container-validation process lifecycles, resume, and cleanup. On any
+manifests, portable new-target naming and contained legacy-target audit, the
+closed schema-5 settings/job-control/reservation transactions, bounded encoder
+and container-validation process lifecycles, resume, and cleanup. On any
 conflict in one of those areas, this document is the sole authority. The older
 document's claim that assembled encoding and its recovery path remain unchanged
 is therefore no longer applicable to those transaction and validation concerns.
@@ -249,7 +250,13 @@ defects.
 | Legal FFprobe JSON section wrappers were rejected | Keep JSON, require authoritative top-level `streams`, accept bounded optional `programs`/`stream_groups` wrappers for audio, require them empty for generated MP4, and freeze FFmpeg 5/6/7 plus distributed-Windows goldens. |
 | Settings rewrites had no single byte/resource/durability contract | Make every schema-5 artifact canonical, add `SettingsArtifactTransactionV1`, charge three isolated coordinator phases, and physically reserve every remaining settings extent through terminal completion. |
 | Output naming bounded only source code-point count | Redefine the unimplemented v1 over the complete component with scalar/control validation, strict resolution tokens, 240-byte/UTF-16-unit limits, and deterministic hash truncation. |
-| Final validation processes could live forever | Give frame-count-aware FFprobe a bounded wall deadline and final full decode a semantic-progress stall deadline through the shared termination/reap state machine. |
+| Final validation processes could live forever | Give work-unit-aware FFprobe a bounded wall deadline and final full decode a semantic-progress stall deadline through the shared termination/reap state machine. |
+| Hash fallback rechecked only length, so dotted Windows device stems remained invalid | Select the longest prefix whose complete fallback passes every `PortableFinalComponentV1` predicate and freeze device-stem goldens. |
+| The settings artifact name and closed schema were still implicit | Freeze a job-control locator, one schema-5 relative path, and the exact key/type/nullability/state contract for all five owned settings objects. |
+| Final-encoding-only settings reserve could not record an earlier failure | Retain one authenticated terminal-settings extent for the entire nonterminal job and add generation-bound reservation descriptors for every finalization extent. |
+| New portable limits rejected locatable historical Windows output | Split new-name portability from the containment-only validator used by read-only legacy audit. |
+| The publishing FFmpeg process could stall forever | Add a semantic encode stall clock driven only by strictly advancing FFmpeg progress counters. |
+| Final FFprobe timeout ignored counted AAC packets and file scan cost | Derive deterministic work units from video frames plus a supported AAC packet upper bound, then include final-file bytes. |
 
 ## Public Settings Contract
 
@@ -274,9 +281,10 @@ exact `auto`, an exact member of the frozen v1 preset set below, or exact
 `custom:<width>x<height>` where each decimal has no sign, whitespace, or leading
 zero and normalizes to `1..10000`. Every CLI, Web, migration-fallback, and resume
 path runs this same validator before target-name persistence. A retained legacy
-`expected_output_filename` remains authoritative only when its complete copied
-component passes `PortableFinalComponentV1`; its historical resolution spelling
-does not get appended again.
+`expected_output_filename` remains authoritative for read-only audit when its
+complete copied component passes `ContainedLegacyFinalComponentV1`; its
+historical resolution spelling does not get appended again and the new portable
+limits are not retroactively imposed on it.
 
 ```text
 JOB_OUTPUT_NAME_V1_RESOLUTION_PRESETS = {
@@ -344,7 +352,8 @@ The two producer fields are either both null or exactly `4` plus a 128-bit OS-
 CSPRNG value encoded as 32 lowercase hexadecimal characters. New schema-5 jobs
 and untouched schema-1-through-4 migrations start with the null pair. Immediately
 before the first publication-v4 FFmpeg launch attempt, atomically update and
-fsync the settings artifact to `4` plus a fresh generation through
+fsync the settings artifact to `4` plus the fresh OS-CSPRNG generation already
+authenticated by `FinalEncodingReservationV1`, through
 `SettingsArtifactTransactionV1` below. Failure to commit, directory-sync, or
 reopen-validate the producer marker is fatal and FFmpeg must not launch. Once
 non-null, both values are immutable across failed or later encode attempts,
@@ -362,17 +371,31 @@ contradictory rather than trusted.
 `expected_final_relative_path` is a canonical nonempty output-root-relative
 POSIX path containing exactly one filename segment, no `.`/`..`, slash,
 backslash, drive, NUL, link, or reparse traversal, and ending in lowercase
-`.mp4`. Its complete filename segment must satisfy
-`PortableFinalComponentV1`: every character is a Unicode scalar value, no scalar
-has Unicode General Category `Cc`, no scalar is in `<>:"/\|?*`, UTF-8 encoding
-is at most 240 bytes, and UTF-16 encoding is at most 240 code units excluding a
-BOM. The substring before its first dot, compared ASCII case-insensitively, is
-not `CON`, `PRN`, `AUX`, `NUL`, `COM1`..`COM9`, or `LPT1`..`LPT9`. The emitted
-suffix ensures that the segment ends in neither a space nor a dot. These
-deliberately platform-independent limits sit below both the project-supported 255-byte POSIX
-component boundary and the 255-UTF-16-code-unit Windows component boundary; an
-output volume unable to create this tested component class is unsupported rather
-than permission to change job identity.
+`.mp4`. For `output_name_algorithm_version="job-output-name-v1"`, its complete
+filename segment must satisfy `PortableFinalComponentV1`: every character is a
+Unicode scalar value, no scalar has Unicode General Category `Cc`, no scalar is
+in `<>:"/\|?*`, UTF-8 encoding is at most 240 bytes, and UTF-16 encoding is at
+most 240 code units excluding a BOM. The substring before its first dot,
+compared ASCII case-insensitively, is not `CON`, `PRN`, `AUX`, `NUL`,
+`COM1`..`COM9`, or `LPT1`..`LPT9`. The emitted suffix ensures that the segment
+ends in neither a space nor a dot. These deliberately platform-independent
+limits sit below both the project-supported 255-byte POSIX component boundary
+and the 255-UTF-16-code-unit Windows component boundary; an output volume unable
+to create this tested component class is unsupported rather than permission to
+change job identity.
+
+`ContainedLegacyFinalComponentV1` is deliberately narrower policy and broader
+syntax. It accepts one nonempty Unicode-scalar component other than `.` or `..`
+which contains no NUL, `/`, or `\` and does not begin with the ASCII drive
+prefix `[A-Za-z]:`; it imposes no 240-byte, 240-UTF-16-unit,
+Windows-device-name, control-category, trailing-space/dot, or new portable-
+character rule. The audit opens that exact child through the already opened
+output-root directory handle without following a link or reparse point and
+requires a locatable ordinary-file entry before it may report presence. It
+never joins an absolute path, normalizes the component, interprets a drive, or
+falls back to a glob. This validator exists only to locate and inspect an
+already persisted schema-1-through-4 target. It never authorizes creation,
+rename, replacement, manifest publication, or cleanup of that spelling.
 
 The path is immutable after job creation or legacy migration. New jobs compute
 it once with the frozen `job-output-name-v1` algorithm and persist it before any
@@ -406,10 +429,15 @@ no Unicode normalization or case conversion, and has these exact steps:
    `digest=SHA256(UTF8(untruncated candidate))`, take its first 32 lowercase hex
    digits, and form
    `<prefix>~<digest>_3D_<format-token>_<resolution-token>.mp4`, where `prefix`
-   is the longest scalar prefix of `sanitized-stem` for which both complete-name
-   limits hold. The fixed tail itself must fit or metadata validation fails. The
-   scan never splits a scalar; a non-BMP scalar counts as four UTF-8 bytes and
-   two UTF-16 code units.
+   is the longest scalar prefix of `sanitized-stem` for which the **complete
+   fallback filename passes every `PortableFinalComponentV1` predicate**, not
+   merely both length limits. Enumerate prefix lengths from the complete scalar
+   count down through zero and select the first passing result; there is no tie
+   or implementation-dependent search. The fixed zero-prefix tail itself must
+   pass the complete validator or metadata validation fails. The scan never
+   splits a scalar; a non-BMP scalar counts as four UTF-8 bytes and two UTF-16
+   code units. Thus `CON.foo` selects prefix `CON`, producing a first-dot prefix
+   beginning `CON~`, rather than retaining the still-invalid `CON.foo`.
 
 The hash suffix makes truncation deterministic and collision-resistant while
 the persisted path, not a later recomputation, remains the identity authority.
@@ -417,23 +445,47 @@ Golden fixtures freeze hidden names, terminal and repeated dots, an input which
 sanitizes to an empty base, invalid ASCII filename characters, repeated
 underscores, preset and custom resolutions, invalid/overlong resolution tokens,
 isolated surrogates, `Cc` controls, 60 non-BMP scalars, exact 239/240/241 UTF-8-
-byte and UTF-16-unit boundaries, and deterministic hash truncation. No production
+byte and UTF-16-unit boundaries, deterministic hash truncation, and exact
+`CON.foo.mp4`, `con.foo.mp4`, `AUX.bar.mp4`, `NUL..mp4`, `COM1.part.mp4`, and
+`LPT9.part.mp4` inputs whose complete emitted results each independently pass
+`PortableFinalComponentV1`. Their exact side-by-side/16x9-1080p goldens are:
+
+```text
+CON.foo.mp4   -> CON~afc0ef4e07a53c5302a14d2d1fd02201_3D_side-by-side_16x9-1080p.mp4
+con.foo.mp4   -> con~3f9776dda8dc90294815dd61a8c3ace9_3D_side-by-side_16x9-1080p.mp4
+AUX.bar.mp4   -> AUX~e8fac5846b90380bd5f72d652d5736c4_3D_side-by-side_16x9-1080p.mp4
+NUL..mp4      -> NUL~9143c618d678d7b537d35615d8540440_3D_side-by-side_16x9-1080p.mp4
+COM1.part.mp4 -> COM1~fe6252979b85daead85a257e026e2f3e_3D_side-by-side_16x9-1080p.mp4
+LPT9.part.mp4 -> LPT9~7fc1ea62997d746b58e6250491ee1b78_3D_side-by-side_16x9-1080p.mp4
+```
+
+No production
 implementation of the earlier 200-code-point draft existed; this paragraph is
 the final definition of `job-output-name-v1`. A future helper change therefore
 creates a new algorithm version rather than reinterpreting v1.
 
 For schema-1-through-4 migration, first validate
-`output_info.expected_output_filename` as the same one-segment relative path. If
-present and valid, copy its exact scalar sequence to `expected_final_relative_path`
-and record `persisted-expected-output-filename-v1`; do not recompute it. If and
-only if the old field is absent, run the frozen `job-output-name-v1` once from
+`output_info.expected_output_filename` with
+`ContainedLegacyFinalComponentV1`. If present and valid, copy its exact scalar
+sequence to `expected_final_relative_path` and record
+`persisted-expected-output-filename-v1`; do not recompute it. If and only if the
+old field is absent, run the frozen `job-output-name-v1` once from
 the raw persisted `metadata.source_video_name`,
 `processing_settings.vr_format`, and
 `processing_settings.vr_resolution`, then persist that result/version. A
-present malformed old field or missing/malformed fallback input is
+present malformed/unlocatable old field or missing/malformed fallback input is
 `FinalMediaTargetMetadataError`, not permission to glob or use the current
 mutable helper. A schema-5 file missing either target field is likewise invalid
 rather than lazily repaired.
+
+Read-only audit may therefore preserve and report a real historical component
+which exceeds the new portable limits, including a 60-non-BMP-scalar Windows
+name. An explicit reencode, replacement, or new manifest publication first
+requires the persisted component to pass `PortableFinalComponentV1`; otherwise
+it fails before temporary creation with `LegacyFinalTargetNotPortableError` and
+leaves the historical file byte-exact. The user may start a new job, which gets
+an independent `job-output-name-v1` target; this job never silently renames its
+identity.
 
 Both encoder entry points consume only this persisted path. The executed final
 argument, `FinalVideoManifest.relative_path`, and normalized `@output:path64`
@@ -453,6 +505,282 @@ pretty-JSON spelling while it is read through the strict migration parser, but
 its first schema-5 replacement uses these canonical bytes. A schema-5 artifact
 whose raw bytes differ from its canonical re-encoding is invalid rather than
 silently normalized during audit.
+
+The following notation is normative. `scalar-string` contains only Unicode
+scalar values. `u64` is a JSON integer, never a boolean, in `0..2^64-1`;
+`positive-u64` excludes zero. `binary64` is a JSON number decoded as a Python
+`float`, never an integer or boolean, and must be finite; a range following the
+type is inclusive. `hex32` and `hex64` are respectively 32 and 64 lowercase
+ASCII hexadecimal characters. `utc-usec` is exactly 27 ASCII bytes in valid
+Gregorian UTC form `YYYY-MM-DDTHH:MM:SS.ffffffZ`, with seconds `00..59`.
+`T?` means JSON `null` or `T`. Every object named below is closed and every
+listed key is required even when its value is null.
+
+`ProcessingSettingsArtifactV5` has exactly these five keys and no others:
+
+```text
+metadata:            MetadataV5
+video_properties:    VideoPropertiesV5
+processing_settings: ProcessingSettingsV5
+output_info:         OutputInfoV5
+runtime_info:        RuntimeInfoV5
+```
+
+`MetadataV5` has exactly:
+
+| Key | Type / value |
+|---|---|
+| `batch_name` | `scalar-string` |
+| `job_id` | `hex32` |
+| `settings_identity_fingerprint` | `hex64` |
+| `settings_artifact_relative_path` | exact `processing-settings-v5.json` |
+| `job_reservation_generation` | `hex32` |
+| `job_terminal_reservation_id` | `hex32` |
+| `settings_schema_version` | exact integer `5` |
+| `source_settings_schema_version` | integer `1..5` |
+| `settings_revision` | `u64` |
+| `processing_attempt` | `positive-u64` |
+| `source_video` | `scalar-string` |
+| `source_video_name` | `scalar-string` |
+| `source_video_fingerprint_algorithm` | exact `file-sample-blake2b-v1` |
+| `source_video_fingerprint` | `hex32?` |
+| `project_version` | nonempty `scalar-string` |
+| `created_at` | `utc-usec` |
+| `last_updated_at` | `utc-usec?` |
+| `terminal_at` | `utc-usec?` |
+| `processing_duration_ms` | `u64?` |
+| `processing_status` | `"in_progress" | "completed" | "failed"` |
+| `cleanup_status` | `"not_started" | "not_requested" | "pending" | "complete" | "incomplete_identity_mismatch" | "incomplete_error"` |
+| `final_media_producer_contract_version` | `null | 4` |
+| `final_media_publication_generation` | `hex32?` |
+
+Migration captures one `migration_now_usec` before object construction. A valid
+legacy epoch value is a non-boolean finite JSON number in
+`0..253402300799.999999`; convert it by checked
+`floor(binary64_value*1_000_000)` and format that integer as `utc-usec`.
+`created_at` uses valid `created_timestamp`, otherwise `migration_now_usec`.
+Legacy `processing_status` maps exact `completed` and `failed` unchanged, maps
+absence, `in_progress`, or `paused` to `in_progress`, and rejects every other
+value. An in-progress mapping sets `last_updated_at=migration_now_usec`. For a
+terminal mapping, `terminal_at` uses valid `completed_timestamp` only for
+completed, otherwise `migration_now_usec`; `last_updated_at=terminal_at`; and
+`processing_duration_ms=floor(max(0,terminal_usec-created_usec)/1000)`; both are
+null for in-progress. It does not retain `created_timestamp`, `last_updated`,
+`last_updated_timestamp`, `completed_at`, `completed_timestamp`,
+`processing_duration_seconds`, or `processing_duration_formatted` as extra
+schema-5 keys. Any substituted legacy value emits one typed migration warning
+outside this artifact; no locale or filesystem mtime participates.
+
+`VideoPropertiesV5` has exactly:
+
+```text
+width:                           integer 1..10000
+height:                          integer 1..10000
+fps:                             binary64 > 0
+frame_count:                     integer 1..STEREO_CONTROL_FRAME_CAP
+duration:                        binary64 >= 0
+codec:                           integer 0..4294967295
+sample_aspect_ratio_numerator:   positive-u64
+sample_aspect_ratio_denominator: positive-u64
+sample_aspect_ratio:             scalar-string
+```
+
+The ratio integers are coprime and `sample_aspect_ratio` equals their canonical
+unsigned-decimal `<numerator>:<denominator>` spelling. `duration` is the one
+validated source value retained at creation/migration; later transitions
+preserve it bit-exactly and do not recompute it from a different probe.
+
+`ProcessingSettingsV5` has exactly the following 56 keys. A missing optional
+legacy key is materialized to the null/default value stated here during the
+single migration; schema 5 never represents omission.
+
+| Type / closed value set | Exact keys |
+|---|---|
+| `binary64` under the existing named range | `stereo_strength`, `convergence`, `virtual_baseline_mm`, `max_disparity_percent`, `scene_cut_threshold`, `fisheye_fov`, `crop_factor`, `fisheye_crop_factor` |
+| `binary64?` in `0..1000000` | `source_fps`, `preview_update_interval` |
+| `"auto" | binary64 0.1..1000` | `metric_convergence_distance` |
+| integer `1..1000000` | `min_scene_frames` |
+| integer `1..16` | `stereo_io_workers` |
+| integer `0..1000000` | `temporal_window_size`, `temporal_window_overlap` |
+| integer `1..32` | `occlusion_fill_max_px` |
+| integer `0..1000000` or null | `denoising_steps`, `seed` |
+| integer `1..10000` or null | `per_eye_width`, `per_eye_height`, `vr_output_width`, `vr_output_height`, `source_width`, `source_height` |
+| `"auto" | integer 1..10000` | `depth_resolution` |
+| `null | "original" | integer 1..120` | `target_fps` |
+| strict JSON boolean | `scene_detection`, `preserve_audio`, `keep_intermediates`, `direct_vr_encode`, `apply_distortion`, `experimental_frame_interpolation`, `use_metric_depth`, `enable_live_preview`, `verbose` |
+| `"relative" | "metric_camera"` | `stereo_geometry_mode` |
+| `"none" | "background"` | `occlusion_fill` |
+| `"fast" | "quality"` | `stereo_render_mode` |
+| `"auto" | "float16" | "float32"` | `raw_storage_dtype` |
+| `"off" | "vdpp"` | `temporal_postprocessor` |
+| `"archive" | "delete"` | `migrate_legacy` |
+| `"side_by_side" | "over_under"` | `vr_format` |
+| exact validated resolution grammar in this section | `vr_resolution` |
+| `"equidistant" | "equisolid" | "orthogonal" | "stereographic"` | `fisheye_projection` |
+| `"auto" | "none" | "1080p" | "4k"` | `super_sample` |
+| `"none" | "x2" | "x4" | "x4-conservative"` | `upscale_model` |
+| `"v2" | "v3" | "see_through" | "moge2"` | `depth_model_version` |
+| `"auto" | "cuda" | "cpu"` | `device` |
+| `"auto" | "libx264" | "nvenc"` | `video_encoder` |
+| `scalar-string?` | `start_time`, `end_time`, `model_path`, `model_size`, `video_path`, `min_resolution` |
+| `scalar-string` | `output_dir` |
+
+The eight existing numeric ranges in the first row are exactly those frozen by
+the schema-4 validator (`0..5`, `0..1`, `0..100`, `0..5`, `0..1`, `75..180`,
+`0.5..1`, and `0.5..2` in the key order shown); migration normalizes integers
+there to binary64. Missing schema-1-through-4 extension keys normalize exactly
+as follows: nullable fields to null; `depth_model_version="v2"`,
+`depth_resolution="auto"`, `device="auto"`, and `video_encoder="auto"`; and
+`use_metric_depth`, `enable_live_preview`, and `verbose` to false.
+All other keys use the defaults already defined in this Public Settings
+Contract. Digit strings for `target_fps`/`depth_resolution` normalize to
+integers. No environment-derived default remains unresolved in persisted
+schema 5.
+
+`OutputInfoV5` has exactly:
+
+```text
+output_directory:              scalar-string
+expected_output_filename:      scalar-string
+expected_final_relative_path:  scalar-string
+output_name_algorithm_version:
+    "job-output-name-v1" | "persisted-expected-output-filename-v1"
+```
+
+The two expected-path strings are byte-for-byte equal. With
+`job-output-name-v1` they pass `PortableFinalComponentV1`; with the persisted
+legacy version they pass `ContainedLegacyFinalComponentV1`. The second spelling
+is retained only as a compatibility field and can never select a different
+entry.
+
+`MetricClampRuntimeSummaryV1`, when present, has exactly
+`schema_version=1`, `affected_frame_count:u64`,
+`mean_clamped_fraction:binary64 0..1`,
+`max_clamped_fraction:binary64 0..1`, and
+`compatibility_summary_sha256:hex64`. It is a bounded aggregate reference, not
+the current O(N) `frame_names`/`clamped_fractions` object. `RuntimeInfoV5` has
+exactly:
+
+```text
+final_output_relative_path:  null | scalar-string
+frames_processed:            u64?
+processing_time_seconds:     binary64? >= 0
+metric_clamp_summary:        MetricClampRuntimeSummaryV1?
+terminal_diagnostic_code:    null | 1..64 ASCII [A-Z][A-Z0-9_]*
+terminal_diagnostic_message: null | scalar-string with <=1024 UTF-8 bytes
+```
+
+These state invariants are part of the schema, not post-parse conventions:
+
+- Initial schema-5 creation, whether new or migrated, is revision zero and
+  attempt one. A new job uses `in_progress` plus `not_started`; all nullable
+  time/runtime/producer fields are null. A migrated in-progress job follows the
+  adapter below and therefore has only `last_updated_at` non-null.
+- Every successful settings replacement increments `settings_revision` by
+  exactly one, preserves `created_at`, and sets `last_updated_at` to that
+  transaction's one captured `utc-usec`. An explicit resume/reencode from
+  `failed` or `completed` first
+  reserves a new terminal extent, increments `processing_attempt`, resets the
+  attempt-local terminal/runtime fields, and sets `in_progress`; it never clears
+  a non-null producer pair.
+- `in_progress` requires null `terminal_at`/duration/terminal diagnostics and
+  cleanup `not_started` or `pending`. `pending` is allowed only after both final
+  manifests are durable and only when `keep_intermediates=false`.
+- `completed` requires non-null `last_updated_at=terminal_at`, duration,
+  final-output path equal to the expected path, exact N frames, and processing
+  time; terminal diagnostics are null. Except for the one untouched legacy
+  migration case below, metric summary is non-null exactly for a metric job.
+  Checked `floor(processing_time_seconds*1000)` equals
+  `processing_duration_ms`.
+  Cleanup is `not_requested` exactly when intermediates are kept;
+  otherwise it is `complete` or one of the two incomplete terminal values.
+- `failed` requires non-null `last_updated_at=terminal_at`, duration, and
+  diagnostic code, with all success runtime fields null. Its cleanup value is
+  never `pending`; a failure before cleanup uses `not_started`.
+- The producer version/generation fields are the null pair or exact `4` plus
+  `hex32`. Every other nullable combination is invalid.
+
+The one legacy-to-v5 runtime/state adapter is also exact. It starts from a
+fully null `RuntimeInfoV5`. Migrated `in_progress` uses `not_started`. Migrated
+`failed` uses `not_started`, code `LEGACY_FAILED_STATUS`, and null message.
+Migrated `completed` sets final output to the persisted expected component,
+frames to `resolved_legacy_N`, defined here as a valid non-boolean legacy
+`runtime_info.frames_processed` in `1..frame_count` or otherwise `frame_count`,
+and processing seconds to
+`binary64(processing_duration_ms)/1000.0`. Its cleanup is `not_requested` when
+`keep_intermediates=true`; otherwise it is `incomplete_error`, because old
+settings cannot authenticate prior deletion. A valid legacy metric clamp
+summary is reduced to the bounded object above and its canonical raw SHA-256;
+otherwise the migrated metric field is null. This null exception is allowed
+only for a terminal, untouched migration with
+`source_settings_schema_version<=4` and `processing_attempt=1`; any new completed
+attempt requires the non-null metric summary. The producer pair stays null.
+Legacy `video_properties` must supply valid width, height, FPS, and frame count;
+duration normalizes to binary64 `frame_count/fps` when absent/invalid, codec to
+integer zero when absent/invalid, and an absent legacy SAR normalizes exactly to
+`1`, `1`, and `"1:1"`. No source reprobe or ambient runtime value participates.
+
+No caller dictionary is merged into any of these objects. Transition APIs
+accept a discriminated typed payload, construct the complete new object, and
+reject any unknown field before calculating bytes.
+
+The authoritative locator is the canonical, self-fingerprinted job-root file
+`job-control-v1.json`, whose closed `JobControlV1` object has exactly:
+
+```text
+schema_version:                         1
+algorithm_version:                      "job-control-v1"
+job_id:                                 hex32
+settings_artifact_relative_path:        "processing-settings-v5.json"
+legacy_settings_artifact_relative_path: scalar-string?
+settings_identity_fingerprint:          hex64
+job_reservation_generation:             hex32
+initial_settings_reservation_id:        hex32
+job_terminal_reservation_id:            hex32
+fingerprint:                            hex64
+```
+
+Its nullable legacy component, when non-null, is one Unicode-scalar segment
+ending exact `-settings.json`, other than `.`/`..`, with no NUL, slash,
+backslash, or leading ASCII `[A-Za-z]:`; it is opened handle-relatively without
+following a link. New jobs require null and migrations require the one selector
+result described below.
+
+Its fingerprint is SHA-256 of its canonical object with `fingerprint` omitted.
+`settings_identity_fingerprint` is SHA-256 of this exact closed canonical object:
+
+```text
+algorithm_version:                    "settings-identity-v1"
+job_id:                                hex32
+settings_artifact_relative_path:       "processing-settings-v5.json"
+source_video_fingerprint_algorithm:    "file-sample-blake2b-v1"
+source_video_fingerprint:              hex32?
+expected_final_relative_path:          scalar-string
+output_name_algorithm_version:
+    "job-output-name-v1" | "persisted-expected-output-filename-v1"
+job_reservation_generation:            hex32
+job_terminal_reservation_id:           hex32
+```
+
+The same
+identity and path values in `MetadataV5` must match the locator.
+
+`job_id`, the job reservation generation, the initial/terminal reservation IDs,
+and every later reservation generation/ID are
+independent 128-bit OS-CSPRNG values encoded as `hex32`. New jobs create this
+locator once before settings and never change it. Migration
+retains the exact contained legacy settings component in its nullable history
+field, writes schema 5 only to the fixed authoritative path, and never replaces
+the historical bytes. If no locator exists, a raw legacy operation uses an
+explicitly supplied contained settings component; without one it enumerates
+non-link ordinary `*-settings.json` children and requires exactly one. Zero is
+not found and more than one is `AmbiguousLegacySettingsError`; mtime and name
+sorting are forbidden. Once the locator exists, every transition, resume,
+audit, cleanup, marker validation, and producer validation reads only its fixed
+path. Extra `*-settings.json` entries are inert history and are never candidates.
+A schema-5 settings file without a valid matching locator, or a locator whose
+fixed target is missing/mismatched, is a control-artifact conflict rather than
+permission to glob or adopt another file.
 
 The bounded artifact constants are:
 
@@ -478,33 +806,280 @@ or the fixed raw cap.
 Every schema-5 string/list/map field has a fixed schema cardinality or a
 prevalidated concrete path/string whose escaped length is included in that
 maximum. `runtime_info` is a closed object, not an arbitrary
-`additional_info.update`: a terminal diagnostic uses a schema enum code of at
-most 64 ASCII bytes and an optional message of at most 1,024 UTF-8 bytes before
-canonical escaping; traceback text, child output, and nested exception objects
+`additional_info.update`: a terminal diagnostic uses the closed uppercase ASCII
+grammar above at most 64 bytes and an optional message of at most 1,024 UTF-8
+bytes before canonical escaping; traceback text, child output, and nested
+exception objects
 are forbidden. Oversize or unknown runtime data is reported outside the artifact
 and cannot make a status transaction exceed its reserved extent.
 
-New-job creation and legacy migration each physically reserve and fsync one
-same-volume `alloc(settings_artifact_raw_max)+A` extent before their first
-settings mutation, using the allocation-unit definition in Disk and I/O below.
-They release it only into the same-directory temporary. Failure leaves any
-legacy authoritative artifact unchanged and starts no frame work. Final encoding
-uses the multi-transition reservation schedule defined later instead.
+### Reservation Extent V1
+
+Disk reservation is persisted state, not an anonymous zero file. All reservation
+artifacts live below one non-link ordinary job-root directory named
+`.depth-surge-reservations-v1`, opened relative to the same trusted job-root
+handle as `job-control-v1.json`. Every payload extent is a create-new ordinary
+file filled non-sparsely with zero bytes, file-synced, and paired with a
+canonical create-new descriptor. A descriptor is a closed
+`ReservationExtentV1` object with exactly:
+
+```text
+schema_version:                  1
+algorithm_version:               "reservation-extent-v1"
+job_id:                          hex32
+settings_artifact_relative_path: "processing-settings-v5.json"
+settings_identity_fingerprint:   hex64
+settings_revision_at_creation:   u64?
+settings_raw_sha256_at_creation: hex64?
+publication_generation:          hex32?
+reservation_generation:          hex32
+reservation_id:                  hex32
+reservation_kind:
+    "initial_settings" | "migration_settings" |
+    "job_terminal_settings" | "nonterminal_settings" |
+    "producer_settings" | "cleanup_pending_settings" |
+    "encoding_input_manifest" | "final_video_manifest" |
+    "prune_marker" | "final_encoding_index"
+extent_relative_path:            scalar-string
+logical_byte_count:              positive-u64
+allocated_byte_count:            positive-u64
+allocation_unit:                 positive-u64
+filesystem_identity:             ReservationFileIdentityV1
+fingerprint:                     hex64
+```
+
+`ReservationFileIdentityV1` is one of two closed objects: POSIX is exactly
+`{platform:"posix",device:u64,inode:u64,link_count:positive-u64}`; Windows is
+exactly
+`{platform:"windows",volume_serial:hex32,file_id:hex32,link_count:positive-u64}`.
+The descriptor fingerprint is SHA-256 of canonical bytes with `fingerprint`
+omitted. `extent_relative_path` is a one-segment child of the authenticated
+reservation directory. Its name is exactly
+`p-<publication-token>-r-<reservation_generation>-<reservation_kind>-<reservation_id>.extent`,
+and the paired descriptor is that exact name plus `.json`. The publication token
+is literal `none` when the descriptor field is null and otherwise its `hex32`
+value; all other substitutions use the literal lowercase kind token and their
+`hex32` values. `extent_relative_path` equals the first name and the descriptor
+path is obtained only by appending `.json`.
+Initial, migration, and lifecycle terminal descriptors always use null
+publication generation and the immutable job reservation generation. A new
+attempt recreates the now-absent terminal extent with the same locator-persisted
+terminal ID/generation; it never edits job control to invent a replacement
+identity. A standalone nonterminal-settings descriptor uses a fresh reservation
+generation/ID and the current settings publication generation, or null when the
+producer pair is null. Every invocation-only producer/cleanup/manifest/prune/
+index descriptor shares the fresh reservation generation and exact non-null
+publication generation of its final-encoding index, while retaining its own
+fresh reservation ID.
+The settings revision/raw-hash fields are the null pair only for the two extents
+created before initial schema-5 publication. Every later extent captures the
+current canonical settings revision and complete raw SHA-256 as a non-null pair;
+crossed pairs are invalid. The final-encoding index separately carries the same
+preflight snapshot because the lifecycle terminal descriptor legitimately
+predates it.
+`MetadataV5.job_terminal_reservation_id` and the matching job-control field
+therefore recover that persistent pair without enumeration; the initial ID
+likewise recovers an interrupted creation/migration pair. Invocation-only IDs
+come only from the authenticated final-encoding index or its one recoverable
+pre-index generation set. Names are never chosen by glob order or mtime.
+
+For an artifact whose maximum canonical payload is `raw`, the extent's exact
+logical length is `alloc(raw)+A`; the extra allocation unit carries the already
+charged filesystem-entry/slack reserve. The descriptor records that value and
+the exact allocation bytes reported after the non-sparse fill. The descriptor
+file itself is separately charged as
+`alloc(reservation_descriptor_raw_max)+A`; it is never hidden inside the payload
+extent's byte count.
+
+Descriptor commit happens only after reopening the extent without following a
+link and capturing its identity, exact logical size, exact allocation size, and
+link count. Reopen validation requires the same identity, link count one,
+logical size, descriptor bytes/fingerprint, same volume as settings, and
+allocated bytes at least the required physical allocation. Sparse, compressed,
+deduplicated, reflink/shared-extent, reparse, or allocation-unknown files do not
+qualify. The descriptor is directory-synced after create. A crash after extent
+fsync but before descriptor commit leaves an unattested extent. Resume may adopt
+it only when its deterministic expected name lies inside the directory bound to
+the matching `job-control-v1.json`, no descriptor exists, it has the exact
+expected zero-filled logical/allocation shape, and the current typed transition
+still requires that kind; it then captures identity and commits the descriptor.
+Otherwise it is a `ReservationConflictError`, not free space and not an object
+which may be silently deleted.
+
+A final-encoding invocation also commits canonical
+`FinalEncodingReservationV1` as
+`.depth-surge-reservations-v1/final-encoding-reservation-v1.json`. It has exactly:
+
+```text
+schema_version:                  1
+algorithm_version:               "final-encoding-reservation-v1"
+job_id:                          hex32
+settings_artifact_relative_path: "processing-settings-v5.json"
+settings_identity_fingerprint:   hex64
+settings_raw_sha256_at_preflight: hex64
+publication_generation:          hex32
+reservation_generation:          hex32
+settings_revision_at_preflight:  u64
+extent_entries:                  list[ReservationEntryV1]
+fingerprint:                     hex64
+```
+
+`ReservationEntryV1` has exactly
+`reservation_id:hex32`, `reservation_kind` from the closed extent enum,
+`descriptor_relative_path:scalar-string`, `descriptor_sha256:hex64`,
+`extent_relative_path:scalar-string`, `logical_byte_count:positive-u64`,
+`allocated_byte_count:positive-u64`, and
+`filesystem_identity:ReservationFileIdentityV1`, with values equal to its
+descriptor; `descriptor_relative_path` is exactly
+`extent_relative_path + ".json"` and its SHA-256 is over the complete canonical
+descriptor bytes. Entries are in fixed consumption
+order: producer if needed, encoding-input manifest, final-video manifest, prune
+markers in canonical prune-entry order, cleanup-pending if needed, then the
+already existing job-terminal extent. The index fingerprint omits only its own
+field. Its own maximum allocation and directory entry are reserved before it is
+written through one `final_encoding_index` extent/descriptor; that bootstrap
+descriptor is not an `extent_entries` member and is removed only after the
+canonical index is directory-synced and reopen-validated.
+
+Every descriptor's canonical raw bytes are at most
+`FINAL_RESERVATION_DESCRIPTOR_RAW_BYTES`. The index has at most
+`FINAL_RESERVATION_ENTRY_CAP` entries and canonical raw bytes at most
+`FINAL_RESERVATION_INDEX_RAW_BYTES`; exceeding either fails read-only preflight.
+Its incremental parser/serializer uses only the reservation stream/JSON-state
+caps in the final-control block and never constructs a second descriptor list.
+
+The publication generation is generated before final-encoding reservation
+preflight. If the producer pair is still null after a crash, exactly one valid
+index plus matching descriptors supplies that still-unpublished generation;
+the producer transaction must commit that same value. If the pair is non-null,
+it must equal the index. A different generation, job/settings identity,
+revision outside the one allowed monotonic transition sequence, descriptor,
+size, allocation, or file identity is a hard conflict. A matching index and
+extent set is reused in place and is never allocated a second time. An
+authenticated stale set may be removed only under the writer lock after the
+typed settings/manifests prove its attempt terminal or superseded; unknown or
+mismatched files are preserved and reported. This is the only crash reuse/
+deletion policy; free-space pressure and mtime never participate.
+
+For an index revision `r`, current settings revision must equal checked
+`r + producer_consumed + pending_consumed + terminal_consumed`, where each term
+is exactly zero or one, is one only after that indexed transition validates, and
+producer precedes every other settings transition. On the success/cleanup path,
+pending precedes terminal; on any earlier failure path, terminal may become one
+with `pending_consumed=0` and the unused pending extent remains reserved until
+that terminal commit. Missing producer/pending entries are inapplicable, not
+consumed. Manifest/marker publication does not increment settings revision.
+Before terminal commit `terminal_consumed=0`; after it becomes one, the terminal
+settings artifact itself is the durable proof used to retire the index. No
+revision range or `>=` comparison substitutes for this equation.
+At revision `r`, the current settings raw SHA-256 must equal
+`settings_raw_sha256_at_preflight`. At a later allowed revision, the strict
+transition evidence and the immutable settings identity must validate; a raw
+hash mismatch while still at `r` is always a conflict.
+
+The sole pre-index crash case performs one bounded direct-child enumeration of
+the authenticated reservation directory, accepts only the exact ASCII filename
+grammar above plus the one fixed index name, sorts names by ASCII byte order,
+strict-parses descriptors, and
+groups them by `(publication_generation,reservation_generation)`. A group is
+recoverable only when it contains exactly the extent-kind/size multiset
+recomputed from the current settings/provider/prune plan and every descriptor
+matches; exactly one such group is required. The separately addressed
+`p-none-r-<job_reservation_generation>-...` initial/terminal group must validate
+against job control and is excluded from this invocation grouping, not treated
+as an unknown candidate. No invocation group means fresh preflight is
+allowed only when no invocation-named child exists; a nonmatching group, two
+groups, or any unknown/malformed colliding entry is a conflict.
+This is set validation, not newest-file selection.
+
+Consuming an extent is also crash-identifiable. The writer never unlinks it and
+then hopes the allocator returns equivalent space. It writes the intended
+bounded canonical bytes over the beginning while retaining the descriptor's
+full logical length, file-syncs, and reopens the same identity. It then atomically
+renames that identity to the transition's deterministic sibling-temporary path,
+syncs both affected directories, truncates to the intended byte count, file-
+syncs, and performs the artifact-specific reopen validation/replacement. The
+descriptor remains until the target replacement is durable. At every crash
+boundary the descriptor/index therefore locates the same file identity at
+exactly one of its extent, deterministic temporary, or committed-target paths;
+resume either completes that declared transition from recomputed canonical bytes
+or, when the authoritative target already proves the commit, removes the
+matching descriptor. Two locations, no location before a proven commit, or a
+different identity is a conflict. This identity-preserving handoff is what
+"consume/release an extent" means everywhere below.
+
+New-job creation and legacy migration calculate the complete typed schema-5
+object, job control, identity fingerprint, and all maxima before mutation. They
+physically reserve and fsync the job-control publication allocation plus **two**
+same-volume settings extents:
+
+```text
+reservation_descriptor_raw_max = max_json_bytes(
+    ReservationExtentV1,
+    all concrete identity/path/kind values,
+)
+reservation_descriptor_extent = alloc(reservation_descriptor_raw_max) + A
+settings_transaction_extent = alloc(settings_artifact_raw_max) + A
+                            + reservation_descriptor_extent
+job_control_raw = max_json_bytes(JobControlV1, concrete legacy path or null)
+job_control_publication_extent = alloc(job_control_raw) + 2*A
+initial_settings_reserve =
+      2 * settings_transaction_extent
+    + job_control_publication_extent
+    + A  # create/sync the authenticated reservation directory
+```
+
+One descriptor is `initial_settings` or `migration_settings`; the other is
+`job_terminal_settings`. After the locator and initial schema-5 artifact are
+directory-synced and reopen-validated, the first extent has been consumed but
+the terminal extent remains physically allocated for every `in_progress` job.
+If migration itself produces a terminal `completed`/`failed` artifact, that
+validated artifact proves no current attempt needs a failure write, so the
+matching unused terminal extent/descriptor is removed only after reopen
+validation; a later explicit attempt recreates it as specified. Migration leaves
+the legacy artifact byte-exact. Any failure before the initial schema-5 commit
+starts no frame work; an incomplete locator/migration is resumed only from its
+matching job identity and reservations.
+
+Creation order is exact: construct the object/IDs and verify the complete
+initial reserve; publish/reopen-validate `job-control-v1.json` through its
+preallocated create-new temporary; create or adopt the reservation directory
+and the two locator-named extent/descriptor pairs; only then publish schema-5
+settings through the initial/migration extent. A crash with a valid locator but
+no settings is an explicit incomplete creation/migration and reuses those IDs.
+A crash before locator publication has changed no authoritative job artifact;
+only an exact matching locator temporary from the same requested object may be
+removed/retried, otherwise creation reports a conflict. Frame work never uses a
+locator-only job.
+
+The `job_terminal_settings` extent remains from that point until one durable
+`completed` or `failed` transition consumes it. Depth, canonicalization, stereo,
+encoding, a growing output video, and cleanup cannot borrow it. Any optional
+nonterminal settings rewrite before finalization first creates a separate
+`nonterminal_settings` extent while the terminal extent remains intact. A
+terminal-to-new-attempt transition similarly reserves one transition extent and
+one replacement terminal extent before changing status. Thus every early-stage
+failure can persist `failed` without an ambient free-space assumption, and a
+resume cannot consume the only space reserved for its next failure.
 
 `SettingsArtifactTransactionV1` is the only schema-5 creation or mutation API.
 Every caller, including creation and migration, uses the eight-MiB final-control
 budget and the six-MiB `producer_settings_commit_peak` formula below. Under the
 acquired job-writer lock it performs exactly this sequence:
 
-1. For new-job creation, require the settings name to be absent under the opened
-   parent-directory handle and construct the initial typed object. Otherwise
-   open the current artifact without following a link, enforce the raw cap while
-   streaming, strict-parse either its declared legacy schema for migration or
-   canonical schema 5, and capture the opened file identity.
-2. Apply one declared monotonic transition to a new typed schema-5 object and
-   preserve every field outside that transition exactly. Serialize canonical
-   bytes into a create-new, non-link temporary in the settings file's directory,
-   using one already reserved transaction extent. Flush and file-sync it.
+1. Resolve and validate the already published `job-control-v1.json`. The
+   preceding new-job preflight required both fixed names absent; initial settings
+   creation now requires the matching locator present and only the settings name
+   absent. Migration opens only the locator's frozen legacy component and also
+   requires the fixed schema-5 target absent; every later transition opens only
+   `processing-settings-v5.json`. Open without following a link, enforce the raw
+   cap while streaming, strict-parse the declared legacy schema or canonical
+   schema 5, and capture the opened file identity.
+2. Apply one declared typed transition to a new complete schema-5 object,
+   increment revision where required, and preserve every field outside that
+   transition exactly. Serialize canonical bytes through the authenticated
+   reserved extent and identity-preserving handoff above to a non-link temporary
+   in the settings file's directory. Flush and file-sync it.
 3. Reopen that temporary without following a link, require the same file
    identity, strict-parse it within the same bounds, require its raw SHA-256 and
    canonical bytes to equal the intended serialization, and verify the complete
@@ -535,8 +1110,8 @@ Finalization has a fixed transition schedule. The producer-marker transaction,
 when needed, occurs immediately before the first FFmpeg launch. After both final
 manifests are durable, `keep_intermediates=false` commits exactly one
 `cleanup_status="pending"` transaction before cleanup. One final transaction
-then commits the terminal cleanup value, `processing_status`, completion/failure
-timestamps, and bounded runtime information together. With intermediates kept,
+then commits the terminal cleanup value, `processing_status`, `terminal_at`,
+duration, and bounded runtime information together. With intermediates kept,
 that single final transaction writes `cleanup_status="not_requested"`; it does
 not perform a separate pending write. A job is not reported completed until the
 terminal transaction is directory-synced and reopen-validated. If that commit
@@ -2683,23 +3258,28 @@ temporary to the canonical length and fsyncs it before publication.
 
 After all manifest/audio/disk preflight and immediately before the first FFmpeg
 launch attempt, validate the producer pair. Commit the immutable
-`final_media_producer_contract_version=4` and independently generated
-`final_media_publication_generation` if the pair is null; never copy the
-provider's `audit_generation_id`. Then replay the frozen provider one last time.
+`final_media_producer_contract_version=4` and the exact authenticated
+reservation-preflight `final_media_publication_generation` if the pair is null;
+that value was independently generated by the OS CSPRNG for this first attempt
+and is never copied from the provider's `audit_generation_id`. Then replay the
+frozen provider one last time.
 This settings write is a monotonic provenance mutation, but launch remains the
 image/audio publication mutation boundary: a mismatch after marker commit but
 before launch may still discard temporaries and restart read-only audit, while
 the marker is never cleared back to null.
 
 Before FFmpeg process launch, a provider mismatch discards the read-only
-encoding audit, manifest/reservation temporaries, and preflight result and may
-restart with a new generation. Launch is the final-encoding mutation boundary.
+encoding audit, authenticated invocation-only reservation/index set, and
+preflight result, retains the lifecycle terminal extent, and may restart with a
+new provider/reservation generation under the same immutable publication
+generation. Launch is the final-encoding mutation boundary.
 At or after launch, a mismatch raises `FinalEncodingInputChangedError`,
 terminates and reaps an active FFmpeg process or rejects its completed output,
-removes the sibling output and reservation temporaries, publishes neither
-manifest nor video, and never retries in the same call. A later independent
-invocation starts a new read-only generation. This rule is subject to the
-external-ABA limitation below.
+removes the sibling output, commits terminal failure from the retained extent,
+then removes only its authenticated unused invocation reservations; it publishes
+neither manifest nor video and never retries in the same call. A later
+independent invocation starts a new read-only generation. This rule is subject
+to the external-ABA limitation below.
 
 The project-owned final-encoding coordinator has its own resident-memory
 contract, independent of the stereo-stage 512 MiB phases:
@@ -2723,11 +3303,20 @@ FINAL_AUDIO_PROBE_STDOUT_BYTES     = 32 KiB
 FINAL_AUDIO_PROBE_STDERR_BYTES     = 32 KiB
 FINAL_AUDIO_PROBE_JSON_STATE_BYTES = 256 KiB
 FINAL_AUDIO_DECODE_DIAGNOSTIC_BYTES = 256 KiB
+FINAL_RESERVATION_ENTRY_CAP         = 64
+FINAL_RESERVATION_DESCRIPTOR_RAW_BYTES = 8 KiB
+FINAL_RESERVATION_INDEX_STREAM_BYTES   = 256 KiB
+FINAL_RESERVATION_INDEX_JSON_STATE_BYTES = 256 KiB
+FINAL_RESERVATION_INDEX_RAW_BYTES      = 256 KiB
 FINAL_AUDIO_PROBE_TIMEOUT_SECONDS   = 30
 FINAL_AUDIO_DECODE_STALL_SECONDS    = 120
+FINAL_ENCODE_STALL_SECONDS          = 120
 FINAL_PROBE_TIMEOUT_BASE_SECONDS    = 30
-FINAL_PROBE_TIMEOUT_PER_1000_FRAMES_SECONDS = 2
+FINAL_PROBE_TIMEOUT_PER_1000_WORK_UNITS_SECONDS = 2
 FINAL_PROBE_TIMEOUT_MAX_SECONDS     = 21_600
+PROJECT_AAC_SAMPLES_PER_PACKET_BOUND = 1024
+PROJECT_AAC_PACKET_SLACK              = 2
+FINAL_PROBE_BYTES_PER_WORK_UNIT       = 64 KiB
 FINAL_DECODE_STALL_SECONDS          = 120
 FINAL_PROCESS_TERMINATE_GRACE_SECONDS = 5
 
@@ -2739,24 +3328,54 @@ encoding_process_peak  = 4 MiB + 256 KiB               = 4.25 MiB
 final_probe_peak       = 4 MiB + 64 KiB + 64 KiB
                          + 512 KiB                      = 4.625 MiB
 final_decode_peak      = 4 MiB + 256 KiB + 64 KiB      = 4.3125 MiB
+reservation_index_peak = 4 MiB + 256 KiB + 256 KiB     = 4.5 MiB
 producer_settings_commit_peak = 4 MiB + 512 KiB + 512 KiB + 1 MiB = 6 MiB
 pending_settings_commit_peak  = producer_settings_commit_peak     = 6 MiB
 completion_settings_commit_peak = producer_settings_commit_peak   = 6 MiB
-encoding_control_peak  = max(the nine phase peaks)      = 6 MiB
+encoding_control_peak  = max(the ten phase peaks)       = 6 MiB
 require 1 <= N <= ENCODING_CONTROL_FRAME_CAP
 require encoding_control_peak <= FINAL_ENCODING_CONTROL_BUDGET
+
+audio_probe_units = (
+    checked_u64_add(
+        ceil_div(audio_end_sample, PROJECT_AAC_SAMPLES_PER_PACKET_BOUND),
+        PROJECT_AAC_PACKET_SLACK,
+    )
+    when normalized argv contains one audio token else 0
+)
+stream_probe_units = checked_u64_add(N, audio_probe_units)
+byte_probe_units = ceil_div(
+    sibling_temporary_byte_count,
+    FINAL_PROBE_BYTES_PER_WORK_UNIT,
+)
+probe_work_units = max(1, stream_probe_units, byte_probe_units)
 
 FINAL_PROBE_TIMEOUT_SECONDS = min(
     FINAL_PROBE_TIMEOUT_MAX_SECONDS,
     checked_u64_add(
         FINAL_PROBE_TIMEOUT_BASE_SECONDS,
         checked_u64_mul(
-            ceil_div(N, 1000),
-            FINAL_PROBE_TIMEOUT_PER_1000_FRAMES_SECONDS,
+            ceil_div(probe_work_units, 1000),
+            FINAL_PROBE_TIMEOUT_PER_1000_WORK_UNITS_SECONDS,
         ),
     ),
 )
 ```
+
+`PROJECT_AAC_SAMPLES_PER_PACKET_BOUND` is a project encoder contract, not an
+assumption about arbitrary AAC. The resolved native FFmpeg AAC-LC encoder must
+report frame size 1024 in every supported FFmpeg 5/6/7 and distributed-Windows
+gate. For project-generated trimmed audio, its counted packet total must be at
+most `ceil_div(audio_end_sample,1024)+2`, where two covers priming/tail packets;
+a runtime/encoder which cannot prove that bound is unsupported before launch.
+The distributed-Windows 44,100-sample golden reports 44 counted AAC frames
+against a bound of 46. This observed value is a gate fixture, not permission to
+reduce the two-packet slack.
+The stream term is a sum because `-count_frames` scans both video and audio, and
+the byte term prevents a small packet count from assigning an unrealistically
+small deadline to a large container. All additions, divisions, and the byte
+count are checked after the encoder has closed/reopened/measured the sibling
+temporary and before the final FFprobe child is launched.
 
 This bound includes replay/container objects, directory enumeration, image hash
 and IHDR parsing, manifest serialization, and the existing drained audio PCM
@@ -2768,17 +3387,35 @@ transactions are isolated phases: their one stream, JSON state, and typed object
 are released before FFmpeg/probe/decode or another settings transition. Encode,
 probe, and full-decode phases use the separate fixed byte caps above and may not
 retain a manifest/image/audio/settings stream buffer. No additional variable-
-cardinality container is allowed.
+cardinality container is allowed. Reservation descriptor/index construction is
+its own isolated streaming phase, released before producer settings or FFmpeg;
+the persisted files, not a resident entry list, carry crash state afterward.
 
 Encoding FFmpeg uses `-nostats -progress pipe:1` and one project-owned bounded
 byte drain. Recognized progress key/value lines are parsed within
 `FINAL_ENCODE_LINE_BYTES` and immediately discarded, so their cumulative length
-is not resident and is not charged as diagnostics. Unrecognized/error bytes are
-retained only in the fixed tail ring. An overlong line or diagnostic bytes
-beyond the diagnostic cap marks the encode failed while the drain continues
-until the process is terminated/reaped. Audio probe and final FFprobe use the
+is not resident and is not charged as diagnostics. Track the maximum valid
+canonical nonnegative decimal values observed for `frame`, `out_time_us`,
+legacy-compatible `out_time_ms`, and `total_size`. `N/A` is accepted only for
+`total_size` and does not count as progress. The semantic stall clock starts at
+successful child launch and resets only when at least one of those four numeric
+maxima strictly increases. Repeated values, regressions, `progress=continue`,
+other keys, stdout/stderr activity, and cancellation polling do not reset it.
+There is no total encode wall deadline because valid video length is variable;
+`FINAL_ENCODE_STALL_SECONDS` without semantic advance raises
+`FinalEncodeTimeoutError`.
+
+Unrecognized/error bytes are retained only in the fixed tail ring. An overlong
+line or diagnostic bytes beyond the diagnostic cap marks the encode failed while
+the drain continues until the process is terminated/reaped. Encode timeout,
+cancellation, parser/pipe failure, and output overflow all close stdin,
+terminate, continue bounded drainage, wait
+`FINAL_PROCESS_TERMINATE_GRACE_SECONDS`, kill if needed, and reap exactly once.
+No timeout path may retain/publish the sibling output or either manifest. Audio
+probe and final FFprobe use the
 finite-output mode of `BoundedProcessCaptureV1`; PCM and final full-decode use
-its streaming-drain mode. All four share its one cancel/terminate/grace/kill/
+its streaming-drain mode. All five child phases share its one
+cancel/terminate/grace/kill/
 reap state machine and the separate caps/timeouts above.
 `subprocess.run(..., capture_output=True)` and `communicate()` into an unbounded
 bytes/string object, the current assembled-encoder capture path, and
@@ -2938,7 +3575,10 @@ EncodingInputSequenceManifest.frame_names.length`. If
 substituting duration. Require zero audio streams when normalized argv contains
 no audio token and exactly one `codec_name=aac` audio stream when it contains one;
 `preserve_audio=true` with no usable selected stream therefore still requires
-zero. Finally run exactly:
+zero. The accepted audio stream also requires canonical integer
+`nb_read_frames` in `1..audio_probe_units`; exceeding the preflight packet bound
+is `FinalContainerAudioPacketBoundError` even if the probe finished before its
+deadline. Finally run exactly:
 
 ```text
 ffmpeg -v error -xerror -nostats -progress pipe:1 \
@@ -2976,9 +3616,10 @@ a temporary and atomic replacement; resume must not inspect the container or
 re-resolve `auto` to guess provenance.
 Both manifests are retained final artifacts and are never listed for
 intermediate cleanup. Final-encoding disk preflight physically reserves their
-schema-derived temporary allocations plus a separate maximum extent for every
-remaining producer, pending-cleanup, and terminal settings transaction before
-starting FFmpeg.
+schema-derived temporary allocations plus a separate extent for each remaining
+producer and pending-cleanup transaction before starting FFmpeg; it authenticates
+and indexes the lifecycle terminal extent already retained since job creation
+rather than allocating it again.
 
 ### Final Media Audit Disposition V1
 
@@ -3005,8 +3646,10 @@ manufacture provenance, or authorize pruning.
 Resolve exactly one expected job final-video path from the immutable
 `output_info.expected_final_relative_path`. A raw schema-1-through-4 audit which
 has not migrated yet applies the exact old-field/frozen-v1 selection above in
-memory; it does not persist during read-only inspection. Failure to obtain one
-canonical path raises `FinalMediaTargetMetadataError` before returning a
+memory; it does not persist during read-only inspection. The copied old field
+uses `ContainedLegacyFinalComponentV1`; a frozen-v1 fallback uses
+`PortableFinalComponentV1`. Failure to obtain one contained path raises
+`FinalMediaTargetMetadataError` before returning a
 disposition. Never invoke the current output-name helper or glob for MP4 files.
 In particular, `*_stitched_*.mp4` and every `/stitch_video` product are invisible
 to this audit. Define presence bits by checking directory entries at that exact
@@ -3087,7 +3730,10 @@ synthesize either manifest. Its stereo-payload reuse and historical-diagnostics
 facts are audited independently. The legacy video cannot authorize a new
 `payload_pruned` commit. An explicit reencode request may create current
 publication evidence only when the exact current image/audio inputs and their
-stage evidence still validate. When cleanup from the historical job removed
+stage evidence still validate and the target also passes
+`PortableFinalComponentV1`; a contained-but-nonportable legacy target fails
+before any write with `LegacyFinalTargetNotPortableError`. When cleanup from the
+historical job removed
 those inputs, preserve the video indefinitely and report it as unauthenticated;
 container probing, full decode, or hashing can inspect bytes but can never infer
 the missing executed command or manufacture publication identity.
@@ -3324,14 +3970,14 @@ demote `payload_pruned` or reopen frame processing.
 and any resumed cleanup first persist `pending`; each terminal result above is
 then atomically persisted without changing final-video success.
 
-A cleanup-only resume which does not enter final encoding performs its own
-read-only calculation and physical reservation of one settings transaction
-extent when `pending` is already durable, otherwise two extents for pending plus
-terminal. It reserves them before marker creation, `payload_pruned`, or deletion
-and consumes them in the same fixed order. Cleanup is forbidden when that
-reservation, the settings memory phase, or reopen validation cannot be proved;
-an authenticated final video remains successful but the job is not reported
-terminally completed.
+A cleanup-only resume which does not enter final encoding must reopen the same
+authenticated reservation index. If `pending` is already durable, only the
+lifecycle `job_terminal_settings` extent remains; otherwise the indexed
+`cleanup_pending_settings` extent plus that terminal extent must both remain.
+It allocates neither again and consumes them in the same fixed order. Cleanup is
+forbidden when either descriptor/index, the settings memory phase, or reopen
+validation cannot be proved; an authenticated final video remains successful
+but the job is not reported terminally completed.
 
 A valid `payload_pruned` state authenticates only metadata, the applicable
 retained Quality content manifest, retained JSONL/root summary, the raw
@@ -4442,80 +5088,102 @@ between prune authorization and cleanup; successful cleanup releases it.
 The later final-encoding preflight is a separate transaction and deliberately
 makes no claim that free space can hold the complete CRF-compressed video. There
 is no deterministic "existing video reserve". It guarantees manifest,
-settings-transaction, and directory-entry publication space. Before allocation
-derive the exact maximum remaining settings transaction count along any path to
-a durable terminal state:
+settings-transaction, descriptor/index, and directory-entry publication space.
+It first reopen-validates the already allocated `job_terminal_settings` extent;
+that lifecycle reserve is indexed into this invocation and is not allocated or
+counted again. Before allocation derive only the additional nonterminal settings
+transactions introduced by finalization:
 
 ```text
-settings_transaction_count =
-      (1 when the producer pair is null else 0)
-    + (1 when keep_intermediates is false else 0)  # cleanup pending
-    + 1                                             # terminal success/failure
-settings_transaction_extent = alloc(settings_artifact_raw_max) + A
-settings_transaction_reserve =
-    settings_transaction_count * settings_transaction_extent
+additional_settings_transaction_count =
+      (1 when the producer pair is null else 0)     # producer marker
+    + (1 when keep_intermediates is false else 0)   # cleanup pending
+additional_settings_transaction_reserve =
+    additional_settings_transaction_count * settings_transaction_extent
 ```
 
 The addition, allocation rounding, and multiplication above use checked uint64
-arithmetic; the count is exactly `1..3` for an encode invocation.
+arithmetic; the additional count is exactly `0..2`. The validated persistent
+terminal descriptor contributes one index entry but zero newly required bytes.
 
-On the job-root volume preflight then requires and physically allocates/fsyncs
-before FFmpeg:
+Define one fully described new physical extent charge:
 
 ```text
-alloc(encoding_input_manifest_raw)
-+ alloc(final_video_manifest_raw)
-+ settings_transaction_reserve
-+ prune_marker_reserve
-+ (5 + prune_marker_file_count)*A
+reservation_extent_charge(raw, descriptor_raw) =
+      alloc(raw) + A
+    + alloc(descriptor_raw) + A
+
+final_encoding_index_raw = max_json_bytes(
+    FinalEncodingReservationV1,
+    3 + additional_settings_transaction_count + prune_marker_file_count,
+    every concrete descriptor path/identity/generation,
+)
+
+final_encoding_new_reserve =
+      additional_settings_transaction_reserve
+    + reservation_extent_charge(
+          encoding_input_manifest_raw,
+          descriptor_raw["encoding_input_manifest"])
+    + reservation_extent_charge(
+          final_video_manifest_raw,
+          descriptor_raw["final_video_manifest"])
+    + sum(reservation_extent_charge(
+              prune_marker_raw[j], descriptor_raw["prune_marker", j])
+          for every planned prune marker j)
+    + reservation_extent_charge(
+          final_encoding_index_raw,
+          descriptor_raw["final_encoding_index"])
 ```
 
-The first two `alloc` terms are the future atomic manifest temporaries. The
-settings term reserves one independent maximum-sized extent plus one directory
-entry for every write still possible, including the terminal write even when
-`keep_intermediates=true`; an existing retained settings file already consumes
-blocks and is never counted as free. All extents and marker terms are held in
-non-sparse, fsynced reservation files, not an unprotected free-space estimate.
+The checked preflight requires and physically creates/fsyncs exactly
+`final_encoding_new_reserve` before FFmpeg. The index uses the same
+identity-preserving extent handoff as every other canonical artifact. Existing
+settings, the terminal extent, and any old final
+video/manifests already consume blocks and are never counted as free. All new
+terms are materialized as the authenticated non-sparse extent/descriptor/index
+files above, not an unprotected free-space estimate.
 
 Immediately before each declared settings transition, release exactly one
 `settings_transaction_extent` and consume it through
 `SettingsArtifactTransactionV1`. A consumed slice is never assumed to be
-replenished from the replaced old settings file. Unused slices remain physically
-reserved across FFmpeg growth, video publication, both manifest commits, and
-cleanup until the one terminal settings transaction is durable. Thus a producer
-write cannot spend the space needed for `cleanup_status="pending"`, and neither
-that pending write nor a large video can spend the terminal-completion extent.
-The producer slice commits before launch; pending and terminal slices are used
-in the fixed finalization order above. If processing fails before pending, the
-terminal failure write still has its own slice and every unused slice is released
-only after that terminal transition is reopen-validated.
+replenished from the replaced old settings file. Additional unused extents plus
+the preexisting terminal extent remain physically reserved across FFmpeg growth,
+video publication, both manifest commits, and cleanup until the one terminal
+settings transaction is durable. Thus a producer write cannot spend the space
+needed for `cleanup_status="pending"`, and neither that pending write nor a large
+video can spend the lifecycle terminal extent. The producer slice commits before
+launch; pending uses its additional slice; completion/failure consumes only the
+original job-terminal extent. If processing fails before pending, the terminal
+failure write still has that extent and every unused additional slice is released
+only after the terminal transition is reopen-validated.
 
-Before FFmpeg, each nonzero manifest temporary is non-sparsely filled and fsynced
-to its schema-derived maximum. After input revalidation or video hashing,
-canonical manifest bytes are streamed over the beginning of their reserved
-extents, checked not to exceed the bound, fsynced, and truncated. Immediately
-before each manifest replacement, release exactly `2*A`; that replacement and
-its following directory sync complete before the next release. After both
-manifests are durable and immediately before each prune marker create-new,
-release exactly `alloc(prune_marker_raw[j])+A`, then create, fsync, and
-directory-sync that marker on the same volume. The reservation entry is removed
-only after all applicable publications, markers, and terminal settings are
-durable. Thus these artifacts need no new payload blocks from ambient free
-space. Actual normalized FFmpeg arguments, all input paths, and every settings
-maximum are resolved before this check.
+Before FFmpeg, each manifest/marker allocation already exists as its validated
+zero-filled extent plus descriptor. The artifact transaction uses the
+identity-preserving prefix-write/rename/truncate handoff above; it never closes
+and unlinks an extent before a replacement temporary owns the same blocks.
+Canonical bytes are checked against the indexed raw maximum, fsynced, reopened,
+and validated before atomic replacement and target-directory sync. Only then
+may the matching descriptor be removed and the next indexed extent be consumed.
+Prune markers follow the same one-at-a-time rule after both manifests are
+durable. The final-encoding index is removed only
+after all applicable publications/markers and the terminal settings transition
+are durable; a crash before then revalidates the remaining entries rather than
+estimating space again. Thus these artifacts need no new payload blocks from
+ambient free space. Actual normalized FFmpeg arguments, all input paths, and
+every settings maximum are resolved before this check.
 
 Both assembled and direct encoding write only to a sibling temporary on the
-final-output volume. FFmpeg ENOSPC/Windows error 112, interruption, validation
-failure, or any error before publication removes that temporary and manifest
-temporaries plus the prune-marker reservation, retains one settings extent until
-the terminal failure transition is durable, then removes unused settings
-reservations. It leaves the old final video plus both old retained manifests
-unchanged. Only a successfully closed and validated temporary may enter the
-publication sequence. Output-file size is reported from the failed temporary,
-but it is never presented as a preflight guarantee. When job root and output
-share a volume, the manifest reservation is still tested independently from the
-unknown growing video temporary; reclaim credit is never used to promise video
-completion.
+final-output volume. FFmpeg ENOSPC/Windows error 112, interruption, timeout,
+validation failure, or any error before publication removes that temporary and
+any unauthenticated artifact temporaries, retains the indexed terminal extent
+until the terminal failure transition is durable, then removes only matching
+unused reservation entries under the authenticated crash policy. It leaves the
+old final video plus both old retained manifests unchanged. Only a successfully
+closed and validated temporary may enter the publication sequence. Output-file
+size is reported from the failed temporary, but it is never presented as a
+preflight guarantee. When job root and output share a volume, manifest extents
+are still tested independently from the unknown growing video temporary;
+reclaim credit is never used to promise video completion.
 
 The 1.25 factor matches metric geometry. Allocation rounding and explicit
 filesystem slack are both intentionally retained. Root reserve is doubled
@@ -4867,7 +5535,12 @@ It is not a setting, saved mode, resume identity, or production branch.
    video-size promise. Direct and
    assembled FFmpeg ENOSPC tests leave an old final video and both old manifests
    byte-exact
-   while removing sibling/reservation temporaries. Hard-link fixtures cover the
+   while removing sibling/owned reservation temporaries. Reservation fixtures
+   cover every exact filename/kind, descriptor and index key, job/settings/
+   publication-generation binding, logical versus allocated bytes, POSIX and
+   Windows identities, non-sparse enforcement, crash adoption between extent
+   fsync and descriptor commit, exact matching reuse without reallocation, and
+   conflict-preserving rejection of unknown/stale/mismatched files. Hard-link fixtures cover the
    existing no-op crop links, retained links, external-link counts,
    symlinks/reparse points, duplicate identities,
    allocation-size lookup failure, per-volume ledgers, and revalidation races.
@@ -4932,7 +5605,15 @@ It is not a setting, saved mode, resume identity, or production branch.
     typed error. FFmpeg 5.x/6.x/7.1.5 and the same Windows-distribution goldens
     accept absent or empty `programs`/`stream_groups`; a nonempty final wrapper
     and every unknown/duplicate root fail. Probe tests exercise the derived wall
-    timeout at its boundary. Full-decode progress fixtures prove monotonic
+    timeout at its boundary using no-audio, ordinary 30/60-fps audio, long
+    low-rational-fps audio, AAC priming/tail, maximum accepted audio packet
+    count, one packet over bound, and byte-dominant container fixtures. They
+    assert checked `N + audio_probe_units`, byte work units, max selection, and
+    timeout cap. Encode progress fixtures prove only strict increases of
+    `frame`/`out_time_us`/`out_time_ms`/`total_size` reset the 120-second clock;
+    repeats, regressions, `N/A`, unrelated output, and a silent child do not,
+    and every timeout takes the common terminate/drain/grace/kill/reap path.
+    Full-decode progress fixtures prove monotonic
     `frame`/`out_time_us`/`out_time_ms` resets the stall clock while repeated or
     unrelated lines do not, require `progress=end`, and exercise the 120-second
     timeout.
@@ -4987,8 +5668,9 @@ It is not a setting, saved mode, resume identity, or production branch.
     and `ENCODING_CONTROL_FRAME_CAP` prove O(1) provider state, exact streamed
     directory completeness, same-generation prepass/argv/postpass, and at most
     six MiB coordinator residency across the distinct manifest, audio-probe,
-    audio-decode, encode, final-probe, final-decode, producer-settings, pending-
-    settings, and completion-settings phase peaks, including bounded parent-
+    audio-decode, reservation-index, encode, final-probe, final-decode,
+    producer-settings, pending-settings, and completion-settings phase peaks,
+    including bounded parent-
     process output and JSON/settings state. No source resolver or assembled
     frame-list interface is called. Pre-launch changes restart only after
     temporary cleanup;
@@ -5013,11 +5695,19 @@ It is not a setting, saved mode, resume identity, or production branch.
     Deleting both manifests afterward yields incomplete evidence, never legacy,
     including after a failed later encode. Target-path fixtures prove new jobs,
     retained `expected_output_filename`, and frozen-v1 fallback each persist one
-    immutable portable component; helper changes cannot redirect audit, argv,
-    manifest, or `path64`. Naming goldens cover invalid scalar/control input,
+    immutable contained component; only new/fallback names are required
+    portable. Helper changes cannot redirect audit, argv, manifest, or `path64`.
+    Naming goldens cover invalid scalar/control input,
     preset/custom resolution grammar, multi-byte and non-BMP stems, both 240-unit
-    limits and their adjacent values, exact deterministic hash truncation, and
-    rejection before any filesystem create when the fixed tail cannot fit.
+    limits and their adjacent values, exact deterministic hash truncation,
+    `CON.foo.mp4`, `con.foo.mp4`, `AUX.bar.mp4`, `NUL..mp4`,
+    `COM1.part.mp4`, and `LPT9.part.mp4` full-
+    validator results, and rejection before any filesystem create when the fixed
+    tail cannot fit. A locatable historical 60-emoji component audits read-only
+    despite exceeding 240 UTF-8 bytes; explicit reencode returns
+    `LegacyFinalTargetNotPortableError` without touching it. Absolute,
+    separator-bearing, dot-segment, NUL, link/reparse, and unlocatable legacy
+    targets fail containment.
 18. Batch-stitching fixtures create `_stitched_*.mp4` beside missing, legacy,
     current, and pruned job artifacts. The job audit and cleanup result are
     unchanged, neither publication manifest is created or consumed, and only
@@ -5027,10 +5717,21 @@ It is not a setting, saved mode, resume identity, or production branch.
     parser, typed-object, serializer, temporary-create/write/fsync, replace,
     directory-sync, and both reopen-validation failures at producer, pending,
     terminal-success, and terminal-failure transitions. Producer failure never
-    launches FFmpeg. Disk-full fixtures consume the unknown video space while
-    proving independent extents remain for pending and terminal writes with
-    intermediates off, and for the terminal write with intermediates kept.
-    Cleanup-only resume reserves one or two extents from persisted state. No
+    launches FFmpeg. Exhaustive schema fixtures remove and add every top-level,
+    metadata, video, normalized-settings, output, runtime, and metric-summary
+    key; cross every integer/binary64/null/timestamp/state condition; and prove
+    two independent serializers emit identical canonical bytes and raw maxima.
+    Locator fixtures prove the fixed schema-5 path wins, extra legacy files and
+    mtime changes are inert, zero legacy candidates are absent, multiple are
+    ambiguous, and migration retains one exact history path without replacing
+    it. Disk-full fixtures consume the unknown video space immediately after
+    initial settings and after every early pipeline stage while proving the
+    lifecycle terminal extent can still commit `failed`. They also prove
+    independent producer/pending extents remain with intermediates off, the
+    same original terminal extent is indexed rather than double-counted, and a
+    terminal-to-new-attempt transition preallocates both rewrite/replacement
+    extents. Cleanup-only resume reuses its one or two persisted indexed extents
+    and allocates neither again. No
     direct pretty-JSON overwrite runs, every phase remains at six MiB or less,
     and no job reports completion before the terminal canonical settings bytes
     are directory-synced and reopen-validated.
@@ -5126,9 +5827,10 @@ With five warmups and 30 measured frames on that clean CUDA environment:
 - direct and assembled final-encoding providers at the same cardinalities up to
   `ENCODING_CONTROL_FRAME_CAP` remain at or below the independent six-MiB
   calculated peak and eight-MiB cap through directory audit, manifest prepass,
-  source-audio probe/decode, argv construction, final validation, postpass, and
-  isolated producer/pending/terminal settings commits, with no eager path/name
-  collection or uncapped settings object;
+  source-audio probe/decode, reservation descriptor/index streaming, argv
+  construction, encode progress, final validation, postpass, and isolated
+  producer/pending/terminal settings commits, with no eager path/name collection
+  or uncapped settings object;
 - simultaneous stereo jobs repeatedly create and tear down threads while a
   third project thread creator contends for the global creation lock. Every run
   restores the previous process stack setting on success and each injected
@@ -5229,13 +5931,16 @@ commit phases with capped stdout/stderr/JSON/settings/ring state and injected
 overflow, timeout, cancellation, sync, reopen, and reap paths on Windows and
 POSIX. It freezes legal FFprobe wrapper output from FFmpeg 5/6/7 and the resolved
 Windows distribution, proves top-level stream authority, and gives full decode
-observable monotonic progress. It also proves portable deterministic target-name
-generation, immutable target-path use, every physically retained settings
-extent through terminal status, and the first-v4-attempt marker across failed/
-repeated encodes. Any eager resolver call, generic capture helper, direct pretty-
-settings overwrite, over-cap RSS, mixed generation, leaked process/thread,
-unreserved status write, or publication after mismatch blocks production
-implementation.
+observable monotonic progress, low-rational-fps AAC work-unit deadlines, and
+publishing-encoder stall termination. It also proves portable deterministic
+target-name generation, containment-only legacy audit, immutable target-path
+use, the complete closed settings schema and fixed job-control locator, every
+authenticated physical extent/index from initial settings through terminal
+status, crash reuse without double allocation, and the first-v4-attempt marker
+across failed/repeated encodes. Any eager resolver call, generic capture helper,
+direct pretty-settings overwrite, mtime-selected settings path, over-cap RSS,
+mixed generation, leaked process/thread, unreserved status write, or publication
+after mismatch blocks production implementation.
 
 Task 0 first evaluates an implementation using only existing NumPy, Torch, and
 OpenCV facilities. If it misses any performance or RSS gate, this specification
@@ -5374,13 +6079,18 @@ Approval of this canonical specification accepts:
     coordinator cap which includes bounded parent-process output and parser
     state for source-audio probe/decode, final validation, and every settings
     commit. Legal FFprobe section wrappers never override authoritative top-level
-    streams; final probe has a frame-derived deadline and full decode has a
-    semantic-progress stall deadline. One canonical settings transaction owns
-    producer/pending/terminal durability and their physical extents through
-    completion. A persisted immutable target path whose complete component meets
-    both 240-byte and 240-UTF-16-unit limits, checked last-index arithmetic, and
-    the fixed signed-int image2 endpoint prevent historical reinterpretation.
-    Batch stitching remains outside this publication and audit scope.
+    streams; final probe has a video/audio/byte-work-derived deadline and full
+    decode has a semantic-progress stall deadline, while the publishing encoder
+    has its own semantic-progress stall deadline. One closed settings schema,
+    fixed job-control locator, and canonical transaction own producer/pending/
+    terminal durability; an authenticated terminal extent survives from initial
+    settings to terminal state and generation-bound descriptors/indexes make
+    every finalization reserve crash-reusable. A new persisted immutable target
+    meets both 240-byte and 240-UTF-16-unit limits; a contained locatable legacy
+    target remains read-only instead of being retroactively renamed/rejected.
+    Checked last-index arithmetic and the fixed signed-int image2 endpoint
+    prevent historical reinterpretation. Batch stitching remains outside this
+    publication and audit scope.
 14. Task 0 must prove the exact geodesic, geometry-nearest, and repair-donor
     heap/k-d performance paths, local/fallback semantic caps, ten-step allocation
     order, no-copy Quality content audit, bounded replayable stereo and encoding
@@ -5389,8 +6099,9 @@ Approval of this canonical specification accepts:
     stereo providers require canonical upstream manifests and never synthesize
     a directory fingerprint. It also proves both CPython historical ZIP forms,
     the bounded owned metric writer, audio/final process lifecycles, FFprobe
-    version goldens, portable immutable final targets, the canonical settings
-    transaction/reservation schedule, and the monotonic publication marker. A
+    version goldens, portable new and contained-legacy immutable final targets,
+    the canonical settings transaction/reservation schedule, and the monotonic
+    publication marker. A
     project-owned prebuilt extension is permitted only under the fixed oracle and packaging
     constraints; it cannot weaken output or add a silent fallback.
 15. All deterministic, resource, transaction, seven-frame visual, temporal, and
