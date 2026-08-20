@@ -14,11 +14,14 @@ this document retains the decisions about opt-in behavior, source-selection
 policy, layout, encoder quality, and basic UX, but not the eager source-resolver
 return interface; the canonical specification replaces input validation,
 audio and `-shortest` policy, command normalization, publication/manifests,
-container validation, bounded source-audio handling, the persisted final target
-and producer marker, the closed schema-5 settings/job-control locator,
+container validation, bounded source-audio handling, the persisted final target,
+generation-derived sibling-video temporary and producer marker, the closed
+schema-5 settings/job-control locator,
 lifecycle-spanning target-parent reservation extents, replayable settings intents,
-fixed write-ahead indexes, persisted-versus-invocation file identities, the
-reserved diagnostics payload-pruned commit, transaction-first audit order,
+fixed write-ahead indexes/control temporaries, reservation-payload framing,
+JobControl-owned extent reconciliation, persisted-versus-invocation file
+identities, the reserved diagnostics payload-pruned commit, transaction-first
+audit order,
 new-versus-legacy target validation, bounded encoder/
 final-validator lifecycles, work-unit FFprobe
 deadlines, resume, and cleanup. The sentence above about unchanged recovery
@@ -365,20 +368,28 @@ preview while the progress values continue to advance.
 
 ## Output Commit And Failure Semantics
 
-The direct method encodes to a sibling temporary path that retains the `.mp4`
-suffix, for example `.name.direct.tmp.mp4`. Retaining the suffix lets FFmpeg
-select the correct muxer.
+The historical target-derived `.name.direct.tmp.mp4` spelling is superseded for
+orchestrated job encoding. Both direct and assembled methods use the exact short
+generation-derived `.depth-surge-final-v4-<publication_generation>.tmp.mp4`
+component persisted by `FinalEncodingReservationV1`; retaining `.mp4` lets
+FFmpeg select the correct muxer without lengthening the final component.
 
-- Remove only that exact stale temporary path before starting.
+- With the authenticated final index active, remove only that exact persisted
+  stale temporary path before starting or relaunching.
 - Never remove or truncate an existing final output before FFmpeg succeeds.
 - On return code zero, require the temporary file to exist and be non-empty,
-  then use `Path.replace` to publish it atomically.
+  then use the canonical validator, flush, and same-parent atomic publication.
 - On nonzero return, launch exception, progress-reader failure, or missing/empty
   output, remove the temporary path and return failure.
 - Include the bounded FFmpeg diagnostic tail in console output on failure.
 - Leave all upstream frame stages and manifests untouched.
 
-The orchestrator marks the job failed through its existing finalization path.
+The canonical specification owns the complete path/parent-identity, crash,
+validation, manifest, fsync, and index-retirement contract. Without that active
+index this document authorizes no wildcard or lookalike temporary cleanup.
+
+The orchestrator marks the job failed through the canonical lifecycle-terminal
+finalization path.
 A resumed job revalidates and reuses the upstream stages, then starts final
 encoding from frame one. Direct encoding itself has no partially reusable
 artifact.
