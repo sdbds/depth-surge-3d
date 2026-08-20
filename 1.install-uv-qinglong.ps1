@@ -145,23 +145,23 @@ else {
     . ./.venv/bin/activate.ps1
 }
 
-Write-Output "Exporting base project dependencies from pyproject.toml"
+Write-Output "Exporting base project dependencies and MoGe-2 extra from pyproject.toml"
 Write-Output "uv pip install target environment: $(Get-UvEnvName)"
-Write-Output "uv pip install dependency profile: base-only"
+Write-Output "uv pip install dependency profile: base+moge2"
 
 $PythonExe = Get-ProjectPython
 
-Write-Output "基础安装直接使用 uv pip install -r pyproject.toml，不启用任何 extra"
+Write-Output "基础安装直接使用 uv pip install -r pyproject.toml，默认启用 moge2 extra"
 
 ~/.local/bin/uv pip install --python .\.venv\Scripts\python.exe "hatchling>=1.25" "hatch-vcs>=0.4"
 
 if ($PythonExe) {
-    ~/.local/bin/uv pip install --no-build-isolation --python $PythonExe -r pyproject.toml
+    ~/.local/bin/uv pip install --no-build-isolation --python $PythonExe -r pyproject.toml --extra moge2
 }
 else {
-    ~/.local/bin/uv pip install --no-build-isolation -r pyproject.toml
+    ~/.local/bin/uv pip install --no-build-isolation -r pyproject.toml --extra moge2
 }
-Check "Install base requirements failed"
+Check "Install base and MoGe-2 requirements failed"
 
 Write-Output "Install finished"
 Read-Host | Out-Null ;
