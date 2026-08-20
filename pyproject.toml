@@ -67,6 +67,9 @@ Issues = "https://github.com/Tok/depth-surge-3d/issues"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.uv.extra-build-dependencies]
+depth-anything-3 = ["hatchling"]
+
 [tool.hatch.metadata]
 allow-direct-references = true
 
@@ -83,8 +86,8 @@ exclude = [
     "/uploads",
 ]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev= [
     "pytest>=7.0.0",
     "pytest-cov>=4.1.0",
     "black==25.1.0",
