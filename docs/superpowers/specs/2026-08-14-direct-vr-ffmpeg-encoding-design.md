@@ -16,6 +16,11 @@ return interface; the canonical specification replaces input validation,
 audio and `-shortest` policy, command normalization, publication/manifests,
 container validation, resume, and cleanup. The sentence above about unchanged
 recovery behavior does not override that later transaction contract.
+Publication v4 applies only to orchestrated job final-media calls through
+`VideoEncoder.create_video` and
+`VideoEncoder.create_video_from_stereo_sequences`. The independent Web
+`/stitch_video` workflow and its `*_stitched_*.mp4` products remain outside both
+documents' job final-media audit, publication manifests, and prune state.
 
 The accepted quality contract is visual and encoding quality parity, not
 bit-identical pixels. When resizing is required, FFmpeg bicubic scaling may
@@ -69,8 +74,9 @@ unconditional default.
 - Streaming depth estimation, stereo rendering, distortion, cropping, or AI
   upscaling directly into FFmpeg.
 - Adding an assembled VR-frame preview during direct encoding.
-- Adding direct encoding to the separate batch-stitching workflow, whose input
-  contract is already assembled VR frames.
+- Adding direct encoding or publication-v4 manifests/audit/pruning to the
+  separate `/stitch_video` batch-stitching workflow, whose input contract is
+  already assembled VR frames.
 - Adding a resume-time UI override. Resume uses the strategy saved by the
   interrupted job.
 - Automatically deleting a pre-existing `99_vr_frames` directory merely
