@@ -257,6 +257,13 @@ defects.
 | New portable limits rejected locatable historical Windows output | Split new-name portability from the containment-only validator used by read-only legacy audit. |
 | The publishing FFmpeg process could stall forever | Add a semantic encode stall clock driven only by strictly advancing FFmpeg progress counters. |
 | Final FFprobe timeout ignored counted AAC packets and file scan cost | Derive deterministic work units from video frames plus a supported AAC packet upper bound, then include final-file bytes. |
+| Windows superscript device digits escaped the portable-name validator | Add `COM`/`LPT` plus U+00B9/U+00B2/U+00B3 to the exact reserved-base set and freeze true fallback plus non-device controls. |
+| Completed migration derived seconds which its own multiply-and-floor invariant rejected | Make integer milliseconds authoritative and require the seconds field to equal one exact binary64 derivation. |
+| Central reservation data did not reserve a target-directory entry or identify its future paths | Put every payload extent in its target parent, persist every source/temporary/target/parent/role binding, and precreate the final or replacement entry before downstream mutation. |
+| Standalone settings extents had no durable owner across a crash | Publish one fixed write-ahead settings-transition index before creating any indexed extent. |
+| Reservation and prune identities used incompatible Windows widths and POSIX mount evidence | Reuse exact 64-bit-volume/128-bit-file spellings and stable mount identity across reservation, prune, and reclaim. |
+| Missing legacy output metadata was reinterpreted by a new naming algorithm | Treat the historical target as unknown and perform no recomputation or glob. |
+| Encoder progress did not distinguish ignorable legal keys from malformed diagnostics | Freeze one bounded ASCII line grammar, semantic keys, control values, and discard behavior for all other legal keys. |
 
 ## Public Settings Contract
 
@@ -279,8 +286,9 @@ test. It is a 1080p-equivalent distance. For render height `H`:
 Schema 5 also closes the existing `vr_resolution` string hole. It accepts only
 exact `auto`, an exact member of the frozen v1 preset set below, or exact
 `custom:<width>x<height>` where each decimal has no sign, whitespace, or leading
-zero and normalizes to `1..10000`. Every CLI, Web, migration-fallback, and resume
-path runs this same validator before target-name persistence. A retained legacy
+zero and normalizes to `1..10000`. Every CLI, Web, new-job, and explicit new-
+target path runs this same validator before target-name persistence. A retained
+legacy
 `expected_output_filename` remains authoritative for read-only audit when its
 complete copied component passes `ContainedLegacyFinalComponentV1`; its
 historical resolution spelling does not get appended again and the new portable
@@ -377,7 +385,10 @@ Unicode scalar value, no scalar has Unicode General Category `Cc`, no scalar is
 in `<>:"/\|?*`, UTF-8 encoding is at most 240 bytes, and UTF-16 encoding is at
 most 240 code units excluding a BOM. The substring before its first dot,
 compared ASCII case-insensitively, is not `CON`, `PRN`, `AUX`, `NUL`,
-`COM1`..`COM9`, or `LPT1`..`LPT9`. The emitted suffix ensures that the segment
+`COM1`..`COM9`, `COM¹`, `COM²`, `COM³`, `LPT1`..`LPT9`, `LPT¹`,
+`LPT²`, or `LPT³`. "ASCII case-insensitively" folds only `A`..`Z`; it
+performs no Unicode normalization or case folding and leaves the three
+superscript scalars unchanged. The emitted suffix ensures that the segment
 ends in neither a space nor a dot. These deliberately platform-independent
 limits sit below both the project-supported 255-byte POSIX component boundary
 and the 255-UTF-16-code-unit Windows component boundary; an output volume unable
@@ -447,8 +458,12 @@ underscores, preset and custom resolutions, invalid/overlong resolution tokens,
 isolated surrogates, `Cc` controls, 60 non-BMP scalars, exact 239/240/241 UTF-8-
 byte and UTF-16-unit boundaries, deterministic hash truncation, and exact
 `CON.foo.mp4`, `con.foo.mp4`, `AUX.bar.mp4`, `NUL..mp4`, `COM1.part.mp4`, and
-`LPT9.part.mp4` inputs whose complete emitted results each independently pass
-`PortableFinalComponentV1`. Their exact side-by-side/16x9-1080p goldens are:
+`LPT9.part.mp4` inputs. They also cover every superscript device base with
+`COM¹.foo.mp4`, `COM².part.mp4`, `COM³.part.mp4`, `LPT¹.foo.mp4`,
+`LPT².part.mp4`, and `LPT³.part.mp4`. For every fallback case the original
+candidate fails the complete validator, fallback executes, and the emitted
+result independently passes `PortableFinalComponentV1`. The exact side-by-side/
+16x9-1080p goldens are:
 
 ```text
 CON.foo.mp4   -> CON~afc0ef4e07a53c5302a14d2d1fd02201_3D_side-by-side_16x9-1080p.mp4
@@ -457,26 +472,39 @@ AUX.bar.mp4   -> AUX~e8fac5846b90380bd5f72d652d5736c4_3D_side-by-side_16x9-1080p
 NUL..mp4      -> NUL~9143c618d678d7b537d35615d8540440_3D_side-by-side_16x9-1080p.mp4
 COM1.part.mp4 -> COM1~fe6252979b85daead85a257e026e2f3e_3D_side-by-side_16x9-1080p.mp4
 LPT9.part.mp4 -> LPT9~7fc1ea62997d746b58e6250491ee1b78_3D_side-by-side_16x9-1080p.mp4
+COM¹.foo.mp4  -> COM¹~f98034cae9fd53d32245fa532dab5a16_3D_side-by-side_16x9-1080p.mp4
+COM².part.mp4 -> COM²~94e29ca23c82f11626cf8a52a80b5dda_3D_side-by-side_16x9-1080p.mp4
+COM³.part.mp4 -> COM³~21b0d5fa00b2d2aa801dc222e836bd0d_3D_side-by-side_16x9-1080p.mp4
+LPT¹.foo.mp4  -> LPT¹~95b3c94fd50b2c12b8af03aa3028b2a6_3D_side-by-side_16x9-1080p.mp4
+LPT².part.mp4 -> LPT²~fee1cd545f4c01fc702da4e08e0a1b40_3D_side-by-side_16x9-1080p.mp4
+LPT³.part.mp4 -> LPT³~7a788f8c065d09115bb8cddbe4b0b354_3D_side-by-side_16x9-1080p.mp4
 ```
+
+`COM³.mp4` and `LPT³.mp4` are deliberate non-fallback controls. Their
+complete candidates begin `COM³_3D_...` and `LPT³_3D_...`; the substring
+before the first dot is therefore not a reserved device name. Both exact
+candidates must pass the validator and the Windows create/open/rename/delete
+integration gate. Rejecting either because the source stem alone was reserved
+would over-apply the Windows rule to a different final component.
 
 No production
 implementation of the earlier 200-code-point draft existed; this paragraph is
 the final definition of `job-output-name-v1`. A future helper change therefore
 creates a new algorithm version rather than reinterpreting v1.
 
-For schema-1-through-4 migration, first validate
+For schema-1-through-4 migration, require and validate
 `output_info.expected_output_filename` with
 `ContainedLegacyFinalComponentV1`. If present and valid, copy its exact scalar
 sequence to `expected_final_relative_path` and record
-`persisted-expected-output-filename-v1`; do not recompute it. If and only if the
-old field is absent, run the frozen `job-output-name-v1` once from
-the raw persisted `metadata.source_video_name`,
-`processing_settings.vr_format`, and
-`processing_settings.vr_resolution`, then persist that result/version. A
-present malformed/unlocatable old field or missing/malformed fallback input is
-`FinalMediaTargetMetadataError`, not permission to glob or use the current
-mutable helper. A schema-5 file missing either target field is likewise invalid
-rather than lazily repaired.
+`persisted-expected-output-filename-v1`; do not recompute it. An absent field is
+`LegacyFinalTargetUnknownError`: migration writes neither locator nor schema-5
+replacement, final-media audit performs no path lookup, and the raw legacy
+artifact remains byte-exact. A present malformed/unlocatable old field is
+`FinalMediaTargetMetadataError`. Neither case permits `job-output-name-v1`, the
+historical mutable helper, a guessed `legacy-job-output-name`, or a glob. Valid
+legacy writers in this repository persisted the field; its absence is unknown
+provenance rather than evidence for any naming algorithm. A schema-5 file
+missing either target field is likewise invalid rather than lazily repaired.
 
 Read-only audit may therefore preserve and report a real historical component
 which exceeds the new portable limits, including a 60-non-BMP-scalar Windows
@@ -510,8 +538,8 @@ The following notation is normative. `scalar-string` contains only Unicode
 scalar values. `u64` is a JSON integer, never a boolean, in `0..2^64-1`;
 `positive-u64` excludes zero. `binary64` is a JSON number decoded as a Python
 `float`, never an integer or boolean, and must be finite; a range following the
-type is inclusive. `hex32` and `hex64` are respectively 32 and 64 lowercase
-ASCII hexadecimal characters. `utc-usec` is exactly 27 ASCII bytes in valid
+type is inclusive. `hex16`, `hex32`, and `hex64` are respectively 16, 32, and
+64 lowercase ASCII hexadecimal characters. `utc-usec` is exactly 27 ASCII bytes in valid
 Gregorian UTC form `YYYY-MM-DDTHH:MM:SS.ffffffZ`, with seconds `00..59`.
 `T?` means JSON `null` or `T`. Every object named below is closed and every
 listed key is required even when its value is null.
@@ -690,8 +718,14 @@ These state invariants are part of the schema, not post-parse conventions:
   final-output path equal to the expected path, exact N frames, and processing
   time; terminal diagnostics are null. Except for the one untouched legacy
   migration case below, metric summary is non-null exactly for a metric job.
-  Checked `floor(processing_time_seconds*1000)` equals
-  `processing_duration_ms`.
+  Integer `processing_duration_ms` is authoritative. Define
+  `duration_seconds_from_ms_v1(ms)` as the IEEE-754 binary64 result of
+  `float64(float64(ms) / float64(1000.0))`, with integer conversion, division,
+  and result rounding each using round-to-nearest, ties-to-even and with no
+  extended-precision retention or fused operation. The stored
+  `processing_time_seconds` must have the identical 64-bit binary64 pattern to
+  that function's result. Multiplying seconds back by 1000, flooring, epsilon
+  comparison, or accepting a caller-supplied display value is forbidden.
   Cleanup is `not_requested` exactly when intermediates are kept;
   otherwise it is `complete` or one of the two incomplete terminal values.
 - `failed` requires non-null `last_updated_at=terminal_at`, duration, and
@@ -707,7 +741,8 @@ Migrated `completed` sets final output to the persisted expected component,
 frames to `resolved_legacy_N`, defined here as a valid non-boolean legacy
 `runtime_info.frames_processed` in `1..frame_count` or otherwise `frame_count`,
 and processing seconds to
-`binary64(processing_duration_ms)/1000.0`. Its cleanup is `not_requested` when
+`duration_seconds_from_ms_v1(processing_duration_ms)`. Its cleanup is
+`not_requested` when
 `keep_intermediates=true`; otherwise it is `incomplete_error`, because old
 settings cannot authenticate prior deletion. A valid legacy metric clamp
 summary is reduced to the bounded object above and its canonical raw SHA-256;
@@ -737,6 +772,8 @@ settings_identity_fingerprint:          hex64
 job_reservation_generation:             hex32
 initial_settings_reservation_id:        hex32
 job_terminal_reservation_id:            hex32
+job_root_identity:                      DirectoryIdentity
+bootstrap_extent_entries:               list[ReservationEntryV1]
 fingerprint:                            hex64
 ```
 
@@ -747,6 +784,15 @@ following a link. New jobs require null and migrations require the one selector
 result described below.
 
 Its fingerprint is SHA-256 of its canonical object with `fingerprint` omitted.
+`bootstrap_extent_entries` has exactly two items in order: one
+`initial_settings` for a new job or `migration_settings` for migration, followed
+by `job_terminal_settings`. Both use the locator generation, the matching two
+locator IDs, null descriptor publication generation, target
+`processing-settings-v5.json`, the exact target-local temporary/central
+descriptor paths, the captured `job_root_identity`, settings payload maximum,
+allocation unit, role, and null prune triple required by `ReservationEntryV1`
+below. These complete entries are the bootstrap write-ahead intent; recovery
+never reconstructs their parent identity or size from ambient state.
 `settings_identity_fingerprint` is SHA-256 of this exact closed canonical object:
 
 ```text
@@ -762,8 +808,9 @@ job_reservation_generation:            hex32
 job_terminal_reservation_id:           hex32
 ```
 
-The same
-identity and path values in `MetadataV5` must match the locator.
+The same settings identity and path values in `MetadataV5` must match the
+locator. Reopening job control also requires the currently opened job-root
+directory identity to equal `job_root_identity` before any child lookup.
 
 `job_id`, the job reservation generation, the initial/terminal reservation IDs,
 and every later reservation generation/ID are
@@ -777,10 +824,12 @@ non-link ordinary `*-settings.json` children and requires exactly one. Zero is
 not found and more than one is `AmbiguousLegacySettingsError`; mtime and name
 sorting are forbidden. Once the locator exists, every transition, resume,
 audit, cleanup, marker validation, and producer validation reads only its fixed
-path. Extra `*-settings.json` entries are inert history and are never candidates.
-A schema-5 settings file without a valid matching locator, or a locator whose
-fixed target is missing/mismatched, is a control-artifact conflict rather than
-permission to glob or adopt another file.
+path, except that bootstrap alone recognizes the locator-declared absent or
+zero-length placeholder state below. Extra `*-settings.json` entries are inert
+history and are never candidates. A schema-5 settings file without a valid
+matching locator, or a non-bootstrap locator whose fixed target is missing/
+mismatched, is a control-artifact conflict rather than permission to glob or
+adopt another file.
 
 The bounded artifact constants are:
 
@@ -815,13 +864,40 @@ and cannot make a status transaction exceed its reserved extent.
 
 ### Reservation Extent V1
 
-Disk reservation is persisted state, not an anonymous zero file. All reservation
-artifacts live below one non-link ordinary job-root directory named
-`.depth-surge-reservations-v1`, opened relative to the same trusted job-root
-handle as `job-control-v1.json`. Every payload extent is a create-new ordinary
-file filled non-sparsely with zero bytes, file-synced, and paired with a
-canonical create-new descriptor. A descriptor is a closed
-`ReservationExtentV1` object with exactly:
+Disk reservation is persisted transaction state, not an anonymous zero file.
+The non-link ordinary job-root directory `.depth-surge-reservations-v1` contains
+only bounded canonical descriptors and write-ahead indexes. It never contains
+payload data extents. Every payload extent is instead a create-new ordinary file
+inside the **already opened target parent directory**, so successful reservation
+has already allocated the directory entry on the exact volume and mount where
+publication will occur. It is filled non-sparsely with zero bytes, file-synced,
+reopened without following a link, and only then paired with a central
+descriptor.
+
+Filesystem identity has one shared spelling. `PosixFileIdentityV1` is exactly
+`{device:u64,inode:u64,mount_identity:canonical-mount-id}` where
+`canonical-mount-id` is the no-leading-zero decimal spelling of a stable
+kernel-provided non-path numeric mount ID. `WindowsFileIdentityV1` is exactly
+`{volume_serial:hex16,file_id:hex32}`: the first member encodes the 64-bit
+`FILE_ID_INFO.VolumeSerialNumber`, the second the 128-bit `FILE_ID_128`.
+`ReservationFileIdentityV1` is exactly one of:
+
+```text
+POSIX:   {platform: "posix", file_identity: PosixFileIdentityV1,
+          link_count: positive-u64}
+Windows: {platform: "windows", file_identity: WindowsFileIdentityV1,
+          link_count: positive-u64}
+```
+
+`DirectoryIdentity` is exactly `{kind:"posix",file_identity:
+PosixFileIdentityV1}` or `{kind:"windows",file_identity:
+WindowsFileIdentityV1}`. Reservation, prune, reclaim-ledger, and target-parent
+comparisons reuse these exact nested types; no zero-extension, alternate field
+width, path-derived mount spelling, or platform-local alias is allowed. A POSIX
+port without a stable mount ID or a Windows port without `FileIdInfo` cannot use
+this reservation/cleanup contract.
+
+A central descriptor is the closed `ReservationExtentV1` object:
 
 ```text
 schema_version:                  1
@@ -839,285 +915,384 @@ reservation_kind:
     "job_terminal_settings" | "nonterminal_settings" |
     "producer_settings" | "cleanup_pending_settings" |
     "encoding_input_manifest" | "final_video_manifest" |
-    "prune_marker" | "final_encoding_index"
-extent_relative_path:            scalar-string
+    "prune_marker"
+transaction_index_relative_path: scalar-string
+transaction_index_fingerprint:   hex64
+source_extent_relative_path:     scalar-string
+temporary_relative_path:         scalar-string
+target_relative_path:            scalar-string
+target_parent_identity:          DirectoryIdentity
+publication_method:              "replace_placeholder" | "replace_existing"
+reserved_placeholder_identity:   ReservationFileIdentityV1?
+payload_role:                    scalar-string
+payload_raw_max:                 positive-u64
 logical_byte_count:              positive-u64
 allocated_byte_count:            positive-u64
 allocation_unit:                 positive-u64
 filesystem_identity:             ReservationFileIdentityV1
+prune_root_relative_path:        scalar-string?
+marker_name:                     scalar-string?
+marker_payload_sha256:           hex64?
 fingerprint:                     hex64
 ```
 
-`ReservationFileIdentityV1` is one of two closed objects: POSIX is exactly
-`{platform:"posix",device:u64,inode:u64,link_count:positive-u64}`; Windows is
+The fingerprint is SHA-256 of canonical bytes with only `fingerprint` omitted.
+The descriptor is a direct child named exactly
+`d-p-<publication-token>-r-<reservation_generation>-<reservation_kind>-<reservation_id>.json`;
+the publication token is literal `none` for null and otherwise the exact
+`hex32`. Its entry's `descriptor_relative_path` is exactly
+`.depth-surge-reservations-v1/<that-name>`. `transaction_index_relative_path`
+is exactly `job-control-v1.json` for bootstrap/lifecycle-terminal descriptors,
+the fixed settings-transition index for standalone rewrite descriptors, or the
+fixed final-encoding index for new invocation descriptors; its fingerprint must
+equal the complete canonical file at that path. All paths are canonical job-root-relative POSIX paths opened
+handle-relatively without links, `.` or `..`. In v1,
+`source_extent_relative_path == temporary_relative_path`, whose last segment is
 exactly
-`{platform:"windows",volume_serial:hex32,file_id:hex32,link_count:positive-u64}`.
-The descriptor fingerprint is SHA-256 of canonical bytes with `fingerprint`
-omitted. `extent_relative_path` is a one-segment child of the authenticated
-reservation directory. Its name is exactly
-`p-<publication-token>-r-<reservation_generation>-<reservation_kind>-<reservation_id>.extent`,
-and the paired descriptor is that exact name plus `.json`. The publication token
-is literal `none` when the descriptor field is null and otherwise its `hex32`
-value; all other substitutions use the literal lowercase kind token and their
-`hex32` values. `extent_relative_path` equals the first name and the descriptor
-path is obtained only by appending `.json`.
-Initial, migration, and lifecycle terminal descriptors always use null
-publication generation and the immutable job reservation generation. A new
-attempt recreates the now-absent terminal extent with the same locator-persisted
-terminal ID/generation; it never edits job control to invent a replacement
-identity. A standalone nonterminal-settings descriptor uses a fresh reservation
-generation/ID and the current settings publication generation, or null when the
-producer pair is null. Every invocation-only producer/cleanup/manifest/prune/
-index descriptor shares the fresh reservation generation and exact non-null
-publication generation of its final-encoding index, while retaining its own
-fresh reservation ID.
-The settings revision/raw-hash fields are the null pair only for the two extents
-created before initial schema-5 publication. Every later extent captures the
-current canonical settings revision and complete raw SHA-256 as a non-null pair;
-crossed pairs are invalid. The final-encoding index separately carries the same
-preflight snapshot because the lifecycle terminal descriptor legitimately
-predates it.
-`MetadataV5.job_terminal_reservation_id` and the matching job-control field
-therefore recover that persistent pair without enumeration; the initial ID
-likewise recovers an interrupted creation/migration pair. Invocation-only IDs
-come only from the authenticated final-encoding index or its one recoverable
-pre-index generation set. Names are never chosen by glob order or mtime.
+`.depth-surge-r-<reservation_generation>-<reservation_kind>-<reservation_id>.reserved`
+inside the parent of `target_relative_path`. For `replace_placeholder`, preflight
+requires the target absent, creates/fsyncs a zero-length ordinary file at that
+final path, captures it as non-null `reserved_placeholder_identity`, then creates
+the separate payload extent. For `replace_existing`, the target entry already
+exists and the placeholder field is null. In both methods temporary and target
+therefore exist before readiness, share the same already opened parent, and its
+identity must equal `target_parent_identity`. There is no cross-directory extent
+rename and no publication which first creates a target entry after readiness.
 
-For an artifact whose maximum canonical payload is `raw`, the extent's exact
-logical length is `alloc(raw)+A`; the extra allocation unit carries the already
-charged filesystem-entry/slack reserve. The descriptor records that value and
-the exact allocation bytes reported after the non-sparse fill. The descriptor
-file itself is separately charged as
-`alloc(reservation_descriptor_raw_max)+A`; it is never hidden inside the payload
-extent's byte count.
+`payload_role` has the exact one-to-one mapping
+`initial_settings -> settings_initial`,
+`migration_settings -> settings_migration`,
+`job_terminal_settings -> settings_terminal`,
+`nonterminal_settings -> settings_nonterminal`,
+`producer_settings -> settings_producer`,
+`cleanup_pending_settings -> settings_cleanup_pending`, and the three manifest/
+marker kinds to their identical kind strings. The three prune fields are the
+null triple except for `prune_marker`; for that kind they are all non-null,
+`temporary_relative_path` and `target_relative_path` have parent
+`prune_root_relative_path`, `marker_name` is the target's final segment, and the
+hash is over the exact future marker payload. Crossed or redundant spellings are
+invalid.
 
-Descriptor commit happens only after reopening the extent without following a
-link and capturing its identity, exact logical size, exact allocation size, and
-link count. Reopen validation requires the same identity, link count one,
-logical size, descriptor bytes/fingerprint, same volume as settings, and
-allocated bytes at least the required physical allocation. Sparse, compressed,
-deduplicated, reflink/shared-extent, reparse, or allocation-unknown files do not
-qualify. The descriptor is directory-synced after create. A crash after extent
-fsync but before descriptor commit leaves an unattested extent. Resume may adopt
-it only when its deterministic expected name lies inside the directory bound to
-the matching `job-control-v1.json`, no descriptor exists, it has the exact
-expected zero-filled logical/allocation shape, and the current typed transition
-still requires that kind; it then captures identity and commits the descriptor.
-Otherwise it is a `ReservationConflictError`, not free space and not an object
-which may be silently deleted.
+Every settings kind targets exact `processing-settings-v5.json`.
+`encoding_input_manifest` targets exact `encoding_input_manifest.json` and
+`final_video_manifest` exact `final_video_manifest.json`. A prune target is
+exactly `<prune_root_relative_path>/<marker_name>`. No kind may select a caller-
+chosen target or temporary mapping.
 
-A final-encoding invocation also commits canonical
-`FinalEncodingReservationV1` as
-`.depth-surge-reservations-v1/final-encoding-reservation-v1.json`. It has exactly:
+Initial/migration settings and prune markers require `replace_placeholder`.
+Lifecycle terminal, nonterminal, producer, and cleanup-pending settings require
+`replace_existing`. A manifest whose target entry is absent at index publication
+uses `replace_placeholder`; a present target, whether valid or stale, uses
+`replace_existing` and remains byte-exact until replacement. The selected method
+is immutable in the descriptor/index. A live bootstrap or fixed write-ahead index
+makes its zero-length placeholder provisional even before descriptor commit;
+existence alone never makes settings, a manifest, or a marker committed.
+`reserved_placeholder_identity` is non-null exactly for
+`replace_placeholder`, has link count one, and must still identify the zero-
+length target immediately before replacement; it is null for
+`replace_existing`.
+
+The settings revision/raw-hash fields are the null pair exactly for the two
+bootstrap extents created before initial schema-5 publication. Every later
+descriptor captures the current canonical settings revision and complete raw
+SHA-256 as a non-null pair; crossed pairs are invalid. Initial, migration, and
+lifecycle terminal descriptors have null `publication_generation` and the
+immutable job reservation generation. A standalone rewrite descriptor uses the
+current nullable producer generation and its settings-index generation. Every
+new final-encoding descriptor uses the final index's non-null publication and
+invocation reservation generations. Initial/terminal IDs come only from job
+control; all other IDs/generations are independent 128-bit OS-CSPRNG `hex32`
+values first persisted by their write-ahead index.
+
+For maximum canonical payload `raw`, `payload_raw_max=raw` and
+`logical_byte_count=alloc(raw)+A`. The extra allocation unit is same-volume
+publication slack and is deliberately still present while payload bytes are
+written. The descriptor records the exact allocation bytes observed after the
+non-sparse fill. Its own central file is separately charged as
+`alloc(reservation_descriptor_raw_max)+A`; descriptor bytes are never hidden in
+the payload extent. Reopen validation requires matching job/settings/index,
+path/role/parent identity, ordinary-file identity, link count one, exact logical
+size, allocation unit, and allocated bytes at least the required physical
+allocation. Sparse, compressed, deduplicated, reflink/shared-extent, reparse, or
+allocation-unknown files do not qualify.
+
+Every non-bootstrap reservation is owned before extent creation by one fixed
+write-ahead index. `ReservationEntryV1` has exactly:
 
 ```text
-schema_version:                  1
-algorithm_version:               "final-encoding-reservation-v1"
-job_id:                          hex32
-settings_artifact_relative_path: "processing-settings-v5.json"
-settings_identity_fingerprint:   hex64
-settings_raw_sha256_at_preflight: hex64
-publication_generation:          hex32
-reservation_generation:          hex32
-settings_revision_at_preflight:  u64
-extent_entries:                  list[ReservationEntryV1]
-fingerprint:                     hex64
+reservation_generation:             hex32
+reservation_id:                     hex32
+reservation_kind:                   closed descriptor kind
+descriptor_publication_generation:  hex32?
+descriptor_relative_path:           scalar-string
+source_extent_relative_path:        scalar-string
+temporary_relative_path:            scalar-string
+target_relative_path:               scalar-string
+target_parent_identity:              DirectoryIdentity
+publication_method:                  "replace_placeholder" | "replace_existing"
+payload_role:                        scalar-string
+payload_raw_max:                     positive-u64
+logical_byte_count:                  positive-u64
+allocation_unit:                     positive-u64
+prune_root_relative_path:            scalar-string?
+marker_name:                         scalar-string?
+marker_payload_sha256:               hex64?
 ```
 
-`ReservationEntryV1` has exactly
-`reservation_id:hex32`, `reservation_kind` from the closed extent enum,
-`descriptor_relative_path:scalar-string`, `descriptor_sha256:hex64`,
-`extent_relative_path:scalar-string`, `logical_byte_count:positive-u64`,
-`allocated_byte_count:positive-u64`, and
-`filesystem_identity:ReservationFileIdentityV1`, with values equal to its
-descriptor; `descriptor_relative_path` is exactly
-`extent_relative_path + ".json"` and its SHA-256 is over the complete canonical
-descriptor bytes. Entries are in fixed consumption
-order: producer if needed, encoding-input manifest, final-video manifest, prune
-markers in canonical prune-entry order, cleanup-pending if needed, then the
-already existing job-terminal extent. The index fingerprint omits only its own
-field. Its own maximum allocation and directory entry are reserved before it is
-written through one `final_encoding_index` extent/descriptor; that bootstrap
-descriptor is not an `extent_entries` member and is removed only after the
-canonical index is directory-synced and reopen-validated.
+Every value is concrete before the index is published and must equal the later
+descriptor. Physical allocation size plus extent/placeholder identities intentionally live only
+in that later self-fingerprinted descriptor: making them required in the
+write-ahead entry would recreate the pre-index orphan window. Before the first
+downstream mutation, an index is `ready` only as a derived condition when every
+listed descriptor, placeholder where applicable, and target-local extent
+validates. After mutation begins, each entry must be exactly one of unconsumed-
+ready or consumed with its artifact/revision commit evidence; the two states
+cannot overlap. No persisted Boolean may claim readiness or consumption.
 
-Every descriptor's canonical raw bytes are at most
-`FINAL_RESERVATION_DESCRIPTOR_RAW_BYTES`. The index has at most
-`FINAL_RESERVATION_ENTRY_CAP` entries and canonical raw bytes at most
-`FINAL_RESERVATION_INDEX_RAW_BYTES`; exceeding either fails read-only preflight.
-Its incremental parser/serializer uses only the reservation stream/JSON-state
-caps in the final-control block and never constructs a second descriptor list.
+A standalone settings transaction first publishes the fixed canonical
+`.depth-surge-reservations-v1/settings-transition-reservation-v1.json` with the
+closed `SettingsTransitionReservationV1` object:
 
-The publication generation is generated before final-encoding reservation
-preflight. If the producer pair is still null after a crash, exactly one valid
-index plus matching descriptors supplies that still-unpublished generation;
-the producer transaction must commit that same value. If the pair is non-null,
-it must equal the index. A different generation, job/settings identity,
-revision outside the one allowed monotonic transition sequence, descriptor,
-size, allocation, or file identity is a hard conflict. A matching index and
-extent set is reused in place and is never allocated a second time. An
-authenticated stale set may be removed only under the writer lock after the
-typed settings/manifests prove its attempt terminal or superseded; unknown or
-mismatched files are preserved and reported. This is the only crash reuse/
-deletion policy; free-space pressure and mtime never participate.
+```text
+schema_version:                   1
+algorithm_version:                "settings-transition-reservation-v1"
+job_id:                           hex32
+settings_artifact_relative_path:  "processing-settings-v5.json"
+settings_identity_fingerprint:    hex64
+settings_revision_at_preflight:   u64
+settings_raw_sha256_at_preflight: hex64
+target_settings_revision:         u64
+target_settings_raw_sha256:       hex64
+transition_kind:                  "nonterminal_rewrite" | "attempt_restart"
+publication_generation:           hex32?
+reservation_generation:           hex32
+extent_entries:                   list[ReservationEntryV1]
+fingerprint:                      hex64
+```
 
-For an index revision `r`, current settings revision must equal checked
-`r + producer_consumed + pending_consumed + terminal_consumed`, where each term
-is exactly zero or one, is one only after that indexed transition validates, and
-producer precedes every other settings transition. On the success/cleanup path,
-pending precedes terminal; on any earlier failure path, terminal may become one
-with `pending_consumed=0` and the unused pending extent remains reserved until
-that terminal commit. Missing producer/pending entries are inapplicable, not
-consumed. Manifest/marker publication does not increment settings revision.
-Before terminal commit `terminal_consumed=0`; after it becomes one, the terminal
-settings artifact itself is the durable proof used to retire the index. No
-revision range or `>=` comparison substitutes for this equation.
-At revision `r`, the current settings raw SHA-256 must equal
-`settings_raw_sha256_at_preflight`. At a later allowed revision, the strict
-transition evidence and the immutable settings identity must validate; a raw
-hash mismatch while still at `r` is always a conflict.
+The fingerprint omits only itself. `target_settings_revision` is checked
+`settings_revision_at_preflight+1`. A nonterminal rewrite has exactly one fresh
+`nonterminal_settings` entry. Attempt restart has that entry followed by the
+replacement `job_terminal_settings` entry carrying the immutable terminal ID
+and job reservation generation from job control. The fresh rewrite descriptor
+binds this settings index and uses its current nullable publication generation;
+the replacement terminal descriptor uses null publication generation and binds
+job control, so it remains authenticated after the settings index retires. The
+target settings hash binds the one typed transition, so the index cannot be
+reused for a different rewrite.
+The fixed index must be absent or byte-valid for the exact current transition;
+mtime, random-name discovery, and newest-file selection are forbidden.
+Before publishing it, derive
+`settings_transition_index_raw=max_json_bytes(SettingsTransitionReservationV1,
+the complete concrete entry list)` and require checked physical reserve
+`alloc(settings_transition_index_raw)+2*A` plus one
+`settings_transaction_extent(entry.publication_method)` for each entry. The
+index publication charge is bootstrap space; every entry charge is then
+materialized and synced before the typed settings mutation.
 
-The sole pre-index crash case performs one bounded direct-child enumeration of
-the authenticated reservation directory, accepts only the exact ASCII filename
-grammar above plus the one fixed index name, sorts names by ASCII byte order,
-strict-parses descriptors, and
-groups them by `(publication_generation,reservation_generation)`. A group is
-recoverable only when it contains exactly the extent-kind/size multiset
-recomputed from the current settings/provider/prune plan and every descriptor
-matches; exactly one such group is required. The separately addressed
-`p-none-r-<job_reservation_generation>-...` initial/terminal group must validate
-against job control and is excluded from this invocation grouping, not treated
-as an unknown candidate. No invocation group means fresh preflight is
-allowed only when no invocation-named child exists; a nonmatching group, two
-groups, or any unknown/malformed colliding entry is a conflict.
-This is set validation, not newest-file selection.
+A final-encoding invocation likewise first publishes canonical
+`FinalEncodingReservationV1` at
+`.depth-surge-reservations-v1/final-encoding-reservation-v1.json`:
 
-Consuming an extent is also crash-identifiable. The writer never unlinks it and
-then hopes the allocator returns equivalent space. It writes the intended
-bounded canonical bytes over the beginning while retaining the descriptor's
-full logical length, file-syncs, and reopens the same identity. It then atomically
-renames that identity to the transition's deterministic sibling-temporary path,
-syncs both affected directories, truncates to the intended byte count, file-
-syncs, and performs the artifact-specific reopen validation/replacement. The
-descriptor remains until the target replacement is durable. At every crash
-boundary the descriptor/index therefore locates the same file identity at
-exactly one of its extent, deterministic temporary, or committed-target paths;
-resume either completes that declared transition from recomputed canonical bytes
-or, when the authoritative target already proves the commit, removes the
-matching descriptor. Two locations, no location before a proven commit, or a
-different identity is a conflict. This identity-preserving handoff is what
-"consume/release an extent" means everywhere below.
+```text
+schema_version:                   1
+algorithm_version:                "final-encoding-reservation-v1"
+job_id:                           hex32
+settings_artifact_relative_path:  "processing-settings-v5.json"
+settings_identity_fingerprint:    hex64
+settings_raw_sha256_at_preflight: hex64
+publication_generation:           hex32
+reservation_generation:           hex32
+settings_revision_at_preflight:   u64
+extent_entries:                   list[ReservationEntryV1]
+fingerprint:                      hex64
+```
 
-New-job creation and legacy migration calculate the complete typed schema-5
-object, job control, identity fingerprint, and all maxima before mutation. They
-physically reserve and fsync the job-control publication allocation plus **two**
-same-volume settings extents:
+Entries are in fixed consumption order: producer if needed, encoding-input
+manifest, final-video manifest, prune markers in canonical prune-entry order,
+cleanup-pending if needed, then the already existing job-terminal extent. The
+last entry repeats the descriptor plan values authenticated by job control and
+uses null descriptor publication generation; every new invocation entry uses
+the index's non-null generation and fresh invocation reservation generation.
+The index fingerprint omits only itself. Every descriptor created for a new
+entry binds this exact index path/fingerprint; the imported terminal descriptor
+continues to bind `job-control-v1.json` and its fingerprint and must validate
+byte-for-byte against the repeated entry.
+
+Both fixed indexes are bounded by `FINAL_RESERVATION_ENTRY_CAP` and
+`FINAL_RESERVATION_INDEX_RAW_BYTES`. Their incremental parser/serializer uses
+only the fixed reservation stream/JSON-state caps. The index is atomically
+create-new published, directory-synced, and reopen-validated **before** any new
+listed target-local extent or descriptor is created. It is the write-ahead
+intent and is not itself backed by another reservation extent; doing so would
+be circular. Its bounded publication is part of read-only free-space preflight,
+and failure leaves settings, manifests, markers, and frame work untouched.
+
+After index commit, create/fsync any declared zero-length target placeholder,
+then create each listed target-local payload extent, sync/reopen it, capture all
+identities/allocation, and create/sync the central descriptor. A crash after
+index commit but before any entry, after a placeholder, after only some extents,
+or between one extent fsync and descriptor commit has one result: resume reads
+the fixed index and exact paths, creates missing objects or adopts unattested
+ones only when parent identity, placeholder emptiness, zero-filled extent bytes,
+logical/allocation shape, link counts, method, and kind all match, then commits
+the descriptor. No index means no new placeholder or extent is
+authorized. An unindexed reserved-name file, extra descriptor, different path/
+parent/identity, or two fixed indexes for incompatible work is
+`ReservationConflictError`; it is preserved, never silently deleted. Thus there
+is no pre-index random group, bounded directory scan, glob, or mtime recovery
+rule.
+
+The publication generation is generated before the final index. If the producer
+pair is null after a crash, the one valid index plus ready descriptors supplies
+the still-unpublished generation and the producer transaction commits exactly
+it. If non-null, it must equal the index. For index revision `r`, current settings
+revision equals checked
+`r + producer_consumed + pending_consumed + terminal_consumed`; each term is
+zero or one and becomes one only after that indexed transition validates.
+Producer precedes all other settings transitions; pending precedes terminal on
+cleanup success, while early failure may consume terminal with pending zero.
+Manifest/marker publication does not change revision. At `r`, raw settings hash
+must equal the index snapshot; later revisions require exact transition evidence.
+No range comparison substitutes for this equation.
+
+Consumption keeps the target-directory allocation and identity. Write the
+bounded canonical payload over the start of the still-full extent, file-sync,
+reopen the same identity, and validate the intended prefix while length remains
+`logical_byte_count`. Then truncate to the exact payload byte count, file-sync,
+and reopen; require the same identity, complete canonical payload validation,
+and observed allocated bytes no greater than the descriptor allocation minus
+`A`.
+
+For `replace_placeholder`, reopen and require the exact persisted zero-length
+placeholder identity. For `replace_existing`, reopen and authenticate the
+current old target through the artifact-specific revision/hash contract; this is
+necessary because a lifecycle settings extent may outlive earlier settings
+replacements. Only after the temporary is exact and truncated may the writer
+atomically replace that already existing target within the same opened parent,
+sync the directory, and reopen/validate the new target. Thus a crash after
+truncate does not need free space to create a directory entry: recovery finds
+the exact truncated temporary and retries between two pre-existing entries. A
+placeholder stays provisional and an old target stays byte-exact until replace.
+
+The descriptor remains until target commit is durable. The only valid recovery
+states are: full-length indexed extent at its source path (zero, partial prefix,
+or complete prefix, all safely rewritable) beside the declared placeholder/old
+target; exact truncated payload at the source path beside that target; or exact
+committed extent identity at the target with the temporary absent. The reserved
+payload identity is temporary before rename and target afterward. An unindexed
+location, two locations for that identity, neither location before a proven
+commit, wrong/missing placeholder when required, different parent/identity, or
+cross-directory rename is a conflict.
+
+These pre-existing target and temporary directory entries are the physical guarantee;
+a central regular-file allocation is not accepted as a substitute. Supported
+POSIX and Windows filesystems must pass an integration gate which fills ambient
+free space after every descriptor is ready and still replaces a placeholder or
+old target from the other existing same-parent entry, directory/file flush,
+reopen, and descriptor retirement. A filesystem for which that gate returns
+ENOSPC/error 112 is unsupported for reserved publication; the lifecycle terminal
+extent remains intact so the attempt can record failure.
+
+New-job creation and valid legacy migration calculate the complete typed
+schema-5 object, job control, identity fingerprint, paths, and maxima before any
+mutation. Their read-only proof is:
 
 ```text
 reservation_descriptor_raw_max = max_json_bytes(
     ReservationExtentV1,
-    all concrete identity/path/kind values,
+    all concrete identity/path/kind/index/role values,
 )
 reservation_descriptor_extent = alloc(reservation_descriptor_raw_max) + A
-settings_transaction_extent = alloc(settings_artifact_raw_max) + A
-                            + reservation_descriptor_extent
+settings_target_extent = alloc(settings_artifact_raw_max) + A
+placeholder_entry_charge(method) =
+    A when method == "replace_placeholder" else 0
+settings_transaction_extent(method) = settings_target_extent
+                                      + reservation_descriptor_extent
+                                      + placeholder_entry_charge(method)
 job_control_raw = max_json_bytes(JobControlV1, concrete legacy path or null)
 job_control_publication_extent = alloc(job_control_raw) + 2*A
 initial_settings_reserve =
-      2 * settings_transaction_extent
-    + job_control_publication_extent
+      job_control_publication_extent
     + A  # create/sync the authenticated reservation directory
+    + settings_transaction_extent("replace_placeholder")
+    + settings_transaction_extent("replace_existing")
 ```
 
-One descriptor is `initial_settings` or `migration_settings`; the other is
-`job_terminal_settings`. After the locator and initial schema-5 artifact are
-directory-synced and reopen-validated, the first extent has been consumed but
-the terminal extent remains physically allocated for every `in_progress` job.
-If migration itself produces a terminal `completed`/`failed` artifact, that
-validated artifact proves no current attempt needs a failure write, so the
-matching unused terminal extent/descriptor is removed only after reopen
-validation; a later explicit attempt recreates it as specified. Migration leaves
-the legacy artifact byte-exact. Any failure before the initial schema-5 commit
-starts no frame work; an incomplete locator/migration is resumed only from its
-matching job identity and reservations.
+Bootstrap order is unique: perform that read-only free-space proof; publish,
+sync, and reopen-validate `job-control-v1.json`; create/adopt and sync the
+reservation directory; create/sync/reopen the initial-settings target
+placeholder plus target-local initial-or-migration and terminal extents;
+commit/sync both descriptors; publish schema-5 settings
+through the initial/migration extent; only then permit frame work. Job control's
+two complete bootstrap entries are the write-ahead intent for these extents,
+and their descriptors bind the job-control fingerprint.
 
-Creation order is exact: construct the object/IDs and verify the complete
-initial reserve; publish/reopen-validate `job-control-v1.json` through its
-preallocated create-new temporary; create or adopt the reservation directory
-and the two locator-named extent/descriptor pairs; only then publish schema-5
-settings through the initial/migration extent. A crash with a valid locator but
-no settings is an explicit incomplete creation/migration and reuses those IDs.
-A crash before locator publication has changed no authoritative job artifact;
-only an exact matching locator temporary from the same requested object may be
-removed/retried, otherwise creation reports a conflict. Frame work never uses a
-locator-only job.
+A valid locator with no committed settings is exactly `locator_only`: its fixed
+target is either still absent before placeholder creation or is the exact zero-
+length placeholder declared by the first bootstrap entry; no other target bytes
+or identity qualify. Recovery creates/adopts only the declared placeholder and
+two extents, then resumes bootstrap. It is never an in-progress job, never starts
+frame work, and needs no terminal failure write.
+A crash before locator publication has no authoritative job artifact; only its
+exact matching create-new locator temporary may be retried. This ordering
+deliberately does not claim that payload extents existed before locator
+publication. If migration produces terminal completed/failed settings, reopen
+validation permits removal of the unused terminal extent/descriptor; an explicit
+new attempt later recreates the same terminal generation/ID through the fixed
+settings-transition index. Legacy bytes remain unchanged.
 
-The `job_terminal_settings` extent remains from that point until one durable
-`completed` or `failed` transition consumes it. Depth, canonicalization, stereo,
-encoding, a growing output video, and cleanup cannot borrow it. Any optional
-nonterminal settings rewrite before finalization first creates a separate
-`nonterminal_settings` extent while the terminal extent remains intact. A
-terminal-to-new-attempt transition similarly reserves one transition extent and
-one replacement terminal extent before changing status. Thus every early-stage
-failure can persist `failed` without an ambient free-space assumption, and a
-resume cannot consume the only space reserved for its next failure.
+For an in-progress job, `job_terminal_settings` remains a target-local physical
+extent until one durable completed/failed transition consumes it. Depth,
+canonicalization, stereo, FFmpeg growth, manifests, and cleanup cannot borrow
+it. Any standalone nonterminal rewrite publishes its fixed settings index first
+and reserves a separate extent while terminal remains. A terminal-to-new-attempt
+transition indexes and readies both its rewrite extent and replacement terminal
+extent before changing status. Once every indexed transition is committed, the
+fixed settings index is removed and the reservation directory synced. Unknown
+or mismatched artifacts are never cleaned up by free-space pressure.
 
 `SettingsArtifactTransactionV1` is the only schema-5 creation or mutation API.
-Every caller, including creation and migration, uses the eight-MiB final-control
-budget and the six-MiB `producer_settings_commit_peak` formula below. Under the
-acquired job-writer lock it performs exactly this sequence:
+Every caller uses the eight-MiB final-control budget and six-MiB settings phase
+peak. Under the job-writer lock it performs exactly:
 
-1. Resolve and validate the already published `job-control-v1.json`. The
-   preceding new-job preflight required both fixed names absent; initial settings
-   creation now requires the matching locator present and only the settings name
-   absent. Migration opens only the locator's frozen legacy component and also
-   requires the fixed schema-5 target absent; every later transition opens only
-   `processing-settings-v5.json`. Open without following a link, enforce the raw
-   cap while streaming, strict-parse the declared legacy schema or canonical
-   schema 5, and capture the opened file identity.
-2. Apply one declared typed transition to a new complete schema-5 object,
-   increment revision where required, and preserve every field outside that
-   transition exactly. Serialize canonical bytes through the authenticated
-   reserved extent and identity-preserving handoff above to a non-link temporary
-   in the settings file's directory. Flush and file-sync it.
-3. Reopen that temporary without following a link, require the same file
-   identity, strict-parse it within the same bounds, require its raw SHA-256 and
-   canonical bytes to equal the intended serialization, and verify the complete
-   typed object plus the transition-specific target fields.
-4. Atomically replace the settings path, durably sync its parent directory, then
-   reopen the final path without following a link. Require the expected ordinary
-   file identity, exact byte count, raw SHA-256, canonical re-encoding, complete
-   typed object, and transition-specific marker/target/status fields.
+1. Resolve/reopen job control and the applicable bootstrap, standalone, or final
+   index; require every entry for this transition ready. Initial creation
+   requires locator present and its exact reserved fixed-target placeholder.
+   Migration opens only the locator's frozen legacy component and requires the
+   same placeholder. Later transitions open only canonical
+   `processing-settings-v5.json`.
+2. Strict-parse the bounded current artifact, apply one declared typed
+   transition, increment revision where required, preserve all other fields, and
+   stream canonical bytes into the authenticated target-local extent without
+   changing its full logical length.
+3. File-sync/reopen the same identity, strict-parse and byte/hash-validate the
+   intended prefix, truncate/reopen to release `A`, then perform the declared
+   placeholder or existing-target same-parent atomic replacement above.
+4. Sync the parent and reopen the final path without following a link. Require
+   the expected ordinary identity, byte count, raw SHA-256, canonical
+   re-encoding, complete typed object, and transition-specific fields before
+   retiring the descriptor/index entry.
 
-Temporary create, write, flush, file sync, replace, directory sync, reopen, or
-validation failure is typed and never reported as a committed transition. Every
-supported POSIX volume uses `fsync` on the opened parent directory. The Windows
-adapter uses a write-through atomic replace (`ReplaceFileW`, or
-`MoveFileExW` with replace-existing plus write-through for creation), followed
-by `FlushFileBuffers` on the reopened target; this is the named Windows
-directory-sync-equivalent and is not confused with an unsupported directory-
-handle flush. Both adapters must pass the crash/reopen gate. Lack of a working
-adapter is not permission to launch FFmpeg after an unattested producer write.
-An orphan temporary is never read as settings and is removed only under the
-writer lock after the authoritative path has been validated. The existing
-direct-overwrite `save_processing_settings`/
-`update_processing_status` paths and the current pretty serializer are forbidden
-for schema 5. The current malformed minimal-fallback artifact is also forbidden;
-failure to create and reopen-validate initial schema-5 settings aborts the job
-before frame work.
+Temporary write, flush, fsync, truncate, allocation-release check, replace,
+directory sync, reopen, or validation failure is typed and never reported as a
+commit. POSIX uses parent-directory `fsync`. Windows uses write-through
+`ReplaceFileW`, or `MoveFileExW` with replace/write-through for creation, plus
+`FlushFileBuffers` on the reopened target. Both adapters must pass the full-disk
+and crash/reopen gates. Existing direct-overwrite settings helpers, pretty schema-
+5 serialization, malformed minimal fallback, and an unindexed temporary are
+forbidden.
 
-Finalization has a fixed transition schedule. The producer-marker transaction,
-when needed, occurs immediately before the first FFmpeg launch. After both final
-manifests are durable, `keep_intermediates=false` commits exactly one
-`cleanup_status="pending"` transaction before cleanup. One final transaction
-then commits the terminal cleanup value, `processing_status`, `terminal_at`,
-duration, and bounded runtime information together. With intermediates kept,
-that single final transaction writes `cleanup_status="not_requested"`; it does
-not perform a separate pending write. A job is not reported completed until the
-terminal transaction is directory-synced and reopen-validated. If that commit
-fails, already authenticated media/manifests remain intact and resume retries
-only the missing settings/finalization transition from their persisted evidence;
-it does not infer settings success or destroy the publication.
+Finalization schedule remains exact. Producer settings, when needed, commit
+immediately before first FFmpeg launch. After both manifests are durable,
+`keep_intermediates=false` publishes every indexed prune marker, commits
+`payload_pruned`, commits one cleanup-pending transition, then performs
+authorized cleanup. One final transaction commits terminal cleanup/status/time/
+duration/runtime together.
+Keeping intermediates writes `not_requested` in that final transaction and has
+no pending write. Completion is not reported until terminal settings are synced
+and reopen-validated. A failed terminal commit preserves authenticated media and
+manifests and resumes only the missing declared transition.
 
 There is no persisted `auto` stereo-render mode. The resolver receives the
 selected renderer device, writes the resolved two-mode value, and therefore
@@ -3392,22 +3567,39 @@ its own isolated streaming phase, released before producer settings or FFmpeg;
 the persisted files, not a resident entry list, carry crash state afterward.
 
 Encoding FFmpeg uses `-nostats -progress pipe:1` and one project-owned bounded
-byte drain. Recognized progress key/value lines are parsed within
-`FINAL_ENCODE_LINE_BYTES` and immediately discarded, so their cumulative length
-is not resident and is not charged as diagnostics. Track the maximum valid
-canonical nonnegative decimal values observed for `frame`, `out_time_us`,
-legacy-compatible `out_time_ms`, and `total_size`. `N/A` is accepted only for
-`total_size` and does not count as progress. The semantic stall clock starts at
-successful child launch and resets only when at least one of those four numeric
-maxima strictly increases. Repeated values, regressions, `progress=continue`,
-other keys, stdout/stderr activity, and cancellation polling do not reset it.
-There is no total encode wall deadline because valid video length is variable;
+byte drain. A legal stdout progress line, including its terminator, is at most
+`FINAL_ENCODE_LINE_BYTES` raw bytes and is exactly
+`[a-z0-9_]{1,32}=<value>` followed by LF or CRLF, where `<value>` is zero or more
+printable ASCII bytes `0x20..0x7e`. NUL, non-ASCII, a missing terminator at EOF,
+an empty/overlong key, or any other syntax is malformed. Legal lines are parsed
+and immediately discarded, so cumulative progress length is neither resident
+nor diagnostic-ring input.
+
+`frame`, `out_time_us`, legacy-compatible `out_time_ms`, and `total_size` require
+canonical nonnegative decimal `0|[1-9][0-9]*` fitting `u64`; `total_size` alone
+also accepts exact `N/A`, which has no semantic value. Track the maximum numeric
+value for each. `progress` accepts only exact `continue` or `end`, controls child
+state, and never resets the clock; successful encode requires one terminal
+`progress=end` before clean process exit. Every other syntactically legal key,
+including `fps`, `bitrate`, `speed`, `dup_frames`, `drop_frames`, and
+`stream_0_0_q`, is silently discarded. It neither resets the clock nor enters
+the diagnostic ring, and a future FFmpeg version may add another legal key
+without changing failure behavior.
+`progress=continue` may repeat; exact `progress=end` occurs exactly once and is
+the final legal stdout record. A line or raw byte after it is a parser failure.
+
+The semantic stall clock starts at successful child launch and resets only when
+at least one of the four numeric maxima strictly increases. Repeated values,
+regressions, `N/A`, either legal `progress` control, ignored legal keys, stderr
+activity, and cancellation polling do not reset it. There is no total encode wall
+deadline because valid video length is variable;
 `FINAL_ENCODE_STALL_SECONDS` without semantic advance raises
 `FinalEncodeTimeoutError`.
 
-Unrecognized/error bytes are retained only in the fixed tail ring. An overlong
-line or diagnostic bytes beyond the diagnostic cap marks the encode failed while
-the drain continues until the process is terminated/reaped. Encode timeout,
+Only raw stderr and malformed/overlong stdout-line bytes enter the fixed tail
+diagnostic ring. A malformed/overlong line or diagnostic bytes beyond the cap
+marks the encode failed while the drain continues until termination/reap; legal
+ignored progress keys can never cause diagnostic overflow. Encode timeout,
 cancellation, parser/pipe failure, and output overflow all close stdin,
 terminate, continue bounded drainage, wait
 `FINAL_PROCESS_TERMINATE_GRACE_SECONDS`, kill if needed, and reap exactly once.
@@ -3525,8 +3717,9 @@ and closes it. Only then does it atomically replace the final path and durably
 sync the final-output directory where supported. It reopens the final path
 without following a link and verifies the same byte count and SHA-256. It next
 atomically commits the revalidated canonical encoding-input manifest and then
-the canonical self-fingerprinted final-video manifest from separately fsynced
-job-root temporaries, syncing the job-root directory after each replacement.
+the canonical self-fingerprinted final-video manifest from their separately
+indexed/fsynced target-local extents, replacing each declared placeholder or old
+target and syncing the job-root directory after each replacement.
 Windows uses `FlushFileBuffers`; unsupported directory-sync operations are
 recorded but do not permit skipping file flushes. The raw final-video manifest
 SHA-256 plus its bound input-manifest fingerprint are the only evidence accepted
@@ -3616,7 +3809,8 @@ a temporary and atomic replacement; resume must not inspect the container or
 re-resolve `auto` to guess provenance.
 Both manifests are retained final artifacts and are never listed for
 intermediate cleanup. Final-encoding disk preflight physically reserves their
-schema-derived temporary allocations plus a separate extent for each remaining
+schema-derived target-local temporary allocations and any required final-path
+placeholders, plus a separate extent for each remaining
 producer and pending-cleanup transaction before starting FFmpeg; it authenticates
 and indexes the lifecycle terminal extent already retained since job creation
 rather than allocating it again.
@@ -3645,12 +3839,12 @@ manufacture provenance, or authorize pruning.
 
 Resolve exactly one expected job final-video path from the immutable
 `output_info.expected_final_relative_path`. A raw schema-1-through-4 audit which
-has not migrated yet applies the exact old-field/frozen-v1 selection above in
-memory; it does not persist during read-only inspection. The copied old field
-uses `ContainedLegacyFinalComponentV1`; a frozen-v1 fallback uses
-`PortableFinalComponentV1`. Failure to obtain one contained path raises
-`FinalMediaTargetMetadataError` before returning a
-disposition. Never invoke the current output-name helper or glob for MP4 files.
+has not migrated requires the exact retained `expected_output_filename` in
+memory; it does not persist during read-only inspection. The copied field uses
+`ContainedLegacyFinalComponentV1`. Absence raises
+`LegacyFinalTargetUnknownError` without a filesystem lookup; malformed or
+unlocatable content raises `FinalMediaTargetMetadataError` before returning a
+disposition. Never invoke v1, the current output-name helper, or a glob for MP4 files.
 In particular, `*_stitched_*.mp4` and every `/stitch_video` product are invisible
 to this audit. Define presence bits by checking directory entries at that exact
 path and the two exact job-root manifest paths without following the final
@@ -3785,26 +3979,18 @@ directory_identity:        DirectoryIdentity
 marker:                    PruneMarker
 ```
 
-`DirectoryIdentity` is the strict platform union:
+`DirectoryIdentity` is the shared closed union defined by Reservation Extent V1.
+Its POSIX `file_identity` values come from the already opened directory handle;
+Linux obtains the stable numeric mount member from `statx.stx_mnt_id`. Its
+Windows `file_identity` comes from `GetFileInformationByHandleEx(FileIdInfo)`.
+A platform/filesystem which cannot provide every shared field cannot prune and
+reports an actionable cleanup error.
 
-```text
-POSIX:   {kind: "posix", st_dev: integer, st_ino: integer,
-          mount_identity: string}
-Windows: {kind: "windows", volume_serial: string, file_id: string}
-```
-
-POSIX integers are nonnegative uint64 values read from the already opened
-directory handle. `mount_identity` is the canonical decimal string, with no
-leading zero except `"0"`, of a kernel-provided non-path numeric mount ID; Linux
-uses `statx.stx_mnt_id`. A POSIX port without an equivalent stable numeric mount
-ID cannot prune. Windows uses `GetFileInformationByHandleEx` with
-`FileIdInfo`: volume serial is exactly 16 lowercase hexadecimal digits and the
-128-bit file ID is exactly 32. A platform/filesystem which cannot provide all
-required identity fields cannot prune and reports an actionable cleanup error.
-
-`PruneMarker` has exactly `name` and `sha256`. Immediately before the
-`payload_pruned` commit, create with create-new/no-follow semantics inside each
-opened target root a marker named
+`PruneMarker` has exactly `name` and `sha256`. Final-encoding reservation has
+already created and authenticated a zero-length final marker placeholder plus a
+separate target-local payload extent inside each opened target root. Immediately
+before the `payload_pruned` commit, consume that pair through write/truncate/
+same-parent replace/fsync to publish a marker named
 `.depth-surge-prune-v2-<32-lowercase-hex>.marker`, where the token is 128 bits
 from the OS CSPRNG. Its bytes are canonical ASCII JSON plus LF with exactly the
 keys `cleanup_contract_version=2`, `relative_path=<the entry path>`, and
@@ -3821,9 +4007,10 @@ entry uses `stage_key="stereo_diagnostics_frames"` and
 `relative_path="04_stereo_diagnostics/frames"`. Stage keys are display/audit
 labels only; cleanup never resolves them through the current
 `INTERMEDIATE_DIRS` mapping.
-Each authorized root must also share the acquired job root's POSIX `st_dev` and
-mount ID or Windows volume serial; a stage mounted underneath the job root is
-not a prune target.
+Each authorized root must also share the acquired job root's POSIX
+`file_identity.device` and `file_identity.mount_identity`, or Windows
+`file_identity.volume_serial`; a stage mounted underneath the job root is not a
+prune target.
 
 Resume supports the committed `cleanup_contract_version` or performs no deletion
 and reports an actionable version error. In the normal recursive path it
@@ -3842,19 +4029,23 @@ followed or recursively deleted; it fails cleanup with an actionable identity
 error and leaves every other unprocessed entry untouched. Recursive traversal
 also never follows a descendant link or reparse point; it may unlink that entry
 itself but cannot visit or delete its target. Every POSIX descendant directory
-must match both the committed root `st_dev` and `mount_identity`; every Windows
-descendant must match the committed volume serial and must not be a reparse
-point. A mount/bind-mount, identity-read failure, mismatching marker, missing
+must match both committed `file_identity.device` and
+`file_identity.mount_identity`; every Windows descendant must match committed
+`file_identity.volume_serial` and must not be a reparse point. A mount/bind-
+mount, identity-read failure, mismatching marker, missing
 marker outside the terminal empty-root rule below, or volume crossing preserves
 the residual tree and reports the offending path.
 Enumeration, identity checks, child opens, and unlink/remove operations are all
 handle-relative to the verified root; cleanup never switches back to recursive
 path-string APIs after authorization.
 
-A marker created before a crash but absent from committed `prune_entries` is an
-inert transaction temporary and never authorizes tree deletion. Its reserved
-name is excluded from ordinary payload listings; a later audit may unlink only
-that marker itself after strict name/content validation. During authorized
+A marker placeholder or fully written marker absent from committed
+`prune_entries` is inert transaction state and never authorizes tree deletion.
+Its reserved name is excluded from ordinary payload listings. Only its matching
+live final-encoding index plus descriptor/identity, or terminal-failure evidence
+which authenticates that unused indexed entry, may complete or unlink that one
+placeholder/marker; content or name alone is insufficient. An unindexed entry is
+preserved as a conflict. During authorized
 cleanup, keep the committed marker until every other descendant has been
 removed. Unlink the marker only after a handle-relative enumeration proves that
 it is the sole remaining entry, then immediately remove the already-open root
@@ -3940,8 +4131,9 @@ deleted. Their presence never makes them reusable.
 
 Finalization order is exact: durably publish and validate the final video,
 durably commit and validate `encoding_input_manifest.json`, durably commit and
-validate `final_video_manifest.json`, create/fsync every prune marker and capture
-the matching open-handle directory identities, commit `payload_pruned`, run
+validate `final_video_manifest.json`, consume/fsync every indexed target-local
+prune-marker extent and recapture the matching open-handle directory identities,
+commit `payload_pruned`, run
 `SettingsArtifactTransactionV1` for `cleanup_status="pending"`, run authorized
 cleanup from the persisted `prune_entries`, then commit one terminal settings
 transaction containing the cleanup result and processing completion fields. A
@@ -5099,7 +5291,8 @@ additional_settings_transaction_count =
       (1 when the producer pair is null else 0)     # producer marker
     + (1 when keep_intermediates is false else 0)   # cleanup pending
 additional_settings_transaction_reserve =
-    additional_settings_transaction_count * settings_transaction_extent
+    additional_settings_transaction_count
+    * settings_transaction_extent("replace_existing")
 ```
 
 The addition, allocation rounding, and multiplication above use checked uint64
@@ -5109,42 +5302,50 @@ terminal descriptor contributes one index entry but zero newly required bytes.
 Define one fully described new physical extent charge:
 
 ```text
-reservation_extent_charge(raw, descriptor_raw) =
+reservation_extent_charge(raw, descriptor_raw, method) =
       alloc(raw) + A
     + alloc(descriptor_raw) + A
+    + placeholder_entry_charge(method)
+
+write_ahead_index_publication_charge(raw) = alloc(raw) + 2*A
 
 final_encoding_index_raw = max_json_bytes(
     FinalEncodingReservationV1,
     3 + additional_settings_transaction_count + prune_marker_file_count,
-    every concrete descriptor path/identity/generation,
+    every concrete source/temporary/target path, parent identity, role,
+    marker binding, size, generation, and descriptor path,
 )
 
 final_encoding_new_reserve =
-      additional_settings_transaction_reserve
+      write_ahead_index_publication_charge(final_encoding_index_raw)
+    + additional_settings_transaction_reserve
     + reservation_extent_charge(
           encoding_input_manifest_raw,
-          descriptor_raw["encoding_input_manifest"])
+          descriptor_raw["encoding_input_manifest"],
+          indexed_method["encoding_input_manifest"])
     + reservation_extent_charge(
           final_video_manifest_raw,
-          descriptor_raw["final_video_manifest"])
+          descriptor_raw["final_video_manifest"],
+          indexed_method["final_video_manifest"])
     + sum(reservation_extent_charge(
-              prune_marker_raw[j], descriptor_raw["prune_marker", j])
+              prune_marker_raw[j], descriptor_raw["prune_marker", j],
+              "replace_placeholder")
           for every planned prune marker j)
-    + reservation_extent_charge(
-          final_encoding_index_raw,
-          descriptor_raw["final_encoding_index"])
 ```
 
-The checked preflight requires and physically creates/fsyncs exactly
-`final_encoding_new_reserve` before FFmpeg. The index uses the same
-identity-preserving extent handoff as every other canonical artifact. Existing
-settings, the terminal extent, and any old final
-video/manifests already consume blocks and are never counted as free. All new
-terms are materialized as the authenticated non-sparse extent/descriptor/index
-files above, not an unprotected free-space estimate.
+The checked preflight first atomically publishes/fsyncs the fixed write-ahead
+index, then creates/fsyncs every declared target placeholder, target-parent-local
+extent, and central descriptor. It requires exactly
+`final_encoding_new_reserve` before FFmpeg.
+The index is a bounded bootstrap publication rather than a recursively reserved
+payload extent. Existing settings, the terminal extent, and any old final video/
+manifests already consume blocks and are never counted as free. Every other new
+term is materialized as an authenticated non-sparse target-local extent plus
+descriptor and any declared placeholder, not left as an unprotected free-space
+estimate.
 
-Immediately before each declared settings transition, release exactly one
-`settings_transaction_extent` and consume it through
+Immediately before each declared settings transition, consume exactly one
+indexed `settings_transaction_extent` through
 `SettingsArtifactTransactionV1`. A consumed slice is never assumed to be
 replenished from the replaced old settings file. Additional unused extents plus
 the preexisting terminal extent remain physically reserved across FFmpeg growth,
@@ -5158,12 +5359,14 @@ failure write still has that extent and every unused additional slice is release
 only after the terminal transition is reopen-validated.
 
 Before FFmpeg, each manifest/marker allocation already exists as its validated
-zero-filled extent plus descriptor. The artifact transaction uses the
-identity-preserving prefix-write/rename/truncate handoff above; it never closes
-and unlinks an extent before a replacement temporary owns the same blocks.
-Canonical bytes are checked against the indexed raw maximum, fsynced, reopened,
-and validated before atomic replacement and target-directory sync. Only then
-may the matching descriptor be removed and the next indexed extent be consumed.
+zero-filled target-local extent plus descriptor and, when needed, final-path
+placeholder. The artifact transaction writes
+and validates canonical bytes at full reserved length, then truncates and proves
+at least `A` released. It atomically replaces the declared placeholder or old
+target according to the indexed method and syncs the parent. It never
+unlinks an extent and asks the allocator for a new temporary or target-directory
+entry. Only durable target reopen validation may
+retire the descriptor and advance to the next indexed extent.
 Prune markers follow the same one-at-a-time rule after both manifests are
 durable. The final-encoding index is removed only
 after all applicable publications/markers and the terminal settings transition
@@ -5198,9 +5401,10 @@ of logical path sizes. Compute a separate ledger for every target volume and
 never transfer reclaim credit between volumes. The audit runs under the acquired
 job writer lock and uses `lstat` or non-following handle opens:
 
-- on POSIX, allocation identity is `(st_dev, st_ino)` and allocated bytes are
-  `st_blocks * 512`;
-- on Windows, allocation identity is `(volume_serial, file_id)` and bytes are
+- on POSIX, allocation identity is the exact shared `PosixFileIdentityV1`
+  `(device,inode,mount_identity)` and allocated bytes are `st_blocks * 512`;
+- on Windows, allocation identity is the exact shared
+  `WindowsFileIdentityV1` `(16-hex volume_serial,32-hex file_id)` and bytes are
   the filesystem allocation size from the opened handle, not `st_size`;
 - each allocation identity contributes at most once, and only when its reported
   hard-link count equals the number of directory entries with that identity in
@@ -5354,6 +5558,26 @@ It is not a setting, saved mode, resume identity, or production branch.
    settings and `QualityStereoControls`; accepted NumPy integers normalize to
    Python `int`. The four discriminated plan variants reject every crossed
    primitive/settings/control combination before decoding.
+10. Completed-state fixtures migrate, canonically serialize, strict-reopen, and
+    bit-compare `processing_time_seconds` for these exact millisecond/binary64-
+    hex pairs: `1/3f50624dd2f1a9fc`, `7/3f7cac083126e979`,
+    `1001/3ff004189374bc6a`, `1003/3ff00c49ba5e353f`,
+    `1007/3ff01cac083126e9`, `123456789/40fe240c9fbe76c9`,
+    `18446744073709547520/4350624dd2f1a9fb`,
+    `18446744073709549568/4350624dd2f1a9fb`, and
+    `18446744073709551615/4350624dd2f1a9fc`. The old multiply/floor check fails
+    at 1001/1003/1007 but the authoritative derivation passes; epsilon is never
+    accepted.
+11. Raw schema-1-through-4 fixtures with an absent
+    `output_info.expected_output_filename` raise
+    `LegacyFinalTargetUnknownError`, write no locator/schema 5, perform no final-
+    path stat/open/glob, and leave every legacy byte unchanged. A present valid
+    component alone may migrate.
+12. Portable-name fixtures cover all six superscript device bases. The six true
+    dotted-device candidates above fail then hash-fallback; their results pass
+    complete validation and Windows create/open/rename/delete. Exact
+    `COM³.mp4` and `LPT³.mp4` remain non-fallback controls whose suffixed
+    candidates pass the same integration operations.
 
 ### Geometry and Numeric Oracles
 
@@ -5510,7 +5734,8 @@ It is not a setting, saved mode, resume identity, or production branch.
    names and remains byte-identical. Float-bit fixtures require `3f800001` from
    both endian hosts and reject the little-endian byte spelling `0100803f`.
 4. Fault injection after final-video close, file fsync, atomic publish,
-   encoding-input/publication-manifest fsync/replace, prune-marker create/fsync,
+   encoding-input/publication-manifest fsync/replace, reserved prune-marker
+   placeholder/write/truncate/replace/fsync,
    directory-identity capture, prune metadata, and every cleanup step proves the
    exact recovery sequence. Missing/stale input or
    publication evidence always reencodes; two valid manifests after a crash
@@ -5536,11 +5761,26 @@ It is not a setting, saved mode, resume identity, or production branch.
    assembled FFmpeg ENOSPC tests leave an old final video and both old manifests
    byte-exact
    while removing sibling/owned reservation temporaries. Reservation fixtures
-   cover every exact filename/kind, descriptor and index key, job/settings/
-   publication-generation binding, logical versus allocated bytes, POSIX and
-   Windows identities, non-sparse enforcement, crash adoption between extent
-   fsync and descriptor commit, exact matching reuse without reallocation, and
-   conflict-preserving rejection of unknown/stale/mismatched files. Hard-link fixtures cover the
+   cover every exact target-local temporary and central descriptor filename,
+   kind/role/path/prune binding, both fixed write-ahead index schemas, job/
+   settings/publication-generation binding, logical versus allocated bytes, and
+   non-sparse enforcement. They inject crashes before/after index publication,
+   each target-parent extent create/fsync, descriptor commit, full-length payload
+   validation, truncate/released-`A` check, same-parent rename, target reopen,
+   and descriptor/index retirement. Matching partial work is adopted without
+   reallocation; unindexed, stale, wrong-parent, wrong-mount, or mismatched files
+   are preserved as conflicts. Bootstrap fixtures prove the sole order is free-
+   space proof, locator, reservation directory, initial target placeholder, both
+   settings extents/descriptors, initial settings, then frame work;
+   `locator_only` has no other
+   interpretation. A full-disk integration gate removes ambient free space only
+   after readiness and proves manifest/settings/marker publication uses the
+   pre-existing placeholder/old-target and payload entries; truncate/rename
+   never creates a new directory entry. No payload
+   extent is accepted in the central reservation directory. POSIX identities
+   include the stable mount ID; Windows fixtures require exactly 16 lowercase
+   hex volume digits plus 32 file-ID digits in reservation, prune, and reclaim.
+   Hard-link fixtures cover the
    existing no-op crop links, retained links, external-link counts,
    symlinks/reparse points, duplicate identities,
    allocation-size lookup failure, per-volume ledgers, and revalidation races.
@@ -5609,10 +5849,17 @@ It is not a setting, saved mode, resume identity, or production branch.
     low-rational-fps audio, AAC priming/tail, maximum accepted audio packet
     count, one packet over bound, and byte-dominant container fixtures. They
     assert checked `N + audio_probe_units`, byte work units, max selection, and
-    timeout cap. Encode progress fixtures prove only strict increases of
+    timeout cap. Encode-progress fixtures accept LF/CRLF bounded printable-ASCII
+    lines for standard and future `[a-z0-9_]{1,32}` keys; `fps`, `bitrate`,
+    `speed`, `dup_frames`, `drop_frames`, `stream_0_0_q`, and an unknown legal
+    key are discarded without ring growth. Only strict increases of canonical
     `frame`/`out_time_us`/`out_time_ms`/`total_size` reset the 120-second clock;
-    repeats, regressions, `N/A`, unrelated output, and a silent child do not,
-    and every timeout takes the common terminate/drain/grace/kill/reap path.
+    repeats, regressions, `N/A`, either legal progress control, ignored keys, and
+    a silent child do not. Invalid `progress` values, noncanonical/overflow
+    counters, missing terminator, NUL/non-ASCII, bad/overlong keys or lines, and
+    any post-`end` byte or cap-plus-one stderr take the parser/budget failure path
+    and common terminate/drain/grace/kill/reap sequence. A clean success requires
+    exactly one final `progress=end`.
     Full-decode progress fixtures prove monotonic
     `frame`/`out_time_us`/`out_time_ms` resets the stall clock while repeated or
     unrelated lines do not, require `progress=end`, and exercise the 120-second
@@ -5694,16 +5941,18 @@ It is not a setting, saved mode, resume identity, or production branch.
     v4 launch, the coordinator commits the marker.
     Deleting both manifests afterward yields incomplete evidence, never legacy,
     including after a failed later encode. Target-path fixtures prove new jobs,
-    retained `expected_output_filename`, and frozen-v1 fallback each persist one
-    immutable contained component; only new/fallback names are required
-    portable. Helper changes cannot redirect audit, argv, manifest, or `path64`.
+    and retained `expected_output_filename` each persist one immutable contained
+    component; only new names are required portable. A missing retained field is
+    target-unknown and invokes neither new nor historical naming logic. Helper
+    changes cannot redirect audit, argv, manifest, or `path64`.
     Naming goldens cover invalid scalar/control input,
     preset/custom resolution grammar, multi-byte and non-BMP stems, both 240-unit
     limits and their adjacent values, exact deterministic hash truncation,
     `CON.foo.mp4`, `con.foo.mp4`, `AUX.bar.mp4`, `NUL..mp4`,
-    `COM1.part.mp4`, and `LPT9.part.mp4` full-
-    validator results, and rejection before any filesystem create when the fixed
-    tail cannot fit. A locatable historical 60-emoji component audits read-only
+    `COM1.part.mp4`, `LPT9.part.mp4`, all six dotted superscript-device inputs,
+    and the two valid unsplit superscript controls. They assert candidate/fallback
+    decisions, full-validator results, and rejection before any filesystem create
+    when the fixed tail cannot fit. A locatable historical 60-emoji component audits read-only
     despite exceeding 240 UTF-8 bytes; explicit reencode returns
     `LegacyFinalTargetNotPortableError` without touching it. Absolute,
     separator-bearing, dot-segment, NUL, link/reparse, and unlocatable legacy
@@ -5726,12 +5975,17 @@ It is not a setting, saved mode, resume identity, or production branch.
     ambiguous, and migration retains one exact history path without replacing
     it. Disk-full fixtures consume the unknown video space immediately after
     initial settings and after every early pipeline stage while proving the
-    lifecycle terminal extent can still commit `failed`. They also prove
-    independent producer/pending extents remain with intermediates off, the
+    target-local lifecycle terminal extent can still commit `failed`. They also
+    prove the fixed standalone settings index is durable before any rewrite/
+    replacement extent, partial index groups recover uniquely, and no random
+    nonterminal extent can exist without a persistent owner. Independent
+    producer/pending extents remain with intermediates off, the
     same original terminal extent is indexed rather than double-counted, and a
     terminal-to-new-attempt transition preallocates both rewrite/replacement
     extents. Cleanup-only resume reuses its one or two persisted indexed extents
-    and allocates neither again. No
+    and allocates neither again. Completed legacy fixtures also run every frozen
+    millisecond/binary64 pair through migration, canonical serialization, raw-
+    maximum construction, and terminal reopen validation. No
     direct pretty-JSON overwrite runs, every phase remains at six MiB or less,
     and no job reports completion before the terminal canonical settings bytes
     are directory-synced and reopen-validated.

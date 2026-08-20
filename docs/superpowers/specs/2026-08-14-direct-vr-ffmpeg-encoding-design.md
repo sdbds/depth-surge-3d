@@ -16,8 +16,9 @@ return interface; the canonical specification replaces input validation,
 audio and `-shortest` policy, command normalization, publication/manifests,
 container validation, bounded source-audio handling, the persisted final target
 and producer marker, the closed schema-5 settings/job-control locator,
-lifecycle-spanning authenticated reservation extents, new-versus-legacy target
-validation, bounded encoder/final-validator lifecycles, work-unit FFprobe
+lifecycle-spanning target-parent reservation extents, fixed write-ahead indexes,
+shared file identities, new-versus-legacy target validation, bounded encoder/
+final-validator lifecycles, work-unit FFprobe
 deadlines, resume, and cleanup. The sentence above about unchanged recovery
 behavior does not override that later transaction contract.
 Publication v4 applies only to orchestrated job final-media calls through
