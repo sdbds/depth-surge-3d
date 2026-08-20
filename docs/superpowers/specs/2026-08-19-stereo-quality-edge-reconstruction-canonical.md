@@ -235,11 +235,16 @@ defects.
 | One local `safe_donor` charge hid a neighbourhood scan | Charge a conservative full Chebyshev support for every donor predicate without allocating a dense mask, and advance Quality RGB identity to v8. |
 | Canonical U64 frame indexes exceeded the unspecified image2 domain | Fix the supported image2 maximum to signed-int max, use checked last-index arithmetic, and require boundary integration fixtures. |
 | Legacy final-media classification and states were not closed | Persist the pre-migration source settings schema, define `FinalMediaAuditDispositionV1` and its complete artifact-presence matrix, add `not_present`, and remove the redundant `final_video_valid` field. |
-| Metric NPZ acceptance delegated syntax to NumPy/ZIP readers | Define `MetricNpzPayloadContractV1`, two exact accepted archive forms, strict ZIP/NPY grammar, a project-owned schema-5 writer, and malformed plus supported-runtime fixture gates. |
+| Metric NPZ acceptance delegated syntax to NumPy/ZIP readers | Define `MetricNpzPayloadContractV1`, exact owned plus CPython-dependent historical archive forms, strict ZIP/NPY grammar, a project-owned schema-5 writer, and malformed plus supported-runtime fixture gates. |
 | Parent-side FFprobe/decode capture was absent from the eight-MiB proof | Use exact `-show_entries`, byte-capped process drains, bounded JSON materialization, fixed diagnostic rings, phase-specific peaks, and typed overflow failure. |
 | A stereo provider could invent an unspecified directory fingerprint | Require one validated canonical upstream manifest for every schema-5 provider and confine manifest-less legacy Fast reuse to the existing read-only compatibility validator. |
 | Publication scope could accidentally absorb batch stitching | Limit publication v4 to the orchestrated assembled/direct job encoders and explicitly exclude `/stitch_video` and `*_stitched_*.mp4`. |
 | Quality identity requested provenance absent from its strict metadata | Make guide/native-geometry byte identity sufficient and remove the contradictory upstream-geometry-provenance requirement. |
+| One historical NPZ form omitted newer CPython `zipfile` output | Retain the observed ordinary-size form, add the exact sentinel-size/version-45 form, classify by bytes rather than Python minor version, and require every supported lock-matrix cell to match one named grammar. |
+| Source settings schema was not final-media producer evidence | Add a monotonic first-publication-v4-attempt marker before FFmpeg launch and require untouched legacy candidates to have its exact null state. |
+| Source-audio probe/decode escaped the encoding coordinator proof | Specify exact audio commands, bounded parsers and drains, checked PCM accounting, cancellation/reap behavior, typed overflow, and separate audio phase peaks. |
+| Final-media audit recomputed paths with a mutable naming helper | Persist one immutable expected relative path plus naming-algorithm version, migrate from retained output info, and make every encoder/manifest/token consume that path. |
+| The owned NPZ writer lacked implementation authority and workspace limits | Authorize only metric-payload storage changes, require incremental CRC/DEFLATE plus seek-patch publication, and cap writer scratch without changing metric arrays or equations. |
 
 ## Public Settings Contract
 
@@ -294,6 +299,93 @@ with a missing, boolean, noninteger, out-of-range, or contradictory source value
 has unknown legacy provenance and cannot qualify for the legacy-final-media
 exception below. `metadata.project_version`, package metadata, and the current
 runtime version never participate in that decision.
+
+Schema-5 settings also persist the final-media target and one monotonic producer
+marker with exactly these additional fields:
+
+```text
+metadata.final_media_producer_contract_version:  null | 4
+metadata.final_media_publication_generation:     null | string
+output_info.expected_final_relative_path:         string
+output_info.output_name_algorithm_version:
+    "job-output-name-v1" | "persisted-expected-output-filename-v1"
+```
+
+The two producer fields are either both null or exactly `4` plus a 128-bit OS-
+CSPRNG value encoded as 32 lowercase hexadecimal characters. New schema-5 jobs
+and untouched schema-1-through-4 migrations start with the null pair. Immediately
+before the first publication-v4 FFmpeg launch attempt, atomically update and
+fsync the settings artifact to `4` plus a fresh generation. Failure to commit it
+before launch. Once non-null, both values are immutable across failed or later
+encode attempts, settings rewrites, resume, and cleanup. The marker records that
+current publication code has irrevocably entered its pre-launch attempt gate; it
+does not prove that FFmpeg launched, is not media-content identity, and is
+distinct from every `EncodingSequenceProvider` generation. A later failed
+reencode does not invalidate an older authenticated publication. Missing,
+crossed, malformed, or downgraded marker fields in schema 5 are unknown current
+provenance, never an implicit null pair.
+For a still-raw schema-1-through-4 artifact only, exact absence of both keys is
+the pre-contract null pair; presence of either key in such a schema is
+contradictory rather than trusted.
+
+`expected_final_relative_path` is a canonical nonempty output-root-relative
+POSIX path containing exactly one filename segment, no `.`/`..`, slash,
+backslash, drive, NUL, link, or reparse traversal, and ending in lowercase
+`.mp4`. It is immutable after job creation or legacy migration. New jobs compute
+it once with the frozen `job-output-name-v1` algorithm and persist it before any
+frame work. That algorithm is defined over Unicode code points, never calls
+`Path`, `os.path`, `sanitize_filename`, or `generate_output_filename`, performs
+no Unicode normalization or case conversion, and has these exact steps:
+
+1. `metadata.source_video_name` must be a string containing no NUL or `/`.
+   An empty string selects base `output`. Otherwise, remove the final suffix only
+   when the last `.` has at least one code point before and after it; this frozen
+   stem rule leaves `.profile`, `name.`, `.` and `..` unchanged.
+2. In a nonempty source's stem, replace each code point in `<>:"/\|?*` with `_`,
+   collapse each maximal underscore run to one underscore, and strip leading/
+   trailing underscores. If the result exceeds 200 code points, apply the same
+   final-suffix rule to that result. When the suffix is at most 200 code points,
+   retain it and truncate the preceding part to `200-len(suffix)`; when the suffix
+   itself is longer, retain its first 200 code points and no preceding part. A
+   nonempty source which sanitizes to the empty string keeps that empty base; it
+   does not become `output`.
+3. `processing_settings.vr_format` must be exactly `side_by_side` or
+   `over_under` and has every `_` changed to `-`.
+   `processing_settings.vr_resolution` must be a string: append it exactly when
+   nonempty and omit the entire resolution part when empty. A missing, null, or
+   nonstring value is metadata failure rather than omission.
+
+It then emits:
+
+```text
+<sanitized-stem>_3D_<format-with-hyphens>[_<nonempty-resolution>].mp4
+```
+
+The strict persisted format/resolution tokens are used without locale rewriting.
+Golden fixtures freeze hidden names, terminal and repeated dots, an input which
+sanitizes to an empty base, invalid ASCII filename characters, repeated
+underscores, empty/nonempty resolutions, the 199/200/201-code-point boundaries
+with and without a suffix, an overlong suffix, and non-ASCII code points. A
+future helper change therefore creates a new algorithm version rather than
+reinterpreting v1.
+
+For schema-1-through-4 migration, first validate
+`output_info.expected_output_filename` as the same one-segment relative path. If
+present and valid, copy its exact code points to `expected_final_relative_path`
+and record `persisted-expected-output-filename-v1`; do not recompute it. If and
+only if the old field is absent, run the frozen `job-output-name-v1` once from
+the raw persisted `metadata.source_video_name`,
+`processing_settings.vr_format`, and
+`processing_settings.vr_resolution`, then persist that result/version. A
+present malformed old field or missing/malformed fallback input is
+`FinalMediaTargetMetadataError`, not permission to glob or use the current
+mutable helper. A schema-5 file missing either target field is likewise invalid
+rather than lazily repaired.
+
+Both encoder entry points consume only this persisted path. The executed final
+argument, `FinalVideoManifest.relative_path`, and normalized `@output:path64`
+must decode to it exactly. Final-media audit reads it directly and never invokes
+`generate_output_filename` or any successor.
 
 There is no persisted `auto` mode. The resolver receives the selected renderer
 device, writes the resolved two-mode value, and therefore never reinterprets a
@@ -502,7 +594,7 @@ and compare it with any retained
 
 ```text
 schema_version:                       1
-algorithm_version:                    "quality-input-content-v3"
+algorithm_version:                    "quality-input-content-v4"
 geometry_mode:                        "relative" | "metric"
 frame_names:                          list[string]
 guides:                               list[QualityGuideIdentity]
@@ -539,7 +631,9 @@ the relative payload filename is exactly `frame_name + ".png"`.
 `MetricGeometryIdentity` has exactly `frame_name`, `relative_path`, `sha256`,
 `byte_count`, `payload_kind="metric_npz"`, `native_shape`,
 `payload_contract="metric-npz-v1"`,
-`archive_form="owned-zip32-v1" | "numpy-force-zip64-local-v1"`,
+`archive_form="owned-zip32-v1" |
+"numpy-force-zip64-local-u32-v1" |
+"numpy-force-zip64-local-sentinel-v1"`,
 `inverse_depth_dtype="float32"`, `valid_dtype="bool"`,
 `focal_x_normalized_float32_bits`, and
 `members=["inverse_depth.npy","valid.npy","focal_x_normalized.npy"]` in that
@@ -553,15 +647,15 @@ only metric entries and a null scale.
 
 `MetricNpzPayloadContractV1` is the sole parser and writer boundary for metric
 Quality content audit. It does not delegate structural acceptance to
-`zipfile`, `np.load`, or an installed NumPy version. It accepts exactly the two
+`zipfile`, `np.load`, or an installed NumPy version. It accepts exactly the three
 `archive_form` values named above:
 
 - schema-5 `_atomic_save_npz` uses the project-owned `owned-zip32-v1` writer;
 - an existing payload written by the pre-schema-5
-  `np.savez_compressed(...)` path may use
-  `numpy-force-zip64-local-v1`.
+  `np.savez_compressed(...)` path uses exactly one of the two named historical
+  forms according to its CPython `zipfile` behavior.
 
-Both forms contain exactly three file records and three central-directory
+All three forms contain exactly three file records and three central-directory
 records in this order, with these case-sensitive ASCII names:
 
 ```text
@@ -591,18 +685,43 @@ platform byte 0 and both attribute words zero. Every size, local offset, central
 offset, and archive length must be at most `0xfffffffe`; overflow raises
 `MetricNpzSizeError` before publication rather than selecting ZIP64.
 
-`numpy-force-zip64-local-v1` is one explicitly accepted historical form, not a
-general ZIP64 mode. It also has version-needed 20 and ordinary non-sentinel
-32-bit sizes/offsets, but each local header has exactly one extra field:
-header ID `0x0001`, payload length 16, then little-endian uint64 uncompressed
-size followed by little-endian uint64 compressed size. Those two values must
-equal the ordinary local and central size fields. Its central extra field is
-empty. Version-made-by/attributes use the same allowlist as above. This local-
-ZIP64-extra plus ordinary-EOCD combination is legal only in this exact form;
-sentinel fields, a ZIP64 EOCD/locator, a central ZIP64 extra, reordered/partial
-ZIP64 values, multiple extras, or any other extra-field ID is rejected.
+The historical forms share these facts: every actual compressed/uncompressed
+member size and local-header offset is at most `0xfffffffe`; the central
+directory stores those ordinary uint32 values and has no extra field; DOS
+metadata, flags, method, order, CRC, and comments follow the common rules above.
+Version-made-by platform byte is 0 or 3, internal attributes are zero, and
+external attributes are exactly `0x01800000`, matching the pre-schema-5 NumPy/
+CPython writer. Each local header has exactly one extra field: header ID
+`0x0001`, payload length 16, then little-endian uint64 actual uncompressed size
+followed by little-endian uint64 actual compressed size. No other local extra
+exists.
 
-Both forms use one single-disk ordinary EOCD with disk numbers zero, three
+`numpy-force-zip64-local-u32-v1` is observed in CPython 3.10.11 and 3.11.0.
+Local and central version-needed plus version-made-by low byte are 20. Each
+local compressed/uncompressed size field contains its ordinary actual uint32
+value; the two uint64 ZIP64-extra values must duplicate those fields exactly.
+
+`numpy-force-zip64-local-sentinel-v1` is observed in CPython 3.11.9/3.11.14 and
+3.12.1. Local and central version-needed plus version-made-by low byte are 45.
+Each local compressed/uncompressed size field is exactly `0xffffffff`; the
+local ZIP64 extra carries the actual values which must equal the central
+ordinary uint32 values. The local CRC remains the actual CRC. It still has no
+central ZIP64 extra or ZIP64 EOCD/locator.
+
+These are two explicit historical layouts, not a general ZIP64 mode. Crossing
+their version/size rules, a ZIP64 EOCD/locator, a central ZIP64 extra, sentinel
+central sizes/offsets, reordered/partial ZIP64 values, multiple extras, or any
+other extra-field ID is rejected. Archive classification never branches on
+`sys.version_info`: CPython changed this behavior within the 3.11 patch line.
+The release matrix must include the earliest and latest project-admitted patch
+release in CPython 3.10, 3.11, and 3.12, every actual CI/distribution runtime,
+and every compatible lowest/highest supported NumPy pin. A generated fixture
+outside these two grammars blocks release of that exact dependency cell;
+production metadata may not continue advertising it as supported until either
+a separately named grammar is reviewed or the public Python/NumPy range is
+narrowed.
+
+All three forms use one single-disk ordinary EOCD with disk numbers zero, three
 entries on disk and in total, exact checked central-directory size/offset, and
 an empty archive comment. Per-member comments are empty. No digital signature,
 archive-extra record, spanning marker, encryption header, or record other than
@@ -642,9 +761,66 @@ and DEFLATE level 9. The DEFLATE bitstream itself is not a semantic identity:
 any standards-conforming stream which passes the closed record grammar is
 accepted, while the complete raw archive SHA-256 still binds the concrete
 bytes. Before implementation, fixtures from the current `_atomic_save_npz()`
-and every supported Python/NumPy lock-matrix cell must classify as exactly the
-historical form; an output outside it blocks that dependency combination rather
-than widening the parser implicitly.
+and every supported Python/NumPy lock-matrix cell must classify as exactly one
+named historical form; an output outside both blocks that dependency
+combination rather than widening the parser implicitly.
+
+The owned writer has this additional-host-workspace contract:
+
+```text
+METRIC_NPZ_WRITE_INPUT_CHUNK_BYTES   = 512 KiB
+METRIC_NPZ_WRITE_STREAM_BYTES        = 1 MiB
+METRIC_NPZ_WRITE_DEFLATE_STATE_BYTES = 512 KiB
+METRIC_NPZ_WRITE_RECORD_BYTES        = 4 KiB
+metric_npz_write_additional_peak =
+    METRIC_NPZ_WRITE_STREAM_BYTES
+  + METRIC_NPZ_WRITE_DEFLATE_STATE_BYTES
+  + METRIC_NPZ_WRITE_RECORD_BYTES
+```
+
+The input chunk is a non-owning contiguous memoryview into the already-owned
+`MetricGeometryFrame`; it is not another 512-KiB allocation. One raw-DEFLATE
+compressor consumes the exact NPY header then row-major array bytes in chunks no
+larger than that value, incrementally updates CRC-32 and checked uint64 raw/
+compressed counts, and writes every returned block immediately to one sibling
+temporary. It performs no per-chunk sync/full flush and issues exactly one final
+finish for each member. A returned block larger than
+`METRIC_NPZ_WRITE_STREAM_BYTES`, native
+deflater residency above its attested state allowance, count/offset overflow,
+short write, or compression error is fatal. No complete raw or compressed member
+copy, second metric array, `BytesIO`, or `np.savez_compressed` call is allowed.
+
+Disk preflight uses checked uint64 arithmetic and this fixed conservative bound,
+where `n` includes the exact NPY preamble/header and array data, `name_bytes` is
+the ASCII member-name length, and `alloc`/`A` are the filesystem functions below:
+
+```text
+raw_deflate_bound(n) = n + (n >> 12) + (n >> 14) + (n >> 25) + 13
+metric_npz_temp_logical_bound =
+    sum(30 + name_bytes[j] + raw_deflate_bound(npy_raw_bytes[j])
+        + 46 + name_bytes[j] for j in the three fixed members)
+    + 22
+metric_npz_temp_disk_reserve = alloc(metric_npz_temp_logical_bound) + A
+```
+
+Every `npy_raw_bytes[j]`, shift, addition, and archive-field conversion is
+checked before mutation; a bound above the owned ZIP32 limits is
+`MetricNpzSizeError`. The reserve is required on the target volume before
+opening the temporary and coexists with every allocated extent of an old
+destination. It covers the one temporary directory entry and may not claim the
+old file as reclaimable.
+
+For each member, write one owned-form local header with fixed-size placeholders,
+stream its data, seek back to patch actual CRC and ordinary uint32 sizes, then
+seek to the checked end before starting the next member. After all three members
+are patched, write the bounded central directory and EOCD from scalar records,
+flush/fsync the temporary, atomically replace the destination, and durably sync
+its parent where supported. Any exception before replace closes and removes only
+the temporary and leaves the old payload byte-exact; an error after replace is
+reported through the metric-stage transaction and never fabricates complete
+metadata. Task 0 measures the complete writer RSS, including native zlib state
+and Python wrappers, against the additional peak rather than treating the
+constants as payload sizes only.
 
 Both float-bit strings use a numeric bit cast: interpret the IEEE-754 binary32
 value's 32-bit pattern as an unsigned integer and format that integer with
@@ -690,7 +866,7 @@ Metric validation uses one project-internal `OwnedMetricAuditFrame`, not
 For one NPZ, the validator:
 
 1. hashes all raw archive bytes, seeks the same contained regular-file handle
-   back to zero, and accepts exactly one of the two complete
+   back to zero, and accepts exactly one of the three complete
    `MetricNpzPayloadContractV1` archive forms;
 2. parses the three closed-grammar NPY-v1 headers through the fixed stream
    buffer and requires the exact member order, shapes, dtypes, scalar focal
@@ -2239,16 +2415,62 @@ fallback from a selected FLAC to the original video after selection.
 The selected path itself must then open as a non-link regular file; otherwise
 audio preflight is fatal.
 
-Hash the selected source's complete raw bytes and pre-probe exactly its first
-audio stream `a:0` after applying the existing resolved input `-ss`/`-t` clip.
-No `a:0`, or a stream which decodes to zero PCM bytes for that clip, is
-`audio_absent`: omit the audio input and produce zero output audio streams. A
-probe error, malformed positive stream, or decode error is fatal rather than
-absence. A usable stream requires positive integer sample rate `S`, positive
-channel count, and successful full clipped-stream decode through fixed
-`pcm_s32le` to a drained pipe with a positive byte count divisible by
-`4*channels`; a fixed 1 MiB read buffer is the only retained PCM workspace and
-the decoded output is never accumulated.
+Hash the selected source's complete raw bytes. Probe its first audio stream with
+this exact command and no generic video-info helper:
+
+```text
+ffprobe -v error -select_streams a:0 \
+  -show_entries stream=codec_type,sample_rate,channels \
+  -of json <selected-audio-source>
+```
+
+`BoundedProcessCaptureV1` applies the audio-specific stdout/stderr caps below.
+Its fixed-schema incremental parser permits exactly root key `streams`, zero or
+one stream object, and exactly the three requested stream keys. Invalid UTF-8,
+NUL, extra/missing keys, JSON depth greater than three, a scalar token longer
+than 32 bytes, a second stream, any stderr byte, nonzero exit, or cap/parser-
+state overflow is fatal. Zero streams is `audio_absent`. One stream requires
+`codec_type="audio"`, `sample_rate` as a canonical nonzero decimal string which
+normalizes to `S <= U32_MAX`, and `channels` as a non-boolean JSON integer in
+`1..U32_MAX`; `N/A`, sign, whitespace, leading zero, float, or exponent forms
+are invalid. Probe timeout raises `FinalAudioProbeTimeoutError`; byte/state
+overflow raises `FinalAudioProbeBudgetError`. A present malformed stream is
+never absence.
+
+The metadata probe does not infer whether the selected clip contains samples.
+For its one valid `a:0`, run exactly this full clipped decode, with the optional
+resolved input arguments present in the shown order only when applicable:
+
+```text
+ffmpeg -v error -xerror \
+  [ -ss <resolved-start> ] [ -t <resolved-duration> ] \
+  -i <selected-audio-source> -map 0:a:0 -vn -sn -dn \
+  -c:a pcm_s32le -f s32le pipe:1
+```
+
+Stdout is continuously drained by `readinto` on one reusable
+`FINAL_ENCODING_AUDIO_STREAM_BYTES` bytearray and is never copied into a new
+per-read bytes object, concatenated, or decoded as text. Each read increments
+`decoded_pcm_bytes=checked_u64_add(decoded_pcm_bytes, read_count)`. Compute
+`pcm_frame_bytes=checked_u64_mul(4, channels)` before launch. At clean EOF,
+zero decoded bytes is `audio_absent`; otherwise the count must be divisible by
+`pcm_frame_bytes`. Stderr is simultaneously drained into the fixed audio-decode
+diagnostic ring. Any byte beyond its cap sets overflow, continues drain through
+termination/reap, and raises `FinalAudioDecodeBudgetError`; nonzero exit or any
+stderr byte is fatal. Counter multiplication/addition overflow raises
+`FinalAudioPcmOverflowError` after termination/reap. Thus a usable stream has a
+positive checked PCM count, while neither decoded PCM nor diagnostics scale in
+resident memory.
+
+Audio probe has a 30-second wall timeout. Full PCM decode has no duration-based
+deadline because clip length is unbounded, but 120 seconds with no stdout,
+stderr, exit, or cancellation-state progress is
+`FinalAudioDecodeTimeoutError`. Timeout, user cancellation, input-generation
+mismatch, pipe failure, parser failure, and counter failure all close stdin,
+terminate the child, continue bounded drainage, wait five seconds, kill if
+needed, and reap exactly once before returning. A cancelled or failed probe/
+decode cannot fall back to the original video, declare absence, launch the final
+encoder, or publish a manifest.
 
 For usable audio, both encoder paths add exactly one audio input and explicitly
 map that input's `a:0`; optional-map `?` syntax is forbidden after preprobe. Let
@@ -2277,16 +2499,27 @@ The encoder streams one image identity at a time, so it never materializes an
 `O(N)` Python object tree. The pre-FFmpeg pass writes canonical bytes at the
 beginning of the reserved temporary, records their length and raw SHA-256 plus
 the self-fingerprint, verifies the already-frozen `EncodingSequenceProvider`
-generation, then physically fills the rest of the schema bound. FFmpeg command construction uses
-only that frozen generation's parents, first/last indexes, and count to form its
-image2 patterns; it never calls the source resolver again. After successful
-encoding the postpass replays that same generation, reopens and rehashes the same
+generation, then physically fills the rest of the schema bound. FFmpeg command
+construction uses only that frozen generation's parents, first/last indexes, and
+count to form its image2 patterns; it never calls the source resolver again.
+After successful encoding, the postpass replays that same generation, reopens
+and rehashes the same
 contained image paths, streams the resulting canonical bytes over that same
 extent, and requires the length, raw hash, self-fingerprint, generation token,
 and every expected source index to match the pre-FFmpeg values. It also rehashes
 the audio source against its captured full identity. A changed file, header,
 order, parent selection, or identity aborts publication; a match truncates the
 temporary to the canonical length and fsyncs it before publication.
+
+After all manifest/audio/disk preflight and immediately before the first FFmpeg
+launch attempt, validate the producer pair. Commit the immutable
+`final_media_producer_contract_version=4` and independently generated
+`final_media_publication_generation` if the pair is null; never copy the
+provider's `audit_generation_id`. Then replay the frozen provider one last time.
+This settings write is a monotonic provenance mutation, but launch remains the
+image/audio publication mutation boundary: a mismatch after marker commit but
+before launch may still discard temporaries and restart read-only audit, while
+the marker is never cleared back to null.
 
 Before FFmpeg process launch, a provider mismatch discards the read-only
 encoding audit, manifest/reservation temporaries, and preflight result and may
@@ -2314,21 +2547,33 @@ FINAL_PROBE_STDOUT_BYTES           = 64 KiB
 FINAL_PROBE_STDERR_BYTES           = 64 KiB
 FINAL_PROBE_JSON_STATE_BYTES       = 512 KiB
 FINAL_DECODE_DIAGNOSTIC_BYTES      = 256 KiB
+FINAL_AUDIO_PROBE_STDOUT_BYTES     = 32 KiB
+FINAL_AUDIO_PROBE_STDERR_BYTES     = 32 KiB
+FINAL_AUDIO_PROBE_JSON_STATE_BYTES = 256 KiB
+FINAL_AUDIO_DECODE_DIAGNOSTIC_BYTES = 256 KiB
+FINAL_AUDIO_PROBE_TIMEOUT_SECONDS   = 30
+FINAL_AUDIO_DECODE_STALL_SECONDS    = 120
+FINAL_PROCESS_TERMINATE_GRACE_SECONDS = 5
 
-encoding_prepass_peak = 4 MiB + 1 MiB + 1 MiB + 1 MiB = 7 MiB
-encoding_process_peak = 4 MiB + 256 KiB                = 4.25 MiB
-final_probe_peak      = 4 MiB + 64 KiB + 64 KiB
-                        + 512 KiB                      = 4.625 MiB
-final_decode_peak     = 4 MiB + 256 KiB                = 4.25 MiB
-encoding_control_peak = max(the four phase peaks)      = 7 MiB
+encoding_manifest_peak = 4 MiB + 1 MiB + 1 MiB         = 6 MiB
+audio_probe_peak       = 4 MiB + 32 KiB + 32 KiB
+                         + 256 KiB                      = 4.3125 MiB
+audio_decode_peak      = 4 MiB + 1 MiB + 256 KiB       = 5.25 MiB
+encoding_process_peak  = 4 MiB + 256 KiB               = 4.25 MiB
+final_probe_peak       = 4 MiB + 64 KiB + 64 KiB
+                         + 512 KiB                      = 4.625 MiB
+final_decode_peak      = 4 MiB + 256 KiB               = 4.25 MiB
+encoding_control_peak  = max(the six phase peaks)       = 6 MiB
 require 1 <= N <= ENCODING_CONTROL_FRAME_CAP
 require encoding_control_peak <= FINAL_ENCODING_CONTROL_BUDGET
 ```
 
 This bound includes replay/container objects, directory enumeration, image hash
 and IHDR parsing, manifest serialization, and the existing drained audio PCM
-buffer. The three one-MiB buffers may coexist only in the prepass/postpass. They
-and their parser objects are released before container probe. The encode,
+buffer. Image hashing plus manifest serialization may coexist only in
+`encoding_manifest_peak`; both are released before the isolated audio probe/
+decode phase. Audio rehash likewise runs after releasing image/JSON streams.
+Every stream/parser/ring is released before final-container probe. Encode,
 probe, and full-decode phases use the separate fixed byte caps above and may not
 retain a manifest/image/audio stream buffer. No additional variable-cardinality
 container is allowed.
@@ -2339,11 +2584,12 @@ byte drain. Recognized progress key/value lines are parsed within
 is not resident and is not charged as diagnostics. Unrecognized/error bytes are
 retained only in the fixed tail ring. An overlong line or diagnostic bytes
 beyond the diagnostic cap marks the encode failed while the drain continues
-until the process is terminated/reaped. FFprobe and
-full-decode use the same `BoundedProcessCaptureV1` abstraction with the separate
-caps above. `subprocess.run(..., capture_output=True)`, `communicate()` into an
-unbounded bytes/string object, the current assembled-encoder capture path, and
-`get_video_info_ffprobe` are forbidden in final publication. The implementation
+until the process is terminated/reaped. Audio probe/PCM decode, final FFprobe,
+and final full-decode use the same `BoundedProcessCaptureV1` abstraction with
+their separate caps above. `subprocess.run(..., capture_output=True)` and
+`communicate()` into an unbounded bytes/string object, the current assembled-
+encoder capture path, and `get_video_info_ffprobe` are forbidden in final
+publication. The implementation
 must drain all configured pipes without deadlock on Windows and POSIX and must
 count raw bytes before UTF-8 decoding. Any helper thread, event-loop object,
 pipe wrapper, decoder, or native stack used for that drain is charged to and
@@ -2429,8 +2675,10 @@ encoding_settings_fingerprint = SHA256(canonical_json({
 }))
 ```
 
-`relative_path` follows output-root containment rules and rejects absolute or
-`..` components. `input_stage_fingerprint` is exactly the validated
+`relative_path` is exactly the persisted
+`output_info.expected_final_relative_path` and follows its stricter one-segment
+containment rules; it is never reconstructed from current settings.
+`input_stage_fingerprint` is exactly the validated
 `EncodingInputSequenceManifest.fingerprint`; no diagnostics/RGB-stage manifest,
 generic mtime metadata, or independently selected hash may substitute. An audio
 path token likewise contains the complete raw pre/post-validated audio/source
@@ -2504,7 +2752,8 @@ a temporary and atomic replacement; resume must not inspect the container or
 re-resolve `auto` to guess provenance.
 Both manifests are retained final artifacts and are never listed for
 intermediate cleanup. Final-encoding disk preflight physically reserves their
-schema-derived temporary allocations before starting FFmpeg.
+schema-derived temporary allocations plus the one-time producer-marker settings
+rewrite when needed before starting FFmpeg.
 
 ### Final Media Audit Disposition V1
 
@@ -2528,12 +2777,16 @@ readable. An explicitly requested best-effort legacy probe may report container
 health in a separate inspection object, but it cannot change this disposition,
 manufacture provenance, or authorize pruning.
 
-Resolve exactly one expected job final-video path from the persisted job input
-name and persisted output settings using the normal job output-name function.
-Do not glob for MP4 files. In particular, `*_stitched_*.mp4` and every
-`/stitch_video` product are invisible to this audit. Define presence bits by
-checking directory entries at that exact path and the two exact job-root
-manifest paths without following the final component:
+Resolve exactly one expected job final-video path from the immutable
+`output_info.expected_final_relative_path`. A raw schema-1-through-4 audit which
+has not migrated yet applies the exact old-field/frozen-v1 selection above in
+memory; it does not persist during read-only inspection. Failure to obtain one
+canonical path raises `FinalMediaTargetMetadataError` before returning a
+disposition. Never invoke the current output-name helper or glob for MP4 files.
+In particular, `*_stitched_*.mp4` and every `/stitch_video` product are invisible
+to this audit. Define presence bits by checking directory entries at that exact
+path and the two exact job-root manifest paths without following the final
+component:
 
 ```text
 V = an entry exists at the expected final-video path
@@ -2542,9 +2795,10 @@ P = an entry exists at final_video_manifest.json
 ```
 
 `final_video_present` equals `V`. Authentication requires all three entries to
-be non-link regular files and the complete binding/container contract above to
-validate. An unsafe entry kind therefore never authenticates even though its
-presence bit is one.
+be non-link regular files, their final path/token to equal the persisted target,
+the producer marker to be exactly `4` plus a valid generation, and the complete
+binding/container contract above to validate. An unsafe entry kind or invalid
+marker therefore never authenticates even though its presence bit is one.
 
 The publication-contract boundary is settings schema 5, not a package or
 project version. Read legacy provenance from raw settings metadata before any
@@ -2565,18 +2819,27 @@ otherwise:
 Migration uses `SavedSettingsResult.source_version` and persists it as specified
 in the settings contract, so a migrated schema-5 file retains its pre-migration
 value. `metadata.project_version`, `pyproject.toml`, runtime package version,
-mtime, and filename dates are forbidden substitutes. Legacy classification is
-true if and only if all of these predicates hold:
+mtime, and filename dates are forbidden substitutes. Source schema describes
+job ancestry only; it is never sufficient evidence of the current video's
+producer. A migrated source-schema-4 job remains a legacy candidate only until
+the first publication-v4 pre-launch attempt marker commits. If both manifests
+disappear after that boundary, `V/I/P=1/0/0` is
+`incomplete_publication_evidence`, regardless of the permanently retained
+source value. Legacy classification is true if and only if all of these
+predicates hold:
 
 ```text
 V=1 and I=0 and P=0
 audit_source_schema in 1..4
 raw persisted metadata.processing_status == "completed"
+final_media_producer_contract_version is exactly null
+final_media_publication_generation is exactly null
 the expected final-video entry is a non-link regular file
 ```
 
 Missing, malformed, or contradictory settings metadata, a non-completed status,
-or an unsafe video entry makes that predicate false. Apply this complete matrix
+an unknown/non-null producer marker, or an unsafe video entry makes that
+predicate false. Apply this complete matrix
 in row order; `valid` in the last two rows means the three artifacts validate as
 one bound publication identity:
 
@@ -3874,12 +4137,22 @@ final_video_manifest_raw = max_json_bytes(
     len(resolved_encoding_arguments),
     every normalized argument and final relative path,
 )
+producer_marker_settings_raw = max_json_bytes(
+    ProcessingSettingsArtifactV5,
+    every retained metadata/video/output/settings value,
+    final_media_producer_contract_version=4,
+    final_media_publication_generation=32 lowercase hex,
+) when the producer marker is null else 0
 prune_marker_raw[j] = max_json_bytes(
     PruneMarkerPayload,
     prune_entry[j].relative_path,
     prune_entry[j].marker token,
 ) + 1  # mandatory LF
 ```
+
+`ProcessingSettingsArtifactV5` means the complete persisted settings JSON shape,
+including all preexisting schema-5 values and the additional metadata/output
+fields in the Public Settings Contract; it is not a marker-only projection.
 
 The preflight helper constructs and tests a maximum-token schema skeleton for
 every formula; an encoded object exceeding its bound is an internal error before
@@ -3936,14 +4209,18 @@ physically allocates/fsyncs before FFmpeg:
 ```text
 alloc(encoding_input_manifest_raw)
 + alloc(final_video_manifest_raw)
++ alloc(producer_marker_settings_raw)
 + prune_marker_reserve
-+ (4 + prune_marker_file_count)*A
++ (5 + prune_marker_file_count)*A
 ```
 
-The two leading `alloc` terms are the future atomic manifest temporaries; an
+The first two `alloc` terms are the future atomic manifest temporaries and the
+third is the one-time settings rewrite before first v4 launch; an
 existing retained file already consumes blocks and is never counted as free.
-Before FFmpeg, each manifest temporary is non-sparsely filled and fsynced to its
-schema-derived maximum. The remaining terms are held in a separate non-sparse,
+Before FFmpeg, each nonzero temporary is non-sparsely filled and fsynced to its
+schema-derived maximum. The marker rewrite consumes its reserved extent and
+commits before launch; the manifest reservations remain. The remaining terms
+are held in a separate non-sparse,
 fsynced reservation file, not an unprotected free-space estimate. After input
 revalidation or video hashing, canonical manifest bytes are streamed over the
 beginning of their reserved extents, checked not to exceed the bound, fsynced,
@@ -4360,7 +4637,12 @@ It is not a setting, saved mode, resume identity, or production branch.
     long audio at the checked `audio_end_sample`. Runtime argv and normalized
     argv have a positional bijection; every valid image/audio/output token and
     every malformed grammar, path64, index, duplicate, and embedded-path case is
-    covered. Output-level `-shortest` is absent.
+    covered. Probe/decode fixtures assert the exact commands, zero/one/two stream
+    shapes, strict sample-rate/channel JSON types, `4*channels` and PCM-counter
+    overflow, partial PCM frames, invalid UTF-8/NUL/extra keys, stdout/stderr/
+    parser/ring boundaries, 30-second probe timeout, decode stall, cancellation,
+    terminate/kill/reap, and no generic helper call. Every audio phase remains
+    within its independent peak. Output-level `-shortest` is absent.
 12. ffprobe fixtures reject extra/missing streams, dimensions, pixel format,
     codec, rational rate, frame count, non-1:1 SAR, missing or wrong reduced DAR,
     audio-token mismatch, and any full-decode error; nonempty garbage never
@@ -4370,8 +4652,8 @@ It is not a setting, saved mode, resume identity, or production branch.
     typed error. Full-decode and encoding diagnostic rings test cap-minus-one,
     cap, and cap-plus-one while proving every child is drained and reaped. The
     publication path never calls either generic capture helper. Direct
-    scale/no-scale and assembled fixtures all contain their
-    exact `setsar=1` filter and produce square-pixel output. Internal concurrent mutation is
+    scale/no-scale and assembled fixtures all contain their exact `setsar=1`
+    filter and produce square-pixel output. Internal concurrent mutation is
     blocked by the project writer lock and persistent pre/post changes fail
     validation. Tests and documentation make no claim to detect the explicitly
     unsupported external ABA restoration.
@@ -4381,14 +4663,21 @@ It is not a setting, saved mode, resume identity, or production branch.
     envelope one frame at a time and never enter `np.load`, the public metric
     constructor, or a second full-array predicate. Golden fixtures cover
     `owned-zip32-v1`, the exact current `_atomic_save_npz()` output, and every
-    supported Python/NumPy lock-matrix cell as
-    `numpy-force-zip64-local-v1`. Member/order/flag/method/header disagreement,
-    descriptor, encryption, ordinary/ZIP64 sentinel and EOCD variants, every
-    forbidden comment/extra/record, NPY v2/v3, endian/Fortran/structured dtype,
+    supported Python/NumPy lock-matrix cell as exactly
+    `numpy-force-zip64-local-u32-v1` or
+    `numpy-force-zip64-local-sentinel-v1`. Golden CPython 3.10.11/3.11.0 outputs
+    require version-20 ordinary local sizes; 3.11.9/3.11.14/3.12.1 outputs
+    require version-45 sentinel local sizes, and crossed forms fail. No test or
+    parser selects a form from the Python minor version. Member/order/flag/
+    method/header disagreement, wrong historical external attributes, descriptor,
+    encryption, ordinary/ZIP64 sentinel and EOCD variants, every forbidden comment/extra/
+    record, NPY v2/v3, endian/Fortran/structured dtype,
     duplicate/extra NPZ members, CRC/deflate failure, short/overlong output,
     invalid values, and injected allocation failure are typed and never start
-    mutation or consolidation as applicable. A legal historical local-ZIP64-
-    extra fixture passes; every other ZIP64 shape fails.
+    mutation or consolidation as applicable. Both named historical local-ZIP64-
+    extra fixtures pass; every other ZIP64 shape fails. Owned-writer fixtures
+    assert fixed scratch, incremental CRC/DEFLATE, seek-patched headers, no full
+    compressed member, atomic old-file preservation, and every failure boundary.
 14. Stereo-provider fixtures change generation token, upstream fingerprint,
     source index, name, count, path, and bytes at every replay boundary. Before
     mutation they cancel/join parked workers, discard actions/preflight, and
@@ -4410,9 +4699,9 @@ It is not a setting, saved mode, resume identity, or production branch.
 16. Synthetic direct and assembled encoding sources at N=1, 10,000, 1,000,000,
     and `ENCODING_CONTROL_FRAME_CAP` prove O(1) provider state, exact streamed
     directory completeness, same-generation prepass/argv/postpass, and at most
-    seven MiB coordinator residency across the distinct prepass, encode, probe,
-    and decode phase peaks, including bounded parent-process output and JSON
-    state. No source resolver or assembled frame-list
+    six MiB coordinator residency across the distinct manifest, audio-probe,
+    audio-decode, encode, final-probe, and final-decode phase peaks, including
+    bounded parent-process output and JSON state. No source resolver or assembled frame-list
     interface is called. Pre-launch changes restart only after temporary cleanup;
     post-launch changes terminate/reap FFmpeg, remove the sibling temporary, and
     publish nothing. The supported FFmpeg boundary fixture decodes indexes
@@ -4429,7 +4718,14 @@ It is not a setting, saved mode, resume identity, or production branch.
     matrix, unsafe path kinds, completed/non-completed status, absent schema-1,
     raw schemas 1..4, new schema 5, migrated schema 5 with preserved source
     schema, missing/corrupt source provenance, and mismatched `project_version`;
-    `not_present` is unique to `V/I/P=0/0/0`.
+    `not_present` is unique to `V/I/P=0/0/0`. A migrated schema-4 legacy video
+    starts with the null producer pair; immediately before its first attempted
+    v4 launch, the coordinator commits the marker.
+    Deleting both manifests afterward yields incomplete evidence, never legacy,
+    including after a failed later encode. Target-path fixtures prove new jobs,
+    retained `expected_output_filename`, and frozen-v1 fallback each persist one
+    immutable path; helper changes, Unicode, suffix, token, and sanitization
+    changes cannot redirect audit, argv, manifest, or `path64`.
 18. Batch-stitching fixtures create `_stitched_*.mp4` beside missing, legacy,
     current, and pruned job artifacts. The job audit and cleanup result are
     unchanged, neither publication manifest is created or consumed, and only
@@ -4524,9 +4820,10 @@ With five warmups and 30 measured frames on that clean CUDA environment:
   is no frame/path/work-item list, only capacity-bounded lazy items, while
   metadata and frame-name arrays stream byte-exactly;
 - direct and assembled final-encoding providers at the same cardinalities up to
-  `ENCODING_CONTROL_FRAME_CAP` remain at or below the independent seven-MiB
+  `ENCODING_CONTROL_FRAME_CAP` remain at or below the independent six-MiB
   calculated peak and eight-MiB cap through directory audit, manifest prepass,
-  argv construction, and postpass, with no eager path/name collection;
+  source-audio probe/decode, argv construction, final validation, and postpass,
+  with no eager path/name collection;
 - simultaneous stereo jobs repeatedly create and tear down threads while a
   third project thread creator contends for the global creation lock. Every run
   restores the previous process stack setting on success and each injected
@@ -4598,8 +4895,12 @@ renderer work is authorized. It first freezes golden
 `MetricNpzPayloadContractV1` fixtures for the owned writer, the current real
 `_atomic_save_npz()`, and every supported Python/NumPy lock-matrix cell. The
 schema-5 project writer and fixed parser must agree on every ZIP/NPY field; a
-runtime form outside the two-name allowlist blocks implementation rather than
+runtime form outside the three-name allowlist blocks implementation rather than
 falling through to NumPy.
+It streams each member through the fixed writer buffers, injects compressor,
+seek, patch, fsync, replace, and disk-full failures, and proves no complete
+compressed member or second array exists at any point. Both measured additional
+RSS and native deflater state must fit the writer formula.
 
 The same gate replaces the current eager `_FileWorkItem`/path lists with the
 replayable source and packed action vector before renderer work begins. Synthetic
@@ -4617,11 +4918,13 @@ assembled frame list with `EncodingSequenceProvider`. It measures the complete
 coordinator at N up to `ENCODING_CONTROL_FRAME_CAP`, exercises both sides of the
 FFmpeg-launch mutation boundary and the signed-int image2 endpoint, and proves
 the same generation supplies streamed manifest bytes, scalar argv construction,
-and postpass. It separately measures prepass, encode, exact ffprobe, and full-
-decode phases with capped stdout/stderr/JSON/ring state and injected overflows on
-Windows and POSIX. Any eager resolver call, generic capture helper, over-cap RSS,
-mixed generation, leaked process/thread, or publication after mismatch blocks
-production implementation.
+and postpass. It separately measures manifest, source-audio probe, clipped PCM
+decode, encode, exact final ffprobe, and final full-decode phases with capped
+stdout/stderr/JSON/ring state and injected overflow, timeout, cancellation, and
+reap paths on Windows and POSIX. It also proves immutable target-path use and the
+first-v4-attempt marker across failed/repeated encodes. Any eager resolver call,
+generic capture helper, over-cap RSS, mixed generation, leaked process/thread,
+or publication after mismatch blocks production implementation.
 
 Task 0 first evaluates an implementation using only existing NumPy, Torch, and
 OpenCV facilities. If it misses any performance or RSS gate, this specification
@@ -4636,8 +4939,12 @@ nor prebuilt-extension path passes, explicit Quality is unavailable with an
 actionable error and the implementation plan returns for architecture approval.
 
 Implementation may change settings, CLI, Web controls, resume behavior, stereo
-geometry, renderer internals, frame writer, diagnostics, tests, benchmark and
-verifier scripts, and stereo documentation. Prefer focused Quality geometry,
+geometry, renderer internals, frame writer, diagnostics, final encoding, tests,
+benchmark and verifier scripts, and stereo documentation. It may change
+`processing/frames/metric_geometry.py` payload storage only as required to
+implement `MetricNpzPayloadContractV1` and its bounded owned writer. Metric array
+semantics, convergence, projection, stage equations, and non-payload metadata
+remain unchanged. Prefer focused Quality geometry,
 coverage, and reconstruction modules over growing `stereo_renderer.py` into a
 second monolith. Update at least `docs/ARCHITECTURE.md`, `docs/PARAMETERS.md`,
 `docs/TROUBLESHOOTING.md`, and affected resume/performance documentation.
@@ -4694,9 +5001,10 @@ Approval of this canonical specification accepts:
 6. Compact production diagnostics coexist with an unchanged allocating public
    mask API and producer-attested lane statistics.
 7. Schema 1 through 4 jobs migrate to Fast; schema 5 preserves resolved intent.
-   Their raw source schema is retained independently of package version for the
-   closed legacy-media audit. Gated CUDA jobs may default Quality, while CPU
-   jobs default Fast.
+   Their raw source schema records ancestry, while a separate monotonic first-
+   v4-attempt marker determines whether final media can still be legacy.
+   Neither depends on package version. Gated CUDA jobs may default Quality,
+   while CPU jobs default Fast.
 8. No neural dependency, generic inpainting, or temporal state enters v1.
 9. Quality v1 serializes one decoded/rendered/written frame lifecycle. Fast uses
    geometry-aware relative/metric slot bounds over `Q`, every `G_i`, compressed
@@ -4719,8 +5027,9 @@ Approval of this canonical specification accepts:
     transaction trust model. Frame identities use only canonical minimal-padded
     stems and numeric-endian-independent float32 bit strings, except for the
     explicitly frozen filename-bearing Fast RGB schema 1. Metric payloads pass
-    the closed two-form `MetricNpzPayloadContractV1`; schema-5 writing no longer
-    delegates archive syntax to NumPy. Quality uses the one strict immutable
+    the closed three-form `MetricNpzPayloadContractV1`; schema-5 writing no longer
+    delegates archive syntax to NumPy and uses only bounded incremental writer
+    workspace. Quality uses the one strict immutable
     `StereoRgbMetadataV2` fingerprint throughout diagnostics, with byte/content
     identity rather than an absent upstream-provenance field.
 11. With intermediates disabled, valid historical aggregates may remain readable
@@ -4730,7 +5039,8 @@ Approval of this canonical specification accepts:
     presence combination without a redundant validity boolean. A pre-contract
     final video with no publication manifests is preserved as unauthenticated
     legacy media, cannot authorize pruning, and is never upgraded by inferred
-    manifests.
+    manifests. Any v4 pre-launch attempt marker makes later missing evidence
+    incomplete, even when the job originally came from schema 1 through 4.
 12. Direct public renderer omission remains Fast on every device; device-aware
     Quality defaulting belongs only to resolved CLI/Web jobs. Metric Quality uses
     explicit `QualityStereoControls` and a discriminated plan, while Quality none
@@ -4747,15 +5057,19 @@ Approval of this canonical specification accepts:
     authority over the older Direct VR transaction rules. Direct and assembled
     sources use one O(1) replayable encoding provider under an eight-MiB
     coordinator cap which includes bounded parent-process output and parser
-    state, checked last-index arithmetic, and the fixed signed-int image2
-    endpoint. Batch stitching remains outside this publication and audit scope.
+    state for source-audio probe/decode as well as final validation. A persisted
+    immutable target path, checked last-index arithmetic, and the fixed signed-
+    int image2 endpoint prevent historical reinterpretation. Batch stitching
+    remains outside this publication and audit scope.
 14. Task 0 must prove the exact geodesic, geometry-nearest, and repair-donor
     heap/k-d performance paths, local/fallback semantic caps, ten-step allocation
     order, no-copy Quality content audit, bounded replayable stereo and encoding
     control planes, mutation-generation boundaries, synchronous migration, and
     the configured/effective/actual/restored-stack thread envelope. Schema-5
     stereo providers require canonical upstream manifests and never synthesize
-    a directory fingerprint. A project-owned
+    a directory fingerprint. It also proves both CPython historical ZIP forms,
+    the bounded owned metric writer, audio process lifecycles, immutable final
+    targets, and the monotonic publication marker. A project-owned
     prebuilt extension is permitted only under the fixed oracle and packaging
     constraints; it cannot weaken output or add a silent fallback.
 15. All deterministic, resource, transaction, seven-frame visual, temporal, and
