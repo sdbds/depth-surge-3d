@@ -277,6 +277,11 @@ defects.
 | Persistent Linux UUID identity implicitly added an undeclared `libblkid` runtime | Remove `libblkid`; use one bounded `/dev/disk/by-uuid` capability adapter and fail before mutation when it cannot prove a unique device mapping. |
 | The three write-ahead control artifacts had unnamed publication temporaries | Give each one exact sibling `.create-new.tmp` path and one common no-replace publication/recovery state machine. |
 | Stage-04 retained a finalization marker-count name after physical ownership moved | Remove the stage variable entirely and introduce `final_prune_marker_file_count` only inside final-encoding preflight. |
+| A full-length pre-descriptor extent could still contain only delayed, uncommitted allocation | Treat every indexed all-zero extent as an incomplete reservation until one whole-range rewrite, file sync, reopen, and allocation classification proves readiness or an unsupported physical-allocation capability. |
+| Partial terminal replay had no durable attempt-local clock origin | Persist `attempt_started_at`, preserve it through nonterminal work, reset it only on explicit attempt restart, and derive every terminal duration from it with one integer rule. |
+| Final-video rename had no pre-existing target directory entry | Persist the publication method in the final index, then materialize and identity-bind the exact final target through an index-owned target descriptor before FFmpeg. |
+| Per-64-KiB payload sync made an O(N) manifest reservation perform thousands of syncs | Stream fixed-size zero writes, perform one file sync per whole extent-fill pass, and gate clean reservation byte, sync-count, and wall-time scaling at large N. |
+| Stage-04 reserve still included future `payload_pruned` metadata | Use `stage_metadata_raw` only for stage-04 memory/disk formulas and charge `payload_pruned_metadata_raw` only in final-encoding preflight when pruning is requested. |
 
 ## Public Settings Contract
 
@@ -597,6 +602,7 @@ hash contracts below, not from this self-fingerprint alone.
 | `source_video_fingerprint` | `hex32?` |
 | `project_version` | nonempty `scalar-string` |
 | `created_at` | `utc-usec` |
+| `attempt_started_at` | `utc-usec` |
 | `last_updated_at` | `utc-usec?` |
 | `terminal_at` | `utc-usec?` |
 | `processing_duration_ms` | `u64?` |
@@ -605,18 +611,35 @@ hash contracts below, not from this self-fingerprint alone.
 | `final_media_producer_contract_version` | `null | 4` |
 | `final_media_publication_generation` | `hex32?` |
 
-Migration captures one `migration_now_usec` before object construction. A valid
-legacy epoch value is a non-boolean finite JSON number in
+Define `utc_ordinal_usec_v1(t)` as the checked integer number of microseconds
+from Gregorian `0001-01-01T00:00:00.000000Z` to the strictly parsed `utc-usec`
+value, using civil-calendar integer arithmetic and no binary64 conversion.
+Define:
+
+```text
+attempt_duration_ms_v1(terminal_at, attempt_started_at) =
+    max(0, utc_ordinal_usec_v1(terminal_at)
+           - utc_ordinal_usec_v1(attempt_started_at)) // 1000
+```
+
+A new job captures one `creation_now_usec` and sets both `created_at` and
+`attempt_started_at` to it. Migration captures one `migration_now_usec` before
+object construction. A valid legacy epoch value is a non-boolean finite JSON
+number in
 `0..253402300799.999999`; convert it by checked
 `floor(binary64_value*1_000_000)` and format that integer as `utc-usec`.
 `created_at` uses valid `created_timestamp`, otherwise `migration_now_usec`.
 Legacy `processing_status` maps exact `completed` and `failed` unchanged, maps
 absence, `in_progress`, or `paused` to `in_progress`, and rejects every other
-value. An in-progress mapping sets `last_updated_at=migration_now_usec`. For a
-terminal mapping, `terminal_at` uses valid `completed_timestamp` only for
-completed, otherwise `migration_now_usec`; `last_updated_at=terminal_at`; and
-`processing_duration_ms=floor(max(0,terminal_usec-created_usec)/1000)`; both are
-null for in-progress. It does not retain `created_timestamp`, `last_updated`,
+value. An in-progress mapping sets `attempt_started_at=migration_now_usec` and
+`last_updated_at=migration_now_usec`; the migration boundary is the only honest
+start available for its schema-5 attempt. For a terminal mapping,
+`attempt_started_at=created_at`; `terminal_at` uses valid `completed_timestamp`
+only for completed, otherwise `migration_now_usec`;
+`last_updated_at=terminal_at`; and `processing_duration_ms` equals
+`attempt_duration_ms_v1(terminal_at,attempt_started_at)`. `terminal_at` and
+duration are null for in-progress. It does not retain `created_timestamp`,
+`last_updated`,
 `last_updated_timestamp`, `completed_at`, `completed_timestamp`,
 `processing_duration_seconds`, or `processing_duration_formatted` as extra
 schema-5 keys. Any substituted legacy value emits one typed migration warning
@@ -726,20 +749,25 @@ These state invariants are part of the schema, not post-parse conventions:
 - Initial schema-5 creation, whether new or migrated, is revision zero and
   attempt one. A new job uses `in_progress` plus `not_started`; all nullable
   time/runtime/producer fields are null. A migrated in-progress job follows the
-  adapter below and therefore has only `last_updated_at` non-null.
+  adapter below and therefore has `attempt_started_at` plus only
+  `last_updated_at` among nullable time fields non-null.
 - Every successful settings replacement increments `settings_revision` by
   exactly one, preserves `created_at`, and sets `last_updated_at` to that
   transaction's one captured `utc-usec`. An explicit resume/reencode from
   `failed` or `completed` first
   reserves a new terminal extent, increments `processing_attempt`, resets the
-  attempt-local terminal/runtime fields, and sets `in_progress`; it never clears
-  a non-null producer pair.
+  attempt-local terminal/runtime fields, sets `attempt_started_at` to that
+  restart transition's captured time, and sets `in_progress`; it never clears a
+  non-null producer pair. Every other nonterminal, producer, and cleanup-pending
+  transition preserves `attempt_started_at` byte-for-byte.
 - `in_progress` requires null `terminal_at`/duration/terminal diagnostics and
   cleanup `not_started` or `pending`. `pending` is allowed only after both final
   manifests are durable and only when `keep_intermediates=false`.
 - `completed` requires non-null `last_updated_at=terminal_at`, duration,
   final-output path equal to the expected path, exact N frames, and processing
-  time; terminal diagnostics are null. Except for the one untouched legacy
+  time; `processing_duration_ms` must equal
+  `attempt_duration_ms_v1(terminal_at,attempt_started_at)` and terminal
+  diagnostics are null. Except for the one untouched legacy
   migration case below, metric summary is non-null exactly for a metric job.
   Integer `processing_duration_ms` is authoritative. Define
   `duration_seconds_from_ms_v1(ms)` as the IEEE-754 binary64 result of
@@ -751,8 +779,9 @@ These state invariants are part of the schema, not post-parse conventions:
   comparison, or accepting a caller-supplied display value is forbidden.
   Cleanup is `not_requested` exactly when intermediates are kept;
   otherwise it is `complete` or one of the two incomplete terminal values.
-- `failed` requires non-null `last_updated_at=terminal_at`, duration, and
-  diagnostic code, with all success runtime fields null. Its cleanup value is
+- `failed` requires non-null `last_updated_at=terminal_at`, duration equal to
+  `attempt_duration_ms_v1(terminal_at,attempt_started_at)`, and diagnostic code,
+  with all success runtime fields null. Its cleanup value is
   never `pending`; a failure before cleanup uses `not_started`.
 - The producer version/generation fields are the null pair or exact `4` plus
   `hex32`. Every other nullable combination is invalid.
@@ -997,10 +1026,27 @@ RESERVATION_DESCRIPTOR_WRITE_CHUNK_BYTES = 4 KiB
 ```
 
 Zero fill uses consecutive writes of exactly the first constant except for the
-final remainder and file-syncs after every write. Descriptor serialization uses
-the second constant except for its final remainder, then performs its one full
-file sync before reopen validation. Neither chunk size is selected from ambient
-memory or filesystem hints.
+final remainder, then performs exactly one full file sync for that completed
+whole-extent fill pass before reopen validation. A short-file continuation is
+one pass over the missing suffix; a forced whole-range rewrite is a new pass and
+has its own one final sync. There is no per-chunk sync. Descriptor serialization
+uses the second constant except for its final remainder, then performs its one
+full file sync before reopen validation. Neither chunk size is selected from
+ambient memory or filesystem hints.
+
+Each final-encoding reservation invocation emits three non-semantic scalar phase
+metrics outside every canonical artifact: `reservation_write_bytes:u64` is the
+sum of bytes returned by zero-fill writes, `reservation_fsync_count:u64` counts
+only full-file sync calls for zero-filled payload extents, and
+`reservation_wall_time_ms:u64` is checked monotonic elapsed time from immediately
+before the first final-index temporary write through ready/error return. Index,
+descriptor, placeholder, and directory syncs remain mandatory but are not folded
+into the second metric.
+On a clean preflight, write bytes equal the sum of new extent logical lengths and
+the sync count equals the number of new payload extents; recovery suffix fills or
+whole-range repair add their actual bytes and one sync per completed pass. These
+counters are streamed/logged and never enter RGB, media, settings, or reservation
+identity.
 
 Every reservation payload uses `CanonicalReservationPayloadFrameV1`. At the
 declared full `logical_byte_count`, its bytes have exactly one of these states:
@@ -1034,8 +1080,9 @@ is not a payload extent and is classified separately.
 
 An authenticated owned `partial` frame carries no semantic intent. Before any
 replay, the owner overwrites the **entire** full logical range with zeros in
-`RESERVATION_ZERO_FILL_CHUNK_BYTES` chunks, file-syncs after every chunk, reopens,
-and proves the zero state plus original identity/allocation. Only then may it
+`RESERVATION_ZERO_FILL_CHUNK_BYTES` chunks, performs one file sync after the
+whole range, reopens, and proves the zero state plus original
+identity/allocation. Only then may it
 write a target again. Bootstrap and standalone settings replay their persisted
 exact target; an internal producer, pending, terminal, manifest, marker, or
 diagnostics transition may recapture only values the applicable contract marks
@@ -1370,6 +1417,9 @@ publication_generation:           hex32
 reservation_generation:           hex32
 settings_revision_at_preflight:   u64
 final_video_relative_path:        scalar-string
+final_video_publication_method:   "replace_placeholder" | "replace_existing"
+final_video_existing_target_identity_at_preflight: ReservationFileIdentityV1?
+final_video_target_descriptor_relative_path: scalar-string
 sibling_video_temporary_relative_path: scalar-string
 sibling_video_parent_identity:    DirectoryIdentity
 diagnostics_metadata_raw_sha256_at_preflight: hex64?
@@ -1389,6 +1439,71 @@ The index fingerprint omits only itself. Every descriptor created for a new
 entry binds this exact index path/fingerprint; the imported terminal descriptor
 continues to bind `job-control-v1.json` and its fingerprint and must validate
 byte-for-byte against the repeated entry.
+
+The final-video target is deliberately not a `ReservationEntryV1`: it reserves a
+directory slot but has no bounded payload extent. Before index publication,
+preflight opens the exact final parent and selects `replace_placeholder` only
+when the final component is absent. In that case
+`final_video_existing_target_identity_at_preflight` is null. An existing
+ordinary non-link, link-count-one final selects `replace_existing` and its
+captured identity is the non-null preflight field. Any other target type or
+crossed nullability fails before publication. The index cannot contain the
+future placeholder identity because the index is required to be durable before
+that placeholder is created.
+
+After index publication, the final target is identity-bound by a separate closed
+`FinalVideoTargetReservationV1` descriptor:
+
+```text
+schema_version:                   1
+algorithm_version:                "final-video-target-reservation-v1"
+job_id:                           hex32
+settings_artifact_relative_path:  "processing-settings-v5.json"
+settings_identity_fingerprint:    hex64
+settings_raw_sha256_at_preflight: hex64
+settings_revision_at_preflight:   u64
+publication_generation:           hex32
+reservation_generation:           hex32
+transaction_index_relative_path:
+    ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
+transaction_index_fingerprint:    hex64
+final_video_relative_path:        scalar-string
+sibling_video_temporary_relative_path: scalar-string
+target_parent_identity:           DirectoryIdentity
+publication_method:               "replace_placeholder" | "replace_existing"
+reserved_target_identity:         ReservationFileIdentityV1
+fingerprint:                      hex64
+```
+
+Its final name is exactly
+`final-video-target-p-<publication_generation>-r-<reservation_generation>.json`
+inside `.depth-surge-reservations-v1`; the index stores that complete relative
+path. Its sole publication temporary is the deterministic sibling
+`.<final-name>.create-new.tmp`. It uses the same canonical self-fingerprint,
+4-KiB descriptor stream, one file sync, rename-no-replace, parent sync, and
+reopen state machine as `ReservationExtentV1`, and its raw bytes must not exceed
+`FINAL_RESERVATION_DESCRIPTOR_RAW_BYTES`.
+
+For `replace_placeholder`, create-new the exact zero-length final component only
+after the index is durable, file-sync it, sync the target parent, reopen it
+without following links, require link count one, and capture
+`reserved_target_identity`. For `replace_existing`, reopen the target and require
+its identity to equal the non-null preflight identity before copying it into the
+descriptor. Publish and reopen-validate the descriptor next. Thus the index is
+the write-ahead authorization, while the later descriptor is the persistent
+physical identity; no immutable pre-write index is rewritten to add a
+post-create fact.
+
+If recovery finds no final target descriptor, `replace_placeholder` accepts only
+an absent target, which it creates as above, or an already present exact zero-
+length ordinary non-link/link-count-one child, which it adopts and identity-
+binds. `replace_existing` requires the exact persisted preflight identity still
+at the target. A nonzero would-be placeholder, unsafe entry, identity mismatch,
+or unindexed final-target descriptor is a conflict. A valid final descriptor
+with its exact deterministic temporary uses the common both-present retirement
+rule; a partial descriptor temporary may be rewritten only while the final is
+absent and the indexed target state still validates.
+
 `final_video_relative_path` is exactly the immutable settings
 `expected_final_relative_path`. The sibling path is derived once before index
 publication and is exactly the ASCII component
@@ -1401,6 +1516,21 @@ Both fields are one-component contained relative paths and must differ. The
 selected path must be absent at preflight; a collision fails before index
 publication rather than choosing another spelling.
 
+An active final index is ready for FFmpeg only when this final-target descriptor
+and every required extent descriptor validate. Before the first video
+replacement, the target must still have `reserved_target_identity`; after a
+validated sibling atomically replaces it, the descriptor remains as index-owned
+evidence that the directory slot was reserved, while the current target is the
+derived consumed-uncommitted state until both manifests authenticate it. A crash
+in that state still follows the existing reencode rule because the executed argv
+was not durable, but it reencodes against the already existing target entry.
+Once both manifests validate, the target is consumed-authenticated and recovery
+continues prune/settings only. A missing target, a second location for the
+reserved identity, or a wrong parent/type/link count is a conflict. The final-
+target descriptor is
+retired only with the final index after the applicable terminal success/failure
+commit and authenticated unused-placeholder handling.
+
 Once the index is durable, it exclusively owns that exact sibling path until
 index retirement. Before any FFmpeg launch or relaunch, an existing entry there
 must be an ordinary non-link, link-count-one child of the persisted parent; it is
@@ -1408,7 +1538,8 @@ unlinked and the parent synced, because an uncommitted video temporary is not
 semantic intent and is never adopted. Wrong type/parent/link count is a conflict.
 The runtime output argv always names this persisted path, while normalized argv
 maps that whole argument to the indexed final path. Success atomically moves it
-to the final component; every prepublication failure removes only this path.
+over the already existing final component; every prepublication failure removes
+only this path.
 Index retirement requires it absent. Without an active matching index, ordinary
 audit neither discovers nor deletes lookalike `.depth-surge-final-v4-*` names.
 The two diagnostics-preflight hashes are the null pair exactly when
@@ -1425,7 +1556,8 @@ stream/JSON-state caps. The settings index is instead bounded by the three
 `SETTINGS_TRANSITION_INDEX_*` constants because it contains one complete target
 settings payload. Each parser/serializer is incremental. The index is published
 through Create-new Control Artifact Publication V1 and reopen-validated
-**before** any new listed target-local extent or descriptor is created. The
+**before** any final-video placeholder, final-target descriptor, new listed
+target-local extent, or extent descriptor is created. The
 settings index is both
 the semantic payload intent and physical plan; the final index is the physical
 ordered plan whose later internally derived settings payloads follow the durable-
@@ -1434,27 +1566,46 @@ doing so would be circular. Its bounded publication is part of read-only free-
 space preflight, and failure leaves settings, manifests, markers, and frame work
 untouched.
 
-After index commit, create/fsync any declared zero-length target placeholder,
-then create each listed target-local payload extent, sync/reopen it, capture all
-identities/allocation, and publish/sync the central descriptor through its fixed
-temporary. A crash after
-index commit but before any entry, after a placeholder, after only some extents,
-or between one extent fsync and descriptor commit has one result: resume reads
-the fixed index and exact paths. Before descriptor commit, an absent extent is
+After final-index commit, first create/adopt and sync the indexed final-video
+target, then publish its target descriptor. For either fixed index, create/fsync
+any declared artifact target placeholder, then create each listed target-local
+payload extent, sync/reopen it, capture all identities/allocation, and publish/
+sync the central descriptor through its fixed temporary. A crash after index
+commit but before the final target, after that target but before its descriptor,
+after an artifact placeholder, after only some extents, or between one extent
+sync and descriptor commit has one result: resume reads the fixed index and exact
+paths. Final-target recovery applies its method/identity rules above. Before an
+extent descriptor commit, an absent extent is
 created; an exact indexed extent path is adoptable when it is an ordinary
 non-link file with link count one in the indexed parent, its length is in
 `0..logical_byte_count`, and every present byte is zero. Resume continues
 non-sparse zero writes from its current length in exact
-`RESERVATION_ZERO_FILL_CHUNK_BYTES` chunks,
-syncs after each chunk, and only at exact final length validates allocation and
-commits the descriptor through its deterministic temporary. A short allocation
-or ENOSPC is `ReservationIncompleteError`, preserves the index/partial zeros, and
-may be retried; it is not an identity conflict. Nonzero bytes, excess length,
-wrong parent/type/link count, a malformed final descriptor, or any final
-allocation that is sparse/shared/short remains `ReservationConflictError`.
+`RESERVATION_ZERO_FILL_CHUNK_BYTES` chunks and performs one sync at the end of
+that suffix-fill pass. At exact logical length it reopens and validates
+allocation. A full-length all-zero file whose allocation is short or merely
+appears sparse **before descriptor commit is still incomplete, not conflicting**:
+the invocation overwrites the complete logical range with zero chunks, performs
+one full file sync, reopens, rescans every byte, and reruns the physical-
+allocation probe. It performs at most one such whole-range repair pass per
+invocation.
+
+If a suffix/whole write or its sync reports ENOSPC/error 112, or the completed
+whole-range repair still reports only an insufficient physical byte count
+without affirmative incompatible-filesystem evidence, raise
+`ReservationIncompleteError`; preserve the index and exact extent for a later
+retry. A short allocation count by itself is never evidence of tampering.
+Commit the descriptor only after the reopened file meets the full exclusive-
+allocation contract. `ReservationConflictError` is limited to nonzero bytes,
+excess length, wrong parent/type/link count, an unindexed path, a malformed final
+descriptor, or a post-rewrite probe which affirmatively proves a hole/sparse
+mapping, compression, deduplication, reflink/shared extents, or an allocation
+state that the platform contract cannot authenticate. Once a descriptor is
+committed, its recorded identity/allocation remains strict and is not repaired by
+this pre-descriptor exception.
 Placeholder adoption still requires its exact path, zero length, parent, method,
-and ordinary-file/link-count shape. No index means no new placeholder or extent is
-authorized. An unindexed reserved-name file, extra descriptor, different path/
+and ordinary-file/link-count shape. No index means no new placeholder, final-
+target descriptor, or extent is authorized. An unindexed reserved-name file,
+extra descriptor, different path/
 parent/identity, or two fixed indexes for incompatible work is
 `ReservationConflictError`; it is preserved, never silently deleted. Thus there
 is no pre-index random group, bounded directory scan, glob, or mtime recovery
@@ -1507,14 +1658,21 @@ location, two locations for that identity, neither location before a proven
 commit, wrong/missing placeholder when required, different parent/identity, or
 cross-directory rename is a conflict.
 
-These pre-existing target and temporary directory entries are the physical guarantee;
-a central regular-file allocation is not accepted as a substitute. Supported
+For bounded artifact transactions, these pre-existing target and temporary
+directory entries are the physical guarantee; a central regular-file allocation
+is not accepted as a substitute. For final video, the target entry/descriptor is
+ready before FFmpeg and the indexed sibling entry exists after FFmpeg has created
+its output, so both names likewise exist before the final replace. Supported
 POSIX and Windows filesystems must pass an integration gate which fills ambient
-free space after every descriptor is ready and still replaces a placeholder or
-old target from the other existing same-parent entry, directory/file flush,
-reopen, and descriptor retirement. A filesystem for which that gate returns
-ENOSPC/error 112 is unsupported for reserved publication; the lifecycle terminal
-extent remains intact so the attempt can record failure.
+free space only after both same-parent entries exist and still replaces a
+placeholder or old target from the other entry, directory/file flush, reopen,
+and descriptor retirement. This explicitly covers POSIX `rename`/`renameat`
+implementations for which an absent destination could otherwise require directory
+growth and return ENOSPC, as permitted by the
+[POSIX.1-2024 rename contract](https://pubs.opengroup.org/onlinepubs/9799919799/functions/rename.html).
+A filesystem for which the pre-existing-target gate
+returns ENOSPC/error 112 is unsupported for reserved publication; the lifecycle
+terminal extent remains intact so the attempt can record failure.
 
 New-job creation and valid legacy migration calculate the complete typed
 schema-5 object, job control, identity fingerprint, paths, and maxima before any
@@ -1632,10 +1790,15 @@ reopen-validated, and self/raw-hash checked. That exact complete-full frame is
 then the durable semantic intent: recovery must publish those exact bytes. A
 crash with a partial frame has committed no semantic intent; recovery first
 restores the all-zero full extent and may then derive the still-applicable
-internal transition again with a newly captured time. It never needs caller
-values. This distinction prevents a partial write from inventing a committed
-timestamp, prevents old longer tails from contaminating a shorter retry, and
-retains exact replay for user-supplied changes.
+internal transition again with a newly captured time. A replayed terminal
+transition takes `attempt_started_at` only from the durable current settings and
+computes both `processing_duration_ms` and `processing_time_seconds` through
+`attempt_duration_ms_v1` and `duration_seconds_from_ms_v1`; process uptime,
+`created_at`, `last_updated_at`, caller timing, and a prior invocation's clock
+sample are forbidden substitutes. It never needs caller values. This distinction
+prevents a partial write from inventing a committed timestamp, prevents old
+longer tails from contaminating a shorter retry, and retains exact replay for
+user-supplied changes.
 
 Finalization schedule remains exact. Producer settings, when needed, commit
 immediately before first FFmpeg launch. After both manifests are durable,
@@ -1730,8 +1893,9 @@ artifact audit:
 4. Recover a present settings-transition index to commit or safely retain its
    exact declared work, retire it when complete, then restart at step 1.
 5. Recover a present final-encoding index in its consumption order, including
-   its artifact-specific manifest/video checks, retain it if work is incomplete,
-   retire it only after terminal commit, then restart at step 1.
+   its final-target descriptor plus artifact-specific manifest/video checks,
+   retain it if work is incomplete, retire it only after terminal commit, then
+   restart at step 1.
 6. Only when bootstrap is complete and neither fixed index is active, run
    `reconcile_job_control_owned_extents()`. If it publishes, resets, removes, or
    retires work, restart at step 1; if it retains a clean zero terminal reserve,
@@ -1740,8 +1904,9 @@ artifact audit:
    implementation audit canonical settings, stages/diagnostics, final media, and
    legacy/current disposition in that order.
 
-An active index owns every exact placeholder, target-local extent, descriptor,
-descriptor temporary, and final-index sibling video temporary it declares.
+An active index owns every exact placeholder, final-video target/target
+descriptor, target-local extent, extent descriptor, descriptor temporary, and
+final-index sibling video temporary it declares.
 Those entries do not contribute a normal
 artifact-presence bit, do not enter `V/I/P`, legacy-final classification, stage
 completeness, or reusable-payload discovery, and cannot be deleted by ordinary
@@ -4171,13 +4336,14 @@ identity.
 
 After resolving `auto`, the encoder constructs the runtime argument vector and
 its normalized copy together before execution, verifies their positional
-one-to-one mapping, requires the indexed sibling path absent, and retains both
-unchanged with the running process. On
+one-to-one mapping, requires the indexed sibling path absent and the final-target
+descriptor ready, and retains both unchanged with the running process. On
 FFmpeg success and process exit, it revalidates every encoding input, then opens
 that exact indexed sibling temporary output without following a link. It applies the exact
 container validator below, hashes and measures the file, fsyncs that open handle,
-and closes it. Only then does it atomically replace the final path and durably
-sync the final-output directory where supported. It reopens the final path
+and closes it. Only then does it atomically replace the already existing reserved
+final path and durably sync the final-output directory where supported. It
+reopens the final path
 without following a link and verifies the same byte count and SHA-256. It next
 atomically commits the revalidated canonical encoding-input manifest and then
 the canonical self-fingerprinted final-video manifest from their separately
@@ -4277,7 +4443,8 @@ re-resolve `auto` to guess provenance.
 Both manifests are retained final artifacts and are never listed for
 intermediate cleanup. Final-encoding disk preflight physically reserves their
 schema-derived target-local temporary allocations and any required final-path
-placeholders, plus a separate extent for each remaining
+placeholders, the exact final-video target entry and its identity descriptor,
+plus a separate extent for each remaining
 producer and pending-cleanup transaction before starting FFmpeg; it authenticates
 and indexes the lifecycle terminal extent already retained since job creation
 rather than allocating it again.
@@ -5667,14 +5834,6 @@ stage_metadata_raw = max_json_bytes(
     N,
     all frame names,
 )
-payload_pruned_metadata_raw = max_json_bytes(
-    Metadata,
-    status="payload_pruned",
-    every prior-state hash,
-    all final manifest hashes,
-    every maximum-width persisted prune path, DirectoryIdentity, marker name/hash,
-)
-metadata_raw    = max(stage_metadata_raw, payload_pruned_metadata_raw)
 summary_raw     = max_json_bytes(RootSummary, 16*W, W, N, all frame names)
 clamp_raw       = max_json_bytes(ClampSummary, N, all frame names)  # metric only
 quality_input_manifest_raw = max_json_bytes(
@@ -5689,7 +5848,7 @@ quality_rgb_metadata_raw = max_json_bytes(
 )  # Quality only; zero for Fast
 jsonl_raw       = sum(stats_raw[i] + 1 for i in source order)
 J_frame         = max({0}, {stats_raw[i] + manifest_raw[i] for all i})
-J_root          = max(metadata_raw, summary_raw,
+J_root          = max(stage_metadata_raw, summary_raw,
                       clamp_raw when metric else 0)
 encoding_input_manifest_raw = max_json_bytes(
     EncodingInputSequenceManifest,
@@ -5738,7 +5897,7 @@ pending_masks = P * M * 4 * mask_bound
 pending_json  = sum(alloc(stats_raw[i]) for i in P_set)
               + sum(alloc(manifest_raw[i]) for i in (P_set union R_set))
 
-root_final = alloc(metadata_raw) + alloc(jsonl_raw) + alloc(summary_raw)
+root_final = alloc(stage_metadata_raw) + alloc(jsonl_raw) + alloc(summary_raw)
            + (alloc(clamp_raw) when metric else 0)
            + (alloc(quality_input_manifest_raw) when Quality else 0)
            + (alloc(quality_rgb_metadata_raw) when Quality else 0)
@@ -5760,12 +5919,13 @@ required_bytes = pending_rgb + pending_masks + pending_json
                + filesystem_slack
 ```
 
-The stage-04 calculation uses maximum-width marker tokens and prune identities
-only to bound future JSON. It owns no marker or `payload_pruned` replacement
-space and retains no ambient-free-space promise across later FFmpeg growth.
-Marker tokens and concrete directory identities are captured by final-encoding
-preflight, whose authenticated extents below are the sole physical owner. No
-prune-marker reserve/count variable exists in the stage-04 byte or file formula.
+The stage-04 calculation neither derives nor charges `payload_pruned` metadata,
+maximum-width marker tokens, or prune identities. It owns no marker or
+`payload_pruned` replacement space and retains no ambient-free-space promise
+across later FFmpeg growth. Marker tokens and concrete directory identities are
+captured by final-encoding preflight, whose authenticated extents below are the
+sole physical owner. No prune-marker reserve/count variable or finalization-only
+metadata maximum exists in the stage-04 byte, file, or `J_root` formula.
 
 The later final-encoding preflight is a separate transaction and deliberately
 makes no claim that free space can hold the complete CRF-compressed video. There
@@ -5782,6 +5942,16 @@ additional_settings_transaction_count =
     + (1 when keep_intermediates is false else 0)   # cleanup pending
 diagnostics_payload_pruned_transaction_count =
       (1 when keep_intermediates is false else 0)
+payload_pruned_metadata_raw = (
+    max_json_bytes(
+        Metadata,
+        status="payload_pruned",
+        every prior-state hash,
+        all final manifest hashes,
+        every concrete persisted prune path, DirectoryIdentity, marker name/hash,
+    )
+    when keep_intermediates is false else 0
+)
 additional_settings_transaction_reserve =
     additional_settings_transaction_count
     * settings_transaction_extent("replace_existing")
@@ -5791,7 +5961,9 @@ The addition, allocation rounding, and multiplication above use checked uint64
 arithmetic; the additional count is exactly `0..2`. The validated persistent
 terminal descriptor contributes one index entry but zero newly required bytes.
 The base three entries are the two manifests plus that terminal descriptor;
-pruning adds the separate diagnostics entry and its marker entries.
+pruning adds the separate diagnostics entry and its marker entries. The singleton
+final-video target descriptor is a required top-level index field/charge, not an
+extent entry and not part of this count.
 
 Define one fully described new physical extent charge:
 
@@ -5802,6 +5974,21 @@ reservation_extent_charge(raw, descriptor_raw, method) =
     + placeholder_entry_charge(method)
 
 write_ahead_index_publication_charge(raw) = alloc(raw) + 2*A
+
+final_video_publication_method = (
+    "replace_placeholder" when final target is absent
+    else "replace_existing"
+)
+final_video_target_descriptor_raw = max_json_bytes(
+    FinalVideoTargetReservationV1,
+    every concrete path/method/generation/index value and the selected
+    platform's maximum `ReservationFileIdentityV1` spelling,
+)
+require final_video_target_descriptor_raw
+        <= FINAL_RESERVATION_DESCRIPTOR_RAW_BYTES
+final_video_target_reservation_charge =
+      alloc(final_video_target_descriptor_raw) + A
+    + placeholder_entry_charge(final_video_publication_method)
 
 final_prune_marker_file_count = (number of planned prune entries
                                  when keep_intermediates is false else 0)
@@ -5816,11 +6003,13 @@ final_encoding_index_raw = max_json_bytes(
     final_encoding_entry_count,
     every concrete source/temporary/target path, parent identity, role,
     marker binding, old diagnostics hashes, size, generation, descriptor path,
-    and final/sibling-video paths plus sibling parent identity,
+    final/sibling-video paths, sibling parent identity, final-video publication
+    method, nullable preflight target identity, and target-descriptor path,
 )
 
 final_encoding_new_reserve =
       write_ahead_index_publication_charge(final_encoding_index_raw)
+    + final_video_target_reservation_charge
     + additional_settings_transaction_reserve
     + reservation_extent_charge(
           encoding_input_manifest_raw,
@@ -5842,12 +6031,16 @@ final_encoding_new_reserve =
 ```
 
 The checked preflight first atomically publishes/fsyncs the fixed write-ahead
-index, then creates/fsyncs every declared target placeholder, target-parent-local
-extent, and central descriptor. It requires exactly
+index, then creates/adopts, syncs, and identity-binds the exact final-video target
+through `FinalVideoTargetReservationV1`, then creates/fsyncs every declared
+artifact target placeholder, target-parent-local extent, and central descriptor.
+It requires exactly
 `final_encoding_new_reserve` before FFmpeg.
 The index is a bounded bootstrap publication rather than a recursively reserved
 payload extent. Existing settings, the terminal extent, and any old final video/
-manifests already consume blocks and are never counted as free. Every other new
+manifests already consume blocks and are never counted as free. The final-target
+descriptor and a zero-length final-video placeholder when needed are materialized,
+not left as a future directory-growth assumption. Every other new
 term is materialized as an authenticated non-sparse target-local extent plus
 descriptor and any declared placeholder, not left as an unprotected free-space
 estimate.
@@ -5866,9 +6059,10 @@ original job-terminal extent. If processing fails before pending, the terminal
 failure write still has that extent and every unused additional slice is released
 only after the terminal transition is reopen-validated.
 
-Before FFmpeg, each manifest/marker/diagnostics allocation already exists as its
-validated zero-filled target-local extent plus descriptor and, when needed,
-final-path placeholder. The artifact transaction writes
+Before FFmpeg, the final-video target entry/descriptor and each manifest/marker/
+diagnostics allocation already exist; the latter use a validated zero-filled
+target-local extent plus descriptor and, when needed, final-path placeholder.
+The artifact transaction writes
 and validates canonical bytes at full reserved length, then truncates and proves
 at least `A` released. It atomically replaces the declared placeholder or old
 target according to the indexed method and syncs the parent. It never
@@ -5877,7 +6071,8 @@ entry. Only durable target reopen validation may
 retire the descriptor and advance to the next indexed extent.
 Prune markers and then the diagnostics payload-pruned metadata follow the same
 one-at-a-time rule after both manifests are durable. The final-encoding index is
-removed only after all applicable publications/markers/diagnostics and the
+removed, together with its final-target descriptor, only after all applicable
+publications/markers/diagnostics and the
 terminal settings transition
 are durable; a crash before then revalidates the remaining entries rather than
 estimating space again. Thus these artifacts need no new payload blocks from
@@ -5890,8 +6085,14 @@ ENOSPC/Windows error 112, interruption, timeout,
 validation failure, or any error before publication removes that temporary and
 any unauthenticated artifact temporaries, retains the indexed terminal extent
 until the terminal failure transition is durable, then removes only matching
-unused reservation entries under the authenticated crash policy. It leaves the
-old final video plus both old retained manifests unchanged. Only a successfully
+unused reservation entries under the authenticated crash policy. An unconsumed
+`replace_placeholder` final target may then be unlinked only when its identity is
+still the descriptor's exact zero-length reserved identity; sync the parent and
+retire the target descriptor with the index. `replace_existing` is never removed,
+and a target already changed by a prior unmanifested publication is preserved as
+incomplete publication evidence rather than mistaken for the old placeholder.
+The path leaves the old final video plus both old retained manifests unchanged
+whenever an old final existed. Only a successfully
 closed and validated temporary may enter the publication sequence. Output-file
 size is reported from the failed temporary, but it is never presented as a
 preflight guarantee. When job root and output share a volume, manifest extents
@@ -5940,7 +6141,7 @@ counting its stage paths.
 Define the no-reclaim first-mutation requirement:
 
 ```text
-first_mutation_reserve = alloc(metadata_raw) + A
+first_mutation_reserve = alloc(stage_metadata_raw) + A
                        + (alloc(quality_input_manifest_raw) + A
                           when Quality manifest publication is planned else 0)
                        + (alloc(quality_rgb_metadata_raw) + A
@@ -6246,7 +6447,9 @@ It is not a setting, saved mode, resume identity, or production branch.
    payload names. The frozen Fast-v3 metadata fixture alone accepts full `.png`
    names and remains byte-identical. Float-bit fixtures require `3f800001` from
    both endian hosts and reject the little-endian byte spelling `0100803f`.
-4. Fault injection after final-video close, file fsync, atomic publish,
+4. Fault injection after final-index publication, final-video target placeholder
+   create/file sync/parent sync, target-descriptor temporary/final publication,
+   final-video close, file fsync, reserved-target atomic publish,
    encoding-input/publication-manifest fsync/replace, reserved prune-marker
    placeholder/write/truncate/replace/fsync,
    directory-identity capture, prune metadata, and every cleanup step proves the
@@ -6271,9 +6474,11 @@ It is not a setting, saved mode, resume identity, or production branch.
    fallback, all retained-manifest, prune-marker, and payload-pruned-metadata
    reservations, and
    simultaneous old RGB plus all new temporaries. It explicitly makes no
-   video-size promise. Stage-04 goldens contain no prune-marker count or physical
-   charge; final-encoding goldens introduce `final_prune_marker_file_count` once
-   and materialize every marker extent/descriptor/placeholder exactly once.
+   video-size promise. Stage-04 goldens contain no prune-marker count,
+   `payload_pruned_metadata_raw`, or finalization-only physical charge; final-
+   encoding goldens introduce `final_prune_marker_file_count` and
+   `payload_pruned_metadata_raw` only when intermediates are removed and
+   materialize every marker extent/descriptor/placeholder exactly once.
    Direct and assembled FFmpeg ENOSPC tests leave an old final video and both old manifests
    byte-exact
    while removing sibling/owned reservation temporaries. Reservation fixtures
@@ -6289,11 +6494,17 @@ It is not a setting, saved mode, resume identity, or production branch.
    settings objects. They inject crashes after every control-artifact write
    chunk, fsync, no-replace rename, parent sync, and retirement, plus before/after
    index publication,
-   after every target-parent zero-fill chunk, after every deterministic descriptor-
-   temporary write chunk and its rename-no-replace commit, full-length payload
+   after every target-parent zero-fill write returns but before the pass's single
+   file sync, including the final write which first reaches full logical length,
+   after that one sync, after every deterministic descriptor-temporary write
+   chunk and its rename-no-replace commit, full-length payload
    validation, truncate/released-`A` check, same-parent rename, target reopen,
    and descriptor/index retirement. Matching partial work is adopted without
-   reallocation. Every payload kind proves all-zero, complete-full, partial, and
+   reallocation. A full-length all-zero pre-descriptor extent with short delayed
+   allocation performs one complete rewrite/sync/reopen; ENOSPC or a still-
+   unproved short count remains retryable incomplete, while affirmative post-
+   rewrite sparse/shared/compressed/unverifiable evidence conflicts. Every
+   payload kind proves all-zero, complete-full, partial, and
    complete-short classification; a 1,200-byte old partial followed by a
    900-byte retry is wholly zeroed before replay and cannot publish the old tail.
    Complete frames with a nonzero tail or illegal typed transition never pass as
@@ -6305,7 +6516,13 @@ It is not a setting, saved mode, resume identity, or production branch.
    interpretation. A full-disk integration gate removes ambient free space only
    after readiness and proves manifest/settings/marker/diagnostics publication uses the
    pre-existing placeholder/old-target and payload entries; truncate/rename
-   never creates a new directory entry. No payload
+   never creates a new directory entry. A separate full-disk final-video gate
+   creates both the indexed sibling and index-owned final target first, then
+   proves same-parent replacement does not extend the directory or return
+   ENOSPC/error 112. Final-target fixtures exhaust absent/existing methods, null
+   preflight identity, post-index placeholder adoption, target-descriptor
+   publication plus raw-cap/one-byte-over rejection, consumed-uncommitted
+   reencode, and wrong identity/type/link/parent conflicts. No payload
    extent is accepted in the central reservation directory. Persisted POSIX
    identities require one uniquely device-matching `/dev/disk/by-uuid` entry,
    32 lowercase filesystem-UUID digits, and the bounded opaque handle type/bytes;
@@ -6457,7 +6674,8 @@ It is not a setting, saved mode, resume identity, or production branch.
     with all frame/diagnostics `rgb_stage_fingerprint` values. An orphan object
     proves no completeness. Fast schema 1 remains byte-compatible and cannot be
     parsed or rewritten as schema 2.
-16. Synthetic direct and assembled encoding sources at N=1, 10,000, 1,000,000,
+16. Synthetic direct and assembled encoding sources at N=1, 10,000, 100,000,
+    1,000,000,
     and `ENCODING_CONTROL_FRAME_CAP` prove O(1) provider state, exact streamed
     directory completeness, same-generation prepass/argv/postpass, and at most
     six MiB coordinator residency across the distinct manifest, audio-probe,
@@ -6468,7 +6686,10 @@ It is not a setting, saved mode, resume identity, or production branch.
     process output and JSON/settings state. No source resolver or assembled
     frame-list interface is called. Pre-launch changes restart only after
     exact indexed temporary cleanup; post-launch changes terminate/reap FFmpeg,
-    remove that same sibling, and publish nothing. Direct and assembled goldens
+    remove that same sibling, and publish nothing. Clean N=100,000, N=1,000,000,
+    and cap reservations also assert exact zero-fill write bytes, one sync per new
+    payload extent, no per-chunk sync, and all three wall-time gates. Direct and
+    assembled goldens
     persist and execute
     `.depth-surge-final-v4-<complete-generation>.tmp.mp4`, bind its parent
     identity/final target, keep the component at 62 units beside a maximum
@@ -6540,8 +6761,12 @@ It is not a setting, saved mode, resume identity, or production branch.
     producer/pending extents remain with intermediates off, the
     same original terminal extent is indexed rather than double-counted, and a
     terminal-to-new-attempt transition preallocates both rewrite/replacement
-    extents. Cleanup-only resume reuses its one or two persisted indexed extents
-    and allocates neither again. Completed legacy fixtures also run every frozen
+    extents, captures a fresh `attempt_started_at`, and then preserves it through
+    producer/pending rewrites. Cleanup-only resume reuses its one or two persisted
+    indexed extents and allocates neither again. Partial success/failure terminal
+    frames rederive a new terminal time and produce the exact attempt-start-based
+    integer duration/binary64 seconds pair, never a created/updated/process-uptime
+    value. Completed legacy fixtures also run every frozen
     millisecond/binary64 pair through migration, canonical serialization, raw-
     maximum construction, and terminal reopen validation. No
     direct pretty-JSON overwrite runs, every phase remains at six MiB or less,
@@ -6643,6 +6868,18 @@ With five warmups and 30 measured frames on that clean CUDA environment:
   construction, encode progress, final validation, postpass, and isolated
   producer/pending/terminal settings commits, with no eager path/name collection
   or uncapped settings object;
+- on the recorded reference local storage, clean direct and assembled final-
+  reservation runs at N=100,000, N=1,000,000, and
+  `ENCODING_CONTROL_FRAME_CAP` record filesystem/storage identity plus
+  `reservation_write_bytes`, `reservation_fsync_count`, and
+  `reservation_wall_time_ms`. For each run, write bytes equal the calculated new
+  payload logical lengths, sync count equals the calculated new payload-extent
+  count rather than chunk count, and no counter or trace contains a per-64-KiB
+  sync. Each of three measured runs finishes within respectively 30, 180, and
+  600 seconds; direct and assembled are gated independently. A production call
+  has no wall-time fallback or alternate semantics, but a release candidate
+  exceeding this gate must optimize the identical sequential protocol rather
+  than reduce N, skip zero/allocation validation, or reintroduce per-chunk sync;
 - simultaneous stereo jobs repeatedly create and tear down threads while a
   third project thread creator contends for the global creation lock. Every run
   restores the previous process stack setting on success and each injected
@@ -6841,8 +7078,9 @@ Approval of this canonical specification accepts:
 7. Schema 1 through 4 jobs migrate to Fast; schema 5 preserves resolved intent.
    Their raw source schema records ancestry, while a separate monotonic first-
    v4-attempt marker determines whether final media can still be legacy.
-   Neither depends on package version. Gated CUDA jobs may default Quality,
-   while CPU jobs default Fast.
+   Neither depends on package version. A persisted attempt start, not creation,
+   last-update, or process uptime, is the sole terminal-duration origin. Gated
+   CUDA jobs may default Quality, while CPU jobs default Fast.
 8. No neural dependency, generic inpainting, or temporal state enters v1.
 9. Quality v1 serializes one decoded/rendered/written frame lifecycle. Fast uses
    geometry-aware relative/metric slot bounds over `Q`, every `G_i`, compressed
@@ -6905,8 +7143,13 @@ Approval of this canonical specification accepts:
     terminal durability. A JobControl reconciler owns the lifecycle terminal
     extent whenever neither fixed index does; exact durable bytes publish and a
     partial frame is wholly zeroed. Generation-bound descriptors/indexes make
-    every finalization reserve crash-reusable and persist the one short sibling-
-    video path. Linux destructive mutation additionally requires the bounded
+    every finalization reserve crash-reusable, persist the one short sibling-
+    video path, and materialize an exact final-video target entry plus its post-
+    index identity descriptor before launch. Payload zero fill uses fixed chunks
+    but only one sync per whole pass; a full-length pre-descriptor allocation
+    shortfall remains retryable until a synchronized whole rewrite proves an
+    incompatible filesystem. Stage-04 never pays for future payload-pruned
+    metadata. Linux destructive mutation additionally requires the bounded
     no-dependency UUID/file-handle capability adapter. A new persisted immutable
     target
     meets both 240-byte and 240-UTF-16-unit limits; a contained locatable legacy

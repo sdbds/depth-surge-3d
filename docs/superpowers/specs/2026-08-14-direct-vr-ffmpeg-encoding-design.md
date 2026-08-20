@@ -19,6 +19,7 @@ generation-derived sibling-video temporary and producer marker, the closed
 schema-5 settings/job-control locator,
 lifecycle-spanning target-parent reservation extents, replayable settings intents,
 fixed write-ahead indexes/control temporaries, reservation-payload framing,
+the index-owned final-target slot and post-index identity descriptor,
 JobControl-owned extent reconciliation, persisted-versus-invocation file
 identities, the reserved diagnostics payload-pruned commit, transaction-first
 audit order,
@@ -376,9 +377,13 @@ FFmpeg select the correct muxer without lengthening the final component.
 
 - With the authenticated final index active, remove only that exact persisted
   stale temporary path before starting or relaunching.
-- Never remove or truncate an existing final output before FFmpeg succeeds.
+- Require the canonical final-target reservation descriptor ready before launch;
+  when the target was absent, its index-authorized zero-length placeholder is
+  already created, synced, and identity-bound.
+- Never remove or truncate that reserved target before FFmpeg succeeds.
 - On return code zero, require the temporary file to exist and be non-empty,
-  then use the canonical validator, flush, and same-parent atomic publication.
+  then use the canonical validator, flush, and replace the already existing
+  same-parent target atomically.
 - On nonzero return, launch exception, progress-reader failure, or missing/empty
   output, remove the temporary path and return failure.
 - Include the bounded FFmpeg diagnostic tail in console output on failure.
