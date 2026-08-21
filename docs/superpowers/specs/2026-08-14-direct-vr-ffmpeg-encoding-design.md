@@ -380,7 +380,11 @@ FFmpeg select the correct muxer without lengthening the final component.
 - Require the canonical final-target reservation descriptor ready before launch;
   when the target was absent, its index-authorized zero-length placeholder is
   already created, synced, and identity-bound.
-- Never remove or truncate that reserved target before FFmpeg succeeds.
+- Do not remove or truncate that reserved target while an encode is active.
+  Canonical authenticated cleanup may unlink only an untouched
+  `replace_placeholder` target either while discarding a prelaunch invocation
+  under its active index or after the terminal failure transition is durable; a
+  `replace_existing` target is never removed by that cleanup.
 - On return code zero, require the temporary file to exist and be non-empty,
   then use the canonical validator, flush, and replace the already existing
   same-parent target atomically.

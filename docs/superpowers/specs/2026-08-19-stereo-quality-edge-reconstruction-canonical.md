@@ -282,6 +282,10 @@ defects.
 | Final-video rename had no pre-existing target directory entry | Persist the publication method in the final index, then materialize and identity-bind the exact final target through an index-owned target descriptor before FFmpeg. |
 | Per-64-KiB payload sync made an O(N) manifest reservation perform thousands of syncs | Stream fixed-size zero writes, perform one file sync per whole extent-fill pass, and gate clean reservation byte, sync-count, and wall-time scaling at large N. |
 | Stage-04 reserve still included future `payload_pruned` metadata | Use `stage_metadata_raw` only for stage-04 memory/disk formulas and charge `payload_pruned_metadata_raw` only in final-encoding preflight when pruning is requested. |
+| Payload padding was reused as payload/descriptor directory-entry slack | Define one set of payload, descriptor, placeholder, and control-publication charge helpers; charge the source entry and both descriptor names independently, and reuse the helpers in every bootstrap, settings, and final-encoding formula. |
+| Post-rewrite allocation states had no exact platform oracle | Add a closed allocation-evidence union, freeze Linux ext4/FIEMAP and Windows NTFS/allocated-range adapters, reject missing capability before mutation, and keep an otherwise short synchronized allocation retryable. |
+| Final-target descriptor and final index were said to retire together | Make final-index retirement an eight-step index-last protocol and admit the descriptor-absent, terminal-durable intermediate state explicitly in recovery. |
+| Direct VR's target-preservation sentence forbade authenticated failure cleanup | Limit the prohibition to an active encode and defer untouched placeholder removal after durable terminal failure to the canonical cleanup contract. |
 
 ## Public Settings Contract
 
@@ -977,9 +981,10 @@ its exact EOF, strict schema, self-fingerprint, and parent/job identity. It then
 atomically renames-no-replace to the absent final name, syncs the parent, and
 reopens the final object. POSIX and Windows use the same no-replace adapters as a
 reservation descriptor. Direct final-name writes, random names, PID/time suffixes,
-globs, and mtime selection are forbidden. The existing `alloc(raw)+2*A`
-publication charge covers the temporary, final directory entry, and replacement
-slack; none of these three control artifacts is recursively reservation-backed.
+globs, and mtime selection are forbidden.
+`control_artifact_create_new_charge(raw)` covers the temporary file data plus
+its temporary and absent-final directory entries; none of these three control
+artifacts is recursively reservation-backed.
 
 Recovery opens only the exact final/temporary pair and applies this closed table:
 
@@ -1181,6 +1186,121 @@ requirements and the actionable unsupported-storage error. The 64-KiB scan
 buffer belongs to the isolated job-control validation phase and no system UUID
 library allocator or process output exists outside that phase.
 
+Physical-allocation proof has one closed persisted spelling.
+`ReservationAllocationEvidenceV1` is exactly one of:
+
+```text
+Linux: {
+    platform:                     "linux",
+    algorithm_version:            "linux-ext4-fiemap-sync-v1",
+    filesystem_magic:             "0000ef53",
+    logical_coverage_byte_count:  positive-u64,
+    allocated_byte_count:         positive-u64
+}
+Windows: {
+    platform:                     "windows",
+    algorithm_version:            "windows-ntfs-allocated-ranges-v1",
+    filesystem_name:              "NTFS",
+    block_refcounting_supported:  false,
+    logical_coverage_byte_count:  positive-u64,
+    allocated_byte_count:         positive-u64
+}
+```
+
+The coverage value equals the descriptor's `logical_byte_count`; allocation is
+at least that value. These are normalized results, not caller-selected labels.
+"Exclusive" in this contract means unshared, fully mapped allocation in the
+named filesystem's accounting domain. Storage-controller compression, thin
+provisioning, and deduplication below that filesystem are not observable through
+either adapter and are outside the claim.
+The implementation reruns the named adapter whenever it validates a committed
+descriptor and requires the same normalized evidence. It does not persist
+physical offsets or extent count because lawful defragmentation may change
+either without changing exclusive allocation.
+
+Before the first job-control or fixed-index temporary write, the read-only
+capability gate opens every prospective target parent and checks the applicable
+adapter. Reservation-backed mutation cannot use the 64-KiB allocation-unit
+fallback: failure to query the exact unit is `ReservationCapabilityError` with
+no job mutation. The v1 Linux adapter requires `fstatfs(parent_fd).f_type` equal
+to `EXT4_SUPER_MAGIC` (`0x0000ef53`) and a successful
+`ioctl(parent_fd, FS_IOC_GETFLAGS)` with neither `FS_COMPR_FL` nor
+`FS_ENCRYPT_FL`; every other Linux filesystem needs a separately frozen adapter.
+The v1 Windows adapter calls `GetVolumeInformationByHandleW(parent_handle)`,
+requires exact filesystem name `NTFS`, and rejects
+`FILE_VOLUME_IS_COMPRESSED`, `FILE_READ_ONLY_VOLUME`, and
+`FILE_SUPPORTS_BLOCK_REFCOUNTING`. It also obtains
+`FileAttributeTagInfo` through `GetFileInformationByHandleEx` and rejects a
+target parent carrying `FILE_ATTRIBUTE_SPARSE_FILE`, `FILE_ATTRIBUTE_COMPRESSED`,
+`FILE_ATTRIBUTE_ENCRYPTED`, `FILE_ATTRIBUTE_REPARSE_POINT`,
+`FILE_ATTRIBUTE_OFFLINE`, or `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`.
+Unsupported queries, remote storage, ReFS, and any other filesystem fail this
+gate with `ReservationCapabilityError`; they do not publish an index and are not
+reclassified as a content conflict.
+A build which does not bind every named structure, constant, syscall/ioctl, and
+handle query marks the corresponding adapter unavailable before job mutation;
+there is no reduced probe.
+
+After each whole-extent file sync, the Linux adapter reopens the owned file and
+calls `statx(open_fd,"",AT_EMPTY_PATH|AT_STATX_FORCE_SYNC,
+STATX_TYPE|STATX_NLINK|STATX_SIZE|STATX_BLOCKS,&stx)`, requiring every requested
+result bit. The allocation count is checked `stx_blocks*512`. It then issues
+`FS_IOC_FIEMAP` with only
+`FIEMAP_FLAG_SYNC`, starting at logical byte zero, requesting the remaining
+range, and using exactly 64 `fiemap_extent` slots per call. A full batch without
+`FIEMAP_EXTENT_LAST` continues at the checked end of its last extent. Each
+positive-length returned extent must advance in strictly increasing logical
+order; after clipping to the requested file range, the extents must cover
+`[0,logical_byte_count)` exactly once with no gap or overlap, and the final
+covering extent must carry `FIEMAP_EXTENT_LAST`.
+
+For Linux, flag zero is accepted on every nonfinal extent and
+`FIEMAP_EXTENT_LAST` alone on the final extent.
+`FIEMAP_EXTENT_UNKNOWN`, `FIEMAP_EXTENT_DELALLOC`, or
+`FIEMAP_EXTENT_UNWRITTEN`, a coverage gap, or a short `stx_blocks*512` result is
+an unready allocation. `FIEMAP_EXTENT_ENCODED`,
+`FIEMAP_EXTENT_DATA_ENCRYPTED`, `FIEMAP_EXTENT_NOT_ALIGNED`,
+`FIEMAP_EXTENT_DATA_INLINE`, `FIEMAP_EXTENT_DATA_TAIL`,
+`FIEMAP_EXTENT_MERGED`, `FIEMAP_EXTENT_SHARED`, or any unknown extent flag is an
+unsupported file state. `SEEK_DATA`/`SEEK_HOLE` and `st_blocks` alone are never
+substitutes for the complete probe. This paging and flag behavior follows the
+kernel's [FIEMAP userspace contract](https://docs.kernel.org/filesystems/fiemap.html).
+
+After `FlushFileBuffers`, the Windows adapter requires
+`GetFileInformationByHandleEx(FileStandardInfo)` to report exact
+`EndOfFile=logical_byte_count`, link count one, a nondirectory/non-delete-pending
+file, and `AllocationSize>=logical_byte_count`. Its file
+`FileAttributeTagInfo` must have none of `FILE_ATTRIBUTE_SPARSE_FILE`,
+`FILE_ATTRIBUTE_COMPRESSED`, `FILE_ATTRIBUTE_ENCRYPTED`,
+`FILE_ATTRIBUTE_REPARSE_POINT`, `FILE_ATTRIBUTE_OFFLINE`, or
+`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`. It then calls
+`DeviceIoControl(FSCTL_QUERY_ALLOCATED_RANGES)` synchronously for exact input
+range `[0,logical_byte_count)` with one `FILE_ALLOCATED_RANGE_BUFFER` output
+slot. Success must return exactly one slot whose range is exactly the input;
+zero/short coverage or short `AllocationSize` is unready. Extra ranges,
+`ERROR_MORE_DATA`, a forbidden attribute, volume-flag drift, or an unsupported
+control is an unsupported file/platform state. This uses the documented rule
+that a non-sparse, non-compressed file returns the one requested range, rather
+than treating allocation size alone as proof; see
+[FSCTL_QUERY_ALLOCATED_RANGES](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_query_allocated_ranges),
+[FILE_STANDARD_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_standard_info),
+[FILE_ATTRIBUTE_TAG_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_attribute_tag_info),
+and
+[GetVolumeInformationByHandleW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getvolumeinformationbyhandlew).
+
+Before descriptor commit, an unready result enters the one whole-range repair
+defined below; if still unready afterward it is always
+`ReservationIncompleteError`. An unsupported file/platform result is
+`ReservationCapabilityError`; an active index and all exact owned paths are
+preserved, and lack of allocation evidence is never called
+`ReservationConflictError`. `ENOTTY`, `EOPNOTSUPP`, `ENOSYS`, `EBADR`, or the
+Windows `ERROR_INVALID_FUNCTION`/`ERROR_NOT_SUPPORTED` result from a named
+adapter is capability failure; other syscall/I/O errors propagate as I/O failure
+without changing the transaction classification. Once a descriptor is committed,
+successful adapter execution which proves its normalized evidence changed is
+instead an evidence conflict; an adapter which can no longer execute remains a
+capability failure.
+
 A central descriptor is the closed `ReservationExtentV1` object:
 
 ```text
@@ -1211,7 +1331,7 @@ reserved_placeholder_identity:   ReservationFileIdentityV1?
 payload_role:                    scalar-string
 payload_raw_max:                 positive-u64
 logical_byte_count:              positive-u64
-allocated_byte_count:            positive-u64
+allocation_evidence:             ReservationAllocationEvidenceV1
 allocation_unit:                 positive-u64
 filesystem_identity:             ReservationFileIdentityV1
 prune_root_relative_path:        scalar-string?
@@ -1308,16 +1428,51 @@ control; all other IDs/generations are independent 128-bit OS-CSPRNG `hex32`
 values first persisted by their write-ahead index.
 
 For maximum canonical payload `raw`, `payload_raw_max=raw` and
-`logical_byte_count=alloc(raw)+A`. The extra allocation unit is same-volume
-publication slack and is deliberately still present while payload bytes are
-written. The descriptor records the exact allocation bytes observed after the
-non-sparse fill. Its own central file is separately charged as
-`alloc(reservation_descriptor_raw_max)+A`; descriptor bytes are never hidden in
-the payload extent. Reopen validation requires matching job/settings/index,
-path/role/parent identity, ordinary-file identity, link count one, exact logical
-size, allocation unit, and allocated bytes at least the required physical
-allocation. Sparse, compressed, deduplicated, reflink/shared-extent, reparse, or
-allocation-unknown files do not qualify.
+`logical_byte_count=payload_logical_bytes(raw)`. The final `A` in that logical
+length is forced all-zero **file data padding**. It is physically allocated while
+the payload is written; it is neither an unallocated publication reserve nor a
+directory-entry charge.
+
+These are the sole reservation-publication charge helpers:
+
+```text
+payload_logical_bytes(raw) = alloc(raw) + A
+
+payload_extent_create_charge(raw) =
+      payload_logical_bytes(raw)
+    + A  # source-extent directory entry
+
+descriptor_create_new_charge(descriptor_raw) =
+      alloc(descriptor_raw)
+    + 2*A  # deterministic temporary entry + absent final descriptor entry
+
+placeholder_entry_charge(method) =
+    A when method == "replace_placeholder" else 0
+
+reservation_extent_charge(raw, descriptor_raw, method) =
+      payload_extent_create_charge(raw)
+    + descriptor_create_new_charge(descriptor_raw)
+    + placeholder_entry_charge(method)
+
+control_artifact_create_new_charge(raw) = alloc(raw) + 2*A
+```
+
+The two descriptor names are charged independently even though no-replace rename
+is atomic: the readiness proof must allow the destination directory to extend
+while the temporary still exists. Thus a `replace_existing` entry costs exactly
+`alloc(raw)+alloc(descriptor_raw)+4*A`; `replace_placeholder` costs one more
+`A`. No term can reuse the payload padding as directory slack. Control-artifact
+publication, bootstrap initial/terminal settings, standalone settings, final
+manifests, prune markers, diagnostics `payload_pruned`, and the final-video
+target descriptor all invoke these helpers rather than spelling private `+A`
+variants.
+
+The descriptor records the exact normalized allocation evidence observed after
+the non-sparse fill; descriptor bytes remain a separate central file. Reopen
+validation requires matching job/settings/index, path/role/parent identity,
+ordinary-file identity, link count one, exact logical size, allocation unit, and
+the applicable `ReservationAllocationEvidenceV1`. A file rejected by that
+adapter does not qualify.
 
 Every non-bootstrap reservation is owned before extent creation by one fixed
 write-ahead index. `ReservationEntryV1` has exactly:
@@ -1397,7 +1552,7 @@ Before publishing it, derive
 `settings_transition_index_raw=max_json_bytes(SettingsTransitionReservationV1,
 the complete concrete target payload and entry list)`, require it not exceed
 `SETTINGS_TRANSITION_INDEX_MAX_RAW_BYTES`, and require checked physical reserve
-`alloc(settings_transition_index_raw)+2*A` plus one
+`control_artifact_create_new_charge(settings_transition_index_raw)` plus one
 `settings_transaction_extent(entry.publication_method)` for each entry. The
 index publication charge is bootstrap space; every entry charge is then
 materialized and synced before the typed settings mutation.
@@ -1494,15 +1649,17 @@ the write-ahead authorization, while the later descriptor is the persistent
 physical identity; no immutable pre-write index is rewritten to add a
 post-create fact.
 
-If recovery finds no final target descriptor, `replace_placeholder` accepts only
-an absent target, which it creates as above, or an already present exact zero-
-length ordinary non-link/link-count-one child, which it adopts and identity-
-binds. `replace_existing` requires the exact persisted preflight identity still
-at the target. A nonzero would-be placeholder, unsafe entry, identity mismatch,
-or unindexed final-target descriptor is a conflict. A valid final descriptor
-with its exact deterministic temporary uses the common both-present retirement
-rule; a partial descriptor temporary may be rewritten only while the final is
-absent and the indexed target state still validates.
+Recovery first tests the `FinalEncodingRetirementV1` state below. When its
+terminal/cleanup preconditions are not satisfied, a missing final-target
+descriptor means construction is still in progress: `replace_placeholder`
+accepts only an absent target, which it creates as above, or an already present
+exact zero-length ordinary non-link/link-count-one child, which it adopts and
+identity-binds. `replace_existing` requires the exact persisted preflight
+identity still at the target. A nonzero would-be placeholder, unsafe entry,
+identity mismatch, or unindexed final-target descriptor is a conflict. A valid
+final descriptor with its exact deterministic temporary uses the common both-
+present retirement rule; a partial descriptor temporary may be rewritten only
+while the final is absent and the indexed target state still validates.
 
 `final_video_relative_path` is exactly the immutable settings
 `expected_final_relative_path`. The sibling path is derived once before index
@@ -1527,9 +1684,10 @@ was not durable, but it reencodes against the already existing target entry.
 Once both manifests validate, the target is consumed-authenticated and recovery
 continues prune/settings only. A missing target, a second location for the
 reserved identity, or a wrong parent/type/link count is a conflict. The final-
-target descriptor is
-retired only with the final index after the applicable terminal success/failure
-commit and authenticated unused-placeholder handling.
+target descriptor remains index-owned through the applicable terminal success/
+failure commit and authenticated unused-placeholder handling. Final retirement
+then removes and syncs that descriptor **before** removing the final index; the
+index is always the last authority to disappear.
 
 Once the index is durable, it exclusively owns that exact sibling path until
 index retirement. Before any FFmpeg launch or relaunch, an existing entry there
@@ -1583,25 +1741,25 @@ non-sparse zero writes from its current length in exact
 `RESERVATION_ZERO_FILL_CHUNK_BYTES` chunks and performs one sync at the end of
 that suffix-fill pass. At exact logical length it reopens and validates
 allocation. A full-length all-zero file whose allocation is short or merely
-appears sparse **before descriptor commit is still incomplete, not conflicting**:
-the invocation overwrites the complete logical range with zero chunks, performs
-one full file sync, reopens, rescans every byte, and reruns the physical-
-allocation probe. It performs at most one such whole-range repair pass per
-invocation.
+returns the named adapter's unready state **before descriptor commit is still
+incomplete, not conflicting**: the invocation overwrites the complete logical
+range with zero chunks, performs one full file sync, reopens, rescans every byte,
+and reruns that same platform adapter. It performs at most one such whole-range
+repair pass per invocation.
 
 If a suffix/whole write or its sync reports ENOSPC/error 112, or the completed
-whole-range repair still reports only an insufficient physical byte count
-without affirmative incompatible-filesystem evidence, raise
-`ReservationIncompleteError`; preserve the index and exact extent for a later
-retry. A short allocation count by itself is never evidence of tampering.
-Commit the descriptor only after the reopened file meets the full exclusive-
-allocation contract. `ReservationConflictError` is limited to nonzero bytes,
-excess length, wrong parent/type/link count, an unindexed path, a malformed final
-descriptor, or a post-rewrite probe which affirmatively proves a hole/sparse
-mapping, compression, deduplication, reflink/shared extents, or an allocation
-state that the platform contract cannot authenticate. Once a descriptor is
-committed, its recorded identity/allocation remains strict and is not repaired by
-this pre-descriptor exception.
+whole-range repair still has short allocation, a coverage gap, or the exact
+retryable Linux flag set, raise `ReservationIncompleteError`; preserve the index
+and exact extent for a later retry. Short or delayed allocation is never evidence
+of tampering. If the closed adapter reports an unsupported file/platform state or
+cannot run, raise `ReservationCapabilityError` and preserve the same state; do
+not turn missing proof into a permanent conflict. Commit the descriptor only
+after the reopened file meets the complete normalized evidence contract.
+`ReservationConflictError` is limited to nonzero bytes, excess length, wrong
+parent/type/link count, an unindexed path, a malformed final descriptor, or a
+successful post-commit adapter result which contradicts the descriptor's durable
+evidence. Once a descriptor is committed, its recorded identity/evidence remains
+strict and is not repaired by this pre-descriptor exception.
 Placeholder adoption still requires its exact path, zero length, parent, method,
 and ordinary-file/link-count shape. No index means no new placeholder, final-
 target descriptor, or extent is authorized. An unindexed reserved-name file,
@@ -1681,22 +1839,22 @@ mutation. Their read-only proof is:
 ```text
 reservation_descriptor_raw_max = max_json_bytes(
     ReservationExtentV1,
-    all concrete identity/path/kind/index/role values,
+    all concrete identity/path/kind/index/role values and the selected
+    platform's maximum `ReservationAllocationEvidenceV1` spelling,
 )
-reservation_descriptor_extent = alloc(reservation_descriptor_raw_max) + A
-settings_target_extent = alloc(settings_artifact_raw_max) + A
-placeholder_entry_charge(method) =
-    A when method == "replace_placeholder" else 0
-settings_transaction_extent(method) = settings_target_extent
-                                      + reservation_descriptor_extent
-                                      + placeholder_entry_charge(method)
+settings_transaction_extent(method) = reservation_extent_charge(
+    settings_artifact_raw_max,
+    reservation_descriptor_raw_max,
+    method,
+)
 job_control_raw = max_json_bytes(
     JobControlV1,
     concrete legacy path or null,
     complete BootstrapSettingsIntentV1 target payload,
 )
 require job_control_raw <= JOB_CONTROL_MAX_RAW_BYTES
-job_control_publication_extent = alloc(job_control_raw) + 2*A
+job_control_publication_extent =
+    control_artifact_create_new_charge(job_control_raw)
 initial_settings_reserve =
       job_control_publication_extent
     + A  # create/sync the authenticated reservation directory
@@ -1893,9 +2051,10 @@ artifact audit:
 4. Recover a present settings-transition index to commit or safely retain its
    exact declared work, retire it when complete, then restart at step 1.
 5. Recover a present final-encoding index in its consumption order, including
-   its final-target descriptor plus artifact-specific manifest/video checks,
-   retain it if work is incomplete, retire it only after terminal commit, then
-   restart at step 1.
+   its final-target descriptor plus artifact-specific manifest/video checks, or
+   the exact descriptor-absent `retirement-in-progress` row. Retain it if work is
+   incomplete; after terminal commit use only the index-last retirement protocol,
+   then restart at step 1.
 6. Only when bootstrap is complete and neither fixed index is active, run
    `reconcile_job_control_owned_extents()`. If it publishes, resets, removes, or
    retires work, restart at step 1; if it retains a clean zero terminal reserve,
@@ -5801,6 +5960,10 @@ alone. Reuse the metric-stage allocation-unit query with its 64 KiB filesystem
 unit fallback; 64 KiB is not a JSON-size assumption. Define
 `A=max(4096, queried_or_fallback_unit)` and
 `alloc(n)=ceil(n/A)*A`.
+The fallback is legal only for a non-reservation stage estimate. Any bootstrap,
+standalone settings, or final-encoding transaction must obtain the exact queried
+unit for every charged target volume or fail the read-only capability gate before
+publishing its control artifact.
 
 JSON bounds are schema-derived. `max_json_bytes(schema, cardinalities,
 known_strings)` walks the exact sorted-key canonical schema and counts ASCII
@@ -5965,16 +6128,10 @@ pruning adds the separate diagnostics entry and its marker entries. The singleto
 final-video target descriptor is a required top-level index field/charge, not an
 extent entry and not part of this count.
 
-Define one fully described new physical extent charge:
+Apply the sole physical charge helpers from `Reservation Extent V1`; no final-
+encoding term defines a private `+A` variant:
 
 ```text
-reservation_extent_charge(raw, descriptor_raw, method) =
-      alloc(raw) + A
-    + alloc(descriptor_raw) + A
-    + placeholder_entry_charge(method)
-
-write_ahead_index_publication_charge(raw) = alloc(raw) + 2*A
-
 final_video_publication_method = (
     "replace_placeholder" when final target is absent
     else "replace_existing"
@@ -5987,7 +6144,7 @@ final_video_target_descriptor_raw = max_json_bytes(
 require final_video_target_descriptor_raw
         <= FINAL_RESERVATION_DESCRIPTOR_RAW_BYTES
 final_video_target_reservation_charge =
-      alloc(final_video_target_descriptor_raw) + A
+      descriptor_create_new_charge(final_video_target_descriptor_raw)
     + placeholder_entry_charge(final_video_publication_method)
 
 final_prune_marker_file_count = (number of planned prune entries
@@ -6008,7 +6165,7 @@ final_encoding_index_raw = max_json_bytes(
 )
 
 final_encoding_new_reserve =
-      write_ahead_index_publication_charge(final_encoding_index_raw)
+      control_artifact_create_new_charge(final_encoding_index_raw)
     + final_video_target_reservation_charge
     + additional_settings_transaction_reserve
     + reservation_extent_charge(
@@ -6070,14 +6227,84 @@ unlinks an extent and asks the allocator for a new temporary or target-directory
 entry. Only durable target reopen validation may
 retire the descriptor and advance to the next indexed extent.
 Prune markers and then the diagnostics payload-pruned metadata follow the same
-one-at-a-time rule after both manifests are durable. The final-encoding index is
-removed, together with its final-target descriptor, only after all applicable
-publications/markers/diagnostics and the
-terminal settings transition
-are durable; a crash before then revalidates the remaining entries rather than
-estimating space again. Thus these artifacts need no new payload blocks from
-ambient free space. Actual normalized FFmpeg arguments, all input paths, and
-every settings maximum are resolved before this check.
+one-at-a-time rule after both manifests are durable. A crash before terminal
+commit revalidates the remaining entries rather than estimating space again.
+Thus these artifacts need no new payload blocks from ambient free space. Actual
+normalized FFmpeg arguments, all input paths, and every settings maximum are
+resolved before this check.
+
+#### Final-Encoding Index-Last Retirement V1
+
+Retirement begins only after the exact terminal settings transition is durable
+and every invocation entry is either committed with its artifact-specific
+evidence or authenticated as unused under the terminal failure path. Two files
+are never described as removed "together." Under the job writer lock, the only
+retirement order is:
+
+1. Reopen and validate the terminal settings bytes, revision equation, attempt,
+   job identity, and terminal success/failure evidence.
+2. Reconcile the exact sibling-video temporary: validate its parent/type/link
+   shape if present, unlink only that indexed child, sync its parent, and require
+   it absent. Apply the create-new control-artifact table to the final index's
+   exact publication temporary and require that temporary absent as well.
+3. Reconcile every unused entry in index order and then the final target. For an
+   unused artifact entry, validate descriptor/index identity, unlink its source
+   extent first, unlink its `replace_placeholder` target second when present,
+   then sync that target parent; `replace_existing` is never unlinked. An
+   untouched `replace_placeholder` final target may then be unlinked only after
+   exact zero-length identity validation, followed by its target-parent sync. A
+   published target is retained according to its manifest/failure evidence.
+4. In index order, for every entry now proved consumed or safely unused, require
+   its source extent absent, unlink its exact safe descriptor temporary first and
+   its final `ReservationExtentV1` descriptor second if present, and do not
+   create replacement work.
+5. Unlink the final-target descriptor's exact safe temporary first and its final
+   descriptor second if present. The final index still owns both names throughout
+   this step.
+6. Sync `.depth-surge-reservations-v1`, then reopen and prove every entry
+   descriptor/temporary and the final-target descriptor/temporary absent.
+7. Unlink the final `final-encoding-reservation-v1.json`. It is the last
+   transaction authority to disappear.
+8. Sync `.depth-surge-reservations-v1` and reopen the exact index path to prove
+   it absent before ordinary settings/stage/final-media audit may begin.
+
+Recovery classifies the physical suffix of that sequence before applying the
+ordinary missing-descriptor construction rule:
+
+| Final index | Durable terminal evidence | Entry/target cleanup | Final-target descriptor pair | Action |
+|---|---|---|---|---|
+| present | absent | any legal prefix | any indexed legal state | continue ordinary final-index recovery; descriptor absence is not retirement |
+| present | present | incomplete | any indexed legal state | resume steps 2 through 6; retain the index |
+| present | present | complete | valid final descriptor and/or its exact safe temporary present | resume steps 5 through 8 |
+| present | present | complete | final and temporary both absent | `retirement-in-progress`; execute steps 7 and 8 without recreating the descriptor |
+| absent | any | any | final or temporary present | unindexed reservation artifact; `ReservationConflictError`, preserve it |
+
+Here `complete` means the sibling is absent, every extent entry is committed/
+retired or authenticated-unused/removed, the final target is in its unique
+success or failure state, and every required target-parent sync is durable. It
+is proved from the index plus terminal/artifact evidence, never from an in-memory
+retirement Boolean. Consequently a crash after descriptor unlink/sync but before
+index unlink converges by the fourth row, while an index-first orphan can never
+be produced.
+Within a terminal-durable `incomplete` row, each exact absence produced by the
+ordered unlinks in steps 2 through 5 is a monotonic cleanup prefix and is never
+recreated. The same absence before terminal evidence is durable remains subject
+to ordinary construction/consumption recovery and cannot be inferred as cleanup.
+
+The prelaunch provider-mismatch discard is not terminal retirement. While the
+final index is active and the video-publication mutation boundary has not been
+crossed, a freshly revalidated mismatch may clean only that exact invocation.
+Because it persists no discard Boolean, every prefix must remain ordinary-
+construction recoverable: after sibling cleanup, validate each unconsumed
+descriptor/source pair, unlink and sync its descriptor pair **before** unlinking
+its source/placeholder and syncing the target parent; do the same for the final-
+target descriptor before its untouched placeholder. The producer settings entry
+may already be consumed by the monotonic v4 marker and is validated as such.
+Finally sync the reservation directory, unlink the final index last, and sync it
+again. A crash while the index remains present returns to the first recovery row,
+may recreate exact reservation work from an absent descriptor/source/placeholder,
+and must revalidate the provider before deciding to discard again. It never uses
+descriptor absence alone as abort intent.
 
 Both assembled and direct encoding write only to the final index's exact
 generation-derived sibling temporary on the final-output volume. FFmpeg
@@ -6088,9 +6315,10 @@ until the terminal failure transition is durable, then removes only matching
 unused reservation entries under the authenticated crash policy. An unconsumed
 `replace_placeholder` final target may then be unlinked only when its identity is
 still the descriptor's exact zero-length reserved identity; sync the parent and
-retire the target descriptor with the index. `replace_existing` is never removed,
-and a target already changed by a prior unmanifested publication is preserved as
-incomplete publication evidence rather than mistaken for the old placeholder.
+then enter `Final-Encoding Index-Last Retirement V1`. `replace_existing` is
+never removed, and a target already changed by a prior unmanifested publication
+is preserved as incomplete publication evidence rather than mistaken for the old
+placeholder.
 The path leaves the old final video plus both old retained manifests unchanged
 whenever an old final existed. Only a successfully
 closed and validated temporary may enter the publication sequence. Output-file
@@ -6470,15 +6698,24 @@ It is not a setting, saved mode, resume identity, or production branch.
 7. Disk preflight covers every lifecycle row and exact packed `P`/`R` actions, maximum
    per-frame/root histogram cardinalities, largest canonical uint64 frame stems
    and long contained relative paths, long metric
-   fraction lists, masks on/off, metric/relative aggregates, allocation-unit
-   fallback, all retained-manifest, prune-marker, and payload-pruned-metadata
-   reservations, and
+   fraction lists, masks on/off, metric/relative aggregates, non-reservation
+   allocation-unit fallback, reservation capability rejection when the exact
+   unit is unavailable, all retained-manifest, prune-marker, and payload-pruned-
+   metadata reservations, and
    simultaneous old RGB plus all new temporaries. It explicitly makes no
    video-size promise. Stage-04 goldens contain no prune-marker count,
    `payload_pruned_metadata_raw`, or finalization-only physical charge; final-
    encoding goldens introduce `final_prune_marker_file_count` and
    `payload_pruned_metadata_raw` only when intermediates are removed and
    materialize every marker extent/descriptor/placeholder exactly once.
+   Formula goldens independently assert `payload_logical_bytes`,
+   `payload_extent_create_charge`, `descriptor_create_new_charge`, both
+   `reservation_extent_charge` methods, every `settings_transaction_extent`,
+   `control_artifact_create_new_charge`, and
+   `final_video_target_reservation_charge`. They prove the payload padding,
+   source entry, descriptor temporary entry, descriptor final entry, and optional
+   target placeholder are five distinct ledger terms and that no caller spells a
+   private `+A` substitute.
    Direct and assembled FFmpeg ENOSPC tests leave an old final video and both old manifests
    byte-exact
    while removing sibling/owned reservation temporaries. Reservation fixtures
@@ -6488,8 +6725,9 @@ It is not a setting, saved mode, resume identity, or production branch.
    ahead index schemas, complete
    bootstrap/standalone target settings objects with frozen timestamps/content/
    raw hashes, job/
-   settings/publication-generation binding, logical versus allocated bytes, and
-   non-sparse enforcement. Maximum and one-byte-over job-control/settings-index
+   settings/publication-generation binding, logical versus allocated bytes,
+   closed `ReservationAllocationEvidenceV1`, and non-sparse enforcement.
+   Maximum and one-byte-over job-control/settings-index
    fixtures prove the streaming six-MiB phase and raw caps without retaining two
    settings objects. They inject crashes after every control-artifact write
    chunk, fsync, no-replace rename, parent sync, and retirement, plus before/after
@@ -6499,11 +6737,19 @@ It is not a setting, saved mode, resume identity, or production branch.
    after that one sync, after every deterministic descriptor-temporary write
    chunk and its rename-no-replace commit, full-length payload
    validation, truncate/released-`A` check, same-parent rename, target reopen,
-   and descriptor/index retirement. Matching partial work is adopted without
-   reallocation. A full-length all-zero pre-descriptor extent with short delayed
-   allocation performs one complete rewrite/sync/reopen; ENOSPC or a still-
-   unproved short count remains retryable incomplete, while affirmative post-
-   rewrite sparse/shared/compressed/unverifiable evidence conflicts. Every
+   and each of the eight index-last retirement steps. Faults specifically occur
+   after final-target descriptor unlink but before reservation-directory sync,
+   after that sync but before final-index unlink, and after index unlink but
+   before its sync; terminal-durable/index-present/descriptor-absent recovery
+   removes and syncs the index without recreating the descriptor. Matching
+   prelaunch-discard faults instead return to ordinary indexed construction,
+   revalidate the provider mismatch, and discard descriptor-first/index-last
+   again. Matching partial work is adopted without reallocation. A full-length all-zero pre-
+   descriptor extent with short/delayed allocation performs one complete
+   rewrite/sync/reopen; ENOSPC or any still-unready evidence remains retryable
+   incomplete. Unsupported adapters/flags/filesystems are capability errors and
+   preserve an active index, never content conflicts; only a successful probe
+   contradicting committed evidence conflicts. Every
    payload kind proves all-zero, complete-full, partial, and
    complete-short classification; a 1,200-byte old partial followed by a
    900-byte retry is wholly zeroed before replay and cannot publish the old tail.
@@ -6513,16 +6759,24 @@ It is not a setting, saved mode, resume identity, or production branch.
    space proof, locator, reservation directory, initial target placeholder, both
    settings extents/descriptors, initial settings, then frame work;
    `locator_only` has no other
-   interpretation. A full-disk integration gate removes ambient free space only
-   after readiness and proves manifest/settings/marker/diagnostics publication uses the
-   pre-existing placeholder/old-target and payload entries; truncate/rename
-   never creates a new directory entry. A separate full-disk final-video gate
+   interpretation. Exact-free-space fixtures leave precisely the canonical
+   calculated charge while independently positioning the payload parent and the
+   central reservation directory one insertion before a new directory-block
+   allocation; bootstrap, standalone settings, and final encoding must still
+   reach ready. One allocation unit below fails before the index, while exact
+   and one unit above do not fail at payload creation or descriptor temporary-to-
+   final rename. A
+   full-disk integration gate removes ambient free space only after readiness and
+   proves manifest/settings/marker/diagnostics publication uses the pre-existing
+   placeholder/old-target and payload entries; truncate/rename never creates a
+   new directory entry. A separate full-disk final-video gate
    creates both the indexed sibling and index-owned final target first, then
    proves same-parent replacement does not extend the directory or return
    ENOSPC/error 112. Final-target fixtures exhaust absent/existing methods, null
    preflight identity, post-index placeholder adoption, target-descriptor
    publication plus raw-cap/one-byte-over rejection, consumed-uncommitted
-   reencode, and wrong identity/type/link/parent conflicts. No payload
+   reencode, index-last terminal retirement, and wrong identity/type/link/parent
+   conflicts. No payload
    extent is accepted in the central reservation directory. Persisted POSIX
    identities require one uniquely device-matching `/dev/disk/by-uuid` entry,
    32 lowercase filesystem-UUID digits, and the bounded opaque handle type/bytes;
@@ -6533,6 +6787,17 @@ It is not a setting, saved mode, resume identity, or production branch.
    `libblkid`/subprocess call fail before mutation. Replacement with a reused
    inode is rejected. Windows fixtures require exactly 16 lowercase hex
    volume digits plus 32 file-ID digits in reservation, prune, and reclaim.
+   Allocation-adapter fixtures page Linux FIEMAP through 0, 1, 64, and 65
+   extents; accept only contiguous ext4 coverage with final `LAST`; classify
+   `UNKNOWN`/`DELALLOC`/`UNWRITTEN`, gaps, and short `stx_blocks*512` as unready;
+   and classify every other known or unknown extent flag and unsupported ioctl as
+   capability failure. Windows fixtures require NTFS, exact FileStandardInfo,
+   clear forbidden FileAttributeTagInfo bits, block-refcounting false, and one
+   exact allocated range. They reject ReFS, a compressed/encrypted/reparse/
+   offline parent or file, extra ranges, `ERROR_MORE_DATA`, volume-flag drift,
+   and unsupported controls with `ReservationCapabilityError`. Every preflight
+   capability failure leaves the job-control/index temporary and all payload
+   paths absent.
    Active-index fixtures prove bootstrap, both fixed indexes, and then
    JobControl-owned extent reconciliation globally precede ordinary settings/
    stage/final-media/legacy audit;
@@ -7145,12 +7410,17 @@ Approval of this canonical specification accepts:
     partial frame is wholly zeroed. Generation-bound descriptors/indexes make
     every finalization reserve crash-reusable, persist the one short sibling-
     video path, and materialize an exact final-video target entry plus its post-
-    index identity descriptor before launch. Payload zero fill uses fixed chunks
-    but only one sync per whole pass; a full-length pre-descriptor allocation
-    shortfall remains retryable until a synchronized whole rewrite proves an
-    incompatible filesystem. Stage-04 never pays for future payload-pruned
-    metadata. Linux destructive mutation additionally requires the bounded
-    no-dependency UUID/file-handle capability adapter. A new persisted immutable
+    index identity descriptor before launch. One charge-helper family counts
+    payload padding, every source/descriptor directory name, and an optional
+    target placeholder separately. Payload zero fill uses fixed chunks but only
+    one sync per whole pass; a full-length pre-descriptor allocation shortfall
+    remains retryable after one synchronized whole rewrite, while an unsupported
+    named adapter is a capability failure rather than a content conflict. Final
+    retirement removes/syncs all descriptors before the final index. Stage-04
+    never pays for future payload-pruned metadata. Linux destructive mutation
+    additionally requires the bounded no-dependency UUID/file-handle capability
+    adapter and the exact ext4/FIEMAP allocation adapter; Windows reservation
+    requires the exact NTFS/allocated-range adapter. A new persisted immutable
     target
     meets both 240-byte and 240-UTF-16-unit limits; a contained locatable legacy
     target remains read-only instead of being retroactively renamed/rejected.
