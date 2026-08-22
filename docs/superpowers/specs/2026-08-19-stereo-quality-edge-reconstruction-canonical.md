@@ -290,6 +290,9 @@ defects.
 | Traditional ext4 block maps were discovered as unsupported only after index publication | Advance the Linux adapter to v2 and accept one uniform `FIEMAP_EXTENT_MERGED` mapping form under the same exact coverage and allocation checks. |
 | One `A` per planned name was overstated as an exact directory-growth bound | Define the formulas as minimum admission forecasts; materialization is the proof, and namespace ENOSPC preserves the active authority without starting downstream mutation. |
 | Deterministic terminal duration still looked like active compute time | Define both persisted duration fields as attempt wall-clock elapsed time, including pauses and downtime, and require that wording in API/UI presentation. |
+| Fixed-path final publication promised rollback after the old video had already been replaced | Declare the successful final-video atomic replacement the irreversible boundary, admit only ordered mixed-generation prefixes while the final index is active, and classify the retained paths through the ordinary audit matrix after retirement. |
+| A crash between short-source truncate and file sync had no release-recovery action | Add `ShortSourceReleaseRecoveryV1`: sync/reopen/check, retry one same-length truncate plus sync/reopen/check, then preserve the transaction as retryable incomplete. |
+| FIEMAP paging left zero, short non-`LAST`, and nonadvancing batches ambiguous | Freeze zero-before-coverage as an unready gap and malformed/nonadvancing pagination as `FIEMAP_PROTOCOL_ERROR` capability failure. |
 
 ## Public Settings Contract
 
@@ -1271,12 +1274,28 @@ STATX_TYPE|STATX_NLINK|STATX_SIZE|STATX_BLOCKS,&stx)`, requiring every requested
 result bit. The allocation count is checked `stx_blocks*512`. It then issues
 `FS_IOC_FIEMAP` with only
 `FIEMAP_FLAG_SYNC`, starting at logical byte zero, requesting the remaining
-range, and using exactly 64 `fiemap_extent` slots per call. A full batch without
-`FIEMAP_EXTENT_LAST` continues at the checked end of its last extent. Each
-positive-length returned extent must advance in strictly increasing logical
+range, and using exactly 64 `fiemap_extent` slots per call. Let `query_start` be
+the requested start for one call. The returned count must be in `0..64`, and
+`FIEMAP_EXTENT_LAST`, when present, may appear only on the last returned extent.
+Violation of either structural rule is `ReservationCapabilityError` with code
+`FIEMAP_PROTOCOL_ERROR`.
+Each positive-length returned extent must advance in strictly increasing logical
 order; after clipping to the requested file range, the extents must cover
 `[0,logical_byte_count)` exactly once with no gap or overlap, and the final
 covering extent must carry `FIEMAP_EXTENT_LAST`.
+
+Pagination has one closed disposition. A zero count before cumulative coverage
+is complete is an unready allocation with a coverage gap and ends this adapter
+attempt. A positive count below 64 whose last extent lacks
+`FIEMAP_EXTENT_LAST` is `ReservationCapabilityError` with code
+`FIEMAP_PROTOCOL_ERROR`; it is neither end-of-query nor retryable allocation
+shortage. Only a 64-entry batch without `LAST` may continue. Its `next_start` is
+the checked `fe_logical+fe_length` of the last extent and must be strictly
+greater than `query_start`; nonprogress, overflow, or already complete coverage
+without `LAST` is the same protocol error. The next call starts exactly there.
+A batch ending in `LAST` terminates only after the cumulative exact-coverage
+test; an earlier gap remains unready. Implementations never issue an unchanged
+query again or invent a retry for malformed pagination.
 
 For Linux, exactly two uniform mapping forms are accepted. An extent-mapped file
 has flag zero on every nonfinal covering extent and `FIEMAP_EXTENT_LAST` alone on
@@ -1723,19 +1742,51 @@ publication rather than choosing another spelling.
 
 An active final index is ready for FFmpeg only when this final-target descriptor
 and every required extent descriptor validate. Before the first video
-replacement, the target must still have `reserved_target_identity`; after a
-validated sibling atomically replaces it, the descriptor remains as index-owned
-evidence that the directory slot was reserved, while the current target is the
-derived consumed-uncommitted state until both manifests authenticate it. A crash
-in that state still follows the existing reencode rule because the executed argv
-was not durable, but it reencodes against the already existing target entry.
+replacement, the target must still have `reserved_target_identity`.
+`FinalVideoIrreversiblePublicationBoundaryV1` is crossed in live execution
+exactly when the same-parent atomic replacement of that target by the validated,
+file-synced sibling returns success. That operation intentionally removes the
+only fixed path to the prior final video. This revision reserves no backup, hard
+link, or rollback copy, so the prior video is not promised recoverable after the
+boundary. The required target-parent sync and target reopen/hash validation
+still follow, but they do not move the rollback boundary later.
+
+If a crash makes the replacement return unobservable, active-index recovery
+derives the side from the exact owned paths. The reserved target identity still
+at the target means the boundary was not crossed; an ordinary safe sibling, if
+present, is discarded under the rule below and FFmpeg reruns. The sibling absent
+and an ordinary non-link/link-count-one target with a different identity means
+the boundary was crossed and the target is `consumed-uncommitted`; recovery
+performs the required parent durability step where supported, reopens it, then
+follows the existing reencode rule because executed argv was not durable. Both
+locations after replacement, a missing target, a second location for the
+reserved identity, or a wrong parent/type/link count is a conflict.
+
+After the boundary, each manifest replacement is independently irreversible.
+While the final index is active, exact entry identity/content and source/target
+placement derive only this ordered table:
+
+| Derived phase | Final-video target | Encoding-input entry | Final-video-manifest entry | Recovery action |
+|---|---|---|---|---|
+| `ready_pre_video` | exact `reserved_target_identity` | exact unconsumed descriptor state | exact unconsumed descriptor state | discard a safe sibling if present, then run FFmpeg |
+| `video_replaced` | sibling absent; safe target identity differs from `reserved_target_identity` | exact unconsumed descriptor state | exact unconsumed descriptor state | finish target durability/reopen as needed, then reencode |
+| `input_manifest_committed` | same replaced-target class | exact committed new target | exact unconsumed descriptor state | reencode; never restore either prior artifact |
+| `publication_authenticated` | exact video bound by both new manifests | exact committed new target | exact committed new target | continue prune/settings without reencode |
+
+A new final-video manifest before its new encoding-input manifest, or any other
+identity/content/source/target combination, is a conflict. These phases are
+transaction states, not ordinary final-media audit results. A terminal failure
+preserves the replaced final-video target and every committed fixed artifact,
+applies only authenticated unused-placeholder cleanup, and lets the audit matrix
+classify the resulting paths after index-last retirement. It never rolls back a
+prior generation.
+
 Once both manifests validate, the target is consumed-authenticated and recovery
-continues prune/settings only. A missing target, a second location for the
-reserved identity, or a wrong parent/type/link count is a conflict. The final-
-target descriptor remains index-owned through the applicable terminal success/
-failure commit and authenticated unused-placeholder handling. Final retirement
-then removes and syncs that descriptor **before** removing the final index; the
-index is always the last authority to disappear.
+continues prune/settings only. The final-target descriptor remains index-owned
+through the applicable terminal success/failure commit and authenticated unused-
+placeholder handling. Final retirement then removes and syncs that descriptor
+**before** removing the final index; the index is always the last authority to
+disappear.
 
 Once the index is durable, it exclusively owns that exact sibling path until
 index retirement. Before any FFmpeg launch or relaunch, an existing entry there
@@ -1744,8 +1795,11 @@ unlinked and the parent synced, because an uncommitted video temporary is not
 semantic intent and is never adopted. Wrong type/parent/link count is a conflict.
 The runtime output argv always names this persisted path, while normalized argv
 maps that whole argument to the indexed final path. Success atomically moves it
-over the already existing final component; every prepublication failure removes
-only this path.
+over the already existing final component. Every failure before
+`FinalVideoIrreversiblePublicationBoundaryV1` removes only this path and leaves
+an authenticated prior publication untouched. A failure after the boundary may
+remove an indexed retry sibling, but never restores or deletes any fixed final-
+publication path.
 Index retirement requires it absent. Without an active matching index, ordinary
 audit neither discovers nor deletes lookalike `.depth-surge-final-v4-*` names.
 The two diagnostics-preflight hashes are the null pair exactly when
@@ -1848,13 +1902,30 @@ the full-source phase validation and match
 start of the still-full extent, file-sync, reopen the same identity, rerun the
 readiness adapter, match that evidence again, and require the exact `complete-full`
 `CanonicalReservationPayloadFrameV1` while length remains
-`logical_byte_count`. Then truncate to that frame's exact `L`, file-sync, and
-reopen; require the same identity, the exact complete-short canonical payload,
-and a post-truncate allocated-byte counter no greater than
-`allocation_evidence_at_readiness.allocated_byte_count-A`. That counter is
-Linux `statx.stx_blocks*512` or Windows `FileStandardInfo.AllocationSize`; it is
-only the release check and does not invoke FIEMAP or
-`FSCTL_QUERY_ALLOCATED_RANGES` over the former logical range.
+`logical_byte_count`. Then truncate to that frame's exact `L` and enter
+`ShortSourceReleaseRecoveryV1`. Its allocation counter is Linux
+`statx.stx_blocks*512` or Windows `FileStandardInfo.AllocationSize`; it is only
+the release check and does not invoke FIEMAP or `FSCTL_QUERY_ALLOCATED_RANGES`
+over the former logical range.
+
+`ShortSourceReleaseRecoveryV1` is the sole normal and recovery continuation once
+the owned source identity has length `L`. First reopen without following links
+and require the exact source path/parent/identity/link count, canonical payload,
+raw hash, typed schema, artifact transition, and declared placeholder or
+authenticated old target. File-sync that identity, close/reopen it, revalidate
+the same facts, and read the post-truncate allocation counter. Success requires
+the counter to be no greater than
+`allocation_evidence_at_readiness.allocated_byte_count-A`. If it is greater,
+perform exactly one idempotent same-length truncate to `L` on that identity,
+file-sync, close/reopen, revalidate content and identity, and read the counter
+again. If the release is still not proved, return `ReservationIncompleteError`
+and preserve the descriptor, source, and target for a later retry.
+
+An unproved release alone is never a content conflict. This protocol never
+extends the source back to `logical_byte_count`, zeroes or rewrites its semantic
+bytes, removes any owned path, or invokes the former full-range readiness
+adapter. An identity, path, target, or canonical-content mismatch still follows
+its existing conflict classification.
 
 For `replace_placeholder`, reopen and require the exact persisted zero-length
 placeholder identity. For `replace_existing`, reopen and authenticate the
@@ -1888,7 +1959,7 @@ and classifying the owned identity:
 | Physical phase | Required validation |
 |---|---|
 | Full source (`zero`, `partial`, or `complete-full`) | Source path, parent, identity, link count, and length equal the descriptor; the full-range platform adapter reruns and exactly matches `allocation_evidence_at_readiness`; the target is the declared placeholder or authenticated old artifact. |
-| Short source (`complete-short`) | The same reserved identity is at the exact source path with length `L`; canonical bytes, raw hash, typed schema, and artifact-specific transition are exact; the target remains the declared placeholder or authenticated old artifact; the post-truncate counter proves at least `A` released. The full-range readiness adapter is forbidden. |
+| Short source (`complete-short`) | The same reserved identity is at the exact source path with length `L`; canonical bytes, raw hash, typed schema, and artifact-specific transition are exact; the target remains the declared placeholder or authenticated old artifact. Run `ShortSourceReleaseRecoveryV1`; only its successful counter result proves at least `A` released. The full-range readiness adapter is forbidden. |
 | Committed target | Source is absent; the same reserved identity is at the exact target path and parent with length `L`; canonical bytes, raw hash, typed schema, and artifact-specific commit evidence are exact; the indexed placeholder/old-target replacement method is satisfied. The full-range readiness adapter is forbidden. |
 
 In the committed-target row, a satisfied `replace_placeholder` means the
@@ -2010,8 +2081,9 @@ peak. Under the job-writer lock it performs exactly:
    Stream the selected canonical bytes into the authenticated target-local extent
    without changing its full logical length.
 3. File-sync/reopen the same identity, strict-parse and byte/hash-validate the
-   intended prefix, truncate/reopen to release `A`, then perform the declared
-   placeholder or existing-target same-parent atomic replacement above.
+   intended prefix, truncate to exact `L`, complete
+   `ShortSourceReleaseRecoveryV1` to prove release of `A`, then perform the
+   declared placeholder or existing-target same-parent atomic replacement above.
 4. Sync the parent and reopen the final path without following a link. Require
    the expected ordinary identity, byte count, raw SHA-256, canonical
    re-encoding, complete typed object, and transition-specific fields before
@@ -4599,6 +4671,18 @@ atomically commits the revalidated canonical encoding-input manifest and then
 the canonical self-fingerprinted final-video manifest from their separately
 indexed/fsynced target-local extents, replacing each declared placeholder or old
 target and syncing the job-root directory after each replacement.
+The atomic final-video replacement in that sequence is
+`FinalVideoIrreversiblePublicationBoundaryV1`. While the reserved target identity
+remains on its pre-boundary side, an authenticated prior video/input-manifest/
+publication-manifest trilogy remains byte-exact. Once replacement has taken
+effect, whether observed by the live call or derived after a crash, no such
+rollback promise exists: the prior video has no reserved recovery path, and each
+subsequent manifest replacement likewise retires that manifest's prior bytes.
+The active final index, target descriptor, and two manifest entries authenticate
+the resulting ordered prefix until either publication completes or terminal-
+failure retirement preserves its actual artifacts. They do not authorize
+synthesizing a prior generation.
+
 If recovery finds that indexed sibling before final publication, it validates
 its safe path shape, removes it, syncs the parent, and reruns FFmpeg; it never
 guesses whether partial or complete media is reusable. A wrong-type sibling is a
@@ -4807,6 +4891,15 @@ one bound publication identity:
 | 1 | 1 | 0 | any | true | false | `incomplete_publication_evidence` |
 | 1 | 1 | 1 | valid | true | true | null |
 | 1 | 1 | 1 | invalid | true | false | `publication_validation_failed` |
+
+This matrix has no post-retirement generation-prefix exception. In particular,
+a new video beside two retained old manifests, or beside a new input manifest
+and an old publication manifest, has `V/I/P=1/1/1` but fails the three-way
+binding and is `publication_validation_failed`. A video with one or both
+manifest paths absent follows the applicable `incomplete_publication_evidence`
+row. Therefore "unmanifested publication" is not a blanket classification: the
+exact entries and their bytes decide the row after all active transaction
+authority has retired.
 
 Ordinary inspection of legacy final media is strictly read-only: preserve the
 video, do not encode, delete, rewrite completion state, call it corrupt, or
@@ -6377,7 +6470,8 @@ ordinary missing-descriptor construction rule:
 
 Here `complete` means the sibling is absent, every extent entry is committed/
 retired or authenticated-unused/removed, the final target is in its unique
-success or failure state, and every required target-parent sync is durable. It
+success state or the exact boundary-aware terminal-failure state selected above,
+and every required target-parent sync is durable. It
 is proved from the index plus terminal/artifact evidence, never from an in-memory
 retirement Boolean. Consequently a crash after descriptor unlink/sync but before
 index unlink converges by the fourth row, while an index-first orphan can never
@@ -6388,8 +6482,8 @@ recreated. The same absence before terminal evidence is durable remains subject
 to ordinary construction/consumption recovery and cannot be inferred as cleanup.
 
 The prelaunch provider-mismatch discard is not terminal retirement. While the
-final index is active and the video-publication mutation boundary has not been
-crossed, a freshly revalidated mismatch may clean only that exact invocation.
+final index is active and `FinalVideoIrreversiblePublicationBoundaryV1` has not
+been crossed, a freshly revalidated mismatch may clean only that exact invocation.
 Because it persists no discard Boolean, every prefix must remain ordinary-
 construction recoverable: after sibling cleanup, validate each unconsumed
 descriptor/source pair, unlink and sync its descriptor pair **before** unlinking
@@ -6405,19 +6499,31 @@ descriptor absence alone as abort intent.
 Both assembled and direct encoding write only to the final index's exact
 generation-derived sibling temporary on the final-output volume. FFmpeg
 ENOSPC/Windows error 112, interruption, timeout,
-validation failure, or any error before publication removes that temporary and
-any unauthenticated artifact temporaries, retains the indexed terminal extent
-until the terminal failure transition is durable, then removes only matching
-unused reservation entries under the authenticated crash policy. An unconsumed
-`replace_placeholder` final target may then be unlinked only when its identity is
-still the descriptor's exact zero-length reserved identity; sync the parent and
-then enter `Final-Encoding Index-Last Retirement V1`. `replace_existing` is
-never removed, and a target already changed by a prior unmanifested publication
-is preserved as incomplete publication evidence rather than mistaken for the old
-placeholder.
-The path leaves the old final video plus both old retained manifests unchanged
-whenever an old final existed. Only a successfully
-closed and validated temporary may enter the publication sequence. Output-file
+validation failure, or any error removes the exact indexed sibling and any
+unauthenticated artifact temporaries, retains the indexed terminal extent until
+the terminal failure transition is durable, then removes only matching unused
+reservation entries under the authenticated crash policy. If
+`FinalVideoIrreversiblePublicationBoundaryV1` was not crossed, an unconsumed
+`replace_placeholder` final target may be unlinked only when its identity is
+still the descriptor's exact zero-length reserved identity; `replace_existing`
+is never removed. An authenticated prior video and both prior manifests are
+therefore byte-exact on this pre-boundary failure path.
+
+If the boundary was crossed, the new final video is retained and never rolled
+back. Each already committed new manifest is retained. Each unconsumed
+`replace_existing` manifest remains at its authenticated preflight bytes, while
+an unconsumed `replace_placeholder` manifest target is removed only by the exact
+identity-checked cleanup in step 3. After the durable terminal-failure transition
+and index-last retirement, `FinalMediaAuditDispositionV1` runs on the resulting
+actual `V/I/P` state: all-present mixed generations are
+`publication_validation_failed`, missing-manifest rows are
+`incomplete_publication_evidence`, and a fully bound new trilogy remains
+authenticated. No failure path assigns one generic "unmanifested publication"
+label or claims to reconstruct old bytes.
+
+Only a successfully closed and validated temporary may enter the publication
+sequence. After the applicable placeholder cleanup and target-parent sync,
+recovery enters `Final-Encoding Index-Last Retirement V1`. Output-file
 size is reported from the failed temporary, but it is never presented as a
 preflight guarantee. When job root and output share a volume, manifest extents
 are still tested independently from the unknown growing video temporary;
@@ -6777,14 +6883,26 @@ It is not a setting, saved mode, resume identity, or production branch.
    both endian hosts and reject the little-endian byte spelling `0100803f`.
 4. Fault injection after final-index publication, final-video target placeholder
    create/file sync/parent sync, target-descriptor temporary/final publication,
-   final-video close, file fsync, reserved-target atomic publish,
-   encoding-input/publication-manifest fsync/replace, reserved prune-marker
+   final-video close and file fsync, final-target replacement before its parent
+   sync, final-target parent sync/reopen, encoding-input-manifest replacement and
+   its parent sync/reopen,
+   immediately before final-video-manifest replacement, and after that
+   replacement both before and after its parent sync/reopen, plus reserved prune-marker
    placeholder/write/truncate/replace/fsync,
    directory-identity capture, prune metadata, and every cleanup step proves the
    exact recovery sequence. Missing/stale input or
    publication evidence always reencodes; two valid manifests after a crash
    permit prune without re-resolving `auto`; no state falsely claims reusable
-   payload. Cleanup injection between marker unlink and root removal exercises
+   payload. Each publication fixture starts with an authenticated old trilogy,
+   proves ordinary audit remains deferred while the final index is active, then
+   forces any required reencode and terminal failure. Pre-boundary outcomes retain
+   the old trilogy byte-exact. Post-boundary outcomes retain the exact ordered
+   fixed-path prefix: old/mixed all-present manifests audit as
+   `publication_validation_failed`, a removed provisional manifest follows its
+   missing-manifest `incomplete_publication_evidence` row, and the fully bound new
+   trilogy remains authenticated. No fixture restores the old video after the
+   irreversible boundary. Cleanup injection between marker unlink and root
+   removal exercises
    only the identity-matching empty-root `rmdir` exception; a single descendant,
    mount/reparse point, or identity mismatch permits no delete and persists the
    specified incomplete cleanup status without rerendering.
@@ -6818,9 +6936,11 @@ It is not a setting, saved mode, resume identity, or production branch.
    target placeholder are five distinct minimum forecast terms and that no
    caller spells a private `+A` substitute or calls the sum a directory-growth
    upper bound.
-   Direct and assembled FFmpeg ENOSPC tests leave an old final video and both old manifests
-   byte-exact
-   while removing sibling/owned reservation temporaries. Reservation fixtures
+   Direct and assembled FFmpeg ENOSPC tests injected before
+   `FinalVideoIrreversiblePublicationBoundaryV1` leave an authenticated old final
+   video and both old manifests byte-exact while removing sibling/owned
+   reservation temporaries. The post-boundary injections in item 4 instead assert
+   the actual audit matrix and never assert rollback. Reservation fixtures
    cover every exact target-local temporary and central descriptor filename,
    all three final/`.create-new.tmp` control-artifact pairs and their complete/
    partial/both-present matrix, kind/role/path/prune binding, both fixed write-
@@ -6852,13 +6972,18 @@ It is not a setting, saved mode, resume identity, or production branch.
    rewrite/sync/reopen; ENOSPC or any still-unready evidence remains retryable
    incomplete. Unsupported adapters/flags/filesystems are capability errors and
    preserve an active index, never content conflicts; only a successful full-
-   source probe contradicting committed readiness evidence conflicts. Two
-   independent fixtures stop (a) after truncate plus file sync and before rename
-   and (b) after rename plus parent sync and before descriptor retirement. Both
-   recover from descriptor state without invoking the full-length allocation
-   adapter: the first validates the exact short source and released `A`; the
-   second validates the exact committed target identity/content and then retires
-   the descriptor. Every
+   source probe contradicting committed readiness evidence conflicts. Four
+   independent fixtures stop (a) after truncate returns but before file sync,
+   (b) after file sync returns but before reopen, (c) after successful short-
+   source release validation but before rename, and (d) after rename plus parent
+   sync and before descriptor retirement. The first three run
+   `ShortSourceReleaseRecoveryV1` without invoking the full-length allocation
+   adapter: exact short identity/content survives, one same-length truncate retry
+   is permitted when the first synchronized counter is too high, and a still-high
+   second counter returns `ReservationIncompleteError` while preserving every
+   owned path. They never re-extend, zero, or report content conflict solely for
+   delayed release. The fourth validates the exact committed target identity/
+   content and then retires the descriptor. Every
    payload kind proves all-zero, complete-full, partial, and
    complete-short classification; a 1,200-byte old partial followed by a
    900-byte retry is wholly zeroed before replay and cannot publish the old tail.
@@ -6900,10 +7025,15 @@ It is not a setting, saved mode, resume identity, or production branch.
    `libblkid`/subprocess call fail before mutation. Replacement with a reused
    inode is rejected. Windows fixtures require exactly 16 lowercase hex
    volume digits plus 32 file-ID digits in reservation, prune, and reclaim.
-   Allocation-adapter fixtures page Linux FIEMAP through 0, 1, 64, and 65
-   mappings; accept only contiguous ext4 coverage with final `LAST`, in either
-   the uniform extent form or uniform `MERGED` block-map form; reject mixed
-   forms; classify
+   Allocation-adapter fixtures page Linux FIEMAP through valid one-entry `LAST`,
+   64-entry `LAST`, and 64-without-`LAST` plus one-with-`LAST` responses. A zero
+   count before complete coverage is an unready gap and causes no unchanged-query
+   retry. Every 1..63 count without `LAST`, `LAST` before the returned final
+   entry, checked-end overflow, a 64-entry no-`LAST` batch whose next start does
+   not strictly advance, and complete coverage without `LAST` are
+   `ReservationCapabilityError(code="FIEMAP_PROTOCOL_ERROR")`. Fixtures accept
+   only contiguous ext4 coverage with final `LAST`, in either the uniform extent
+   form or uniform `MERGED` block-map form; reject mixed forms; classify
    `UNKNOWN`/`DELALLOC`/`UNWRITTEN`, gaps, and short `stx_blocks*512` as unready;
    and classify every other known or unknown extent flag and unsupported ioctl as
    capability failure. Windows fixtures require NTFS, exact FileStandardInfo,
@@ -7436,6 +7566,11 @@ filesystem-superblock parsers are explicitly outside implementation authority.
   validation surface before the proven causes are addressed.
 - **Optical flow in Quality v1:** serializes frame work and can warp outlines;
   temporal state requires a separate reviewed design.
+- **Three-artifact rollback backups:** preserving the old video and both old
+  manifests after fixed-path replacement requires a second generation-bound
+  multi-artifact transaction, backup identities/names, space and directory-entry
+  accounting, and cross-platform restore/retirement rules. Quality v1 instead
+  declares video replacement irreversible and audits the actual retained prefix.
 
 ## Approval Criteria
 
@@ -7482,7 +7617,11 @@ Approval of this canonical specification accepts:
     independent of stat-only provenance, diagnostics, and mask policy. A
     durably fsynced manifest of the actually executed FFmpeg arguments binds that
     fingerprint after final-video publication and before `payload_pruned`;
-    missing evidence forces reencode, never inference. The project writer lock
+    missing evidence forces reencode, never inference. Atomic replacement of the
+    final video is the explicit irreversible boundary: an active final index owns
+    only the ordered manifest prefix, and terminal failure preserves the actual
+    paths for the closed audit matrix rather than promising rollback. The project
+    writer lock
     excludes internal mutation; external ABA mutation is explicitly outside the
     transaction trust model. Frame identities use only canonical minimal-padded
     stems and numeric-endian-independent float32 bit strings, except for the
@@ -7538,9 +7677,13 @@ Approval of this canonical specification accepts:
     one sync per whole pass; a full-length pre-descriptor allocation shortfall
     remains retryable after one synchronized whole rewrite, while an unsupported
     named adapter is a capability failure rather than a content conflict. Linux
-    FIEMAP accepts both uniform extent and uniform `MERGED` block-map mappings.
-    Readiness evidence is rerun only for a full source; exact short-source and
-    committed-target phases use identity/content/release contracts. Final
+    FIEMAP accepts both uniform extent and uniform `MERGED` block-map mappings;
+    zero-before-coverage is unready, while short non-`LAST` and nonadvancing
+    pagination are protocol capability failures. Readiness evidence is rerun only
+    for a full source; exact short-source and committed-target phases use
+    identity/content/release contracts. Short-source release recovery syncs and
+    reopens first, permits one same-length truncate retry, and otherwise remains
+    incomplete without destroying semantic intent. Final
     retirement removes/syncs all descriptors before the final index. Stage-04
     never pays for future payload-pruned metadata. Linux destructive mutation
     additionally requires the bounded no-dependency UUID/file-handle capability
