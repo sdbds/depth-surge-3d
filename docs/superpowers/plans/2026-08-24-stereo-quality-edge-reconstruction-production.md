@@ -39,7 +39,7 @@
 - Produces: `resolve_stereo_render_mode(persisted, override, is_resume, renderer_device_type) -> StereoRenderMode`.
 - Preserves: `StereoSplatSettings(max_eye_shift_fraction, occlusion_fill)` with no new field.
 
-- [ ] **Step 1: Add RED settings and constructor tests**
+- [x] **Step 1: Add RED settings and constructor tests**
 
 ```python
 def test_quality_fields_are_keyword_only_and_numpy_integer_normalizes():
@@ -59,11 +59,11 @@ def test_schema_four_migrates_to_fast_and_limit_eight():
     assert parsed.settings["occlusion_fill_max_px"] == 8
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm missing fields/schema-5 behavior fail**
+- [x] **Step 2: Run the focused tests and confirm missing fields/schema-5 behavior fail**
 
 Run: `python -m pytest tests/unit/test_settings.py tests/unit/test_stereo_renderer.py tests/unit/test_cli.py -q`
 
-- [ ] **Step 3: Implement schema 5 validation and device-aware omission resolution**
+- [x] **Step 3: Implement schema 5 validation and device-aware omission resolution**
 
 ```python
 stereo_render_mode: Literal["fast", "quality"] = field(
@@ -74,15 +74,15 @@ occlusion_fill_max_px: int = field(default=8, kw_only=True)
 
 Validate `vr_resolution` against exact presets or `custom:<width>x<height>` and add CLI choices `--stereo-render-mode` and `--occlusion-fill-max-px`. Resolve omitted new CUDA jobs to Quality only at the application boundary; library defaults stay Fast.
 
-- [ ] **Step 4: Dispatch before legacy geometry construction**
+- [x] **Step 4: Dispatch before legacy geometry construction**
 
 Add `_render_relative_fast(...)` containing the current body. `render()` branches on `settings.stereo_render_mode` before any `build_relative_geometry` call; initially the Quality branch imports and calls the Task 4 entry point.
 
-- [ ] **Step 5: Run focused tests and frozen Fast hashes**
+- [x] **Step 5: Run focused tests and frozen Fast hashes**
 
 Run: `python -m pytest tests/unit/test_settings.py tests/unit/test_stereo_renderer.py tests/unit/test_cli.py -q`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```text
 feat: add typed stereo quality settings

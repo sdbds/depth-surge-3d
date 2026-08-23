@@ -8,12 +8,38 @@ from numbers import Integral, Real
 from os import PathLike
 from typing import Any, Literal
 
+import numpy as np
+
 from .constants import DEFAULT_SETTINGS, VALIDATION_RANGES
 
 
 SettingsSource = Literal["explicit", "legacy_disk"]
 TemporalPostprocessor = Literal["off", "vdpp"]
-PROCESSING_SETTINGS_SCHEMA_VERSION = 4
+StereoRenderMode = Literal["fast", "quality"]
+PROCESSING_SETTINGS_SCHEMA_VERSION = 5
+JOB_OUTPUT_NAME_V1_RESOLUTION_PRESETS = frozenset(
+    {
+        "square-480",
+        "square-720",
+        "square-1k",
+        "square-2k",
+        "square-3k",
+        "square-4k",
+        "square-5k",
+        "16x9-480p",
+        "16x9-720p",
+        "16x9-1080p",
+        "16x9-1440p",
+        "16x9-4k",
+        "16x9-5k",
+        "16x9-8k",
+        "ultrawide",
+        "wide-2k",
+        "wide-4k",
+        "cinema-2k",
+        "cinema-4k",
+    }
+)
 REMOVED_SETTING_NAMES = {
     "baseline",
     "focal_length",
@@ -55,6 +81,7 @@ _EXISTING_BOOLEAN_SETTINGS = {
     "experimental_frame_interpolation",
 }
 _EXISTING_CHOICE_SETTINGS = {
+    "stereo_render_mode": {"fast", "quality"},
     "stereo_geometry_mode": {"relative", "metric_camera"},
     "vr_format": {"side_by_side", "over_under"},
     "fisheye_projection": {"equidistant", "equisolid", "orthogonal", "stereographic"},
@@ -126,6 +153,13 @@ def _validate_dibr_setting(name: str, value: object) -> Any:
     if name in {"min_scene_frames", "stereo_io_workers"}:
         low, high = VALIDATION_RANGES[name]
         return _integer(name, value, int(low), int(high))
+    if name == "occlusion_fill_max_px":
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+            raise ValueError("occlusion_fill_max_px must be a non-boolean integer")
+        normalized = int(value)
+        if not 1 <= normalized <= 32:
+            raise ValueError("occlusion_fill_max_px must be within 1..32")
+        return normalized
     if name == "occlusion_fill":
         return _choice(name, value, {"none", "background"})
     if name == "raw_storage_dtype":
@@ -148,10 +182,23 @@ def _validate_target_fps(value: object) -> int | str | None:
 
 
 def _validate_resolution_setting(name: str, value: object) -> str | None:
-    if isinstance(value, str):
-        return value
     if value is None and name == "min_resolution":
         return None
+    if name == "min_resolution" and isinstance(value, str):
+        return value
+    if name == "vr_resolution" and isinstance(value, str):
+        if value == "auto" or value in JOB_OUTPUT_NAME_V1_RESOLUTION_PRESETS:
+            return value
+        if value.startswith("custom:"):
+            dimensions = value.removeprefix("custom:").split("x")
+            if (
+                len(dimensions) == 2
+                and all(part.isascii() and part.isdigit() for part in dimensions)
+                and all(part == str(int(part)) for part in dimensions if part)
+                and all(1 <= int(part) <= 10_000 for part in dimensions if part)
+                and all(part for part in dimensions)
+            ):
+                return value
     raise ValueError(f"{name} must be a string")
 
 
@@ -251,6 +298,7 @@ def _validate_value(name: str, value: object) -> Any:
         "stereo_strength",
         "convergence",
         "occlusion_fill",
+        "occlusion_fill_max_px",
         "scene_detection",
         "scene_cut_threshold",
         "min_scene_frames",
@@ -339,11 +387,16 @@ def parse_saved_processing_settings(
         )
 
     if source_version == PROCESSING_SETTINGS_SCHEMA_VERSION:
-        if "temporal_postprocessor" not in values:
-            raise ValueError(
-                "temporal_postprocessor is required by settings schema "
-                f"{PROCESSING_SETTINGS_SCHEMA_VERSION}"
-            )
+        for required in (
+            "temporal_postprocessor",
+            "stereo_render_mode",
+            "occlusion_fill_max_px",
+        ):
+            if required not in values:
+                raise ValueError(
+                    f"{required} is required by settings schema "
+                    f"{PROCESSING_SETTINGS_SCHEMA_VERSION}"
+                )
         return SavedSettingsResult(
             settings=validate_settings(values, source="explicit"),
             source_version=source_version,
@@ -351,9 +404,12 @@ def parse_saved_processing_settings(
             removed_settings=(),
         )
 
+    legacy_values = dict(values)
+    legacy_values.pop("stereo_render_mode", None)
+    legacy_values.pop("occlusion_fill_max_px", None)
     removed = tuple(sorted(set(values) - _KNOWN_SETTING_NAMES))
     return SavedSettingsResult(
-        settings=validate_settings(values, source="legacy_disk"),
+        settings=validate_settings(legacy_values, source="legacy_disk"),
         source_version=source_version,
         migrated=True,
         removed_settings=removed,
@@ -381,3 +437,24 @@ def resolve_temporal_postprocessor(
             {"off", "vdpp"},
         )  # type: ignore[return-value]
     return "off"
+
+
+def resolve_stereo_render_mode(
+    *,
+    persisted: object,
+    override: object,
+    is_resume: bool,
+    renderer_device_type: object,
+) -> StereoRenderMode:
+    """Resolve omission without changing the library-level Fast default."""
+
+    if override is not None:
+        return _choice(
+            "stereo_render_mode", override, {"fast", "quality"}
+        )  # type: ignore[return-value]
+    if is_resume and persisted is not None:
+        return _choice(
+            "stereo_render_mode", persisted, {"fast", "quality"}
+        )  # type: ignore[return-value]
+    device_type = str(renderer_device_type).split(":", 1)[0].lower()
+    return "quality" if device_type == "cuda" else "fast"

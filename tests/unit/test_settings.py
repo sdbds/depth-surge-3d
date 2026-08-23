@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 import pytest
 
 from src.depth_surge_3d.core.settings import (
@@ -11,6 +12,7 @@ from src.depth_surge_3d.core.settings import (
     REMOVED_SETTING_NAMES,
     UnsupportedSettingsSchemaError,
     parse_saved_processing_settings,
+    resolve_stereo_render_mode,
     resolve_temporal_postprocessor,
     validate_settings,
 )
@@ -37,7 +39,7 @@ def test_direct_vr_encode_accepts_booleans(value: bool) -> None:
 
 
 def test_metric_geometry_settings_bump_settings_schema() -> None:
-    assert PROCESSING_SETTINGS_SCHEMA_VERSION == 4
+    assert PROCESSING_SETTINGS_SCHEMA_VERSION == 5
 
 
 def test_metric_geometry_defaults_are_explicit() -> None:
@@ -67,7 +69,7 @@ def test_metric_settings_reject_out_of_contract_values(name, value) -> None:
 
 
 def test_temporal_postprocessor_bumps_settings_schema() -> None:
-    assert PROCESSING_SETTINGS_SCHEMA_VERSION == 4
+    assert PROCESSING_SETTINGS_SCHEMA_VERSION == 5
 
 
 def test_temporal_postprocessor_defaults_off() -> None:
@@ -124,16 +126,33 @@ def test_v2_prerelease_temporal_postprocessor_is_preserved() -> None:
     assert loaded.settings["temporal_postprocessor"] == "vdpp"
 
 
-def test_v4_requires_temporal_postprocessor_field() -> None:
+def test_v5_requires_quality_fields() -> None:
     with pytest.raises(ValueError, match="temporal_postprocessor"):
-        parse_saved_processing_settings({}, saved_version=4)
+        parse_saved_processing_settings({}, saved_version=5)
+
+    with pytest.raises(ValueError, match="stereo_render_mode"):
+        parse_saved_processing_settings(
+            {"temporal_postprocessor": "off", "occlusion_fill_max_px": 8},
+            saved_version=5,
+        )
+
+    with pytest.raises(ValueError, match="occlusion_fill_max_px"):
+        parse_saved_processing_settings(
+            {"temporal_postprocessor": "off", "stereo_render_mode": "fast"},
+            saved_version=5,
+        )
 
 
-def test_v4_rejects_unknown_fields_instead_of_filtering_them() -> None:
+def test_v5_rejects_unknown_fields_instead_of_filtering_them() -> None:
     with pytest.raises(ValueError, match="unknown setting.*future_knob"):
         parse_saved_processing_settings(
-            {"temporal_postprocessor": "off", "future_knob": True},
-            saved_version=4,
+            {
+                "temporal_postprocessor": "off",
+                "stereo_render_mode": "fast",
+                "occlusion_fill_max_px": 8,
+                "future_knob": True,
+            },
+            saved_version=5,
         )
 
 
@@ -141,8 +160,8 @@ def test_future_schema_fails_without_mutating_input() -> None:
     raw = {"temporal_postprocessor": "vdpp", "future_knob": True}
     original = dict(raw)
 
-    with pytest.raises(UnsupportedSettingsSchemaError, match="newer settings schema 5"):
-        parse_saved_processing_settings(raw, saved_version=5)
+    with pytest.raises(UnsupportedSettingsSchemaError, match="newer settings schema 6"):
+        parse_saved_processing_settings(raw, saved_version=6)
 
     assert raw == original
 
@@ -179,6 +198,8 @@ def test_final_defaults_cover_depth_dibr_and_migration_controls() -> None:
     assert settings["stereo_strength"] == 2.0
     assert settings["convergence"] == 0.5
     assert settings["occlusion_fill"] == "background"
+    assert settings["stereo_render_mode"] == "fast"
+    assert settings["occlusion_fill_max_px"] == 8
     assert settings["scene_detection"] is True
     assert settings["scene_cut_threshold"] == 0.55
     assert settings["min_scene_frames"] == 8
@@ -194,6 +215,101 @@ def test_final_defaults_cover_depth_dibr_and_migration_controls() -> None:
         "processing_mode",
     }
     assert REMOVED_SETTING_NAMES.isdisjoint(settings)
+
+
+@pytest.mark.parametrize("value", [True, False, np.bool_(True), 0, 33, 1.0, "8"])
+def test_occlusion_fill_max_px_rejects_non_integral_or_out_of_range_values(
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="occlusion_fill_max_px"):
+        validate_settings({"occlusion_fill_max_px": value}, source="explicit")
+
+
+def test_occlusion_fill_max_px_normalizes_numpy_integer() -> None:
+    settings = validate_settings(
+        {"occlusion_fill_max_px": np.int64(9)}, source="explicit"
+    )
+
+    assert settings["occlusion_fill_max_px"] == 9
+    assert type(settings["occlusion_fill_max_px"]) is int
+
+
+@pytest.mark.parametrize("value", ["fast", "quality"])
+def test_stereo_render_mode_accepts_only_frozen_modes(value: str) -> None:
+    assert validate_settings({"stereo_render_mode": value}, source="explicit")[
+        "stereo_render_mode"
+    ] == value
+
+
+def test_schema_four_migrates_to_fast_and_limit_eight() -> None:
+    loaded = parse_saved_processing_settings(
+        {"temporal_postprocessor": "vdpp", "stereo_render_mode": "quality"},
+        saved_version=4,
+    )
+
+    assert loaded.settings["stereo_render_mode"] == "fast"
+    assert loaded.settings["occlusion_fill_max_px"] == 8
+    assert loaded.source_version == 4
+
+
+@pytest.mark.parametrize(
+    ("persisted", "override", "is_resume", "device", "expected"),
+    [
+        (None, None, False, "cuda", "quality"),
+        (None, None, False, "cpu", "fast"),
+        ("quality", None, False, "cpu", "fast"),
+        ("quality", None, True, "cpu", "quality"),
+        ("quality", "fast", True, "cuda", "fast"),
+        ("fast", "quality", True, "cpu", "quality"),
+    ],
+)
+def test_stereo_render_mode_presence_aware_resolution(
+    persisted: str | None,
+    override: str | None,
+    is_resume: bool,
+    device: str,
+    expected: str,
+) -> None:
+    assert resolve_stereo_render_mode(
+        persisted=persisted,
+        override=override,
+        is_resume=is_resume,
+        renderer_device_type=device,
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "auto",
+        "16x9-1080p",
+        "square-4k",
+        "custom:1x10000",
+        "custom:10000x1",
+    ],
+)
+def test_vr_resolution_accepts_frozen_portable_values(value: str) -> None:
+    assert validate_settings({"vr_resolution": value}, source="explicit")[
+        "vr_resolution"
+    ] == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "1080p",
+        "custom:01x1",
+        "custom:1x01",
+        "custom:0x1",
+        "custom:1x10001",
+        "custom:+1x1",
+        "custom:1 x1",
+        "CUSTOM:1x1",
+    ],
+)
+def test_vr_resolution_rejects_noncanonical_values(value: str) -> None:
+    with pytest.raises(ValueError, match="vr_resolution"):
+        validate_settings({"vr_resolution": value}, source="explicit")
 
 
 def test_temporal_compatibility_settings_remain_validated_and_saved() -> None:

@@ -17,6 +17,7 @@ from depth_surge_3d.core.constants import (
 )
 from depth_surge_3d.core.settings import (
     parse_saved_processing_settings,
+    resolve_stereo_render_mode,
     resolve_temporal_postprocessor,
     validate_settings,
 )
@@ -135,6 +136,20 @@ def _parse_metric_convergence(value: str) -> str | float:
     return resolved
 
 
+def _parse_occlusion_fill_max_px(value: str) -> int:
+    try:
+        normalized = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "occlusion fill maximum must be an integer in 1..32"
+        ) from exc
+    if str(normalized) != value or not 1 <= normalized <= 32:
+        raise argparse.ArgumentTypeError(
+            "occlusion fill maximum must be an integer in 1..32"
+        )
+    return normalized
+
+
 def _build_processing_settings(args: argparse.Namespace) -> dict[str, object]:
     """Translate CLI names once, then hand one validated object to the pipeline."""
     spec = get_backend_spec(args.depth_model_version)
@@ -155,6 +170,13 @@ def _build_processing_settings(args: argparse.Namespace) -> dict[str, object]:
             "stereo_strength": args.stereo_strength,
             "convergence": args.convergence,
             "occlusion_fill": args.occlusion_fill,
+            "stereo_render_mode": resolve_stereo_render_mode(
+                persisted=None,
+                override=args.stereo_render_mode,
+                is_resume=False,
+                renderer_device_type=_effective_vdpp_device(args.device),
+            ),
+            "occlusion_fill_max_px": args.occlusion_fill_max_px,
             "stereo_geometry_mode": args.stereo_geometry_mode,
             "virtual_baseline_mm": args.virtual_baseline_mm,
             "metric_convergence_distance": args.metric_convergence_distance,
@@ -275,6 +297,18 @@ Note: V2 uses fixed shot-aware temporal inference; V3, See-Through, and MoGe-2 i
         choices=["none", "background"],
         default=DEFAULT_SETTINGS["occlusion_fill"],
         help="Disocclusion handling mode (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--stereo-render-mode",
+        choices=["fast", "quality"],
+        default=None,
+        help="Stereo renderer (default: quality on CUDA, fast on CPU)",
+    )
+    parser.add_argument(
+        "--occlusion-fill-max-px",
+        type=_parse_occlusion_fill_max_px,
+        default=DEFAULT_SETTINGS["occlusion_fill_max_px"],
+        help="Quality local disocclusion limit at 1080p (default: %(default)s)",
     )
     parser.add_argument(
         "--stereo-geometry-mode",

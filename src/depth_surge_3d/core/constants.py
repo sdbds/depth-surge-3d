@@ -54,6 +54,8 @@ DEFAULT_SETTINGS = {
     "metric_convergence_distance": "auto",
     "max_disparity_percent": 2.0,
     "occlusion_fill": "background",
+    "stereo_render_mode": "fast",
+    "occlusion_fill_max_px": 8,
     "scene_detection": True,
     "scene_cut_threshold": 0.55,
     "min_scene_frames": 8,

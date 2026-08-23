@@ -210,6 +210,42 @@ def test_relative_wrapper_passes_legacy_offsets_to_the_common_splat_core(
     assert captured_offsets[0][0][0, 0] == 61
 
 
+def test_quality_dispatch_happens_before_fast_geometry_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = np.zeros((2, 3, 3), dtype=np.uint8)
+    canonical = np.full((1, 2), 0.5, dtype=np.float32)
+    expected = _empty_render_result(frame)
+    renderer = StereoRenderer(device="cpu")
+    calls: list[tuple[np.ndarray, np.ndarray, StereoRenderSettings]] = []
+
+    def fail_fast_geometry(*_args, **_kwargs):
+        raise AssertionError("Fast geometry must not run for Quality")
+
+    def fake_quality(
+        source: np.ndarray,
+        canonical_values: np.ndarray,
+        settings: StereoRenderSettings,
+    ) -> StereoRenderResult:
+        calls.append((source, canonical_values, settings))
+        return expected
+
+    monkeypatch.setattr(
+        "src.depth_surge_3d.rendering.stereo_renderer.build_relative_geometry",
+        fail_fast_geometry,
+    )
+    monkeypatch.setattr(renderer, "_render_relative_quality", fake_quality, raising=False)
+
+    actual = renderer.render(
+        frame,
+        canonical,
+        StereoRenderSettings(stereo_render_mode="quality"),
+    )
+
+    assert actual is expected
+    assert len(calls) == 1
+
+
 def test_half_lane_boundaries_obey_ceil_without_epsilon() -> None:
     boundary = np.float32(2.0 / HORIZONTAL_SUBPIXELS)
     below = np.nextafter(boundary, np.float32(0.0))
@@ -623,6 +659,38 @@ def test_strength_boundaries_are_valid(strength: float) -> None:
 def test_render_settings_reject_invalid_values(values: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         StereoRenderSettings(**values)
+
+
+def test_quality_render_fields_are_keyword_only_and_normalized() -> None:
+    with pytest.raises(TypeError):
+        StereoRenderSettings(2.0, 0.5, "background", "quality", 8)  # type: ignore[misc]
+
+    settings = StereoRenderSettings(
+        stereo_render_mode="quality",
+        occlusion_fill_max_px=np.int64(9),  # type: ignore[arg-type]
+    )
+
+    assert settings.stereo_render_mode == "quality"
+    assert settings.occlusion_fill_max_px == 9
+    assert type(settings.occlusion_fill_max_px) is int
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"stereo_render_mode": "balanced"},
+        {"occlusion_fill_max_px": True},
+        {"occlusion_fill_max_px": np.bool_(False)},
+        {"occlusion_fill_max_px": 0},
+        {"occlusion_fill_max_px": 33},
+        {"occlusion_fill_max_px": 8.0},
+    ],
+)
+def test_quality_render_fields_reject_out_of_contract_values(
+    values: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        StereoRenderSettings(**values)  # type: ignore[arg-type]
 
 
 def test_renderer_rejects_nonfinite_or_out_of_range_canonical() -> None:

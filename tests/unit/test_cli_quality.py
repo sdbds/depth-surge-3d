@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+import importlib
+import sys
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture
+def cli_module():
+    project_root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(project_root / "src"))
+    try:
+        yield importlib.import_module("depth_surge_3d.cli")
+    finally:
+        sys.path.pop(0)
+
+
+def test_cli_accepts_explicit_quality_controls(cli_module) -> None:
+    args = cli_module.create_argument_parser().parse_args(
+        [
+            "input.mp4",
+            "--stereo-render-mode",
+            "quality",
+            "--occlusion-fill-max-px",
+            "10",
+            "--device",
+            "cpu",
+        ]
+    )
+
+    settings = cli_module._build_processing_settings(args)
+
+    assert settings["stereo_render_mode"] == "quality"
+    assert settings["occlusion_fill_max_px"] == 10
+
+
+@pytest.mark.parametrize(("device", "expected"), [("cuda", "quality"), ("cpu", "fast")])
+def test_cli_resolves_omitted_mode_from_effective_device(
+    monkeypatch: pytest.MonkeyPatch,
+    cli_module,
+    device: str,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(cli_module, "_effective_vdpp_device", lambda _requested: device)
+    args = cli_module.create_argument_parser().parse_args(["input.mp4"])
+
+    settings = cli_module._build_processing_settings(args)
+
+    assert settings["stereo_render_mode"] == expected
+
+
+def test_cli_rejects_invalid_quality_limit_before_processing(cli_module) -> None:
+    parser = cli_module.create_argument_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["input.mp4", "--occlusion-fill-max-px", "0"])

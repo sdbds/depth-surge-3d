@@ -5,7 +5,8 @@ from __future__ import annotations
 import gc
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from numbers import Integral
 from typing import Literal
 
 import numpy as np
@@ -34,6 +35,10 @@ class StereoRenderSettings:
     stereo_strength: float = 2.0
     convergence: float = 0.5
     occlusion_fill: Literal["none", "background"] = "background"
+    stereo_render_mode: Literal["fast", "quality"] = field(
+        default="fast", kw_only=True
+    )
+    occlusion_fill_max_px: int = field(default=8, kw_only=True)
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.stereo_strength) or not 0.0 <= self.stereo_strength <= 5.0:
@@ -42,6 +47,15 @@ class StereoRenderSettings:
             raise ValueError("convergence must be finite and within [0, 1]")
         if self.occlusion_fill not in {"none", "background"}:
             raise ValueError("occlusion_fill must be 'none' or 'background'")
+        if self.stereo_render_mode not in {"fast", "quality"}:
+            raise ValueError("stereo_render_mode must be 'fast' or 'quality'")
+        value = self.occlusion_fill_max_px
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+            raise ValueError("occlusion_fill_max_px must be a non-boolean integer")
+        normalized = int(value)
+        if not 1 <= normalized <= 32:
+            raise ValueError("occlusion_fill_max_px must be within 1..32")
+        object.__setattr__(self, "occlusion_fill_max_px", normalized)
 
 
 @dataclass(frozen=True)
@@ -308,6 +322,18 @@ class StereoRenderer:
         settings = settings or StereoRenderSettings()
         self._validate_inputs(source, canonical_values, settings)
         source = np.ascontiguousarray(source)
+        if settings.stereo_render_mode == "quality":
+            return self._render_relative_quality(source, canonical_values, settings)
+        return self._render_relative_fast(source, canonical_values, settings)
+
+    def _render_relative_fast(
+        self,
+        source: np.ndarray,
+        canonical_values: np.ndarray,
+        settings: StereoRenderSettings,
+    ) -> StereoRenderResult:
+        """Run the unchanged Revision 5 relative renderer."""
+
         height, width = int(source.shape[0]), int(source.shape[1])
         geometry = build_relative_geometry(
             canonical_values,
@@ -328,6 +354,23 @@ class StereoRenderer:
                 occlusion_fill=settings.occlusion_fill,
             ),
             geometry_seconds,
+        )
+
+    def _render_relative_quality(
+        self,
+        source: np.ndarray,
+        canonical_values: np.ndarray,
+        settings: StereoRenderSettings,
+    ) -> StereoRenderResult:
+        """Load the optional production Quality path only when selected."""
+
+        from .quality.renderer import render_relative_quality_public
+
+        return render_relative_quality_public(
+            renderer=self,
+            frame=source,
+            canonical=canonical_values,
+            settings=settings,
         )
 
     def render_geometry(
