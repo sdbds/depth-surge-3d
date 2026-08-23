@@ -117,6 +117,8 @@ def test_tiny_geometry_worker_matches_closed_form_oracle_and_reports_visits() ->
     result = benchmarks.execute_worker_case(case)
 
     assert result.status == "passed"
+    assert result.equality_sha256 != "00" * 32
+    assert result.facts
     assert result.facts["oracle"] == "full-grid-closed-form-v1"
     assert result.equality_sha256 != "00" * 32
     if result.facts["capacity_rejected"]:
@@ -352,8 +354,47 @@ def test_each_nonfixture_worker_emits_closed_success_evidence(
     result = benchmarks.execute_worker_case(case)
 
     assert result.status == "passed"
-    assert result.equality_sha256 != "00" * 32
-    assert result.facts
+
+
+def test_go_handshake_retries_only_transient_open_denials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts: list[object] = [PermissionError(13, "denied"), b"go"]
+    pauses: list[float] = []
+
+    def read_bytes(_path: Path) -> bytes:
+        value = attempts.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    benchmarks._await_go_handshake(
+        tmp_path / "go",
+        deadline_ns=10,
+        now_ns=lambda: 0,
+        pause=pauses.append,
+    )
+
+    assert attempts == []
+    assert pauses == [0.001]
+
+
+def test_go_handshake_rejects_wrong_bytes_without_retry(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "go"
+    path.write_bytes(b"")
+
+    with pytest.raises(benchmarks.BenchmarkExecutionError, match="invalid"):
+        benchmarks._await_go_handshake(
+            path,
+            deadline_ns=10,
+            now_ns=lambda: 0,
+            pause=lambda _seconds: None,
+        )
 
 
 def test_fixture_worker_streams_the_reported_job_without_adopting_other_settings(

@@ -1272,6 +1272,26 @@ def _load_case_file(path: Path) -> BenchmarkCase:
     return BenchmarkCase.from_object(value)
 
 
+def _await_go_handshake(
+    path: Path,
+    *,
+    deadline_ns: int,
+    now_ns: Callable[[], int] = time.perf_counter_ns,
+    pause: Callable[[float], None] = time.sleep,
+) -> None:
+    while True:
+        try:
+            payload = path.read_bytes()
+        except (FileNotFoundError, PermissionError) as error:
+            if now_ns() >= deadline_ns:
+                raise BenchmarkExecutionError("benchmark parent handshake timed out") from error
+            pause(0.001)
+            continue
+        if payload != b"go":
+            raise BenchmarkExecutionError("benchmark parent handshake is invalid")
+        return
+
+
 def run_case_subprocess(  # noqa: C901
     case: BenchmarkCase,
     *,
@@ -1534,12 +1554,7 @@ def _worker_main(argv: list[str]) -> int:
     ready_temporary.write_bytes(ready)
     os.replace(ready_temporary, arguments.ready_file)
     go_deadline = time.perf_counter_ns() + 30_000_000_000
-    while not arguments.go_file.is_file():
-        if time.perf_counter_ns() >= go_deadline:
-            raise BenchmarkExecutionError("benchmark parent handshake timed out")
-        time.sleep(0.001)
-    if arguments.go_file.read_bytes() != b"go":
-        raise BenchmarkExecutionError("benchmark parent handshake is invalid")
+    _await_go_handshake(arguments.go_file, deadline_ns=go_deadline)
     result = _execute_prepared_worker_case(
         case,
         baseline_rss_bytes=baseline_rss_bytes,
