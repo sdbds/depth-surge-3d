@@ -120,6 +120,37 @@ def test_report_fails_closed_when_required_runs_are_missing_or_duplicated() -> N
         )
 
 
+@pytest.mark.parametrize("decision", ["existing_dependencies", "prebuilt_extension"])
+def test_report_rejects_failed_required_run_for_every_decision(
+    decision: reporting.GateDecision,
+) -> None:
+    failed = reporting.GateRunDescriptor.create(
+        run_id="geometry.cpu.failed",
+        gate="geometry-scale",
+        case="failed",
+        device_context="cpu",
+        status="failed",
+        wall_time_ns=1,
+        peak_rss_bytes=1,
+        rss_cap_bytes=1024,
+        arena_bytes=0,
+        visit_total=0,
+        visit_max=0,
+        visit_p95=0,
+        equality_sha256="00" * 32,
+        facts={"reason": "candidate gate failed"},
+    )
+
+    with pytest.raises(reporting.IncompleteTask0ReportError, match="failed"):
+        reporting.Task0Report.create(
+            source=_source(),
+            environment=_environment(),
+            required_run_ids=(failed.run_id,),
+            runs=(failed,),
+            gate_decision=decision,
+        )
+
+
 def test_atomic_report_round_trip_rejects_noncanonical_and_wrong_source(
     tmp_path: Path,
 ) -> None:

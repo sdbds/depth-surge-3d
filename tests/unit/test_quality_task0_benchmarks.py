@@ -56,12 +56,11 @@ def test_geometry_memory_preflight_rejects_over_budget_without_allocation() -> N
         height=2160,
         geometry_ratio="4",
         edge_percent=100,
-        baseline_rss_bytes=96 * 1024 * 1024,
     )
 
     assert estimate.geometry_pixels == 4 * 3840 * 2160
     assert estimate.query_pixels == 3840 * 2160
-    assert estimate.predicted_peak_rss_bytes > benchmarks.HOST_RSS_CAP_BYTES
+    assert estimate.predicted_phase_rss_bytes > benchmarks.HOST_RSS_CAP_BYTES
     with pytest.raises(benchmarks.BenchmarkCapacityError, match="pre-mutation"):
         benchmarks.require_geometry_capacity(estimate)
 
@@ -136,9 +135,80 @@ def test_subprocess_runner_measures_rss_and_builds_a_closed_descriptor(tmp_path:
 
     assert descriptor.run_id == case.run_id
     assert descriptor.status == "passed"
-    assert 32 * 1024 * 1024 < descriptor.peak_rss_bytes <= benchmarks.HOST_RSS_CAP_BYTES
+    assert 0 < descriptor.peak_rss_bytes <= benchmarks.HOST_RSS_CAP_BYTES
+    assert descriptor.facts["process_baseline_rss_bytes"] > 0
+    assert descriptor.facts["process_tree_peak_rss_bytes"] > 32 * 1024 * 1024
+    assert descriptor.peak_rss_bytes == (
+        descriptor.facts["process_tree_peak_rss_bytes"]
+        - descriptor.facts["process_baseline_rss_bytes"]
+    )
     assert descriptor.wall_time_ns > 0
     assert descriptor.visit_total > 0
+
+
+def test_over_cap_worker_evidence_is_failed_instead_of_mislabeled_passed() -> None:
+    case = benchmarks.BenchmarkCase.create(
+        run_id="runtime.cpu.overcap",
+        gate="runtime-matrix",
+        case="overcap",
+        device_context="cpu",
+        operation="runtime",
+        parameters={},
+    )
+    result = benchmarks.WorkerResult(
+        status="passed",
+        arena_bytes=0,
+        visit_total=0,
+        visit_max=0,
+        visit_p95=0,
+        equality_sha256="01" * 32,
+        facts={"phase": "runtime"},
+        baseline_rss_bytes=100,
+    )
+
+    descriptor = benchmarks.finalize_worker_descriptor(
+        case,
+        result,
+        wall_time_ns=1,
+        process_tree_peak_rss_bytes=benchmarks.HOST_RSS_CAP_BYTES + 101,
+    )
+
+    assert descriptor.status == "failed"
+    assert descriptor.facts["rss_cap_exceeded"] is True
+
+
+def test_runtime_baseline_is_not_charged_to_the_quality_phase_cap() -> None:
+    case = benchmarks.BenchmarkCase.create(
+        run_id="runtime.cpu.baseline",
+        gate="runtime-matrix",
+        case="baseline",
+        device_context="cpu",
+        operation="runtime",
+        parameters={},
+    )
+    baseline = benchmarks.HOST_RSS_CAP_BYTES + 32 * 1024 * 1024
+    result = benchmarks.WorkerResult(
+        status="passed",
+        arena_bytes=0,
+        visit_total=0,
+        visit_max=0,
+        visit_p95=0,
+        equality_sha256="01" * 32,
+        facts={"phase": "runtime"},
+        baseline_rss_bytes=baseline,
+    )
+
+    descriptor = benchmarks.finalize_worker_descriptor(
+        case,
+        result,
+        wall_time_ns=1,
+        process_tree_peak_rss_bytes=baseline + 8 * 1024 * 1024,
+    )
+
+    assert descriptor.status == "passed"
+    assert descriptor.peak_rss_bytes == 8 * 1024 * 1024
+    assert descriptor.facts["rss_measurement"] == "process-tree-peak-minus-baseline-v1"
+    assert descriptor.facts["rss_cap_exceeded"] is False
 
 
 @pytest.mark.parametrize(

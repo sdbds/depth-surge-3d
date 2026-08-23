@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import gc
 import hashlib
 import json
@@ -203,6 +203,7 @@ class WorkerResult:
     visit_p95: int
     equality_sha256: str
     facts: dict
+    baseline_rss_bytes: int = 0
 
     def to_object(self) -> dict:
         return {
@@ -213,6 +214,7 @@ class WorkerResult:
             "visit_p95": self.visit_p95,
             "equality_sha256": self.equality_sha256,
             "facts": self.facts,
+            "baseline_rss_bytes": self.baseline_rss_bytes,
         }
 
     @classmethod
@@ -225,12 +227,19 @@ class WorkerResult:
             "visit_p95",
             "equality_sha256",
             "facts",
+            "baseline_rss_bytes",
         }
         if not isinstance(value, dict) or set(value) != expected:
             raise BenchmarkExecutionError("benchmark worker result schema is invalid")
         if value["status"] not in {"passed", "failed"} or not isinstance(value["facts"], dict):
             raise BenchmarkExecutionError("benchmark worker status/facts are invalid")
-        for key in ("arena_bytes", "visit_total", "visit_max", "visit_p95"):
+        for key in (
+            "arena_bytes",
+            "visit_total",
+            "visit_max",
+            "visit_p95",
+            "baseline_rss_bytes",
+        ):
             reporting.checked_u64(value[key], key)
         if not isinstance(value["equality_sha256"], str) or len(value["equality_sha256"]) != 64:
             raise BenchmarkExecutionError("benchmark equality hash is invalid")
@@ -242,6 +251,7 @@ class WorkerResult:
             visit_p95=value["visit_p95"],
             equality_sha256=value["equality_sha256"],
             facts=value["facts"],
+            baseline_rss_bytes=value["baseline_rss_bytes"],
         )
 
 
@@ -251,7 +261,7 @@ class GeometryMemoryEstimate:
     query_pixels: int
     index_bytes: int
     query_bytes: int
-    predicted_peak_rss_bytes: int
+    predicted_phase_rss_bytes: int
 
 
 def available_gate_names() -> tuple[str, ...]:
@@ -440,7 +450,6 @@ def estimate_geometry_case_bytes(
     height: int,
     geometry_ratio: str,
     edge_percent: int,
-    baseline_rss_bytes: int,
 ) -> GeometryMemoryEstimate:
     geometry_height, geometry_width = _ratio_shape(width, height, geometry_ratio)
     geometry_pixels = geometry_height * geometry_width
@@ -451,8 +460,7 @@ def estimate_geometry_case_bytes(
     fill_scratch = 8 * 1024 * 1024
     fixed_headroom = 24 * 1024 * 1024
     predicted = (
-        baseline_rss_bytes
-        + 4 * geometry_pixels
+        4 * geometry_pixels
         + index_bytes
         + query_bytes
         + build_scratch
@@ -464,12 +472,12 @@ def estimate_geometry_case_bytes(
         query_pixels=query_pixels,
         index_bytes=index_bytes,
         query_bytes=query_bytes,
-        predicted_peak_rss_bytes=predicted,
+        predicted_phase_rss_bytes=predicted,
     )
 
 
 def require_geometry_capacity(estimate: GeometryMemoryEstimate) -> None:
-    if estimate.predicted_peak_rss_bytes > HOST_RSS_CAP_BYTES:
+    if estimate.predicted_phase_rss_bytes > HOST_RSS_CAP_BYTES:
         raise BenchmarkCapacityError(
             "geometry scale case exceeds the 512 MiB host cap at pre-mutation admission"
         )
@@ -505,13 +513,11 @@ def _geometry_worker(case: BenchmarkCase) -> WorkerResult:
     height = case.integer_parameter("height")
     ratio = case.string_parameter("geometry_ratio")
     edge_percent = case.integer_parameter("edge_percent")
-    baseline = reporting.read_process_rss_bytes(os.getpid())
     estimate = estimate_geometry_case_bytes(
         width=width,
         height=height,
         geometry_ratio=ratio,
         edge_percent=edge_percent,
-        baseline_rss_bytes=baseline,
     )
     try:
         require_geometry_capacity(estimate)
@@ -519,7 +525,7 @@ def _geometry_worker(case: BenchmarkCase) -> WorkerResult:
         facts = {
             "capacity_rejected": True,
             "pre_mutation": True,
-            "predicted_peak_rss_bytes": estimate.predicted_peak_rss_bytes,
+            "predicted_phase_rss_bytes": estimate.predicted_phase_rss_bytes,
             "geometry_pixels": estimate.geometry_pixels,
             "query_pixels": estimate.query_pixels,
             "oracle": "full-grid-closed-form-v1",
@@ -608,7 +614,6 @@ def _fault_worker() -> WorkerResult:
             height=2160,
             geometry_ratio="4",
             edge_percent=100,
-            baseline_rss_bytes=96 * 1024 * 1024,
         )
         require_geometry_capacity(estimate)
     except BenchmarkCapacityError:
@@ -1171,6 +1176,20 @@ def _fixture_worker(case: BenchmarkCase) -> WorkerResult:
     )
 
 
+def _prepare_worker_case(case: BenchmarkCase) -> None:
+    if case.operation != "runtime" and not case.device_context.startswith("cuda:"):
+        return
+    import cv2  # noqa: F401
+    import torch
+
+    cuda_available = bool(torch.cuda.is_available())
+    if cuda_available:
+        torch.cuda.get_device_name(0)
+    torch.get_num_threads()
+    torch.get_num_interop_threads()
+    cv2.getNumThreads()
+
+
 def execute_worker_case(case: BenchmarkCase) -> WorkerResult:
     operations: dict[str, Callable[[BenchmarkCase], WorkerResult]] = {
         "geometry": _geometry_worker,
@@ -1184,7 +1203,13 @@ def execute_worker_case(case: BenchmarkCase) -> WorkerResult:
         "faults": lambda _case: _fault_worker(),
     }
     if case.operation in operations:
-        return operations[case.operation](case)
+        _prepare_worker_case(case)
+        gc.collect()
+        baseline_rss_bytes = reporting.read_process_rss_bytes(os.getpid())
+        return replace(
+            operations[case.operation](case),
+            baseline_rss_bytes=baseline_rss_bytes,
+        )
     raise BenchmarkExecutionError(f"benchmark operation is not implemented: {case.operation}")
 
 
@@ -1248,21 +1273,51 @@ def run_case_subprocess(  # noqa: C901
     if reporting.canonical_json_bytes(value) != stdout:
         raise BenchmarkExecutionError("benchmark worker output is not canonical")
     result = WorkerResult.from_object(value)
+    return finalize_worker_descriptor(
+        case,
+        result,
+        wall_time_ns=wall_time,
+        process_tree_peak_rss_bytes=peak_rss,
+    )
+
+
+def finalize_worker_descriptor(
+    case: BenchmarkCase,
+    result: WorkerResult,
+    *,
+    wall_time_ns: int,
+    process_tree_peak_rss_bytes: int,
+) -> reporting.GateRunDescriptor:
+    baseline = result.baseline_rss_bytes
+    if baseline <= 0:
+        raise BenchmarkExecutionError("worker did not record a positive process RSS baseline")
+    if process_tree_peak_rss_bytes < baseline:
+        raise BenchmarkExecutionError("process-tree RSS peak is below the worker baseline")
+    phase_peak_rss_bytes = process_tree_peak_rss_bytes - baseline
+    cap_exceeded = phase_peak_rss_bytes > HOST_RSS_CAP_BYTES
+    facts = {
+        **result.facts,
+        "process_baseline_rss_bytes": baseline,
+        "process_tree_peak_rss_bytes": process_tree_peak_rss_bytes,
+        "rss_measurement": "process-tree-peak-minus-baseline-v1",
+        "rss_cap_exceeded": cap_exceeded,
+    }
+    status: reporting.RunStatus = "failed" if cap_exceeded else result.status
     return reporting.GateRunDescriptor.create(
         run_id=case.run_id,
         gate=case.gate,
         case=case.case,
         device_context=case.device_context,
-        status=result.status,
-        wall_time_ns=wall_time,
-        peak_rss_bytes=peak_rss,
+        status=status,
+        wall_time_ns=wall_time_ns,
+        peak_rss_bytes=phase_peak_rss_bytes,
         rss_cap_bytes=HOST_RSS_CAP_BYTES,
         arena_bytes=result.arena_bytes,
         visit_total=result.visit_total,
         visit_max=result.visit_max,
         visit_p95=result.visit_p95,
         equality_sha256=result.equality_sha256,
-        facts=result.facts,
+        facts=facts,
     )
 
 
