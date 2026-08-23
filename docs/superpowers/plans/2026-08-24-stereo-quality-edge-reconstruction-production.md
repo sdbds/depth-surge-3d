@@ -109,7 +109,7 @@ feat: add typed stereo quality settings
 - Produces: single-eye `build_relative_eye_offsets_into(...)` and `build_geometry_eye_offsets_into(...)`.
 - Consumes: wheel-root `_quality_kd_native` with frozen build info `quality-implicit-region-kd-median-of-medians-v1`.
 
-- [ ] **Step 1: Add RED import/parity tests against the Task 0 scalar fixtures**
+- [x] **Step 1: Add RED import/parity tests against the Task 0 scalar fixtures**
 
 ```python
 def test_production_geometry_matches_gate_prototype(relative_fixture):
@@ -120,27 +120,27 @@ def test_production_geometry_matches_gate_prototype(relative_fixture):
 
 Include half-lane ULPs, `G/Q` 0.5/1/2/4, sparse-region rejection, geodesic ties, CPU/CUDA-context equality, and native build metadata.
 
-- [ ] **Step 2: Run tests and confirm production modules are absent**
+- [x] **Step 2: Run tests and confirm production modules are absent**
 
 Run: `python -m pytest tests/unit/test_quality_production_core.py tests/unit/test_quality_native_wheel.py -q`
 
-- [ ] **Step 3: Mechanically promote gate-proven modules and rewrite only package imports**
+- [x] **Step 3: Mechanically promote gate-proven modules and rewrite only package imports**
 
 Promote exact implementations from `scripts/quality_task0`; production code must not import `scripts`. Keep oracle-only helpers private and retain all checked arena/visit caps.
 
-- [ ] **Step 4: Build the extension and run parity tests**
+- [x] **Step 4: Build the extension and run parity tests**
 
 Run: `python scripts/build_quality_task0_native.py`
 
 Run: `python -m pytest tests/unit/test_quality_production_core.py tests/unit/test_quality_native_wheel.py -q`
 
-- [ ] **Step 5: Build and inspect a wheel**
+- [x] **Step 5: Build and inspect a wheel**
 
 Run: `python -m build --wheel`
 
 Assert a clean subprocess imports both `depth_surge_3d.rendering.quality` and `_quality_kd_native` from the installed wheel.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```text
 feat: promote quality geometry native core
