@@ -1221,8 +1221,11 @@ def run_case_subprocess(  # noqa: C901
     try:
         while process.poll() is None:
             try:
-                peak_rss = max(peak_rss, reporting.read_process_rss_bytes(process.pid))
-            except OSError:
+                peak_rss = max(
+                    peak_rss,
+                    reporting.read_process_tree_rss_bytes(process.pid),
+                )
+            except (OSError, reporting.ReportError):
                 pass
             time.sleep(0.005)
         stdout, stderr = process.communicate(timeout=5)

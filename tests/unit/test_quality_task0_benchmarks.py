@@ -136,7 +136,7 @@ def test_subprocess_runner_measures_rss_and_builds_a_closed_descriptor(tmp_path:
 
     assert descriptor.run_id == case.run_id
     assert descriptor.status == "passed"
-    assert 0 < descriptor.peak_rss_bytes <= benchmarks.HOST_RSS_CAP_BYTES
+    assert 32 * 1024 * 1024 < descriptor.peak_rss_bytes <= benchmarks.HOST_RSS_CAP_BYTES
     assert descriptor.wall_time_ns > 0
     assert descriptor.visit_total > 0
 

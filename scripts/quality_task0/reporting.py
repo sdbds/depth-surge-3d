@@ -540,6 +540,98 @@ def _read_windows_process_rss(process_id: int) -> int:
         kernel32.CloseHandle(handle)
 
 
+def _windows_process_parent_map() -> dict[int, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(ProcessEntry32W),
+    )
+    kernel32.Process32NextW.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(ProcessEntry32W),
+    )
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot == wintypes.HANDLE(-1).value:
+        raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot failed")
+    parents: dict[int, int] = {}
+    try:
+        entry = ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        present = bool(kernel32.Process32FirstW(snapshot, ctypes.byref(entry)))
+        while present:
+            parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            present = bool(kernel32.Process32NextW(snapshot, ctypes.byref(entry)))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return parents
+
+
+def _posix_process_parent_map() -> dict[int, int]:
+    parents: dict[int, int] = {}
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return parents
+    for child in proc.iterdir():
+        if not child.name.isdigit():
+            continue
+        try:
+            raw = (child / "stat").read_text(encoding="ascii")
+            suffix = raw[raw.rindex(")") + 2 :].split()
+            parents[int(child.name)] = int(suffix[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    return parents
+
+
+def read_process_tree_rss_bytes(root_process_id: int) -> int:
+    if (
+        isinstance(root_process_id, bool)
+        or not isinstance(root_process_id, int)
+        or root_process_id <= 0
+    ):
+        raise ReportSchemaError("root process id must be positive")
+    parents = _windows_process_parent_map() if os.name == "nt" else _posix_process_parent_map()
+    selected = {root_process_id}
+    changed = True
+    while changed:
+        changed = False
+        for process_id, parent_id in parents.items():
+            if parent_id in selected and process_id not in selected:
+                selected.add(process_id)
+                changed = True
+    total = 0
+    sampled = 0
+    for process_id in selected:
+        try:
+            total += read_process_rss_bytes(process_id)
+            sampled += 1
+        except (OSError, ReportSchemaError):
+            continue
+    if sampled == 0:
+        raise ReportSchemaError("process tree disappeared before RSS sampling")
+    return checked_u64(total, "process tree RSS")
+
+
 def capture_environment_identity() -> EnvironmentIdentity:
     def version(distribution: str) -> str:
         try:
