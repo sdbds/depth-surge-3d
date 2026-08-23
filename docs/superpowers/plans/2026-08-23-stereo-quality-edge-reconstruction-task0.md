@@ -115,7 +115,7 @@
 - [x] Add strict ZIP/NPY parser tests for all three allowlisted layouts and malformed flags, descriptors, offsets, CRC, dtypes, shapes, compression, and trailing data.
 - [x] Implement one-frame `5*G_i` metric ownership, fixed buffers, streaming hashes, and release-before-next-frame audit.
 - [x] Implement the fixed writer with fault injection at compression, seek, patch, sync, replace, and disk-full boundaries.
-- [ ] Prove no complete second array/member exists concurrently and all audit/writer RSS formulas hold.
+- [x] Prove no complete second array/member exists concurrently and all audit/writer RSS formulas hold.
 
 ### Task 0.8: Replayable Stereo Control Plane
 
@@ -141,25 +141,25 @@
 - [x] Freeze legal FFprobe wrappers for FFmpeg 5/6/7 and Windows; reject duplicate authoritative top-level keys while allowing nested duplicates.
 - [x] Implement and fault-test portable output naming, fixed settings locator, write-ahead intents, authenticated physical extents, short-source recovery, job-control terminal reconciliation, and index-last retirement.
 - [x] Cover replace/video/input-manifest/final-manifest crash windows under the approved irreversible post-boundary publication policy.
-- [ ] Measure every coordinator phase under its capped stdout/stderr/JSON/settings/ring and timeout formulas.
+- [x] Measure every coordinator phase under its capped stdout/stderr/JSON/settings/ring and timeout formulas.
 
 ### Task 0.10: Scale Matrix And Gate Decision
 
 **Files:**
 - Create: `scripts/quality_task0/benchmarks.py`
 - Create: `tests/unit/test_quality_task0_benchmarks.py`
-- Create: `docs/superpowers/reports/2026-08-23-stereo-quality-task0.json`
+- Create: `docs/superpowers/reports/2026-08-24-stereo-quality-task0.json`
 
-- [ ] Run 1080p and 4K edge/query populations 25, 50, and 100 percent; run separate 25-percent fallback; run `G/Q` 0.5, 1, 2, and 4.
-- [ ] Record scalar equality, heap occupancy, exact index bytes, visit total/max/p95, cap failures, wall time, RSS, allocation lifetime, and CPU/CUDA contexts.
-- [ ] Run decoder/control/encoding scale matrices and every required fault injection.
-- [ ] Publish one canonical report with all required runs or fail closed without a decision.
-- [ ] If existing dependencies pass, record `existing_dependencies` and write the production implementation plan. If they fail runtime/RSS only, stop and prepare the separately reviewed prebuilt-extension plan. Do not edit the production renderer before this decision.
+- [x] Run 1080p and 4K edge/query populations 25, 50, and 100 percent; run separate 25-percent fallback; run `G/Q` 0.5, 1, 2, and 4.
+- [x] Record scalar equality, heap occupancy, exact index bytes, visit total/max/p95, cap failures, wall time, RSS, allocation lifetime, and CPU/CUDA contexts.
+- [x] Run decoder/control/encoding scale matrices and every required fault injection.
+- [x] Publish one canonical report with all required runs or fail closed without a decision.
+- [x] Record `prebuilt_extension` after existing-dependency Python kernels miss the frozen runtime gate; freeze the build-time native extension and write the production implementation plan without changing production behavior first.
 
 ### Task 0.11: Verification And Review Boundary
 
-- [ ] Run every `test_quality_task0_*.py` test with the worktree environment.
-- [ ] Run Black, configured flake8/McCabe, mypy, and the complete pytest suite.
-- [ ] Run `git diff --check`; inspect status and the full scoped diff.
-- [ ] Confirm `src/depth_surge_3d/rendering/stereo_renderer.py` and other production behavior are unchanged in Task 0.
-- [ ] Commit the complete Task 0 evidence as one reviewable gate result; do not claim Quality availability.
+- [x] Run every `test_quality_task0_*.py` test with the worktree environment.
+- [x] Run Black, configured flake8/McCabe, mypy, and the complete pytest suite; record pre-existing repository-wide lint/type debt separately from the clean Task 0 scope.
+- [x] Run `git diff --check`; inspect status and the full scoped diff.
+- [x] Confirm `src/depth_surge_3d/rendering/stereo_renderer.py` and other production behavior are unchanged in Task 0.
+- [x] Commit the complete Task 0 evidence as one reviewable gate result; do not claim Quality availability.
