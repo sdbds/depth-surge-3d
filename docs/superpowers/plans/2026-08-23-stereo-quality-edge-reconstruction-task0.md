@@ -111,10 +111,10 @@
 - Create: `tests/unit/test_quality_task0_content_reader.py`
 - Create: `tests/unit/test_quality_task0_metric_npz.py`
 
-- [ ] Freeze golden payloads for the owned writer, current `_atomic_save_npz()`, and supported Python/NumPy cells.
-- [ ] Add strict ZIP/NPY parser tests for all three allowlisted layouts and malformed flags, descriptors, offsets, CRC, dtypes, shapes, compression, and trailing data.
-- [ ] Implement one-frame `5*G_i` metric ownership, fixed buffers, streaming hashes, and release-before-next-frame audit.
-- [ ] Implement the fixed writer with fault injection at compression, seek, patch, sync, replace, and disk-full boundaries.
+- [x] Freeze golden payloads for the owned writer, current `_atomic_save_npz()`, and supported Python/NumPy cells.
+- [x] Add strict ZIP/NPY parser tests for all three allowlisted layouts and malformed flags, descriptors, offsets, CRC, dtypes, shapes, compression, and trailing data.
+- [x] Implement one-frame `5*G_i` metric ownership, fixed buffers, streaming hashes, and release-before-next-frame audit.
+- [x] Implement the fixed writer with fault injection at compression, seek, patch, sync, replace, and disk-full boundaries.
 - [ ] Prove no complete second array/member exists concurrently and all audit/writer RSS formulas hold.
 
 ### Task 0.8: Replayable Stereo Control Plane
