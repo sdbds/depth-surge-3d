@@ -97,11 +97,11 @@
 - Create: `scripts/quality_task0/quality_geometry.py`
 - Create: `tests/unit/test_quality_task0_geometry.py`
 
-- [ ] Add independent exact one-sided interpolation tests where a one-ULP primitive difference changes a projected fine lane.
-- [ ] Implement the ten-step relative and metric prototype order with allocation/lifetime event tracing.
-- [ ] Prove exact Fast bilinear equality outside the edge band and final-geodesic-region selection inside it.
-- [ ] Prove region scratch ends before the retained-zero index begins and that derived relative/metric fields follow the frozen operation order.
-- [ ] Compare metric clamp statistics and relative eye-offset arithmetic against existing Fast scalar oracles at `G/Q` ratios 0.5, 1, 2, and 4.
+- [x] Add independent exact one-sided interpolation tests where a one-ULP primitive difference changes a projected fine lane.
+- [x] Implement the ten-step relative and metric prototype order with allocation/lifetime event tracing.
+- [x] Prove exact Fast bilinear equality outside the edge band and final-geodesic-region selection inside it.
+- [x] Prove region scratch ends before the retained-zero index begins and that derived relative/metric fields follow the frozen operation order.
+- [x] Compare metric clamp statistics and relative eye-offset arithmetic against existing Fast scalar oracles at `G/Q` ratios 0.5, 1, 2, and 4.
 
 ### Task 0.7: Native Content Reader And Owned NPZ Writer
 

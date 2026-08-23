@@ -218,13 +218,13 @@ def build_four_connected_edge_band(
     boundary = np.zeros((height, width), dtype=np.bool_)
     for y in range(height):
         for x in range(width):
-            region = mapped_regions[y, x]
+            region = np.uint32(mapped_regions[y, x])
             if not _is_region(region):
                 continue
-            if x + 1 < width and _different_regions(region, mapped_regions[y, x + 1]):
+            if x + 1 < width and _different_regions(region, np.uint32(mapped_regions[y, x + 1])):
                 boundary[y, x] = True
                 boundary[y, x + 1] = True
-            if y + 1 < height and _different_regions(region, mapped_regions[y + 1, x]):
+            if y + 1 < height and _different_regions(region, np.uint32(mapped_regions[y + 1, x])):
                 boundary[y, x] = True
                 boundary[y + 1, x] = True
     for _ in range(dilation_radius):
