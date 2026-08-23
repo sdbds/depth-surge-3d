@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import math
+from collections import Counter
 from dataclasses import dataclass
 from typing import Literal
 
@@ -21,6 +22,8 @@ from ..stereo_renderer import (
 )
 from .geometry import (
     QualityGeometryResult,
+    build_geometry_eye_offsets_into,
+    build_metric_quality_geometry,
     build_relative_eye_offsets_into,
     build_relative_quality_geometry,
 )
@@ -34,7 +37,12 @@ from .repair_records import (
     QualityRepairBudgetError,
     validate_record_coverage,
 )
-from .types import CompactStereoRenderResult
+from .types import (
+    CompactStereoRenderResult,
+    HoleRunDiagnostics,
+    MetricStereoPrimitiveInput,
+    QualityStereoControls,
+)
 from .visibility import QualitySplatBand, quality_splat_band
 
 
@@ -50,6 +58,7 @@ class _CompactEyeResult:
     coverage_count: np.ndarray
     repair_bits: np.ndarray
     plan: QualityRepairPlan | None
+    hole_runs: HoleRunDiagnostics | None = None
 
 
 @dataclass
@@ -229,6 +238,8 @@ def _render_none_eye_once(
     height, width = source.shape[:2]
     output = np.empty_like(source)
     coverage = np.empty((height, width), dtype=np.uint8)
+    lane_histogram: Counter[int] = Counter()
+    span_histogram: Counter[int] = Counter()
     for start_row in range(0, height, band_height):
         end_row = min(height, start_row + band_height)
         band = _quality_splat(renderer, source, geometry, offsets, start_row, end_row)
@@ -237,11 +248,37 @@ def _render_none_eye_once(
             width,
             HORIZONTAL_SUBPIXELS,
         )
-        coverage[start_row:end_row] = lane_valid.sum(dim=2).detach().cpu().numpy().astype(np.uint8)
+        lane_valid_host = np.ascontiguousarray(lane_valid.detach().cpu().numpy())
+        coverage[start_row:end_row] = lane_valid_host.sum(axis=2).astype(np.uint8)
+        for row in lane_valid_host:
+            missing = np.flatnonzero(~row.reshape(-1))
+            cursor = 0
+            while cursor < missing.size:
+                start = int(missing[cursor])
+                end_cursor = cursor + 1
+                while (
+                    end_cursor < missing.size
+                    and int(missing[end_cursor]) == int(missing[end_cursor - 1]) + 1
+                ):
+                    end_cursor += 1
+                end = int(missing[end_cursor - 1])
+                lane_histogram[end - start + 1] += 1
+                span_histogram[end // HORIZONTAL_SUBPIXELS - start // HORIZONTAL_SUBPIXELS + 1] += 1
+                cursor = end_cursor
         downsampled = _downsample_subpixel_band(band.splat.colour)
         output[start_row:end_row] = _convert_image_band(downsampled, source.dtype)
-        del band, lane_valid, downsampled
-    return _CompactEyeResult(output, coverage, _none_repair_bits(coverage), None)
+        del band, lane_valid, lane_valid_host, downsampled
+    hole_runs = HoleRunDiagnostics(
+        lane_count_histogram=tuple(sorted(lane_histogram.items())),
+        touched_pixel_span_histogram=tuple(sorted(span_histogram.items())),
+    )
+    return _CompactEyeResult(
+        output,
+        coverage,
+        _none_repair_bits(coverage),
+        None,
+        hole_runs,
+    )
 
 
 def _background_repair_bits(
@@ -405,6 +442,93 @@ def _build_eye_offsets(
     return output
 
 
+def _build_metric_eye_offsets(
+    geometry: QualityGeometryResult,
+    eye: Literal["left", "right"],
+) -> np.ndarray:
+    output = np.empty(geometry.near_score.shape, dtype=np.int32)
+    build_geometry_eye_offsets_into(
+        geometry.total_disparity_fraction,
+        eye=eye,
+        output_int32=output,
+        row_float64_scratch=np.empty(geometry.near_score.shape[1], dtype=np.float64),
+    )
+    return output
+
+
+def _quality_limits(
+    geometry: QualityGeometryResult,
+    *,
+    height: int,
+    occlusion_fill: Literal["none", "background"],
+    occlusion_fill_max_px: int,
+) -> dict[str, dict[str, int | float]] | None:
+    if occlusion_fill != "background":
+        return None
+    safe_limit = max(
+        1,
+        math.floor(occlusion_fill_max_px * height / 1080.0 + 0.5),
+    )
+    local_limit = min(safe_limit, geometry.predicted_gap_px)
+    return {
+        eye: {
+            "max_neighbour_abs_q_jump_px": float(
+                geometry.max_neighbour_abs_q_jump_px
+            ),
+            "predicted_gap_px": int(geometry.predicted_gap_px),
+            "local_limit_px": int(local_limit),
+        }
+        for eye in ("left", "right")
+    }
+
+
+def _render_metric_quality_eyes(
+    *,
+    renderer: StereoRenderer,
+    source: np.ndarray,
+    geometry: QualityGeometryResult,
+    controls: QualityStereoControls,
+) -> tuple[_CompactEyeResult, _CompactEyeResult]:
+    height, width = source.shape[:2]
+    initial_height = calculate_band_height(
+        width,
+        height,
+        renderer.temporary_budget_bytes,
+    )
+    band_state = _FrameBandState(
+        initial_height=initial_height,
+        retry_height=max(1, initial_height // 2),
+        current_height=initial_height,
+    )
+    budgets = QualityRepairBudgets()
+    eyes: list[_CompactEyeResult] = []
+    for eye in ("left", "right"):
+        offsets = _build_metric_eye_offsets(geometry, eye)
+        if controls.occlusion_fill == "none":
+            result = _retry_after_oom(
+                renderer,
+                band_state,
+                _render_none_eye_once,
+                renderer=renderer,
+                source=source,
+                geometry=geometry,
+                offsets=offsets,
+            )
+        else:
+            result = _render_background_eye(
+                renderer=renderer,
+                source=source,
+                geometry=geometry,
+                offsets=offsets,
+                controls_limit_px=controls.occlusion_fill_max_px,
+                budgets=budgets,
+                band_state=band_state,
+            )
+        eyes.append(result)
+        del offsets
+    return eyes[0], eyes[1]
+
+
 def render_relative_quality_compact(
     *,
     renderer: StereoRenderer,
@@ -468,6 +592,25 @@ def render_relative_quality_compact(
         eyes.append(result)
         del offsets
     left, right = eyes
+    safe_limit = max(
+        1,
+        math.floor(settings.occlusion_fill_max_px * height / 1080.0 + 0.5),
+    )
+    local_limit = min(safe_limit, geometry.predicted_gap_px)
+    quality_limits = (
+        {
+            eye: {
+                "max_neighbour_abs_q_jump_px": float(
+                    geometry.max_neighbour_abs_q_jump_px
+                ),
+                "predicted_gap_px": int(geometry.predicted_gap_px),
+                "local_limit_px": int(local_limit),
+            }
+            for eye in ("left", "right")
+        }
+        if settings.occlusion_fill == "background"
+        else None
+    )
     return CompactStereoRenderResult(
         left_image=left.image,
         right_image=right.image,
@@ -477,6 +620,84 @@ def render_relative_quality_compact(
         right_repair_bits=right.repair_bits,
         left_plan=left.plan,
         right_plan=right.plan,
+        geometry_nearest={
+            "indexed_sample_count": int(canonical_values.size),
+            "query_count": int(geometry.geometry_query_count),
+            "visited_nodes_total": int(geometry.geometry_visited_nodes_total),
+            "visited_nodes_max": int(geometry.geometry_visited_nodes_max),
+        },
+        quality_limits=quality_limits,
+        left_hole_runs=left.hole_runs,
+        right_hole_runs=right.hole_runs,
+    )
+
+
+def render_metric_primitives_compact(
+    *,
+    renderer: StereoRenderer,
+    frame: np.ndarray,
+    primitives: MetricStereoPrimitiveInput,
+    controls: QualityStereoControls,
+) -> CompactStereoRenderResult:
+    """Render native metric primitives after edge-aware Quality resampling."""
+
+    if not isinstance(renderer, StereoRenderer):
+        raise TypeError("renderer must be StereoRenderer")
+    if not isinstance(primitives, MetricStereoPrimitiveInput):
+        raise TypeError("primitives must be MetricStereoPrimitiveInput")
+    if not isinstance(controls, QualityStereoControls):
+        raise TypeError("controls must be QualityStereoControls")
+    source = np.ascontiguousarray(np.asarray(frame))
+    if source.dtype != np.uint8 or source.ndim != 3 or source.shape[2] != 3:
+        raise TypeError("Quality rendering requires uint8 BGR input")
+    metric = primitives.metric
+    for name in ("inverse_depth", "valid", "focal_x_normalized"):
+        if not hasattr(metric, name):
+            raise TypeError("metric primitive is missing native geometry fields")
+    height, width = source.shape[:2]
+    geometry = build_metric_quality_geometry(
+        source,
+        metric.inverse_depth,
+        metric.valid,
+        metric.focal_x_normalized,
+        render_shape=(height, width),
+        virtual_baseline_mm=float(primitives.virtual_baseline_mm),
+        convergence_distance_m=float(primitives.convergence_distance_m),
+        max_disparity_percent=float(primitives.max_disparity_percent),
+        retained_crop_width=primitives.retained_crop_width,
+    )
+    left, right = _render_metric_quality_eyes(
+        renderer=renderer,
+        source=source,
+        geometry=geometry,
+        controls=controls,
+    )
+    if geometry.metric_stats is None:
+        raise RuntimeError("Metric Quality geometry did not produce projection statistics")
+    return CompactStereoRenderResult(
+        left_image=left.image,
+        right_image=right.image,
+        left_coverage_count=left.coverage_count,
+        right_coverage_count=right.coverage_count,
+        left_repair_bits=left.repair_bits,
+        right_repair_bits=right.repair_bits,
+        left_plan=left.plan,
+        right_plan=right.plan,
+        metric_stats=geometry.metric_stats,
+        geometry_nearest={
+            "indexed_sample_count": int(metric.inverse_depth.size),
+            "query_count": int(geometry.geometry_query_count),
+            "visited_nodes_total": int(geometry.geometry_visited_nodes_total),
+            "visited_nodes_max": int(geometry.geometry_visited_nodes_max),
+        },
+        quality_limits=_quality_limits(
+            geometry,
+            height=height,
+            occlusion_fill=controls.occlusion_fill,
+            occlusion_fill_max_px=controls.occlusion_fill_max_px,
+        ),
+        left_hole_runs=left.hole_runs,
+        right_hole_runs=right.hole_runs,
     )
 
 

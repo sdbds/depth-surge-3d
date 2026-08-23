@@ -81,6 +81,23 @@ class MetricStereoPrimitiveInput:
 
 
 @dataclass(frozen=True)
+class HoleRunDiagnostics:
+    """Bounded per-eye histograms collected without retaining fine lanes."""
+
+    lane_count_histogram: tuple[tuple[int, int], ...]
+    touched_pixel_span_histogram: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class FastEyeDiagnostics:
+    """Fine-lane counters attested by the unchanged Fast fill pass."""
+
+    hole_runs: HoleRunDiagnostics
+    local_filled_lane_count: int
+    final_unresolved_lane_count: int
+
+
+@dataclass(frozen=True)
 class CompactStereoRenderResult:
     """RGB plus two one-byte diagnostic planes per eye."""
 
@@ -93,6 +110,12 @@ class CompactStereoRenderResult:
     left_plan: Any | None = None
     right_plan: Any | None = None
     metric_stats: Any | None = None
+    geometry_nearest: dict[str, int] | None = None
+    quality_limits: dict[str, dict[str, int | float]] | None = None
+    left_hole_runs: HoleRunDiagnostics | None = None
+    right_hole_runs: HoleRunDiagnostics | None = None
+    left_fast_diagnostics: FastEyeDiagnostics | None = None
+    right_fast_diagnostics: FastEyeDiagnostics | None = None
 
     def __post_init__(self) -> None:
         shape = self.left_image.shape

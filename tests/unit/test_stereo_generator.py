@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import threading
 from pathlib import Path
@@ -34,6 +35,10 @@ from src.depth_surge_3d.rendering.stereo_renderer import (
     StereoRenderer,
     StereoRenderSettings,
     StereoSplatSettings,
+)
+from src.depth_surge_3d.rendering.quality.types import (
+    MetricStereoPrimitiveInput,
+    RelativeStereoPrimitiveInput,
 )
 
 
@@ -107,6 +112,390 @@ def _settings(**overrides: object) -> dict[str, object]:
     }
     values.update(overrides)
     return values
+
+
+def test_quality_file_pipeline_uses_one_slot_and_publishes_compact_diagnostics(
+    tmp_path: Path,
+) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(
+        tmp_path,
+        count=1,
+        frame_shape=(8, 16),
+        depth_shape=(4, 8),
+    )
+    generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+
+    assert generator.create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(
+            stereo_render_mode="quality",
+            occlusion_fill_max_px=8,
+            stereo_strength=0.0,
+            keep_intermediates=True,
+        ),
+    )
+
+    assert generator.last_pipeline_stats is not None
+    assert generator.last_pipeline_stats.permit_count == 1
+    frame_dir = tmp_path / "04_stereo_diagnostics" / "frames" / "frame_0000"
+    manifest = json.loads((frame_dir / "manifest.json").read_text(encoding="ascii"))
+    assert manifest["render_mode"] == "quality"
+    assert manifest["mask_payloads_enabled"] is True
+    assert (frame_dir / "left_coverage.png").exists()
+    assert (frame_dir / "right_repair.png").exists()
+    rgb_metadata = json.loads(
+        (directories["left_frames"] / "metadata.json").read_text(encoding="ascii")
+    )
+    assert rgb_metadata["schema_version"] == 2
+    assert rgb_metadata["algorithm_version"] == (
+        "torch-horizontal-16x-rgb-geodesic-repair-v8"
+    )
+    diagnostics_metadata = json.loads(
+        (tmp_path / "04_stereo_diagnostics" / "metadata.json").read_text(
+            encoding="ascii"
+        )
+    )
+    assert diagnostics_metadata["status"] == "complete"
+    assert (
+        tmp_path
+        / "04_stereo_diagnostics"
+        / "stereo_coverage_summary.json"
+    ).exists()
+
+
+def test_quality_resume_rebuilds_damaged_aggregates_without_rerendering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(
+        tmp_path,
+        count=2,
+        frame_shape=(6, 12),
+        depth_shape=(3, 6),
+    )
+    settings = _settings(
+        stereo_render_mode="quality",
+        stereo_strength=0.0,
+        keep_intermediates=False,
+    )
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_files(frame_files, depth_files, directories, settings)
+    left_hashes = [
+        hashlib.sha256((directories["left_frames"] / path.name).read_bytes()).hexdigest()
+        for path in frame_files
+    ]
+    summary_path = tmp_path / "04_stereo_diagnostics" / "stereo_coverage_summary.json"
+    summary_path.unlink()
+
+    def forbidden_render(**_kwargs):
+        raise AssertionError("aggregate repair must not rerender RGB")
+
+    monkeypatch.setattr(
+        stereo_generator,
+        "render_relative_quality_compact",
+        forbidden_render,
+    )
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_files(frame_files, depth_files, directories, settings)
+
+    assert summary_path.exists()
+    assert left_hashes == [
+        hashlib.sha256((directories["left_frames"] / path.name).read_bytes()).hexdigest()
+        for path in frame_files
+    ]
+
+
+def test_quality_resume_rerenders_only_the_invalid_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(
+        tmp_path,
+        count=2,
+        frame_shape=(6, 12),
+        depth_shape=(3, 6),
+    )
+    settings = _settings(
+        stereo_render_mode="quality",
+        stereo_strength=0.0,
+        keep_intermediates=False,
+    )
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_files(frame_files, depth_files, directories, settings)
+    target = directories["left_frames"] / frame_files[1].name
+    target.write_bytes(b"damaged")
+    original = stereo_generator.render_relative_quality_compact
+    rendered: list[int] = []
+
+    def record_render(**kwargs):
+        rendered.append(int(kwargs["frame"][0, 0, 0]))
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        stereo_generator,
+        "render_relative_quality_compact",
+        record_render,
+    )
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_files(frame_files, depth_files, directories, settings)
+
+    assert rendered == [21]
+
+
+def test_quality_mask_true_to_false_migrates_manifests_without_rerendering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(
+        tmp_path,
+        count=2,
+        frame_shape=(6, 12),
+        depth_shape=(3, 6),
+    )
+    base = _settings(
+        stereo_render_mode="quality",
+        stereo_strength=0.0,
+        keep_intermediates=True,
+    )
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_files(frame_files, depth_files, directories, base)
+
+    def forbidden_render(**_kwargs):
+        raise AssertionError("mask removal must not rerender RGB")
+
+    monkeypatch.setattr(
+        stereo_generator,
+        "render_relative_quality_compact",
+        forbidden_render,
+    )
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        {**base, "keep_intermediates": False},
+    )
+
+    for frame_file in frame_files:
+        frame_dir = (
+            tmp_path
+            / "04_stereo_diagnostics"
+            / "frames"
+            / frame_file.stem
+        )
+        manifest = json.loads((frame_dir / "manifest.json").read_text(encoding="ascii"))
+        assert manifest["mask_payloads_enabled"] is False
+        assert manifest["payloads"]["left_coverage"] is None
+        assert not (frame_dir / "left_coverage.png").exists()
+
+
+def test_quality_mask_false_to_true_rerenders_every_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(
+        tmp_path,
+        count=2,
+        frame_shape=(6, 12),
+        depth_shape=(3, 6),
+    )
+    base = _settings(
+        stereo_render_mode="quality",
+        stereo_strength=0.0,
+        keep_intermediates=False,
+    )
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_files(frame_files, depth_files, directories, base)
+    original = stereo_generator.render_relative_quality_compact
+    rendered: list[int] = []
+
+    def record_render(**kwargs):
+        rendered.append(int(kwargs["frame"][0, 0, 0]))
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        stereo_generator,
+        "render_relative_quality_compact",
+        record_render,
+    )
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        {**base, "keep_intermediates": True},
+    )
+
+    assert rendered == [20, 21]
+
+
+def test_new_fast_render_keeps_rgb_bytes_and_publishes_bounded_diagnostics(
+    tmp_path: Path,
+) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(
+        tmp_path,
+        count=1,
+        frame_shape=(6, 12),
+        depth_shape=(3, 6),
+    )
+    frame = cv2.imread(str(frame_files[0]), cv2.IMREAD_COLOR)
+    encoded = cv2.imread(str(depth_files[0]), cv2.IMREAD_UNCHANGED)
+    canonical = encoded.astype(np.float32) / np.float32(65535.0)
+    renderer = StereoRenderer(device="cpu")
+    expected = renderer.render(
+        frame,
+        canonical,
+        StereoRenderSettings(
+            stereo_strength=2.0,
+            convergence=0.5,
+            occlusion_fill="background",
+        ),
+    )
+
+    assert StereoPairGenerator(renderer=renderer).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(stereo_render_mode="fast", keep_intermediates=True),
+    )
+
+    assert np.array_equal(
+        cv2.imread(str(directories["left_frames"] / frame_files[0].name)),
+        expected.left_image,
+    )
+    frame_dir = tmp_path / "04_stereo_diagnostics" / "frames" / "frame_0000"
+    manifest = json.loads((frame_dir / "manifest.json").read_text(encoding="ascii"))
+    stats = json.loads((frame_dir / "stats.json").read_text(encoding="ascii"))
+    assert manifest["render_mode"] == "fast"
+    assert stats["geometry_nearest"] is None
+    assert stats["eyes"]["left"]["quality_budgets"] is None
+
+
+def test_relative_decoder_retains_owned_uint16_primitive_until_render_thread(
+    tmp_path: Path,
+) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(
+        tmp_path,
+        count=1,
+        frame_shape=(8, 16),
+        depth_shape=(4, 8),
+    )
+    work = stereo_generator._FileWorkItem(
+        index=0,
+        frame_path=frame_files[0],
+        depth_path=depth_files[0],
+        frame_name=frame_files[0].stem,
+        left_path=directories["left_frames"] / frame_files[0].name,
+        right_path=directories["right_frames"] / frame_files[0].name,
+    )
+
+    frame, primitive, stats = stereo_generator._decode_relative_work_item(
+        work,
+        encoding_scale=65535.0,
+        render_shape=(8, 16),
+    )
+
+    assert frame.dtype == np.uint8
+    assert isinstance(primitive, RelativeStereoPrimitiveInput)
+    assert primitive.encoded_canonical.dtype == np.uint16
+    assert primitive.encoded_canonical.flags.owndata
+    assert stats is None
+
+
+def test_metric_decoder_returns_native_primitive_without_render_geometry(
+    tmp_path: Path,
+) -> None:
+    frame_files, metric_files, directories, resolved = _make_metric_inputs(tmp_path)
+    generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+    store, _metadata = generator._get_metric_store(metric_files, frame_files)
+    work = stereo_generator._FileWorkItem(
+        index=0,
+        frame_path=frame_files[0],
+        depth_path=metric_files[0],
+        frame_name=frame_files[0].stem,
+        left_path=directories["left_frames"] / frame_files[0].name,
+        right_path=directories["right_frames"] / frame_files[0].name,
+    )
+
+    frame, primitive, stats = stereo_generator._decode_metric_work_item(
+        work,
+        store=store,
+        render_shape=(4, 5),
+        virtual_baseline_mm=63.0,
+        convergence_distance_m=resolved,
+        max_disparity_percent=2.0,
+        retained_crop_width=8,
+    )
+
+    assert frame.dtype == np.uint8
+    assert isinstance(primitive, MetricStereoPrimitiveInput)
+    assert isinstance(primitive.metric, MetricGeometryFrame)
+    assert stats is None
+
+
+def test_stage_plans_are_four_discriminated_variants(tmp_path: Path) -> None:
+    relative_frames, relative_depths, _ = _make_file_inputs(tmp_path / "relative", count=1)
+    metric_frames, metric_depths, _, _ = _make_metric_inputs(
+        tmp_path / "metric",
+        inverse_values=[1.0],
+    )
+    generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+
+    fast_relative = generator._build_stage_plan(
+        relative_depths,
+        relative_frames,
+        (8, 8),
+        _settings(stereo_render_mode="fast"),
+        "background",
+    )
+    quality_relative = generator._build_stage_plan(
+        relative_depths,
+        relative_frames,
+        (8, 8),
+        _settings(stereo_render_mode="quality"),
+        "background",
+    )
+    fast_metric = generator._build_stage_plan(
+        metric_depths,
+        metric_frames,
+        (4, 5),
+        _settings(stereo_geometry_mode="metric_camera", stereo_render_mode="fast"),
+        "background",
+    )
+    quality_metric = generator._build_stage_plan(
+        metric_depths,
+        metric_frames,
+        (4, 5),
+        _settings(stereo_geometry_mode="metric_camera", stereo_render_mode="quality"),
+        "background",
+    )
+
+    assert [
+        fast_relative.kind,
+        quality_relative.kind,
+        fast_metric.kind,
+        quality_metric.kind,
+    ] == ["fast_relative", "quality_relative", "fast_metric", "quality_metric"]
+    assert isinstance(quality_metric.settings, stereo_generator.QualityStereoControls)
+
+
+def test_impossible_discriminated_plan_rejects_mismatched_settings() -> None:
+    with pytest.raises(TypeError, match="StereoRenderSettings"):
+        stereo_generator._FastRelativePlan(  # type: ignore[arg-type]
+            source_metadata={},
+            decode=lambda work: None,
+            settings=StereoSplatSettings(max_eye_shift_fraction=0.01),
+        )
 
 
 class _FakeRenderer:
@@ -844,6 +1233,51 @@ def test_metric_generator_uses_resolved_auto_convergence_and_common_renderer(
     assert 'convergence"' not in json.dumps(metadata)
     assert "per_eye_width" not in json.dumps(metadata)
     assert "vr_output_width" not in json.dumps(metadata)
+
+
+def test_metric_quality_pipeline_uses_native_renderer_and_persists_stats(
+    tmp_path: Path,
+) -> None:
+    frame_files, metric_files, directories, _ = _make_metric_inputs(
+        tmp_path,
+        inverse_values=[1.0],
+    )
+    generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+
+    assert generator.create_stereo_pairs_from_files(
+        frame_files,
+        metric_files,
+        directories,
+        _settings(
+            stereo_geometry_mode="metric_camera",
+            stereo_render_mode="quality",
+            metric_convergence_distance="auto",
+            virtual_baseline_mm=63.0,
+            max_disparity_percent=2.0,
+            crop_factor=0.75,
+            occlusion_fill="none",
+            occlusion_fill_max_px=8,
+            keep_intermediates=True,
+        ),
+    )
+
+    assert generator.last_pipeline_stats is not None
+    assert generator.last_pipeline_stats.permit_count == 1
+    frame_manifest = (
+        tmp_path
+        / "04_stereo_diagnostics"
+        / "frames"
+        / "frame_0000"
+        / "manifest.json"
+    )
+    manifest = json.loads(frame_manifest.read_text(encoding="ascii"))
+    assert manifest["geometry_mode"] == "metric"
+    stats_path = frame_manifest.with_name("stats.json")
+    assert json.loads(stats_path.read_text(encoding="ascii"))[
+        "metric_projection"
+    ]["valid_pixel_count"] > 0
+    assert not (directories["left_frames"] / "clamp_stats").exists()
+    assert (directories["left_frames"] / "clamp_summary.json").exists()
 
 
 def test_mode_specific_fingerprints_ignore_inactive_and_final_width_settings(

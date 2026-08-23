@@ -31,6 +31,7 @@ class QualityRepairPlan:
     local_evaluated_slot_count: int
     local_physical_sample_read_count: int
     local_filled_run_count: int
+    local_budget_skipped_run_count: int
     fallback_indexed_donor_count: int
     fallback_index_bytes: int
     fallback_query_count: int
@@ -264,6 +265,7 @@ def plan_quality_repairs(
 ) -> QualityRepairPlan:
     """Plan local, exemplar, and exact same-region fallback repair."""
 
+    skipped_before = budgets.local_budget_skipped_run_count
     local: LocalStripPlanResult = plan_local_strips(
         records,
         analysis,
@@ -283,6 +285,9 @@ def plan_quality_repairs(
             local_evaluated_slot_count=local.evaluated_slot_count,
             local_physical_sample_read_count=local.physical_sample_read_count,
             local_filled_run_count=local.local_filled_run_count,
+            local_budget_skipped_run_count=(
+                budgets.local_budget_skipped_run_count - skipped_before
+            ),
             fallback_indexed_donor_count=0,
             fallback_index_bytes=0,
             fallback_query_count=0,
@@ -349,6 +354,9 @@ def plan_quality_repairs(
         local_evaluated_slot_count=local.evaluated_slot_count,
         local_physical_sample_read_count=local.physical_sample_read_count,
         local_filled_run_count=local.local_filled_run_count,
+        local_budget_skipped_run_count=(
+            budgets.local_budget_skipped_run_count - skipped_before
+        ),
         fallback_indexed_donor_count=provisional.indexed_donor_count,
         fallback_index_bytes=provisional.index_bytes,
         fallback_query_count=provisional.query_count,

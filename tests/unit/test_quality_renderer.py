@@ -167,3 +167,42 @@ def test_quality_controls_reject_boolean_limit() -> None:
 
     with pytest.raises(ValueError, match="non-boolean integer"):
         types.QualityStereoControls("background", True)
+
+
+def test_metric_quality_renders_native_primitives_and_returns_final_stats() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    types = importlib.import_module("src.depth_surge_3d.rendering.quality.types")
+    metric_geometry = importlib.import_module(
+        "src.depth_surge_3d.processing.frames.metric_geometry"
+    )
+    frame = np.arange(6 * 11 * 3, dtype=np.uint8).reshape(6, 11, 3)
+    metric = metric_geometry.MetricGeometryFrame(
+        np.array([[1.0, 0.8, 0.0], [0.7, 0.5, 0.3]], dtype=np.float32),
+        np.array([[True, True, False], [True, True, True]], dtype=np.bool_),
+        np.float32(0.5),
+    )
+    primitives = types.MetricStereoPrimitiveInput(
+        metric=metric,
+        virtual_baseline_mm=np.float64(63.0),
+        convergence_distance_m=np.float64(2.0),
+        max_disparity_percent=np.float64(2.0),
+        retained_crop_width=11,
+    )
+
+    result = quality.render_metric_primitives_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        primitives=primitives,
+        controls=types.QualityStereoControls("none", 8),
+    )
+
+    assert result.left_image.shape == frame.shape
+    assert result.right_image.shape == frame.shape
+    assert result.metric_stats is not None
+    assert result.metric_stats.valid_pixel_count > 0
+    assert result.geometry_nearest == {
+        "indexed_sample_count": 6,
+        "query_count": result.geometry_nearest["query_count"],
+        "visited_nodes_total": result.geometry_nearest["visited_nodes_total"],
+        "visited_nodes_max": result.geometry_nearest["visited_nodes_max"],
+    }

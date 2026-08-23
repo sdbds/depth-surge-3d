@@ -71,6 +71,7 @@ def test_quality_repair_plan_covers_every_invalid_lane_once() -> None:
     assert plan.component_count == 1
     assert plan.record_component_ids.tolist() == [0]
     assert budgets.local_budget_skipped_run_count == 1
+    assert plan.local_budget_skipped_run_count == 1
     assert plan.fallback_query_count == 1
 
 

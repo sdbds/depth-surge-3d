@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import math
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from numbers import Integral
 from typing import Literal
@@ -206,11 +207,11 @@ def _select_fill_indexes(
     return torch.where(choose_left, left_index, right_index), has_candidate
 
 
-def _fill_background_band(
+def _fill_background_band_state(
     splat: SubpixelSplatResult,
     *,
     max_gap_samples: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fill bounded horizontal holes from one selected discrete boundary."""
 
     image = splat.colour
@@ -240,8 +241,23 @@ def _fill_background_band(
     candidate_colour = _gather_columns(image, selected)
     del selected
     filled = torch.where(fillable.unsqueeze(-1), candidate_colour, image)
-    del candidate_colour, fillable
+    del candidate_colour
     filled.masked_fill_(hole_mask.unsqueeze(-1), 0.0)
+    return filled, hole_mask, fillable
+
+
+def _fill_background_band(
+    splat: SubpixelSplatResult,
+    *,
+    max_gap_samples: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fill bounded horizontal holes with byte-compatible legacy behavior."""
+
+    filled, hole_mask, fillable = _fill_background_band_state(
+        splat,
+        max_gap_samples=max_gap_samples,
+    )
+    del fillable
     return filled, hole_mask
 
 
@@ -286,6 +302,30 @@ def _convert_image_band(image: torch.Tensor, dtype: np.dtype) -> np.ndarray:
     else:
         raise TypeError(f"Unsupported frame dtype: {dtype}")
     return values.astype(dtype, copy=False)
+
+
+def _update_hole_histograms(
+    lane_valid: np.ndarray,
+    lane_histogram: Counter[int],
+    span_histogram: Counter[int],
+) -> None:
+    for row in lane_valid:
+        missing = np.flatnonzero(~row.reshape(-1))
+        cursor = 0
+        while cursor < missing.size:
+            start = int(missing[cursor])
+            end_cursor = cursor + 1
+            while (
+                end_cursor < missing.size
+                and int(missing[end_cursor]) == int(missing[end_cursor - 1]) + 1
+            ):
+                end_cursor += 1
+            end = int(missing[end_cursor - 1])
+            lane_histogram[end - start + 1] += 1
+            span_histogram[
+                end // HORIZONTAL_SUBPIXELS - start // HORIZONTAL_SUBPIXELS + 1
+            ] += 1
+            cursor = end_cursor
 
 
 class StereoRenderer:
@@ -603,6 +643,269 @@ class StereoRenderer:
                 )
 
         return output, valid_output, hole_output
+
+    def render_relative_fast_compact(
+        self,
+        frame: np.ndarray,
+        canonical: np.ndarray,
+        settings: StereoRenderSettings,
+    ):
+        """Render legacy RGB while retaining only compact diagnostic planes."""
+
+        source = np.asarray(frame)
+        canonical_values = np.asarray(canonical, dtype=np.float32)
+        self._validate_inputs(source, canonical_values, settings)
+        if settings.stereo_render_mode != "fast":
+            raise ValueError("Fast compact rendering requires fast settings")
+        source = np.ascontiguousarray(source)
+        height, width = source.shape[:2]
+        geometry = build_relative_geometry(
+            canonical_values,
+            (height, width),
+            stereo_strength=settings.stereo_strength,
+            convergence=settings.convergence,
+        )
+        legacy_near_score = torch.from_numpy(
+            np.array(geometry.near_score, copy=True, order="C")
+        )
+        eye_offsets = calculate_eye_sample_offsets(legacy_near_score, settings)
+        return self._render_fast_compact_core(
+            source,
+            geometry,
+            eye_offsets,
+            StereoSplatSettings(
+                max_eye_shift_fraction=settings.stereo_strength / 200.0,
+                occlusion_fill=settings.occlusion_fill,
+            ),
+        )
+
+    def render_geometry_fast_compact(
+        self,
+        frame: np.ndarray,
+        geometry: StereoGeometryFrame,
+        settings: StereoSplatSettings,
+        *,
+        metric_stats=None,
+    ):
+        """Render common Fast geometry without public boolean-mask allocations."""
+
+        source = np.asarray(frame)
+        self._validate_geometry_inputs(source, geometry, settings)
+        source = np.ascontiguousarray(source)
+        eye_offsets = calculate_geometry_eye_sample_offsets(
+            geometry.total_disparity_fraction
+        )
+        return self._render_fast_compact_core(
+            source,
+            geometry,
+            eye_offsets,
+            settings,
+            metric_stats=metric_stats,
+        )
+
+    def _render_fast_compact_core(
+        self,
+        source: np.ndarray,
+        geometry: StereoGeometryFrame,
+        eye_offsets: tuple[np.ndarray, np.ndarray],
+        settings: StereoSplatSettings,
+        *,
+        metric_stats=None,
+    ):
+        height, width = source.shape[:2]
+        first_band_height = calculate_band_height(
+            width,
+            height,
+            self.temporary_budget_bytes,
+        )
+        try:
+            return self._render_fast_compact_with_band_height(
+                source,
+                geometry,
+                eye_offsets,
+                settings,
+                first_band_height,
+                metric_stats=metric_stats,
+            )
+        except torch.cuda.OutOfMemoryError:
+            self._release_after_oom()
+            retry_band_height = max(1, first_band_height // 2)
+            try:
+                return self._render_fast_compact_with_band_height(
+                    source,
+                    geometry,
+                    eye_offsets,
+                    settings,
+                    retry_band_height,
+                    metric_stats=metric_stats,
+                )
+            except torch.cuda.OutOfMemoryError as error:
+                self._release_after_oom()
+                raise RuntimeError(
+                    "CUDA stereo rendering ran out of memory for frame "
+                    f"{width}x{height}; attempted band heights "
+                    f"{first_band_height} and {retry_band_height}"
+                ) from error
+
+    def _render_fast_compact_with_band_height(
+        self,
+        source: np.ndarray,
+        geometry: StereoGeometryFrame,
+        eye_offsets: tuple[np.ndarray, np.ndarray],
+        settings: StereoSplatSettings,
+        band_height: int,
+        *,
+        metric_stats=None,
+    ):
+        from .quality.types import CompactStereoRenderResult
+
+        left = self._render_fast_eye_compact(
+            source,
+            geometry,
+            eye_offsets[0],
+            settings,
+            band_height,
+        )
+        right = self._render_fast_eye_compact(
+            source,
+            geometry,
+            eye_offsets[1],
+            settings,
+            band_height,
+        )
+        return CompactStereoRenderResult(
+            left_image=left[0],
+            right_image=right[0],
+            left_coverage_count=left[1],
+            right_coverage_count=right[1],
+            left_repair_bits=left[2],
+            right_repair_bits=right[2],
+            metric_stats=metric_stats,
+            left_hole_runs=left[3].hole_runs,
+            right_hole_runs=right[3].hole_runs,
+            left_fast_diagnostics=left[3],
+            right_fast_diagnostics=right[3],
+        )
+
+    def _render_fast_eye_compact(
+        self,
+        source: np.ndarray,
+        geometry: StereoGeometryFrame,
+        sample_offsets: np.ndarray,
+        settings: StereoSplatSettings,
+        band_height: int,
+    ):
+        from .quality.types import FastEyeDiagnostics, HoleRunDiagnostics
+
+        height, width = source.shape[:2]
+        output = np.empty_like(source)
+        coverage_output = np.empty((height, width), dtype=np.uint8)
+        repair_output = np.zeros((height, width), dtype=np.uint8)
+        lane_histogram: Counter[int] = Counter()
+        span_histogram: Counter[int] = Counter()
+        local_filled_lane_count = 0
+        final_unresolved_lane_count = 0
+        max_gap_width = math.ceil(width * settings.max_eye_shift_fraction) + 2
+        max_gap_samples = HORIZONTAL_SUBPIXELS * max_gap_width
+
+        with torch.inference_mode():
+            for start_row in range(0, height, band_height):
+                end_row = min(height, start_row + band_height)
+                source_band = torch.from_numpy(
+                    np.ascontiguousarray(source[start_row:end_row])
+                ).to(self.device)
+                near_score_band = torch.from_numpy(
+                    np.array(
+                        geometry.near_score[start_row:end_row],
+                        copy=True,
+                        order="C",
+                    )
+                ).to(self.device)
+                source_valid_band = torch.from_numpy(
+                    np.array(
+                        geometry.source_valid[start_row:end_row],
+                        copy=True,
+                        order="C",
+                    )
+                ).to(self.device)
+                offset_band = self._transfer_offset_band(
+                    sample_offsets[start_row:end_row]
+                )
+                splat = forward_splat_band(
+                    source_band,
+                    near_score_band,
+                    offset_band,
+                    source_index_offset=start_row * width,
+                    source_valid=source_valid_band,
+                )
+                if settings.occlusion_fill == "background":
+                    rendered, hole_mask, fillable = _fill_background_band_state(
+                        splat,
+                        max_gap_samples=max_gap_samples,
+                    )
+                else:
+                    rendered = splat.colour
+                    hole_mask = ~splat.valid
+                    fillable = torch.zeros_like(splat.valid)
+                if not torch.isfinite(rendered).all():
+                    raise ValueError("Rendered image contains non-finite values")
+                row_count = end_row - start_row
+                prefill = np.ascontiguousarray(
+                    splat.valid.detach().cpu().numpy()
+                ).reshape(row_count, width, HORIZONTAL_SUBPIXELS)
+                filled = np.ascontiguousarray(
+                    fillable.detach().cpu().numpy()
+                ).reshape(row_count, width, HORIZONTAL_SUBPIXELS)
+                unresolved = np.ascontiguousarray(
+                    hole_mask.detach().cpu().numpy()
+                ).reshape(row_count, width, HORIZONTAL_SUBPIXELS)
+                coverage = np.sum(prefill, axis=2, dtype=np.uint16).astype(np.uint8)
+                coverage_output[start_row:end_row] = coverage
+                repair = repair_output[start_row:end_row]
+                repair[(coverage > 0) & (coverage < HORIZONTAL_SUBPIXELS)] |= np.uint8(
+                    0x01
+                )
+                repair[coverage == 0] |= np.uint8(0x02)
+                repair[np.any(filled, axis=2)] |= np.uint8(0x04)
+                unresolved_pixels = np.any(unresolved, axis=2)
+                repair[unresolved_pixels] |= np.uint8(0x40)
+                if settings.occlusion_fill == "background":
+                    repair[unresolved_pixels] |= np.uint8(0x08)
+                local_filled_lane_count += int(np.count_nonzero(filled))
+                final_unresolved_lane_count += int(np.count_nonzero(unresolved))
+                _update_hole_histograms(prefill, lane_histogram, span_histogram)
+                downsampled = _downsample_subpixel_band(rendered)
+                output[start_row:end_row] = _convert_image_band(
+                    downsampled,
+                    source.dtype,
+                )
+                del (
+                    source_band,
+                    near_score_band,
+                    source_valid_band,
+                    offset_band,
+                    splat,
+                    rendered,
+                    hole_mask,
+                    fillable,
+                    prefill,
+                    filled,
+                    unresolved,
+                    unresolved_pixels,
+                    coverage,
+                    repair,
+                    downsampled,
+                )
+        hole_runs = HoleRunDiagnostics(
+            lane_count_histogram=tuple(sorted(lane_histogram.items())),
+            touched_pixel_span_histogram=tuple(sorted(span_histogram.items())),
+        )
+        diagnostics = FastEyeDiagnostics(
+            hole_runs=hole_runs,
+            local_filled_lane_count=local_filled_lane_count,
+            final_unresolved_lane_count=final_unresolved_lane_count,
+        )
+        return output, coverage_output, repair_output, diagnostics
 
     def _transfer_offset_band(self, values: np.ndarray) -> torch.Tensor:
         if self.profile and self.device.type == "cuda":
