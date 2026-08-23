@@ -1420,6 +1420,295 @@ py::tuple build_repair_records(
     return py::make_tuple(std::move(records), std::move(result_statistics));
 }
 
+bool is_safe_donor_pixel(
+    const std::uint8_t* coverage,
+    const std::uint32_t* regions,
+    std::uint32_t height,
+    std::uint32_t width,
+    std::uint32_t pixel,
+    std::uint32_t region,
+    std::uint32_t radius
+) {
+    const std::uint32_t row = pixel / width;
+    const std::uint32_t column = pixel % width;
+    const std::uint32_t row_start = row > radius ? row - radius : 0;
+    const std::uint32_t column_start = column > radius ? column - radius : 0;
+    const std::uint32_t row_end = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        height,
+        static_cast<std::uint64_t>(row) + radius + 1
+    ));
+    const std::uint32_t column_end = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(
+            width,
+            static_cast<std::uint64_t>(column) + radius + 1
+        )
+    );
+    for (std::uint32_t sample_row = row_start; sample_row < row_end; ++sample_row) {
+        for (
+            std::uint32_t sample_column = column_start;
+            sample_column < column_end;
+            ++sample_column
+        ) {
+            const std::uint32_t sample = sample_row * width + sample_column;
+            if (coverage[sample] != 16 || regions[sample] != region) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+py::tuple build_safe_donor_index(
+    const py::array& coverage_count,
+    const py::array& pure_region_id,
+    const py::array& referenced_regions
+) {
+    validate_array(
+        coverage_count,
+        py::dtype::of<std::uint8_t>(),
+        "coverage_count"
+    );
+    validate_array(
+        pure_region_id,
+        py::dtype::of<std::uint32_t>(),
+        "pure_region_id"
+    );
+    validate_vector(
+        referenced_regions,
+        py::dtype::of<bool>(),
+        "referenced_regions"
+    );
+    if (
+        pure_region_id.shape(0) != coverage_count.shape(0) ||
+        pure_region_id.shape(1) != coverage_count.shape(1)
+    ) {
+        throw py::value_error("safe-donor analysis rasters must match");
+    }
+    if (referenced_regions.shape(0) < 2) {
+        throw py::value_error("referenced_regions must include a positive region");
+    }
+    const std::uint64_t sample_count64 =
+        static_cast<std::uint64_t>(coverage_count.shape(0)) *
+        static_cast<std::uint64_t>(coverage_count.shape(1));
+    const std::uint64_t region_count64 =
+        static_cast<std::uint64_t>(referenced_regions.shape(0) - 1);
+    if (sample_count64 + 1 > kUint32Max || region_count64 + 1 > kUint32Max) {
+        throw py::value_error("safe-donor index shape must fit uint32");
+    }
+
+    const auto height = static_cast<std::uint32_t>(coverage_count.shape(0));
+    const auto width = static_cast<std::uint32_t>(coverage_count.shape(1));
+    const auto sample_count = static_cast<std::uint32_t>(sample_count64);
+    const auto region_count = static_cast<std::uint32_t>(region_count64);
+    const auto* coverage =
+        static_cast<const std::uint8_t*>(coverage_count.data());
+    const auto* regions =
+        static_cast<const std::uint32_t*>(pure_region_id.data());
+    const auto* referenced =
+        static_cast<const std::uint8_t*>(referenced_regions.data());
+    const auto radius = static_cast<std::uint32_t>(std::max(
+        1.0,
+        std::floor(static_cast<double>(height) / 1080.0 + 0.5)
+    ));
+    py::array_t<std::uint32_t> offsets(
+        static_cast<py::ssize_t>(region_count) + 1
+    );
+    auto* offset_values = offsets.mutable_data();
+    std::fill(offset_values, offset_values + region_count + 1, 0);
+    std::uint32_t donor_count = 0;
+    {
+        py::gil_scoped_release release;
+        for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
+            const std::uint32_t region = regions[pixel];
+            if (
+                region == 0 ||
+                region > region_count ||
+                referenced[region] == 0 ||
+                coverage[pixel] != 16
+            ) {
+                continue;
+            }
+            if (!is_safe_donor_pixel(
+                coverage,
+                regions,
+                height,
+                width,
+                pixel,
+                region,
+                radius
+            )) {
+                continue;
+            }
+            ++offset_values[region - 1];
+            ++donor_count;
+        }
+        std::uint32_t running = 0;
+        for (std::uint32_t region_index = 0; region_index < region_count; ++region_index) {
+            running += offset_values[region_index];
+            offset_values[region_index] = running;
+        }
+        offset_values[region_count] = donor_count;
+    }
+    const std::uint64_t index_bytes =
+        static_cast<std::uint64_t>(donor_count) * sizeof(std::uint32_t) +
+        static_cast<std::uint64_t>(region_count + 1) * sizeof(std::uint32_t);
+    if (index_bytes > 48ULL * 1024ULL * 1024ULL) {
+        throw std::runtime_error("safe-donor index exceeds its 48 MiB partition");
+    }
+
+    py::array_t<std::uint32_t> members(donor_count);
+    auto* member_values = members.mutable_data();
+    {
+        py::gil_scoped_release release;
+        for (std::uint32_t cursor = sample_count; cursor > 0; --cursor) {
+            const std::uint32_t pixel = cursor - 1;
+            const std::uint32_t region = regions[pixel];
+            if (
+                region == 0 ||
+                region > region_count ||
+                referenced[region] == 0 ||
+                coverage[pixel] != 16 ||
+                !is_safe_donor_pixel(
+                    coverage,
+                    regions,
+                    height,
+                    width,
+                    pixel,
+                    region,
+                    radius
+                )
+            ) {
+                continue;
+            }
+            const std::uint32_t destination = --offset_values[region - 1];
+            member_values[destination] = pixel;
+        }
+        for (std::uint32_t region_index = 0; region_index < region_count; ++region_index) {
+            partition_region_tree(
+                member_values,
+                offset_values[region_index],
+                offset_values[region_index + 1],
+                width
+            );
+        }
+    }
+    return py::make_tuple(std::move(members), std::move(offsets));
+}
+
+std::uint32_t read_little_u32(const std::uint8_t* source) {
+    return
+        static_cast<std::uint32_t>(source[0]) |
+        (static_cast<std::uint32_t>(source[1]) << 8) |
+        (static_cast<std::uint32_t>(source[2]) << 16) |
+        (static_cast<std::uint32_t>(source[3]) << 24);
+}
+
+py::array query_fallback_records(
+    const py::array& members,
+    const py::array& offsets,
+    std::uint64_t height,
+    std::uint64_t width,
+    py::array raw_records,
+    const py::array& blue,
+    const py::array& green,
+    const py::array& red,
+    std::uint64_t radius_px,
+    py::array budget_state
+) {
+    validate_index_arrays(members, offsets, height, width);
+    if (
+        !raw_records.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        raw_records.ndim() != 2 ||
+        raw_records.shape(1) != 16 ||
+        (raw_records.flags() & py::array::c_style) == 0 ||
+        !raw_records.writeable()
+    ) {
+        throw py::value_error("raw_records must be a writable uint8 [N,16] array");
+    }
+    for (const auto* plane : {&blue, &green, &red}) {
+        validate_array(*plane, py::dtype::of<std::uint8_t>(), "pure_bgr plane");
+        if (
+            plane->shape(0) != static_cast<py::ssize_t>(height) ||
+            plane->shape(1) != static_cast<py::ssize_t>(width)
+        ) {
+            throw py::value_error("pure_bgr planes must match the indexed raster");
+        }
+    }
+    validate_budget_state(budget_state);
+    if (radius_px > std::numeric_limits<std::uint32_t>::max()) {
+        throw py::value_error("fallback radius must fit uint32");
+    }
+    std::uint32_t query_count = 0;
+    const auto* input_records =
+        static_cast<const std::uint8_t*>(raw_records.data());
+    for (py::ssize_t index = 0; index < raw_records.shape(0); ++index) {
+        if (input_records[index * 16 + 13] == 0) {
+            ++query_count;
+        }
+    }
+    if (
+        static_cast<std::uint64_t>(query_count) * sizeof(std::uint32_t) >
+        16ULL * 1024ULL * 1024ULL
+    ) {
+        throw std::runtime_error(
+            "fallback visit counts exceed their 16 MiB partition"
+        );
+    }
+
+    py::array_t<std::uint32_t> visits(query_count);
+    auto* visit_values = visits.mutable_data();
+    auto* record_values =
+        static_cast<std::uint8_t*>(raw_records.mutable_data());
+    const auto* member_values =
+        static_cast<const std::uint32_t*>(members.data());
+    const auto* offset_values =
+        static_cast<const std::uint32_t*>(offsets.data());
+    const auto* blue_values = static_cast<const std::uint8_t*>(blue.data());
+    const auto* green_values = static_cast<const std::uint8_t*>(green.data());
+    const auto* red_values = static_cast<const std::uint8_t*>(red.data());
+    auto* budget_values =
+        static_cast<std::uint64_t*>(budget_state.mutable_data());
+    const auto region_count = static_cast<std::uint32_t>(offsets.shape(0) - 1);
+    const auto width32 = static_cast<std::uint32_t>(width);
+    const std::uint64_t radius2 = radius_px * radius_px;
+    std::uint32_t query = 0;
+    {
+        py::gil_scoped_release release;
+        for (py::ssize_t index = 0; index < raw_records.shape(0); ++index) {
+            std::uint8_t* record = record_values + index * 16;
+            if (record[13] != 0) {
+                continue;
+            }
+            const std::uint32_t pixel = read_little_u32(record);
+            const std::uint32_t region = read_little_u32(record + 6);
+            if (pixel >= height * width || region == 0 || region > region_count) {
+                throw std::invalid_argument("fallback record identity is invalid");
+            }
+            const RepairBest best = query_repair_one(
+                member_values,
+                offset_values[region - 1],
+                offset_values[region],
+                width32,
+                pixel / width32,
+                pixel % width32,
+                radius2,
+                budget_values,
+                &visit_values[query]
+            );
+            if (!best.found) {
+                throw std::runtime_error(
+                    "repair record has no safe donor within fallback limit"
+                );
+            }
+            record[10] = blue_values[best.sample_index];
+            record[11] = green_values[best.sample_index];
+            record[12] = red_values[best.sample_index];
+            ++query;
+        }
+    }
+    return visits;
+}
+
 py::tuple build_index(
     const py::array& region_ids,
     std::uint64_t region_count_value,
@@ -1574,6 +1863,27 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("valid"),
         py::arg("winner_near_score"),
         py::arg("winner_region_id")
+    );
+    module.def(
+        "build_safe_donor_index",
+        &build_safe_donor_index,
+        py::arg("coverage_count"),
+        py::arg("pure_region_id"),
+        py::arg("referenced_regions")
+    );
+    module.def(
+        "query_fallback_records",
+        &query_fallback_records,
+        py::arg("member_index"),
+        py::arg("region_offsets"),
+        py::arg("height"),
+        py::arg("width"),
+        py::arg("raw_records"),
+        py::arg("blue"),
+        py::arg("green"),
+        py::arg("red"),
+        py::arg("radius_px"),
+        py::arg("budget_state")
     );
     module.def("build_info", &build_info);
 }

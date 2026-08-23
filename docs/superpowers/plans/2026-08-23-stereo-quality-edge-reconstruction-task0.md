@@ -85,11 +85,11 @@
 - Create: `tests/unit/test_quality_task0_fallback.py`
 - Create: `tests/unit/test_quality_task0_exemplar.py`
 
-- [ ] Reuse Task 0.2 only through its frozen array/query interface and verify the 48 MiB/16 MiB repair-arena partition.
-- [ ] Add high-fallback 4K and degenerate donor fixtures, including fatal next-node overflow without a current-best result.
-- [ ] Implement exact full-frame provisional fallback colours before exemplar work.
-- [ ] Add RED tests for ROI/core ownership, pyramid masks, ties-to-even child means, frontier order, complete 7x7/9x9 supports, reflect-101 target gradients, deterministic candidate subsampling, and every budget boundary.
-- [ ] Implement the bounded three-level exemplar oracle and prove unfinished targets retain provisional fallback.
+- [x] Reuse Task 0.2 only through its frozen array/query interface and verify the 48 MiB/16 MiB repair-arena partition.
+- [x] Add high-fallback 4K and degenerate donor fixtures, including fatal next-node overflow without a current-best result.
+- [x] Implement exact full-frame provisional fallback colours before exemplar work.
+- [x] Add RED tests for ROI/core ownership, pyramid masks, ties-to-even child means, frontier order, complete 7x7/9x9 supports, reflect-101 target gradients, deterministic candidate subsampling, and every budget boundary.
+- [x] Implement the bounded three-level exemplar oracle and prove unfinished targets retain provisional fallback.
 
 ### Task 0.6: Geometry Construction And Lifetime Trace
 

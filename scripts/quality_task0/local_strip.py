@@ -17,6 +17,9 @@ from .repair_records import (
 QUALITY_LOCAL_SLOT_CAP = 16_777_216
 QUALITY_LOCAL_NEIGHBOR_SAMPLE_CAP = 268_435_456
 QUALITY_REPAIR_FALLBACK_VISIT_CAP = 268_435_456
+QUALITY_EXEMPLAR_CORE_EVALUATION_CAP = 2_000_000
+QUALITY_EXEMPLAR_COMPONENT_EVALUATION_CAP = 8_000_000
+QUALITY_EXEMPLAR_EYE_EVALUATION_CAP = 32_000_000
 _UINT64_MAX = int(np.iinfo(np.uint64).max)
 _ROW_DELTAS = (0, -1, 1, -2, 2)
 _Bgr = tuple[int, int, int]
@@ -40,9 +43,13 @@ class QualityRepairBudgets:
     local_slot_cap: int = QUALITY_LOCAL_SLOT_CAP
     local_neighbor_sample_cap: int = QUALITY_LOCAL_NEIGHBOR_SAMPLE_CAP
     repair_fallback_visit_cap: int = QUALITY_REPAIR_FALLBACK_VISIT_CAP
+    exemplar_core_evaluation_cap: int = QUALITY_EXEMPLAR_CORE_EVALUATION_CAP
+    exemplar_component_evaluation_cap: int = QUALITY_EXEMPLAR_COMPONENT_EVALUATION_CAP
+    exemplar_eye_evaluation_cap: int = QUALITY_EXEMPLAR_EYE_EVALUATION_CAP
     local_slots_consumed: int = field(default=0, init=False)
     local_neighbor_samples_consumed: int = field(default=0, init=False)
     repair_fallback_visits_consumed: int = field(default=0, init=False)
+    exemplar_eye_evaluations_consumed: int = field(default=0, init=False)
     local_budget_skipped_run_count: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
@@ -50,6 +57,9 @@ class QualityRepairBudgets:
             "local_slot_cap",
             "local_neighbor_sample_cap",
             "repair_fallback_visit_cap",
+            "exemplar_core_evaluation_cap",
+            "exemplar_component_evaluation_cap",
+            "exemplar_eye_evaluation_cap",
         ):
             value = getattr(self, name)
             if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
