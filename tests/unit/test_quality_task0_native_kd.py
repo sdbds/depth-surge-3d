@@ -84,6 +84,26 @@ def test_native_optimized_large_build_is_byte_exact_with_python_oracle() -> None
     assert np.array_equal(actual.region_offsets, expected.region_offsets)
 
 
+def test_native_build_above_packed_coordinate_limit_remains_byte_exact() -> None:
+    region_ids = np.ones((1, 65_536), dtype=np.uint32)
+    include = np.zeros_like(region_ids, dtype=np.bool_)
+    include[0, [0, 1, 32_768, 65_534, 65_535]] = True
+
+    expected = implicit_kd.build_implicit_region_kd(
+        region_ids,
+        region_count=1,
+        include=include,
+    )
+    actual = _api("build_native_implicit_region_kd")(
+        region_ids,
+        region_count=1,
+        include=include,
+    )
+
+    assert np.array_equal(actual.member_index, expected.member_index)
+    assert np.array_equal(actual.region_offsets, expected.region_offsets)
+
+
 def test_native_build_rejects_noncanonical_inputs_before_native_mutation() -> None:
     build_native = _api("build_native_implicit_region_kd")
 

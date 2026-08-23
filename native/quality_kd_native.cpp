@@ -20,6 +20,7 @@ constexpr std::size_t kStackCapacity = 64;
 constexpr std::uint64_t kUint32Max = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint64_t kRepairRecordCap = (64ULL * 1024ULL * 1024ULL) / 16ULL;
 constexpr std::uint8_t kDividerAddMarker = 0x40;
+constexpr std::uint32_t kPackedCoordinateLimit = 0xffff;
 
 class U32Divider {
 public:
@@ -134,15 +135,11 @@ std::uint32_t median_of_five_numeric(const std::uint32_t* values) {
     std::uint32_t d = values[3];
     std::uint32_t e = values[4];
     compare_swap_numeric(a, b);
-    compare_swap_numeric(d, e);
-    compare_swap_numeric(c, e);
     compare_swap_numeric(c, d);
-    compare_swap_numeric(b, e);
-    compare_swap_numeric(a, d);
     compare_swap_numeric(a, c);
     compare_swap_numeric(b, d);
     compare_swap_numeric(b, c);
-    return c;
+    return e < b ? b : (c < e ? c : e);
 }
 
 std::uint32_t partition_about_numeric(
@@ -155,10 +152,15 @@ std::uint32_t partition_about_numeric(
     std::swap(members[pivot_index], members[right]);
     std::uint32_t destination = left;
     for (std::uint32_t cursor = left; cursor < right; ++cursor) {
-        if (members[cursor] < pivot) {
-            std::swap(members[destination], members[cursor]);
-            ++destination;
-        }
+        const std::uint32_t cursor_value = members[cursor];
+        const std::uint32_t destination_value = members[destination];
+        const std::uint32_t swap_mask =
+            0U - static_cast<std::uint32_t>(cursor_value < pivot);
+        const std::uint32_t swap_bits =
+            (cursor_value ^ destination_value) & swap_mask;
+        members[destination] = destination_value ^ swap_bits;
+        members[cursor] = cursor_value ^ swap_bits;
+        destination += swap_mask & 1U;
     }
     std::swap(members[right], members[destination]);
     return destination;
@@ -228,7 +230,7 @@ void select_kth_numeric(
     std::uint8_t selection_depth
 ) {
     if (right - left < 96) {
-        insertion_sort_numeric(members, left, right);
+        std::sort(members + left, members + right + 1);
         return;
     }
     while (left < right) {
@@ -274,7 +276,8 @@ void partition_region_tree(
     std::uint32_t start,
     std::uint32_t end,
     std::uint32_t height,
-    std::uint32_t width
+    std::uint32_t width,
+    bool packed_coordinates = false
 ) {
     if (start == end) {
         return;
@@ -289,6 +292,11 @@ void partition_region_tree(
         const bool column_axis = (frame.depth & 1) != 0;
         if (column_axis) {
             for (std::uint32_t cursor = frame.start; cursor < frame.end; ++cursor) {
+                if (packed_coordinates) {
+                    const std::uint32_t packed = members[cursor];
+                    members[cursor] = (packed << 16) | (packed >> 16);
+                    continue;
+                }
                 const std::uint32_t sample = members[cursor];
                 const std::uint32_t row = width_divider.divide(sample);
                 const std::uint32_t column = sample - row * width;
@@ -306,6 +314,11 @@ void partition_region_tree(
         }
         if (column_axis) {
             for (std::uint32_t cursor = frame.start; cursor < frame.end; ++cursor) {
+                if (packed_coordinates) {
+                    const std::uint32_t packed = members[cursor];
+                    members[cursor] = (packed << 16) | (packed >> 16);
+                    continue;
+                }
                 const std::uint32_t column_major = members[cursor];
                 const std::uint32_t column = height_divider.divide(column_major);
                 const std::uint32_t row = column_major - column * height;
@@ -388,6 +401,7 @@ RepairBest query_repair_one(
     std::uint32_t start,
     std::uint32_t end,
     std::uint32_t width,
+    const U32Divider& width_divider,
     std::uint32_t target_y,
     std::uint32_t target_x,
     std::uint64_t radius2,
@@ -428,8 +442,8 @@ RepairBest query_repair_one(
 
         const std::uint32_t middle = frame.start + ((frame.end - frame.start - 1) / 2);
         const std::uint32_t sample_index = members[middle];
-        const std::uint32_t y = sample_index / width;
-        const std::uint32_t x = sample_index % width;
+        const std::uint32_t y = width_divider.divide(sample_index);
+        const std::uint32_t x = sample_index - y * width;
         const std::int64_t dy = static_cast<std::int64_t>(target_y) - y;
         const std::int64_t dx = static_cast<std::int64_t>(target_x) - x;
         const std::uint64_t distance2 = squared_integer_delta(dx) + squared_integer_delta(dy);
@@ -485,6 +499,7 @@ GeometryBest query_geometry_one(
     std::uint32_t start,
     std::uint32_t end,
     std::uint32_t width,
+    const U32Divider& width_divider,
     double target_y,
     double target_x,
     std::uint64_t* budget_state,
@@ -521,8 +536,8 @@ GeometryBest query_geometry_one(
 
         const std::uint32_t middle = frame.start + ((frame.end - frame.start - 1) / 2);
         const std::uint32_t sample_index = members[middle];
-        const std::uint32_t y = sample_index / width;
-        const std::uint32_t x = sample_index % width;
+        const std::uint32_t y = width_divider.divide(sample_index);
+        const std::uint32_t x = sample_index - y * width;
         const double dx = target_x - static_cast<double>(x);
         const double dy = target_y - static_cast<double>(y);
         const double distance2 = (dx * dx) + (dy * dy);
@@ -693,6 +708,7 @@ py::tuple query_repair_batch(
     const std::uint32_t region_count = static_cast<std::uint32_t>(offsets.shape(0) - 1);
     const std::uint32_t height32 = static_cast<std::uint32_t>(height);
     const std::uint32_t width32 = static_cast<std::uint32_t>(width);
+    const U32Divider width_divider(width32);
     const std::uint64_t radius2 = radius_px * radius_px;
 
     py::array_t<std::uint32_t> result_samples(query_count);
@@ -716,6 +732,7 @@ py::tuple query_repair_batch(
                 offset_values[region - 1],
                 offset_values[region],
                 width32,
+                width_divider,
                 y_values[query],
                 x_values[query],
                 radius2,
@@ -760,6 +777,7 @@ py::tuple query_geometry_batch(
     auto* budget_values = static_cast<std::uint64_t*>(budget_state.mutable_data());
     const std::uint32_t region_count = static_cast<std::uint32_t>(offsets.shape(0) - 1);
     const std::uint32_t width32 = static_cast<std::uint32_t>(width);
+    const U32Divider width_divider(width32);
 
     py::array_t<std::uint32_t> result_samples(query_count);
     py::array_t<double> result_distances(query_count);
@@ -782,6 +800,7 @@ py::tuple query_geometry_batch(
                 offset_values[region - 1],
                 offset_values[region],
                 width32,
+                width_divider,
                 y_values[query],
                 x_values[query],
                 budget_values,
@@ -1740,6 +1759,7 @@ py::array query_fallback_records(
         static_cast<std::uint64_t*>(budget_state.mutable_data());
     const auto region_count = static_cast<std::uint32_t>(offsets.shape(0) - 1);
     const auto width32 = static_cast<std::uint32_t>(width);
+    const U32Divider width_divider(width32);
     const std::uint64_t radius2 = radius_px * radius_px;
     std::uint32_t query = 0;
     {
@@ -1754,13 +1774,16 @@ py::array query_fallback_records(
             if (pixel >= height * width || region == 0 || region > region_count) {
                 throw std::invalid_argument("fallback record identity is invalid");
             }
+            const std::uint32_t pixel_y = width_divider.divide(pixel);
+            const std::uint32_t pixel_x = pixel - pixel_y * width32;
             const RepairBest best = query_repair_one(
                 member_values,
                 offset_values[region - 1],
                 offset_values[region],
                 width32,
-                pixel / width32,
-                pixel % width32,
+                width_divider,
+                pixel_y,
+                pixel_x,
                 radius2,
                 budget_values,
                 &visit_values[query]
@@ -1854,14 +1877,27 @@ py::tuple build_index(
     auto* member_values = members.mutable_data();
     {
         py::gil_scoped_release release;
+        const bool packed_coordinates =
+            height <= kPackedCoordinateLimit && width <= kPackedCoordinateLimit;
+        std::uint32_t row = static_cast<std::uint32_t>(height) - 1;
+        std::uint32_t column = width32 - 1;
         for (std::uint32_t cursor = sample_count32; cursor > 0; --cursor) {
             const std::uint32_t sample_index = cursor - 1;
-            if (include != nullptr && include[sample_index] == 0) {
-                continue;
+            if (include == nullptr || include[sample_index] != 0) {
+                const std::uint32_t region_slot = regions[sample_index] - 1;
+                const std::uint32_t destination = --offset_values[region_slot];
+                member_values[destination] = packed_coordinates
+                    ? (row << 16) | column
+                    : sample_index;
             }
-            const std::uint32_t region_slot = regions[sample_index] - 1;
-            const std::uint32_t destination = --offset_values[region_slot];
-            member_values[destination] = sample_index;
+            if (column == 0) {
+                column = width32 - 1;
+                if (row > 0) {
+                    --row;
+                }
+            } else {
+                --column;
+            }
         }
         for (std::uint32_t region_index = 0; region_index < region_count; ++region_index) {
             partition_region_tree(
@@ -1869,8 +1905,17 @@ py::tuple build_index(
                 offset_values[region_index],
                 offset_values[region_index + 1],
                 static_cast<std::uint32_t>(height),
-                width32
+                width32,
+                packed_coordinates
             );
+        }
+        if (packed_coordinates) {
+            for (std::uint32_t cursor = 0; cursor < included_count; ++cursor) {
+                const std::uint32_t packed = member_values[cursor];
+                const std::uint32_t row = packed >> 16;
+                const std::uint32_t column = packed & kPackedCoordinateLimit;
+                member_values[cursor] = row * width32 + column;
+            }
         }
     }
     return py::make_tuple(std::move(members), std::move(offsets));

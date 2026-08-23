@@ -327,8 +327,11 @@ class Task0Report:
         if gate_decision not in {"existing_dependencies", "prebuilt_extension"}:
             raise ReportSchemaError("gate decision is outside the closed set")
         ordered_runs = tuple(sorted(runs, key=lambda run: run.run_id))
-        if any(run.status != "passed" for run in ordered_runs):
-            raise IncompleteTask0ReportError("Task 0 decision has failed required runs")
+        failed_run_ids = tuple(run.run_id for run in ordered_runs if run.status != "passed")
+        if failed_run_ids:
+            raise IncompleteTask0ReportError(
+                "Task 0 decision has failed required runs: " + ", ".join(failed_run_ids)
+            )
         provisional = cls(source, environment, required, ordered_runs, gate_decision, "")
         return cls(
             source,

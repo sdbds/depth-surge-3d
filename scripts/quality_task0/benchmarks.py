@@ -1476,7 +1476,11 @@ def _default_device_contexts() -> tuple[str, ...]:
     )
 
 
-def run_task0_gate_suite(selected_gates: tuple[str, ...]) -> reporting.Task0Report:
+def run_task0_gate_suite(
+    selected_gates: tuple[str, ...],
+    *,
+    report_path: Path | None = None,
+) -> reporting.Task0Report:
     root = Path(__file__).resolve().parents[2]
     fixture = Path(
         os.environ.get(
@@ -1487,9 +1491,20 @@ def run_task0_gate_suite(selected_gates: tuple[str, ...]) -> reporting.Task0Repo
     registry = build_case_registry(
         device_contexts=_default_device_contexts(), fixture_settings=fixture
     )
+    excluded_paths = {"docs/superpowers/reports/2026-08-23-stereo-quality-task0.json"}
+    if report_path is not None:
+        resolved_report = (
+            (root / report_path).resolve()
+            if not report_path.is_absolute()
+            else report_path.resolve()
+        )
+        try:
+            excluded_paths.add(resolved_report.relative_to(root).as_posix())
+        except ValueError:
+            pass
     source = reporting.capture_source_identity(
         root,
-        excluded_relative_paths=("docs/superpowers/reports/2026-08-23-stereo-quality-task0.json",),
+        excluded_relative_paths=tuple(sorted(excluded_paths)),
     )
     return assemble_gate_report(
         selected_gates=selected_gates,

@@ -41,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
             print(name)
         return 0
     selected = reporting.select_gate_names(arguments.gate, available)
-    report = benchmarks.run_task0_gate_suite(selected)
+    report = benchmarks.run_task0_gate_suite(selected, report_path=arguments.report)
     reporting.publish_report(arguments.report, report)
     print(arguments.report)
     return 0

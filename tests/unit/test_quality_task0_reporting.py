@@ -141,7 +141,10 @@ def test_report_rejects_failed_required_run_for_every_decision(
         facts={"reason": "candidate gate failed"},
     )
 
-    with pytest.raises(reporting.IncompleteTask0ReportError, match="failed"):
+    with pytest.raises(
+        reporting.IncompleteTask0ReportError,
+        match=r"failed required runs: geometry\.cpu\.failed",
+    ):
         reporting.Task0Report.create(
             source=_source(),
             environment=_environment(),
@@ -222,6 +225,38 @@ def test_cli_script_is_directly_executable_from_the_repository_root() -> None:
 
     assert b"geometry-scale" in completed.stdout
     assert completed.stderr == b""
+
+
+def test_cli_excludes_its_selected_report_path_from_source_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts.quality_task0 import benchmarks
+
+    report_path = tmp_path / "task0.json"
+    sentinel = object()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(benchmarks, "available_gate_names", lambda: ("geometry",))
+
+    def run(selected: tuple[str, ...], *, report_path: Path):
+        captured["selected"] = selected
+        captured["report_path"] = report_path
+        return sentinel
+
+    monkeypatch.setattr(benchmarks, "run_task0_gate_suite", run)
+    monkeypatch.setattr(
+        reporting,
+        "publish_report",
+        lambda path, report: captured.update(published_path=path, report=report),
+    )
+
+    assert run_quality_task0.main(["--report", str(report_path)]) == 0
+    assert captured == {
+        "selected": ("geometry",),
+        "report_path": report_path,
+        "published_path": report_path,
+        "report": sentinel,
+    }
 
 
 def test_process_rss_and_device_context_labels_are_bounded_scalars() -> None:
