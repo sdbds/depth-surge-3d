@@ -296,6 +296,10 @@ defects.
 | `ReplaceFileW` can return failure after moving or deleting an old target | Forbid it and freeze one handle-relative `SetFileInformationByHandle(FileRenameInfo)` adapter whose post-call path/identity table, not its Boolean return alone, decides unchanged, committed, recoverable gap, or conflict. |
 | Manifest recovery ignored durable complete source frames | Make encoding-input prepass `complete-full` the one explicitly staged exception, promote it to exact intent only after the video boundary, and discriminate zero/partial/complete/committed final-manifest phases before deciding to reencode. |
 | Existing manifest targets had no durable preflight byte/identity binding | Add an exact preflight identity/byte-count/raw-hash triple to each fixed-artifact `replace_existing` entry and descriptor; keep future settings targets on their separate typed predecessor-transition contract. |
+| A post-boundary reencode could leave a retry sibling beside a replaced target that the global table called conflicting | Add one phase-specific `post_boundary_retry_sibling_present` state; remove only the exact indexed safe sibling, sync, revalidate, and reencode without adopting it. |
+| Post-boundary audio matching had no durable prior-attempt referent | Define one invocation-local `SelectedAudioIdentityV1`; each relaunch selects/probes afresh, freezes one pre/post identity pair, and need not reproduce a lost attempt's audio choice. |
+| Full hashes of unbounded pre-existing fixed targets had no coordinator phase | Add one fixed one-MiB hash stream and three isolated five-MiB preflight/descriptor/consumption phase peaks with exact scan/error/release rules. |
+| The Windows rename source handle was frozen but its `RootDirectory` handle was not | Add `WindowsTargetParentHandleV1` with one exact `CreateFileW` access/share/flags contract and before/after parent identity attestation. |
 
 ## Public Settings Contract
 
@@ -1509,6 +1513,31 @@ The old target's observed size is not constrained by the new payload's
 `payload_raw_max`; hashing is O(1) resident state and must either cover all bytes
 or fail read-only preflight without silently replacing them.
 
+All three scans use exactly one reusable
+`FINAL_FIXED_TARGET_HASH_STREAM_BYTES` bytearray through `readinto`; they never
+construct a per-read bytes object or retain target content. Preflight first
+captures the open-handle identity/count and then requires the scan to reach one
+exact EOF at that count. Descriptor construction and consumption instead require
+the persisted identity/count/hash triple. Every scan uses checked `u64` byte
+addition, treats early EOF, an extra byte, identity/count drift on the final
+same-handle restat, cancellation, or an I/O error as a typed failure in its
+current transaction phase, and never substitutes a partial hash. Different
+fixed targets and the three scans of one target are strictly serial.
+
+For preflight, finish and release every target scan before acquiring the final-
+index serializer or JSON stream/state. For descriptor construction, the
+reservation-index stream/parser is released
+after its scalar entry has been authenticated and before this hash buffer is
+acquired; descriptor serialization starts only after the hash buffer is
+released. For consumption, complete-short payload parsing/validation is released
+first, this scan is then the final old-target operation immediately before the
+same-parent adapter, and the hash buffer is released before that adapter call.
+Consequently no fixed-target hash scan coexists with reservation-index JSON
+state, payload serialization/parsing state, a settings object, or another
+stream buffer. There is no size-derived wall timeout for an intentionally
+unbounded old target; scanned bytes and elapsed wall time may be reported only as
+nonsemantic invocation telemetry and cannot relax cancellation or correctness.
+
 For `replace_placeholder`, all three preflight-target fields are null. They are
 also null for every settings kind: a lifecycle, pending, or terminal settings
 target may be the result of an earlier authorized indexed settings transition,
@@ -1820,11 +1849,21 @@ Active-index recovery derives the side only from the owned paths. Exact
 `reserved_target_identity` at the final path is pre-boundary; an ordinary safe
 sibling may then be discarded and FFmpeg rerun. An absent sibling plus an
 ordinary non-link/link-count-one final target with a different identity is the
-committed post-boundary state. On Windows only, an absent final target plus the
-exact ordinary safe sibling is `windows_video_replace_gap`; recovery must first
-retry `WindowsSameParentRenameV1` with `replace_if_exists=false` to restore that
-fixed final name, then continue post-boundary. Both names present when the target
-is not the reserved identity, both absent, a second location for the reserved
+committed post-boundary state. There is exactly one legal both-present exception:
+when the encoding-input manifest is its exact committed new target and the
+final-manifest source is `zero` or `partial` beside its declared old target, an
+ordinary non-link/link-count-one final target different from
+`reserved_target_identity` plus the exact indexed ordinary non-link/link-count-
+one sibling is `post_boundary_retry_sibling_present`. Recovery wholly zeroes a
+partial final-manifest source, unlinks only that sibling, syncs its parent,
+revalidates current image inputs against the committed manifest, freshly derives
+`SelectedAudioIdentityV1`, and reruns FFmpeg; it never adopts or inspects the
+retry media as publication intent. On Windows
+only, an absent final target plus the exact ordinary safe sibling is
+`windows_video_replace_gap`; recovery must first retry
+`WindowsSameParentRenameV1` with `replace_if_exists=false` to restore that fixed
+final name, then continue post-boundary. Both names present outside the one
+phase-specific exception, both absent, a second location for the reserved
 identity, or a wrong parent/type/link count is a conflict.
 
 Manifest entry state uses the common `zero`, `partial`, `complete-full`,
@@ -1842,7 +1881,8 @@ source/target placement and the sole recovery action are:
 | `windows_video_replace_gap_before_input_commit` | final target absent; exact safe sibling present | source is postpass-proved `complete-full`; declared old target remains | source is exact `zero`; declared old target remains | forward-rename the sibling to the final name, flush/reopen/classify it, then enter `video_replaced_input_intent` |
 | `video_replaced_input_intent` | safe replaced final target present; sibling absent | source is semantic `complete-full`, `complete-short`, or its exact Windows replacement gap; declared old target remains unless the entry itself is in the gap | source is exact `zero`; declared old target remains | truncate/release if full and publish or forward-complete the exact input bytes; recovery then enters `input_manifest_committed_no_final_intent` |
 | `windows_video_replace_gap_after_input_commit` | final target absent; exact safe sibling present | exact committed new target | source is exact `zero`; declared old target remains | forward-rename the sibling to the final name and flush/reopen/classify it; recovery then enters `input_manifest_committed_no_final_intent` |
-| `input_manifest_committed_no_final_intent` | same safe replaced-target class | exact committed new target | source is `zero` or `partial`; declared old target remains | wholly zero a partial final-manifest frame, revalidate current inputs against the committed input manifest, then reencode without rewriting that manifest |
+| `post_boundary_retry_sibling_present` | safe replaced final target and exact indexed safe sibling both present | exact committed new target | source is `zero` or `partial`; declared old target remains | wholly zero a partial final-manifest frame; unlink only the sibling and sync its parent; revalidate image inputs against the committed manifest, freshly select/probe audio, then reencode without rewriting that manifest |
+| `input_manifest_committed_no_final_intent` | safe replaced final target present; sibling absent | exact committed new target | source is `zero` or `partial`; declared old target remains | wholly zero a partial final-manifest frame, revalidate image inputs against the committed manifest, freshly select/probe audio, then reencode without rewriting that manifest |
 | `final_manifest_intent` | exact video byte count/hash bound by the complete frame | exact committed new target | source is `complete-full`, `complete-short`, or its exact Windows replacement gap; declared old target remains unless the entry itself is in the gap | validate the normalized argv, input binding, and current video, then publish or forward-complete those exact bytes without reencoding |
 | `publication_authenticated` | exact video bound by both committed new manifests | exact committed new target | exact committed new target | continue prune/settings without reencode |
 
@@ -1876,9 +1916,12 @@ index retirement. Before any FFmpeg launch or relaunch, an existing entry there
 must be an ordinary non-link, link-count-one child of the persisted parent. It is
 unlinked and the parent synced when the reserved final target still exists,
 because that pre-boundary video temporary is not semantic intent. The sole
-exception is the exact Windows target-absent replacement gap: that sibling is
-forward-renamed to restore the final path before any relaunch. Wrong type/parent/
-link count or any other target/sibling combination is a conflict.
+post-boundary both-present allowance is
+`post_boundary_retry_sibling_present`; it is likewise unlinked and synced before
+input revalidation/relaunch because no complete final-manifest intent binds its
+bytes. The exact Windows target-absent replacement gap instead forward-renames
+the sibling to restore the final path before any relaunch. Wrong type/parent/link
+count or any other target/sibling combination is a conflict.
 The runtime output argv always names this persisted path, while normalized argv
 maps that whole argument to the indexed final path. The same-parent adapter moves
 it over the already existing final component and classifies the resulting paths
@@ -2034,8 +2077,40 @@ gap state below is already past that boundary even when the API returned failure
 
 Every Windows same-parent rename in this specification uses
 `WindowsSameParentRenameV1`, implemented only as
-`SetFileInformationByHandle(source_handle, FileRenameInfo, ...)`. The source is
-opened by its authorized identity with
+`SetFileInformationByHandle(source_handle, FileRenameInfo, ...)`. Its
+`RootDirectory` is always one `WindowsTargetParentHandleV1`, opened exactly as:
+
+```text
+CreateFileW(
+    exact_authenticated_target_parent_path,
+    FILE_ADD_FILE | SYNCHRONIZE,
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    NULL,
+    OPEN_EXISTING,
+    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    NULL,
+)
+```
+
+The handle is noninheritable and synchronous; `FILE_FLAG_OVERLAPPED`, zero/
+identity-only access, `MAXIMUM_ALLOWED`, generic-access substitution, a narrower
+share mode, and any reopen fallback are forbidden. Immediately after open,
+`GetFileInformationByHandleEx(FileAttributeTagInfo)` must prove a directory with
+no reparse-point attribute, and `GetFileInformationByHandleEx(FileIdInfo)` must
+equal the persisted target-parent `WindowsFileIdentityV1`. Its volume serial must
+also equal the source file's volume serial. Reattest both queries immediately
+before each rename call and after every return before classifying child paths;
+keep the same parent handle open through the call and classification. An open,
+access, type, reparse, identity, volume, or reattestation failure is the current
+phase's typed capability/I/O/conflict result with authority and observable paths
+preserved; it never falls back to a current-directory or absolute target name.
+This freezes the directory handle required by [`CreateFileW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
+and matches the destination-directory `FILE_ADD_FILE|SYNCHRONIZE`, full-share,
+backup-intent contract in Microsoft's
+[`FileRenameInformation`](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/87f86c9b-6c2a-4803-84b7-131a74a434fa)
+algorithm.
+
+The source is opened by its authorized identity with
 `GENERIC_READ|GENERIC_WRITE|DELETE|SYNCHRONIZE`, exactly
 `FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE`, and the no-follow/reparse
 checks already required by its artifact contract. `FILE_RENAME_INFO` contains
@@ -4443,6 +4518,39 @@ fallback from a selected FLAC to the original video after selection.
 The selected path itself must then open as a non-link regular file; otherwise
 audio preflight is fatal.
 
+Each FFmpeg launch or relaunch derives exactly one closed, invocation-local
+`SelectedAudioIdentityV1` record:
+
+```text
+selection:              "disabled" | "original_audio_flac" | "original_video"
+selected_source_path:   exact resolved in-memory path | null
+source_open_identity:   {platform:"posix",st_dev:u64,st_ino:u64}
+                      | {platform:"windows",volume_serial:hex16,file_id:hex32}
+                      | null
+source_byte_count:      u64?
+source_raw_sha256:      hex64?
+resolved_clip_arguments: list[ASCII scalar-string]
+disposition:            "disabled" | "no_a0" | "zero_decoded_samples" | "usable"
+sample_rate:            positive-u32?
+channels:               positive-u32?
+decoded_pcm_bytes:      u64?
+audio_end_sample:       positive-u64?
+```
+
+`disabled` requires null source/probe fields, an empty clip-argument list, and
+`disposition="disabled"`. Either selected source requires the exact path and
+open-handle identity used for the full hash, a nonnegative byte count, its full
+raw hash, and the exact optional `-ss`/`-t` argument elements. `no_a0` has null
+sample rate, channels, decoded count, and end sample. `zero_decoded_samples` has
+the validated positive sample rate/channels, decoded count zero, and a null end
+sample; `usable` has those sample fields, a positive decoded count, and the
+checked positive `audio_end_sample`. All other cross-field shapes are invalid.
+This record is frozen before argv construction, is never serialized into the
+image manifest or final index,
+and is discarded with its invocation. A successful final-video manifest instead
+binds the actually used usable source hash/count and audio behavior through its
+normalized argv; absence of an audio token binds the resulting no-audio output.
+
 Hash the selected source's complete raw bytes. Probe its first audio stream with
 this exact command and no generic video-info helper:
 
@@ -4553,7 +4661,9 @@ and rehashes the same contained image paths, streams canonical bytes only throug
 the bounded comparer/hash sink rather than overwriting the extent, and requires
 the length, raw hash, self-fingerprint, generation token, and every expected
 source index to match the staged values. It also rehashes the audio source
-against its captured full identity. A changed file, header, order, parent
+when selected, or proves that none was selected when disabled, against the same
+attempt's frozen `SelectedAudioIdentityV1` without rerunning selection. A changed
+file, header, order, parent
 selection, or identity aborts publication. A match file-syncs/reopens and
 revalidates the still-full staged source, then authorizes final-video replacement.
 Only after that replacement boundary does ordinary reservation consumption
@@ -4563,10 +4673,23 @@ There is one post-boundary relaunch form. In
 `input_manifest_committed_no_final_intent`, the input source extent is already
 consumed and must not be recreated. Before FFmpeg, replay the provider through
 the same bounded canonical comparer against the committed manifest target and
-require its canonical fingerprint, indexes, paths, headers, and current audio
-identity to match. Freeze that fresh provider generation through the launch;
-after FFmpeg, repeat the same content comparison and require the generation
-unchanged as the postpass.
+require its canonical fingerprint, indexes, paths, and headers to match. Run the
+fixed audio selection/hash/probe/decode contract against the filesystem state of
+this relaunch and freeze the resulting fresh `SelectedAudioIdentityV1` together
+with that provider generation. There is intentionally no durable selected-audio
+identity from an earlier attempt whose final-manifest intent was never completed;
+the fresh record need not select the same source or reproduce that lost attempt's
+probe disposition. Thus a FLAC which appears, disappears, or changes between two
+independent attempts affects the new encode rather than retroactively conflicting
+with the committed image-only manifest.
+
+After FFmpeg, repeat the same image-content comparison and require the provider
+generation unchanged. Do not rerun audio selection: reopen the record's exact
+selected path, require the same open-handle identity/type, byte count, and full
+raw hash, and use the frozen probe/decode fields and clip arguments unchanged.
+For `disabled`, no audio path may have been opened. This is the only meaning of
+the required exact pre/post audio pair; it is equality within this invocation,
+not equality to an unrecoverable prior invocation.
 Only an exact pair authorizes another video replacement. This branch constructs
 no encoding-input bytes and never changes that committed target; mismatch or
 unavailability fails the attempt and preserves the post-boundary publication
@@ -4610,6 +4733,7 @@ FINAL_ENCODING_CONTROL_OVERHEAD    = 4 MiB
 FINAL_ENCODING_IMAGE_STREAM_BYTES  = 1 MiB
 FINAL_ENCODING_JSON_STREAM_BYTES   = 1 MiB
 FINAL_ENCODING_AUDIO_STREAM_BYTES  = 1 MiB
+FINAL_FIXED_TARGET_HASH_STREAM_BYTES = 1 MiB
 FINAL_ENCODE_DIAGNOSTIC_BYTES      = 256 KiB
 FINAL_ENCODE_LINE_BYTES            = 8 KiB
 FINAL_PROBE_STDOUT_BYTES           = 64 KiB
@@ -4648,13 +4772,16 @@ final_probe_peak       = 4 MiB + 64 KiB + 64 KiB
                          + 512 KiB                      = 4.625 MiB
 final_decode_peak      = 4 MiB + 256 KiB + 64 KiB      = 4.3125 MiB
 reservation_index_peak = 4 MiB + 256 KiB + 256 KiB     = 4.5 MiB
+fixed_target_preflight_peak = 4 MiB + 1 MiB             = 5 MiB
+fixed_target_descriptor_peak = 4 MiB + 1 MiB            = 5 MiB
+fixed_target_consumption_peak = 4 MiB + 1 MiB           = 5 MiB
 job_control_validation_peak = 4 MiB + 512 KiB + 512 KiB
                               + 64 KiB                    = 5.0625 MiB
 settings_intent_commit_peak = 4 MiB + 512 KiB + 512 KiB + 1 MiB = 6 MiB
 producer_settings_commit_peak = 4 MiB + 512 KiB + 512 KiB + 1 MiB = 6 MiB
 pending_settings_commit_peak  = producer_settings_commit_peak     = 6 MiB
 completion_settings_commit_peak = producer_settings_commit_peak   = 6 MiB
-encoding_control_peak  = max(the twelve phase peaks)    = 6 MiB
+encoding_control_peak  = max(the fifteen phase peaks)   = 6 MiB
 require 1 <= N <= ENCODING_CONTROL_FRAME_CAP
 require encoding_control_peak <= FINAL_ENCODING_CONTROL_BUDGET
 
@@ -4704,6 +4831,11 @@ and IHDR parsing, manifest serialization, and the existing drained audio PCM
 buffer. Image hashing plus manifest serialization may coexist only in
 `encoding_manifest_peak`; both are released before the isolated audio probe/
 decode phase. Audio rehash likewise runs after releasing image/JSON streams.
+Each fixed-target peak owns only `FINAL_FIXED_TARGET_HASH_STREAM_BYTES` beside
+the control overhead. The index parser, descriptor serializer, and complete-
+short payload parser are released in the order fixed by the target-binding
+contract before that phase starts, and the hash stream is released before the
+next phase or rename adapter.
 Every stream/parser/ring is released before final-container probe. Settings
 transactions are isolated phases: their one stream, JSON state, and typed object
 are released before FFmpeg/probe/decode or another settings transition. Encode,
@@ -4897,10 +5029,13 @@ synthesizing a prior generation.
 If recovery finds that indexed sibling while the reserved final target still
 exists, it validates the safe path shape, removes it, syncs the parent, and
 reruns FFmpeg; it never guesses whether partial or complete pre-boundary media is
-reusable. When the final target is absent, the exact safe sibling is instead the
-Windows replacement gap and must be moved forward to restore the target name.
-A wrong-type sibling, any other target/sibling combination, or an absent active
-index is a transaction conflict or lacks cleanup authority as specified above.
+reusable. The same remove/sync/reencode policy applies to the exact
+`post_boundary_retry_sibling_present` row; that row is not a second publication
+boundary and never adopts the retry bytes. When the final target is absent, the
+exact safe sibling is instead the Windows replacement gap and must be moved
+forward to restore the target name. A wrong-type sibling, any target/sibling
+combination outside those closed rows, or an absent active index is a transaction
+conflict or lacks cleanup authority as specified above.
 Windows uses `FlushFileBuffers`; unsupported directory-sync operations are
 recorded but do not permit skipping file flushes. The raw final-video manifest
 SHA-256 plus its bound input-manifest fingerprint are the only evidence accepted
@@ -7116,6 +7251,9 @@ It is not a setting, saved mode, resume identity, or production branch.
    create/file sync/parent sync, target-descriptor temporary/final publication,
    encoding-input prepass partial/full-frame sync/reopen, final-video close and
    file fsync, every final-target adapter return before physical classification,
+   a post-boundary relaunch's FFmpeg close before its second replacement,
+   immediately before its second POSIX rename call, and after a second Windows
+   rename false/unchanged return but before classification,
    final-target replacement/gap before parent sync/reopen, encoding-input full-
    intent promotion/truncate/release/replacement and parent sync/reopen, final-
    manifest partial/full-frame sync/truncate/release/replacement, and that
@@ -7140,7 +7278,10 @@ It is not a setting, saved mode, resume identity, or production branch.
    the old trilogy byte-exact. Windows target-absent/sibling-present gaps both
    before and after input-manifest commit are explicitly post-boundary even when
    the API returned false and must forward-restore the final path before their
-   distinct phase recovery. Post-boundary outcomes retain
+   distinct phase recovery. A safe both-present retry pair is accepted only with
+   committed input plus final-manifest zero/partial, removes/syncs only the exact
+   indexed sibling, and reencodes; the same pair in every other phase conflicts.
+   Post-boundary outcomes retain
    the exact ordered
    fixed-path prefix: old/mixed all-present manifests audit as
    `publication_validation_failed`, a removed provisional manifest follows its
@@ -7203,9 +7344,14 @@ It is not a setting, saved mode, resume identity, or production branch.
    the target identity, changing one byte, changing its length, crossing triple
    nullability, or producing an unrepresentable/short streaming read fails before
    replacement; an old target larger than the new `payload_raw_max` is still
-   hashed and bound with O(1) resident state. The diagnostics generic raw hash
-   equals its special preflight hash. Every settings entry keeps the triple null
-   and instead passes its typed predecessor revision/raw-hash/content-fingerprint
+   hashed and bound with O(1) resident state. Preflight, descriptor construction,
+   and consumption each prove one exact serial
+   `FINAL_FIXED_TARGET_HASH_STREAM_BYTES` scan, checked byte accounting, final
+   same-handle restat, cancellation/I/O/short/extra-byte failure, buffer release,
+   and their isolated five-MiB phase peak; no scan overlaps index JSON,
+   descriptor, payload, or settings state. The diagnostics generic raw hash equals
+   its special preflight hash. Every settings entry keeps the triple null and
+   instead passes its typed predecessor revision/raw-hash/content-fingerprint
    transition fixtures.
    Maximum and one-byte-over job-control/settings-index
    fixtures prove the streaming six-MiB phase and raw caps without retaining two
@@ -7285,14 +7431,24 @@ It is not a setting, saved mode, resume identity, or production branch.
    inode is rejected. Windows fixtures require exactly 16 lowercase hex
    volume digits plus 32 file-ID digits in reservation, prune, and reclaim. They
    also prove every same-parent operation uses only
-   `SetFileInformationByHandle(FileRenameInfo)`, the persisted parent handle and
-   one-component UTF-16 target, `ReplaceIfExists=TRUE` for the initial replacement
-   and `FALSE` for create-new/gap recovery, exact zeroed buffer/size arithmetic,
-   and immediate false-return error capture; `ReplaceFileW`, `MoveFileExW`,
+   `SetFileInformationByHandle(FileRenameInfo)`, a fresh
+   `WindowsTargetParentHandleV1` matching the persisted parent identity, and one-
+   component UTF-16 target. Parent-handle fixtures assert `CreateFileW` with exact
+   `FILE_ADD_FILE|SYNCHRONIZE` desired access, full share mode,
+   `OPEN_EXISTING`, both required flags,
+   noninheritance/synchronous use, same-volume proof, and identity/type/reparse
+   attestation before and after every call; each forbidden access/share/flag or
+   identity-only handle fails without fallback. `ReplaceIfExists=TRUE` is used
+   for replacement and `FALSE` for create-new/gap recovery, with exact zeroed
+   buffer/size arithmetic and immediate false-return error capture;
+   `ReplaceFileW`, `MoveFileExW`,
    `FileRenameInfoEx`, and a backup name are never invoked. Injected true/false
-   returns separately classify unchanged, committed, target-absent gap, both-
-   present anomaly, wrong identity, and no-progress retry from actual reopened
-   paths/file IDs. Injected post-call flush/path-query failures preserve authority
+   returns separately classify the exact source/authorized-target unchanged pair,
+   committed, target-absent gap, every other both-present anomaly, wrong identity,
+   and no-progress retry from actual reopened paths/file IDs. The higher-level
+   state table accepts that unchanged pair as a disposable retry only in
+   `post_boundary_retry_sibling_present`. Injected post-call flush/path-query
+   failures preserve authority
    and force a fresh recovery classification rather than trusting the saved API
    result. Crashes occur after source flush, after the API return before
    classification, after forward gap restoration, after target flush, and before
@@ -7382,7 +7538,13 @@ It is not a setting, saved mode, resume identity, or production branch.
     not change the authoritative top-level zero/one result. Raw golden outputs
     from FFmpeg 5.x, 6.x, 7.1.5, and the project-resolved Windows distribution
     (currently n8.0.1-52-geef9672b02-20260203) all parse. Output-level
-    `-shortest` is absent.
+    `-shortest` is absent. Post-boundary relaunch fixtures independently make
+    `original_audio.flac` appear, make it disappear, replace bytes at the same
+    selected path, and change fresh sample-rate/channel results or the usable/
+    absent disposition between attempts. Each new attempt may derive a different
+    `SelectedAudioIdentityV1`,
+    but its own pre/post pair must match exactly and the final manifest must bind
+    the identity actually encoded.
 12. ffprobe fixtures reject extra/missing streams, dimensions, pixel format,
     codec, rational rate, frame count, non-1:1 SAR, missing or wrong reduced DAR,
     audio-token mismatch, and any full-decode error; nonempty garbage never
@@ -7463,7 +7625,8 @@ It is not a setting, saved mode, resume identity, or production branch.
     and `ENCODING_CONTROL_FRAME_CAP` prove O(1) provider state, exact streamed
     directory completeness, same-generation prepass/argv/postpass, and at most
     six MiB coordinator residency across the distinct manifest, audio-probe,
-    audio-decode, reservation-index, encode, final-probe, final-decode,
+    audio-decode, reservation-index, fixed-target-preflight, fixed-target-
+    descriptor, fixed-target-consumption, encode, final-probe, final-decode,
     job-control, replayable-settings-intent, producer-settings, pending-settings,
     and completion-settings phase peaks,
     including bounded parent-
@@ -7476,16 +7639,21 @@ It is not a setting, saved mode, resume identity, or production branch.
     payload extent, no per-chunk sync, and all three wall-time gates. Direct and
     assembled goldens also enter `input_manifest_committed_no_final_intent`,
     compare both pre/post passes against the committed target without recreating
-    an input extent, and reject one changed image/audio identity without changing
-    that target. They persist and execute
+    an input extent, reject one changed image against that target, and reject one
+    selected-audio change inside the same invocation without changing the target;
+    a fresh later invocation follows its separately tested selection rule. They
+    persist and execute
     `.depth-surge-final-v4-<complete-generation>.tmp.mp4`, bind its parent
     identity/final target, keep the component at 62 units beside a maximum
     240-unit final name, reject a pre-index collision and wrong path type, and
     never remove a lookalike or any such name without the active index. Crashes
     with unfinished or closed-unpublished media while the old target remains
-    delete/reencode in both cases rather than adopting bytes; the exact Windows
-    target-absent gap instead forward-restores that sibling and enters post-boundary manifest
-    recovery. The supported FFmpeg boundary fixture decodes indexes
+    delete/reencode in both cases rather than adopting bytes. The same crashes
+    beside a safe post-boundary target enter
+    `post_boundary_retry_sibling_present`, delete/sync the indexed sibling, and
+    reencode; the exact Windows target-absent gap instead forward-restores that
+    sibling and enters post-boundary manifest recovery. The supported FFmpeg
+    boundary fixture decodes indexes
     2,147,483,645..2,147,483,646 without error; checked U64 overflow, a two-frame
     range beginning at 2,147,483,646, and any endpoint at 2,147,483,647 fail
     before launch.
@@ -7904,7 +8072,12 @@ Approval of this canonical specification accepts:
     loss of the authorized old final target is the explicit irreversible
     boundary even when the Windows API returned failure: an active final index
     owns only the ordered manifest prefix, and terminal failure preserves the
-    actual paths for the closed audit matrix rather than promising rollback. The
+    actual paths for the closed audit matrix rather than promising rollback. A
+    both-present target/retry-sibling pair is legal only with committed input and
+    zero/partial final-manifest source; it removes the indexed sibling and
+    reencodes rather than adopting unbound media. Each such relaunch selects and
+    probes audio afresh into an invocation-local identity which must match only
+    its own postpass; no lost prior-attempt audio choice is invented. The
     project writer lock
     excludes internal mutation; external ABA mutation is explicitly outside the
     transaction trust model. Frame identities use only canonical minimal-padded
@@ -7940,8 +8113,9 @@ Approval of this canonical specification accepts:
     authority over the older Direct VR transaction rules. Direct and assembled
     sources use one O(1) replayable encoding provider under an eight-MiB
     coordinator cap which includes bounded parent-process output and parser
-    state for source-audio probe/decode, final validation, and every settings
-    commit. Legal FFprobe section wrappers never override authoritative top-level
+    state for source-audio probe/decode, all three fixed-target hash phases, final
+    validation, and every settings commit. Legal FFprobe section wrappers never
+    override authoritative top-level
     streams; final probe has a video/audio/byte-work-derived deadline and full
     decode has a semantic-progress stall deadline, while the publishing encoder
     has its own semantic-progress stall deadline. One closed settings schema,
@@ -7969,11 +8143,14 @@ Approval of this canonical specification accepts:
     reopens first, permits one same-length truncate retry, and otherwise remains
     incomplete without destroying semantic intent. Every fixed-artifact
     `replace_existing` target is write-ahead-bound by its preflight identity,
-    byte count, and raw hash in both index and descriptor; evolving settings
-    targets instead use their typed predecessor transition. Windows publication
-    uses only the frozen handle-relative `FileRenameInfo` adapter, reclassifies
-    physical path/file-ID state after every return, and forward-recovers an exact
-    target-absent gap without claiming the old artifact survives. Final
+    byte count, and raw hash in both index and descriptor; each of its three full
+    scans owns one isolated fixed one-MiB stream and no overlapping JSON/payload
+    state. Evolving settings targets instead use their typed predecessor
+    transition. Windows publication uses only the frozen handle-relative
+    `FileRenameInfo` adapter with the exact `WindowsTargetParentHandleV1`,
+    reclassifies parent and child path/file-ID state after every return, and
+    forward-recovers an exact target-absent gap without claiming the old artifact
+    survives. Final
     retirement removes/syncs all descriptors before the final index. Stage-04
     never pays for future payload-pruned metadata. Linux destructive mutation
     additionally requires the bounded no-dependency UUID/file-handle capability
