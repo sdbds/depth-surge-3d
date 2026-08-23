@@ -29,11 +29,11 @@
 - Create: `scripts/run_quality_task0.py`
 - Create: `tests/unit/test_quality_task0_reporting.py`
 
-- [ ] Add RED tests for canonical JSON, exact run descriptors, process RSS sampling, checked uint64 counters, CPU/CUDA context labels, and fail-closed incomplete reports.
-- [ ] Implement deterministic report construction and atomic report publication without importing production Quality code.
-- [ ] Add CLI selection for individual gates and the complete suite; reject unknown or duplicate gate names.
-- [ ] Record commit, dirty diff hash, Python/NumPy/Torch/OpenCV versions, platform, device context, wall time, peak RSS, exact arena bytes, visit totals/max/p95, and equality hashes.
-- [ ] Verify the report reader rejects missing runs, noncanonical JSON, cap failures mislabeled as success, and reports produced from a different source diff.
+- [x] Add RED tests for canonical JSON, exact run descriptors, process RSS sampling, checked uint64 counters, CPU/CUDA context labels, and fail-closed incomplete reports.
+- [x] Implement deterministic report construction and atomic report publication without importing production Quality code.
+- [x] Add CLI selection for individual gates and the complete suite; reject unknown or duplicate gate names.
+- [x] Record commit, dirty diff hash, Python/NumPy/Torch/OpenCV versions, platform, device context, wall time, peak RSS, exact arena bytes, visit totals/max/p95, and equality hashes.
+- [x] Verify the report reader rejects missing runs, noncanonical JSON, cap failures mislabeled as success, and reports produced from a different source diff.
 
 ### Task 0.2: Deterministic Per-region Implicit K-d Index
 
