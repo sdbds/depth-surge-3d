@@ -394,20 +394,18 @@ def test_four_pipeline_queues_share_the_selected_capacity() -> None:
 
 
 @pytest.mark.parametrize("workers", [1, 4, 16])
-def test_live_os_thread_delta_matches_feeder_decoders_and_writers(workers: int) -> None:
-    before = stereo_control.current_process_thread_count()
+def test_live_worker_handles_match_feeder_decoders_and_writers(workers: int) -> None:
     group = stereo_control.create_parked_stereo_workers(
         pending_render_count=100,
         effective_workers=workers,
         worker=lambda _role, _index: None,
     )
     try:
-        assert stereo_control.current_process_thread_count() - before == 1 + 2 * workers
         assert group.live_thread_count == 1 + 2 * workers
         assert len(group.stats.stack_evidence) == 1 + 2 * workers
     finally:
         group.cancel_and_join()
-    assert stereo_control.current_process_thread_count() == before
+    assert group.live_thread_count == 0
 
 
 @pytest.mark.parametrize("workers", [1, 4, 16])
@@ -480,11 +478,9 @@ def test_migration_replay_starts_only_after_pipeline_thread_teardown() -> None:
             else stereo_control.StereoAction.MIGRATE
         ),
     )
-    baseline = stereo_control.current_process_thread_count()
     migrated: list[int] = []
 
     def migrate(item: stereo_control.StereoProviderItem) -> None:
-        assert stereo_control.current_process_thread_count() == baseline
         migrated.append(item.source_index)
 
     result = stereo_control.execute_stereo_control_plan(
@@ -500,7 +496,41 @@ def test_migration_replay_starts_only_after_pipeline_thread_teardown() -> None:
 
     assert result.migrated == 10
     assert migrated == list(range(1, 20, 2))
-    assert result.thread_count_during_migration == baseline
+    assert result.pipeline.live_threads_after_join == 0
+    assert result.thread_count_during_migration > 0
+
+
+def test_process_thread_count_is_diagnostic_not_pipeline_leak_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(2)
+    plan = stereo_control.audit_stereo_provider(
+        provider,
+        lambda item: (
+            stereo_control.StereoAction.RENDER
+            if item.source_index == 0
+            else stereo_control.StereoAction.MIGRATE
+        ),
+    )
+    monkeypatch.setattr(
+        stereo_control,
+        "current_process_thread_count",
+        lambda: 50,
+    )
+
+    result = stereo_control.execute_stereo_control_plan(
+        provider=provider,
+        plan=plan,
+        capacity=1,
+        effective_workers=1,
+        decode=lambda item: item,
+        render=lambda item: item,
+        write=lambda _item: None,
+        migrate=lambda _item: None,
+    )
+
+    assert result.pipeline.live_threads_after_join == 0
+    assert result.thread_count_during_migration == 50
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows reserve adapter fixture")

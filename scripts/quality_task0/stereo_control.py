@@ -795,6 +795,7 @@ class StreamingStereoPipelineStats:
     decoder_writer_overlap: bool
     work_item_copies: int
     parked_committed_delta_bytes: int
+    live_threads_after_join: int
 
 
 @dataclass(frozen=True)
@@ -876,6 +877,7 @@ def run_streaming_stereo_pipeline(  # noqa: C901
             False,
             0,
             0,
+            0,
         )
     if capacity <= 0 or effective_workers <= 0:
         raise ValueError("nonzero render work requires positive capacity and workers")
@@ -885,7 +887,6 @@ def run_streaming_stereo_pipeline(  # noqa: C901
     permits = threading.BoundedSemaphore(capacity)
     trace = _StreamingTrace()
     pipeline_cancel = threading.Event()
-    before_threads = current_process_thread_count()
 
     def validate_handoff(item: StereoProviderItem) -> None:
         _validate_provider_item(item, plan.generation, item.source_index)
@@ -975,7 +976,7 @@ def run_streaming_stereo_pipeline(  # noqa: C901
         effective_workers=effective_workers,
         worker=worker,
     )
-    actual_threads = current_process_thread_count() - before_threads
+    actual_threads = group.live_thread_count
     parked_committed_delta = max(0, current_process_committed_bytes() - before_committed)
     rendered = 0
     completions = 0
@@ -1017,6 +1018,7 @@ def run_streaming_stereo_pipeline(  # noqa: C901
             queues.write_completions.task_done()
             completions += 1
         group.join()
+        live_threads_after_join = group.live_thread_count
     except BaseException:
         pipeline_cancel.set()
         group.cancel_and_join()
@@ -1036,6 +1038,7 @@ def run_streaming_stereo_pipeline(  # noqa: C901
         decoder_writer_overlap=trace.decoder_writer_overlap,
         work_item_copies=0,
         parked_committed_delta_bytes=parked_committed_delta,
+        live_threads_after_join=live_threads_after_join,
     )
 
 
@@ -1052,7 +1055,6 @@ def execute_stereo_control_plan(
 ) -> StereoControlExecutionStats:
     """Run P, join all threads, then replay R synchronously."""
 
-    baseline_threads = current_process_thread_count()
     pipeline = run_streaming_stereo_pipeline(
         provider=provider,
         plan=plan,
@@ -1063,12 +1065,12 @@ def execute_stereo_control_plan(
         write=write,
     )
     migration_threads = current_process_thread_count()
-    if migration_threads != baseline_threads:
+    if pipeline.live_threads_after_join != 0:
         raise StereoThreadBudgetError(
             "teardown",
             "pipeline threads remain live before migration",
             pipeline.actual_thread_count,
-            pipeline.actual_thread_count - (migration_threads - baseline_threads),
+            pipeline.actual_thread_count - pipeline.live_threads_after_join,
         )
     migrated = 0
     for item in iter_stereo_action(provider, plan, StereoAction.MIGRATE):
