@@ -1,0 +1,51 @@
+"""Python boundary for the prebuilt native RGB geodesic solver."""
+
+from __future__ import annotations
+
+import numpy as np
+
+from . import native_kd, region_solver
+from .indexed_heap import QualityRegionQueueBudgetError
+
+
+def solve_native_geodesic_regions(
+    guide: np.ndarray,
+    band_mask: np.ndarray,
+    seed_region_map: np.ndarray,
+    region_rank_bits: np.ndarray,
+) -> region_solver.GeodesicSolveResult:
+    """Assign a full render band using the build-time native indexed heap."""
+
+    region_solver._validate_solver_inputs(
+        guide,
+        band_mask,
+        seed_region_map,
+        region_rank_bits,
+    )
+    native = native_kd._require_native()
+    try:
+        owner, distance, position, statistics = native.solve_geodesic_regions(
+            guide,
+            band_mask,
+            seed_region_map,
+            region_rank_bits,
+        )
+    except RuntimeError as error:
+        if "quality region queue" in str(error):
+            raise QualityRegionQueueBudgetError(str(error)) from error
+        raise
+    for values in (owner, distance, position):
+        values.setflags(write=False)
+    return region_solver.GeodesicSolveResult(
+        region_map=owner,
+        distance=distance,
+        heap_position=position,
+        max_live_entries=int(statistics["max_live_entries"]),
+        settled_count=int(statistics["settled_count"]),
+        queue_insertions=int(statistics["queue_insertions"]),
+        queue_decrease_keys=int(statistics["queue_decrease_keys"]),
+        queue_pops=int(statistics["queue_pops"]),
+        heap_pixel_bytes=int(statistics["heap_pixel_bytes"]),
+        heap_position_bytes=int(position.nbytes),
+        distance_bytes=int(distance.nbytes),
+    )

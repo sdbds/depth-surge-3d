@@ -1,0 +1,65 @@
+name: Quality Native Wheels
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build-native-wheel:
+    name: ${{ matrix.runner }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, ubuntu-24.04, ubuntu-24.04-arm]
+        python: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install native build toolchain
+        run: >-
+          python -m pip install --upgrade
+          pip hatchling "setuptools>=84" "numpy>=1.24,<2" "torch==2.13.0"
+
+      - name: Build platform wheel
+        run: python -m hatchling build -t wheel -d dist
+
+      - name: Verify prebuilt extension contract
+        shell: python
+        run: |
+          import pathlib
+          import sys
+          import zipfile
+
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          target = pathlib.Path("wheel-smoke")
+          with zipfile.ZipFile(wheel) as archive:
+              archive.extractall(target)
+          sys.path.insert(0, str(target.resolve()))
+          import _quality_kd_native as native
+
+          info = native.build_info()
+          assert info["runtime_jit"] is False
+          assert info["kd_stack_capacity"] == 64
+          assert info["algorithm"] == (
+              "quality-implicit-region-kd-median-of-medians-v1"
+          )
+
+      - name: Upload prebuilt wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-native-${{ runner.os }}-${{ runner.arch }}-py${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error

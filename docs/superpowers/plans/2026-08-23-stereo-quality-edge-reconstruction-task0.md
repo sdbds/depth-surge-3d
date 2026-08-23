@@ -57,12 +57,12 @@
 - Create: `scripts/quality_task0/region_solver.py`
 - Create: `tests/unit/test_quality_task0_region_solver.py`
 
-- [ ] Add a scalar four-neighbour Dijkstra oracle with the exact BGR movement cost, seed ownership, and priority tuple.
-- [ ] Add RED tests for one live entry per unsettled pixel, indexed decrease-key, heap-position sentinels, neighbour order, equal-cost owner ties, and capacity/inconsistent-position failures.
-- [ ] Implement fixed `uint32` heap storage plus dense `int32` position state without stale duplicate pushes.
-- [ ] Add RED fixtures for a movable clean edge, competing highlight/fringe/true edge, disconnected validity, flat-colour geometry partition, and global components crossing synthetic band boundaries.
-- [ ] Implement low-resolution canonical regions, explicit half-pixel nearest labels, boundary dilation, erosion/skeleton seeds, and the global integer geodesic solve.
-- [ ] Assert exact equality with the scalar oracle and record live heap maximum, exact bytes, and queue operations.
+- [x] Add a scalar four-neighbour Dijkstra oracle with the exact BGR movement cost, seed ownership, and priority tuple.
+- [x] Add RED tests for one live entry per unsettled pixel, indexed decrease-key, heap-position sentinels, neighbour order, equal-cost owner ties, and capacity/inconsistent-position failures.
+- [x] Implement fixed `uint32` heap storage plus dense `int32` position state without stale duplicate pushes.
+- [x] Add RED fixtures for a movable clean edge, competing highlight/fringe/true edge, disconnected validity, flat-colour geometry partition, and global components crossing synthetic band boundaries.
+- [x] Implement low-resolution canonical regions, explicit half-pixel nearest labels, boundary dilation, erosion/skeleton seeds, and the global integer geodesic solve.
+- [x] Assert exact equality with the scalar oracle and record live heap maximum, exact bytes, and queue operations.
 
 ### Task 0.4: Repair Records, Local Oracle, And Shared Budgets
 
