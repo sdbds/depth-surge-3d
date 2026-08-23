@@ -162,7 +162,7 @@ feat: promote quality geometry native core
 - Produces: `plan_quality_repairs(analysis, *, render_shape, local_limit_px, budgets) -> QualityRepairPlan`.
 - Produces: a final sorted 16-byte record table with backend values 1/2/3 and immutable scalar diagnostics.
 
-- [ ] **Step 1: Add RED production parity and global-component tests**
+- [x] **Step 1: Add RED production parity and global-component tests**
 
 ```python
 def test_repair_plan_covers_every_invalid_lane_once(pass_a_fixture):
@@ -173,23 +173,23 @@ def test_repair_plan_covers_every_invalid_lane_once(pass_a_fixture):
 
 Cover equal-depth splits, cross-band components, local direction, safe donors, shared left/right budgets, exemplar exhaustion, no-donor failure, and fallback visit overflow.
 
-- [ ] **Step 2: Run tests and confirm planner import fails**
+- [x] **Step 2: Run tests and confirm planner import fails**
 
 Run: `python -m pytest tests/unit/test_quality_production_repair.py -q`
 
-- [ ] **Step 3: Promote the gate-proven repair modules**
+- [x] **Step 3: Promote the gate-proven repair modules**
 
 Keep record dtype offsets `0,4,6,10,13,14,15`, record/graph/repair arena caps at 64 MiB each, and the exact local/exemplar/fallback budget order.
 
-- [ ] **Step 4: Implement the global sparse component coordinator**
+- [x] **Step 4: Implement the global sparse component coordinator**
 
 `planner.py` sorts records, performs exact horizontal/vertical/in-pixel unions, streams canonical component ranges, calls local then fallback-precompute then exemplar, finalizes fallback, and returns aggregate counters without a dense repair map.
 
-- [ ] **Step 5: Run repair tests and Task 0 oracle tests together**
+- [x] **Step 5: Run repair tests and Task 0 oracle tests together**
 
 Run: `python -m pytest tests/unit/test_quality_production_repair.py tests/unit/test_quality_task0_local_strip.py tests/unit/test_quality_task0_fallback.py tests/unit/test_quality_task0_exemplar.py -q`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```text
 feat: add bounded quality repair planner
