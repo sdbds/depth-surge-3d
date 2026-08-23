@@ -1333,7 +1333,9 @@ def run_case_subprocess(  # noqa: C901
                 reporting.read_process_tree_rss_bytes(process.pid),
             )
             time.sleep(0.002)
-        go_file.write_bytes(b"go")
+        go_temporary = go_file.with_name(f".{go_file.name}.tmp")
+        go_temporary.write_bytes(b"go")
+        os.replace(go_temporary, go_file)
         peak_rss = process_tree_baseline_rss
         while process.poll() is None:
             try:
