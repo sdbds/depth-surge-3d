@@ -74,6 +74,20 @@ def test_visit_p95_uses_exact_nearest_rank_without_float_percentile_workspace() 
         benchmarks.visit_p95_nearest_rank(np.asarray([], dtype=np.uint32))
 
 
+def test_full_grid_oracle_resolves_half_pixel_ties_to_lower_coordinates() -> None:
+    target_y = np.asarray([0.5, 1.5, 1.5000000000000002], dtype=np.float64)
+    target_x = np.asarray([0.5, 0.0, 0.5], dtype=np.float64)
+
+    sample_indices = benchmarks.full_grid_nearest_sample_indices(
+        target_y,
+        target_x,
+        height=4,
+        width=3,
+    )
+
+    assert sample_indices.tolist() == [0, 3, 6]
+
+
 def test_4k_fallback_stripes_leave_a_full_safe_donor_support() -> None:
     period, hole_width = benchmarks.fallback_stripe_geometry(
         edge_percent=25,
@@ -164,12 +178,13 @@ def test_over_cap_worker_evidence_is_failed_instead_of_mislabeled_passed() -> No
         equality_sha256="01" * 32,
         facts={"phase": "runtime"},
         baseline_rss_bytes=100,
+        phase_wall_time_ns=1,
     )
 
     descriptor = benchmarks.finalize_worker_descriptor(
         case,
         result,
-        wall_time_ns=1,
+        process_wall_time_ns=2,
         process_tree_peak_rss_bytes=benchmarks.HOST_RSS_CAP_BYTES + 101,
     )
 
@@ -196,19 +211,55 @@ def test_runtime_baseline_is_not_charged_to_the_quality_phase_cap() -> None:
         equality_sha256="01" * 32,
         facts={"phase": "runtime"},
         baseline_rss_bytes=baseline,
+        phase_wall_time_ns=123,
     )
 
     descriptor = benchmarks.finalize_worker_descriptor(
         case,
         result,
-        wall_time_ns=1,
+        process_wall_time_ns=999,
         process_tree_peak_rss_bytes=baseline + 8 * 1024 * 1024,
     )
 
     assert descriptor.status == "passed"
+    assert descriptor.wall_time_ns == 123
+    assert descriptor.facts["process_wall_time_ns"] == 999
     assert descriptor.peak_rss_bytes == 8 * 1024 * 1024
     assert descriptor.facts["rss_measurement"] == "process-tree-peak-minus-baseline-v1"
     assert descriptor.facts["rss_cap_exceeded"] is False
+
+
+def test_geometry_phase_over_thirty_seconds_is_failed() -> None:
+    case = benchmarks.BenchmarkCase.create(
+        run_id="geometry.cpu.slow",
+        gate="geometry-scale",
+        case="slow",
+        device_context="cpu",
+        operation="geometry",
+        parameters={},
+    )
+    result = benchmarks.WorkerResult(
+        status="passed",
+        arena_bytes=0,
+        visit_total=0,
+        visit_max=0,
+        visit_p95=0,
+        equality_sha256="01" * 32,
+        facts={},
+        baseline_rss_bytes=100,
+        phase_wall_time_ns=30_000_000_001,
+    )
+
+    descriptor = benchmarks.finalize_worker_descriptor(
+        case,
+        result,
+        process_wall_time_ns=31_000_000_000,
+        process_tree_peak_rss_bytes=101,
+    )
+
+    assert descriptor.status == "failed"
+    assert descriptor.facts["wall_cap_ns"] == 30_000_000_000
+    assert descriptor.facts["wall_cap_exceeded"] is True
 
 
 @pytest.mark.parametrize(

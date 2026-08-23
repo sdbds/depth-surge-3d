@@ -204,6 +204,7 @@ class WorkerResult:
     equality_sha256: str
     facts: dict
     baseline_rss_bytes: int = 0
+    phase_wall_time_ns: int = 0
 
     def to_object(self) -> dict:
         return {
@@ -215,6 +216,7 @@ class WorkerResult:
             "equality_sha256": self.equality_sha256,
             "facts": self.facts,
             "baseline_rss_bytes": self.baseline_rss_bytes,
+            "phase_wall_time_ns": self.phase_wall_time_ns,
         }
 
     @classmethod
@@ -228,6 +230,7 @@ class WorkerResult:
             "equality_sha256",
             "facts",
             "baseline_rss_bytes",
+            "phase_wall_time_ns",
         }
         if not isinstance(value, dict) or set(value) != expected:
             raise BenchmarkExecutionError("benchmark worker result schema is invalid")
@@ -239,6 +242,7 @@ class WorkerResult:
             "visit_max",
             "visit_p95",
             "baseline_rss_bytes",
+            "phase_wall_time_ns",
         ):
             reporting.checked_u64(value[key], key)
         if not isinstance(value["equality_sha256"], str) or len(value["equality_sha256"]) != 64:
@@ -252,6 +256,7 @@ class WorkerResult:
             equality_sha256=value["equality_sha256"],
             facts=value["facts"],
             baseline_rss_bytes=value["baseline_rss_bytes"],
+            phase_wall_time_ns=value["phase_wall_time_ns"],
         )
 
 
@@ -498,6 +503,29 @@ def visit_p95_nearest_rank(visits: np.ndarray) -> int:
     raise AssertionError("visit histogram did not reach its population")
 
 
+def full_grid_nearest_sample_indices(
+    target_y: np.ndarray,
+    target_x: np.ndarray,
+    *,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    if (
+        target_y.dtype != np.float64
+        or target_x.dtype != np.float64
+        or target_y.ndim != 1
+        or target_x.shape != target_y.shape
+    ):
+        raise TypeError("full-grid targets must be matching one-dimensional float64 arrays")
+    if height <= 0 or width <= 0 or height * width > implicit_kd.UINT32_MAX:
+        raise ValueError("full-grid shape is outside the uint32 sample-index contract")
+    rows = np.ceil(target_y - np.float64(0.5)).astype(np.int64)
+    columns = np.ceil(target_x - np.float64(0.5)).astype(np.int64)
+    np.clip(rows, 0, height - 1, out=rows)
+    np.clip(columns, 0, width - 1, out=columns)
+    return (rows * width + columns).astype(np.uint32)
+
+
 def _hash_arrays(*values: np.ndarray) -> str:
     digest = hashlib.sha256()
     for value in values:
@@ -569,14 +597,13 @@ def _geometry_worker(case: BenchmarkCase) -> WorkerResult:
     sample_positions = np.unique(
         np.linspace(0, query_count - 1, min(query_count, 4096), dtype=np.int64)
     )
-    expected_rows = np.floor(target_y[sample_positions] + np.float64(0.5)).astype(np.int64)
-    expected_columns = np.floor(target_x[sample_positions] + np.float64(0.5)).astype(np.int64)
-    np.clip(expected_rows, 0, geometry_height - 1, out=expected_rows)
-    np.clip(expected_columns, 0, geometry_width - 1, out=expected_columns)
-    expected_samples = expected_rows * geometry_width + expected_columns
-    if not np.array_equal(
-        result.sample_index[sample_positions], expected_samples.astype(np.uint32)
-    ):
+    expected_samples = full_grid_nearest_sample_indices(
+        target_y[sample_positions],
+        target_x[sample_positions],
+        height=geometry_height,
+        width=geometry_width,
+    )
+    if not np.array_equal(result.sample_index[sample_positions], expected_samples):
         raise BenchmarkExecutionError("native geometry differs from the full-grid closed form")
     visits = result.visited_nodes
     visit_total = int(visits.sum(dtype=np.uint64))
@@ -1206,9 +1233,12 @@ def execute_worker_case(case: BenchmarkCase) -> WorkerResult:
         _prepare_worker_case(case)
         gc.collect()
         baseline_rss_bytes = reporting.read_process_rss_bytes(os.getpid())
+        started = time.perf_counter_ns()
+        result = operations[case.operation](case)
         return replace(
-            operations[case.operation](case),
+            result,
             baseline_rss_bytes=baseline_rss_bytes,
+            phase_wall_time_ns=time.perf_counter_ns() - started,
         )
     raise BenchmarkExecutionError(f"benchmark operation is not implemented: {case.operation}")
 
@@ -1235,7 +1265,7 @@ def run_case_subprocess(  # noqa: C901
         owned_temp = tempfile.TemporaryDirectory(prefix="quality-task0-case-")
         case_file = Path(owned_temp.name) / "case.json"
         case_file.write_bytes(reporting.canonical_json_bytes(case.to_object()))
-    started = time.monotonic_ns()
+    started = time.perf_counter_ns()
     process = subprocess.Popen(
         [sys.executable, "-m", "scripts.quality_task0.benchmarks", "--worker-case", str(case_file)],
         cwd=root,
@@ -1260,7 +1290,7 @@ def run_case_subprocess(  # noqa: C901
             process.wait()
         if owned_temp is not None:
             owned_temp.cleanup()
-    wall_time = time.monotonic_ns() - started
+    wall_time = time.perf_counter_ns() - started
     if len(stdout) > 1024 * 1024 or len(stderr) > 1024 * 1024:
         raise BenchmarkExecutionError("benchmark worker output exceeds one MiB")
     if process.returncode != 0:
@@ -1276,7 +1306,7 @@ def run_case_subprocess(  # noqa: C901
     return finalize_worker_descriptor(
         case,
         result,
-        wall_time_ns=wall_time,
+        process_wall_time_ns=wall_time,
         process_tree_peak_rss_bytes=peak_rss,
     )
 
@@ -1285,7 +1315,7 @@ def finalize_worker_descriptor(
     case: BenchmarkCase,
     result: WorkerResult,
     *,
-    wall_time_ns: int,
+    process_wall_time_ns: int,
     process_tree_peak_rss_bytes: int,
 ) -> reporting.GateRunDescriptor:
     baseline = result.baseline_rss_bytes
@@ -1293,23 +1323,33 @@ def finalize_worker_descriptor(
         raise BenchmarkExecutionError("worker did not record a positive process RSS baseline")
     if process_tree_peak_rss_bytes < baseline:
         raise BenchmarkExecutionError("process-tree RSS peak is below the worker baseline")
+    if process_wall_time_ns < result.phase_wall_time_ns:
+        raise BenchmarkExecutionError(
+            "worker phase wall time is outside the process wall time: "
+            f"phase={result.phase_wall_time_ns}, process={process_wall_time_ns}"
+        )
     phase_peak_rss_bytes = process_tree_peak_rss_bytes - baseline
     cap_exceeded = phase_peak_rss_bytes > HOST_RSS_CAP_BYTES
+    wall_cap_ns = 30_000_000_000 if case.operation in {"geometry", "region", "fallback"} else None
+    wall_cap_exceeded = wall_cap_ns is not None and result.phase_wall_time_ns > wall_cap_ns
     facts = {
         **result.facts,
+        "process_wall_time_ns": process_wall_time_ns,
         "process_baseline_rss_bytes": baseline,
         "process_tree_peak_rss_bytes": process_tree_peak_rss_bytes,
         "rss_measurement": "process-tree-peak-minus-baseline-v1",
         "rss_cap_exceeded": cap_exceeded,
+        "wall_cap_ns": wall_cap_ns,
+        "wall_cap_exceeded": wall_cap_exceeded,
     }
-    status: reporting.RunStatus = "failed" if cap_exceeded else result.status
+    status: reporting.RunStatus = "failed" if cap_exceeded or wall_cap_exceeded else result.status
     return reporting.GateRunDescriptor.create(
         run_id=case.run_id,
         gate=case.gate,
         case=case.case,
         device_context=case.device_context,
         status=status,
-        wall_time_ns=wall_time_ns,
+        wall_time_ns=result.phase_wall_time_ns,
         peak_rss_bytes=phase_peak_rss_bytes,
         rss_cap_bytes=HOST_RSS_CAP_BYTES,
         arena_bytes=result.arena_bytes,

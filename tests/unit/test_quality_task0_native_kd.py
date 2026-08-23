@@ -73,6 +73,17 @@ def test_native_build_is_byte_exact_with_python_oracle(
     assert not actual.region_offsets.flags.writeable
 
 
+def test_native_optimized_large_build_is_byte_exact_with_python_oracle() -> None:
+    rows, columns = np.indices((19, 23), dtype=np.uint32)
+    region_ids = ((rows + 2 * columns) % 3 + 1).astype(np.uint32)
+
+    expected = implicit_kd.build_implicit_region_kd(region_ids, region_count=3)
+    actual = _api("build_native_implicit_region_kd")(region_ids, region_count=3)
+
+    assert np.array_equal(actual.member_index, expected.member_index)
+    assert np.array_equal(actual.region_offsets, expected.region_offsets)
+
+
 def test_native_build_rejects_noncanonical_inputs_before_native_mutation() -> None:
     build_native = _api("build_native_implicit_region_kd")
 

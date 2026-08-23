@@ -19,6 +19,53 @@ namespace {
 constexpr std::size_t kStackCapacity = 64;
 constexpr std::uint64_t kUint32Max = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint64_t kRepairRecordCap = (64ULL * 1024ULL * 1024ULL) / 16ULL;
+constexpr std::uint8_t kDividerAddMarker = 0x40;
+
+class U32Divider {
+public:
+    explicit U32Divider(std::uint32_t divisor) {
+        std::uint8_t floor_log_2 = 0;
+        for (std::uint32_t value = divisor; value > 1; value >>= 1) {
+            ++floor_log_2;
+        }
+        if ((divisor & (divisor - 1)) == 0) {
+            more_ = floor_log_2;
+            return;
+        }
+        const std::uint64_t numerator = 1ULL << (32 + floor_log_2);
+        std::uint32_t proposed_magic = static_cast<std::uint32_t>(numerator / divisor);
+        const std::uint32_t remainder = static_cast<std::uint32_t>(numerator % divisor);
+        if (divisor - remainder < (1U << floor_log_2)) {
+            more_ = floor_log_2;
+        } else {
+            proposed_magic += proposed_magic;
+            const std::uint32_t twice_remainder = remainder + remainder;
+            if (twice_remainder >= divisor || twice_remainder < remainder) {
+                ++proposed_magic;
+            }
+            more_ = static_cast<std::uint8_t>(floor_log_2 | kDividerAddMarker);
+        }
+        magic_ = proposed_magic + 1;
+    }
+
+    inline std::uint32_t divide(std::uint32_t numerator) const {
+        if (magic_ == 0) {
+            return numerator >> more_;
+        }
+        const std::uint32_t quotient = static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(magic_) * numerator) >> 32
+        );
+        const std::uint8_t shift = static_cast<std::uint8_t>(more_ & 0x1f);
+        if ((more_ & kDividerAddMarker) != 0) {
+            return (((numerator - quotient) >> 1) + quotient) >> shift;
+        }
+        return quotient >> shift;
+    }
+
+private:
+    std::uint32_t magic_ = 0;
+    std::uint8_t more_ = 0;
+};
 
 struct BuildFrame {
     std::uint32_t start;
@@ -58,42 +105,15 @@ struct GeometryBest {
     std::uint32_t sample_index = 0;
 };
 
-bool key_less(
-    std::uint32_t left,
-    std::uint32_t right,
-    std::uint32_t width,
-    std::uint8_t axis
-) {
-    if (axis == 0) {
-        return left < right;
-    }
-    const std::uint32_t left_x = left % width;
-    const std::uint32_t right_x = right % width;
-    if (left_x != right_x) {
-        return left_x < right_x;
-    }
-    const std::uint32_t left_y = left / width;
-    const std::uint32_t right_y = right / width;
-    if (left_y != right_y) {
-        return left_y < right_y;
-    }
-    return left < right;
-}
-
-void insertion_sort(
+void insertion_sort_numeric(
     std::uint32_t* members,
     std::uint32_t left,
-    std::uint32_t right,
-    std::uint32_t width,
-    std::uint8_t axis
+    std::uint32_t right
 ) {
     for (std::uint32_t cursor = left + 1; cursor <= right; ++cursor) {
         const std::uint32_t value = members[cursor];
         std::uint32_t destination = cursor;
-        while (
-            destination > left &&
-            key_less(value, members[destination - 1], width, axis)
-        ) {
+        while (destination > left && value < members[destination - 1]) {
             members[destination] = members[destination - 1];
             --destination;
         }
@@ -101,19 +121,41 @@ void insertion_sort(
     }
 }
 
-std::uint32_t partition_about(
+inline void compare_swap_numeric(std::uint32_t& left, std::uint32_t& right) {
+    if (right < left) {
+        std::swap(left, right);
+    }
+}
+
+std::uint32_t median_of_five_numeric(const std::uint32_t* values) {
+    std::uint32_t a = values[0];
+    std::uint32_t b = values[1];
+    std::uint32_t c = values[2];
+    std::uint32_t d = values[3];
+    std::uint32_t e = values[4];
+    compare_swap_numeric(a, b);
+    compare_swap_numeric(d, e);
+    compare_swap_numeric(c, e);
+    compare_swap_numeric(c, d);
+    compare_swap_numeric(b, e);
+    compare_swap_numeric(a, d);
+    compare_swap_numeric(a, c);
+    compare_swap_numeric(b, d);
+    compare_swap_numeric(b, c);
+    return c;
+}
+
+std::uint32_t partition_about_numeric(
     std::uint32_t* members,
     std::uint32_t left,
     std::uint32_t right,
-    std::uint32_t pivot_index,
-    std::uint32_t width,
-    std::uint8_t axis
+    std::uint32_t pivot_index
 ) {
     const std::uint32_t pivot = members[pivot_index];
     std::swap(members[pivot_index], members[right]);
     std::uint32_t destination = left;
     for (std::uint32_t cursor = left; cursor < right; ++cursor) {
-        if (key_less(members[cursor], pivot, width, axis)) {
+        if (members[cursor] < pivot) {
             std::swap(members[destination], members[cursor]);
             ++destination;
         }
@@ -122,27 +164,23 @@ std::uint32_t partition_about(
     return destination;
 }
 
-void select_kth(
+void select_kth_numeric(
     std::uint32_t* members,
     std::uint32_t left,
     std::uint32_t right,
     std::uint32_t kth,
-    std::uint32_t width,
-    std::uint8_t axis,
     std::uint8_t selection_depth
 );
 
-std::uint32_t median_of_medians(
+std::uint32_t median_of_medians_numeric(
     std::uint32_t* members,
     std::uint32_t left,
     std::uint32_t right,
-    std::uint32_t width,
-    std::uint8_t axis,
     std::uint8_t selection_depth
 ) {
     const std::uint32_t size = right - left + 1;
     if (size <= 5) {
-        insertion_sort(members, left, right, width, axis);
+        insertion_sort_numeric(members, left, right);
         return left + ((size - 1) / 2);
     }
     if (selection_depth >= kStackCapacity) {
@@ -153,8 +191,16 @@ std::uint32_t median_of_medians(
     for (std::uint32_t group_start = left; group_start <= right;) {
         const std::uint32_t remaining = right - group_start;
         const std::uint32_t group_end = group_start + (remaining < 4 ? remaining : 4);
-        insertion_sort(members, group_start, group_end, width, axis);
-        const std::uint32_t group_median = group_start + ((group_end - group_start) / 2);
+        std::uint32_t group_median = group_start;
+        if (remaining >= 4) {
+            const std::uint32_t median_value = median_of_five_numeric(members + group_start);
+            while (members[group_median] != median_value) {
+                ++group_median;
+            }
+        } else {
+            insertion_sort_numeric(members, group_start, group_end);
+            group_median = group_start + ((group_end - group_start) / 2);
+        }
         std::swap(members[median_end], members[group_median]);
         ++median_end;
         if (remaining < 5) {
@@ -164,37 +210,40 @@ std::uint32_t median_of_medians(
     }
 
     const std::uint32_t median_kth = left + ((median_end - left - 1) / 2);
-    select_kth(
+    select_kth_numeric(
         members,
         left,
         median_end - 1,
         median_kth,
-        width,
-        axis,
         static_cast<std::uint8_t>(selection_depth + 1)
     );
     return median_kth;
 }
 
-void select_kth(
+void select_kth_numeric(
     std::uint32_t* members,
     std::uint32_t left,
     std::uint32_t right,
     std::uint32_t kth,
-    std::uint32_t width,
-    std::uint8_t axis,
     std::uint8_t selection_depth
 ) {
+    if (right - left < 96) {
+        insertion_sort_numeric(members, left, right);
+        return;
+    }
     while (left < right) {
-        std::uint32_t pivot_index = median_of_medians(
+        std::uint32_t pivot_index = median_of_medians_numeric(
             members,
             left,
             right,
-            width,
-            axis,
             selection_depth
         );
-        pivot_index = partition_about(members, left, right, pivot_index, width, axis);
+        pivot_index = partition_about_numeric(
+            members,
+            left,
+            right,
+            pivot_index
+        );
         if (kth == pivot_index) {
             return;
         }
@@ -224,25 +273,45 @@ void partition_region_tree(
     std::uint32_t* members,
     std::uint32_t start,
     std::uint32_t end,
+    std::uint32_t height,
     std::uint32_t width
 ) {
     if (start == end) {
         return;
     }
     std::array<BuildFrame, kStackCapacity> stack{};
+    const U32Divider width_divider(width);
+    const U32Divider height_divider(height);
     std::size_t top = push_frame(stack, 0, start, end, 0);
     while (top > 0) {
         const BuildFrame frame = stack[--top];
         const std::uint32_t middle = frame.start + ((frame.end - frame.start - 1) / 2);
-        select_kth(
-            members,
-            frame.start,
-            frame.end - 1,
-            middle,
-            width,
-            static_cast<std::uint8_t>(frame.depth & 1),
-            0
-        );
+        const bool column_axis = (frame.depth & 1) != 0;
+        if (column_axis) {
+            for (std::uint32_t cursor = frame.start; cursor < frame.end; ++cursor) {
+                const std::uint32_t sample = members[cursor];
+                const std::uint32_t row = width_divider.divide(sample);
+                const std::uint32_t column = sample - row * width;
+                members[cursor] = column * height + row;
+            }
+        }
+        if (frame.depth != 0) {
+            select_kth_numeric(
+                members,
+                frame.start,
+                frame.end - 1,
+                middle,
+                0
+            );
+        }
+        if (column_axis) {
+            for (std::uint32_t cursor = frame.start; cursor < frame.end; ++cursor) {
+                const std::uint32_t column_major = members[cursor];
+                const std::uint32_t column = height_divider.divide(column_major);
+                const std::uint32_t row = column_major - column * height;
+                members[cursor] = row * width + column;
+            }
+        }
         const std::uint8_t next_depth = static_cast<std::uint8_t>(frame.depth + 1);
         if (middle + 1 < frame.end) {
             top = push_frame(stack, top, middle + 1, frame.end, next_depth);
@@ -1588,6 +1657,7 @@ py::tuple build_safe_donor_index(
                 member_values,
                 offset_values[region_index],
                 offset_values[region_index + 1],
+                height,
                 width
             );
         }
@@ -1798,6 +1868,7 @@ py::tuple build_index(
                 member_values,
                 offset_values[region_index],
                 offset_values[region_index + 1],
+                static_cast<std::uint32_t>(height),
                 width32
             );
         }
