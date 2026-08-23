@@ -123,10 +123,10 @@
 - Create: `scripts/quality_task0/stereo_control.py`
 - Create: `tests/unit/test_quality_task0_stereo_control.py`
 
-- [ ] Add RED tests for replayable source iteration, packed action vectors, `P=0,R=N`, mixed actions, and `N=STEREO_CONTROL_FRAME_CAP` under four MiB.
-- [ ] Implement capacity-one Quality lifecycle and bounded Fast slots without eager path/work-item lists.
-- [ ] Add global stack-creation lock, parked-worker gate, restoration, reserve adapter, contention, teardown migration, and failure injection tests.
-- [ ] Measure effective workers, live thread counts, queues, requested stacks, committed-memory deltas, and decoder/renderer/writer overlap for workers 1, 4, and 16.
+- [x] Add RED tests for replayable source iteration, packed action vectors, `P=0,R=N`, mixed actions, and `N=STEREO_CONTROL_FRAME_CAP` under four MiB.
+- [x] Implement capacity-one Quality lifecycle and bounded Fast slots without eager path/work-item lists.
+- [x] Add global stack-creation lock, parked-worker gate, restoration, reserve adapter, contention, teardown migration, and failure injection tests.
+- [x] Measure effective workers, live thread counts, queues, requested stacks, committed-memory deltas, and decoder/renderer/writer overlap for workers 1, 4, and 16.
 
 ### Task 0.9: Streaming Encoding Coordinator And Reservation Recovery
 
