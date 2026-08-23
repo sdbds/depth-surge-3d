@@ -86,6 +86,9 @@ def _write_settings(
     metadata = {
         "batch_name": "job",
         "source_video": str(source_video),
+        "source_video_name": source_video.name,
+        "project_version": "0.8.0",
+        "created_timestamp": 1_700_000_000.0,
         "processing_status": "in_progress",
     }
     if include_source_fingerprint:
@@ -95,8 +98,19 @@ def _write_settings(
         metadata["settings_schema_version"] = PROCESSING_SETTINGS_SCHEMA_VERSION
     payload = {
         "metadata": metadata,
-        "video_properties": {"frame_count": 2, "width": 6, "height": 4, "fps": 30.0},
+        "video_properties": {
+            "frame_count": 2,
+            "width": 6,
+            "height": 4,
+            "fps": 30.0,
+            "duration": 2.0 / 30.0,
+            "codec": 0,
+        },
         "processing_settings": processing_settings,
+        "output_info": {
+            "output_directory": str(output_dir),
+            "expected_output_filename": "legacy-output.mp4",
+        },
     }
     path = output_dir / "job-settings.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -1064,7 +1078,6 @@ def test_archive_collision_fails_before_mutating_any_source(tmp_path):
 
 def test_legacy_settings_are_backed_up_and_rewritten_without_removed_names(tmp_path):
     from src.depth_surge_3d.io.resume import (
-        PROCESSING_SETTINGS_SCHEMA_VERSION,
         apply_legacy_migration,
         build_resume_report,
     )
@@ -1076,7 +1089,8 @@ def test_legacy_settings_are_backed_up_and_rewritten_without_removed_names(tmp_p
     apply_legacy_migration(report, "archive")
 
     assert (tmp_path / "settings.legacy.json").read_bytes() == original_bytes
-    migrated = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert settings_file.read_bytes() == original_bytes
+    migrated = json.loads((tmp_path / "processing-settings-v5.json").read_text(encoding="ascii"))
     assert migrated["metadata"]["settings_schema_version"] == PROCESSING_SETTINGS_SCHEMA_VERSION
     assert migrated["processing_settings"]["stereo_strength"] == 3.0
     assert "baseline" not in migrated["processing_settings"]
@@ -1136,7 +1150,7 @@ def test_matching_settings_backup_allows_crash_resume(tmp_path):
 
     apply_legacy_migration(report, "archive")
 
-    migrated = json.loads(settings_file.read_text(encoding="utf-8"))
+    migrated = json.loads((tmp_path / "processing-settings-v5.json").read_text(encoding="ascii"))
     assert "baseline" not in migrated["processing_settings"]
 
 
@@ -1150,7 +1164,7 @@ def test_settings_rewrite_failure_rolls_back_archived_stages(tmp_path, monkeypat
     def fail_write(*_args, **_kwargs):
         raise OSError("simulated settings write failure")
 
-    monkeypatch.setattr(resume, "_atomic_write_json", fail_write)
+    monkeypatch.setattr(resume, "bootstrap_settings_job_v1", fail_write)
 
     with pytest.raises(OSError, match="simulated settings"):
         resume.apply_legacy_migration(report, "archive")
@@ -1587,7 +1601,7 @@ def test_delete_cleanup_failure_does_not_roll_back_committed_migration(tmp_path,
     assert not legacy_depth.exists()
     assert not (tmp_path / "04_left_frames").exists()
     assert (tmp_path / ".resume_delete_staging").is_dir()
-    migrated = json.loads(settings_file.read_text(encoding="utf-8"))
+    migrated = json.loads((tmp_path / "processing-settings-v5.json").read_text(encoding="ascii"))
     assert "baseline" not in migrated["processing_settings"]
 
 

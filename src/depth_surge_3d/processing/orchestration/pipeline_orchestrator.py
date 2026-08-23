@@ -14,6 +14,8 @@ from ...io.operations import (
     cleanup_intermediate_files,
     create_output_directories,
     save_processing_settings,
+    recover_processing_settings_artifact,
+    load_processing_settings,
     update_processing_status,
 )
 from ...io.job_lock import JobWriterLock
@@ -442,19 +444,17 @@ class ProcessingOrchestrator:
             )
 
         if success:
-            output_filename = generate_output_filename(
-                Path(video_path).name,
-                settings["vr_format"],
-                settings["vr_resolution"],
-            )
+            output_filename = self._expected_output_filename(video_path, settings)
             print(step_complete("Step 8: Created final video"))
             self._print_saved_to(directories["base"], f"Final output: {output_filename}")
 
         # Finalize and cleanup
         if progress_tracker and hasattr(progress_tracker, "finish"):
             progress_tracker.finish("Video processing complete")
-        self._finalize_processing(success, output_path, video_path, settings, num_frames)
-        return success
+        finalized = self._finalize_processing(
+            success, output_path, video_path, settings, num_frames
+        )
+        return success and finalized is not False
 
     def _setup_processing(
         self,
@@ -495,9 +495,19 @@ class ProcessingOrchestrator:
         else:
             directories = create_output_directories(output_path, settings["keep_intermediates"])
         batch_name = f"{Path(video_path).stem}_{int(time.time())}"
-        settings_file = save_processing_settings(
-            output_path, batch_name, settings, video_properties, video_path
-        )
+        fixed_settings = output_path / "processing-settings-v5.json"
+        if fixed_settings.is_file():
+            recover_processing_settings_artifact(fixed_settings)
+            settings_file = fixed_settings
+        else:
+            settings_file = save_processing_settings(
+                output_path,
+                batch_name,
+                settings,
+                video_properties,
+                video_path,
+                transactional_v5=True,
+            )
 
         print(f"\n{title_bar('=== Depth Surge 3D Video Processing ===')}")
         print(f"Input: {video_path}")
@@ -518,7 +528,7 @@ class ProcessingOrchestrator:
         video_path: str,
         settings: dict[str, Any],
         num_frames: int,
-    ) -> None:
+    ) -> bool:
         """
         Finalize processing and update settings file.
 
@@ -539,20 +549,14 @@ class ProcessingOrchestrator:
             formatted_time = self._format_processing_time(elapsed_time)
 
             # Generate output filename
-            output_filename = generate_output_filename(
-                Path(video_path).name,
-                settings["vr_format"],
-                settings["vr_resolution"],
-            )
+            output_filename = self._expected_output_filename(video_path, settings)
             output_file_path = str(output_path / output_filename)
 
-            # Display colored completion banner
-            completion_banner(
-                output_file=output_file_path,
-                processing_time=formatted_time,
-                num_frames=num_frames,
-                vr_format=settings["vr_format"],
-            )
+            cleanup_status = "not_requested"
+            if not settings.get("keep_intermediates", True):
+                removed_count = cleanup_intermediate_files(output_path)
+                cleanup_status = "complete"
+                print(f"Removed {removed_count} temporary processing files")
 
             # Update settings file
             if self._settings_file:
@@ -560,22 +564,51 @@ class ProcessingOrchestrator:
                     "final_output": output_file_path,
                     "frames_processed": num_frames,
                     "processing_time_seconds": elapsed_time,
+                    "cleanup_status": cleanup_status,
                 }
                 if self._metric_clamp_summary is not None:
                     runtime_info["metric_clamp_summary"] = dict(self._metric_clamp_summary)
-                update_processing_status(
+                if not update_processing_status(
                     self._settings_file,
                     "completed",
                     runtime_info,
-                )
+                ):
+                    print("Error: Could not commit terminal processing settings")
+                    return False
 
-            if not settings.get("keep_intermediates", True):
-                removed_count = cleanup_intermediate_files(output_path)
-                print(f"Removed {removed_count} temporary processing files")
+            completion_banner(
+                output_file=output_file_path,
+                processing_time=formatted_time,
+                num_frames=num_frames,
+                vr_format=settings["vr_format"],
+            )
+            return True
         elif self._settings_file:
-            update_processing_status(
+            return update_processing_status(
                 self._settings_file, "failed", {"error": "Video creation failed"}
             )
+        return not success
+
+    def _expected_output_filename(
+        self,
+        video_path: str,
+        settings: dict[str, Any],
+    ) -> str:
+        if self._settings_file is not None and self._settings_file.name == (
+            "processing-settings-v5.json"
+        ):
+            saved = load_processing_settings(self._settings_file)
+            if saved is not None:
+                output_info = saved.get("output_info")
+                if isinstance(output_info, dict):
+                    expected = output_info.get("expected_final_relative_path")
+                    if isinstance(expected, str) and expected:
+                        return expected
+        return generate_output_filename(
+            Path(video_path).name,
+            settings["vr_format"],
+            settings["vr_resolution"],
+        )
 
     @staticmethod
     def _format_processing_time(seconds: float) -> str:

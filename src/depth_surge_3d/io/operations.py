@@ -12,16 +12,19 @@ For pure functions without side effects, see utils/path_utils.py.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import time
 from collections.abc import Collection
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 import cv2
 
 from ..core.constants import (
@@ -37,6 +40,21 @@ from ..core.file_identity import (
 from ..utils.path_utils import (
     generate_output_filename,
     format_time_duration,
+)
+from .canonical_json import canonical_json_bytes
+from .reservation_protocol import (
+    SETTINGS_ARTIFACT_RELATIVE_PATH,
+    SettingsArtifactTransactionV1,
+    allocation_unit_for_path,
+    bootstrap_settings_job_v1,
+    commit_terminal_settings_v1,
+    platform_allocation_adapter,
+    platform_allocation_counter,
+    recover_settings_job_v1,
+)
+from .settings_artifact import (
+    ProcessingSettingsArtifactV5,
+    create_processing_settings_artifact_v5,
 )
 
 
@@ -451,6 +469,8 @@ def save_processing_settings(
     settings: dict[str, Any],
     video_properties: dict[str, Any],
     source_video_path: str,
+    *,
+    transactional_v5: bool = False,
 ) -> Path:
     """
     Save processing settings to a JSON file in the output directory.
@@ -468,6 +488,15 @@ def save_processing_settings(
     Side Effects:
         Writes JSON file to disk
     """
+    if transactional_v5:
+        return _save_processing_settings_v5(
+            output_dir=output_dir,
+            batch_name=batch_name,
+            settings=settings,
+            video_properties=video_properties,
+            source_video_path=source_video_path,
+        )
+
     source_path = Path(source_video_path)
     source_video_fingerprint = (
         file_sample_fingerprint(source_path) if source_path.is_file() else None
@@ -526,6 +555,49 @@ def save_processing_settings(
         return settings_file
 
 
+def _utc_now_usec() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _save_processing_settings_v5(
+    *,
+    output_dir: Path,
+    batch_name: str,
+    settings: dict[str, Any],
+    video_properties: dict[str, Any],
+    source_video_path: str,
+) -> Path:
+    """Create a new schema-5 job through locator-first reserved publication."""
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_path = Path(source_video_path)
+    source_fingerprint = file_sample_fingerprint(source_path) if source_path.is_file() else None
+    artifact = create_processing_settings_artifact_v5(
+        batch_name=batch_name,
+        source_video=str(source_video_path),
+        source_video_name=source_path.name,
+        source_video_fingerprint=source_fingerprint,
+        video_properties=video_properties,
+        processing_settings=settings,
+        output_directory=str(output_dir),
+        project_version="0.9.0",
+        creation_now_usec=_utc_now_usec(),
+    )
+    allocation_unit = allocation_unit_for_path(output_dir)
+    bootstrap_settings_job_v1(
+        job_root=output_dir,
+        artifact=artifact,
+        initial_settings_reservation_id=secrets.token_hex(16),
+        allocation_adapter=platform_allocation_adapter,
+        allocation_counter=platform_allocation_counter,
+        allocation_unit=allocation_unit,
+    )
+    settings_file = output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH
+    print(f"Settings saved to: {settings_file}")
+    return settings_file
+
+
 def load_processing_settings(settings_file: Path) -> dict[str, Any] | None:
     """
     Load processing settings from a JSON file.
@@ -544,8 +616,13 @@ def load_processing_settings(settings_file: Path) -> dict[str, Any] | None:
             print(f"Settings file not found: {settings_file}")
             return None
 
-        with open(settings_file, "r", encoding="utf-8") as f:
-            settings_data = json.load(f)
+        if settings_file.name == SETTINGS_ARTIFACT_RELATIVE_PATH.name:
+            settings_data = ProcessingSettingsArtifactV5.parse(
+                settings_file.read_bytes()
+            ).to_object()
+        else:
+            with open(settings_file, "r", encoding="utf-8") as f:
+                settings_data = json.load(f)
 
         print(f"Settings loaded from: {settings_file}")
         return settings_data
@@ -572,6 +649,12 @@ def update_processing_status(
     Side Effects:
         Reads and writes JSON file
     """
+    if settings_file.name == SETTINGS_ARTIFACT_RELATIVE_PATH.name:
+        return _update_processing_status_v5(
+            settings_file,
+            status=status,
+            additional_info=additional_info,
+        )
     try:
         settings_data = load_processing_settings(settings_file)
         if not settings_data:
@@ -611,6 +694,149 @@ def update_processing_status(
         return False
 
 
+def _bounded_metric_summary(value: object) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("metric_clamp_summary must be an object")
+    if set(value) == {
+        "schema_version",
+        "affected_frame_count",
+        "mean_clamped_fraction",
+        "max_clamped_fraction",
+        "compatibility_summary_sha256",
+    }:
+        return dict(value)
+    return {
+        "schema_version": 1,
+        "affected_frame_count": int(value["affected_frame_count"]),
+        "mean_clamped_fraction": float(value["mean_clamped_fraction"]),
+        "max_clamped_fraction": float(value["max_clamped_fraction"]),
+        "compatibility_summary_sha256": hashlib.sha256(canonical_json_bytes(value)).hexdigest(),
+    }
+
+
+def commit_final_media_producer_marker(
+    settings_file: Path,
+    *,
+    generation: str,
+) -> ProcessingSettingsArtifactV5:
+    """Durably enter publication-v4 before the first FFmpeg launch."""
+
+    settings_file = Path(settings_file)
+    if settings_file.name != SETTINGS_ARTIFACT_RELATIVE_PATH.name:
+        raise ValueError("producer marker requires processing-settings-v5.json")
+    job_root = settings_file.parent
+    current = recover_settings_job_v1(
+        job_root,
+        allocation_adapter=platform_allocation_adapter,
+        allocation_counter=platform_allocation_counter,
+    )
+    target = current.with_producer_marker(
+        generation=generation,
+        updated_at=_utc_now_usec(),
+    )
+    if target is current:
+        return current
+    transaction = SettingsArtifactTransactionV1.begin(
+        job_root=job_root,
+        current=current,
+        target=target,
+        allocation_adapter=platform_allocation_adapter,
+        allocation_counter=platform_allocation_counter,
+        allocation_unit=allocation_unit_for_path(job_root),
+        reservation_generation=secrets.token_hex(16),
+        reservation_id=secrets.token_hex(16),
+    )
+    return transaction.commit()
+
+
+def recover_processing_settings_artifact(
+    settings_file: Path,
+) -> ProcessingSettingsArtifactV5:
+    settings_file = Path(settings_file)
+    if settings_file.name != SETTINGS_ARTIFACT_RELATIVE_PATH.name:
+        raise ValueError("schema-5 recovery requires processing-settings-v5.json")
+    return recover_settings_job_v1(
+        settings_file.parent,
+        allocation_adapter=platform_allocation_adapter,
+        allocation_counter=platform_allocation_counter,
+    )
+
+
+def _update_processing_status_v5(
+    settings_file: Path,
+    *,
+    status: str,
+    additional_info: dict[str, Any] | None,
+) -> bool:
+    """Commit a closed terminal transition through the retained lifecycle extent."""
+
+    try:
+        job_root = settings_file.parent
+        current = recover_settings_job_v1(
+            job_root,
+            allocation_adapter=platform_allocation_adapter,
+            allocation_counter=platform_allocation_counter,
+        )
+        now = _utc_now_usec()
+        info = dict(additional_info or {})
+        if status == "completed":
+            settings = current.to_object()["processing_settings"]
+            cleanup_status = info.get("cleanup_status")
+            if cleanup_status is None:
+                cleanup_status = "not_requested" if settings["keep_intermediates"] else "complete"
+            if cleanup_status not in {
+                "not_requested",
+                "complete",
+                "incomplete_identity_mismatch",
+                "incomplete_error",
+            }:
+                raise ValueError(f"invalid cleanup_status: {cleanup_status!r}")
+            completed_cleanup_status = cast(
+                Literal[
+                    "not_requested",
+                    "complete",
+                    "incomplete_identity_mismatch",
+                    "incomplete_error",
+                ],
+                cleanup_status,
+            )
+            target = current.completed(
+                terminal_at=now,
+                frames_processed=info.get(
+                    "frames_processed",
+                    current.to_object()["video_properties"]["frame_count"],
+                ),
+                cleanup_status=completed_cleanup_status,
+                metric_clamp_summary=_bounded_metric_summary(info.get("metric_clamp_summary")),
+            )
+        elif status == "failed":
+            message = info.get("error") or info.get("terminal_diagnostic_message")
+            if message is not None:
+                message = str(message).encode("utf-8")[:1024].decode("utf-8", errors="ignore")
+            target = current.failed(
+                terminal_at=now,
+                diagnostic_code=str(info.get("terminal_diagnostic_code", "PROCESSING_FAILED")),
+                diagnostic_message=message,
+            )
+        elif status == "in_progress" and current.status == "in_progress":
+            return True
+        else:
+            raise ValueError(f"unsupported schema-5 processing status transition: {status}")
+        commit_terminal_settings_v1(
+            job_root=job_root,
+            current=current,
+            target=target,
+            allocation_adapter=platform_allocation_adapter,
+            allocation_counter=platform_allocation_counter,
+        )
+        return True
+    except Exception as error:
+        print(f"Warning: Could not commit schema-5 processing status: {error}")
+        return False
+
+
 def find_settings_file(output_dir: Path, batch_name: str | None = None) -> Path | None:
     """
     Find a settings file in the output directory.
@@ -626,6 +852,9 @@ def find_settings_file(output_dir: Path, batch_name: str | None = None) -> Path 
         Reads directory contents from filesystem
     """
     try:
+        fixed = output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH
+        if fixed.is_file() and not fixed.is_symlink():
+            return fixed
         if batch_name:
             # Look for specific batch
             settings_file = output_dir / f"{batch_name}-settings.json"

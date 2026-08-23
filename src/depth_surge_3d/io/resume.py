@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import json
+import secrets
 import shutil
 import warnings
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from ..core.settings import (
-    PROCESSING_SETTINGS_SCHEMA_VERSION,
     parse_saved_processing_settings,
     validate_settings,
 )
@@ -48,6 +49,19 @@ from ..processing.frames.depth_storage import (
     RawDepthStore,
     depth_preprocessing_algorithm,
     select_depth_model_settings,
+)
+from .reservation_protocol import (
+    JOB_CONTROL_RELATIVE_PATH,
+    SETTINGS_ARTIFACT_RELATIVE_PATH,
+    allocation_unit_for_path,
+    bootstrap_settings_job_v1,
+    platform_allocation_adapter,
+    platform_allocation_counter,
+    recover_settings_job_v1,
+)
+from .settings_artifact import (
+    ProcessingSettingsArtifactV5,
+    migrate_processing_settings_artifact_v5,
 )
 from ..processing.frames.metric_geometry import MetricGeometryStore
 from ..processing.frames.scene_analyzer import (
@@ -260,6 +274,9 @@ def resolve_resume_depth_model_version(
 
 
 def _find_settings_file(output_dir: Path) -> Path | None:
+    fixed = output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH
+    if fixed.is_file() and not fixed.is_symlink():
+        return fixed
     candidates = sorted(
         output_dir.glob("*-settings.json"),
         key=lambda path: (path.stat().st_mtime_ns, path.name),
@@ -274,7 +291,10 @@ def _resolve_settings_file(output_dir: Path, settings_file: Path | str | None) -
     candidate = Path(settings_file).resolve()
     if (
         candidate.parent != output_dir
-        or not candidate.name.endswith("-settings.json")
+        or (
+            candidate.name != SETTINGS_ARTIFACT_RELATIVE_PATH.name
+            and not candidate.name.endswith("-settings.json")
+        )
         or not candidate.is_file()
     ):
         raise ValueError("Resume settings file must be a job settings file in the output directory")
@@ -1482,7 +1502,7 @@ def _build_generated_stages(
     return [stereo, distortion, crop, upscale, vr]
 
 
-def build_resume_report(
+def build_resume_report(  # noqa: C901
     output_dir: Path | str,
     current_settings: dict[str, Any],
     *,
@@ -1494,9 +1514,14 @@ def build_resume_report(
 
     root = Path(output_dir).resolve()
     selected_settings_file = _resolve_settings_file(root, settings_file)
-    settings_data = (
-        _read_json(selected_settings_file) if selected_settings_file is not None else None
-    )
+    if selected_settings_file is None:
+        settings_data = None
+    elif selected_settings_file.name == SETTINGS_ARTIFACT_RELATIVE_PATH.name:
+        settings_data = ProcessingSettingsArtifactV5.parse(
+            selected_settings_file.read_bytes()
+        ).to_object()
+    else:
+        settings_data = _read_json(selected_settings_file)
     raw_saved = (settings_data or {}).get("processing_settings", {})
     if not isinstance(raw_saved, dict):
         raw_saved = {}
@@ -1704,18 +1729,39 @@ def _preflight_migration(report: ResumeReport, mode: MigrationMode) -> dict[Path
 def _migrate_settings(report: ResumeReport) -> None:
     if report.settings_file is None or report.original_settings_data is None:
         return
+    if not report.settings_backup_required:
+        return
     if report.settings_backup_required:
         backup = report.output_dir / "settings.legacy.json"
         if not backup.exists():
             _atomic_write_bytes(backup, report.settings_file.read_bytes())
-
-    migrated = dict(report.original_settings_data)
-    original_metadata = migrated.get("metadata", {})
-    metadata = dict(original_metadata) if isinstance(original_metadata, dict) else {}
-    metadata["settings_schema_version"] = PROCESSING_SETTINGS_SCHEMA_VERSION
-    migrated["metadata"] = metadata
-    migrated["processing_settings"] = report.migrated_settings
-    _atomic_write_json(report.settings_file, migrated)
+    fixed = report.output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH
+    control = report.output_dir / JOB_CONTROL_RELATIVE_PATH
+    if fixed.is_file() and control.is_file():
+        recover_settings_job_v1(
+            report.output_dir,
+            allocation_adapter=platform_allocation_adapter,
+            allocation_counter=platform_allocation_counter,
+        )
+        return
+    migration_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    artifact = migrate_processing_settings_artifact_v5(
+        legacy_settings=report.original_settings_data,
+        migrated_processing_settings=report.migrated_settings,
+        migration_now_usec=migration_now,
+        job_id=secrets.token_hex(16),
+        job_reservation_generation=secrets.token_hex(16),
+        job_terminal_reservation_id=secrets.token_hex(16),
+    )
+    bootstrap_settings_job_v1(
+        job_root=report.output_dir,
+        artifact=artifact,
+        initial_settings_reservation_id=secrets.token_hex(16),
+        allocation_adapter=platform_allocation_adapter,
+        allocation_counter=platform_allocation_counter,
+        allocation_unit=allocation_unit_for_path(report.output_dir),
+        legacy_settings_artifact_relative_path=report.settings_file.name,
+    )
 
 
 def _rollback_migration(
@@ -1753,12 +1799,12 @@ def apply_legacy_migration(report: ResumeReport, mode: MigrationMode) -> None:
     )
     moved: list[tuple[Path, Path]] = []
     try:
+        _migrate_settings(report)
         for source in report.migration_paths:
             destination = destinations[source]
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(source), str(destination))
             moved.append((source, destination))
-        _migrate_settings(report)
     except Exception:
         _rollback_migration(report, moved, original_settings)
         _remove_empty_migration_directories(report.output_dir)
