@@ -11,7 +11,6 @@ from pathlib import Path
 import shutil
 import stat
 from typing import Any, Sequence
-import zipfile
 
 import numpy as np
 
@@ -84,10 +83,12 @@ class MetricGeometryFrame:
     valid: np.ndarray
     focal_x_normalized: np.float32
 
-    def __post_init__(self) -> None:
-        inverse = self.inverse_depth
-        valid = self.valid
-        focal = self.focal_x_normalized
+    @staticmethod
+    def _validate_fields(
+        inverse: np.ndarray,
+        valid: np.ndarray,
+        focal: np.float32,
+    ) -> None:
         _validate_inverse_array(inverse)
         _validate_valid_array(valid)
         if inverse.shape != valid.shape:
@@ -98,6 +99,12 @@ class MetricGeometryFrame:
             raise ValueError("Valid metric inverse_depth values must be positive")
         _validate_focal(focal)
 
+    def __post_init__(self) -> None:
+        inverse = self.inverse_depth
+        valid = self.valid
+        focal = self.focal_x_normalized
+        self._validate_fields(inverse, valid, focal)
+
         owned_inverse = np.array(inverse, dtype=np.float32, copy=True, order="C")
         owned_valid = np.array(valid, dtype=np.bool_, copy=True, order="C")
         owned_inverse.setflags(write=False)
@@ -105,6 +112,30 @@ class MetricGeometryFrame:
         object.__setattr__(self, "inverse_depth", owned_inverse)
         object.__setattr__(self, "valid", owned_valid)
         object.__setattr__(self, "focal_x_normalized", np.float32(focal))
+
+    @classmethod
+    def _from_owned(
+        cls,
+        inverse_depth: np.ndarray,
+        valid: np.ndarray,
+        focal_x_normalized: np.float32,
+    ) -> MetricGeometryFrame:
+        """Freeze already-owned contiguous arrays without another full-frame copy."""
+
+        cls._validate_fields(inverse_depth, valid, focal_x_normalized)
+        for name, values in (
+            ("inverse_depth", inverse_depth),
+            ("valid", valid),
+        ):
+            if not values.flags.c_contiguous or not values.flags.owndata:
+                raise TypeError(f"Owned metric {name} must be a C-contiguous allocation")
+        inverse_depth.setflags(write=False)
+        valid.setflags(write=False)
+        frame = object.__new__(cls)
+        object.__setattr__(frame, "inverse_depth", inverse_depth)
+        object.__setattr__(frame, "valid", valid)
+        object.__setattr__(frame, "focal_x_normalized", np.float32(focal_x_normalized))
+        return frame
 
 
 @dataclass(frozen=True)
@@ -399,28 +430,33 @@ def _atomic_write_json(path: Path, payload: dict[str, Any], *, required_bytes: i
 
 
 def _atomic_save_npz(path: Path, frame: MetricGeometryFrame, *, required_bytes: int) -> None:
-    _mkdir_with_disk_full_context(
-        path.parent,
-        required_bytes=required_bytes,
-        failing_path=path,
-    )
-    temporary = path.with_name(f"{path.name}.tmp")
+    from ...io import metric_npz
+
+    required = int(required_bytes)
+
+    def reserve(parent: Path, logical_bound: int) -> None:
+        _mkdir_with_disk_full_context(
+            parent,
+            required_bytes=max(required, logical_bound),
+            failing_path=path,
+        )
+
     try:
-        with temporary.open("wb") as handle:
-            np.savez_compressed(
-                handle,
-                inverse_depth=frame.inverse_depth,
-                valid=frame.valid,
-                focal_x_normalized=np.asarray(frame.focal_x_normalized, dtype=np.float32),
-            )
-        temporary.replace(path)
+        metric_npz.write_metric_npz(
+            path,
+            frame.inverse_depth,
+            frame.valid,
+            frame.focal_x_normalized,
+            reserve=reserve,
+        )
+    except metric_npz.MetricNpzDiskFullError as error:
+        free_bytes = _current_free_bytes(path.parent)
+        raise MetricGeometryDiskFullError(required, free_bytes, path) from error
     except OSError as error:
         if not _is_disk_full(error):
             raise
         free_bytes = _current_free_bytes(path.parent)
-        raise MetricGeometryDiskFullError(required_bytes, free_bytes, path) from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        raise MetricGeometryDiskFullError(required, free_bytes, path) from error
 
 
 def _is_disk_full(error: OSError) -> bool:
@@ -803,58 +839,27 @@ class MetricGeometryStore:
             raise ValueError(f"Unknown metric geometry frame name: {frame_name}")
         return self.directory / f"{Path(frame_name).stem}.npz"
 
-    def _validate_payload_header(self, path: Path) -> None:
-        native_shape = tuple(self.metadata["native_shape"])
-        try:
-            with zipfile.ZipFile(path) as payload:
-                if payload.namelist() != _METRIC_PAYLOAD_MEMBERS:
-                    expected = ", ".join(_METRIC_PAYLOAD_MEMBERS)
-                    raise ValueError(
-                        f"Metric geometry payload must contain exact members {expected}: {path}"
-                    )
-                headers: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {}
-                for member_name in _METRIC_PAYLOAD_MEMBERS:
-                    with payload.open(member_name) as member:
-                        headers[member_name] = _read_npy_header(member)
-        except FileNotFoundError as error:
-            raise ValueError(f"Metric geometry payload is missing: {path}") from error
-        except OSError:
-            raise
-        except ValueError:
-            raise
-        except Exception as error:
-            raise ValueError(f"Metric geometry payload is unreadable: {path}") from error
-
-        _validate_grid_header(
-            label="inverse_depth",
-            header=headers["inverse_depth.npy"],
-            expected_dtype=np.dtype(np.float32),
-            native_shape=native_shape,
-            path=path,
-        )
-        _validate_grid_header(
-            label="valid",
-            header=headers["valid.npy"],
-            expected_dtype=np.dtype(np.bool_),
-            native_shape=native_shape,
-            path=path,
-        )
-        _validate_focal_header(headers["focal_x_normalized.npy"], path)
-
     def _load_validated_payload(self, path: Path) -> MetricGeometryFrame:
-        self._validate_payload_header(path)
+        from ...io import metric_npz
+
         try:
-            with np.load(path, allow_pickle=False) as payload:
-                inverse = np.array(payload["inverse_depth"], copy=True)
-                valid = np.array(payload["valid"], copy=True)
-                focal = np.float32(payload["focal_x_normalized"].item())
+            audit = metric_npz.audit_metric_npz(
+                path,
+                expected_shape=tuple(self.metadata["native_shape"]),
+            )
         except FileNotFoundError as error:
             raise ValueError(f"Metric geometry payload is missing: {path}") from error
         except OSError:
             raise
         except Exception as error:
+            if isinstance(error, metric_npz.MetricNpzError):
+                raise
             raise ValueError(f"Metric geometry payload is unreadable: {path}") from error
-        return MetricGeometryFrame(inverse, valid, focal)
+        return MetricGeometryFrame._from_owned(
+            audit.inverse_depth,
+            audit.valid,
+            audit.focal_x_normalized,
+        )
 
     def validate_payloads(self, *, cleanup_temporaries: bool = True) -> int:
         """Validate exact payloads, optionally cleaning interrupted writes."""

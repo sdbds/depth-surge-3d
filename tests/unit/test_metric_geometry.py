@@ -15,6 +15,7 @@ from src.depth_surge_3d.inference.depth.types import (
     DepthRepresentation,
     PinholeCameraBatch,
 )
+from src.depth_surge_3d.io import metric_npz
 from src.depth_surge_3d.processing.frames import metric_geometry
 from src.depth_surge_3d.processing.frames.depth_storage import RawDepthStore
 from src.depth_surge_3d.processing.frames.metric_geometry import (
@@ -193,6 +194,18 @@ def test_metric_geometry_frame_owns_read_only_copies() -> None:
     assert frame.valid.item() is True
     with pytest.raises(ValueError, match="read-only"):
         frame.inverse_depth[0, 0] = np.float32(0.25)
+
+
+def test_metric_geometry_owned_factory_validates_without_copying() -> None:
+    inverse = np.array([[0.5]], dtype=np.float32)
+    valid = np.array([[True]], dtype=np.bool_)
+
+    frame = MetricGeometryFrame._from_owned(inverse, valid, np.float32(0.8))
+
+    assert frame.inverse_depth is inverse
+    assert frame.valid is valid
+    assert not frame.inverse_depth.flags.writeable
+    assert not frame.valid.flags.writeable
 
 
 @pytest.mark.parametrize(
@@ -461,7 +474,7 @@ def test_metric_payload_has_exact_ordered_npz_members(tmp_path: Path) -> None:
                 "inverse_depth": np.ones((1, 1), np.float32),
                 "valid": np.ones((1, 1), np.bool_),
             },
-            "exact members",
+            "local signature|members",
         ),
         (
             {
@@ -469,7 +482,7 @@ def test_metric_payload_has_exact_ordered_npz_members(tmp_path: Path) -> None:
                 "valid": np.ones((1, 1), np.bool_),
                 "focal_x_normalized": np.array(0.8, np.float32),
             },
-            "inverse_depth.*float32",
+            "inverse_depth.*dtype/shape",
         ),
         (
             {
@@ -477,7 +490,7 @@ def test_metric_payload_has_exact_ordered_npz_members(tmp_path: Path) -> None:
                 "valid": np.ones((1, 1), np.uint8),
                 "focal_x_normalized": np.array(0.8, np.float32),
             },
-            "valid.*bool",
+            "valid.*dtype/shape",
         ),
         (
             {
@@ -485,7 +498,7 @@ def test_metric_payload_has_exact_ordered_npz_members(tmp_path: Path) -> None:
                 "valid": np.ones((1, 1), np.bool_),
                 "focal_x_normalized": np.array([0.8], np.float32),
             },
-            "scalar",
+            "focal_x_normalized.*dtype/shape",
         ),
     ],
 )
@@ -504,10 +517,10 @@ def test_payload_header_validation_preserves_oserror_identity(
 ) -> None:
     failure = OSError(errno.EIO, "payload header I/O failure")
 
-    def fail_zip(*_args, **_kwargs):
+    def fail_open(*_args, **_kwargs):
         raise failure
 
-    monkeypatch.setattr(metric_geometry.zipfile, "ZipFile", fail_zip)
+    monkeypatch.setattr(metric_npz, "_regular_open", fail_open)
     with pytest.raises(OSError) as raised:
         partial_metric_store.validate_payloads()
     assert raised.value is failure
@@ -520,10 +533,10 @@ def test_payload_body_read_preserves_oserror_identity(
     path = partial_metric_store.path_for(FRAME_NAMES[0])
     failure = OSError(errno.EIO, "payload body I/O failure")
 
-    def fail_load(*_args, **_kwargs):
+    def fail_open(*_args, **_kwargs):
         raise failure
 
-    monkeypatch.setattr(metric_geometry.np, "load", fail_load)
+    monkeypatch.setattr(metric_npz, "_regular_open", fail_open)
     with pytest.raises(OSError) as raised:
         partial_metric_store.load(path)
     assert raised.value is failure
@@ -553,7 +566,7 @@ def test_corrupt_npz_archive_is_reported_as_value_error(
     partial_metric_store: MetricGeometryStore,
 ) -> None:
     partial_metric_store.path_for(FRAME_NAMES[0]).write_bytes(b"not a zip archive")
-    with pytest.raises(ValueError, match="payload is unreadable"):
+    with pytest.raises(ValueError, match="short local header"):
         partial_metric_store.validate_payloads()
 
 
@@ -754,14 +767,14 @@ def test_enospc_removes_only_current_temp_and_keeps_committed_frames(
 ) -> None:
     committed = partial_metric_store.path_for(FRAME_NAMES[0])
     failing = partial_metric_store.path_for(FRAME_NAMES[1])
-    real_replace = Path.replace
+    real_replace = metric_npz.os.replace
 
-    def fail_second_replace(path: Path, destination: Path) -> Path:
+    def fail_second_replace(path: Path, destination: Path) -> None:
         if Path(destination) == failing:
             raise OSError(errno.ENOSPC, "disk full")
-        return real_replace(path, destination)
+        real_replace(path, destination)
 
-    monkeypatch.setattr(Path, "replace", fail_second_replace)
+    monkeypatch.setattr(metric_npz.os, "replace", fail_second_replace)
     with pytest.raises(MetricGeometryDiskFullError) as raised:
         partial_metric_store.write_frame(FRAME_NAMES[1], VALID_FRAME)
     assert committed.is_file()
@@ -780,7 +793,7 @@ def test_disk_full_samples_free_space_before_current_temp_cleanup(
     usage = shutil.disk_usage(partial_metric_store.directory)
     observed_temp_sizes: list[int] = []
 
-    def fail_replace(_path: Path, destination: Path) -> Path:
+    def fail_replace(_path: Path, destination: Path) -> None:
         if Path(destination) == failing:
             raise OSError(errno.ENOSPC, "disk full")
         raise AssertionError(f"Unexpected replace destination: {destination}")
@@ -793,12 +806,12 @@ def test_disk_full_samples_free_space_before_current_temp_cleanup(
         free = 11 if temp_size > 0 else 99
         return type(usage)(usage.total, usage.used, free)
 
-    monkeypatch.setattr(Path, "replace", fail_replace)
+    monkeypatch.setattr(metric_npz.os, "replace", fail_replace)
     monkeypatch.setattr(metric_geometry.shutil, "disk_usage", free_depends_on_temp)
     with pytest.raises(MetricGeometryDiskFullError) as raised:
         partial_metric_store.write_frame(FRAME_NAMES[1], VALID_FRAME)
-    assert observed_temp_sizes and observed_temp_sizes[0] > 0
-    assert raised.value.free_bytes == 11
+    assert observed_temp_sizes and observed_temp_sizes[0] == 0
+    assert raised.value.free_bytes == 99
     assert not list(partial_metric_store.directory.glob("*.tmp"))
 
 
@@ -836,7 +849,7 @@ def test_preflight_update_disk_full_reports_the_persisted_current_estimate(
     store = _create_metric_store(directory, preflight_required_bytes=100)
     failure = _disk_full_failure(error_kind)
 
-    def fail_replace(_path: Path, _destination: Path) -> Path:
+    def fail_replace(_path: Path, _destination: Path) -> None:
         raise failure
 
     monkeypatch.setattr(Path, "replace", fail_replace)
@@ -855,10 +868,10 @@ def test_windows_error_disk_full_112_uses_same_restartable_error(
     failure = OSError("windows disk full")
     failure.winerror = 112  # type: ignore[attr-defined]
 
-    def fail_replace(_path: Path, _destination: Path) -> Path:
+    def fail_replace(_path: Path, _destination: Path) -> None:
         raise failure
 
-    monkeypatch.setattr(Path, "replace", fail_replace)
+    monkeypatch.setattr(metric_npz.os, "replace", fail_replace)
     with pytest.raises(MetricGeometryDiskFullError) as raised:
         partial_metric_store.write_frame(FRAME_NAMES[1], VALID_FRAME)
     assert raised.value.failing_path == partial_metric_store.path_for(FRAME_NAMES[1])
@@ -872,10 +885,10 @@ def test_non_disk_full_oserror_is_reraised_unchanged(
 ) -> None:
     failure = OSError(errno.EACCES, "denied")
 
-    def fail_replace(_path: Path, _destination: Path) -> Path:
+    def fail_replace(_path: Path, _destination: Path) -> None:
         raise failure
 
-    monkeypatch.setattr(Path, "replace", fail_replace)
+    monkeypatch.setattr(metric_npz.os, "replace", fail_replace)
     with pytest.raises(OSError) as raised:
         partial_metric_store.write_frame(FRAME_NAMES[1], VALID_FRAME)
     assert raised.value is failure
