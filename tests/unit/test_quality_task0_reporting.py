@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -178,6 +179,18 @@ def test_cli_selection_supports_individual_and_complete_gate_sets() -> None:
         )
     with pytest.raises(reporting.GateSelectionError):
         run_quality_task0.parse_gate_selection(["--gate", "unknown"], available)
+
+
+def test_cli_script_is_directly_executable_from_the_repository_root() -> None:
+    completed = subprocess.run(
+        [sys.executable, "scripts/run_quality_task0.py", "--list"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert b"geometry-scale" in completed.stdout
+    assert completed.stderr == b""
 
 
 def test_process_rss_and_device_context_labels_are_bounded_scalars() -> None:
