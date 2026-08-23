@@ -211,7 +211,7 @@ feat: add bounded quality repair planner
 - Produces: `render_relative_primitives_compact(...)` and `render_metric_primitives_compact(...)`.
 - Produces: public `StereoRenderer.render(... quality ...) -> StereoRenderResult` by materializing four independent boolean masks.
 
-- [ ] **Step 1: Add RED Pass A/Pass B tests with independent fine-grid oracle**
+- [x] **Step 1: Add RED Pass A/Pass B tests with independent fine-grid oracle**
 
 ```python
 def test_quality_replay_never_changes_valid_winner_lanes(edge_fixture):
@@ -223,27 +223,27 @@ def test_quality_replay_never_changes_valid_winner_lanes(edge_fixture):
 
 Cover pure/mixed proxies, 16-lane ties-to-even, per-run region ownership, partial/full holes, repair-bit values, none mode, background mode, one-row/full-band equality, and both OOM retry boundaries.
 
-- [ ] **Step 2: Run focused tests and observe missing renderer failure**
+- [x] **Step 2: Run focused tests and observe missing renderer failure**
 
 Run: `python -m pytest tests/unit/test_quality_renderer.py -q`
 
-- [ ] **Step 3: Add winner-index visibility extraction without changing Fast**
+- [x] **Step 3: Add winner-index visibility extraction without changing Fast**
 
 Expose an internal winner-key result used only by `quality.visibility`. Pass A reduces each active band into planar coverage/pure proxy arrays plus sparse records, then releases all fine tensors.
 
-- [ ] **Step 4: Add Pass B replay and compact result**
+- [x] **Step 4: Add Pass B replay and compact result**
 
 Recompute visibility with the immutable single-eye offset map, verify mask OR/popcount equality, scatter only final record colours into invalid lanes, use the fixed reduction tree, and return RGB plus `uint8` coverage/repair planes.
 
-- [ ] **Step 5: Add exact OOM rollback and sequential-eye lifetimes**
+- [x] **Step 5: Add exact OOM rollback and sequential-eye lifetimes**
 
 An OOM at `h0` resets the current eye and retries from row zero at `h1`; an OOM at `h1` raises with both heights. Preserve shared budget checkpoints and completed earlier-eye compact output only.
 
-- [ ] **Step 6: Wire the public wrapper and rerun frozen Fast tests**
+- [x] **Step 6: Wire the public wrapper and rerun frozen Fast tests**
 
 Run: `python -m pytest tests/unit/test_quality_renderer.py tests/unit/test_stereo_renderer.py tests/unit/test_stereo_edge_coverage.py -q`
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```text
 feat: add compact two-pass quality renderer

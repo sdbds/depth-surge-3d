@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+import importlib
+
+import numpy as np
+import pytest
+import torch
+
+from src.depth_surge_3d.rendering.stereo_renderer import (
+    SPLAT_BYTES_PER_PIXEL,
+    StereoRenderer,
+    StereoRenderSettings,
+)
+
+
+def _quality_settings(**values: object) -> StereoRenderSettings:
+    return StereoRenderSettings(
+        stereo_render_mode="quality",
+        **values,  # type: ignore[arg-type]
+    )
+
+
+def test_quality_strength_zero_is_exact_and_has_no_repair_bits() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    generator = np.random.default_rng(20260824)
+    frame = generator.integers(0, 256, size=(5, 13, 3), dtype=np.uint8)
+    canonical = generator.random((3, 7), dtype=np.float32)
+
+    result = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(stereo_strength=0.0),
+    )
+
+    assert np.array_equal(result.left_image, frame)
+    assert np.array_equal(result.right_image, frame)
+    assert np.all(result.left_coverage_count == 16)
+    assert np.all(result.right_coverage_count == 16)
+    assert not result.left_repair_bits.any()
+    assert not result.right_repair_bits.any()
+
+
+def test_quality_none_records_partial_and_full_holes_without_repair() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    frame = np.full((5, 32, 3), 100, dtype=np.uint8)
+    canonical = np.ones((2, 8), dtype=np.float32)
+
+    result = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(
+            stereo_strength=5.0,
+            convergence=0.0,
+            occlusion_fill="none",
+        ),
+    )
+
+    left_missing = result.left_coverage_count < 16
+    assert left_missing.any()
+    assert np.all(result.left_repair_bits[left_missing] & np.uint8(0x40))
+    assert not np.any(result.left_repair_bits & np.uint8(0x3C))
+    assert np.any(result.left_repair_bits & np.uint8(0x01))
+
+
+def test_quality_background_finishes_every_lane_and_public_holes_are_clear() -> None:
+    generator = np.random.default_rng(29)
+    frame = generator.integers(0, 256, size=(9, 48, 3), dtype=np.uint8)
+    canonical = np.tile(
+        np.concatenate(
+            [
+                np.full(12, 0.15, dtype=np.float32),
+                np.full(12, 0.9, dtype=np.float32),
+                np.full(24, 0.2, dtype=np.float32),
+            ]
+        ),
+        (9, 1),
+    )
+    renderer = StereoRenderer(device="cpu")
+
+    result = renderer.render(
+        frame,
+        canonical,
+        _quality_settings(stereo_strength=5.0, convergence=0.45),
+    )
+
+    assert not result.left_hole_mask.any()
+    assert not result.right_hole_mask.any()
+    assert result.left_valid_mask.any() and result.right_valid_mask.any()
+    assert result.left_image.dtype == frame.dtype
+    assert result.right_image.dtype == frame.dtype
+
+
+def test_quality_band_height_does_not_change_rgb_or_compact_masks() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    generator = np.random.default_rng(37)
+    frame = generator.integers(0, 256, size=(8, 41, 3), dtype=np.uint8)
+    canonical = generator.random((4, 17), dtype=np.float32)
+    settings = _quality_settings(
+        stereo_strength=3.0,
+        convergence=0.4,
+        occlusion_fill="none",
+    )
+
+    full = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=settings,
+    )
+    one_row = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(
+            device="cpu",
+            temporary_budget_bytes=41 * SPLAT_BYTES_PER_PIXEL,
+        ),
+        frame=frame,
+        canonical=canonical,
+        settings=settings,
+    )
+
+    for name in (
+        "left_image",
+        "right_image",
+        "left_coverage_count",
+        "right_coverage_count",
+        "left_repair_bits",
+        "right_repair_bits",
+    ):
+        assert np.array_equal(getattr(full, name), getattr(one_row, name))
+
+
+def test_quality_pass_retries_once_from_the_start_after_cuda_oom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    frame = np.zeros((4, 9, 3), dtype=np.uint8)
+    canonical = np.full((2, 4), 0.5, dtype=np.float32)
+    renderer = StereoRenderer(
+        device="cpu",
+        temporary_budget_bytes=9 * SPLAT_BYTES_PER_PIXEL * 4,
+    )
+    original = quality._render_none_eye_once
+    attempted_heights: list[int] = []
+
+    def fail_once(*args, **kwargs):
+        attempted_heights.append(int(kwargs["band_height"]))
+        if len(attempted_heights) == 1:
+            raise torch.cuda.OutOfMemoryError("injected")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(quality, "_render_none_eye_once", fail_once)
+
+    result = quality.render_relative_quality_compact(
+        renderer=renderer,
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(occlusion_fill="none"),
+    )
+
+    assert attempted_heights[:2] == [4, 2]
+    assert result.left_image.shape == frame.shape
+
+
+def test_quality_controls_reject_boolean_limit() -> None:
+    types = importlib.import_module("src.depth_surge_3d.rendering.quality.types")
+
+    with pytest.raises(ValueError, match="non-boolean integer"):
+        types.QualityStereoControls("background", True)
