@@ -18,6 +18,7 @@ namespace {
 
 constexpr std::size_t kStackCapacity = 64;
 constexpr std::uint64_t kUint32Max = std::numeric_limits<std::uint32_t>::max();
+constexpr std::uint64_t kRepairRecordCap = (64ULL * 1024ULL * 1024ULL) / 16ULL;
 
 struct BuildFrame {
     std::uint32_t start;
@@ -1133,6 +1134,292 @@ py::tuple solve_geodesic_regions(
     );
 }
 
+struct RepairRecordStatistics {
+    std::uint64_t record_count = 0;
+    std::uint64_t prefill_run_count = 0;
+    std::uint64_t repair_run_count = 0;
+    std::uint64_t invalid_lane_count = 0;
+};
+
+template <typename Callback>
+void visit_repair_runs(
+    const std::uint8_t* valid,
+    const float* near_score,
+    const std::uint32_t* region_id,
+    std::uint32_t height,
+    std::uint32_t fine_width,
+    RepairRecordStatistics* statistics,
+    Callback callback
+) {
+    for (std::uint32_t row = 0; row < height; ++row) {
+        const std::uint32_t row_start = row * fine_width;
+        std::uint32_t fine_column = 0;
+        while (fine_column < fine_width) {
+            if (valid[row_start + fine_column] != 0) {
+                ++fine_column;
+                continue;
+            }
+            const std::uint32_t run_start = fine_column;
+            while (
+                fine_column + 1 < fine_width &&
+                valid[row_start + fine_column + 1] == 0
+            ) {
+                ++fine_column;
+            }
+            const std::uint32_t run_end = fine_column;
+            ++statistics->prefill_run_count;
+            statistics->invalid_lane_count += run_end - run_start + 1;
+            const bool has_left = run_start != 0;
+            const bool has_right = run_end + 1 < fine_width;
+            if (!has_left && !has_right) {
+                throw std::invalid_argument("row-wide pre-fill run has no donor");
+            }
+
+            const auto emit = [&](std::uint32_t start,
+                                  std::uint32_t end,
+                                  std::uint32_t region,
+                                  std::uint8_t far_side) {
+                ++statistics->repair_run_count;
+                statistics->record_count += end / 16 - start / 16 + 1;
+                if (statistics->record_count > kRepairRecordCap) {
+                    throw std::runtime_error("64 MiB repair record arena exceeded");
+                }
+                callback(row, start, end, region, far_side);
+            };
+
+            if (!has_left) {
+                emit(
+                    run_start,
+                    run_end,
+                    region_id[row_start + run_end + 1],
+                    1
+                );
+            } else if (!has_right) {
+                emit(
+                    run_start,
+                    run_end,
+                    region_id[row_start + run_start - 1],
+                    0
+                );
+            } else {
+                const float left_score = near_score[row_start + run_start - 1];
+                const float right_score = near_score[row_start + run_end + 1];
+                if (left_score < right_score) {
+                    emit(
+                        run_start,
+                        run_end,
+                        region_id[row_start + run_start - 1],
+                        0
+                    );
+                } else if (right_score < left_score) {
+                    emit(
+                        run_start,
+                        run_end,
+                        region_id[row_start + run_end + 1],
+                        1
+                    );
+                } else {
+                    const std::uint32_t left_length =
+                        (run_end - run_start + 2) / 2;
+                    const std::uint32_t left_end = run_start + left_length - 1;
+                    emit(
+                        run_start,
+                        left_end,
+                        region_id[row_start + run_start - 1],
+                        0
+                    );
+                    if (left_end < run_end) {
+                        emit(
+                            left_end + 1,
+                            run_end,
+                            region_id[row_start + run_end + 1],
+                            1
+                        );
+                    }
+                }
+            }
+            ++fine_column;
+        }
+    }
+}
+
+void write_little_u16(std::uint8_t* destination, std::uint16_t value) {
+    destination[0] = static_cast<std::uint8_t>(value & 0xffU);
+    destination[1] = static_cast<std::uint8_t>((value >> 8) & 0xffU);
+}
+
+void write_little_u32(std::uint8_t* destination, std::uint32_t value) {
+    destination[0] = static_cast<std::uint8_t>(value & 0xffU);
+    destination[1] = static_cast<std::uint8_t>((value >> 8) & 0xffU);
+    destination[2] = static_cast<std::uint8_t>((value >> 16) & 0xffU);
+    destination[3] = static_cast<std::uint8_t>((value >> 24) & 0xffU);
+}
+
+void write_repair_run_records(
+    std::uint8_t* records,
+    std::uint64_t* cursor,
+    std::uint32_t row,
+    std::uint32_t run_start,
+    std::uint32_t run_end,
+    std::uint32_t region,
+    std::uint8_t far_side,
+    std::uint32_t width
+) {
+    std::uint32_t segment_start = run_start;
+    while (segment_start <= run_end) {
+        const std::uint32_t column = segment_start / 16;
+        const std::uint32_t segment_end = std::min(
+            run_end,
+            column * 16 + 15
+        );
+        const std::uint32_t first_lane = segment_start % 16;
+        const std::uint32_t lane_count = segment_end - segment_start + 1;
+        const std::uint32_t base_mask = lane_count == 16
+            ? 0xffffU
+            : ((1U << lane_count) - 1U);
+        const std::uint16_t mask = static_cast<std::uint16_t>(
+            base_mask << first_lane
+        );
+        std::uint8_t* record = records + (*cursor * 16);
+        write_little_u32(record, row * width + column);
+        write_little_u16(record + 4, mask);
+        write_little_u32(record + 6, region);
+        record[14] = far_side;
+        ++(*cursor);
+        segment_start = segment_end + 1;
+    }
+}
+
+py::tuple build_repair_records(
+    const py::array& valid,
+    const py::array& winner_near_score,
+    const py::array& winner_region_id
+) {
+    validate_array(valid, py::dtype::of<bool>(), "valid");
+    validate_array(
+        winner_near_score,
+        py::dtype::of<float>(),
+        "winner_near_score"
+    );
+    validate_array(
+        winner_region_id,
+        py::dtype::of<std::uint32_t>(),
+        "winner_region_id"
+    );
+    if (
+        winner_near_score.shape(0) != valid.shape(0) ||
+        winner_near_score.shape(1) != valid.shape(1) ||
+        winner_region_id.shape(0) != valid.shape(0) ||
+        winner_region_id.shape(1) != valid.shape(1)
+    ) {
+        throw py::value_error("winner rasters must have matching shapes");
+    }
+    if (valid.shape(1) % 16 != 0) {
+        throw py::value_error("valid width must be a multiple of 16");
+    }
+    const std::uint64_t sample_count =
+        static_cast<std::uint64_t>(valid.shape(0)) *
+        static_cast<std::uint64_t>(valid.shape(1));
+    if (sample_count > kUint32Max) {
+        throw py::value_error("fine-grid sample count must fit uint32");
+    }
+
+    const auto height = static_cast<std::uint32_t>(valid.shape(0));
+    const auto fine_width = static_cast<std::uint32_t>(valid.shape(1));
+    const auto width = fine_width / 16;
+    const auto* valid_values = static_cast<const std::uint8_t*>(valid.data());
+    const auto* score_values = static_cast<const float*>(winner_near_score.data());
+    const auto* region_values =
+        static_cast<const std::uint32_t*>(winner_region_id.data());
+    RepairRecordStatistics statistics{};
+    {
+        py::gil_scoped_release release;
+        for (std::uint64_t sample = 0; sample < sample_count; ++sample) {
+            if (valid_values[sample] == 0) {
+                continue;
+            }
+            if (!std::isfinite(score_values[sample]) || score_values[sample] < 0.0F) {
+                throw std::invalid_argument(
+                    "valid winner near scores must be finite and nonnegative"
+                );
+            }
+            if (region_values[sample] == 0 || region_values[sample] == kUint32Max) {
+                throw std::invalid_argument(
+                    "valid winners must have positive canonical regions"
+                );
+            }
+        }
+        visit_repair_runs(
+            valid_values,
+            score_values,
+            region_values,
+            height,
+            fine_width,
+            &statistics,
+            [](std::uint32_t,
+               std::uint32_t,
+               std::uint32_t,
+               std::uint32_t,
+               std::uint8_t) {}
+        );
+    }
+
+    py::array_t<std::uint8_t> records(
+        {
+            static_cast<py::ssize_t>(statistics.record_count),
+            static_cast<py::ssize_t>(16),
+        }
+    );
+    auto* record_values = records.mutable_data();
+    std::fill(
+        record_values,
+        record_values + statistics.record_count * 16,
+        0
+    );
+    std::uint64_t cursor = 0;
+    {
+        py::gil_scoped_release release;
+        RepairRecordStatistics second_pass{};
+        visit_repair_runs(
+            valid_values,
+            score_values,
+            region_values,
+            height,
+            fine_width,
+            &second_pass,
+            [&](std::uint32_t row,
+                std::uint32_t start,
+                std::uint32_t end,
+                std::uint32_t region,
+                std::uint8_t far_side) {
+                write_repair_run_records(
+                    record_values,
+                    &cursor,
+                    row,
+                    start,
+                    end,
+                    region,
+                    far_side,
+                    width
+                );
+            }
+        );
+        if (
+            cursor != statistics.record_count ||
+            second_pass.prefill_run_count != statistics.prefill_run_count ||
+            second_pass.repair_run_count != statistics.repair_run_count ||
+            second_pass.invalid_lane_count != statistics.invalid_lane_count
+        ) {
+            throw std::runtime_error("repair record preflight count changed");
+        }
+    }
+    py::dict result_statistics;
+    result_statistics["prefill_run_count"] = statistics.prefill_run_count;
+    result_statistics["repair_run_count"] = statistics.repair_run_count;
+    result_statistics["invalid_lane_count"] = statistics.invalid_lane_count;
+    return py::make_tuple(std::move(records), std::move(result_statistics));
+}
+
 py::tuple build_index(
     const py::array& region_ids,
     std::uint64_t region_count_value,
@@ -1280,6 +1567,13 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("band_mask"),
         py::arg("seed_region_map"),
         py::arg("region_rank_bits")
+    );
+    module.def(
+        "build_repair_records",
+        &build_repair_records,
+        py::arg("valid"),
+        py::arg("winner_near_score"),
+        py::arg("winner_region_id")
     );
     module.def("build_info", &build_info);
 }

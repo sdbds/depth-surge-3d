@@ -71,11 +71,11 @@
 - Create: `scripts/quality_task0/local_strip.py`
 - Create: `tests/unit/test_quality_task0_local_strip.py`
 
-- [ ] Add RED tests for the frozen unaligned 16-byte dtype, run splitting, far-side identity, record order, contiguous/disjoint masks, and pre-fill reconstruction.
-- [ ] Implement deterministic record construction with exact invalid-mask OR/popcount checks.
-- [ ] Add the million-one-lane-run fixture and independent scalar local-strip oracle.
-- [ ] Test complete whole-run slot/neighbourhood reservations, budget skip without reads/debits, full Chebyshev donor charges, direction-preserving donor order, and shared left-then-right counters.
-- [ ] Implement local planning without dense donor helpers or pressure-dependent early termination.
+- [x] Add RED tests for the frozen unaligned 16-byte dtype, run splitting, far-side identity, record order, contiguous/disjoint masks, and pre-fill reconstruction.
+- [x] Implement deterministic record construction with exact invalid-mask OR/popcount checks.
+- [x] Add the million-one-lane-run fixture and independent scalar local-strip oracle.
+- [x] Test complete whole-run slot/neighbourhood reservations, budget skip without reads/debits, full Chebyshev donor charges, direction-preserving donor order, and shared left-then-right counters.
+- [x] Implement local planning without dense donor helpers or pressure-dependent early termination.
 
 ### Task 0.5: Fallback And Exemplar Prototypes
 
