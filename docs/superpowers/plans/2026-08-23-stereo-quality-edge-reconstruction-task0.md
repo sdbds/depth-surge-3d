@@ -136,11 +136,11 @@
 - Create: `tests/unit/test_quality_task0_encoding_provider.py`
 - Create: `tests/unit/test_quality_task0_reservation_protocol.py`
 
-- [ ] Prototype `EncodingSequenceProvider` with one frozen generation for manifest streaming, scalar argv, and postpass.
-- [ ] Exercise both sides of the FFmpeg launch boundary and signed-int image2 endpoint without an assembled frame list.
-- [ ] Freeze legal FFprobe wrappers for FFmpeg 5/6/7 and Windows; reject duplicate authoritative top-level keys while allowing nested duplicates.
-- [ ] Implement and fault-test portable output naming, fixed settings locator, write-ahead intents, authenticated physical extents, short-source recovery, job-control terminal reconciliation, and index-last retirement.
-- [ ] Cover replace/video/input-manifest/final-manifest crash windows under the approved irreversible post-boundary publication policy.
+- [x] Prototype `EncodingSequenceProvider` with one frozen generation for manifest streaming, scalar argv, and postpass.
+- [x] Exercise both sides of the FFmpeg launch boundary and signed-int image2 endpoint without an assembled frame list.
+- [x] Freeze legal FFprobe wrappers for FFmpeg 5/6/7 and Windows; reject duplicate authoritative top-level keys while allowing nested duplicates.
+- [x] Implement and fault-test portable output naming, fixed settings locator, write-ahead intents, authenticated physical extents, short-source recovery, job-control terminal reconciliation, and index-last retirement.
+- [x] Cover replace/video/input-manifest/final-manifest crash windows under the approved irreversible post-boundary publication policy.
 - [ ] Measure every coordinator phase under its capped stdout/stderr/JSON/settings/ring and timeout formulas.
 
 ### Task 0.10: Scale Matrix And Gate Decision
