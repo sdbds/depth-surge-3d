@@ -149,12 +149,16 @@ def test_subprocess_runner_measures_rss_and_builds_a_closed_descriptor(tmp_path:
 
     assert descriptor.run_id == case.run_id
     assert descriptor.status == "passed"
-    assert 0 < descriptor.peak_rss_bytes <= benchmarks.HOST_RSS_CAP_BYTES
+    assert 0 <= descriptor.peak_rss_bytes <= benchmarks.HOST_RSS_CAP_BYTES
     assert descriptor.facts["process_baseline_rss_bytes"] > 0
+    assert (
+        descriptor.facts["process_tree_baseline_rss_bytes"]
+        >= descriptor.facts["process_baseline_rss_bytes"]
+    )
     assert descriptor.facts["process_tree_peak_rss_bytes"] > 32 * 1024 * 1024
     assert descriptor.peak_rss_bytes == (
         descriptor.facts["process_tree_peak_rss_bytes"]
-        - descriptor.facts["process_baseline_rss_bytes"]
+        - descriptor.facts["process_tree_baseline_rss_bytes"]
     )
     assert descriptor.wall_time_ns > 0
     assert descriptor.visit_total > 0
@@ -179,6 +183,7 @@ def test_over_cap_worker_evidence_is_failed_instead_of_mislabeled_passed() -> No
         facts={"phase": "runtime"},
         baseline_rss_bytes=100,
         phase_wall_time_ns=1,
+        worker_process_id=200,
     )
 
     descriptor = benchmarks.finalize_worker_descriptor(
@@ -186,6 +191,7 @@ def test_over_cap_worker_evidence_is_failed_instead_of_mislabeled_passed() -> No
         result,
         process_wall_time_ns=2,
         process_tree_peak_rss_bytes=benchmarks.HOST_RSS_CAP_BYTES + 101,
+        process_tree_baseline_rss_bytes=100,
     )
 
     assert descriptor.status == "failed"
@@ -212,18 +218,22 @@ def test_runtime_baseline_is_not_charged_to_the_quality_phase_cap() -> None:
         facts={"phase": "runtime"},
         baseline_rss_bytes=baseline,
         phase_wall_time_ns=123,
+        worker_process_id=200,
     )
+    launcher = 6 * 1024 * 1024
 
     descriptor = benchmarks.finalize_worker_descriptor(
         case,
         result,
         process_wall_time_ns=999,
-        process_tree_peak_rss_bytes=baseline + 8 * 1024 * 1024,
+        process_tree_peak_rss_bytes=baseline + launcher + 8 * 1024 * 1024,
+        process_tree_baseline_rss_bytes=baseline + launcher,
     )
 
     assert descriptor.status == "passed"
     assert descriptor.wall_time_ns == 123
     assert descriptor.facts["process_wall_time_ns"] == 999
+    assert descriptor.facts["launcher_peak_rss_bytes"] == launcher
     assert descriptor.peak_rss_bytes == 8 * 1024 * 1024
     assert descriptor.facts["rss_measurement"] == "process-tree-peak-minus-baseline-v1"
     assert descriptor.facts["rss_cap_exceeded"] is False
@@ -248,6 +258,7 @@ def test_geometry_phase_over_thirty_seconds_is_failed() -> None:
         facts={},
         baseline_rss_bytes=100,
         phase_wall_time_ns=30_000_000_001,
+        worker_process_id=200,
     )
 
     descriptor = benchmarks.finalize_worker_descriptor(
@@ -255,11 +266,47 @@ def test_geometry_phase_over_thirty_seconds_is_failed() -> None:
         result,
         process_wall_time_ns=31_000_000_000,
         process_tree_peak_rss_bytes=101,
+        process_tree_baseline_rss_bytes=100,
     )
 
     assert descriptor.status == "failed"
     assert descriptor.facts["wall_cap_ns"] == 30_000_000_000
     assert descriptor.facts["wall_cap_exceeded"] is True
+
+
+def test_control_phase_uses_its_four_mib_resident_cap() -> None:
+    case = benchmarks.BenchmarkCase.create(
+        run_id="control.cpu.overcap",
+        gate="control-scale",
+        case="overcap",
+        device_context="cpu",
+        operation="control",
+        parameters={},
+    )
+    result = benchmarks.WorkerResult(
+        status="passed",
+        arena_bytes=0,
+        visit_total=0,
+        visit_max=0,
+        visit_p95=0,
+        equality_sha256="01" * 32,
+        facts={},
+        baseline_rss_bytes=100,
+        phase_wall_time_ns=1,
+        worker_process_id=200,
+    )
+
+    descriptor = benchmarks.finalize_worker_descriptor(
+        case,
+        result,
+        process_wall_time_ns=2,
+        process_tree_peak_rss_bytes=100 + 4 * 1024 * 1024 + 1,
+        process_tree_baseline_rss_bytes=100,
+    )
+
+    assert descriptor.status == "failed"
+    assert descriptor.rss_cap_bytes == 4 * 1024 * 1024
+    assert descriptor.facts["rss_cap_exceeded"] is True
 
 
 @pytest.mark.parametrize(

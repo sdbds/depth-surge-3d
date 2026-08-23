@@ -38,6 +38,8 @@ from . import (
 
 
 HOST_RSS_CAP_BYTES = 512 * 1024 * 1024
+CONTROL_RSS_CAP_BYTES = 4 * 1024 * 1024
+ENCODING_RSS_CAP_BYTES = 8 * 1024 * 1024
 _RESOLUTIONS = {"1080p": (1920, 1080), "4k": (3840, 2160)}
 _GEOMETRY_RATIOS = ("0.5", "1", "2", "4")
 _EDGE_POPULATIONS = (25, 50, 100)
@@ -205,6 +207,7 @@ class WorkerResult:
     facts: dict
     baseline_rss_bytes: int = 0
     phase_wall_time_ns: int = 0
+    worker_process_id: int = 0
 
     def to_object(self) -> dict:
         return {
@@ -217,6 +220,7 @@ class WorkerResult:
             "facts": self.facts,
             "baseline_rss_bytes": self.baseline_rss_bytes,
             "phase_wall_time_ns": self.phase_wall_time_ns,
+            "worker_process_id": self.worker_process_id,
         }
 
     @classmethod
@@ -231,6 +235,7 @@ class WorkerResult:
             "facts",
             "baseline_rss_bytes",
             "phase_wall_time_ns",
+            "worker_process_id",
         }
         if not isinstance(value, dict) or set(value) != expected:
             raise BenchmarkExecutionError("benchmark worker result schema is invalid")
@@ -243,6 +248,7 @@ class WorkerResult:
             "visit_p95",
             "baseline_rss_bytes",
             "phase_wall_time_ns",
+            "worker_process_id",
         ):
             reporting.checked_u64(value[key], key)
         if not isinstance(value["equality_sha256"], str) or len(value["equality_sha256"]) != 64:
@@ -257,6 +263,7 @@ class WorkerResult:
             facts=value["facts"],
             baseline_rss_bytes=value["baseline_rss_bytes"],
             phase_wall_time_ns=value["phase_wall_time_ns"],
+            worker_process_id=value["worker_process_id"],
         )
 
 
@@ -1217,7 +1224,11 @@ def _prepare_worker_case(case: BenchmarkCase) -> None:
     cv2.getNumThreads()
 
 
-def execute_worker_case(case: BenchmarkCase) -> WorkerResult:
+def _execute_prepared_worker_case(
+    case: BenchmarkCase,
+    *,
+    baseline_rss_bytes: int,
+) -> WorkerResult:
     operations: dict[str, Callable[[BenchmarkCase], WorkerResult]] = {
         "geometry": _geometry_worker,
         "region": _region_worker,
@@ -1230,17 +1241,24 @@ def execute_worker_case(case: BenchmarkCase) -> WorkerResult:
         "faults": lambda _case: _fault_worker(),
     }
     if case.operation in operations:
-        _prepare_worker_case(case)
-        gc.collect()
-        baseline_rss_bytes = reporting.read_process_rss_bytes(os.getpid())
         started = time.perf_counter_ns()
         result = operations[case.operation](case)
         return replace(
             result,
             baseline_rss_bytes=baseline_rss_bytes,
             phase_wall_time_ns=time.perf_counter_ns() - started,
+            worker_process_id=os.getpid(),
         )
     raise BenchmarkExecutionError(f"benchmark operation is not implemented: {case.operation}")
+
+
+def execute_worker_case(case: BenchmarkCase) -> WorkerResult:
+    _prepare_worker_case(case)
+    gc.collect()
+    return _execute_prepared_worker_case(
+        case,
+        baseline_rss_bytes=reporting.read_process_rss_bytes(os.getpid()),
+    )
 
 
 def _load_case_file(path: Path) -> BenchmarkCase:
@@ -1260,20 +1278,63 @@ def run_case_subprocess(  # noqa: C901
     case_file: Path | None = None,
 ) -> reporting.GateRunDescriptor:
     root = Path(__file__).resolve().parents[2]
-    owned_temp: tempfile.TemporaryDirectory[str] | None = None
+    owned_temp = tempfile.TemporaryDirectory(prefix="quality-task0-control-")
+    control_root = Path(owned_temp.name)
     if case_file is None:
-        owned_temp = tempfile.TemporaryDirectory(prefix="quality-task0-case-")
-        case_file = Path(owned_temp.name) / "case.json"
+        case_file = control_root / "case.json"
         case_file.write_bytes(reporting.canonical_json_bytes(case.to_object()))
+    ready_file = control_root / "ready.json"
+    go_file = control_root / "go"
     started = time.perf_counter_ns()
     process = subprocess.Popen(
-        [sys.executable, "-m", "scripts.quality_task0.benchmarks", "--worker-case", str(case_file)],
+        [
+            sys.executable,
+            "-m",
+            "scripts.quality_task0.benchmarks",
+            "--worker-case",
+            str(case_file),
+            "--ready-file",
+            str(ready_file),
+            "--go-file",
+            str(go_file),
+        ],
         cwd=root,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     peak_rss = 0
+    process_tree_baseline_rss = 0
     try:
+        ready_deadline = time.perf_counter_ns() + 30_000_000_000
+        while not ready_file.is_file() and process.poll() is None:
+            if time.perf_counter_ns() >= ready_deadline:
+                raise BenchmarkExecutionError("benchmark worker baseline handshake timed out")
+            time.sleep(0.005)
+        if not ready_file.is_file():
+            stdout, stderr = process.communicate(timeout=5)
+            detail = stderr.decode("utf-8", errors="replace")[-4096:]
+            raise BenchmarkExecutionError(f"benchmark worker failed before readiness: {detail}")
+        ready_raw = ready_file.read_bytes()
+        try:
+            ready_value = json.loads(ready_raw.decode("ascii"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise BenchmarkExecutionError("benchmark worker readiness is malformed") from error
+        if (
+            reporting.canonical_json_bytes(ready_value) != ready_raw
+            or not isinstance(ready_value, dict)
+            or set(ready_value) != {"baseline_rss_bytes", "worker_process_id"}
+        ):
+            raise BenchmarkExecutionError("benchmark worker readiness schema is invalid")
+        reporting.checked_u64(ready_value["baseline_rss_bytes"], "worker baseline RSS")
+        reporting.checked_u64(ready_value["worker_process_id"], "worker process id")
+        for _ in range(3):
+            process_tree_baseline_rss = max(
+                process_tree_baseline_rss,
+                reporting.read_process_tree_rss_bytes(process.pid),
+            )
+            time.sleep(0.002)
+        go_file.write_bytes(b"go")
+        peak_rss = process_tree_baseline_rss
         while process.poll() is None:
             try:
                 peak_rss = max(
@@ -1288,8 +1349,7 @@ def run_case_subprocess(  # noqa: C901
         if process.poll() is None:
             process.kill()
             process.wait()
-        if owned_temp is not None:
-            owned_temp.cleanup()
+        owned_temp.cleanup()
     wall_time = time.perf_counter_ns() - started
     if len(stdout) > 1024 * 1024 or len(stderr) > 1024 * 1024:
         raise BenchmarkExecutionError("benchmark worker output exceeds one MiB")
@@ -1303,11 +1363,17 @@ def run_case_subprocess(  # noqa: C901
     if reporting.canonical_json_bytes(value) != stdout:
         raise BenchmarkExecutionError("benchmark worker output is not canonical")
     result = WorkerResult.from_object(value)
+    if (
+        result.baseline_rss_bytes != ready_value["baseline_rss_bytes"]
+        or result.worker_process_id != ready_value["worker_process_id"]
+    ):
+        raise BenchmarkExecutionError("worker result differs from readiness identity")
     return finalize_worker_descriptor(
         case,
         result,
         process_wall_time_ns=wall_time,
         process_tree_peak_rss_bytes=peak_rss,
+        process_tree_baseline_rss_bytes=process_tree_baseline_rss,
     )
 
 
@@ -1317,32 +1383,47 @@ def finalize_worker_descriptor(
     *,
     process_wall_time_ns: int,
     process_tree_peak_rss_bytes: int,
+    process_tree_baseline_rss_bytes: int,
 ) -> reporting.GateRunDescriptor:
     baseline = result.baseline_rss_bytes
-    if baseline <= 0:
-        raise BenchmarkExecutionError("worker did not record a positive process RSS baseline")
-    if process_tree_peak_rss_bytes < baseline:
-        raise BenchmarkExecutionError("process-tree RSS peak is below the worker baseline")
+    if baseline <= 0 or result.worker_process_id <= 0:
+        raise BenchmarkExecutionError("worker did not record a positive process baseline identity")
+    if process_tree_baseline_rss_bytes < baseline:
+        raise BenchmarkExecutionError("process-tree baseline is below the worker baseline")
+    if process_tree_peak_rss_bytes < process_tree_baseline_rss_bytes:
+        raise BenchmarkExecutionError("process-tree RSS peak is below its measured baseline")
     if process_wall_time_ns < result.phase_wall_time_ns:
         raise BenchmarkExecutionError(
             "worker phase wall time is outside the process wall time: "
             f"phase={result.phase_wall_time_ns}, process={process_wall_time_ns}"
         )
-    phase_peak_rss_bytes = process_tree_peak_rss_bytes - baseline
-    cap_exceeded = phase_peak_rss_bytes > HOST_RSS_CAP_BYTES
+    phase_peak_rss_bytes = process_tree_peak_rss_bytes - process_tree_baseline_rss_bytes
+    if case.operation == "control":
+        rss_cap_bytes = CONTROL_RSS_CAP_BYTES
+    elif case.operation == "encoding":
+        rss_cap_bytes = ENCODING_RSS_CAP_BYTES
+    else:
+        rss_cap_bytes = HOST_RSS_CAP_BYTES
+    cap_exceeded = phase_peak_rss_bytes > rss_cap_bytes
+    arena_cap_exceeded = result.arena_bytes > rss_cap_bytes
     wall_cap_ns = 30_000_000_000 if case.operation in {"geometry", "region", "fallback"} else None
     wall_cap_exceeded = wall_cap_ns is not None and result.phase_wall_time_ns > wall_cap_ns
     facts = {
         **result.facts,
         "process_wall_time_ns": process_wall_time_ns,
         "process_baseline_rss_bytes": baseline,
+        "process_tree_baseline_rss_bytes": process_tree_baseline_rss_bytes,
+        "launcher_peak_rss_bytes": process_tree_baseline_rss_bytes - baseline,
         "process_tree_peak_rss_bytes": process_tree_peak_rss_bytes,
         "rss_measurement": "process-tree-peak-minus-baseline-v1",
         "rss_cap_exceeded": cap_exceeded,
+        "arena_cap_exceeded": arena_cap_exceeded,
         "wall_cap_ns": wall_cap_ns,
         "wall_cap_exceeded": wall_cap_exceeded,
     }
-    status: reporting.RunStatus = "failed" if cap_exceeded or wall_cap_exceeded else result.status
+    status: reporting.RunStatus = (
+        "failed" if cap_exceeded or arena_cap_exceeded or wall_cap_exceeded else result.status
+    )
     return reporting.GateRunDescriptor.create(
         run_id=case.run_id,
         gate=case.gate,
@@ -1351,7 +1432,7 @@ def finalize_worker_descriptor(
         status=status,
         wall_time_ns=result.phase_wall_time_ns,
         peak_rss_bytes=phase_peak_rss_bytes,
-        rss_cap_bytes=HOST_RSS_CAP_BYTES,
+        rss_cap_bytes=rss_cap_bytes,
         arena_bytes=result.arena_bytes,
         visit_total=result.visit_total,
         visit_max=result.visit_max,
@@ -1419,8 +1500,33 @@ def run_task0_gate_suite(selected_gates: tuple[str, ...]) -> reporting.Task0Repo
 def _worker_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker-case", type=Path, required=True)
+    parser.add_argument("--ready-file", type=Path, required=True)
+    parser.add_argument("--go-file", type=Path, required=True)
     arguments = parser.parse_args(argv)
-    result = execute_worker_case(_load_case_file(arguments.worker_case))
+    case = _load_case_file(arguments.worker_case)
+    _prepare_worker_case(case)
+    gc.collect()
+    baseline_rss_bytes = reporting.read_process_rss_bytes(os.getpid())
+    ready = reporting.canonical_json_bytes(
+        {
+            "baseline_rss_bytes": baseline_rss_bytes,
+            "worker_process_id": os.getpid(),
+        }
+    )
+    ready_temporary = arguments.ready_file.with_name(f".{arguments.ready_file.name}.tmp")
+    ready_temporary.write_bytes(ready)
+    os.replace(ready_temporary, arguments.ready_file)
+    go_deadline = time.perf_counter_ns() + 30_000_000_000
+    while not arguments.go_file.is_file():
+        if time.perf_counter_ns() >= go_deadline:
+            raise BenchmarkExecutionError("benchmark parent handshake timed out")
+        time.sleep(0.001)
+    if arguments.go_file.read_bytes() != b"go":
+        raise BenchmarkExecutionError("benchmark parent handshake is invalid")
+    result = _execute_prepared_worker_case(
+        case,
+        baseline_rss_bytes=baseline_rss_bytes,
+    )
     sys.stdout.buffer.write(reporting.canonical_json_bytes(result.to_object()))
     return 0
 
