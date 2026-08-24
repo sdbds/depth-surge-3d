@@ -538,55 +538,9 @@ def _label_region_fragments(
     region_map: np.ndarray,
     band_mask: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    fragment_map = np.zeros(band_mask.shape, dtype=np.uint32)
-    pixel_count = int(np.count_nonzero(band_mask))
-    fragment_regions = np.zeros(pixel_count + 1, dtype=np.uint32)
-    fragment_bounds = np.zeros((pixel_count + 1, 4), dtype=np.uint32)
-    if pixel_count == 0:
-        return fragment_map, fragment_regions, fragment_bounds, 0
-    queue = np.empty(pixel_count, dtype=np.uint32)
-    height, width = band_mask.shape
-    fragment_count = 0
-    for start in range(band_mask.size):
-        region = region_map.flat[start]
-        if (
-            not bool(band_mask.flat[start])
-            or int(fragment_map.flat[start]) != 0
-            or not _is_region(region)
-        ):
-            continue
-        fragment_count += 1
-        head = 0
-        tail = 1
-        queue[0] = np.uint32(start)
-        fragment_map.flat[start] = np.uint32(fragment_count)
-        fragment_regions[fragment_count] = region
-        start_y, start_x = divmod(start, width)
-        fragment_bounds[fragment_count] = np.asarray(
-            [start_y, start_y, start_x, start_x],
-            dtype=np.uint32,
-        )
-        while head < tail:
-            pixel = int(queue[head])
-            head += 1
-            y, x = divmod(pixel, width)
-            bounds = fragment_bounds[fragment_count]
-            bounds[0] = np.uint32(min(int(bounds[0]), y))
-            bounds[1] = np.uint32(max(int(bounds[1]), y))
-            bounds[2] = np.uint32(min(int(bounds[2]), x))
-            bounds[3] = np.uint32(max(int(bounds[3]), x))
-            for ny, nx in _neighbour_coordinates(y, x, height, width):
-                neighbour = ny * width + nx
-                if not bool(band_mask.flat[neighbour]):
-                    continue
-                if int(fragment_map.flat[neighbour]) != 0:
-                    continue
-                if region_map.flat[neighbour] != region:
-                    continue
-                fragment_map.flat[neighbour] = np.uint32(fragment_count)
-                queue[tail] = np.uint32(neighbour)
-                tail += 1
-    return fragment_map, fragment_regions, fragment_bounds, fragment_count
+    values = native_kd._require_native().label_region_fragments(region_map, band_mask)
+    fragment_map, fragment_regions, fragment_bounds = values[:3]
+    return fragment_map, fragment_regions, fragment_bounds, int(values[3])
 
 
 def _validate_solver_inputs(

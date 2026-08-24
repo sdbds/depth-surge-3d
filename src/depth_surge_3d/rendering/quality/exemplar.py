@@ -192,31 +192,15 @@ def select_frontier_target(level: ExemplarLevel) -> tuple[int, int, int] | None:
 
     if not isinstance(level, ExemplarLevel):
         raise TypeError("level must be ExemplarLevel")
-    height, width = level.target_mask.shape
-    best: tuple[int, int, int] | None = None
-    for row in range(_PATCH_RADIUS, height - _PATCH_RADIUS):
-        for column in range(_PATCH_RADIUS, width - _PATCH_RADIUS):
-            if not level.target_mask[row, column] or level.processed_mask[row, column]:
-                continue
-            if not _has_processed_four_neighbour(level, row, column):
-                continue
-            row_slice = slice(row - _PATCH_RADIUS, row + _PATCH_RADIUS + 1)
-            column_slice = slice(column - _PATCH_RADIUS, column + _PATCH_RADIUS + 1)
-            if np.any(level.barrier_mask[row_slice, column_slice]):
-                continue
-            processed_count = int(np.count_nonzero(level.processed_mask[row_slice, column_slice]))
-            if processed_count < 8:
-                continue
-            candidate = (processed_count, row, column)
-            if best is None or (-candidate[0], candidate[1], candidate[2]) < (
-                -best[0],
-                best[1],
-                best[2],
-            ):
-                best = candidate
-    if best is None:
+    selected = native_kd._require_native().select_exemplar_frontier(
+        level.target_mask,
+        level.processed_mask,
+        level.barrier_mask,
+    )
+    if selected is None:
         return None
-    return best[1], best[2], best[0]
+    row, column, known_count = selected
+    return int(row), int(column), int(known_count)
 
 
 def enumerate_donor_centres(donor_mask: np.ndarray) -> np.ndarray:

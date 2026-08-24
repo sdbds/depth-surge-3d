@@ -77,3 +77,119 @@ def test_native_mapping_and_edge_band_match_the_scalar_oracle(monkeypatch) -> No
 
     assert np.array_equal(actual_map, expected_map)
     assert np.array_equal(actual_band, expected_band)
+
+
+def test_native_region_fragment_labels_match_the_scalar_oracle() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    prototype = importlib.import_module("scripts.quality_task0.region_solver")
+    regions = np.array(
+        [
+            [1, 1, 2, 2, 2, 3],
+            [1, 2, 2, 4, 2, 3],
+            [1, 1, 4, 4, 3, 3],
+            [5, 5, 4, 0, 3, 3],
+            [5, 6, 6, 6, 0xFFFFFFFF, 3],
+        ],
+        dtype=np.uint32,
+    )
+    band = np.array(
+        [
+            [1, 1, 1, 0, 1, 1],
+            [1, 1, 1, 1, 1, 0],
+            [0, 1, 1, 1, 1, 1],
+            [1, 1, 0, 1, 1, 1],
+            [1, 1, 1, 1, 1, 1],
+        ],
+        dtype=np.bool_,
+    )
+    expected = prototype._label_region_fragments(regions, band)
+
+    actual = native_kd._require_native().label_region_fragments(regions, band)
+
+    assert int(actual[3]) == expected[3]
+    for actual_values, expected_values in zip(actual[:3], expected[:3], strict=True):
+        assert np.array_equal(actual_values, expected_values)
+
+
+def test_native_one_sided_collection_matches_the_scalar_oracle() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    prototype = importlib.import_module("scripts.quality_task0.quality_geometry")
+    source_regions = np.array(
+        [
+            [1, 1, 2, 2],
+            [1, 3, 3, 2],
+            [1, 1, 2, 2],
+        ],
+        dtype=np.uint32,
+    )
+    render_shape = (7, 9)
+    final_regions = np.ascontiguousarray(
+        source_regions[
+            np.array([0, 0, 1, 1, 1, 2, 2])[:, None],
+            np.array([0, 0, 1, 1, 2, 2, 2, 3, 3])[None, :],
+        ]
+    )
+    final_regions[2:5, 3:6] = np.uint32(2)
+    radius = 2
+    edge_count = sum(
+        int(np.count_nonzero(row))
+        for _, row in prototype._iter_streamed_edge_rows(
+            source_regions,
+            render_shape,
+            radius,
+        )
+    )
+    source_primitives = (
+        np.arange(source_regions.size, dtype=np.float32).reshape(source_regions.shape),
+        np.ascontiguousarray(
+            np.arange(source_regions.size, dtype=np.float32).reshape(source_regions.shape)
+            / np.float32(7.0)
+        ),
+    )
+
+    def output_primitives():
+        return tuple(
+            np.full(render_shape, np.float32(-77.0), dtype=np.float32) for _ in source_primitives
+        )
+
+    def query_arrays():
+        return (
+            np.empty(edge_count, dtype=np.uint32),
+            np.empty(edge_count, dtype=np.uint32),
+            np.empty(edge_count, dtype=np.float64),
+            np.empty(edge_count, dtype=np.float64),
+        )
+
+    expected_outputs = output_primitives()
+    expected_queries = query_arrays()
+    expected_state = prototype._RegionState(
+        source_region_map=source_regions,
+        final_region_map=final_regions,
+        region_count=3,
+        radius=radius,
+        edge_band_pixel_count=edge_count,
+        final_region_hash="unused",
+    )
+    expected_counts = prototype._collect_one_sided_queries(
+        source_primitives,
+        expected_outputs,
+        expected_state,
+        *expected_queries,
+    )
+
+    actual_outputs = output_primitives()
+    actual_queries = query_arrays()
+    actual_counts = native_kd._require_native().collect_one_sided_queries(
+        source_primitives,
+        actual_outputs,
+        source_regions,
+        final_regions,
+        radius,
+        *actual_queries,
+    )
+
+    assert tuple(int(value) for value in actual_counts) == expected_counts
+    for actual, expected in zip(actual_outputs, expected_outputs, strict=True):
+        assert actual.tobytes() == expected.tobytes()
+    for actual, expected in zip(actual_queries, expected_queries, strict=True):
+        assert actual[: expected_counts[0]].tobytes() == expected[: expected_counts[0]].tobytes()

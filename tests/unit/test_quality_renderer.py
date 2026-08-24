@@ -169,6 +169,96 @@ def test_quality_controls_reject_boolean_limit() -> None:
         types.QualityStereoControls("background", True)
 
 
+def test_native_analysis_band_matches_the_existing_scalar_boundary() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    forward_splat = importlib.import_module("src.depth_surge_3d.rendering.forward_splat")
+    local_strip = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    native_repair = importlib.import_module("src.depth_surge_3d.rendering.quality.native_repair")
+    visibility = importlib.import_module("src.depth_surge_3d.rendering.quality.visibility")
+    height, width = 2, 3
+    fine_width = width * 16
+    valid = np.ones((height, fine_width), dtype=np.bool_)
+    valid[0, 5:9] = False
+    valid[0, 22:25] = False
+    valid[1, :2] = False
+    winner_sources = np.empty((height, fine_width), dtype=np.int64)
+    for column in range(width):
+        winner_sources[:, column * 16 : (column + 1) * 16] = (0, 2, 1)[column]
+    winner_sources[0, 43] = 2
+    winner_sources[~valid] = 0xFFFFFFFF
+    source_regions = np.array([[1, 1, 2], [1, 2, 2]], dtype=np.uint32)
+    near_score = np.zeros((height, fine_width), dtype=np.float32)
+    colour = np.zeros((height, fine_width, 3), dtype=np.float32)
+    source_near = np.array([0.25, 0.5, 0.75, 0.3, 0.7, 0.8], dtype=np.float32)
+    source_bgr = np.array(
+        [
+            [10, 20, 30],
+            [40, 50, 60],
+            [70, 80, 90],
+            [15, 25, 35],
+            [45, 55, 65],
+            [75, 85, 95],
+        ],
+        dtype=np.float32,
+    )
+    for sample in np.flatnonzero(valid):
+        source_index = int(winner_sources.flat[int(sample)])
+        near_score.flat[int(sample)] = source_near[source_index]
+        colour.reshape(-1, 3)[int(sample)] = source_bgr[source_index]
+    band = visibility.QualitySplatBand(
+        splat=forward_splat.SubpixelSplatResult(
+            colour=torch.from_numpy(colour),
+            disparity=torch.from_numpy(near_score),
+            valid=torch.from_numpy(valid),
+        ),
+        winner_source_index=torch.from_numpy(winner_sources),
+    )
+
+    def empty_analysis():
+        return local_strip.QualityVisibilityAnalysis(
+            np.empty((height, width), dtype=np.uint8),
+            np.empty((height, width), dtype=np.uint32),
+            tuple(np.empty((height, width), dtype=np.uint8) for _ in range(3)),
+            anchor_fallbacks_seeded=True,
+        )
+
+    expected_analysis = empty_analysis()
+    expected_inputs = quality._write_analysis_band(
+        expected_analysis,
+        band,
+        source_regions,
+        0,
+        height,
+    )
+    expected_records = native_repair.build_native_repair_records(
+        expected_inputs[0],
+        expected_inputs[1],
+        expected_inputs[2],
+        winner_bgr=expected_inputs[3],
+    ).records
+
+    actual_analysis = empty_analysis()
+    actual_records = quality._write_analysis_band_native(
+        actual_analysis,
+        band,
+        source_bgr.astype(np.uint8).reshape(height, width, 3),
+        source_near.reshape(source_regions.shape),
+        source_regions,
+        0,
+        height,
+    ).records
+
+    assert np.array_equal(actual_analysis.coverage_count, expected_analysis.coverage_count)
+    assert np.array_equal(actual_analysis.pure_region_id, expected_analysis.pure_region_id)
+    for actual, expected in zip(
+        actual_analysis.pure_bgr,
+        expected_analysis.pure_bgr,
+        strict=True,
+    ):
+        assert np.array_equal(actual, expected)
+    assert actual_records.tobytes() == expected_records.tobytes()
+
+
 def test_metric_quality_renders_native_primitives_and_returns_final_stats() -> None:
     quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
     types = importlib.import_module("src.depth_surge_3d.rendering.quality.types")

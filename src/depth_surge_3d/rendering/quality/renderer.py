@@ -29,12 +29,12 @@ from .geometry import (
     build_relative_quality_geometry,
 )
 from .local_strip import QualityRepairBudgets, QualityVisibilityAnalysis
-from .native_repair import build_native_repair_records
 from .planner import QualityRepairPlan, plan_quality_repairs
 from .repair_records import (
     NO_REGION,
     QUALITY_REPAIR_RECORD_CAP,
     REPAIR_RECORD_DTYPE,
+    RepairRecordBuildResult,
     QualityRepairBudgetError,
     validate_record_coverage,
 )
@@ -186,6 +186,41 @@ def _write_analysis_band(
     )
 
 
+def _write_analysis_band_native(
+    analysis: QualityVisibilityAnalysis,
+    band: QualitySplatBand,
+    source_bgr: np.ndarray,
+    source_near_score: np.ndarray,
+    source_regions: np.ndarray,
+    start_row: int,
+    end_row: int,
+) -> RepairRecordBuildResult:
+    winner_sources_i32 = np.ascontiguousarray(
+        band.winner_source_index.to(dtype=torch.int32).detach().cpu().numpy()
+    )
+    winner_sources = winner_sources_i32.view(np.uint32)
+    native = native_kd._require_native()
+    raw_records, statistics = native.analyze_splat_band(
+        winner_sources,
+        source_bgr,
+        source_near_score,
+        source_regions,
+        analysis.coverage_count[start_row:end_row],
+        analysis.pure_region_id[start_row:end_row],
+        analysis.pure_bgr[0][start_row:end_row],
+        analysis.pure_bgr[1][start_row:end_row],
+        analysis.pure_bgr[2][start_row:end_row],
+    )
+    records = raw_records.reshape(-1).view(REPAIR_RECORD_DTYPE)
+    records.setflags(write=False)
+    return RepairRecordBuildResult(
+        records=records,
+        prefill_run_count=int(statistics["prefill_run_count"]),
+        repair_run_count=int(statistics["repair_run_count"]),
+        invalid_lane_count=int(statistics["invalid_lane_count"]),
+    )
+
+
 def _analyze_eye_once(
     *,
     renderer: StereoRenderer,
@@ -194,10 +229,15 @@ def _analyze_eye_once(
     offsets: np.ndarray,
     band_height: int,
 ) -> _EyeAnalysisResult:
-    height, width = source.shape[:2]
+    height = int(source.shape[0])
+    width = int(source.shape[1])
     coverage = np.empty((height, width), dtype=np.uint8)
     pure_regions = np.empty((height, width), dtype=np.uint32)
-    pure_bgr = tuple(np.empty((height, width), dtype=np.uint8) for _ in range(3))
+    pure_bgr = (
+        np.empty((height, width), dtype=np.uint8),
+        np.empty((height, width), dtype=np.uint8),
+        np.empty((height, width), dtype=np.uint8),
+    )
     analysis = QualityVisibilityAnalysis(
         coverage,
         pure_regions,
@@ -209,20 +249,16 @@ def _analyze_eye_once(
     for start_row in range(0, height, band_height):
         end_row = min(height, start_row + band_height)
         band = _quality_splat(renderer, source, geometry, offsets, start_row, end_row)
-        valid, winner_near_score, winner_regions, winner_bgr = _write_analysis_band(
+        built = _write_analysis_band_native(
             analysis,
             band,
+            source,
+            geometry.near_score,
             geometry.final_region_map,
             start_row,
             end_row,
         )
-        if not valid.all():
-            built = build_native_repair_records(
-                valid,
-                winner_near_score,
-                winner_regions,
-                winner_bgr=winner_bgr,
-            )
+        if built.records.size:
             next_count = record_count + int(built.records.size)
             if next_count > QUALITY_REPAIR_RECORD_CAP:
                 raise QualityRepairBudgetError("64 MiB repair record arena exceeded")
@@ -230,7 +266,7 @@ def _analyze_eye_once(
             destination[:] = built.records
             destination["pixel_index"] += np.uint32(start_row * width)
             record_count = next_count
-        del band, valid, winner_near_score, winner_regions, winner_bgr
+        del band, built
     records = record_arena[:record_count]
     records.setflags(write=False)
     return _EyeAnalysisResult(analysis=analysis, records=records)
@@ -417,7 +453,7 @@ def _render_background_eye(
     plan = plan_quality_repairs(
         analyzed.analysis,
         records=analyzed.records,
-        render_shape=source.shape[:2],
+        render_shape=(int(source.shape[0]), int(source.shape[1])),
         local_limit_px=local_limit,
         budgets=budgets,
     )

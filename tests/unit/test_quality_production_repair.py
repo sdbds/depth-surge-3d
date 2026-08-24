@@ -338,6 +338,14 @@ def test_production_exemplar_reuses_one_native_sobel_pair_per_level(monkeypatch)
             return planes
 
         @staticmethod
+        def select_exemplar_frontier(target_mask, processed_mask, barrier_mask):
+            return native.select_exemplar_frontier(
+                target_mask,
+                processed_mask,
+                barrier_mask,
+            )
+
+        @staticmethod
         def select_exemplar_donor(
             working_bgr,
             processed_mask,
@@ -563,6 +571,87 @@ def test_planner_skips_exemplar_when_the_region_has_no_strict_safe_donor(
 
     assert result.records["backend"].tolist() == [3]
     assert result.exemplar_donor_evaluation_count == 0
+
+
+def test_native_safe_donor_mask_matches_the_strict_index_members() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    native = native_kd._require_native()
+    coverage = np.full((11, 13), 16, dtype=np.uint8)
+    regions = np.ones((11, 13), dtype=np.uint32)
+    regions[:, 7:] = np.uint32(2)
+    coverage[5, 3] = np.uint8(15)
+    coverage[7, 9] = np.uint8(0)
+    referenced = np.array([False, True, True], dtype=np.bool_)
+    members, offsets = native.build_safe_donor_index(
+        coverage,
+        regions,
+        referenced,
+    )
+    expected_mask = np.zeros(coverage.shape, dtype=np.bool_)
+    expected_mask.reshape(-1)[members] = True
+    expected_regions = np.zeros(referenced.shape, dtype=np.bool_)
+    expected_regions[1:] = offsets[1:] != offsets[:-1]
+
+    actual_mask, actual_regions = native.build_safe_donor_mask(
+        coverage,
+        regions,
+        referenced,
+    )
+
+    assert np.array_equal(actual_mask, expected_mask)
+    assert np.array_equal(actual_regions, expected_regions)
+
+
+def test_native_exemplar_candidate_mask_matches_the_complete_support_oracle() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    generator = np.random.default_rng(2026082402)
+    shape = (21, 27)
+    safe = np.ascontiguousarray(generator.random(shape) >= 0.08)
+    regions = np.ones(shape, dtype=np.uint32)
+    regions[:, 9:18] = np.uint32(2)
+    regions[:, 18:] = np.uint32(3)
+    regions[10, 13] = np.uint32(0xFFFFFFFF)
+    expected = np.zeros(shape, dtype=np.bool_)
+    for row in range(4, shape[0] - 4):
+        for column in range(4, shape[1] - 4):
+            region = regions[row, column]
+            support = np.s_[row - 4 : row + 5, column - 4 : column + 5]
+            expected[row, column] = bool(
+                region not in (0, 0xFFFFFFFF)
+                and np.all(safe[support])
+                and np.all(regions[support] == region)
+            )
+
+    actual = native_kd._require_native().build_exemplar_candidate_mask(safe, regions)
+
+    assert np.array_equal(actual, expected)
+
+
+def test_native_exemplar_frontier_matches_the_scalar_oracle() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    prototype = importlib.import_module("scripts.quality_task0.exemplar")
+    generator = np.random.default_rng(2026082401)
+    shape = (19, 23)
+    target = np.ascontiguousarray(generator.random(shape) < 0.35)
+    processed = np.ascontiguousarray(generator.random(shape) < 0.55)
+    barrier = np.ascontiguousarray(generator.random(shape) < 0.04)
+    processed[target] = False
+    level = prototype.ExemplarLevel(
+        np.zeros((*shape, 3), dtype=np.uint8),
+        np.zeros(shape, dtype=np.bool_),
+        target,
+        processed,
+        barrier,
+    )
+    expected = prototype.select_frontier_target(level)
+
+    actual = native_kd._require_native().select_exemplar_frontier(
+        target,
+        processed,
+        barrier,
+    )
+
+    assert (None if actual is None else tuple(int(value) for value in actual)) == expected
 
 
 def test_planner_skips_exemplar_when_no_complete_donor_patch_exists(

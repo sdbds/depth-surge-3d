@@ -1230,28 +1230,28 @@ struct RepairRecordStatistics {
     std::uint64_t invalid_lane_count = 0;
 };
 
-template <typename Callback>
-void visit_repair_runs(
-    const std::uint8_t* valid,
-    const float* near_score,
-    const std::uint32_t* region_id,
+template <typename ValidAt, typename ScoreAt, typename RegionAt, typename Callback>
+void visit_repair_runs_with_accessors(
     std::uint32_t height,
     std::uint32_t fine_width,
     RepairRecordStatistics* statistics,
+    ValidAt valid_at,
+    ScoreAt score_at,
+    RegionAt region_at,
     Callback callback
 ) {
     for (std::uint32_t row = 0; row < height; ++row) {
         const std::uint32_t row_start = row * fine_width;
         std::uint32_t fine_column = 0;
         while (fine_column < fine_width) {
-            if (valid[row_start + fine_column] != 0) {
+            if (valid_at(row_start + fine_column)) {
                 ++fine_column;
                 continue;
             }
             const std::uint32_t run_start = fine_column;
             while (
                 fine_column + 1 < fine_width &&
-                valid[row_start + fine_column + 1] == 0
+                !valid_at(row_start + fine_column + 1)
             ) {
                 ++fine_column;
             }
@@ -1280,31 +1280,31 @@ void visit_repair_runs(
                 emit(
                     run_start,
                     run_end,
-                    region_id[row_start + run_end + 1],
+                    region_at(row_start + run_end + 1),
                     1
                 );
             } else if (!has_right) {
                 emit(
                     run_start,
                     run_end,
-                    region_id[row_start + run_start - 1],
+                    region_at(row_start + run_start - 1),
                     0
                 );
             } else {
-                const float left_score = near_score[row_start + run_start - 1];
-                const float right_score = near_score[row_start + run_end + 1];
+                const float left_score = score_at(row_start + run_start - 1);
+                const float right_score = score_at(row_start + run_end + 1);
                 if (left_score < right_score) {
                     emit(
                         run_start,
                         run_end,
-                        region_id[row_start + run_start - 1],
+                        region_at(row_start + run_start - 1),
                         0
                     );
                 } else if (right_score < left_score) {
                     emit(
                         run_start,
                         run_end,
-                        region_id[row_start + run_end + 1],
+                        region_at(row_start + run_end + 1),
                         1
                     );
                 } else {
@@ -1314,14 +1314,14 @@ void visit_repair_runs(
                     emit(
                         run_start,
                         left_end,
-                        region_id[row_start + run_start - 1],
+                        region_at(row_start + run_start - 1),
                         0
                     );
                     if (left_end < run_end) {
                         emit(
                             left_end + 1,
                             run_end,
-                            region_id[row_start + run_end + 1],
+                            region_at(row_start + run_end + 1),
                             1
                         );
                     }
@@ -1330,6 +1330,27 @@ void visit_repair_runs(
             ++fine_column;
         }
     }
+}
+
+template <typename Callback>
+void visit_repair_runs(
+    const std::uint8_t* valid,
+    const float* near_score,
+    const std::uint32_t* region_id,
+    std::uint32_t height,
+    std::uint32_t fine_width,
+    RepairRecordStatistics* statistics,
+    Callback callback
+) {
+    visit_repair_runs_with_accessors(
+        height,
+        fine_width,
+        statistics,
+        [&](std::uint32_t sample) { return valid[sample] != 0; },
+        [&](std::uint32_t sample) { return near_score[sample]; },
+        [&](std::uint32_t sample) { return region_id[sample]; },
+        callback
+    );
 }
 
 void write_little_u16(std::uint8_t* destination, std::uint16_t value) {
@@ -1383,6 +1404,50 @@ void write_repair_run_records(
             record[11] = static_cast<std::uint8_t>(winner_bgr[sample + 1]);
             record[12] = static_cast<std::uint8_t>(winner_bgr[sample + 2]);
         }
+        record[14] = far_side;
+        ++(*cursor);
+        segment_start = segment_end + 1;
+    }
+}
+
+void write_repair_run_records_from_sources(
+    std::uint8_t* records,
+    std::uint64_t* cursor,
+    std::uint32_t row,
+    std::uint32_t run_start,
+    std::uint32_t run_end,
+    std::uint32_t region,
+    std::uint8_t far_side,
+    std::uint32_t width,
+    std::uint32_t fine_width,
+    const std::uint32_t* winner_source_index,
+    const std::uint8_t* source_bgr
+) {
+    const std::uint32_t anchor = far_side == 0 ? run_start - 1 : run_end + 1;
+    const std::uint32_t source =
+        winner_source_index[static_cast<std::uint64_t>(row) * fine_width + anchor];
+    std::uint32_t segment_start = run_start;
+    while (segment_start <= run_end) {
+        const std::uint32_t column = segment_start / 16;
+        const std::uint32_t segment_end = std::min(
+            run_end,
+            column * 16 + 15
+        );
+        const std::uint32_t first_lane = segment_start % 16;
+        const std::uint32_t lane_count = segment_end - segment_start + 1;
+        const std::uint32_t base_mask = lane_count == 16
+            ? 0xffffU
+            : ((1U << lane_count) - 1U);
+        const std::uint16_t mask = static_cast<std::uint16_t>(
+            base_mask << first_lane
+        );
+        std::uint8_t* record = records + (*cursor * 16);
+        write_little_u32(record, row * width + column);
+        write_little_u16(record + 4, mask);
+        write_little_u32(record + 6, region);
+        record[10] = source_bgr[static_cast<std::uint64_t>(source) * 3];
+        record[11] = source_bgr[static_cast<std::uint64_t>(source) * 3 + 1];
+        record[12] = source_bgr[static_cast<std::uint64_t>(source) * 3 + 2];
         record[14] = far_side;
         ++(*cursor);
         segment_start = segment_end + 1;
@@ -1533,6 +1598,247 @@ py::tuple build_repair_records(
                     far_side,
                     width,
                     fine_width,
+                    colour_values
+                );
+            }
+        );
+        if (
+            cursor != statistics.record_count ||
+            second_pass.prefill_run_count != statistics.prefill_run_count ||
+            second_pass.repair_run_count != statistics.repair_run_count ||
+            second_pass.invalid_lane_count != statistics.invalid_lane_count
+        ) {
+            throw std::runtime_error("repair record preflight count changed");
+        }
+    }
+    py::dict result_statistics;
+    result_statistics["prefill_run_count"] = statistics.prefill_run_count;
+    result_statistics["repair_run_count"] = statistics.repair_run_count;
+    result_statistics["invalid_lane_count"] = statistics.invalid_lane_count;
+    return py::make_tuple(std::move(records), std::move(result_statistics));
+}
+
+std::uint8_t rounded_u8_mean(std::uint32_t sum, std::uint32_t count) {
+    std::uint32_t quotient = sum / count;
+    const std::uint32_t remainder = sum % count;
+    const std::uint32_t twice_remainder = remainder * 2;
+    if (twice_remainder > count || (twice_remainder == count && (quotient & 1U) != 0)) {
+        ++quotient;
+    }
+    return static_cast<std::uint8_t>(quotient);
+}
+
+py::tuple analyze_splat_band(
+    const py::array& winner_source_index,
+    const py::array& source_bgr,
+    const py::array& source_near_score,
+    const py::array& source_region_map,
+    py::array& coverage_count,
+    py::array& pure_region_id,
+    py::array& blue,
+    py::array& green,
+    py::array& red
+) {
+    validate_array(
+        winner_source_index,
+        py::dtype::of<std::uint32_t>(),
+        "winner_source_index"
+    );
+    validate_array(
+        source_near_score,
+        py::dtype::of<float>(),
+        "source_near_score"
+    );
+    validate_array(
+        source_region_map,
+        py::dtype::of<std::uint32_t>(),
+        "source_region_map"
+    );
+    validate_array(
+        coverage_count,
+        py::dtype::of<std::uint8_t>(),
+        "coverage_count"
+    );
+    validate_array(
+        pure_region_id,
+        py::dtype::of<std::uint32_t>(),
+        "pure_region_id"
+    );
+    validate_array(blue, py::dtype::of<std::uint8_t>(), "blue");
+    validate_array(green, py::dtype::of<std::uint8_t>(), "green");
+    validate_array(red, py::dtype::of<std::uint8_t>(), "red");
+    if (
+        !source_bgr.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        source_bgr.ndim() != 3 ||
+        source_bgr.shape(2) != 3 ||
+        (source_bgr.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error(
+            "source_bgr must be a C-contiguous uint8 [H,W,3] raster"
+        );
+    }
+    if (
+        source_bgr.shape(0) != source_region_map.shape(0) ||
+        source_bgr.shape(1) != source_region_map.shape(1) ||
+        source_near_score.shape(0) != source_region_map.shape(0) ||
+        source_near_score.shape(1) != source_region_map.shape(1)
+    ) {
+        throw py::value_error("source rasters must have matching shapes");
+    }
+    if (winner_source_index.shape(1) % 16 != 0) {
+        throw py::value_error("winner width must be a multiple of 16");
+    }
+    const auto height = static_cast<std::uint32_t>(winner_source_index.shape(0));
+    const auto fine_width = static_cast<std::uint32_t>(winner_source_index.shape(1));
+    const auto width = fine_width / 16;
+    for (py::array* output : {
+             &coverage_count,
+             &pure_region_id,
+             &blue,
+             &green,
+             &red,
+         }) {
+        if (output->shape(0) != height || output->shape(1) != width) {
+            throw py::value_error("analysis outputs must match the coarse band shape");
+        }
+        if (!output->writeable()) {
+            throw py::value_error("analysis outputs must be writeable");
+        }
+    }
+    const std::uint64_t sample_count64 =
+        static_cast<std::uint64_t>(height) * fine_width;
+    const std::uint64_t source_count64 =
+        static_cast<std::uint64_t>(source_region_map.shape(0)) *
+        static_cast<std::uint64_t>(source_region_map.shape(1));
+    if (sample_count64 > kUint32Max || source_count64 > kUint32Max) {
+        throw py::value_error("splat analysis shapes must fit uint32");
+    }
+    const auto sample_count = static_cast<std::uint32_t>(sample_count64);
+    const auto source_count = static_cast<std::uint32_t>(source_count64);
+    const auto* winner_values =
+        static_cast<const std::uint32_t*>(winner_source_index.data());
+    const auto* colour_values = static_cast<const std::uint8_t*>(source_bgr.data());
+    const auto* source_scores = static_cast<const float*>(source_near_score.data());
+    const auto* source_regions =
+        static_cast<const std::uint32_t*>(source_region_map.data());
+    auto* coverage_values = static_cast<std::uint8_t*>(coverage_count.mutable_data());
+    auto* pure_region_values =
+        static_cast<std::uint32_t*>(pure_region_id.mutable_data());
+    auto* blue_values = static_cast<std::uint8_t*>(blue.mutable_data());
+    auto* green_values = static_cast<std::uint8_t*>(green.mutable_data());
+    auto* red_values = static_cast<std::uint8_t*>(red.mutable_data());
+    const auto valid_at = [&](std::uint32_t sample) {
+        return winner_values[sample] != kUint32Max;
+    };
+    const auto score_at = [&](std::uint32_t sample) {
+        return source_scores[winner_values[sample]];
+    };
+    const auto region_at = [&](std::uint32_t sample) {
+        return source_regions[winner_values[sample]];
+    };
+    RepairRecordStatistics statistics{};
+    {
+        py::gil_scoped_release release;
+        for (std::uint32_t pixel = 0; pixel < height * width; ++pixel) {
+            const std::uint32_t first_sample = pixel * 16;
+            std::uint32_t lane_count = 0;
+            std::uint32_t first_region = kUint32Max;
+            bool pure = true;
+            std::array<std::uint32_t, 3> sums{0, 0, 0};
+            for (std::uint32_t lane = 0; lane < 16; ++lane) {
+                const std::uint32_t sample = first_sample + lane;
+                const std::uint32_t source = winner_values[sample];
+                if (source == kUint32Max) {
+                    continue;
+                }
+                if (source >= source_count) {
+                    throw std::invalid_argument("valid winner source lies outside source_region_map");
+                }
+                const std::uint32_t region = source_regions[source];
+                if (region == 0 || region == kUint32Max) {
+                    throw std::invalid_argument(
+                        "valid winners must have positive canonical regions"
+                    );
+                }
+                const float score = source_scores[source];
+                if (!std::isfinite(score) || score < 0.0F) {
+                    throw std::invalid_argument(
+                        "valid winner near scores must be finite and nonnegative"
+                    );
+                }
+                if (lane_count == 0) {
+                    first_region = region;
+                } else if (region != first_region) {
+                    pure = false;
+                }
+                for (std::uint32_t channel = 0; channel < 3; ++channel) {
+                    sums[channel] += colour_values[
+                        static_cast<std::uint64_t>(source) * 3 + channel
+                    ];
+                }
+                ++lane_count;
+            }
+            coverage_values[pixel] = static_cast<std::uint8_t>(lane_count);
+            pure_region_values[pixel] = kUint32Max;
+            blue_values[pixel] = 0;
+            green_values[pixel] = 0;
+            red_values[pixel] = 0;
+            if (lane_count != 0 && pure) {
+                pure_region_values[pixel] = first_region;
+                blue_values[pixel] = rounded_u8_mean(sums[0], lane_count);
+                green_values[pixel] = rounded_u8_mean(sums[1], lane_count);
+                red_values[pixel] = rounded_u8_mean(sums[2], lane_count);
+            }
+        }
+        visit_repair_runs_with_accessors(
+            height,
+            fine_width,
+            &statistics,
+            valid_at,
+            score_at,
+            region_at,
+            [](std::uint32_t,
+               std::uint32_t,
+               std::uint32_t,
+               std::uint32_t,
+               std::uint8_t) {}
+        );
+    }
+    py::array_t<std::uint8_t> records(
+        {
+            static_cast<py::ssize_t>(statistics.record_count),
+            static_cast<py::ssize_t>(16),
+        }
+    );
+    auto* record_values = records.mutable_data();
+    std::fill(record_values, record_values + statistics.record_count * 16, 0);
+    std::uint64_t cursor = 0;
+    {
+        py::gil_scoped_release release;
+        RepairRecordStatistics second_pass{};
+        visit_repair_runs_with_accessors(
+            height,
+            fine_width,
+            &second_pass,
+            valid_at,
+            score_at,
+            region_at,
+            [&](std::uint32_t row,
+                std::uint32_t start,
+                std::uint32_t end,
+                std::uint32_t region,
+                std::uint8_t far_side) {
+                write_repair_run_records_from_sources(
+                    record_values,
+                    &cursor,
+                    row,
+                    start,
+                    end,
+                    region,
+                    far_side,
+                    width,
+                    fine_width,
+                    winner_values,
                     colour_values
                 );
             }
@@ -1713,6 +2019,8 @@ py::tuple build_safe_donor_index(
     auto* member_values = members.mutable_data();
     {
         py::gil_scoped_release release;
+        const bool packed_coordinates =
+            height <= kPackedCoordinateLimit && width <= kPackedCoordinateLimit;
         for (std::uint32_t cursor = sample_count; cursor > 0; --cursor) {
             const std::uint32_t pixel = cursor - 1;
             const std::uint32_t region = regions[pixel];
@@ -1739,7 +2047,13 @@ py::tuple build_safe_donor_index(
                 continue;
             }
             const std::uint32_t destination = --offset_values[region - 1];
-            member_values[destination] = pixel;
+            if (packed_coordinates) {
+                const std::uint32_t member_row = pixel / width;
+                const std::uint32_t member_column = pixel - member_row * width;
+                member_values[destination] = (member_row << 16) | member_column;
+            } else {
+                member_values[destination] = pixel;
+            }
         }
         for (std::uint32_t region_index = 0; region_index < region_count; ++region_index) {
             partition_region_tree(
@@ -1747,11 +2061,105 @@ py::tuple build_safe_donor_index(
                 offset_values[region_index],
                 offset_values[region_index + 1],
                 height,
-                width
+                width,
+                packed_coordinates
             );
+        }
+        if (packed_coordinates) {
+            for (std::uint32_t cursor = 0; cursor < donor_count; ++cursor) {
+                const std::uint32_t packed = member_values[cursor];
+                const std::uint32_t member_row = packed >> 16;
+                const std::uint32_t member_column = packed & kPackedCoordinateLimit;
+                member_values[cursor] = member_row * width + member_column;
+            }
         }
     }
     return py::make_tuple(std::move(members), std::move(offsets));
+}
+
+py::tuple build_safe_donor_mask(
+    const py::array& coverage_count,
+    const py::array& pure_region_id,
+    const py::array& referenced_regions
+) {
+    validate_array(
+        coverage_count,
+        py::dtype::of<std::uint8_t>(),
+        "coverage_count"
+    );
+    validate_array(
+        pure_region_id,
+        py::dtype::of<std::uint32_t>(),
+        "pure_region_id"
+    );
+    validate_vector(
+        referenced_regions,
+        py::dtype::of<bool>(),
+        "referenced_regions"
+    );
+    if (
+        pure_region_id.shape(0) != coverage_count.shape(0) ||
+        pure_region_id.shape(1) != coverage_count.shape(1)
+    ) {
+        throw py::value_error("safe-donor analysis rasters must match");
+    }
+    if (referenced_regions.shape(0) < 2) {
+        throw py::value_error("referenced_regions must include a positive region");
+    }
+    const std::uint64_t sample_count64 =
+        static_cast<std::uint64_t>(coverage_count.shape(0)) *
+        static_cast<std::uint64_t>(coverage_count.shape(1));
+    const std::uint64_t region_count64 =
+        static_cast<std::uint64_t>(referenced_regions.shape(0) - 1);
+    if (sample_count64 > kUint32Max || region_count64 + 1 > kUint32Max) {
+        throw py::value_error("safe-donor mask shape must fit uint32");
+    }
+    const auto height = static_cast<std::uint32_t>(coverage_count.shape(0));
+    const auto width = static_cast<std::uint32_t>(coverage_count.shape(1));
+    const auto sample_count = static_cast<std::uint32_t>(sample_count64);
+    const auto region_count = static_cast<std::uint32_t>(region_count64);
+    const auto* coverage =
+        static_cast<const std::uint8_t*>(coverage_count.data());
+    const auto* regions =
+        static_cast<const std::uint32_t*>(pure_region_id.data());
+    const auto* referenced =
+        static_cast<const std::uint8_t*>(referenced_regions.data());
+    const auto radius = static_cast<std::uint32_t>(std::max(
+        1.0,
+        std::floor(static_cast<double>(height) / 1080.0 + 0.5)
+    ));
+    py::array_t<bool> safe({coverage_count.shape(0), coverage_count.shape(1)});
+    py::array_t<bool> region_has_safe_donor(referenced_regions.shape(0));
+    auto* safe_values = safe.mutable_data();
+    auto* region_values = region_has_safe_donor.mutable_data();
+    {
+        py::gil_scoped_release release;
+        std::fill(safe_values, safe_values + sample_count, false);
+        std::fill(region_values, region_values + region_count + 1, false);
+        for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
+            const std::uint32_t region = regions[pixel];
+            if (
+                region == 0 ||
+                region > region_count ||
+                referenced[region] == 0 ||
+                coverage[pixel] != 16 ||
+                !is_safe_donor_pixel(
+                    coverage,
+                    regions,
+                    height,
+                    width,
+                    pixel,
+                    region,
+                    radius
+                )
+            ) {
+                continue;
+            }
+            safe_values[pixel] = true;
+            region_values[region] = true;
+        }
+    }
+    return py::make_tuple(std::move(safe), std::move(region_has_safe_donor));
 }
 
 std::uint32_t read_little_u32(const std::uint8_t* source) {
@@ -3247,7 +3655,8 @@ py::tuple plan_local_strips_native(
         bool best_found = false;
         std::uint64_t best_score = 0;
         std::uint64_t best_ordinal = 0;
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> best_donors;
+        std::int64_t best_row = 0;
+        std::int64_t best_start = 0;
         for (std::uint32_t offset = 1; offset <= search_limit; ++offset) {
             for (std::size_t row_index = 0; row_index < row_deltas.size(); ++row_index) {
                 const std::uint64_t ordinal = (offset - 1ULL) * 5 + row_index;
@@ -3264,21 +3673,13 @@ py::tuple plan_local_strips_native(
                 for (const std::int64_t column : candidate_columns) {
                     legal = legal && column >= 0 && column < width;
                 }
-                std::vector<std::pair<std::uint32_t, std::uint32_t>> donors;
-                donors.reserve(donor_count);
                 for (std::uint32_t donor_index = 0; donor_index < donor_count; ++donor_index) {
                     const std::int64_t column =
                         candidate_start - static_cast<std::int64_t>(donor_index) * direction;
                     legal = legal && column >= 0 && column < width;
                     legal = legal && (column - boundary_column) * direction > 0;
-                    if (legal) {
-                        donors.emplace_back(
-                            static_cast<std::uint32_t>(candidate_row),
-                            static_cast<std::uint32_t>(column)
-                        );
-                    }
                 }
-                if (!legal || donors.size() != donor_count) {
+                if (!legal) {
                     continue;
                 }
                 LocalContext candidate{};
@@ -3297,14 +3698,16 @@ py::tuple plan_local_strips_native(
                     continue;
                 }
                 bool safe = true;
-                for (const auto& donor : donors) {
+                for (std::uint32_t donor_index = 0; donor_index < donor_count; ++donor_index) {
+                    const std::int64_t donor_column =
+                        candidate_start - static_cast<std::int64_t>(donor_index) * direction;
                     if (!local_donor_is_safe(
                         coverage,
                         regions,
                         height,
                         width,
-                        donor.first,
-                        donor.second,
+                        candidate_row,
+                        donor_column,
                         region,
                         safe_radius,
                         statistics
@@ -3329,7 +3732,8 @@ py::tuple plan_local_strips_native(
                     best_found = true;
                     best_score = score;
                     best_ordinal = ordinal;
-                    best_donors = std::move(donors);
+                    best_row = candidate_row;
+                    best_start = candidate_start;
                 }
             }
         }
@@ -3341,8 +3745,9 @@ py::tuple plan_local_strips_native(
                 ? record_end - 1 - donor_index
                 : record_start + donor_index;
             std::uint8_t* record = output_records + 16ULL * record_index;
-            const auto donor = best_donors[donor_index];
-            const auto sample = static_cast<std::uint64_t>(donor.first) * width + donor.second;
+            const std::int64_t donor_column =
+                best_start - static_cast<std::int64_t>(donor_index) * direction;
+            const auto sample = static_cast<std::uint64_t>(best_row * width + donor_column);
             record[10] = colours[0][sample];
             record[11] = colours[1][sample];
             record[12] = colours[2][sample];
@@ -3610,6 +4015,421 @@ py::array build_four_connected_edge_band_native(
     return output;
 }
 
+py::tuple label_region_fragments_native(
+    const py::array& region_map,
+    const py::array& band_mask
+) {
+    validate_array(region_map, py::dtype::of<std::uint32_t>(), "region_map");
+    validate_array(band_mask, py::dtype::of<bool>(), "band_mask");
+    if (
+        region_map.shape(0) != band_mask.shape(0) ||
+        region_map.shape(1) != band_mask.shape(1)
+    ) {
+        throw py::value_error("region_map and band_mask must match");
+    }
+    const std::uint64_t sample_count64 =
+        static_cast<std::uint64_t>(region_map.shape(0)) *
+        static_cast<std::uint64_t>(region_map.shape(1));
+    if (sample_count64 + 1 > kUint32Max) {
+        throw py::value_error("region fragment raster exceeds uint32 capacity");
+    }
+    const auto height = static_cast<std::uint32_t>(region_map.shape(0));
+    const auto width = static_cast<std::uint32_t>(region_map.shape(1));
+    const auto sample_count = static_cast<std::uint32_t>(sample_count64);
+    const auto* regions = static_cast<const std::uint32_t*>(region_map.data());
+    const auto* band = static_cast<const std::uint8_t*>(band_mask.data());
+    std::uint32_t band_count = 0;
+    for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
+        band_count += band[pixel] != 0;
+    }
+    py::array_t<std::uint32_t> fragment_map({height, width});
+    py::array_t<std::uint32_t> fragment_regions(
+        static_cast<py::ssize_t>(band_count) + 1
+    );
+    py::array_t<std::uint32_t> fragment_bounds(
+        {
+            static_cast<py::ssize_t>(band_count) + 1,
+            static_cast<py::ssize_t>(4),
+        }
+    );
+    auto* labels = fragment_map.mutable_data();
+    auto* output_regions = fragment_regions.mutable_data();
+    auto* bounds = fragment_bounds.mutable_data();
+    std::fill(labels, labels + sample_count, 0);
+    std::fill(output_regions, output_regions + band_count + 1, 0);
+    std::fill(bounds, bounds + static_cast<std::uint64_t>(band_count + 1) * 4, 0);
+    std::vector<std::uint32_t> queue(band_count);
+    std::uint32_t fragment_count = 0;
+    {
+        py::gil_scoped_release release;
+        const auto is_region = [](std::uint32_t value) {
+            return value != 0 && value != kUint32Max;
+        };
+        for (std::uint32_t start = 0; start < sample_count; ++start) {
+            const std::uint32_t region = regions[start];
+            if (band[start] == 0 || labels[start] != 0 || !is_region(region)) {
+                continue;
+            }
+            ++fragment_count;
+            std::uint32_t head = 0;
+            std::uint32_t tail = 1;
+            queue[0] = start;
+            labels[start] = fragment_count;
+            output_regions[fragment_count] = region;
+            const std::uint32_t start_row = start / width;
+            const std::uint32_t start_column = start % width;
+            std::uint32_t* fragment_bound = bounds + fragment_count * 4;
+            fragment_bound[0] = start_row;
+            fragment_bound[1] = start_row;
+            fragment_bound[2] = start_column;
+            fragment_bound[3] = start_column;
+            while (head < tail) {
+                const std::uint32_t pixel = queue[head++];
+                const std::uint32_t row = pixel / width;
+                const std::uint32_t column = pixel % width;
+                fragment_bound[0] = std::min(fragment_bound[0], row);
+                fragment_bound[1] = std::max(fragment_bound[1], row);
+                fragment_bound[2] = std::min(fragment_bound[2], column);
+                fragment_bound[3] = std::max(fragment_bound[3], column);
+                const auto enqueue = [&](std::uint32_t neighbour) {
+                    if (
+                        band[neighbour] == 0 ||
+                        labels[neighbour] != 0 ||
+                        regions[neighbour] != region
+                    ) {
+                        return;
+                    }
+                    labels[neighbour] = fragment_count;
+                    queue[tail++] = neighbour;
+                };
+                if (row != 0) {
+                    enqueue(pixel - width);
+                }
+                if (column != 0) {
+                    enqueue(pixel - 1);
+                }
+                if (column + 1 < width) {
+                    enqueue(pixel + 1);
+                }
+                if (row + 1 < height) {
+                    enqueue(pixel + width);
+                }
+            }
+        }
+    }
+    return py::make_tuple(
+        std::move(fragment_map),
+        std::move(fragment_regions),
+        std::move(fragment_bounds),
+        fragment_count
+    );
+}
+
+double half_pixel_source_coordinate(
+    std::uint32_t output_index,
+    std::uint32_t source_size,
+    std::uint32_t destination_size
+) {
+    double coordinate = static_cast<double>(output_index);
+    coordinate = coordinate + 0.5;
+    coordinate = coordinate * static_cast<double>(source_size);
+    coordinate = coordinate / static_cast<double>(destination_size);
+    return coordinate - 0.5;
+}
+
+std::uint32_t nearest_half_pixel_source_index(
+    std::uint32_t output_index,
+    std::uint32_t source_size,
+    std::uint32_t destination_size
+) {
+    const double coordinate = half_pixel_source_coordinate(
+        output_index,
+        source_size,
+        destination_size
+    );
+    const auto rounded = static_cast<std::int64_t>(std::floor(coordinate + 0.5));
+    return static_cast<std::uint32_t>(std::min(
+        std::max<std::int64_t>(rounded, 0),
+        static_cast<std::int64_t>(source_size - 1)
+    ));
+}
+
+py::tuple collect_one_sided_queries_native(
+    const py::tuple& source_primitives,
+    const py::tuple& output_primitives,
+    const py::array& source_region_map,
+    const py::array& final_region_map,
+    std::uint32_t radius,
+    py::array& query_pixels,
+    py::array& query_regions,
+    py::array& query_y,
+    py::array& query_x
+) {
+    validate_array(
+        source_region_map,
+        py::dtype::of<std::uint32_t>(),
+        "source_region_map"
+    );
+    validate_array(
+        final_region_map,
+        py::dtype::of<std::uint32_t>(),
+        "final_region_map"
+    );
+    validate_vector(query_pixels, py::dtype::of<std::uint32_t>(), "query_pixels");
+    validate_vector(query_regions, py::dtype::of<std::uint32_t>(), "query_regions");
+    validate_vector(query_y, py::dtype::of<double>(), "query_y");
+    validate_vector(query_x, py::dtype::of<double>(), "query_x");
+    if (
+        source_primitives.size() == 0 ||
+        source_primitives.size() != output_primitives.size()
+    ) {
+        throw py::value_error("source and output primitive tuples must match");
+    }
+    if (
+        query_regions.shape(0) != query_pixels.shape(0) ||
+        query_y.shape(0) != query_pixels.shape(0) ||
+        query_x.shape(0) != query_pixels.shape(0)
+    ) {
+        throw py::value_error("query arrays must have matching capacities");
+    }
+    if (
+        !query_pixels.writeable() ||
+        !query_regions.writeable() ||
+        !query_y.writeable() ||
+        !query_x.writeable()
+    ) {
+        throw py::value_error("query arrays must be writeable");
+    }
+    const auto source_height = static_cast<std::uint32_t>(source_region_map.shape(0));
+    const auto source_width = static_cast<std::uint32_t>(source_region_map.shape(1));
+    const auto render_height = static_cast<std::uint32_t>(final_region_map.shape(0));
+    const auto render_width = static_cast<std::uint32_t>(final_region_map.shape(1));
+    const std::uint64_t render_count64 =
+        static_cast<std::uint64_t>(render_height) * render_width;
+    if (render_count64 > kUint32Max) {
+        throw py::value_error("render shape exceeds uint32 capacity");
+    }
+    std::vector<py::array> source_arrays;
+    std::vector<py::array> output_arrays;
+    std::vector<const float*> source_values;
+    std::vector<float*> output_values;
+    source_arrays.reserve(source_primitives.size());
+    output_arrays.reserve(output_primitives.size());
+    source_values.reserve(source_primitives.size());
+    output_values.reserve(output_primitives.size());
+    for (std::size_t index = 0; index < source_primitives.size(); ++index) {
+        source_arrays.push_back(py::cast<py::array>(source_primitives[index]));
+        output_arrays.push_back(py::cast<py::array>(output_primitives[index]));
+        auto& source = source_arrays.back();
+        auto& output = output_arrays.back();
+        validate_array(source, py::dtype::of<float>(), "source primitive");
+        validate_array(output, py::dtype::of<float>(), "output primitive");
+        if (
+            source.shape(0) != source_height ||
+            source.shape(1) != source_width ||
+            output.shape(0) != render_height ||
+            output.shape(1) != render_width
+        ) {
+            throw py::value_error("primitive rasters do not match their geometry shapes");
+        }
+        if (!output.writeable()) {
+            throw py::value_error("output primitives must be writeable");
+        }
+        source_values.push_back(static_cast<const float*>(source.data()));
+        output_values.push_back(static_cast<float*>(output.mutable_data()));
+    }
+    const auto* source_regions =
+        static_cast<const std::uint32_t*>(source_region_map.data());
+    const auto* final_regions =
+        static_cast<const std::uint32_t*>(final_region_map.data());
+    auto* pixel_values = static_cast<std::uint32_t*>(query_pixels.mutable_data());
+    auto* query_region_values =
+        static_cast<std::uint32_t*>(query_regions.mutable_data());
+    auto* query_y_values = static_cast<double*>(query_y.mutable_data());
+    auto* query_x_values = static_cast<double*>(query_x.mutable_data());
+    const auto query_capacity = static_cast<std::uint32_t>(query_pixels.shape(0));
+    std::vector<std::uint32_t> source_columns(render_width);
+    for (std::uint32_t column = 0; column < render_width; ++column) {
+        source_columns[column] = nearest_half_pixel_source_index(
+            column,
+            source_width,
+            render_width
+        );
+    }
+    std::vector<std::uint32_t> source_rows(render_height);
+    for (std::uint32_t row = 0; row < render_height; ++row) {
+        source_rows[row] = nearest_half_pixel_source_index(
+            row,
+            source_height,
+            render_height
+        );
+    }
+    const auto boundary_cache_rows = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        render_height,
+        2ULL * radius + 1
+    ));
+    std::vector<std::uint8_t> boundary_cache(
+        static_cast<std::uint64_t>(boundary_cache_rows) * render_width,
+        0
+    );
+    std::vector<std::uint64_t> boundary_cache_tags(
+        boundary_cache_rows,
+        std::numeric_limits<std::uint64_t>::max()
+    );
+    std::vector<std::uint8_t> edge(render_width, 0);
+    std::uint32_t query_count = 0;
+    std::uint32_t edge_count = 0;
+    {
+        py::gil_scoped_release release;
+        const auto mapped_label = [&](std::uint32_t row, std::uint32_t column) {
+            return source_regions[
+                source_rows[row] * source_width + source_columns[column]
+            ];
+        };
+        const auto boundary_for = [&](std::uint32_t row) {
+            const std::uint32_t slot = row % boundary_cache_rows;
+            auto* boundary = boundary_cache.data() +
+                static_cast<std::uint64_t>(slot) * render_width;
+            if (boundary_cache_tags[slot] == row) {
+                return boundary;
+            }
+            std::fill(boundary, boundary + render_width, 0);
+            for (std::uint32_t column = 0; column < render_width; ++column) {
+                const std::uint32_t label = mapped_label(row, column);
+                if (
+                    column + 1 < render_width &&
+                    label != mapped_label(row, column + 1)
+                ) {
+                    boundary[column] = 1;
+                    boundary[column + 1] = 1;
+                }
+                if (row != 0 && label != mapped_label(row - 1, column)) {
+                    boundary[column] = 1;
+                }
+                if (
+                    row + 1 < render_height &&
+                    label != mapped_label(row + 1, column)
+                ) {
+                    boundary[column] = 1;
+                }
+            }
+            boundary_cache_tags[slot] = row;
+            return boundary;
+        };
+        for (std::uint32_t row = 0; row < render_height; ++row) {
+            std::fill(edge.begin(), edge.end(), 0);
+            const std::uint32_t row_start = row > radius ? row - radius : 0;
+            const std::uint32_t row_end = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                render_height,
+                static_cast<std::uint64_t>(row) + radius + 1
+            ));
+            for (std::uint32_t boundary_row = row_start; boundary_row < row_end; ++boundary_row) {
+                const auto* boundary = boundary_for(boundary_row);
+                const std::uint32_t vertical_distance =
+                    boundary_row > row ? boundary_row - row : row - boundary_row;
+                const std::uint32_t horizontal_radius = radius - vertical_distance;
+                for (std::uint32_t column = 0; column < render_width; ++column) {
+                    if (boundary[column] == 0) {
+                        continue;
+                    }
+                    const std::uint32_t column_start =
+                        column > horizontal_radius ? column - horizontal_radius : 0;
+                    const std::uint32_t column_end = static_cast<std::uint32_t>(
+                        std::min<std::uint64_t>(
+                            render_width,
+                            static_cast<std::uint64_t>(column) + horizontal_radius + 1
+                        )
+                    );
+                    std::fill(
+                        edge.begin() + column_start,
+                        edge.begin() + column_end,
+                        1
+                    );
+                }
+            }
+            for (std::uint32_t column = 0; column < render_width; ++column) {
+                if (edge[column] == 0) {
+                    continue;
+                }
+                ++edge_count;
+                const std::uint32_t output_pixel = row * render_width + column;
+                const std::uint32_t selected_region = final_regions[output_pixel];
+                const double source_x = half_pixel_source_coordinate(
+                    column,
+                    source_width,
+                    render_width
+                );
+                const double source_y = half_pixel_source_coordinate(
+                    row,
+                    source_height,
+                    render_height
+                );
+                const double clipped_x = std::min(
+                    std::max(source_x, 0.0),
+                    static_cast<double>(source_width - 1)
+                );
+                const double clipped_y = std::min(
+                    std::max(source_y, 0.0),
+                    static_cast<double>(source_height - 1)
+                );
+                const std::uint32_t x0 = static_cast<std::uint32_t>(std::floor(clipped_x));
+                const std::uint32_t x1 = std::min(x0 + 1, source_width - 1);
+                const std::uint32_t y0 = static_cast<std::uint32_t>(std::floor(clipped_y));
+                const std::uint32_t y1 = std::min(y0 + 1, source_height - 1);
+                const double weight_x = clipped_x - static_cast<double>(x0);
+                const double weight_y = clipped_y - static_cast<double>(y0);
+                const double opposite_x = 1.0 - weight_x;
+                const double opposite_y = 1.0 - weight_y;
+                const std::array<double, 4> weights{
+                    opposite_y * opposite_x,
+                    opposite_y * weight_x,
+                    weight_y * opposite_x,
+                    weight_y * weight_x,
+                };
+                const std::array<std::uint32_t, 4> samples{
+                    y0 * source_width + x0,
+                    y0 * source_width + x1,
+                    y1 * source_width + x0,
+                    y1 * source_width + x1,
+                };
+                std::array<double, 4> retained_weights{};
+                for (std::uint32_t index = 0; index < 4; ++index) {
+                    retained_weights[index] = weights[index] *
+                        (source_regions[samples[index]] == selected_region ? 1.0 : 0.0);
+                }
+                double retained = retained_weights[0] + retained_weights[1];
+                retained = retained + retained_weights[2];
+                retained = retained + retained_weights[3];
+                if (retained != 0.0) {
+                    for (std::size_t primitive = 0; primitive < source_values.size(); ++primitive) {
+                        const auto* source = source_values[primitive];
+                        double numerator =
+                            static_cast<double>(source[samples[0]]) * retained_weights[0] +
+                            static_cast<double>(source[samples[1]]) * retained_weights[1];
+                        numerator = numerator +
+                            static_cast<double>(source[samples[2]]) * retained_weights[2];
+                        numerator = numerator +
+                            static_cast<double>(source[samples[3]]) * retained_weights[3];
+                        output_values[primitive][output_pixel] = static_cast<float>(
+                            numerator / retained
+                        );
+                    }
+                    continue;
+                }
+                if (query_count >= query_capacity) {
+                    throw std::runtime_error("one-sided query capacity exceeded");
+                }
+                pixel_values[query_count] = output_pixel;
+                query_region_values[query_count] = selected_region;
+                query_y_values[query_count] = source_y;
+                query_x_values[query_count] = source_x;
+                ++query_count;
+            }
+        }
+    }
+    return py::make_tuple(query_count, edge_count);
+}
+
 py::array build_exemplar_candidate_mask_native(
     const py::array& safe_donor_mask,
     const py::array& pure_region_id
@@ -3634,37 +4454,127 @@ py::array build_exemplar_candidate_mask_native(
     }
     {
         py::gil_scoped_release release;
-        for (std::uint32_t row = 4; row + 4 < height; ++row) {
-            for (std::uint32_t column = 4; column + 4 < width; ++column) {
+        std::vector<std::uint32_t> vertical_run(width, 0);
+        std::vector<std::uint32_t> vertical_region(width, kUint32Max);
+        for (std::uint32_t row = 0; row < height; ++row) {
+            std::uint32_t horizontal_run = 0;
+            std::uint32_t horizontal_region = kUint32Max;
+            for (std::uint32_t column = 0; column < width; ++column) {
                 const std::uint32_t pixel = row * width + column;
                 const std::uint32_t region = regions[pixel];
-                if (
-                    safe[pixel] == 0 || region == 0 ||
-                    region == std::numeric_limits<std::uint32_t>::max()
-                ) {
+                const bool usable =
+                    safe[pixel] != 0 && region != 0 && region != kUint32Max;
+                if (!usable) {
+                    horizontal_run = 0;
+                    horizontal_region = kUint32Max;
+                } else if (horizontal_region == region) {
+                    ++horizontal_run;
+                } else {
+                    horizontal_run = 1;
+                    horizontal_region = region;
+                }
+                if (column < 8) {
                     continue;
                 }
-                bool candidate = true;
-                for (std::int32_t delta_row = -4; delta_row <= 4 && candidate; ++delta_row) {
-                    const std::uint32_t sample_row = static_cast<std::uint32_t>(
-                        static_cast<std::int32_t>(row) + delta_row
-                    );
-                    for (std::int32_t delta_column = -4; delta_column <= 4; ++delta_column) {
-                        const std::uint32_t sample_column = static_cast<std::uint32_t>(
-                            static_cast<std::int32_t>(column) + delta_column
-                        );
-                        const std::uint32_t sample = sample_row * width + sample_column;
-                        if (safe[sample] == 0 || regions[sample] != region) {
-                            candidate = false;
-                            break;
-                        }
-                    }
+                const std::uint32_t center_column = column - 4;
+                const bool horizontal_support = horizontal_run >= 9;
+                if (!horizontal_support) {
+                    vertical_run[center_column] = 0;
+                    vertical_region[center_column] = kUint32Max;
+                    continue;
                 }
-                result[pixel] = candidate;
+                if (vertical_region[center_column] == region) {
+                    ++vertical_run[center_column];
+                } else {
+                    vertical_run[center_column] = 1;
+                    vertical_region[center_column] = region;
+                }
+                if (vertical_run[center_column] >= 9) {
+                    const std::uint32_t center_row = row - 4;
+                    result[center_row * width + center_column] = true;
+                }
             }
         }
     }
     return output;
+}
+
+py::object select_exemplar_frontier_native(
+    const py::array& target_mask,
+    const py::array& processed_mask,
+    const py::array& barrier_mask
+) {
+    validate_array(target_mask, py::dtype::of<bool>(), "target_mask");
+    validate_array(processed_mask, py::dtype::of<bool>(), "processed_mask");
+    validate_array(barrier_mask, py::dtype::of<bool>(), "barrier_mask");
+    if (
+        processed_mask.shape(0) != target_mask.shape(0) ||
+        processed_mask.shape(1) != target_mask.shape(1) ||
+        barrier_mask.shape(0) != target_mask.shape(0) ||
+        barrier_mask.shape(1) != target_mask.shape(1)
+    ) {
+        throw py::value_error("exemplar frontier masks must match");
+    }
+    const auto height = static_cast<std::uint32_t>(target_mask.shape(0));
+    const auto width = static_cast<std::uint32_t>(target_mask.shape(1));
+    const auto* target = static_cast<const std::uint8_t*>(target_mask.data());
+    const auto* processed = static_cast<const std::uint8_t*>(processed_mask.data());
+    const auto* barrier = static_cast<const std::uint8_t*>(barrier_mask.data());
+    bool found = false;
+    std::uint32_t best_count = 0;
+    std::uint32_t best_row = 0;
+    std::uint32_t best_column = 0;
+    if (height >= 7 && width >= 7) {
+        py::gil_scoped_release release;
+        for (std::uint32_t row = 3; row + 3 < height; ++row) {
+            for (std::uint32_t column = 3; column + 3 < width; ++column) {
+                const std::uint32_t pixel = row * width + column;
+                if (target[pixel] == 0 || processed[pixel] != 0) {
+                    continue;
+                }
+                const bool has_neighbour =
+                    (processed[pixel - width] != 0 && barrier[pixel - width] == 0) ||
+                    (processed[pixel - 1] != 0 && barrier[pixel - 1] == 0) ||
+                    (processed[pixel + 1] != 0 && barrier[pixel + 1] == 0) ||
+                    (processed[pixel + width] != 0 && barrier[pixel + width] == 0);
+                if (!has_neighbour) {
+                    continue;
+                }
+                bool has_barrier = false;
+                std::uint32_t processed_count = 0;
+                for (std::uint32_t sample_row = row - 3; sample_row <= row + 3; ++sample_row) {
+                    for (
+                        std::uint32_t sample_column = column - 3;
+                        sample_column <= column + 3;
+                        ++sample_column
+                    ) {
+                        const std::uint32_t sample = sample_row * width + sample_column;
+                        if (barrier[sample] != 0) {
+                            has_barrier = true;
+                            break;
+                        }
+                        processed_count += processed[sample] != 0;
+                    }
+                    if (has_barrier) {
+                        break;
+                    }
+                }
+                if (has_barrier || processed_count < 8) {
+                    continue;
+                }
+                if (!found || processed_count > best_count) {
+                    found = true;
+                    best_count = processed_count;
+                    best_row = row;
+                    best_column = column;
+                }
+            }
+        }
+    }
+    if (!found) {
+        return py::none();
+    }
+    return py::make_tuple(best_row, best_column, best_count);
 }
 
 struct ExemplarMaskLevel {
@@ -3982,12 +4892,32 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("winner_bgr") = py::none()
     );
     module.def(
+        "analyze_splat_band",
+        &analyze_splat_band,
+        py::arg("winner_source_index"),
+        py::arg("source_bgr"),
+        py::arg("source_near_score"),
+        py::arg("source_region_map"),
+        py::arg("coverage_count"),
+        py::arg("pure_region_id"),
+        py::arg("blue"),
+        py::arg("green"),
+        py::arg("red")
+    );
+    module.def(
         "build_safe_donor_index",
         &build_safe_donor_index,
         py::arg("coverage_count"),
         py::arg("pure_region_id"),
         py::arg("referenced_regions"),
         py::arg("include_full_pure_for_empty_regions") = false
+    );
+    module.def(
+        "build_safe_donor_mask",
+        &build_safe_donor_mask,
+        py::arg("coverage_count"),
+        py::arg("pure_region_id"),
+        py::arg("referenced_regions")
     );
     module.def(
         "query_fallback_records",
@@ -4092,10 +5022,36 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("radius")
     );
     module.def(
+        "label_region_fragments",
+        &label_region_fragments_native,
+        py::arg("region_map"),
+        py::arg("band_mask")
+    );
+    module.def(
+        "collect_one_sided_queries",
+        &collect_one_sided_queries_native,
+        py::arg("source_primitives"),
+        py::arg("output_primitives"),
+        py::arg("source_region_map"),
+        py::arg("final_region_map"),
+        py::arg("radius"),
+        py::arg("query_pixels"),
+        py::arg("query_regions"),
+        py::arg("query_y"),
+        py::arg("query_x")
+    );
+    module.def(
         "build_exemplar_candidate_mask",
         &build_exemplar_candidate_mask_native,
         py::arg("safe_donor_mask"),
         py::arg("pure_region_id")
+    );
+    module.def(
+        "select_exemplar_frontier",
+        &select_exemplar_frontier_native,
+        py::arg("target_mask"),
+        py::arg("processed_mask"),
+        py::arg("barrier_mask")
     );
     module.def(
         "component_may_score_exemplar",

@@ -172,15 +172,13 @@ def _materialize_safe_donor_mask(
         if int(record["backend"]) == 0:
             referenced[int(record["region_id"])] = True
     native = fallback.native_kd._require_native()
-    members, offsets = native.build_safe_donor_index(
+    safe, region_has_safe_donor = native.build_safe_donor_mask(
         analysis.coverage_count,
         analysis.pure_region_id,
         referenced,
     )
-    safe = np.zeros(analysis.coverage_count.shape, dtype=np.bool_)
-    safe.reshape(-1)[members] = True
-    region_has_safe_donor = np.zeros(region_count + 1, dtype=np.bool_)
-    region_has_safe_donor[1:] = offsets[1:] != offsets[:-1]
+    safe.setflags(write=False)
+    region_has_safe_donor.setflags(write=False)
     return safe, region_has_safe_donor
 
 

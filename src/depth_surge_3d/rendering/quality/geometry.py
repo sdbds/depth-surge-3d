@@ -165,7 +165,10 @@ def one_sided_resample_scalar(
     """Apply the exact ordered binary64 oracle or report retained zero."""
 
     _validate_native_primitive("values", values)
-    _validate_source_regions(source_regions, values.shape)
+    _validate_source_regions(
+        source_regions,
+        (int(values.shape[0]), int(values.shape[1])),
+    )
     region = _validate_region(selected_region, int(source_regions.max()))
     destination_shape = _validate_shape("render_shape", render_shape)
     output_row, output_column = _validate_output_coordinate(
@@ -596,7 +599,10 @@ def _resample_primitives_in_place(
 ) -> _ResampleDiagnostics:
     if len(source_primitives) != len(output_primitives) or not source_primitives:
         raise ValueError("source and output primitive tuples must match")
-    render_shape = regions.final_region_map.shape
+    render_shape = (
+        int(regions.final_region_map.shape[0]),
+        int(regions.final_region_map.shape[1]),
+    )
     query_capacity = regions.edge_band_pixel_count
     recorder.allocate(7, "retained_zero_query_scratch", 40 * query_capacity)
     query_pixels = np.empty(query_capacity, dtype=np.uint32)
@@ -645,38 +651,18 @@ def _collect_one_sided_queries(
     query_y: np.ndarray,
     query_x: np.ndarray,
 ) -> tuple[int, int]:
-    render_shape = regions.final_region_map.shape
-    query_count = 0
-    edge_count = 0
-    for row, edge_row in _iter_streamed_edge_rows(
+    query_count, edge_count = native_kd._require_native().collect_one_sided_queries(
+        source_primitives,
+        output_primitives,
         regions.source_region_map,
-        render_shape,
+        regions.final_region_map,
         regions.radius,
-    ):
-        for column in np.flatnonzero(edge_row):
-            edge_count += 1
-            selected_region = int(regions.final_region_map[row, int(column)])
-            weights = _one_sided_weights(
-                regions.source_region_map,
-                selected_region,
-                render_shape,
-                row,
-                int(column),
-            )
-            if weights.retained != np.float64(0.0):
-                for source, output in zip(
-                    source_primitives,
-                    output_primitives,
-                    strict=True,
-                ):
-                    output[row, int(column)] = _apply_one_sided_weights(source, weights)
-                continue
-            query_pixels[query_count] = np.uint32(row * render_shape[1] + int(column))
-            query_regions[query_count] = np.uint32(selected_region)
-            query_y[query_count] = weights.source_y
-            query_x[query_count] = weights.source_x
-            query_count += 1
-    return query_count, edge_count
+        query_pixels,
+        query_regions,
+        query_y,
+        query_x,
+    )
+    return int(query_count), int(edge_count)
 
 
 def _resolve_retained_zero_queries(
@@ -940,7 +926,8 @@ def _update_relative_total_inside_band(
     strength: np.float64,
     convergence: np.float64,
 ) -> None:
-    for row, edge_row in _iter_streamed_edge_rows(source_regions, near_score.shape, radius):
+    render_shape = (int(near_score.shape[0]), int(near_score.shape[1]))
+    for row, edge_row in _iter_streamed_edge_rows(source_regions, render_shape, radius):
         if not np.any(edge_row):
             continue
         values = near_score[row, edge_row].astype(np.float64)
@@ -1071,7 +1058,7 @@ def _update_metric_derived_inside_band(
     limit = np.float64(disparity_percent / np.float64(100.0))
     for row, edge_row in _iter_streamed_edge_rows(
         regions.source_region_map,
-        baseline.near_score.shape,
+        (int(baseline.near_score.shape[0]), int(baseline.near_score.shape[1])),
         regions.radius,
     ):
         columns = np.flatnonzero(edge_row)
@@ -1309,7 +1296,11 @@ def _validate_offset_buffers(
     scratch: np.ndarray,
 ) -> None:
     _validate_native_primitive("near_score", near_score)
-    _validate_common_offset_buffers(near_score.shape, output, scratch)
+    _validate_common_offset_buffers(
+        (int(near_score.shape[0]), int(near_score.shape[1])),
+        output,
+        scratch,
+    )
 
 
 def _validate_geometry_offset_buffers(
@@ -1325,7 +1316,11 @@ def _validate_geometry_offset_buffers(
         or not np.isfinite(total).all()
     ):
         raise TypeError("total_disparity_fraction must be a finite C-contiguous float64 raster")
-    _validate_common_offset_buffers(total.shape, output, scratch)
+    _validate_common_offset_buffers(
+        (int(total.shape[0]), int(total.shape[1])),
+        output,
+        scratch,
+    )
 
 
 def _validate_common_offset_buffers(
