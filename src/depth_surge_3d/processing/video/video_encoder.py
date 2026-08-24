@@ -27,6 +27,7 @@ from ...io.operations import (
 )
 from ...io.reservation_protocol import (
     SETTINGS_ARTIFACT_RELATIVE_PATH,
+    ReservationConflictError,
     ReservationIncompleteError,
 )
 from ...io.settings_artifact import ProcessingSettingsArtifactV5
@@ -140,6 +141,22 @@ class VideoEncoder:
         reservation = self._pending_final_reservation
         if reservation is None:
             return
+        current = recover_processing_control_prefix_v1(reservation.job_root)
+        expected_status = "completed" if success else "failed"
+        if current is None or current.status != expected_status:
+            raise ReservationConflictError(
+                f"final reservation retirement requires durable {expected_status} "
+                "terminal settings"
+            )
+        index_temporary = reservation.index_path.with_name(
+            f".{reservation.index_path.name}.create-new.tmp"
+        )
+        if not any(
+            path.exists() or path.is_symlink()
+            for path in (reservation.index_path, index_temporary)
+        ):
+            self._pending_final_reservation = None
+            return
         if success:
             reservation.retire()
         else:
@@ -197,18 +214,9 @@ class VideoEncoder:
         except Exception as error:
             print(f"Error preparing schema-5 video publication: {error}")
             return False
-        if schema5_context is not None and self.defer_final_reservation_retirement:
+        if schema5_context is not None:
             self._pending_final_reservation = schema5_context.reservation
         if schema5_context is not None and schema5_context.already_authenticated:
-            defer_retirement = (
-                self.defer_final_reservation_retirement
-                or schema5_context.reservation.has_post_publication_work
-            )
-            if not defer_retirement:
-                schema5_context.reservation.retire()
-                self._pending_final_reservation = None
-            else:
-                self._pending_final_reservation = schema5_context.reservation
             return True
         if recover_before_dependency_gate and not verify_ffmpeg_installation():
             print("Error: FFmpeg not found. Cannot create output video.")
@@ -306,10 +314,6 @@ class VideoEncoder:
                     input_stage_fingerprint=(schema5_context.staged_manifest.fingerprint),
                     final_relative_path=schema5_context.expected_relative_path,
                 )
-                defer_retirement = (
-                    self.defer_final_reservation_retirement
-                    or schema5_context.reservation.has_post_publication_work
-                )
                 FinalPublicationTransactionV4(
                     job_root=output_dir,
                     settings=schema5_context.settings,
@@ -326,12 +330,9 @@ class VideoEncoder:
                         selected_audio.audio_end_sample,
                     ),
                     reservation=schema5_context.reservation,
-                    retire_reservation=not defer_retirement,
+                    retire_reservation=False,
                 ).publish()
-                if defer_retirement:
-                    self._pending_final_reservation = schema5_context.reservation
-                else:
-                    self._pending_final_reservation = None
+                self._pending_final_reservation = schema5_context.reservation
             return True
         except ReservationIncompleteError:
             raise
@@ -340,10 +341,7 @@ class VideoEncoder:
             return False
         finally:
             if schema5_context is not None:
-                try:
-                    schema5_context.sibling_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                self._discard_schema5_sibling_after_attempt(schema5_context)
 
     @staticmethod
     def _per_eye_size(settings: dict[str, Any]) -> tuple[int, int]:
@@ -355,6 +353,13 @@ class VideoEncoder:
         if width <= 0 or height <= 0:
             raise ValueError("schema-5 per-eye dimensions must be positive")
         return width, height
+
+    @staticmethod
+    def _discard_schema5_sibling_after_attempt(context: _Schema5EncodingContext) -> None:
+        try:
+            context.reservation.discard_nonsemantic_sibling()
+        except Exception as error:
+            print(f"Warning: Preserving indexed sibling for recovery: {error}")
 
     def _prepare_schema5_assembled_context(
         self,
@@ -465,9 +470,8 @@ class VideoEncoder:
             }:
                 raise ValueError(f"unsupported final encoding recovery phase: {recovery.phase}")
             if reservation.sibling_path.exists() or reservation.sibling_path.is_symlink():
-                if not reservation.sibling_path.is_file() or reservation.sibling_path.is_symlink():
-                    raise ValueError("indexed retry sibling is unsafe")
-                reservation.sibling_path.unlink()
+                if not reservation.discard_nonsemantic_sibling():
+                    raise ValueError("indexed sibling is not discardable in this phase")
             reservation.reset_incomplete_manifest_sources()
             manifest_source = reservation.input_publication_source()
             if manifest_source is None:
@@ -1058,6 +1062,7 @@ class VideoEncoder:
             print(f"Error recovering schema-5 video publication: {error}")
             return False
         temporary: Path | None = None
+        schema5_context: _Schema5EncodingContext | None = None
         legacy_output_path: Path | None = None
         if not (output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH).is_file():
             output_filename = generate_output_filename(
@@ -1084,18 +1089,9 @@ class VideoEncoder:
                 output_dir=output_dir,
                 settings=settings,
             )
-            if schema5_context is not None and self.defer_final_reservation_retirement:
+            if schema5_context is not None:
                 self._pending_final_reservation = schema5_context.reservation
             if schema5_context is not None and schema5_context.already_authenticated:
-                defer_retirement = (
-                    self.defer_final_reservation_retirement
-                    or schema5_context.reservation.has_post_publication_work
-                )
-                if not defer_retirement:
-                    schema5_context.reservation.retire()
-                    self._pending_final_reservation = None
-                else:
-                    self._pending_final_reservation = schema5_context.reservation
                 return True
             if recover_before_dependency_gate and not verify_ffmpeg_installation():
                 print("Error: FFmpeg not found. Cannot create output video.")
@@ -1164,10 +1160,6 @@ class VideoEncoder:
                     input_stage_fingerprint=(schema5_context.staged_manifest.fingerprint),
                     final_relative_path=schema5_context.expected_relative_path,
                 )
-                defer_retirement = (
-                    self.defer_final_reservation_retirement
-                    or schema5_context.reservation.has_post_publication_work
-                )
                 FinalPublicationTransactionV4(
                     job_root=output_dir,
                     settings=schema5_context.settings,
@@ -1184,12 +1176,9 @@ class VideoEncoder:
                         selected_audio.audio_end_sample,
                     ),
                     reservation=schema5_context.reservation,
-                    retire_reservation=not defer_retirement,
+                    retire_reservation=False,
                 ).publish()
-                if defer_retirement:
-                    self._pending_final_reservation = schema5_context.reservation
-                else:
-                    self._pending_final_reservation = None
+                self._pending_final_reservation = schema5_context.reservation
             return True
         except InterruptedError:
             raise
@@ -1199,7 +1188,9 @@ class VideoEncoder:
             print(f"Error creating direct VR output video: {error}")
             return False
         finally:
-            if temporary is not None:
+            if schema5_context is not None:
+                self._discard_schema5_sibling_after_attempt(schema5_context)
+            elif temporary is not None:
                 try:
                     temporary.unlink(missing_ok=True)
                 except OSError as error:

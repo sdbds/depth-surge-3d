@@ -549,7 +549,7 @@ class TestCleanupOnlyResume:
         resume.assert_called_once_with(tmp_path)
         setup.assert_not_called()
 
-    def test_payload_pruned_resume_persists_pending_then_finishes(self, tmp_path):
+    def test_payload_pruned_resume_without_final_index_fails_without_mutation(self, tmp_path):
         settings_file = tmp_path / "processing-settings-v5.json"
         settings_file.write_bytes(b"settings")
         diagnostics = tmp_path / "04_stereo_diagnostics"
@@ -594,10 +594,10 @@ class TestCleanupOnlyResume:
                 side_effect=lambda *_args, **_kwargs: events.append("terminal") or True,
             ) as update,
         ):
-            assert orchestrator._resume_cleanup_only(tmp_path) is True
+            assert orchestrator._resume_cleanup_only(tmp_path) is False
 
-        assert events == ["recover", "audit", "pending", "delete", "terminal", "recover"]
-        assert update.call_args.args[2]["cleanup_status"] == "complete"
+        assert events == ["recover"]
+        update.assert_not_called()
 
     def test_authenticated_active_index_finishes_before_pipeline_setup(self, tmp_path):
         settings_file = tmp_path / "processing-settings-v5.json"

@@ -12,6 +12,7 @@ from src.depth_surge_3d.rendering.quality.diagnostic_transaction import (
     self_fingerprint,
 )
 from src.depth_surge_3d.rendering.quality.cleanup_transaction import (
+    CleanupTransactionError,
     commit_payload_pruned,
     run_authorized_cleanup,
 )
@@ -28,7 +29,9 @@ from src.depth_surge_3d.processing.video.final_publication import (
     audit_final_media_v1,
 )
 from src.depth_surge_3d.io import reservation_protocol
-from src.depth_surge_3d.io.operations import recover_processing_control_prefix_v1
+from src.depth_surge_3d.io.operations import (
+    recover_processing_control_prefix_v1,
+)
 from src.depth_surge_3d.io.reservation_protocol import ReservationAllocationEvidence
 from tests.unit.test_settings_artifact_v5 import _artifact
 
@@ -562,8 +565,33 @@ def test_pruning_success_consumes_all_extents_before_index_last_retirement(tmp_p
     ).publish()
 
     pruned = commit_payload_pruned(tmp_path, reservation=reservation)
+    with pytest.raises(CleanupTransactionError, match="cleanup_status=pending"):
+        run_authorized_cleanup(
+            tmp_path,
+            metadata=pruned,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+    assert (tmp_path / "00_original_frames" / "payload.bin").is_file()
     pending = reservation.commit_cleanup_pending_settings()
-    removed = run_authorized_cleanup(tmp_path, metadata=pruned)
+    removed = run_authorized_cleanup(
+        tmp_path,
+        metadata=pruned,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    completed = pending.completed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        frames_processed=12,
+        cleanup_status="complete",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=pending,
+        target=completed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
     reservation.retire()
 
     assert pending.to_object()["metadata"]["cleanup_status"] == "pending"
@@ -636,11 +664,67 @@ def test_pruning_crash_after_markers_reopens_the_remaining_ordered_prefix(tmp_pa
     assert reopened.cleanup_pending_settings_transaction is not None
 
     pruned = commit_payload_pruned(tmp_path, reservation=reopened)
-    reopened.commit_cleanup_pending_settings()
-    run_authorized_cleanup(tmp_path, metadata=pruned)
+    pending = reopened.commit_cleanup_pending_settings()
+    run_authorized_cleanup(
+        tmp_path,
+        metadata=pruned,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    completed = pending.completed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        frames_processed=12,
+        cleanup_status="complete",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=pending,
+        target=completed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
     reopened.retire()
 
     assert not reopened.index_path.exists()
+
+
+def test_schema5_cleanup_rejects_missing_final_index_without_mutation(tmp_path) -> None:
+    artifact = _pruning_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    _complete_prune_diagnostics(tmp_path)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    reservation.commit_producer_settings()
+    pending = reservation.commit_cleanup_pending_settings()
+    payload = tmp_path / "00_original_frames" / "payload.bin"
+    payload_before = payload.read_bytes()
+    settings_path = tmp_path / "processing-settings-v5.json"
+    settings_before = settings_path.read_bytes()
+    reservation.index_path.unlink()
+
+    with pytest.raises(CleanupTransactionError, match="active final reservation"):
+        commit_payload_pruned(tmp_path)
+    with pytest.raises(CleanupTransactionError, match="active final reservation"):
+        run_authorized_cleanup(
+            tmp_path,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert pending.to_object()["metadata"]["cleanup_status"] == "pending"
+    assert payload.read_bytes() == payload_before
+    assert settings_path.read_bytes() == settings_before
 
 
 @pytest.mark.parametrize(
@@ -734,10 +818,34 @@ def test_reserved_publication_retires_descriptors_then_index_last(tmp_path) -> N
 
     assert not input_descriptor.exists()
     assert not final_descriptor.exists()
+    assert reservation.target_descriptor_path.is_file()
+    assert reservation.index_path.is_file()
+    assert audit_final_media_v1(tmp_path, artifact).final_video_authenticated is True
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="exact completed settings",
+    ):
+        reservation.retire()
+    assert reservation.target_descriptor_path.is_file()
+    assert reservation.index_path.is_file()
+
+    completed = artifact.completed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        frames_processed=12,
+        cleanup_status="not_requested",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=completed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    reservation.retire(event=events.append)
+
     assert not reservation.target_descriptor_path.exists()
     assert not reservation.index_path.exists()
     assert events[-2:] == ["reservation:target-descriptor-retired", "reservation:index-retired"]
-    assert audit_final_media_v1(tmp_path, artifact).final_video_authenticated is True
 
 
 def test_reserved_post_video_crash_keeps_index_as_recovery_authority(tmp_path) -> None:
@@ -946,6 +1054,18 @@ def test_reserved_manifest_crash_prefix_reopens_to_one_phase(
     recovery = loaded.observe()
     assert (recovery.phase, recovery.action) == (phase, action)
     if crash_at == "after-final-manifest":
+        completed = artifact.completed(
+            terminal_at="2026-08-24T12:35:00.000000Z",
+            frames_processed=12,
+            cleanup_status="not_requested",
+        )
+        reservation_protocol.commit_terminal_settings_v1(
+            job_root=tmp_path,
+            current=artifact,
+            target=completed,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
         loaded.retire()
         assert not loaded.index_path.exists()
 
@@ -1008,7 +1128,18 @@ def test_descriptorless_committed_manifests_require_three_way_binding(tmp_path) 
         loaded.observe()
 
 
-def test_terminal_retirement_recovers_after_target_descriptor_unlink(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "crash_point",
+    [
+        "after-target-descriptor-unlink-before-sync",
+        "after-target-descriptor-retirement",
+        "after-index-unlink-before-sync",
+    ],
+)
+def test_terminal_retirement_recovers_each_descriptor_index_sync_boundary(
+    tmp_path,
+    crash_point,
+) -> None:
     artifact = _producer_artifact()
     _install_schema5_job(tmp_path, artifact)
     raw, fingerprint = _input_manifest()
@@ -1056,17 +1187,96 @@ def test_terminal_retirement_recovers_after_target_descriptor_unlink(tmp_path) -
         allocation_adapter=_test_allocation,
         allocation_counter=_test_allocation_counter,
     )
+    index_temporary = reservation.index_path.with_name(
+        f".{reservation.index_path.name}.create-new.tmp"
+    )
+    index_temporary.write_bytes(b"stale-index-temporary")
 
     with pytest.raises(InjectedFinalPublicationCrash):
-        reservation.retire(crash_at="after-target-descriptor-retirement")
+        reservation.retire(crash_at=crash_point)
 
-    assert recover_final_encoding_terminal_retirement_v1(
+    assert not index_temporary.exists()
+    recovered = recover_final_encoding_terminal_retirement_v1(
         tmp_path,
         completed,
         allocation_adapter=_test_allocation,
         allocation_counter=_test_allocation_counter,
     )
+    assert recovered is (crash_point != "after-index-unlink-before-sync")
     assert not reservation.index_path.exists()
+
+
+def test_completed_retirement_rejects_revision_outside_indexed_prefix(tmp_path) -> None:
+    artifact = _producer_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    raw, fingerprint = _input_manifest()
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=len(raw),
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    reservation.input_manifest_transaction.stage_complete_full(raw)
+    reservation.sibling_path.write_bytes(b"validated-reserved-video")
+    FinalPublicationTransactionV4(
+        job_root=tmp_path,
+        settings=artifact,
+        sibling_relative_path=reservation.sibling_path.name,
+        encoding_input_manifest_raw=raw,
+        input_stage_fingerprint=fingerprint,
+        resolved_encoding_arguments=(
+            "ffmpeg",
+            "@output:path64="
+            + FinalPublicationTransactionV4.path64(
+                artifact.to_object()["output_info"]["expected_final_relative_path"]
+            ),
+        ),
+        container_validator=lambda _path: True,
+        reservation=reservation,
+        retire_reservation=False,
+    ).publish()
+    completed = artifact.completed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        frames_processed=12,
+        cleanup_status="not_requested",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=completed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    value = completed.to_object()
+    value["metadata"]["settings_revision"] += 1
+    value["content_fingerprint"] = hashlib.sha256(
+        canonical_json_bytes(
+            {key: item for key, item in value.items() if key != "content_fingerprint"}
+        )
+    ).hexdigest()
+    wrong_revision = type(completed).from_object(value)
+    (tmp_path / "processing-settings-v5.json").write_bytes(wrong_revision.encode())
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="revision.*indexed prefix",
+    ):
+        recover_final_encoding_terminal_retirement_v1(
+            tmp_path,
+            wrong_revision,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert reservation.index_path.is_file()
+    assert reservation.target_descriptor_path.is_file()
 
 
 def test_terminal_failure_retirement_removes_only_unused_placeholders(tmp_path) -> None:
@@ -1113,8 +1323,17 @@ def test_terminal_failure_retirement_removes_only_unused_placeholders(tmp_path) 
     assert not reservation.index_path.exists()
 
 
+@pytest.mark.parametrize(
+    "crash_point",
+    [
+        "failure-retirement:0:descriptor",
+        "failure-retirement:descriptors-unlinked-before-sync",
+        "failure-retirement:index-unlinked-before-sync",
+    ],
+)
 def test_terminal_failure_retirement_resumes_without_recreating_cleaned_extents(
     tmp_path,
+    crash_point,
 ) -> None:
     artifact = _producer_artifact()
     _install_schema5_job(tmp_path, artifact)
@@ -1153,17 +1372,18 @@ def test_terminal_failure_retirement_resumes_without_recreating_cleaned_extents(
             failed,
             allocation_adapter=_test_allocation,
             allocation_counter=_test_allocation_counter,
-            crash_at="failure-retirement:0:descriptor",
+            crash_at=crash_point,
         )
 
     assert not first_descriptor.exists()
     assert not first_source.exists()
-    assert recover_final_encoding_terminal_retirement_v1(
+    recovered = recover_final_encoding_terminal_retirement_v1(
         tmp_path,
         failed,
         allocation_adapter=_test_allocation,
         allocation_counter=_test_allocation_counter,
     )
+    assert recovered is (crash_point != "failure-retirement:index-unlinked-before-sync")
     assert not first_descriptor.exists()
     assert not first_source.exists()
     assert not reservation.index_path.exists()
@@ -1285,6 +1505,629 @@ def test_terminal_failure_preserves_descriptorless_zero_placeholder(tmp_path) ->
     assert placeholder.is_file()
     assert placeholder.stat().st_size == 0
     assert reservation.index_path.is_file()
+
+
+def test_terminal_failure_never_deletes_a_durable_producer_settings_intent(tmp_path) -> None:
+    artifact = _pruning_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    _complete_prune_diagnostics(tmp_path)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    transaction = reservation.producer_settings_transaction
+    payload = reservation.producer_settings_payload
+    assert transaction is not None and payload is not None
+    transaction.stage_complete_full(payload)
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+
+    with pytest.raises(reservation_protocol.ReservationConflictError):
+        recover_final_encoding_terminal_retirement_v1(
+            tmp_path,
+            failed,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert transaction.source_path.is_file()
+    assert transaction.descriptor_path.is_file()
+    assert reservation.index_path.is_file()
+
+
+def test_terminal_update_forwards_durable_producer_intent_before_failed_commit(
+    tmp_path,
+) -> None:
+    artifact = _pruning_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    _complete_prune_diagnostics(tmp_path)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    transaction = reservation.producer_settings_transaction
+    payload = reservation.producer_settings_payload
+    assert transaction is not None and payload is not None
+    transaction.stage_complete_full(payload)
+    forwarded = recover_processing_control_prefix_v1(
+        tmp_path,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    assert forwarded is not None
+    assert forwarded.to_object()["metadata"]["final_media_publication_generation"] == "44" * 16
+    failed = forwarded.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=forwarded,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    assert recover_final_encoding_terminal_retirement_v1(
+        tmp_path,
+        failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+
+    persisted = recover_processing_control_prefix_v1(
+        tmp_path,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    assert persisted is not None
+    assert persisted.status == "failed"
+    assert not reservation.index_path.exists()
+
+
+def test_terminal_failure_preserves_final_video_replacement_gap(tmp_path) -> None:
+    artifact = _artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    reservation.sibling_path.write_bytes(b"new-video")
+    reservation.final_video_path.unlink()
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="replacement gap",
+    ):
+        recover_final_encoding_terminal_retirement_v1(
+            tmp_path,
+            failed,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert reservation.sibling_path.read_bytes() == b"new-video"
+    assert reservation.index_path.is_file()
+
+
+def test_failed_retirement_validates_target_descriptor_before_deleting_owned_paths(
+    tmp_path,
+) -> None:
+    artifact = _artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    reservation.sibling_path.write_bytes(b"partial-video")
+    input_source = reservation.input_manifest_transaction.source_path
+    input_descriptor = reservation.input_manifest_transaction.descriptor_path
+    source_before = input_source.read_bytes()
+    descriptor_before = input_descriptor.read_bytes()
+    reservation.target_descriptor_path.write_bytes(b'{"damaged":true}')
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+
+    with pytest.raises(reservation_protocol.ReservationConflictError):
+        recover_final_encoding_terminal_retirement_v1(
+            tmp_path,
+            failed,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert reservation.sibling_path.read_bytes() == b"partial-video"
+    assert input_source.read_bytes() == source_before
+    assert input_descriptor.read_bytes() == descriptor_before
+    assert reservation.index_path.is_file()
+
+
+def test_failed_retirement_keeps_index_temporary_until_full_preflight_passes(
+    tmp_path,
+) -> None:
+    artifact = _artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    index_temporary = reservation.index_path.with_name(
+        f".{reservation.index_path.name}.create-new.tmp"
+    )
+    index_temporary.write_bytes(b"stale-index-temporary")
+    reservation.sibling_path.write_bytes(b"partial-video")
+    reservation.target_descriptor_path.write_bytes(b'{"damaged":true}')
+    source = reservation.input_manifest_transaction.source_path
+    source_before = source.read_bytes()
+
+    with pytest.raises(reservation_protocol.ReservationConflictError):
+        recover_processing_control_prefix_v1(
+            tmp_path,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert index_temporary.read_bytes() == b"stale-index-temporary"
+    assert reservation.sibling_path.read_bytes() == b"partial-video"
+    assert source.read_bytes() == source_before
+    assert reservation.index_path.is_file()
+
+
+def test_failed_retirement_rejects_swapped_zero_placeholder_before_deletion(tmp_path) -> None:
+    artifact = _artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    reservation.sibling_path.write_bytes(b"partial-video")
+    input_source = reservation.input_manifest_transaction.source_path
+    source_before = input_source.read_bytes()
+    original_identity = reservation_protocol._identity(reservation.final_video_path)
+    reservation.final_video_path.unlink()
+    reservation.final_video_path.write_bytes(b"")
+    assert reservation_protocol._identity(reservation.final_video_path) != original_identity
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="placeholder identity",
+    ):
+        recover_final_encoding_terminal_retirement_v1(
+            tmp_path,
+            failed,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert reservation.sibling_path.read_bytes() == b"partial-video"
+    assert input_source.read_bytes() == source_before
+    assert reservation.index_path.is_file()
+
+
+def test_reserved_publication_rejects_nonempty_owned_placeholder_before_replacement(
+    tmp_path,
+) -> None:
+    artifact = _producer_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    raw, fingerprint = _input_manifest()
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=len(raw),
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    input_transaction = reservation.input_manifest_transaction
+    assert input_transaction is not None
+    input_transaction.stage_complete_full(raw)
+    reservation.sibling_path.write_bytes(b"validated-video")
+    reservation.final_video_path.write_bytes(b"unauthorized-placeholder-bytes")
+    source_before = input_transaction.source_path.read_bytes()
+    descriptor_before = input_transaction.descriptor_path.read_bytes()
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="placeholder.*nonempty",
+    ):
+        FinalPublicationTransactionV4(
+            job_root=tmp_path,
+            settings=artifact,
+            sibling_relative_path=reservation.sibling_path.name,
+            encoding_input_manifest_raw=raw,
+            input_stage_fingerprint=fingerprint,
+            resolved_encoding_arguments=(
+                "ffmpeg",
+                "@output:path64="
+                + FinalPublicationTransactionV4.path64(
+                    artifact.to_object()["output_info"]["expected_final_relative_path"]
+                ),
+            ),
+            container_validator=lambda _path: True,
+            reservation=reservation,
+            retire_reservation=False,
+        ).publish()
+
+    assert reservation.final_video_path.read_bytes() == b"unauthorized-placeholder-bytes"
+    assert reservation.sibling_path.read_bytes() == b"validated-video"
+    assert input_transaction.source_path.read_bytes() == source_before
+    assert input_transaction.descriptor_path.read_bytes() == descriptor_before
+    assert reservation.index_path.is_file()
+
+
+def test_failed_retirement_preflights_committed_manifest_before_any_mutation(
+    tmp_path,
+) -> None:
+    artifact = _artifact()
+    _install_schema5_job(tmp_path, artifact)
+    raw, _fingerprint = _input_manifest()
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=len(raw),
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    transaction = reservation.input_manifest_transaction
+    assert transaction is not None
+    transaction.stage_complete_full(raw)
+    with pytest.raises(reservation_protocol.InjectedReservationCrash):
+        transaction.consume_streamed_prefix(
+            prefix_byte_count=len(raw),
+            prefix_sha256=hashlib.sha256(raw).hexdigest(),
+            crash_at="after-rename-parent-sync",
+        )
+    assert transaction.descriptor_path.is_file()
+    assert not transaction.source_path.exists()
+    reservation.sibling_path.write_bytes(b"partial-video")
+    reservation.target_descriptor_path.write_bytes(b'{"damaged":true}')
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    descriptor_before = transaction.descriptor_path.read_bytes()
+    target_before = transaction.target_path.read_bytes()
+
+    with pytest.raises(reservation_protocol.ReservationConflictError):
+        recover_final_encoding_terminal_retirement_v1(
+            tmp_path,
+            failed,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert transaction.descriptor_path.read_bytes() == descriptor_before
+    assert transaction.target_path.read_bytes() == target_before
+    assert reservation.sibling_path.read_bytes() == b"partial-video"
+    assert reservation.index_path.is_file()
+
+
+def test_failed_retirement_rejects_nonempty_owned_placeholder_before_any_mutation(
+    tmp_path,
+) -> None:
+    artifact = _artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    input_transaction = reservation.input_manifest_transaction
+    assert input_transaction is not None
+    reservation.sibling_path.write_bytes(b"partial-video")
+    reservation.final_video_path.write_bytes(b"unauthorized-placeholder-bytes")
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    source_before = input_transaction.source_path.read_bytes()
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="placeholder.*nonempty",
+    ):
+        recover_final_encoding_terminal_retirement_v1(
+            tmp_path,
+            failed,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert reservation.final_video_path.read_bytes() == b"unauthorized-placeholder-bytes"
+    assert reservation.sibling_path.read_bytes() == b"partial-video"
+    assert input_transaction.source_path.read_bytes() == source_before
+    assert reservation.index_path.is_file()
+
+
+def test_failed_retirement_rejects_descriptor_temporary_with_source_before_mutation(
+    tmp_path,
+) -> None:
+    artifact = _producer_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    transaction = reservation.input_manifest_transaction
+    assert transaction is not None
+    descriptor_temporary = transaction.descriptor_path.with_name(
+        f".{transaction.descriptor_path.name}.create-new.tmp"
+    )
+    transaction.descriptor_path.replace(descriptor_temporary)
+    reservation.sibling_path.write_bytes(b"partial-video")
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    temporary_before = descriptor_temporary.read_bytes()
+    source_before = transaction.source_path.read_bytes()
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="descriptor temporary.*source",
+    ):
+        recover_final_encoding_terminal_retirement_v1(
+            tmp_path,
+            failed,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert descriptor_temporary.read_bytes() == temporary_before
+    assert transaction.source_path.read_bytes() == source_before
+    assert reservation.sibling_path.read_bytes() == b"partial-video"
+    assert reservation.index_path.is_file()
+
+
+@pytest.mark.parametrize(
+    ("stop_after_input", "retry_sibling", "authenticated"),
+    [
+        (True, False, False),
+        (True, True, False),
+        (False, False, True),
+    ],
+)
+def test_failed_retirement_preserves_each_legal_post_boundary_publication_prefix(
+    tmp_path,
+    stop_after_input,
+    retry_sibling,
+    authenticated,
+) -> None:
+    artifact = _producer_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    raw, fingerprint = _input_manifest()
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=len(raw),
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    input_transaction = reservation.input_manifest_transaction
+    assert input_transaction is not None
+    input_transaction.stage_complete_full(raw)
+    reservation.sibling_path.write_bytes(b"published-post-boundary-video")
+    publication = FinalPublicationTransactionV4(
+        job_root=tmp_path,
+        settings=artifact,
+        sibling_relative_path=reservation.sibling_path.name,
+        encoding_input_manifest_raw=raw,
+        input_stage_fingerprint=fingerprint,
+        resolved_encoding_arguments=(
+            "ffmpeg",
+            "@output:path64="
+            + FinalPublicationTransactionV4.path64(
+                artifact.to_object()["output_info"]["expected_final_relative_path"]
+            ),
+        ),
+        container_validator=lambda _path: True,
+        reservation=reservation,
+        retire_reservation=False,
+    )
+    if stop_after_input:
+        with pytest.raises(InjectedFinalPublicationCrash):
+            publication.publish(crash_at="after-input-manifest")
+    else:
+        publication.publish()
+    if retry_sibling:
+        reservation.sibling_path.write_bytes(b"unpublished-retry-video")
+
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    assert recover_final_encoding_terminal_retirement_v1(
+        tmp_path,
+        failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+
+    assert reservation.final_video_path.read_bytes() == b"published-post-boundary-video"
+    assert (tmp_path / "encoding_input_manifest.json").read_bytes() == raw
+    assert not reservation.sibling_path.exists()
+    assert not reservation.index_path.exists()
+    disposition = audit_final_media_v1(tmp_path, failed)
+    assert disposition.final_video_authenticated is authenticated
+    assert disposition.final_video_authentication_reason == (
+        None if authenticated else "incomplete_publication_evidence"
+    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows replacement gaps are platform-specific")

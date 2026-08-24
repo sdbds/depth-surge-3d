@@ -556,6 +556,18 @@ def commit_payload_pruned(  # noqa: C901
     root = Path(job_root).resolve()
     active_index = root / ".depth-surge-reservations-v1" / "final-encoding-reservation-v1.json"
     index_temporary = active_index.with_name(f".{active_index.name}.create-new.tmp")
+    control_path = root / "job-control-v1.json"
+    control_temporary = control_path.with_name(f".{control_path.name}.create-new.tmp")
+    schema5 = any(
+        path.exists() or path.is_symlink() for path in (control_path, control_temporary)
+    )
+    active_pair = any(
+        path.exists() or path.is_symlink() for path in (active_index, index_temporary)
+    )
+    if schema5 and not active_pair:
+        raise CleanupTransactionError(
+            "schema-5 payload pruning requires its active final reservation"
+        )
     if reservation is None:
         from ...io.operations import recover_processing_control_prefix_v1
         from ...processing.video.final_publication import (
@@ -563,13 +575,12 @@ def commit_payload_pruned(  # noqa: C901
         )
 
         settings = recover_processing_control_prefix_v1(root)
-        active_pair = any(
-            path.exists() or path.is_symlink() for path in (active_index, index_temporary)
-        )
         if active_pair:
             if settings is None:
                 raise CleanupTransactionError("schema-5 cleanup has no recovered job control")
             reservation = load_final_encoding_reservation_v1(root, settings)
+    elif schema5 and not hasattr(reservation, "index"):
+        raise CleanupTransactionError("schema-5 cleanup reservation is not index-bound")
     metadata_path = root / "04_stereo_diagnostics" / "metadata.json"
     final_manifest_path = root / "final_video_manifest.json"
     metadata_raw = metadata_path.read_bytes()
@@ -1327,13 +1338,22 @@ def _delete_descendants_no_follow(
     )
 
 
-def _parse_payload_pruned(job_root: Path) -> dict[str, Any]:
+def _read_bounded_regular_file(path: Path, *, max_bytes: int) -> bytes:
+    metadata = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink() or metadata.st_size > max_bytes:
+        raise CleanupTransactionError(f"cleanup control file is unsafe or oversized: {path}")
+    with path.open("rb", buffering=0) as handle:
+        raw = handle.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise CleanupTransactionError(f"cleanup control file exceeds its bound: {path}")
+    return raw
+
+
+def _parse_payload_pruned(job_root: Path) -> tuple[dict[str, Any], bytes]:
     path = Path(job_root) / "04_stereo_diagnostics" / "metadata.json"
-    raw = path.read_bytes()
-    if len(raw) > 16 * 1024 * 1024:
-        raise CleanupTransactionError("payload-pruned metadata exceeds its bound")
+    raw = _read_bounded_regular_file(path, max_bytes=16 * 1024 * 1024)
     value = _parse_canonical_object(raw)
-    return _validate_payload_pruned_authorization(Path(job_root), value)
+    return _validate_payload_pruned_authorization(Path(job_root), value), raw
 
 
 def run_authorized_cleanup(
@@ -1341,15 +1361,80 @@ def run_authorized_cleanup(
     *,
     metadata: dict[str, Any] | None = None,
     fault: FaultHook | None = None,
+    allocation_adapter: Any | None = None,
+    allocation_counter: Any | None = None,
 ) -> int:
     """Delete only persisted, identity-bound roots and keep each marker until last."""
 
     root = Path(job_root).resolve()
-    value = (
-        _validate_payload_pruned_authorization(root, metadata)
-        if metadata is not None
-        else _parse_payload_pruned(root)
-    )
+    control_path = root / "job-control-v1.json"
+    control_temporary = control_path.with_name(f".{control_path.name}.create-new.tmp")
+    if any(
+        path.exists() or path.is_symlink() for path in (control_path, control_temporary)
+    ):
+        from ...io.operations import recover_processing_control_prefix_v1
+        from ...processing.video.final_publication import (
+            FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+            load_final_encoding_reservation_v1,
+        )
+
+        active_index = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+        index_temporary = active_index.with_name(
+            f".{active_index.name}.create-new.tmp"
+        )
+        if not any(
+            path.exists() or path.is_symlink()
+            for path in (active_index, index_temporary)
+        ):
+            raise CleanupTransactionError(
+                "schema-5 cleanup requires its active final reservation"
+            )
+
+        recovery_kwargs = {}
+        if allocation_adapter is not None:
+            recovery_kwargs["allocation_adapter"] = allocation_adapter
+        if allocation_counter is not None:
+            recovery_kwargs["allocation_counter"] = allocation_counter
+        try:
+            settings = recover_processing_control_prefix_v1(root, **recovery_kwargs)
+        except Exception as error:
+            raise CleanupTransactionError(
+                "schema-5 cleanup control recovery failed"
+            ) from error
+        if settings is None:
+            raise CleanupTransactionError("schema-5 cleanup has no durable settings")
+        cleanup_status = settings.to_object()["metadata"]["cleanup_status"]
+        if cleanup_status != "pending":
+            raise CleanupTransactionError(
+                "schema-5 cleanup requires durable cleanup_status=pending"
+            )
+        load_kwargs = {}
+        if allocation_adapter is not None:
+            load_kwargs["allocation_adapter"] = allocation_adapter
+        if allocation_counter is not None:
+            load_kwargs["allocation_counter"] = allocation_counter
+        try:
+            reservation = load_final_encoding_reservation_v1(
+                root,
+                settings,
+                **load_kwargs,
+            )
+            recovery = reservation.recover_publication_prefix()
+        except Exception as error:
+            raise CleanupTransactionError(
+                "schema-5 cleanup could not reopen its final reservation"
+            ) from error
+        if recovery.phase != "publication_authenticated":
+            raise CleanupTransactionError(
+                "schema-5 cleanup requires authenticated final publication"
+            )
+    value, durable_raw = _parse_payload_pruned(root)
+    if metadata is not None:
+        cached = _validate_payload_pruned_authorization(root, metadata)
+        if cached != value or canonical_json_bytes(cached) != durable_raw:
+            raise CleanupTransactionError(
+                "cleanup metadata cache differs from durable authorization"
+            )
     root_identity = _directory_identity(root)
     mount_identity: _InvocationMountIdentity | None = None
     if os.name != "nt":

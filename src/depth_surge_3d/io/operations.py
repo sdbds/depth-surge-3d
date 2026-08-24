@@ -793,30 +793,21 @@ def commit_cleanup_pending_status(
         path.exists() or path.is_symlink()
         for path in (active_index, active_index_temporary)
     )
-    if active_final:
-        from ..processing.video.final_publication import (
-            load_final_encoding_reservation_v1,
+    if not active_final:
+        raise ReservationConflictError(
+            "cleanup pending requires its active final reservation"
         )
-
-        reservation = load_final_encoding_reservation_v1(job_root, current)
-    elif reservation is not None:
-        raise ReservationConflictError("cleanup reservation is no longer authoritative")
-    if reservation is not None:
-        return reservation.commit_cleanup_pending_settings()
-    if current.to_object()["metadata"]["cleanup_status"] == "pending":
-        return current
-    target = current.cleanup_pending(updated_at=_utc_now_usec())
-    transaction = SettingsArtifactTransactionV1.begin(
-        job_root=job_root,
-        current=current,
-        target=target,
-        allocation_adapter=platform_allocation_adapter,
-        allocation_counter=platform_allocation_counter,
-        allocation_unit=allocation_unit_for_path(job_root),
-        reservation_generation=secrets.token_hex(16),
-        reservation_id=secrets.token_hex(16),
+    from ..processing.video.final_publication import (
+        load_final_encoding_reservation_v1,
     )
-    return transaction.commit()
+
+    active_reservation = load_final_encoding_reservation_v1(job_root, current)
+    if reservation is not None and (
+        getattr(getattr(reservation, "index", None), "fingerprint", None)
+        != active_reservation.index.fingerprint
+    ):
+        raise ReservationConflictError("cleanup reservation is no longer authoritative")
+    return active_reservation.commit_cleanup_pending_settings()
 
 
 def recover_processing_settings_artifact(
@@ -892,6 +883,24 @@ def recover_processing_control_prefix_v1(
     )
     if settings_active and final_active:
         raise ReservationConflictError("both fixed reservation indexes are active")
+    artifact: ProcessingSettingsArtifactV5 | None = None
+    if final_active and fixed_settings.exists():
+        artifact = recover_settings_job_v1(
+            root,
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+        )
+        if artifact.status in {"completed", "failed"}:
+            if not recover_final_encoding_terminal_retirement_v1(
+                root,
+                artifact,
+                allocation_adapter=allocation_adapter,
+                allocation_counter=allocation_counter,
+            ):
+                raise ReservationConflictError(
+                    "terminal settings retain only an uncommitted final index temporary"
+                )
+            return artifact
     if final_active:
         recovered_final_index = recover_final_encoding_index_pair_v1(root)
         final_active = recovered_final_index is not None
@@ -901,11 +910,12 @@ def recover_processing_control_prefix_v1(
                 allocation_adapter=allocation_adapter,
                 allocation_counter=allocation_counter,
             )
-    artifact = recover_settings_job_v1(
-        root,
-        allocation_adapter=allocation_adapter,
-        allocation_counter=allocation_counter,
-    )
+    if artifact is None:
+        artifact = recover_settings_job_v1(
+            root,
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+        )
     if final_active:
         if artifact.status in {"completed", "failed"}:
             recover_final_encoding_terminal_retirement_v1(
@@ -922,6 +932,11 @@ def recover_processing_control_prefix_v1(
                 allocation_counter=allocation_counter,
             )
             reservation.recover_publication_prefix()
+            artifact = recover_settings_job_v1(
+                root,
+                allocation_adapter=allocation_adapter,
+                allocation_counter=allocation_counter,
+            )
     return artifact
 
 

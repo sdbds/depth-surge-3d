@@ -165,6 +165,11 @@ class ProcessingOrchestrator:
             )
         except (OSError, UnicodeError, json.JSONDecodeError):
             diagnostics_metadata = None
+        if (cleanup_pending or payload_pruned) and reservation is None:
+            print(
+                "Error: Cleanup-only recovery requires the active final encoding reservation"
+            )
+            return False
         if not cleanup_pending and not payload_pruned and not publication_authenticated:
             return None
         self._settings_file = settings_file

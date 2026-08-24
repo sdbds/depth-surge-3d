@@ -36,7 +36,7 @@ def test_cli_accepts_explicit_quality_controls(cli_module) -> None:
     assert settings["occlusion_fill_max_px"] == 10
 
 
-@pytest.mark.parametrize(("device", "expected"), [("cuda", "quality"), ("cpu", "fast")])
+@pytest.mark.parametrize(("device", "expected"), [("cuda", "fast"), ("cpu", "fast")])
 def test_cli_resolves_omitted_mode_from_effective_device(
     monkeypatch: pytest.MonkeyPatch,
     cli_module,

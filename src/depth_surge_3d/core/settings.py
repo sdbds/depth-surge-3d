@@ -458,5 +458,5 @@ def resolve_stereo_render_mode(
         return _choice(
             "stereo_render_mode", persisted, {"fast", "quality"}
         )  # type: ignore[return-value]
-    device_type = str(renderer_device_type).split(":", 1)[0].lower()
-    return "quality" if device_type == "cuda" else "fast"
+    del renderer_device_type
+    return "fast"

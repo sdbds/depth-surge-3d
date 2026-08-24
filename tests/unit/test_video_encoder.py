@@ -1193,8 +1193,9 @@ def test_schema5_assembled_encode_publishes_bound_video_and_manifests(tmp_path, 
         lambda: (_ for _ in ()).throw(AssertionError("manifest was materialized")),
     )
 
-    encoder = VideoEncoder(defer_final_reservation_retirement=True)
+    encoder = VideoEncoder()
     assert encoder.create_video(frames, job, str(source), settings)
+    assert encoder.pending_final_encoding_reservation is not None
     artifact = ProcessingSettingsArtifactV5.parse(settings_file.read_bytes())
     expected = artifact.to_object()["output_info"]["expected_final_relative_path"]
     assert (job / expected).read_bytes() == b"validated-mp4"
@@ -1205,9 +1206,20 @@ def test_schema5_assembled_encode_publishes_bound_video_and_manifests(tmp_path, 
     assert launches[0][launches[0].index("-start_number") + 1] == "1"
     assert launches[0][launches[0].index("-vf") + 1] == "setsar=1"
 
-    resumed = VideoEncoder(defer_final_reservation_retirement=True)
+    resumed = VideoEncoder()
     assert resumed.create_video(frames, job, str(source), settings)
     assert len(launches) == 1
+    assert resumed.pending_final_encoding_reservation is not None
+    from src.depth_surge_3d.io.operations import update_processing_status
+    from src.depth_surge_3d.io.reservation_protocol import ReservationConflictError
+
+    with pytest.raises(ReservationConflictError, match="terminal settings"):
+        resumed.retire_final_encoding_reservation(success=True)
+    assert update_processing_status(
+        settings_file,
+        "completed",
+        {"frames_processed": 1},
+    )
     resumed.retire_final_encoding_reservation(success=True)
     assert not (job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json").exists()
 
@@ -1272,6 +1284,18 @@ def test_schema5_failed_encode_keeps_reservation_available_for_terminal_retireme
     assert encoder._pending_final_reservation is not None
     assert (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).is_file()
 
+    from src.depth_surge_3d.io.operations import update_processing_status
+    from src.depth_surge_3d.io.reservation_protocol import ReservationConflictError
+
+    with pytest.raises(ReservationConflictError, match="durable failed"):
+        encoder.retire_final_encoding_reservation(success=False)
+    assert encoder._pending_final_reservation is not None
+    assert (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).is_file()
+    assert update_processing_status(
+        job / "processing-settings-v5.json",
+        "failed",
+        {"error": "forced failure"},
+    )
     encoder.retire_final_encoding_reservation(success=False)
     assert encoder._pending_final_reservation is None
     assert not (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).exists()
@@ -1338,6 +1362,18 @@ def test_schema5_manifest_staging_failure_keeps_new_reservation_for_terminal_ret
     assert encoder._pending_final_reservation is not None
     assert (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).is_file()
 
+    from src.depth_surge_3d.io.operations import update_processing_status
+    from src.depth_surge_3d.io.reservation_protocol import ReservationConflictError
+
+    with pytest.raises(ReservationConflictError, match="durable failed"):
+        encoder.retire_final_encoding_reservation(success=False)
+    assert encoder._pending_final_reservation is not None
+    assert (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).is_file()
+    assert update_processing_status(
+        job / "processing-settings-v5.json",
+        "failed",
+        {"error": "forced staging failure"},
+    )
     encoder.retire_final_encoding_reservation(success=False)
     assert encoder._pending_final_reservation is None
     assert not (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).exists()
@@ -1430,7 +1466,8 @@ def test_schema5_direct_encode_uses_provider_and_same_publication_contract(tmp_p
     monkeypatch.setattr(VideoEncoder, "_run_schema5_ffmpeg_with_progress", fake_progress)
     monkeypatch.setattr(VideoEncoder, "_validate_final_container", lambda *_args: True)
 
-    assert VideoEncoder().create_video_from_stereo_sequences(
+    encoder = VideoEncoder()
+    assert encoder.create_video_from_stereo_sequences(
         [left],
         [right],
         job,
@@ -1442,6 +1479,8 @@ def test_schema5_direct_encode_uses_provider_and_same_publication_contract(tmp_p
     expected = artifact.to_object()["output_info"]["expected_final_relative_path"]
     assert (job / expected).read_bytes() == b"validated-direct-mp4"
     assert audit_final_media_v1(job, artifact).final_video_authenticated is True
+    assert encoder.pending_final_encoding_reservation is not None
+    assert (job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json").is_file()
 
 
 @pytest.mark.parametrize(
@@ -1538,4 +1577,24 @@ def test_schema5_post_boundary_restart_reencodes_without_rewriting_input_manifes
     if committed_input is not None:
         assert (job / "encoding_input_manifest.json").read_bytes() == committed_input
     assert audit_final_media_v1(job, artifact).final_video_authenticated is True
-    assert not (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).exists()
+    assert (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).is_file()
+
+
+@pytest.mark.parametrize("discard_result", [False, OSError("forward recovery pending")])
+def test_schema5_attempt_cleanup_never_unlinks_a_nondiscardable_sibling(
+    tmp_path,
+    discard_result,
+) -> None:
+    sibling = tmp_path / ".depth-surge-final-v4-fixture.tmp.mp4"
+    sibling.write_bytes(b"only-forward-recovery-copy")
+    reservation = Mock()
+    if isinstance(discard_result, Exception):
+        reservation.discard_nonsemantic_sibling.side_effect = discard_result
+    else:
+        reservation.discard_nonsemantic_sibling.return_value = discard_result
+    context = Mock(reservation=reservation)
+
+    VideoEncoder._discard_schema5_sibling_after_attempt(context)
+
+    assert sibling.read_bytes() == b"only-forward-recovery-copy"
+    reservation.discard_nonsemantic_sibling.assert_called_once_with()

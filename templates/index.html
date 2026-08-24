@@ -2166,11 +2166,7 @@
 
         function applyStereoRenderModeDefault() {
             if (stereoRenderModeExplicit) return;
-            const requestedDevice = document.getElementById('device').value;
-            const qualityDefault = requestedDevice === 'cuda'
-                || (requestedDevice === 'auto' && systemCudaAvailable === true);
-            document.getElementById('stereoRenderMode').value =
-                qualityDefault ? 'quality' : 'fast';
+            document.getElementById('stereoRenderMode').value = 'fast';
         }
 
         function updateStereoQualityControls() {

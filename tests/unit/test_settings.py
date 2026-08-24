@@ -271,7 +271,7 @@ def test_schema_four_migrates_to_fast_and_limit_eight() -> None:
 @pytest.mark.parametrize(
     ("persisted", "override", "is_resume", "device", "expected"),
     [
-        (None, None, False, "cuda", "quality"),
+        (None, None, False, "cuda", "fast"),
         (None, None, False, "cpu", "fast"),
         ("quality", None, False, "cpu", "fast"),
         ("quality", None, True, "cpu", "quality"),

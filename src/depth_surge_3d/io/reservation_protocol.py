@@ -443,6 +443,7 @@ def _unlink_safe_control_temporary(
     *,
     expected_identity: ReservationFileIdentity | None = None,
     expected_parent_identity: DirectoryIdentity | None = None,
+    sync_parent: bool = True,
 ) -> None:
     path = Path(path)
     if not (path.exists() or path.is_symlink()):
@@ -460,7 +461,10 @@ def _unlink_safe_control_temporary(
             parent_identity = directory_identity_from_posix_fd(parent_fd)
             child_fd = os.open(
                 path.name,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=parent_fd,
             )
             identity = file_identity_from_posix_fd(child_fd)
@@ -471,7 +475,8 @@ def _unlink_safe_control_temporary(
             if identity.link_count != 1:
                 raise ReservationConflictError("control temporary is not single-link")
             os.unlink(path.name, dir_fd=parent_fd)
-            os.fsync(parent_fd)
+            if sync_parent:
+                os.fsync(parent_fd)
             if directory_identity_from_posix_fd(parent_fd) != parent_identity:
                 raise ReservationConflictError("control temporary parent changed")
         finally:
