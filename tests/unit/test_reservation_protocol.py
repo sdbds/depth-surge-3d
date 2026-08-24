@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 from pathlib import Path
 import os
 
@@ -117,6 +118,28 @@ def _create_transaction(
         generation="cd" * 16,
         reservation_id="ef" * 16,
     )
+
+
+def test_streamed_prefix_consumption_never_requires_a_payload_bytes_object(tmp_path: Path) -> None:
+    payload = b'{"large":"' + b"x" * 3000 + b'"}'
+
+    def allocated(path: Path) -> int:
+        size = path.stat().st_size
+        return ((size + 4095) // 4096) * 4096
+
+    transaction = _create_transaction(tmp_path, counter=allocated)
+    with transaction.source_path.open("r+b", buffering=0) as handle:
+        assert handle.write(payload) == len(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    transaction.consume_streamed_prefix(
+        prefix_byte_count=len(payload),
+        prefix_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+    assert transaction.target_path.read_bytes() == payload
+    assert not transaction.descriptor_path.exists()
 
 
 def test_write_ahead_index_is_durable_before_placeholder_extent_and_descriptor(

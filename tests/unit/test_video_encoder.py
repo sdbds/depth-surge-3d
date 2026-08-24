@@ -11,6 +11,10 @@ import numpy as np
 import pytest
 
 from src.depth_surge_3d.core.file_identity import file_sample_fingerprint
+from src.depth_surge_3d.processing.video.final_audio import (
+    OpenFileIdentityV1,
+    SelectedAudioIdentityV1,
+)
 from src.depth_surge_3d.processing.video.video_encoder import VideoEncoder
 from src.depth_surge_3d.processing.frames.source_frame_manifest import (
     write_source_frame_manifest,
@@ -87,6 +91,22 @@ def _direct_settings(**overrides):
     }
     settings.update(overrides)
     return settings
+
+
+def _usable_audio(path: Path) -> SelectedAudioIdentityV1:
+    return SelectedAudioIdentityV1(
+        selection="original_video",
+        selected_source_path=path,
+        source_open_identity=OpenFileIdentityV1("windows", "0" * 16, "1" * 32),
+        source_byte_count=5,
+        source_raw_sha256="a" * 64,
+        resolved_clip_arguments=("-ss", "2"),
+        disposition="usable",
+        sample_rate=48_000,
+        channels=2,
+        decoded_pcm_bytes=384_000,
+        audio_end_sample=96_096,
+    )
 
 
 @pytest.mark.parametrize("start", [0, 1, 1_000_000])
@@ -264,6 +284,68 @@ def test_direct_command_maps_audio_from_third_input(tmp_path):
     assert max(index for index, value in enumerate(command) if value == "-i") < command.index(
         "-filter_complex"
     )
+
+
+def test_schema5_direct_command_uses_preflighted_audio_without_shortest(tmp_path):
+    left = _write_eye_sequence(tmp_path / "left", [1])
+    right = _write_eye_sequence(tmp_path / "right", [1])
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"audio")
+    encoder = VideoEncoder()
+    sequence = encoder._validate_direct_stereo_sequence(left, right, 1)
+
+    command = encoder._build_direct_stereo_command(
+        sequence,
+        tmp_path / ".output.tmp.mp4",
+        str(source),
+        _direct_settings(preserve_audio=True),
+        selected_audio=_usable_audio(source.resolve()),
+    )
+
+    assert command.count("-i") == 3
+    assert command[command.index("-ss") : command.index("-filter_complex")] == [
+        "-ss",
+        "2",
+        "-i",
+        str(source.resolve()),
+    ]
+    audio_map = command.index("-map", command.index("-map") + 1)
+    assert command[audio_map : audio_map + 6] == [
+        "-map",
+        "2:a:0",
+        "-filter:a",
+        "atrim=end_sample=96096,asetpts=PTS-STARTPTS",
+        "-c:a",
+        "aac",
+    ]
+    assert "-shortest" not in command
+
+
+def test_normalized_arguments_use_frozen_audio_identity_without_rehash(tmp_path):
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"audio")
+    runtime = tmp_path / ".depth-surge-final-v4-a.tmp.mp4"
+    command = [
+        "ffmpeg",
+        "-i",
+        "frames/frame_%06d.png",
+        "-i",
+        str(source.resolve()),
+        str(runtime),
+    ]
+
+    with patch.object(VideoEncoder, "_hash_input") as hash_input:
+        normalized = VideoEncoder._normalize_publication_arguments(
+            command=command,
+            image_inputs={"frames/frame_%06d.png": "frames"},
+            selected_audio=_usable_audio(source.resolve()),
+            runtime_output=runtime,
+            input_stage_fingerprint="b" * 64,
+            final_relative_path="output.mp4",
+        )
+
+    assert normalized[4] == f"@audio:sha256={'a' * 64}:bytes=5:stream=a:0"
+    hash_input.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -1037,3 +1119,261 @@ def test_extract_frames_does_not_reuse_empty_sequence_with_stale_downstream_file
 
     assert run.call_count == 1
     assert result == []
+
+
+def test_schema5_assembled_encode_publishes_bound_video_and_manifests(tmp_path, monkeypatch):
+    from src.depth_surge_3d.core.settings import validate_settings
+    from src.depth_surge_3d.io.operations import save_processing_settings
+    from src.depth_surge_3d.io.settings_artifact import ProcessingSettingsArtifactV5
+    from src.depth_surge_3d.processing.video.final_publication import audit_final_media_v1
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    job = tmp_path / "job"
+    frames = job / "99_vr_frames"
+    frames.mkdir(parents=True)
+    image = np.zeros((4, 8, 3), dtype=np.uint8)
+    assert cv2.imwrite(str(frames / "frame_000001.png"), image)
+    settings = validate_settings(
+        {
+            "preserve_audio": False,
+            "video_encoder": "libx264",
+            "vr_resolution": "custom:4x4",
+            "per_eye_width": 4,
+            "per_eye_height": 4,
+            "vr_output_width": 8,
+            "vr_output_height": 4,
+        },
+        source="explicit",
+    )
+    settings_file = save_processing_settings(
+        job,
+        "job",
+        settings,
+        {
+            "width": 4,
+            "height": 4,
+            "fps": 24.0,
+            "frame_count": 1,
+            "duration": 1.0 / 24.0,
+            "codec": 0,
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+            "sample_aspect_ratio": "1:1",
+        },
+        str(source),
+        transactional_v5=True,
+    )
+
+    launches: list[list[str]] = []
+
+    def fake_bounded_run(self, command, total_frames, progress_tracker=None):
+        launches.append(command)
+        Path(command[-1]).write_bytes(b"validated-mp4")
+        return 0, ()
+
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("schema-5 encoding used unbounded subprocess.run")
+        ),
+    )
+    monkeypatch.setattr(VideoEncoder, "_run_schema5_ffmpeg_with_progress", fake_bounded_run)
+    monkeypatch.setattr(VideoEncoder, "_validate_final_container", lambda *_args: True)
+    monkeypatch.setattr(
+        io,
+        "BytesIO",
+        lambda: (_ for _ in ()).throw(AssertionError("manifest was materialized")),
+    )
+
+    encoder = VideoEncoder(defer_final_reservation_retirement=True)
+    assert encoder.create_video(frames, job, str(source), settings)
+    artifact = ProcessingSettingsArtifactV5.parse(settings_file.read_bytes())
+    expected = artifact.to_object()["output_info"]["expected_final_relative_path"]
+    assert (job / expected).read_bytes() == b"validated-mp4"
+    assert (job / "encoding_input_manifest.json").is_file()
+    assert (job / "final_video_manifest.json").is_file()
+    assert audit_final_media_v1(job, artifact).final_video_authenticated is True
+    assert (job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json").is_file()
+
+    resumed = VideoEncoder(defer_final_reservation_retirement=True)
+    assert resumed.create_video(frames, job, str(source), settings)
+    assert len(launches) == 1
+    resumed.retire_final_encoding_reservation(success=True)
+    assert not (job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json").exists()
+
+
+def test_schema5_direct_encode_uses_provider_and_same_publication_contract(tmp_path, monkeypatch):
+    from src.depth_surge_3d.core.settings import validate_settings
+    from src.depth_surge_3d.io.operations import save_processing_settings
+    from src.depth_surge_3d.io.settings_artifact import ProcessingSettingsArtifactV5
+    from src.depth_surge_3d.processing.video.final_publication import audit_final_media_v1
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    job = tmp_path / "job"
+    left_dir = job / "04_left_frames"
+    right_dir = job / "04_right_frames"
+    left_dir.mkdir(parents=True)
+    right_dir.mkdir(parents=True)
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    left = left_dir / "frame_000001.png"
+    right = right_dir / "frame_000001.png"
+    assert cv2.imwrite(str(left), image)
+    assert cv2.imwrite(str(right), image)
+    settings = validate_settings(
+        {
+            "preserve_audio": False,
+            "direct_vr_encode": True,
+            "video_encoder": "libx264",
+            "vr_resolution": "custom:4x4",
+            "per_eye_width": 4,
+            "per_eye_height": 4,
+            "vr_output_width": 8,
+            "vr_output_height": 4,
+        },
+        source="explicit",
+    )
+    settings_file = save_processing_settings(
+        job,
+        "job",
+        settings,
+        {
+            "width": 4,
+            "height": 4,
+            "fps": 24.0,
+            "frame_count": 1,
+            "duration": 1.0 / 24.0,
+            "codec": 0,
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+            "sample_aspect_ratio": "1:1",
+        },
+        str(source),
+        transactional_v5=True,
+    )
+
+    def fake_progress(self, command, total_frames, progress_tracker):
+        Path(command[-1]).write_bytes(b"validated-direct-mp4")
+        return 0, ()
+
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+        lambda: True,
+    )
+    monkeypatch.setattr(VideoEncoder, "_run_schema5_ffmpeg_with_progress", fake_progress)
+    monkeypatch.setattr(VideoEncoder, "_validate_final_container", lambda *_args: True)
+
+    assert VideoEncoder().create_video_from_stereo_sequences(
+        [left],
+        [right],
+        job,
+        str(source),
+        settings,
+        total_frames=1,
+    )
+    artifact = ProcessingSettingsArtifactV5.parse(settings_file.read_bytes())
+    expected = artifact.to_object()["output_info"]["expected_final_relative_path"]
+    assert (job / expected).read_bytes() == b"validated-direct-mp4"
+    assert audit_final_media_v1(job, artifact).final_video_authenticated is True
+
+
+@pytest.mark.parametrize(
+    ("crash_point", "expected_launches"),
+    [
+        ("after-video", 2),
+        ("after-input-manifest", 2),
+        ("after-final-intent-sync", 1),
+    ],
+)
+def test_schema5_post_boundary_restart_reencodes_without_rewriting_input_manifest(
+    tmp_path, monkeypatch, crash_point, expected_launches
+):
+    from src.depth_surge_3d.core.settings import validate_settings
+    from src.depth_surge_3d.io.operations import save_processing_settings
+    from src.depth_surge_3d.io.settings_artifact import ProcessingSettingsArtifactV5
+    from src.depth_surge_3d.processing.video.final_publication import (
+        FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+        FinalPublicationTransactionV4,
+        audit_final_media_v1,
+    )
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    job = tmp_path / "job"
+    frames = job / "99_vr_frames"
+    frames.mkdir(parents=True)
+    assert cv2.imwrite(str(frames / "frame_000001.png"), np.zeros((4, 8, 3), np.uint8))
+    settings = validate_settings(
+        {
+            "preserve_audio": False,
+            "video_encoder": "libx264",
+            "vr_resolution": "custom:4x4",
+            "per_eye_width": 4,
+            "per_eye_height": 4,
+            "vr_output_width": 8,
+            "vr_output_height": 4,
+        },
+        source="explicit",
+    )
+    settings_file = save_processing_settings(
+        job,
+        "job",
+        settings,
+        {
+            "width": 4,
+            "height": 4,
+            "fps": 24.0,
+            "frame_count": 1,
+            "duration": 1.0 / 24.0,
+            "codec": 0,
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+            "sample_aspect_ratio": "1:1",
+        },
+        str(source),
+        transactional_v5=True,
+    )
+    launches = 0
+
+    def fake_bounded_run(self, command, total_frames, progress_tracker=None):
+        nonlocal launches
+        launches += 1
+        Path(command[-1]).write_bytes(f"validated-{launches}".encode())
+        return 0, ()
+
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+        lambda: True,
+    )
+    monkeypatch.setattr(VideoEncoder, "_run_schema5_ffmpeg_with_progress", fake_bounded_run)
+    monkeypatch.setattr(VideoEncoder, "_validate_final_container", lambda *_args: True)
+    original_publish = FinalPublicationTransactionV4.publish
+
+    def crash_after_input(self):
+        return original_publish(self, crash_at=crash_point)
+
+    monkeypatch.setattr(FinalPublicationTransactionV4, "publish", crash_after_input)
+    assert not VideoEncoder(defer_final_reservation_retirement=True).create_video(
+        frames, job, str(source), settings
+    )
+    committed_input = (
+        (job / "encoding_input_manifest.json").read_bytes()
+        if crash_point != "after-video"
+        else None
+    )
+    assert (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).is_file()
+
+    monkeypatch.setattr(FinalPublicationTransactionV4, "publish", original_publish)
+    assert VideoEncoder().create_video(frames, job, str(source), settings)
+
+    artifact = ProcessingSettingsArtifactV5.parse(settings_file.read_bytes())
+    assert launches == expected_launches
+    if committed_input is not None:
+        assert (job / "encoding_input_manifest.json").read_bytes() == committed_input
+    assert audit_final_media_v1(job, artifact).final_video_authenticated is True
+    assert not (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).exists()

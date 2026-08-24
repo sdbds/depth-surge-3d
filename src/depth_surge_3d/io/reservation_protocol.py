@@ -754,6 +754,7 @@ class ReservedArtifactTransaction:
         generation: str,
         reservation_id: str,
         allocation_counter: AllocationCounter | None = None,
+        expected_publication_method: PublicationMethod | None = None,
         event: Callable[[str], None] | None = None,
     ) -> ReservedArtifactTransaction:
         started = time.monotonic_ns()
@@ -763,11 +764,20 @@ class ReservedArtifactTransaction:
             raise ReservationConflictError("reservation extent has no durable write-ahead index")
         target_path = job_root / target_relative_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        if target_path.exists():
-            publication_method: PublicationMethod = "replace_existing"
+        target_exists = target_path.exists() or target_path.is_symlink()
+        publication_method: PublicationMethod = expected_publication_method or (
+            "replace_existing" if target_exists else "replace_placeholder"
+        )
+        if publication_method == "replace_existing":
+            if not target_exists:
+                raise ReservationConflictError("declared existing reservation target is absent")
+            _identity(target_path)
             placeholder_identity = None
-        else:
-            publication_method = "replace_placeholder"
+        elif publication_method == "replace_placeholder" and target_exists:
+            if target_path.stat(follow_symlinks=False).st_size != 0:
+                raise ReservationConflictError("declared reservation placeholder is nonempty")
+            placeholder_identity = _identity(target_path)
+        elif publication_method == "replace_placeholder":
             try:
                 with target_path.open("xb") as placeholder:
                     placeholder.flush()
@@ -782,15 +792,37 @@ class ReservedArtifactTransaction:
             placeholder_identity = _identity(target_path)
             if event is not None:
                 event("placeholder:created")
+        else:
+            raise ValueError("unknown expected reservation publication method")
         logical = payload_logical_bytes(payload_raw_max, allocation_unit)
         source_name = f".depth-surge-r-{generation}-{reservation_kind}-{reservation_id}.reserved"
         source_path = target_path.parent / source_name
         metrics = ReservationMetrics()
         try:
-            with source_path.open("xb") as handle:
+            if source_path.exists() or source_path.is_symlink():
+                if source_path.is_symlink() or not source_path.is_file():
+                    raise ReservationConflictError("reservation source is unsafe")
+                current_size = source_path.stat().st_size
+                if current_size > logical:
+                    raise ReservationConflictError("reservation source exceeds logical length")
+                with source_path.open("rb", buffering=0) as existing:
+                    while True:
+                        chunk = existing.read(RESERVATION_ZERO_FILL_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        if any(chunk):
+                            raise ReservationConflictError(
+                                "descriptorless reservation source is not all zero"
+                            )
+                open_mode = "r+b"
+            else:
+                current_size = 0
+                open_mode = "x+b"
+            with source_path.open(open_mode) as handle:
+                handle.seek(current_size)
                 if event is not None:
                     event("extent:created")
-                remaining = logical
+                remaining = logical - current_size
                 zero_chunk = b"\x00" * RESERVATION_ZERO_FILL_CHUNK_BYTES
                 while remaining:
                     chunk = zero_chunk[: min(remaining, len(zero_chunk))]
@@ -806,10 +838,17 @@ class ReservedArtifactTransaction:
             if error.errno == errno.ENOSPC or getattr(error, "winerror", None) == 112:
                 raise ReservationIncompleteError("reservation extent fill is incomplete") from error
             raise
-        if (
-            source_path.stat().st_size != logical
-            or classify_payload_frame(source_path.read_bytes(), b"{}") != "zero"
-        ):
+        zero_ready = source_path.stat().st_size == logical
+        if zero_ready:
+            with source_path.open("rb", buffering=0) as handle:
+                while True:
+                    chunk = handle.read(RESERVATION_ZERO_FILL_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    if any(chunk):
+                        zero_ready = False
+                        break
+        if not zero_ready:
             raise ReservationIncompleteError("reservation extent is not a full zero frame")
         evidence = allocation_adapter(source_path, logical)
         if evidence.logical_coverage_byte_count != logical:
@@ -961,6 +1000,127 @@ class ReservedArtifactTransaction:
         if self.allocation_counter(self.source_path) > threshold:
             raise ReservationIncompleteError("short-source allocation release remains unproved")
 
+    def _stream_prefix_and_zero_tail(
+        self,
+        path: Path,
+        *,
+        prefix_byte_count: int,
+        expected_sha256: str,
+        expected_total_byte_count: int,
+    ) -> None:
+        if (
+            type(prefix_byte_count) is not int
+            or prefix_byte_count <= 0
+            or prefix_byte_count > self.descriptor.payload_raw_max
+            or prefix_byte_count > expected_total_byte_count
+            or not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+        ):
+            raise ValueError("streamed reservation identity is invalid")
+        digest = hashlib.sha256()
+        remaining = prefix_byte_count
+        with path.open("rb", buffering=0) as handle:
+            while remaining:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ReservationConflictError("streamed reservation prefix ended early")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            tail_remaining = expected_total_byte_count - prefix_byte_count
+            while tail_remaining:
+                chunk = handle.read(min(1024 * 1024, tail_remaining))
+                if not chunk or any(chunk):
+                    raise ReservationConflictError("streamed reservation tail is not all zero")
+                tail_remaining -= len(chunk)
+            if handle.read(1):
+                raise ReservationConflictError("streamed reservation has trailing bytes")
+        if digest.hexdigest() != expected_sha256:
+            raise ReservationConflictError("streamed reservation prefix hash differs")
+
+    def validate_streamed_physical_phase(
+        self,
+        *,
+        prefix_byte_count: int,
+        prefix_sha256: str,
+    ) -> str:
+        """Validate a large canonical prefix without materializing it in memory."""
+
+        source_exists = self.source_path.exists()
+        target_exists = self.target_path.exists()
+        if source_exists:
+            if _identity(self.source_path) != self.descriptor.filesystem_identity:
+                raise ReservationConflictError("reservation source identity changed")
+            self._validate_placeholder()
+            size = self.source_path.stat().st_size
+            if size == self.descriptor.logical_byte_count:
+                evidence = self.allocation_adapter(self.source_path, size)
+                if evidence != self.descriptor.allocation_evidence_at_readiness:
+                    raise ReservationEvidenceConflictError("full-source readiness evidence changed")
+                self._stream_prefix_and_zero_tail(
+                    self.source_path,
+                    prefix_byte_count=prefix_byte_count,
+                    expected_sha256=prefix_sha256,
+                    expected_total_byte_count=size,
+                )
+                return "full-source"
+            if size == prefix_byte_count:
+                self._stream_prefix_and_zero_tail(
+                    self.source_path,
+                    prefix_byte_count=prefix_byte_count,
+                    expected_sha256=prefix_sha256,
+                    expected_total_byte_count=size,
+                )
+                return "short-source"
+            raise ReservationConflictError("streamed reservation source length is invalid")
+        if target_exists:
+            if (
+                _identity(self.target_path) != self.descriptor.filesystem_identity
+                or self.target_path.stat().st_size != prefix_byte_count
+            ):
+                raise ReservationConflictError("streamed reservation target identity differs")
+            self._stream_prefix_and_zero_tail(
+                self.target_path,
+                prefix_byte_count=prefix_byte_count,
+                expected_sha256=prefix_sha256,
+                expected_total_byte_count=prefix_byte_count,
+            )
+            return "committed-target"
+        raise ReservationConflictError("streamed extent exists at neither authorized location")
+
+    def _short_release_recovery_streamed(
+        self,
+        *,
+        prefix_byte_count: int,
+        prefix_sha256: str,
+    ) -> None:
+        if (
+            self.validate_streamed_physical_phase(
+                prefix_byte_count=prefix_byte_count,
+                prefix_sha256=prefix_sha256,
+            )
+            != "short-source"
+        ):
+            raise ReservationConflictError("streamed release recovery requires short source")
+        with self.source_path.open("r+b") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        threshold = (
+            self.descriptor.allocation_evidence_at_readiness.allocated_byte_count
+            - self.descriptor.allocation_unit
+        )
+        if self.allocation_counter(self.source_path) <= threshold:
+            return
+        with self.source_path.open("r+b") as handle:
+            handle.truncate(prefix_byte_count)
+            handle.flush()
+            os.fsync(handle.fileno())
+        self.validate_streamed_physical_phase(
+            prefix_byte_count=prefix_byte_count,
+            prefix_sha256=prefix_sha256,
+        )
+        if self.allocation_counter(self.source_path) > threshold:
+            raise ReservationIncompleteError("streamed short-source release remains unproved")
+
     def _rename_and_sync(self) -> None:
         self._validate_placeholder()
         os.replace(self.source_path, self.target_path)
@@ -1009,6 +1169,76 @@ class ReservedArtifactTransaction:
             self._retire_descriptor()
             return phase
         raise ReservationConflictError(f"unsupported reservation recovery phase: {phase}")
+
+    def consume_streamed_prefix(
+        self,
+        *,
+        prefix_byte_count: int,
+        prefix_sha256: str,
+        crash_at: str | None = None,
+    ) -> str:
+        phase = self.validate_streamed_physical_phase(
+            prefix_byte_count=prefix_byte_count,
+            prefix_sha256=prefix_sha256,
+        )
+        if phase != "full-source":
+            raise ReservationConflictError("streamed consumption requires complete-full source")
+        with self.source_path.open("r+b") as handle:
+            handle.truncate(prefix_byte_count)
+        if crash_at == "after-truncate":
+            raise InjectedReservationCrash(crash_at)
+        with self.source_path.open("r+b") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        if crash_at == "after-truncate-sync":
+            raise InjectedReservationCrash(crash_at)
+        self._short_release_recovery_streamed(
+            prefix_byte_count=prefix_byte_count,
+            prefix_sha256=prefix_sha256,
+        )
+        self._rename_and_sync()
+        if crash_at == "after-rename-parent-sync":
+            raise InjectedReservationCrash(crash_at)
+        if (
+            self.validate_streamed_physical_phase(
+                prefix_byte_count=prefix_byte_count,
+                prefix_sha256=prefix_sha256,
+            )
+            != "committed-target"
+        ):
+            raise ReservationConflictError("streamed target commit validation failed")
+        self._retire_descriptor()
+        return "committed-target"
+
+    def recover_streamed_prefix(
+        self,
+        *,
+        prefix_byte_count: int,
+        prefix_sha256: str,
+    ) -> str:
+        phase = self.validate_streamed_physical_phase(
+            prefix_byte_count=prefix_byte_count,
+            prefix_sha256=prefix_sha256,
+        )
+        if phase == "full-source":
+            with self.source_path.open("r+b") as handle:
+                handle.truncate(prefix_byte_count)
+            phase = "short-source"
+        if phase == "short-source":
+            self._short_release_recovery_streamed(
+                prefix_byte_count=prefix_byte_count,
+                prefix_sha256=prefix_sha256,
+            )
+            self._rename_and_sync()
+            phase = "committed-target"
+        if phase == "committed-target":
+            self.validate_streamed_physical_phase(
+                prefix_byte_count=prefix_byte_count,
+                prefix_sha256=prefix_sha256,
+            )
+            self._retire_descriptor()
+            return phase
+        raise ReservationConflictError(f"unsupported streamed recovery phase: {phase}")
 
 
 def classify_fiemap_batch(

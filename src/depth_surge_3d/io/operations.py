@@ -757,11 +757,23 @@ def recover_processing_settings_artifact(
     settings_file = Path(settings_file)
     if settings_file.name != SETTINGS_ARTIFACT_RELATIVE_PATH.name:
         raise ValueError("schema-5 recovery requires processing-settings-v5.json")
-    return recover_settings_job_v1(
+    artifact = recover_settings_job_v1(
         settings_file.parent,
         allocation_adapter=platform_allocation_adapter,
         allocation_counter=platform_allocation_counter,
     )
+    if artifact.status in {"completed", "failed"}:
+        from ..processing.video.final_publication import (
+            recover_final_encoding_terminal_retirement_v1,
+        )
+
+        recover_final_encoding_terminal_retirement_v1(
+            settings_file.parent,
+            artifact,
+            allocation_adapter=platform_allocation_adapter,
+            allocation_counter=platform_allocation_counter,
+        )
+    return artifact
 
 
 def _update_processing_status_v5(

@@ -94,6 +94,19 @@ class ProcessingOrchestrator:
         self._settings_file: Path | None = None  # Track settings file for error handling
         self._start_time: float = 0.0  # Track processing start time
         self._metric_clamp_summary: dict[str, Any] | None = None
+        if hasattr(self.video_encoder, "defer_final_reservation_retirement"):
+            self.video_encoder.defer_final_reservation_retirement = True
+
+    def _retire_final_encoding_reservation(self, *, success: bool) -> bool:
+        retire = getattr(self.video_encoder, "retire_final_encoding_reservation", None)
+        if not callable(retire):
+            return True
+        try:
+            retire(success=success)
+            return True
+        except Exception as error:
+            print(f"Error: Could not retire final encoding reservation: {error}")
+            return False
 
     def process(
         self,
@@ -159,7 +172,11 @@ class ProcessingOrchestrator:
         except Exception as e:
             print(f"Error in video processing: {e}")
             if self._settings_file:
-                update_processing_status(self._settings_file, "failed", {"error": str(e)})
+                terminal = update_processing_status(
+                    self._settings_file, "failed", {"error": str(e)}
+                )
+                if terminal:
+                    self._retire_final_encoding_reservation(success=False)
             return False
         finally:
             try:
@@ -575,6 +592,8 @@ class ProcessingOrchestrator:
                 ):
                     print("Error: Could not commit terminal processing settings")
                     return False
+                if not self._retire_final_encoding_reservation(success=True):
+                    return False
 
             completion_banner(
                 output_file=output_file_path,
@@ -584,9 +603,12 @@ class ProcessingOrchestrator:
             )
             return True
         elif self._settings_file:
-            return update_processing_status(
+            terminal = update_processing_status(
                 self._settings_file, "failed", {"error": "Video creation failed"}
             )
+            if terminal and not self._retire_final_encoding_reservation(success=False):
+                return False
+            return terminal
         return not success
 
     def _expected_output_filename(

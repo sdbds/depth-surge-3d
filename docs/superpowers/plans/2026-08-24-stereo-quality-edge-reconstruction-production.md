@@ -392,27 +392,27 @@ feat: add recoverable settings artifact v5
 - Produces: `EncodingSequenceProvider`, canonical encoding-input manifest, strict FFprobe parsers, and scalar image2/concat argv construction.
 - Produces: sibling-video validation and publication order `video -> input manifest -> final manifest` with actual V/I/P audit classification.
 
-- [ ] **Step 1: Add RED provider/FFprobe/progress tests**
+- [x] **Step 1: Add RED provider/FFprobe/progress tests**
 
 Cover N=1 and `4_194_304`, signed image2 endpoints, generation replay, provider mutation, FFmpeg 5/6/7 JSON wrappers, duplicate authoritative keys, bounded output, and progress monotonicity.
 
-- [ ] **Step 2: Add RED publication/reencode crash tests**
+- [x] **Step 2: Add RED publication/reencode crash tests**
 
 Inject at final replacement, input-manifest replacement, final-manifest replacement, post-boundary reencode, and descriptor retirement. Assert the approved irreversible boundary keeps actual evidence and never promises restoration of the old triplet.
 
-- [ ] **Step 3: Run focused tests and confirm old list-based encoder fails**
+- [x] **Step 3: Run focused tests and confirm old list-based encoder fails**
 
 Run: `python -m pytest tests/unit/test_encoding_provider.py tests/unit/test_final_publication.py tests/unit/test_video_encoder.py -q`
 
-- [ ] **Step 4: Promote provider and integrate reservations**
+- [x] **Step 4: Promote provider and integrate reservations**
 
 Audit once, launch only after producer-marker/settings commit, revalidate the same generation after FFmpeg, validate sibling media, then publish each artifact using its reserved extent and index-last retirement.
 
-- [ ] **Step 5: Run encoding, reservation, and direct-VR integration tests**
+- [x] **Step 5: Run encoding, reservation, and direct-VR integration tests**
 
 Run: `python -m pytest tests/unit/test_encoding_provider.py tests/unit/test_final_publication.py tests/unit/test_video_encoder.py tests/integration/test_direct_vr_ffmpeg_encoding.py -q`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```text
 feat: stream and recover final publication v4

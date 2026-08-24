@@ -38,6 +38,7 @@ class TestProcessingOrchestratorInit:
         assert orchestrator.upscaler == upscaler
         assert orchestrator.vr_assembler == vr_assembler
         assert orchestrator.video_encoder == video_encoder
+        assert video_encoder.defer_final_reservation_retirement is True
         assert orchestrator.verbose is False
         assert orchestrator._start_time == 0.0
         assert not hasattr(orchestrator, "_total_steps")
@@ -235,7 +236,8 @@ class TestFinalizeProcessing:
         mock_time.return_value = 1500.0  # Current time when finalize is called
         mock_gen_filename.return_value = "video_3D_side_by_side.mp4"
 
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        video_encoder = Mock()
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), video_encoder)
         orchestrator._start_time = 1000.0  # Started 500 seconds ago
         orchestrator._settings_file = Path("/output/settings.json")
 
@@ -259,13 +261,15 @@ class TestFinalizeProcessing:
 
         # Check status was updated
         mock_update_status.assert_called_once()
+        video_encoder.retire_final_encoding_reservation.assert_called_once_with(success=True)
 
     @patch(
         "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.update_processing_status"
     )
     def test_finalize_processing_failure(self, mock_update_status):
         """Test finalize processing on failure."""
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        video_encoder = Mock()
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), video_encoder)
         orchestrator._settings_file = Path("/output/settings.json")
 
         settings = {"vr_format": "side_by_side", "vr_resolution": "16x9-1080p"}
@@ -281,6 +285,7 @@ class TestFinalizeProcessing:
         mock_update_status.assert_called_once_with(
             Path("/output/settings.json"), "failed", {"error": "Video creation failed"}
         )
+        video_encoder.retire_final_encoding_reservation.assert_called_once_with(success=False)
 
     @patch(
         "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.cleanup_intermediate_files"

@@ -10,16 +10,23 @@ from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from fractions import Fraction
+import hashlib
+import os
 import re
+import secrets
 import subprocess
 from pathlib import Path
-from typing import Any
+from pathlib import PurePosixPath
+from typing import Any, Literal, cast
 
 from ...io.operations import (
+    commit_final_media_producer_marker,
     get_frame_files,
     get_video_info_ffprobe,
     verify_ffmpeg_installation,
 )
+from ...io.reservation_protocol import SETTINGS_ARTIFACT_RELATIVE_PATH
+from ...io.settings_artifact import ProcessingSettingsArtifactV5
 from ...utils.path_utils import (
     calculate_frame_range,
     generate_output_filename,
@@ -36,6 +43,28 @@ from ..frames.source_frame_manifest import (
 )
 from ...core.file_identity import file_sample_fingerprint
 from ...utils.imaging.png_header import PngHeader, read_png_header
+from .encoding_provider import (
+    FINAL_DECODE_DIAGNOSTIC_BYTES,
+    FINAL_ENCODING_LINE_BYTES,
+    EncodingSequenceProvider,
+    FfmpegProgressParser,
+    FinalContainerExpectation,
+    StagedEncodingInputManifest,
+    audit_encoding_input_manifest,
+    stage_encoding_input_manifest,
+    validate_encoding_postpass,
+)
+from .final_publication import (
+    EncodingInputPublicationSource,
+    FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+    FinalPublicationTransactionV4,
+    PreparedFinalEncodingReservationV1,
+    prepare_final_encoding_reservation_v1,
+    load_final_encoding_reservation_v1,
+)
+from .bounded_process import run_ffmpeg_progress_v1
+from .final_container_validation import validate_final_container_v4
+from .final_audio import SelectedAudioIdentityV1, prepare_selected_audio_v1
 
 
 _DIRECT_FRAME_NAME = re.compile(r"^frame_(\d{6,})\.png$")
@@ -55,6 +84,18 @@ class _DirectStereoSequence:
     right_header: PngHeader
 
 
+@dataclass(frozen=True)
+class _Schema5EncodingContext:
+    settings: ProcessingSettingsArtifactV5
+    provider: EncodingSequenceProvider
+    staged_manifest: StagedEncodingInputManifest | None
+    manifest_source: EncodingInputPublicationSource | None
+    expected_relative_path: str
+    sibling_path: Path
+    reservation: PreparedFinalEncodingReservationV1
+    already_authenticated: bool = False
+
+
 class VideoEncoder:
     """
     Handles video encoding using FFmpeg.
@@ -66,7 +107,12 @@ class VideoEncoder:
     - Audio integration
     """
 
-    def __init__(self, verbose: bool = False):
+    def __init__(
+        self,
+        verbose: bool = False,
+        *,
+        defer_final_reservation_retirement: bool = False,
+    ):
         """
         Initialize video encoder.
 
@@ -74,8 +120,20 @@ class VideoEncoder:
             verbose: Enable verbose output
         """
         self.verbose = verbose
+        self.defer_final_reservation_retirement = defer_final_reservation_retirement
+        self._pending_final_reservation: PreparedFinalEncodingReservationV1 | None = None
 
-    def create_video(
+    def retire_final_encoding_reservation(self, *, success: bool) -> None:
+        reservation = self._pending_final_reservation
+        if reservation is None:
+            return
+        if success:
+            reservation.retire()
+        else:
+            reservation.retire_terminal_failure()
+        self._pending_final_reservation = None
+
+    def create_video(  # noqa: C901
         self,
         vr_frames_dir: Path,
         output_dir: Path,
@@ -102,52 +160,472 @@ class VideoEncoder:
             print("Error: FFmpeg not found. Cannot create output video.")
             return False
 
-        # Generate output filename
-        output_filename = generate_output_filename(
-            Path(original_video).name, settings["vr_format"], settings["vr_resolution"]
+        schema5_context = self._prepare_schema5_assembled_context(
+            vr_frames_dir=vr_frames_dir,
+            output_dir=output_dir,
+            settings=settings,
         )
-        output_path = output_dir / output_filename
+        if schema5_context is not None and schema5_context.already_authenticated:
+            if self.defer_final_reservation_retirement:
+                self._pending_final_reservation = schema5_context.reservation
+            else:
+                schema5_context.reservation.retire()
+            return True
+        if schema5_context is None:
+            output_filename = generate_output_filename(
+                Path(original_video).name,
+                settings["vr_format"],
+                settings["vr_resolution"],
+            )
+            output_path = output_dir / output_filename
+        else:
+            output_path = schema5_context.sibling_path
 
         # Build base FFmpeg command
         base_fps = self._resolve_output_fps(original_video, settings)
 
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-framerate",
-            str(base_fps),
-            "-i",
-            str(vr_frames_dir / "frame_%06d.png"),
-        ]
+        cmd = ["ffmpeg", "-y"]
+        if schema5_context is not None:
+            cmd.extend(["-v", "error", "-xerror", "-nostats", "-progress", "pipe:1"])
+        cmd.extend(
+            [
+                "-framerate",
+                str(base_fps),
+                "-i",
+                str(vr_frames_dir / "frame_%06d.png"),
+            ]
+        )
 
-        # Add audio if preserving - use pre-extracted FLAC file
-        if settings.get("preserve_audio", True):
+        selected_audio: SelectedAudioIdentityV1 | None = None
+        # Legacy jobs retain their historical optional-map behavior. Schema 5
+        # freezes an exact audio identity before constructing the command.
+        audio_source: str | Path | None = None
+        if schema5_context is not None:
+            selected_audio = prepare_selected_audio_v1(
+                output_dir=output_dir,
+                original_video=original_video,
+                settings=settings,
+                frame_count=schema5_context.provider.frame_count,
+                fps=str(base_fps),
+            )
+            cmd.extend(selected_audio.input_arguments())
+            cmd.extend(["-map", "0:v:0"])
+            cmd.extend(selected_audio.output_arguments(1))
+            cmd.extend(["-frames:v", str(schema5_context.provider.frame_count)])
+        elif settings.get("preserve_audio", True):
             audio_file = output_dir / "original_audio.flac"
             print(f"Looking for pre-extracted audio at: {audio_file}")
             if audio_file.exists():
                 print(f"Using pre-extracted audio: {audio_file}")
-                audio_source: str | Path = audio_file
+                audio_source = audio_file
             else:
                 print(f"Warning: Pre-extracted audio not found at {audio_file}")
                 print(f"Extracting audio from original video: {original_video}")
                 audio_source = original_video
+            assert audio_source is not None
             cmd.extend(self._build_audio_input_args(audio_source, settings))
             cmd.extend(["-c:a", "aac", "-shortest"])
 
         # Add video encoding settings
         encoder = settings.get("video_encoder", "auto")
         encoder_args, _ = self._build_encoder_cmd(encoder, output_path)
+        resolved_encoder = encoder_args[encoder_args.index("-c:v") + 1]
         cmd.extend(encoder_args)
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"FFmpeg error: {result.stderr}")
-                return False
+            if schema5_context is not None:
+                returncode, diagnostics = self._run_schema5_ffmpeg_with_progress(
+                    cmd,
+                    schema5_context.provider.frame_count,
+                )
+                if returncode != 0:
+                    self._print_direct_ffmpeg_failure(returncode, diagnostics)
+                    return False
+            else:
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"FFmpeg error: {result.stderr}")
+                    return False
+            if schema5_context is not None:
+                assert schema5_context.staged_manifest is not None
+                assert schema5_context.manifest_source is not None
+                validate_encoding_postpass(
+                    schema5_context.provider,
+                    job_root=output_dir,
+                    staged=schema5_context.staged_manifest,
+                    per_eye_size=self._per_eye_size(settings),
+                    vr_format=settings["vr_format"],
+                )
+                assert selected_audio is not None
+                selected_audio.revalidate()
+                normalized = self._normalize_publication_arguments(
+                    command=cmd,
+                    image_inputs={
+                        str(vr_frames_dir / "frame_%06d.png"): "frames",
+                    },
+                    selected_audio=selected_audio,
+                    runtime_output=output_path,
+                    input_stage_fingerprint=(schema5_context.staged_manifest.fingerprint),
+                    final_relative_path=schema5_context.expected_relative_path,
+                )
+                FinalPublicationTransactionV4(
+                    job_root=output_dir,
+                    settings=schema5_context.settings,
+                    sibling_relative_path=output_path.name,
+                    encoding_input_source=schema5_context.manifest_source,
+                    input_stage_fingerprint=(schema5_context.staged_manifest.fingerprint),
+                    resolved_encoding_arguments=normalized,
+                    container_validator=lambda path: self._validate_final_container(
+                        path,
+                        settings,
+                        schema5_context.provider.frame_count,
+                        str(base_fps),
+                        resolved_encoder,
+                        selected_audio.audio_end_sample,
+                    ),
+                    reservation=schema5_context.reservation,
+                    retire_reservation=not self.defer_final_reservation_retirement,
+                ).publish()
+                if self.defer_final_reservation_retirement:
+                    self._pending_final_reservation = schema5_context.reservation
             return True
         except Exception as e:
             print(f"Error creating output video: {e}")
             return False
+        finally:
+            if schema5_context is not None:
+                try:
+                    schema5_context.sibling_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _per_eye_size(settings: dict[str, Any]) -> tuple[int, int]:
+        try:
+            width = int(settings["per_eye_width"])
+            height = int(settings["per_eye_height"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("schema-5 encoding requires per-eye dimensions") from error
+        if width <= 0 or height <= 0:
+            raise ValueError("schema-5 per-eye dimensions must be positive")
+        return width, height
+
+    def _prepare_schema5_assembled_context(
+        self,
+        *,
+        vr_frames_dir: Path,
+        output_dir: Path,
+        settings: dict[str, Any],
+    ) -> _Schema5EncodingContext | None:
+        settings_path = output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH
+        if not settings_path.is_file():
+            return None
+        artifact = ProcessingSettingsArtifactV5.parse(settings_path.read_bytes())
+        frame_count = 0
+        first_index: int | None = None
+        last_index: int | None = None
+        for path in vr_frames_dir.iterdir():
+            match = _DIRECT_FRAME_NAME.fullmatch(path.name)
+            if match is not None and path.is_file() and not path.is_symlink():
+                index = int(match.group(1))
+                if path.name != f"frame_{index:06d}.png":
+                    raise ValueError("assembled frame padding is noncanonical")
+                frame_count += 1
+                first_index = index if first_index is None else min(first_index, index)
+                last_index = index if last_index is None else max(last_index, index)
+        if frame_count == 0 or first_index is None or last_index is None:
+            raise ValueError("assembled schema-5 encoding has no frames")
+        if frame_count != last_index - first_index + 1:
+            raise ValueError("assembled schema-5 frame sequence is not contiguous")
+        root = output_dir.resolve()
+        parent = vr_frames_dir.resolve().relative_to(root)
+        provider = EncodingSequenceProvider.freeze(
+            mode="assembled_vr",
+            frame_count=frame_count,
+            first_index=first_index,
+            frames_parent=PurePosixPath(parent.as_posix()),
+        )
+        return self._prepare_schema5_publication_context(
+            provider=provider,
+            output_dir=output_dir,
+            artifact=artifact,
+            settings_path=settings_path,
+            settings=settings,
+        )
+
+    def _prepare_schema5_direct_context(
+        self,
+        *,
+        sequence: _DirectStereoSequence,
+        output_dir: Path,
+        settings: dict[str, Any],
+    ) -> _Schema5EncodingContext | None:
+        settings_path = output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH
+        if not settings_path.is_file():
+            return None
+        artifact = ProcessingSettingsArtifactV5.parse(settings_path.read_bytes())
+        root = output_dir.resolve()
+        left_parent = sequence.left_pattern.parent.resolve().relative_to(root)
+        right_parent = sequence.right_pattern.parent.resolve().relative_to(root)
+        provider = EncodingSequenceProvider.freeze(
+            mode="direct_stereo",
+            frame_count=sequence.frame_count,
+            first_index=sequence.start_number,
+            left_parent=PurePosixPath(left_parent.as_posix()),
+            right_parent=PurePosixPath(right_parent.as_posix()),
+        )
+        return self._prepare_schema5_publication_context(
+            provider=provider,
+            output_dir=output_dir,
+            artifact=artifact,
+            settings_path=settings_path,
+            settings=settings,
+        )
+
+    def _prepare_schema5_publication_context(
+        self,
+        *,
+        provider: EncodingSequenceProvider,
+        output_dir: Path,
+        artifact: ProcessingSettingsArtifactV5,
+        settings_path: Path,
+        settings: dict[str, Any],
+    ) -> _Schema5EncodingContext:
+        metadata = artifact.to_object()["metadata"]
+        publication_generation = metadata["final_media_publication_generation"]
+        active_index = output_dir / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+        if active_index.is_file():
+            reservation = load_final_encoding_reservation_v1(output_dir, artifact)
+            recovery = reservation.observe()
+            if recovery.phase == "video_replaced_input_intent":
+                reservation.recover_input_manifest_intent()
+                recovery = reservation.observe()
+            if recovery.phase == "final_manifest_intent":
+                reservation.recover_final_manifest_intent()
+                recovery = reservation.observe()
+            if recovery.phase == "publication_authenticated":
+                assert publication_generation is not None
+                return _Schema5EncodingContext(
+                    settings=artifact,
+                    provider=provider,
+                    staged_manifest=None,
+                    manifest_source=None,
+                    expected_relative_path=artifact.to_object()["output_info"][
+                        "expected_final_relative_path"
+                    ],
+                    sibling_path=reservation.sibling_path,
+                    reservation=reservation,
+                    already_authenticated=True,
+                )
+            if recovery.phase not in {
+                "ready_pre_video",
+                "input_manifest_committed_no_final_intent",
+                "post_boundary_retry_sibling_present",
+            }:
+                raise ValueError(f"unsupported final encoding recovery phase: {recovery.phase}")
+            if reservation.sibling_path.exists() or reservation.sibling_path.is_symlink():
+                if not reservation.sibling_path.is_file() or reservation.sibling_path.is_symlink():
+                    raise ValueError("indexed retry sibling is unsafe")
+                reservation.sibling_path.unlink()
+            reservation.reset_incomplete_manifest_sources()
+            manifest_source = reservation.input_publication_source()
+            if manifest_source is None:
+                staged, manifest_source = self._stage_encoding_manifest_file(
+                    provider=provider,
+                    output_dir=output_dir,
+                    settings=settings,
+                    reservation=reservation,
+                )
+            else:
+                staged = audit_encoding_input_manifest(
+                    provider,
+                    job_root=output_dir,
+                    expected_fingerprint=manifest_source.fingerprint,
+                    expected_raw_sha256=manifest_source.raw_sha256,
+                    expected_raw_byte_count=manifest_source.raw_byte_count,
+                    per_eye_size=self._per_eye_size(settings),
+                    vr_format=settings["vr_format"],
+                )
+            publication_generation = reservation.index.publication_generation
+        else:
+            if publication_generation is None:
+                publication_generation = secrets.token_hex(16)
+            reservation = prepare_final_encoding_reservation_v1(
+                job_root=output_dir,
+                settings=artifact,
+                publication_generation=publication_generation,
+                input_manifest_raw_max=self._encoding_manifest_raw_bound(provider),
+                final_manifest_raw_max=1024 * 1024,
+            )
+            staged, manifest_source = self._stage_encoding_manifest_file(
+                provider=provider,
+                output_dir=output_dir,
+                settings=settings,
+                reservation=reservation,
+            )
+        artifact = commit_final_media_producer_marker(
+            settings_path,
+            generation=publication_generation,
+        )
+        return _Schema5EncodingContext(
+            settings=artifact,
+            provider=provider,
+            staged_manifest=staged,
+            manifest_source=manifest_source,
+            expected_relative_path=artifact.to_object()["output_info"][
+                "expected_final_relative_path"
+            ],
+            sibling_path=reservation.sibling_path,
+            reservation=reservation,
+        )
+
+    @staticmethod
+    def _encoding_manifest_raw_bound(provider: EncodingSequenceProvider) -> int:
+        parents = tuple(
+            parent
+            for parent in (
+                provider.frames_parent,
+                provider.left_parent,
+                provider.right_parent,
+            )
+            if parent is not None
+        )
+        view_count = 1 if provider.mode == "assembled_vr" else 2
+        maximum_parent_scalars = max(len(parent.as_posix()) for parent in parents)
+        maximum_index_digits = len(str(provider.last_index))
+        maximum_path_scalars = maximum_parent_scalars + maximum_index_digits + 18
+        per_frame_bound = 96 + view_count * (6 * maximum_path_scalars + 512)
+        raw_bound = 4096 + provider.frame_count * per_frame_bound
+        if raw_bound > 512 * 1024 * 1024:
+            raise ValueError("encoding input manifest exceeds its 512 MiB raw bound")
+        return raw_bound
+
+    def _stage_encoding_manifest_file(
+        self,
+        *,
+        provider: EncodingSequenceProvider,
+        output_dir: Path,
+        settings: dict[str, Any],
+        reservation: PreparedFinalEncodingReservationV1,
+    ) -> tuple[StagedEncodingInputManifest, EncodingInputPublicationSource]:
+        transaction = reservation.input_manifest_transaction
+        if transaction is None:
+            raise ValueError("encoding input reservation is already consumed")
+        path = transaction.source_path
+        try:
+            with path.open("r+b", buffering=0) as sink:
+                sink.seek(0)
+                staged = stage_encoding_input_manifest(
+                    provider,
+                    job_root=output_dir,
+                    sink=sink,
+                    per_eye_size=self._per_eye_size(settings),
+                    vr_format=settings["vr_format"],
+                )
+                if staged.raw_byte_count > transaction.descriptor.payload_raw_max:
+                    raise ValueError("encoding manifest exceeded its reserved raw bound")
+                sink.flush()
+                os.fsync(sink.fileno())
+            source = EncodingInputPublicationSource(
+                path=path,
+                fingerprint=staged.fingerprint,
+                raw_sha256=staged.raw_sha256,
+                raw_byte_count=staged.raw_byte_count,
+                logical_byte_count=transaction.descriptor.logical_byte_count,
+            ).validated()
+            transaction.validate_streamed_physical_phase(
+                prefix_byte_count=staged.raw_byte_count,
+                prefix_sha256=staged.raw_sha256,
+            )
+            return staged, source
+        except BaseException:
+            raise
+
+    @staticmethod
+    def _selected_audio_source(
+        output_dir: Path,
+        original_video: str,
+        settings: dict[str, Any],
+    ) -> str | Path | None:
+        if not settings.get("preserve_audio", True):
+            return None
+        audio_file = output_dir / "original_audio.flac"
+        return audio_file if audio_file.exists() else original_video
+
+    @staticmethod
+    def _hash_input(path: Path) -> tuple[str, int]:
+        digest = hashlib.sha256()
+        count = 0
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                count += len(chunk)
+        return digest.hexdigest(), count
+
+    @classmethod
+    def _normalize_publication_arguments(
+        cls,
+        *,
+        command: list[str],
+        image_inputs: dict[str, str],
+        selected_audio: SelectedAudioIdentityV1,
+        runtime_output: Path,
+        input_stage_fingerprint: str,
+        final_relative_path: str,
+    ) -> tuple[str, ...]:
+        normalized: list[str] = []
+        audio_token = selected_audio.normalized_input_token()
+        audio_text = str(selected_audio.selected_source_path) if selected_audio.usable else None
+        for index, argument in enumerate(command):
+            text = str(argument)
+            if index > 0 and command[index - 1] == "-i":
+                view = image_inputs.get(text)
+                if view is not None:
+                    text = "@image-sequence:sha256=" f"{input_stage_fingerprint}:view={view}"
+                elif audio_text is not None and text == audio_text:
+                    assert audio_token is not None
+                    text = audio_token
+                else:
+                    raise ValueError("runtime argv contains an unbound input path")
+            if index == len(command) - 1:
+                if text != str(runtime_output):
+                    raise ValueError("runtime argv final output path changed")
+                text = "@output:path64=" + FinalPublicationTransactionV4.path64(final_relative_path)
+            normalized.append(text)
+        return tuple(normalized)
+
+    @staticmethod
+    def _validate_final_container(
+        path: Path,
+        settings: dict[str, Any],
+        frame_count: int,
+        fps: str,
+        resolved_encoder: str,
+        audio_end_sample: int | None,
+    ) -> bool:
+        width = int(settings["vr_output_width"])
+        height = int(settings["vr_output_height"])
+        rate = Fraction(fps)
+        canonical_fps = f"{rate.numerator}/{rate.denominator}"
+        if audio_end_sample is not None:
+            packet_bound = (audio_end_sample + 1023) // 1024 + 2
+        else:
+            packet_bound = 0
+        expectation = FinalContainerExpectation(
+            width=width,
+            height=height,
+            fps=canonical_fps,
+            frame_count=frame_count,
+            resolved_encoder=cast(
+                Literal["libx264", "libx265", "hevc_nvenc"], resolved_encoder
+            ),
+            audio_expected=audio_end_sample is not None,
+            audio_packet_upper_bound=packet_bound,
+        )
+        return validate_final_container_v4(path, expectation)
 
     @staticmethod
     def _build_audio_input_args(
@@ -265,12 +743,14 @@ class VideoEncoder:
             right_header=right_header,
         )
 
-    def _build_direct_stereo_command(
+    def _build_direct_stereo_command(  # noqa: C901
         self,
         sequence: _DirectStereoSequence,
         temporary_output: Path,
         original_video: str,
         settings: dict[str, Any],
+        *,
+        selected_audio: SelectedAudioIdentityV1 | None = None,
     ) -> list[str]:
         """Build an FFmpeg command that stacks validated left and right image2 inputs."""
 
@@ -294,28 +774,32 @@ class VideoEncoder:
 
         fps = self._resolve_output_fps(original_video, settings)
         start_number = str(sequence.start_number)
-        command = [
-            "ffmpeg",
-            "-y",
-            "-loglevel",
-            "error",
-            "-nostats",
-            "-framerate",
-            fps,
-            "-start_number",
-            start_number,
-            "-i",
-            str(sequence.left_pattern),
-            "-framerate",
-            fps,
-            "-start_number",
-            start_number,
-            "-i",
-            str(sequence.right_pattern),
-        ]
+        command = ["ffmpeg", "-y"]
+        if selected_audio is not None:
+            command.extend(["-v", "error", "-xerror", "-nostats"])
+        else:
+            command.extend(["-loglevel", "error", "-nostats"])
+        command.extend(
+            [
+                "-framerate",
+                fps,
+                "-start_number",
+                start_number,
+                "-i",
+                str(sequence.left_pattern),
+                "-framerate",
+                fps,
+                "-start_number",
+                start_number,
+                "-i",
+                str(sequence.right_pattern),
+            ]
+        )
 
         preserve_audio = settings.get("preserve_audio", True)
-        if preserve_audio:
+        if selected_audio is not None:
+            command.extend(selected_audio.input_arguments())
+        elif preserve_audio:
             audio_file = temporary_output.parent / "original_audio.flac"
             audio_source: str | Path = audio_file if audio_file.exists() else original_video
             command.extend(self._build_audio_input_args(audio_source, settings))
@@ -338,7 +822,9 @@ class VideoEncoder:
             )
 
         command.extend(["-filter_complex", filter_graph, "-map", "[vr]"])
-        if preserve_audio:
+        if selected_audio is not None:
+            command.extend(selected_audio.output_arguments(2))
+        elif preserve_audio:
             command.extend(["-map", "2:a:0?", "-c:a", "aac", "-shortest"])
         command.extend(["-frames:v", str(sequence.frame_count), "-progress", "pipe:1"])
         encoder_args, _ = self._build_encoder_cmd(
@@ -387,6 +873,36 @@ class VideoEncoder:
                 )
             self._print_direct_ffmpeg_diagnostics(tuple(diagnostics))
             raise
+
+    def _run_schema5_ffmpeg_with_progress(
+        self,
+        command: list[str],
+        total_frames: int,
+        progress_tracker=None,
+    ) -> tuple[int, tuple[str, ...]]:
+        """Run final encoding with bounded binary progress and diagnostic pipes."""
+
+        parser = FfmpegProgressParser()
+        result = run_ffmpeg_progress_v1(
+            command,
+            parser=parser,
+            diagnostic_cap=FINAL_DECODE_DIAGNOSTIC_BYTES,
+            line_cap=FINAL_ENCODING_LINE_BYTES,
+            stall_seconds=120.0,
+        )
+        diagnostics = tuple(
+            line for line in result.stderr.decode("utf-8", errors="replace").splitlines() if line
+        )
+        if result.stderr:
+            return result.returncode if result.returncode != 0 else 1, diagnostics
+        if progress_tracker is not None and parser.maximums["frame"] >= 0:
+            self._consume_direct_ffmpeg_line(
+                f"frame={parser.maximums['frame']}",
+                total_frames,
+                progress_tracker,
+                deque(maxlen=1),
+            )
+        return result.returncode, diagnostics
 
     @staticmethod
     def _consume_direct_ffmpeg_line(
@@ -449,7 +965,7 @@ class VideoEncoder:
         )
         VideoEncoder._print_direct_ffmpeg_diagnostics(diagnostics)
 
-    def create_video_from_stereo_sequences(
+    def create_video_from_stereo_sequences(  # noqa: C901
         self,
         left_files: Sequence[Path],
         right_files: Sequence[Path],
@@ -462,34 +978,119 @@ class VideoEncoder:
     ) -> bool:
         """Encode validated eye sequences and atomically publish the final video."""
 
-        output_filename = generate_output_filename(
-            Path(original_video).name,
-            settings["vr_format"],
-            settings["vr_resolution"],
-        )
-        output_path = output_dir / output_filename
-        temporary = output_path.with_name(f".{output_path.stem}.direct.tmp.mp4")
-        try:
+        temporary: Path | None = None
+        legacy_output_path: Path | None = None
+        if not (output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH).is_file():
+            output_filename = generate_output_filename(
+                Path(original_video).name,
+                settings["vr_format"],
+                settings["vr_resolution"],
+            )
+            legacy_output_path = output_dir / output_filename
+            temporary = legacy_output_path.with_name(f".{legacy_output_path.stem}.direct.tmp.mp4")
             temporary.unlink(missing_ok=True)
+        try:
             if not verify_ffmpeg_installation():
                 print("Error: FFmpeg not found. Cannot create output video.")
                 return False
             sequence = self._validate_direct_stereo_sequence(
                 list(left_files), list(right_files), total_frames
             )
+            schema5_context = self._prepare_schema5_direct_context(
+                sequence=sequence,
+                output_dir=output_dir,
+                settings=settings,
+            )
+            if schema5_context is not None and schema5_context.already_authenticated:
+                if self.defer_final_reservation_retirement:
+                    self._pending_final_reservation = schema5_context.reservation
+                else:
+                    schema5_context.reservation.retire()
+                return True
+            selected_audio = (
+                prepare_selected_audio_v1(
+                    output_dir=output_dir,
+                    original_video=original_video,
+                    settings=settings,
+                    frame_count=sequence.frame_count,
+                    fps=self._resolve_output_fps(original_video, settings),
+                )
+                if schema5_context is not None
+                else None
+            )
+            if schema5_context is None:
+                assert legacy_output_path is not None and temporary is not None
+                output_path = legacy_output_path
+            else:
+                output_path = output_dir / schema5_context.expected_relative_path
+                temporary = schema5_context.sibling_path
+            temporary.unlink(missing_ok=True)
             command = self._build_direct_stereo_command(
-                sequence, temporary, original_video, settings
+                sequence,
+                temporary,
+                original_video,
+                settings,
+                selected_audio=selected_audio,
             )
-            returncode, diagnostics = self._run_ffmpeg_with_progress(
-                command, sequence.frame_count, progress_tracker
-            )
+            if schema5_context is None:
+                returncode, diagnostics = self._run_ffmpeg_with_progress(
+                    command, sequence.frame_count, progress_tracker
+                )
+            else:
+                returncode, diagnostics = self._run_schema5_ffmpeg_with_progress(
+                    command, sequence.frame_count, progress_tracker
+                )
             if returncode != 0:
                 self._print_direct_ffmpeg_failure(returncode, diagnostics)
                 return False
             if not temporary.is_file() or temporary.stat().st_size == 0:
                 self._print_direct_ffmpeg_output_validation_failure(diagnostics)
                 return False
-            temporary.replace(output_path)
+            if schema5_context is None:
+                temporary.replace(output_path)
+            else:
+                assert schema5_context.staged_manifest is not None
+                assert schema5_context.manifest_source is not None
+                validate_encoding_postpass(
+                    schema5_context.provider,
+                    job_root=output_dir,
+                    staged=schema5_context.staged_manifest,
+                    per_eye_size=self._per_eye_size(settings),
+                    vr_format=settings["vr_format"],
+                )
+                assert selected_audio is not None
+                selected_audio.revalidate()
+                normalized = self._normalize_publication_arguments(
+                    command=command,
+                    image_inputs={
+                        str(sequence.left_pattern): "left",
+                        str(sequence.right_pattern): "right",
+                    },
+                    selected_audio=selected_audio,
+                    runtime_output=temporary,
+                    input_stage_fingerprint=(schema5_context.staged_manifest.fingerprint),
+                    final_relative_path=schema5_context.expected_relative_path,
+                )
+                FinalPublicationTransactionV4(
+                    job_root=output_dir,
+                    settings=schema5_context.settings,
+                    sibling_relative_path=temporary.name,
+                    encoding_input_source=schema5_context.manifest_source,
+                    input_stage_fingerprint=(schema5_context.staged_manifest.fingerprint),
+                    resolved_encoding_arguments=normalized,
+                    container_validator=lambda path: self._validate_final_container(
+                        path,
+                        settings,
+                        schema5_context.provider.frame_count,
+                        self._resolve_output_fps(original_video, settings),
+                        command[command.index("-c:v") + 1],
+                        selected_audio.audio_end_sample,
+                    ),
+                    reservation=schema5_context.reservation,
+                    retire_reservation=not self.defer_final_reservation_retirement,
+                ).publish()
+                if self.defer_final_reservation_retirement:
+                    self._pending_final_reservation = schema5_context.reservation
             return True
         except InterruptedError:
             raise
@@ -497,10 +1098,11 @@ class VideoEncoder:
             print(f"Error creating direct VR output video: {error}")
             return False
         finally:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError as error:
-                print(f"Warning: Could not clean direct VR temporary output: {error}")
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError as error:
+                    print(f"Warning: Could not clean direct VR temporary output: {error}")
 
     def extract_frames(
         self,
