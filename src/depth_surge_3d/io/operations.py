@@ -49,6 +49,7 @@ from .reservation_protocol import (
     ReservationConflictError,
     SettingsArtifactTransactionV1,
     allocation_unit_for_path,
+    assert_only_job_control_owned_reservations_v1,
     bootstrap_settings_job_v1,
     commit_terminal_settings_v1,
     platform_allocation_adapter,
@@ -848,7 +849,7 @@ def recover_processing_control_prefix_v1(
     from .reservation_protocol import load_job_control
 
     try:
-        load_job_control(root)
+        control = load_job_control(root)
     except ReservationConflictError:
         if not any(
             path.exists() or path.is_symlink()
@@ -900,6 +901,7 @@ def recover_processing_control_prefix_v1(
                 raise ReservationConflictError(
                     "terminal settings retain only an uncommitted final index temporary"
                 )
+            assert_only_job_control_owned_reservations_v1(root, control)
             return artifact
     if final_active:
         recovered_final_index = recover_final_encoding_index_pair_v1(root)
@@ -937,6 +939,14 @@ def recover_processing_control_prefix_v1(
                 allocation_adapter=allocation_adapter,
                 allocation_counter=allocation_counter,
             )
+    fixed_indexes = (
+        settings_index,
+        settings_index_temporary,
+        final_index,
+        final_index_temporary,
+    )
+    if not any(path.exists() or path.is_symlink() for path in fixed_indexes):
+        assert_only_job_control_owned_reservations_v1(root, control)
     return artifact
 
 

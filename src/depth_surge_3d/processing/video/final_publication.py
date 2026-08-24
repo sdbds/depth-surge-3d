@@ -46,6 +46,7 @@ from ...io.reservation_protocol import (
     platform_allocation_adapter,
     platform_allocation_counter,
     payload_logical_bytes,
+    publish_index_owned_descriptor_v1,
     publish_write_ahead_intent,
     recover_control_artifact_pair_v1,
     same_parent_replace_v1,
@@ -1617,6 +1618,87 @@ def _load_reservation_json(path: Path, *, max_bytes: int) -> object:
         ) from error
 
 
+def _validate_descriptor_temporary_prefix_v1(
+    path: Path,
+    expected_raw: bytes,
+    *,
+    label: str,
+) -> None:
+    temporary_raw = _read_bounded_regular_file(path, max_bytes=max(len(expected_raw), 1))
+    if len(temporary_raw) > len(expected_raw) or not expected_raw.startswith(temporary_raw):
+        raise ReservationConflictError(f"{label} is not the authoritative descriptor prefix")
+
+
+def _current_target_descriptor_from_index_v1(
+    root: Path,
+    index: FinalEncodingReservationIndexV1,
+) -> FinalVideoTargetReservationV1:
+    final_path = root / index.final_video_relative_path
+    if not _regular_nonlink(final_path):
+        raise ReservationConflictError(
+            "partial final target descriptor has no reserved target authority"
+        )
+    reserved_identity = _reservation_identity(final_path)
+    if index.final_video_publication_method == "replace_placeholder":
+        if final_path.stat(follow_symlinks=False).st_size != 0:
+            raise ReservationConflictError("partial final target descriptor lost its placeholder")
+    else:
+        expected = index.final_video_existing_target_identity_at_preflight
+        if expected is None or reserved_identity != expected:
+            raise ReservationConflictError("partial final target descriptor old target changed")
+        if _hash_file(final_path) != (
+            index.final_video_existing_target_raw_sha256_at_preflight,
+            index.final_video_existing_target_byte_count_at_preflight,
+        ):
+            raise ReservationConflictError("partial final target descriptor old target bytes changed")
+    return FinalVideoTargetReservationV1.build(
+        job_id=index.job_id,
+        settings_identity_fingerprint=index.settings_identity_fingerprint,
+        settings_raw_sha256_at_preflight=index.settings_raw_sha256_at_preflight,
+        settings_revision_at_preflight=index.settings_revision_at_preflight,
+        publication_generation=index.publication_generation,
+        reservation_generation=index.reservation_generation,
+        transaction_index_fingerprint=index.fingerprint,
+        final_video_relative_path=index.final_video_relative_path,
+        sibling_video_temporary_relative_path=index.sibling_video_temporary_relative_path,
+        target_parent_identity=index.sibling_video_parent_identity,
+        publication_method=index.final_video_publication_method,
+        reserved_target_identity=reserved_identity,
+    )
+
+
+def _publish_current_target_descriptor_v1(
+    root: Path,
+    index: FinalEncodingReservationIndexV1,
+    descriptor: FinalVideoTargetReservationV1,
+) -> None:
+    descriptor_path = root / index.final_video_target_descriptor_relative_path
+    final_path = root / index.final_video_relative_path
+
+    def validate_authority() -> None:
+        if _read_bounded_regular_file(
+            root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+            max_bytes=1024 * 1024,
+        ) != canonical_json_bytes(index.to_object()):
+            raise ReservationConflictError(
+                "final index changed before target descriptor normalization"
+            )
+        _assert_reserved_final_target_preboundary_v1(final_path, descriptor)
+        if descriptor.publication_method == "replace_existing" and _hash_file(final_path) != (
+            index.final_video_existing_target_raw_sha256_at_preflight,
+            index.final_video_existing_target_byte_count_at_preflight,
+        ):
+            raise ReservationConflictError(
+                "existing final target changed before descriptor normalization"
+            )
+
+    publish_index_owned_descriptor_v1(
+        descriptor_path,
+        descriptor.to_object(),
+        validate_authority=validate_authority,
+    )
+
+
 def recover_final_encoding_index_pair_v1(
     job_root: Path,
 ) -> FinalEncodingReservationIndexV1 | None:
@@ -1908,6 +1990,59 @@ def _load_indexed_extent(  # noqa: C901
         transaction_index_relative_path=owner_index_path,
         transaction_index_fingerprint=owner_index_fingerprint,
     )
+    return transaction
+
+
+def _validate_partial_indexed_extent_descriptor_v1(
+    *,
+    root: Path,
+    index: FinalEncodingReservationIndexV1,
+    entry: dict,
+    allocation_adapter: AllocationAdapter,
+    allocation_counter: AllocationCounter | None,
+) -> ReservedArtifactTransaction:
+    """Rebuild descriptor bytes without publishing and authenticate the temp prefix."""
+
+    descriptor_path, _source_path = _indexed_extent_paths(root, entry)
+    temporary = descriptor_path.with_name(f".{descriptor_path.name}.create-new.tmp")
+    validated = False
+
+    def validate_only(
+        path: Path,
+        payload: dict,
+        *,
+        validate_authority: Callable[[], None],
+        event=None,
+    ) -> None:
+        nonlocal validated
+        if path != descriptor_path or event is not None:
+            raise ReservationConflictError("descriptor normalization target changed")
+        expected_raw = canonical_json_bytes(payload)
+        _validate_descriptor_temporary_prefix_v1(
+            temporary,
+            expected_raw,
+            label=f"{entry['reservation_kind']} descriptor temporary",
+        )
+        validate_authority()
+        validated = True
+
+    transaction = ReservedArtifactTransaction.create(
+        job_root=root,
+        index_relative_path=FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+        target_relative_path=Path(entry["target_relative_path"]),
+        reservation_kind=entry["reservation_kind"],
+        payload_raw_max=entry["payload_raw_max"],
+        allocation_unit=entry["allocation_unit"],
+        allocation_adapter=allocation_adapter,
+        generation=entry["reservation_generation"],
+        reservation_id=entry["reservation_id"],
+        allocation_counter=allocation_counter,
+        expected_publication_method=entry["publication_method"],
+        descriptor_publisher=validate_only,
+        materialize_missing=False,
+    )
+    if not validated:
+        raise ReservationConflictError("descriptor prefix validation did not run")
     return transaction
 
 
@@ -2423,10 +2558,9 @@ def _snapshot_completed_retirement_plan_v1(
         target_path,
         label="final target descriptor",
     )
-    authoritative_path = target_path if target is not None else target_temporary_path
-    if target is not None or target_temporary is not None:
+    if target is not None:
         descriptor = FinalVideoTargetReservationV1.from_object(
-            _load_reservation_json(authoritative_path, max_bytes=1024 * 1024)
+            _load_reservation_json(target_path, max_bytes=1024 * 1024)
         )
         _validate_target_descriptor_against_index_v1(index, descriptor)
         if (
@@ -2436,6 +2570,17 @@ def _snapshot_completed_retirement_plan_v1(
             raise ReservationConflictError(
                 "final target descriptor changed before completed retirement"
             )
+        if target is not None and target_temporary is not None:
+            _validate_descriptor_temporary_prefix_v1(
+                target_temporary_path,
+                canonical_json_bytes(descriptor.to_object()),
+                label="final target descriptor temporary",
+            )
+    elif target_temporary is not None:
+        descriptor = FinalVideoTargetReservationV1.from_object(
+            _load_reservation_json(target_temporary_path, max_bytes=1024 * 1024)
+        )
+        _validate_target_descriptor_against_index_v1(index, descriptor)
     index_snapshot = _snapshot_retirement_path_v1(
         index_path,
         label="final encoding index",
@@ -2603,7 +2748,35 @@ def load_final_encoding_reservation_v1(
             publication_method=index.final_video_publication_method,
             reserved_target_identity=reserved_identity,
         )
-        publish_write_ahead_intent(target_path, target.to_object())
+
+        def validate_target_descriptor_authority() -> None:
+            index_path = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+            expected_index_raw = canonical_json_bytes(index.to_object())
+            if (
+                _read_bounded_regular_file(index_path, max_bytes=1024 * 1024)
+                != expected_index_raw
+            ):
+                raise ReservationConflictError(
+                    "final index changed before target descriptor publication"
+                )
+            _assert_reserved_final_target_preboundary_v1(final_path, target)
+            if target.publication_method == "replace_existing":
+                current_hash, current_count = _hash_file(final_path)
+                if (
+                    current_hash
+                    != index.final_video_existing_target_raw_sha256_at_preflight
+                    or current_count
+                    != index.final_video_existing_target_byte_count_at_preflight
+                ):
+                    raise ReservationConflictError(
+                        "existing final target changed before descriptor publication"
+                    )
+
+        publish_index_owned_descriptor_v1(
+            target_path,
+            target.to_object(),
+            validate_authority=validate_target_descriptor_authority,
+        )
     if (
         target.job_id != index.job_id
         or target.settings_identity_fingerprint != index.settings_identity_fingerprint
@@ -2833,6 +3006,12 @@ def _snapshot_failed_retirement_plan_v1(
                 transaction_index_relative_path=FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
                 transaction_index_fingerprint=index.fingerprint,
             )
+            if descriptor_temporary is not None:
+                _validate_descriptor_temporary_prefix_v1(
+                    descriptor_temporary_path,
+                    canonical_json_bytes(descriptor.to_object()),
+                    label=f"{kind} descriptor temporary",
+                )
             source_snapshot = _snapshot_retirement_path_v1(
                 source_path,
                 label=f"{kind} source",
@@ -2855,6 +3034,23 @@ def _snapshot_failed_retirement_plan_v1(
                 )
         elif source_path.exists() or source_path.is_symlink():
             raise ReservationConflictError(f"{kind} source appeared without its descriptor")
+        elif descriptor_temporary is not None:
+            temporary_descriptor = ReservationDescriptor.from_object(
+                _load_reservation_json(
+                    descriptor_temporary_path,
+                    max_bytes=1024 * 1024,
+                )
+            )
+            validate_descriptor_against_entry_v1(
+                temporary_descriptor,
+                entry,
+                job_id=index.job_id,
+                settings_identity_fingerprint=index.settings_identity_fingerprint,
+                settings_revision_at_creation=index.settings_revision_at_preflight,
+                settings_raw_sha256_at_creation=index.settings_raw_sha256_at_preflight,
+                transaction_index_relative_path=FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+                transaction_index_fingerprint=index.fingerprint,
+            )
         extent_plans.append(
             _FailedExtentRetirementV1(
                 position=position,
@@ -2884,6 +3080,12 @@ def _snapshot_failed_retirement_plan_v1(
         )
         if target_descriptor is None or current_target_descriptor != target_descriptor:
             raise ReservationConflictError("final target descriptor changed during preflight")
+        if target_descriptor_temporary is not None:
+            _validate_descriptor_temporary_prefix_v1(
+                target_descriptor_temporary_path,
+                canonical_json_bytes(current_target_descriptor.to_object()),
+                label="final target descriptor temporary",
+            )
         final_path = root / index.final_video_relative_path
         if (
             target_descriptor.publication_method == "replace_placeholder"
@@ -2898,6 +3100,24 @@ def _snapshot_failed_retirement_plan_v1(
                 label="final video placeholder",
                 expected_identity=target_descriptor.reserved_target_identity,
                 expected_parent_identity=target_descriptor.target_parent_identity,
+            )
+    elif target_descriptor_temporary is not None:
+        temporary_target_descriptor = FinalVideoTargetReservationV1.from_object(
+            _load_reservation_json(
+                target_descriptor_temporary_path,
+                max_bytes=1024 * 1024,
+            )
+        )
+        _validate_target_descriptor_against_index_v1(
+            index,
+            temporary_target_descriptor,
+        )
+        if (
+            target_descriptor is not None
+            and temporary_target_descriptor != target_descriptor
+        ):
+            raise ReservationConflictError(
+                "final target descriptor temporary changed during preflight"
             )
     elif target_descriptor is not None:
         raise ReservationConflictError("final target descriptor disappeared during preflight")
@@ -2930,6 +3150,8 @@ def _assert_failed_retirement_has_no_forward_obligation_v1(
 
     input_retirement_state: str | None = None
     final_manifest_retirement_state: str | None = None
+    normalize_entries: list[dict] = []
+    normalize_target: FinalVideoTargetReservationV1 | None = None
     terminal_settings = ProcessingSettingsArtifactV5.parse(
         _read_bounded_regular_file(
             root / "processing-settings-v5.json",
@@ -2985,6 +3207,12 @@ def _assert_failed_retirement_has_no_forward_obligation_v1(
             raise ReservationConflictError(
                 "final target descriptor changed the old target identity"
             )
+        if target_descriptor_temporary.exists() or target_descriptor_temporary.is_symlink():
+            _validate_descriptor_temporary_prefix_v1(
+                target_descriptor_temporary,
+                canonical_json_bytes(target_descriptor.to_object()),
+                label="final target descriptor temporary",
+            )
         if final.exists() or final.is_symlink():
             if _reservation_identity(final) != target_descriptor.reserved_target_identity:
                 if (
@@ -3001,10 +3229,30 @@ def _assert_failed_retirement_has_no_forward_obligation_v1(
         elif target_descriptor.publication_method == "replace_existing":
             raise ReservationConflictError("existing final target is missing")
     elif target_descriptor_temporary.exists() or target_descriptor_temporary.is_symlink():
-        if sibling.exists() or sibling.is_symlink():
-            raise ReservationConflictError(
-                "final-video sibling has no authoritative target descriptor"
+        temporary_raw = _read_bounded_regular_file(
+            target_descriptor_temporary,
+            max_bytes=1024 * 1024,
+        )
+        try:
+            complete_temporary = FinalVideoTargetReservationV1.from_object(
+                strict_canonical_json_loads(
+                    temporary_raw,
+                    max_bytes=1024 * 1024,
+                )
             )
+        except (CanonicalJsonError, ReservationConflictError):
+            complete_temporary = None
+        if complete_temporary is not None:
+            _validate_target_descriptor_against_index_v1(index, complete_temporary)
+            target_descriptor = complete_temporary
+        else:
+            target_descriptor = _current_target_descriptor_from_index_v1(root, index)
+            _validate_descriptor_temporary_prefix_v1(
+                target_descriptor_temporary,
+                canonical_json_bytes(target_descriptor.to_object()),
+                label="final target descriptor temporary",
+            )
+            normalize_target = target_descriptor
 
     if sibling.exists() or sibling.is_symlink():
         if not _regular_nonlink(sibling):
@@ -3061,10 +3309,33 @@ def _assert_failed_retirement_has_no_forward_obligation_v1(
         target_present = target_path.exists() or target_path.is_symlink()
         if temporary_present and not _regular_nonlink(descriptor_temporary):
             raise ReservationConflictError(f"{kind} descriptor temporary is unsafe")
-        if not descriptor_present:
-            if temporary_present and source_present:
-                raise ReservationConflictError(
-                    f"{kind} descriptor temporary has a materialized source"
+        transaction: ReservedArtifactTransaction | None = None
+        if not descriptor_present and temporary_present and source_present:
+            transaction = _validate_partial_indexed_extent_descriptor_v1(
+                root=root,
+                index=index,
+                entry=entry,
+                allocation_adapter=allocation_adapter,
+                allocation_counter=allocation_counter,
+            )
+            normalize_entries.append(entry)
+        elif not descriptor_present:
+            if temporary_present:
+                temporary_descriptor = ReservationDescriptor.from_object(
+                    _load_reservation_json(
+                        descriptor_temporary,
+                        max_bytes=1024 * 1024,
+                    )
+                )
+                validate_descriptor_against_entry_v1(
+                    temporary_descriptor,
+                    entry,
+                    job_id=index.job_id,
+                    settings_identity_fingerprint=index.settings_identity_fingerprint,
+                    settings_revision_at_creation=index.settings_revision_at_preflight,
+                    settings_raw_sha256_at_creation=index.settings_raw_sha256_at_preflight,
+                    transaction_index_relative_path=FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+                    transaction_index_fingerprint=index.fingerprint,
                 )
             if source_present:
                 raise ReservationConflictError(f"{kind} source has no descriptor")
@@ -3106,15 +3377,16 @@ def _assert_failed_retirement_has_no_forward_obligation_v1(
             elif kind == "final_video_manifest":
                 final_manifest_retirement_state = "unused"
             continue
-        if not _regular_nonlink(descriptor_path):
-            raise ReservationConflictError(f"{kind} descriptor is unsafe")
-        transaction = _load_indexed_extent(
-            root=root,
-            index=index,
-            entry=entry,
-            allocation_adapter=allocation_adapter,
-            allocation_counter=allocation_counter,
-        )
+        if transaction is None:
+            if not _regular_nonlink(descriptor_path):
+                raise ReservationConflictError(f"{kind} descriptor is unsafe")
+            transaction = _load_indexed_extent(
+                root=root,
+                index=index,
+                entry=entry,
+                allocation_adapter=allocation_adapter,
+                allocation_counter=allocation_counter,
+            )
         if transaction is None:
             raise ReservationConflictError(f"{kind} descriptor disappeared")
         descriptor = transaction.descriptor
@@ -3318,6 +3590,27 @@ def _assert_failed_retirement_has_no_forward_obligation_v1(
     elif input_retirement_state == "committed" or final_manifest_retirement_state == "committed":
         raise ReservationConflictError(
             "committed publication manifest exists before the video boundary"
+        )
+    if normalize_target is not None or normalize_entries:
+        if normalize_target is not None:
+            _publish_current_target_descriptor_v1(root, index, normalize_target)
+        for entry in normalize_entries:
+            transaction = _load_indexed_extent(
+                root=root,
+                index=index,
+                entry=entry,
+                allocation_adapter=allocation_adapter,
+                allocation_counter=allocation_counter,
+            )
+            if transaction is None:
+                raise ReservationConflictError(
+                    f"{entry['reservation_kind']} descriptor normalization disappeared"
+                )
+        return _assert_failed_retirement_has_no_forward_obligation_v1(
+            root,
+            index,
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
         )
     return _snapshot_failed_retirement_plan_v1(
         root,

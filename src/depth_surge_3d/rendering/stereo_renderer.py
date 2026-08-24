@@ -5,7 +5,6 @@ from __future__ import annotations
 import gc
 import math
 import time
-from collections import Counter
 from dataclasses import dataclass, field
 from numbers import Integral
 from typing import Literal
@@ -304,8 +303,8 @@ def _convert_image_band(image: torch.Tensor, dtype: np.dtype) -> np.ndarray:
 
 def _update_hole_histograms(
     lane_valid: np.ndarray,
-    lane_histogram: Counter[int],
-    span_histogram: Counter[int],
+    lane_histogram: np.ndarray,
+    span_histogram: np.ndarray,
 ) -> None:
     for row in lane_valid:
         missing = np.flatnonzero(~row.reshape(-1))
@@ -319,8 +318,10 @@ def _update_hole_histograms(
             ):
                 end_cursor += 1
             end = int(missing[end_cursor - 1])
-            lane_histogram[end - start + 1] += 1
-            span_histogram[end // HORIZONTAL_SUBPIXELS - start // HORIZONTAL_SUBPIXELS + 1] += 1
+            lane_histogram[end - start + 1] += np.uint64(1)
+            span_histogram[
+                end // HORIZONTAL_SUBPIXELS - start // HORIZONTAL_SUBPIXELS + 1
+            ] += np.uint64(1)
             cursor = end_cursor
 
 
@@ -793,8 +794,8 @@ class StereoRenderer:
         output = np.empty_like(source)
         coverage_output = np.empty((height, width), dtype=np.uint8)
         repair_output = np.zeros((height, width), dtype=np.uint8)
-        lane_histogram: Counter[int] = Counter()
-        span_histogram: Counter[int] = Counter()
+        lane_histogram = np.zeros(16 * (width + 1), dtype=np.uint64)
+        span_histogram = np.zeros(width + 1, dtype=np.uint64)
         local_filled_lane_count = 0
         final_unresolved_lane_count = 0
         max_gap_width = math.ceil(width * settings.max_eye_shift_fraction) + 2
@@ -885,8 +886,8 @@ class StereoRenderer:
                     downsampled,
                 )
         hole_runs = HoleRunDiagnostics(
-            lane_count_histogram=tuple(sorted(lane_histogram.items())),
-            touched_pixel_span_histogram=tuple(sorted(span_histogram.items())),
+            lane_count_histogram=lane_histogram,
+            touched_pixel_span_histogram=span_histogram,
         )
         diagnostics = FastEyeDiagnostics(
             hole_runs=hole_runs,

@@ -196,7 +196,7 @@ def test_quality_pass_retries_once_from_the_start_after_cuda_oom(
     canonical = np.full((2, 4), 0.5, dtype=np.float32)
     renderer = StereoRenderer(
         device="cpu",
-        temporary_budget_bytes=9 * SPLAT_BYTES_PER_PIXEL * 4,
+        temporary_budget_bytes=9 * quality.QUALITY_SPLAT_BYTES_PER_PIXEL * 4,
     )
     original = quality._render_none_eye_once
     attempted_heights: list[int] = []
@@ -218,6 +218,101 @@ def test_quality_pass_retries_once_from_the_start_after_cuda_oom(
 
     assert attempted_heights[:2] == [4, 2]
     assert result.left_image.shape == frame.shape
+
+
+def test_quality_band_height_uses_the_quality_device_coefficient() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+
+    assert quality.QUALITY_SPLAT_BYTES_PER_PIXEL == 1536
+    assert quality._calculate_quality_band_height(3840, 2160, 256 * 1024 * 1024) == (
+        256 * 1024 * 1024 // (3840 * 1536)
+    )
+
+
+def test_quality_second_oom_releases_device_state_and_reports_both_heights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    state = quality._FrameBandState(initial_height=8, retry_height=4, current_height=8)
+    attempted_heights: list[int] = []
+    releases: list[object] = []
+
+    def always_oom(*, band_height: int, **_kwargs: object) -> None:
+        attempted_heights.append(band_height)
+        raise torch.cuda.OutOfMemoryError("injected")
+
+    monkeypatch.setattr(quality, "_release_after_oom", lambda owner: releases.append(owner))
+    source = np.zeros((8, 11, 3), dtype=np.uint8)
+
+    with pytest.raises(RuntimeError, match="attempted band heights 8 and 4"):
+        quality._retry_after_oom(
+            object(),
+            state,
+            always_oom,
+            source=source,
+        )
+
+    assert attempted_heights == [8, 4]
+    assert len(releases) == 2
+
+
+def test_quality_none_retains_dense_uint64_hole_histograms() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    frame = np.full((3, 17, 3), 80, dtype=np.uint8)
+    canonical = np.tile(np.linspace(0.0, 1.0, 17, dtype=np.float32), (3, 1))
+
+    result = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(
+            stereo_strength=5.0,
+            convergence=0.0,
+            occlusion_fill="none",
+        ),
+    )
+
+    for hole_runs in (result.left_hole_runs, result.right_hole_runs):
+        assert hole_runs is not None
+        assert hole_runs.lane_count_histogram.dtype == np.uint64
+        assert hole_runs.lane_count_histogram.shape == (16 * (17 + 1),)
+        assert hole_runs.touched_pixel_span_histogram.dtype == np.uint64
+        assert hole_runs.touched_pixel_span_histogram.shape == (17 + 1,)
+
+
+def test_quality_background_transfers_the_pass_a_b_plane_to_repair_bits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    frame = np.full((3, 17, 3), 80, dtype=np.uint8)
+    canonical = np.tile(np.linspace(0.0, 1.0, 17, dtype=np.float32), (3, 1))
+    pass_a_b_planes: list[np.ndarray] = []
+    original_analyze = quality._analyze_eye_once
+    original_bits = quality._background_repair_bits
+
+    def capture_analysis(*args, **kwargs):
+        analyzed = original_analyze(*args, **kwargs)
+        pass_a_b_planes.append(analyzed.analysis.pure_bgr[0])
+        return analyzed
+
+    def capture_transfer(coverage, records, *, out):
+        expected = pass_a_b_planes.pop(0)
+        assert out is expected
+        return original_bits(coverage, records, out=out)
+
+    monkeypatch.setattr(quality, "_analyze_eye_once", capture_analysis)
+    monkeypatch.setattr(quality, "_background_repair_bits", capture_transfer)
+
+    result = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(stereo_strength=5.0, convergence=0.0),
+    )
+
+    assert not pass_a_b_planes
+    assert result.left_repair_bits.base is None
+    assert result.right_repair_bits.base is None
 
 
 def test_quality_controls_reject_boolean_limit() -> None:

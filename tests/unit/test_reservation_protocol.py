@@ -212,6 +212,73 @@ def test_control_publication_adopts_only_the_exact_durable_temporary(tmp_path: P
     assert not temporary.exists()
 
 
+def test_control_publication_syncs_a_complete_temporary_before_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final = tmp_path / "job-control-v1.json"
+    temporary = tmp_path / ".job-control-v1.json.create-new.tmp"
+    payload = {"algorithm_version": "test-control-v1"}
+    raw = reservation_protocol.canonical_json_bytes(payload)
+    temporary.write_bytes(raw)
+    original_fsync = reservation_protocol.os.fsync
+    original_replace = reservation_protocol.same_parent_replace_v1
+    events: list[str] = []
+
+    def fsync(descriptor: int) -> None:
+        events.append("file-sync")
+        original_fsync(descriptor)
+
+    def replace(*args, **kwargs) -> None:
+        assert "file-sync" in events
+        events.append("rename")
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(reservation_protocol.os, "fsync", fsync)
+    monkeypatch.setattr(reservation_protocol, "same_parent_replace_v1", replace)
+
+    reservation_protocol.publish_write_ahead_intent(final, payload)
+
+    assert events.index("file-sync") < events.index("rename")
+    assert final.read_bytes() == raw
+
+
+def test_control_recovery_syncs_a_complete_temporary_before_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final = tmp_path / "job-control-v1.json"
+    temporary = tmp_path / ".job-control-v1.json.create-new.tmp"
+    raw = reservation_protocol.canonical_json_bytes(
+        {"algorithm_version": "test-control-v1"}
+    )
+    temporary.write_bytes(raw)
+    original_fsync = reservation_protocol.os.fsync
+    original_replace = reservation_protocol.same_parent_replace_v1
+    events: list[str] = []
+
+    def fsync(descriptor: int) -> None:
+        events.append("file-sync")
+        original_fsync(descriptor)
+
+    def replace(*args, **kwargs) -> None:
+        assert "file-sync" in events
+        events.append("rename")
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(reservation_protocol.os, "fsync", fsync)
+    monkeypatch.setattr(reservation_protocol, "same_parent_replace_v1", replace)
+
+    assert reservation_protocol.recover_control_artifact_pair_v1(
+        final,
+        max_bytes=4096,
+        parser=lambda value: value,
+    ) == raw
+
+    assert events.index("file-sync") < events.index("rename")
+    assert final.read_bytes() == raw
+
+
 def test_control_publication_never_overwrites_a_different_durable_temporary(
     tmp_path: Path,
 ) -> None:
@@ -255,6 +322,212 @@ def test_control_recovery_checks_preconditions_before_promoting_temporary(
 
     assert temporary.read_bytes() == raw
     assert not final.exists()
+
+
+def test_index_owned_extent_descriptor_rewrites_a_partial_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = (
+        tmp_path
+        / ".depth-surge-reservations-v1"
+        / f"d-p-none-r-{'cd' * 16}-encoding_input_manifest-{'ef' * 16}.json"
+    )
+    temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
+    original = reservation_protocol._write_control_temporary
+
+    def interrupt_descriptor(path: Path, raw: bytes, *, event):
+        if path == temporary:
+            with path.open("xb", buffering=0) as handle:
+                prefix = raw[: max(1, min(37, len(raw) - 1))]
+                assert handle.write(prefix) == len(prefix)
+                handle.flush()
+                os.fsync(handle.fileno())
+            raise OSError("injected descriptor short write")
+        return original(path, raw, event=event)
+
+    monkeypatch.setattr(
+        reservation_protocol,
+        "_write_control_temporary",
+        interrupt_descriptor,
+    )
+    with pytest.raises(OSError, match="short write"):
+        _create_transaction(tmp_path)
+    prefix = temporary.read_bytes()
+    monkeypatch.setattr(reservation_protocol, "_write_control_temporary", original)
+
+    transaction = _create_transaction(tmp_path)
+
+    assert transaction.descriptor_path.read_bytes().startswith(prefix)
+    assert transaction.descriptor_path == descriptor
+    assert descriptor.is_file()
+    assert not temporary.exists()
+
+
+def test_index_owned_descriptor_syncs_a_complete_temporary_before_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = tmp_path / ".depth-surge-reservations-v1" / "descriptor.json"
+    descriptor.parent.mkdir(parents=True)
+    temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
+    payload = {"algorithm_version": "test-descriptor-v1"}
+    raw = reservation_protocol.canonical_json_bytes(payload)
+    temporary.write_bytes(raw)
+    original_fsync = reservation_protocol.os.fsync
+    original_replace = reservation_protocol.same_parent_replace_v1
+    events: list[str] = []
+
+    def fsync(file_descriptor: int) -> None:
+        events.append("file-sync")
+        original_fsync(file_descriptor)
+
+    def replace(*args, **kwargs) -> None:
+        assert "file-sync" in events
+        events.append("rename")
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(reservation_protocol.os, "fsync", fsync)
+    monkeypatch.setattr(reservation_protocol, "same_parent_replace_v1", replace)
+
+    reservation_protocol.publish_index_owned_descriptor_v1(
+        descriptor,
+        payload,
+        validate_authority=lambda: None,
+    )
+
+    assert events.index("file-sync") < events.index("rename")
+    assert descriptor.read_bytes() == raw
+
+
+def test_index_owned_descriptor_rejects_temporary_swap_before_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = tmp_path / ".depth-surge-reservations-v1" / "descriptor.json"
+    descriptor.parent.mkdir(parents=True)
+    temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
+    payload = {"algorithm_version": "test-descriptor-v1"}
+    raw = reservation_protocol.canonical_json_bytes(payload)
+    descriptor.write_bytes(raw)
+    temporary.write_bytes(raw)
+    original_read = reservation_protocol._read_bounded_regular_file_with_identity
+    swapped = False
+
+    def read_then_swap(path: Path, *, max_bytes: int):
+        nonlocal swapped
+        result = original_read(path, max_bytes=max_bytes)
+        if Path(path) == temporary and not swapped:
+            swapped = True
+            temporary.unlink()
+            temporary.write_bytes(raw)
+        return result
+
+    monkeypatch.setattr(
+        reservation_protocol,
+        "_read_bounded_regular_file_with_identity",
+        read_then_swap,
+    )
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="temporary identity changed",
+    ):
+        reservation_protocol.publish_index_owned_descriptor_v1(
+            descriptor,
+            payload,
+            validate_authority=lambda: None,
+        )
+
+    assert swapped
+    assert descriptor.read_bytes() == raw
+    assert temporary.read_bytes() == raw
+
+
+def test_control_recovery_rejects_temporary_swap_before_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final = tmp_path / "job-control-v1.json"
+    temporary = tmp_path / ".job-control-v1.json.create-new.tmp"
+    raw = reservation_protocol.canonical_json_bytes(
+        {"algorithm_version": "test-control-v1"}
+    )
+    final.write_bytes(raw)
+    temporary.write_bytes(b"durable-prefix")
+    original_read = reservation_protocol._read_bounded_regular_file_with_identity
+    swapped = False
+
+    def read_then_swap(path: Path, *, max_bytes: int):
+        nonlocal swapped
+        result = original_read(path, max_bytes=max_bytes)
+        if Path(path) == temporary and not swapped:
+            swapped = True
+            temporary.unlink()
+            temporary.write_bytes(b"replacement")
+        return result
+
+    monkeypatch.setattr(
+        reservation_protocol,
+        "_read_bounded_regular_file_with_identity",
+        read_then_swap,
+    )
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="temporary identity changed",
+    ):
+        reservation_protocol.recover_control_artifact_pair_v1(
+            final,
+            max_bytes=4096,
+            parser=lambda value: value,
+        )
+
+    assert swapped
+    assert final.read_bytes() == raw
+    assert temporary.read_bytes() == b"replacement"
+
+
+def test_index_owned_extent_descriptor_preserves_a_malformed_nonprefix_temporary(
+    tmp_path: Path,
+) -> None:
+    descriptor = (
+        tmp_path
+        / ".depth-surge-reservations-v1"
+        / f"d-p-none-r-{'cd' * 16}-encoding_input_manifest-{'ef' * 16}.json"
+    )
+    descriptor.parent.mkdir(parents=True)
+    temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
+    foreign = b"not-a-descriptor-prefix"
+    temporary.write_bytes(foreign)
+
+    with pytest.raises(reservation_protocol.ReservationConflictError, match="prefix"):
+        _create_transaction(tmp_path)
+
+    assert temporary.read_bytes() == foreign
+    assert not descriptor.exists()
+
+
+def test_index_owned_extent_descriptor_preserves_a_complete_foreign_intent(
+    tmp_path: Path,
+) -> None:
+    descriptor = (
+        tmp_path
+        / ".depth-surge-reservations-v1"
+        / f"d-p-none-r-{'cd' * 16}-encoding_input_manifest-{'ef' * 16}.json"
+    )
+    descriptor.parent.mkdir(parents=True)
+    temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
+    foreign = reservation_protocol.canonical_json_bytes(
+        {"algorithm_version": "foreign-descriptor-v1"}
+    )
+    reservation_protocol._write_control_temporary(temporary, foreign, event=None)
+
+    with pytest.raises(reservation_protocol.ReservationConflictError, match="prefix"):
+        _create_transaction(tmp_path)
+
+    assert temporary.read_bytes() == foreign
+    assert not descriptor.exists()
 
 
 def test_streamed_prefix_consumption_never_requires_a_payload_bytes_object(tmp_path: Path) -> None:
@@ -673,6 +946,32 @@ def test_job_control_temporary_from_another_root_is_never_promoted(tmp_path: Pat
 
     assert temporary.is_file()
     assert not (target_root / "job-control-v1.json").exists()
+
+
+def test_job_control_candidate_preserves_an_unindexed_nested_prune_marker(
+    tmp_path: Path,
+) -> None:
+    control = _job_control(tmp_path)
+    temporary = tmp_path / ".job-control-v1.json.create-new.tmp"
+    reservation_protocol._write_control_temporary(
+        temporary,
+        reservation_protocol.canonical_json_bytes(control.to_object()),
+        event=None,
+    )
+    parent = tmp_path / "00_original_frames"
+    parent.mkdir()
+    marker = parent / ".depth-surge-prune-v2-foreign.json"
+    marker.write_bytes(b"foreign-marker")
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="unindexed reserved payload",
+    ):
+        reservation_protocol.load_job_control(tmp_path)
+
+    assert marker.read_bytes() == b"foreign-marker"
+    assert temporary.is_file()
+    assert not (tmp_path / "job-control-v1.json").exists()
 
 
 def test_fixed_settings_locator_never_adopts_a_legacy_glob_match(tmp_path: Path) -> None:

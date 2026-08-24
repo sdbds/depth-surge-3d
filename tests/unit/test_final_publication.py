@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -19,6 +20,7 @@ from src.depth_surge_3d.rendering.quality.cleanup_transaction import (
 from src.depth_surge_3d.processing.video.final_publication import (
     EncodingInputPublicationSource,
     FinalMediaAuditDispositionV1,
+    FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
     FinalPublicationTransactionV4,
     InjectedFinalPublicationCrash,
     build_final_video_manifest_v4,
@@ -727,6 +729,75 @@ def test_schema5_cleanup_rejects_missing_final_index_without_mutation(tmp_path) 
     assert settings_path.read_bytes() == settings_before
 
 
+@pytest.mark.parametrize("temporary_only", [False, True])
+def test_global_recovery_rejects_an_unindexed_final_target_descriptor_pair(
+    tmp_path,
+    temporary_only,
+) -> None:
+    artifact = _producer_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation_dir = tmp_path / ".depth-surge-reservations-v1"
+    descriptor = reservation_dir / f"final-video-target-p-{'44' * 16}-r-{'55' * 16}.json"
+    if temporary_only:
+        descriptor = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
+    descriptor.write_bytes(b'{"unindexed":true}')
+    settings_before = (tmp_path / "processing-settings-v5.json").read_bytes()
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="unindexed reservation artifact",
+    ):
+        recover_processing_control_prefix_v1(
+            tmp_path,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert descriptor.read_bytes() == b'{"unindexed":true}'
+    assert (tmp_path / "processing-settings-v5.json").read_bytes() == settings_before
+
+
+@pytest.mark.parametrize(
+    ("relative_parent", "reserved_name"),
+    [
+        (
+            "00_original_frames",
+            f".depth-surge-r-{'55' * 16}-encoding_input_manifest-{'66' * 16}.reserved",
+        ),
+        (
+            "04_stereo_diagnostics",
+            f".depth-surge-r-{'55' * 16}-diagnostics_payload_pruned-{'66' * 16}.reserved",
+        ),
+        ("00_original_frames", ".depth-surge-prune-v2-foreign.json"),
+    ],
+)
+def test_global_recovery_rejects_an_unindexed_nested_reserved_payload(
+    tmp_path,
+    relative_parent,
+    reserved_name,
+) -> None:
+    artifact = _producer_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    parent = tmp_path / relative_parent
+    parent.mkdir(parents=True, exist_ok=True)
+    reserved = parent / reserved_name
+    reserved.write_bytes(b"foreign-reservation")
+    settings_before = (tmp_path / "processing-settings-v5.json").read_bytes()
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="unindexed reserved payload",
+    ):
+        recover_processing_control_prefix_v1(
+            tmp_path,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert reserved.read_bytes() == b"foreign-reservation"
+    assert (tmp_path / "processing-settings-v5.json").read_bytes() == settings_before
+
+
 @pytest.mark.parametrize(
     "stop_event",
     [
@@ -770,6 +841,77 @@ def test_final_reservation_construction_recovers_every_indexed_prefix(tmp_path, 
     assert recovered.input_manifest_transaction is not None
     assert recovered.final_manifest_transaction is not None
     assert recovered.observe().phase == "ready_pre_video"
+
+
+def test_final_target_descriptor_rewrites_an_index_owned_partial_temporary(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = _producer_artifact()
+    _install_schema5_job(tmp_path, artifact)
+
+    def stop(value: str) -> None:
+        if value == "index:published":
+            raise RuntimeError(value)
+
+    with pytest.raises(RuntimeError, match="index:published"):
+        prepare_final_encoding_reservation_v1(
+            job_root=tmp_path,
+            settings=artifact,
+            publication_generation="44" * 16,
+            input_manifest_raw_max=4096,
+            final_manifest_raw_max=4096,
+            allocation_unit=4096,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+            reservation_generation="55" * 16,
+            input_reservation_id="66" * 16,
+            final_reservation_id="77" * 16,
+            event=stop,
+        )
+
+    index = json.loads((tmp_path / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).read_text(
+        encoding="ascii"
+    ))
+    descriptor = tmp_path / index["final_video_target_descriptor_relative_path"]
+    temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
+    original = reservation_protocol._write_control_temporary
+
+    def interrupt_descriptor(path: Path, raw: bytes, *, event):
+        if path == temporary:
+            with path.open("xb", buffering=0) as handle:
+                prefix = raw[: max(1, min(37, len(raw) - 1))]
+                assert handle.write(prefix) == len(prefix)
+                handle.flush()
+                os.fsync(handle.fileno())
+            raise OSError("injected target descriptor short write")
+        return original(path, raw, event=event)
+
+    monkeypatch.setattr(
+        reservation_protocol,
+        "_write_control_temporary",
+        interrupt_descriptor,
+    )
+    with pytest.raises(OSError, match="short write"):
+        load_final_encoding_reservation_v1(
+            tmp_path,
+            artifact,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+    prefix = temporary.read_bytes()
+    monkeypatch.setattr(reservation_protocol, "_write_control_temporary", original)
+
+    recovered = load_final_encoding_reservation_v1(
+        tmp_path,
+        artifact,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+
+    assert recovered.target_descriptor_path.is_file()
+    assert recovered.target_descriptor_path.read_bytes().startswith(prefix)
+    assert not temporary.exists()
 
 
 def test_reserved_publication_retires_descriptors_then_index_last(tmp_path) -> None:
@@ -1414,18 +1556,20 @@ def test_terminal_failure_discards_descriptor_temporaries_and_zero_placeholders(
     )
     descriptor = tmp_path / entry["descriptor_relative_path"]
     source = tmp_path / entry["source_extent_relative_path"]
+    descriptor_raw = descriptor.read_bytes()
     descriptor.unlink()
     source.unlink()
     (tmp_path / entry["target_relative_path"]).unlink()
     descriptor_temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
-    descriptor_temporary.write_bytes(b'{"partial":')
+    descriptor_temporary.write_bytes(descriptor_raw)
     target_descriptor = reservation.target_descriptor_path
+    target_descriptor_raw = target_descriptor.read_bytes()
     target_descriptor.unlink()
     reservation.final_video_path.unlink()
     target_descriptor_temporary = target_descriptor.with_name(
         f".{target_descriptor.name}.create-new.tmp"
     )
-    target_descriptor_temporary.write_bytes(b'{"partial":')
+    target_descriptor_temporary.write_bytes(target_descriptor_raw)
     failed = artifact.failed(
         terminal_at="2026-08-24T12:35:00.000000Z",
         diagnostic_code="FINAL_ENCODING_FAILED",
@@ -1710,6 +1854,128 @@ def test_failed_retirement_validates_target_descriptor_before_deleting_owned_pat
     assert reservation.index_path.is_file()
 
 
+@pytest.mark.parametrize("descriptor_kind", ["extent", "final-target"])
+def test_failed_retirement_rejects_a_foreign_both_present_descriptor_temporary(
+    tmp_path,
+    descriptor_kind,
+) -> None:
+    artifact = _artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    transaction = reservation.input_manifest_transaction
+    assert transaction is not None
+    descriptor = (
+        transaction.descriptor_path
+        if descriptor_kind == "extent"
+        else reservation.target_descriptor_path
+    )
+    temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
+    foreign = canonical_json_bytes({"algorithm_version": "foreign-descriptor-v1"})
+    temporary.write_bytes(foreign)
+    reservation.sibling_path.write_bytes(b"partial-video")
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    source_before = transaction.source_path.read_bytes()
+
+    with pytest.raises(reservation_protocol.ReservationConflictError):
+        recover_final_encoding_terminal_retirement_v1(
+            tmp_path,
+            failed,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert temporary.read_bytes() == foreign
+    assert descriptor.is_file()
+    assert transaction.source_path.read_bytes() == source_before
+    assert reservation.sibling_path.read_bytes() == b"partial-video"
+    assert reservation.index_path.is_file()
+
+
+@pytest.mark.parametrize("descriptor_kind", ["extent", "final-target"])
+def test_failed_retirement_preserves_a_foreign_temp_only_descriptor(
+    tmp_path,
+    descriptor_kind,
+) -> None:
+    artifact = _artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    transaction = reservation.input_manifest_transaction
+    assert transaction is not None
+    if descriptor_kind == "extent":
+        descriptor = transaction.descriptor_path
+        transaction.source_path.unlink()
+        transaction.target_path.unlink()
+    else:
+        descriptor = reservation.target_descriptor_path
+        reservation.final_video_path.unlink()
+    descriptor.unlink()
+    temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
+    foreign = b'{"foreign":true}'
+    temporary.write_bytes(foreign)
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    final_transaction = reservation.final_manifest_transaction
+    assert final_transaction is not None
+    unrelated_source_before = final_transaction.source_path.read_bytes()
+
+    with pytest.raises(reservation_protocol.ReservationConflictError):
+        recover_final_encoding_terminal_retirement_v1(
+            tmp_path,
+            failed,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert temporary.read_bytes() == foreign
+    assert reservation.index_path.is_file()
+    assert final_transaction.source_path.read_bytes() == unrelated_source_before
+
+
 def test_failed_retirement_keeps_index_temporary_until_full_preflight_passes(
     tmp_path,
 ) -> None:
@@ -1984,7 +2250,7 @@ def test_failed_retirement_rejects_nonempty_owned_placeholder_before_any_mutatio
     assert reservation.index_path.is_file()
 
 
-def test_failed_retirement_rejects_descriptor_temporary_with_source_before_mutation(
+def test_failed_retirement_normalizes_descriptor_prefix_before_source_retirement(
     tmp_path,
 ) -> None:
     artifact = _producer_artifact()
@@ -2007,7 +2273,9 @@ def test_failed_retirement_rejects_descriptor_temporary_with_source_before_mutat
     descriptor_temporary = transaction.descriptor_path.with_name(
         f".{transaction.descriptor_path.name}.create-new.tmp"
     )
-    transaction.descriptor_path.replace(descriptor_temporary)
+    descriptor_raw = transaction.descriptor_path.read_bytes()
+    transaction.descriptor_path.unlink()
+    descriptor_temporary.write_bytes(descriptor_raw[: len(descriptor_raw) // 2])
     reservation.sibling_path.write_bytes(b"partial-video")
     failed = artifact.failed(
         terminal_at="2026-08-24T12:35:00.000000Z",
@@ -2021,12 +2289,90 @@ def test_failed_retirement_rejects_descriptor_temporary_with_source_before_mutat
         allocation_adapter=_test_allocation,
         allocation_counter=_test_allocation_counter,
     )
-    temporary_before = descriptor_temporary.read_bytes()
-    source_before = transaction.source_path.read_bytes()
+    entry_position = reservation.index.extent_entries.index(
+        next(
+            entry
+            for entry in reservation.index.extent_entries
+            if entry["reservation_kind"] == "encoding_input_manifest"
+        )
+    )
 
     with pytest.raises(
-        reservation_protocol.ReservationConflictError,
-        match="descriptor temporary.*source",
+        InjectedFinalPublicationCrash,
+        match=f"failure-retirement:{entry_position}:source",
+    ):
+        recover_final_encoding_terminal_retirement_v1(
+            tmp_path,
+            failed,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+            crash_at=f"failure-retirement:{entry_position}:source",
+        )
+
+    assert transaction.descriptor_path.read_bytes() == descriptor_raw
+    assert not descriptor_temporary.exists()
+    assert not transaction.source_path.exists()
+    assert not reservation.sibling_path.exists()
+    assert reservation.index_path.is_file()
+
+    assert recover_final_encoding_terminal_retirement_v1(
+        tmp_path,
+        failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    assert not transaction.descriptor_path.exists()
+    assert not reservation.index_path.exists()
+
+
+def test_failed_retirement_readonly_preflight_never_repairs_an_early_short_source(
+    tmp_path,
+) -> None:
+    artifact = _producer_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    transaction = reservation.input_manifest_transaction
+    assert transaction is not None
+    descriptor_raw = transaction.descriptor_path.read_bytes()
+    descriptor_temporary = transaction.descriptor_path.with_name(
+        f".{transaction.descriptor_path.name}.create-new.tmp"
+    )
+    transaction.descriptor_path.unlink()
+    descriptor_temporary.write_bytes(descriptor_raw[:37])
+    transaction.source_path.write_bytes(b"\x00")
+    final_transaction = reservation.final_manifest_transaction
+    assert final_transaction is not None
+    final_transaction.target_path.write_bytes(b"foreign")
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    prefix_before = descriptor_temporary.read_bytes()
+    later_target_before = final_transaction.target_path.read_bytes()
+
+    with pytest.raises(
+        reservation_protocol.ReservationIncompleteError,
+        match="read-only validation",
     ):
         recover_final_encoding_terminal_retirement_v1(
             tmp_path,
@@ -2035,9 +2381,9 @@ def test_failed_retirement_rejects_descriptor_temporary_with_source_before_mutat
             allocation_counter=_test_allocation_counter,
         )
 
-    assert descriptor_temporary.read_bytes() == temporary_before
-    assert transaction.source_path.read_bytes() == source_before
-    assert reservation.sibling_path.read_bytes() == b"partial-video"
+    assert descriptor_temporary.read_bytes() == prefix_before
+    assert transaction.source_path.read_bytes() == b"\x00"
+    assert final_transaction.target_path.read_bytes() == later_target_before
     assert reservation.index_path.is_file()
 
 

@@ -386,7 +386,11 @@ def _open_relative_regular_file(
         close_handle(wintypes.HANDLE(raw_parent))
 
 
-def _read_bounded_regular_file(path: Path, *, max_bytes: int) -> bytes:
+def _read_bounded_regular_file_with_identity(
+    path: Path,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, ReservationFileIdentity, DirectoryIdentity]:
     if max_bytes <= 0:
         raise ValueError("bounded read limit must be positive")
     try:
@@ -394,7 +398,7 @@ def _read_bounded_regular_file(path: Path, *, max_bytes: int) -> bytes:
             path,
             writable=False,
             create=False,
-        ) as (handle, _identity_value, _parent_identity):
+        ) as (handle, identity, parent_identity):
             assert isinstance(handle, BufferedIOBase) or hasattr(handle, "read")
             size = os.fstat(handle.fileno()).st_size
             if size > max_bytes:
@@ -402,13 +406,21 @@ def _read_bounded_regular_file(path: Path, *, max_bytes: int) -> bytes:
             raw = handle.read(size + 1)
             if len(raw) != size:
                 raise ReservationConflictError("control artifact changed during bounded read")
-            return raw
+            return raw, identity, parent_identity
     except FileNotFoundError:
         raise
     except OSError as error:
         if getattr(error, "winerror", None) in {2, 3} or error.errno == errno.ENOENT:
             raise FileNotFoundError(path) from error
         raise
+
+
+def _read_bounded_regular_file(path: Path, *, max_bytes: int) -> bytes:
+    raw, _identity_value, _parent_identity = _read_bounded_regular_file_with_identity(
+        path,
+        max_bytes=max_bytes,
+    )
+    return raw
 
 
 def _write_control_temporary(
@@ -436,6 +448,30 @@ def _write_control_temporary(
         if os.fstat(handle.fileno()).st_size != len(raw):
             raise ReservationConflictError("control temporary EOF changed")
         return identity, parent_identity
+
+
+def _sync_complete_control_temporary(
+    path: Path,
+    raw: bytes,
+) -> tuple[ReservationFileIdentity, DirectoryIdentity]:
+    """Make an authenticated complete temporary durable before promotion."""
+
+    with _open_relative_regular_file(
+        path,
+        writable=True,
+        create=False,
+    ) as (handle, identity, parent_identity):
+        size = os.fstat(handle.fileno()).st_size
+        if size != len(raw):
+            raise ReservationConflictError("complete control temporary EOF changed")
+        handle.seek(0)
+        if handle.read(size + 1) != raw:
+            raise ReservationConflictError("complete control temporary bytes changed")
+        handle.flush()
+        os.fsync(handle.fileno())
+    if _read_bounded_regular_file(path, max_bytes=max(len(raw), 1)) != raw:
+        raise ReservationConflictError("complete control temporary failed reopen validation")
+    return identity, parent_identity
 
 
 def _unlink_safe_control_temporary(
@@ -537,19 +573,25 @@ def _write_json_file(path: Path, payload: dict, *, event: Callable[[str], None] 
     if path.exists() or path.is_symlink():
         if _read_bounded_regular_file(path, max_bytes=max(len(raw), 1)) != raw:
             raise ReservationConflictError(f"authoritative control artifact differs: {path}")
-        _unlink_safe_control_temporary(temporary)
+        if temporary.exists() or temporary.is_symlink():
+            _temporary_raw, temporary_identity, parent_identity = (
+                _read_bounded_regular_file_with_identity(
+                    temporary,
+                    max_bytes=max(len(raw), 1),
+                )
+            )
+            _unlink_safe_control_temporary(
+                temporary,
+                expected_identity=temporary_identity,
+                expected_parent_identity=parent_identity,
+            )
         return
     if temporary.exists() or temporary.is_symlink():
         if _read_bounded_regular_file(temporary, max_bytes=max(len(raw), 1)) != raw:
             raise ReservationIncompleteError(
                 f"control temporary is an incomplete durable prefix: {temporary}"
             )
-        with _open_relative_regular_file(
-            temporary,
-            writable=False,
-            create=False,
-        ) as (_handle, source_identity, parent_identity):
-            pass
+        source_identity, parent_identity = _sync_complete_control_temporary(temporary, raw)
         same_parent_replace_v1(
             temporary,
             path,
@@ -584,6 +626,101 @@ def _write_json_file(path: Path, payload: dict, *, event: Callable[[str], None] 
         raise ReservationConflictError(f"published control artifact failed reopen: {path}")
     if event is not None:
         event("index:published")
+
+
+def publish_index_owned_descriptor_v1(
+    path: Path,
+    payload: dict,
+    *,
+    validate_authority: Callable[[], None],
+    event: Callable[[str], None] | None = None,
+) -> None:
+    """Publish one descriptor, repairing only an authenticated partial temp."""
+
+    if not callable(validate_authority):
+        raise TypeError("index-owned descriptor validation must be callable")
+    path = Path(path)
+    raw = canonical_json_bytes(payload)
+    temporary = path.with_name(f".{path.name}.create-new.tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() or path.is_symlink():
+        if _read_bounded_regular_file(path, max_bytes=max(len(raw), 1)) != raw:
+            raise ReservationConflictError(f"authoritative descriptor differs: {path}")
+        if temporary.exists() or temporary.is_symlink():
+            temporary_raw, temporary_identity, parent_identity = (
+                _read_bounded_regular_file_with_identity(
+                    temporary,
+                    max_bytes=max(len(raw), 1),
+                )
+            )
+            if temporary_raw != raw:
+                raise ReservationConflictError(
+                    "indexed descriptor has a foreign deterministic temporary"
+                )
+            _unlink_safe_control_temporary(
+                temporary,
+                expected_identity=temporary_identity,
+                expected_parent_identity=parent_identity,
+            )
+        return
+
+    if temporary.exists() or temporary.is_symlink():
+        with _open_relative_regular_file(
+            temporary,
+            writable=True,
+            create=False,
+        ) as (handle, source_identity, parent_identity):
+            size = os.fstat(handle.fileno()).st_size
+            if size > len(raw):
+                raise ReservationConflictError(
+                    "indexed descriptor temporary exceeds its canonical payload"
+                )
+            existing = handle.read(size + 1)
+            if len(existing) != size:
+                raise ReservationConflictError(
+                    "indexed descriptor temporary changed during validation"
+                )
+            if existing != raw:
+                if len(existing) >= len(raw) or not raw.startswith(existing):
+                    raise ReservationConflictError(
+                        "indexed descriptor temporary is not the deterministic payload prefix"
+                    )
+            validate_authority()
+            if existing != raw:
+                handle.seek(0)
+                handle.truncate(0)
+                for offset in range(0, len(raw), CONTROL_ARTIFACT_WRITE_CHUNK_BYTES):
+                    chunk = raw[offset : offset + CONTROL_ARTIFACT_WRITE_CHUNK_BYTES]
+                    if handle.write(chunk) != len(chunk):
+                        raise OSError("short indexed descriptor rewrite")
+                if event is not None:
+                    event("descriptor:temporary-rewritten")
+            handle.flush()
+            os.fsync(handle.fileno())
+            if os.fstat(handle.fileno()).st_size != len(raw):
+                raise ReservationConflictError("indexed descriptor temporary EOF changed")
+        if _read_bounded_regular_file(temporary, max_bytes=max(len(raw), 1)) != raw:
+            raise ReservationConflictError(
+                "indexed descriptor temporary failed reopen validation"
+            )
+    else:
+        validate_authority()
+        source_identity, parent_identity = _write_control_temporary(
+            temporary,
+            raw,
+            event=event,
+        )
+
+    same_parent_replace_v1(
+        temporary,
+        path,
+        expected_source_identity=source_identity,
+        expected_target_identity=None,
+        expected_parent_identity=parent_identity,
+        replace_existing=False,
+    )
+    if _read_bounded_regular_file(path, max_bytes=max(len(raw), 1)) != raw:
+        raise ReservationConflictError("published indexed descriptor failed reopen")
 
 
 def publish_write_ahead_intent(
@@ -625,7 +762,17 @@ def recover_control_artifact_pair_v1(
                 f"authoritative control artifact is malformed: {path}"
             ) from error
         if temporary_present:
-            _unlink_safe_control_temporary(temporary)
+            _temporary_raw, temporary_identity, parent_identity = (
+                _read_bounded_regular_file_with_identity(
+                    temporary,
+                    max_bytes=max_bytes,
+                )
+            )
+            _unlink_safe_control_temporary(
+                temporary,
+                expected_identity=temporary_identity,
+                expected_parent_identity=parent_identity,
+            )
             _sync_parent(temporary.parent)
         return result
     raw = _read_bounded_regular_file(temporary, max_bytes=max_bytes)
@@ -646,12 +793,7 @@ def recover_control_artifact_pair_v1(
             raise ReservationConflictError(
                 f"control temporary prepublication validation failed: {temporary}"
             ) from error
-    with _open_relative_regular_file(
-        temporary,
-        writable=False,
-        create=False,
-    ) as (_handle, source_identity, parent_identity):
-        pass
+    source_identity, parent_identity = _sync_complete_control_temporary(temporary, raw)
     same_parent_replace_v1(
         temporary,
         path,
@@ -2070,6 +2212,8 @@ class ReservedArtifactTransaction:
         allocation_counter: AllocationCounter | None = None,
         expected_publication_method: PublicationMethod | None = None,
         event: Callable[[str], None] | None = None,
+        descriptor_publisher: Callable[..., None] = publish_index_owned_descriptor_v1,
+        materialize_missing: bool = True,
     ) -> ReservedArtifactTransaction:
         started = time.monotonic_ns()
         job_root = Path(job_root)
@@ -2180,6 +2324,10 @@ class ReservedArtifactTransaction:
                 raise ReservationConflictError("declared reservation placeholder is nonempty")
             placeholder_identity = _identity(target_path)
         elif publication_method == "replace_placeholder":
+            if not materialize_missing:
+                raise ReservationIncompleteError(
+                    "reservation placeholder is absent during read-only readiness validation"
+                )
             try:
                 with target_path.open("xb") as placeholder:
                     placeholder.flush()
@@ -2220,22 +2368,28 @@ class ReservedArtifactTransaction:
             else:
                 current_size = 0
                 open_mode = "x+b"
-            with source_path.open(open_mode) as handle:
-                handle.seek(current_size)
-                if event is not None:
-                    event("extent:created")
-                remaining = logical - current_size
-                zero_chunk = b"\x00" * RESERVATION_ZERO_FILL_CHUNK_BYTES
-                while remaining:
-                    chunk = zero_chunk[: min(remaining, len(zero_chunk))]
-                    written = handle.write(chunk)
-                    if written != len(chunk):
-                        raise OSError("short reservation zero fill")
-                    metrics.reservation_write_bytes += written
-                    remaining -= written
-                handle.flush()
-                os.fsync(handle.fileno())
-                metrics.reservation_fsync_count += 1
+            if not materialize_missing:
+                if current_size != logical:
+                    raise ReservationIncompleteError(
+                        "reservation source is not ready during read-only validation"
+                    )
+            else:
+                with source_path.open(open_mode) as handle:
+                    handle.seek(current_size)
+                    if event is not None:
+                        event("extent:created")
+                    remaining = logical - current_size
+                    zero_chunk = b"\x00" * RESERVATION_ZERO_FILL_CHUNK_BYTES
+                    while remaining:
+                        chunk = zero_chunk[: min(remaining, len(zero_chunk))]
+                        written = handle.write(chunk)
+                        if written != len(chunk):
+                            raise OSError("short reservation zero fill")
+                        metrics.reservation_write_bytes += written
+                        remaining -= written
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    metrics.reservation_fsync_count += 1
         except OSError as error:
             if error.errno == errno.ENOSPC or getattr(error, "winerror", None) == 112:
                 raise ReservationIncompleteError("reservation extent fill is incomplete") from error
@@ -2403,7 +2557,49 @@ class ReservedArtifactTransaction:
             marker_payload_sha256=marker_sha256,
         )
         descriptor_path = job_root / descriptor_relative
-        _write_json_file(descriptor_path, descriptor.to_object(), event=None)
+
+        def validate_descriptor_authority() -> None:
+            if _read_bounded_regular_file(index_path, max_bytes=1024 * 1024) != index_raw:
+                raise ReservationConflictError(
+                    "reservation index changed before descriptor publication"
+                )
+            if (
+                not source_path.is_file()
+                or source_path.is_symlink()
+                or _identity(source_path) != source_identity
+                or source_path.stat(follow_symlinks=False).st_size != logical
+            ):
+                raise ReservationConflictError(
+                    "reservation source changed before descriptor publication"
+                )
+            if publication_method == "replace_placeholder":
+                if (
+                    placeholder_identity is None
+                    or not target_path.is_file()
+                    or target_path.is_symlink()
+                    or _identity(target_path) != placeholder_identity
+                    or target_path.stat(follow_symlinks=False).st_size != 0
+                ):
+                    raise ReservationConflictError(
+                        "reservation placeholder changed before descriptor publication"
+                    )
+            else:
+                current_hash, current_count = _stream_file_sha256_count(target_path)
+                if (
+                    old_target_identity is None
+                    or _identity(target_path) != old_target_identity
+                    or current_count != old_target_byte_count
+                    or current_hash != old_target_sha256
+                ):
+                    raise ReservationConflictError(
+                        "existing reservation target changed before descriptor publication"
+                    )
+
+        descriptor_publisher(
+            descriptor_path,
+            descriptor.to_object(),
+            validate_authority=validate_descriptor_authority,
+        )
         if event is not None:
             event("descriptor:published")
         metrics.reservation_wall_time_ms = (time.monotonic_ns() - started) // 1_000_000
@@ -3151,6 +3347,40 @@ def publish_job_control(job_root: Path, control: JobControlV1) -> None:
     publish_write_ahead_intent(job_root / JOB_CONTROL_RELATIVE_PATH, control.to_object())
 
 
+_FINAL_ENCODING_RESERVED_PAYLOAD_PARENTS_V1 = (
+    "00_original_frames",
+    "01_scene_data",
+    "02_depth_raw",
+    "03_disparity_maps",
+    "03_metric_geometry",
+    "03_disparity_stabilized",
+    "04_left_frames",
+    "04_right_frames",
+    "05_left_distorted",
+    "05_right_distorted",
+    "06_left_cropped",
+    "06_right_cropped",
+    "07_left_upscaled",
+    "07_right_upscaled",
+    "99_vr_frames",
+    "04_stereo_diagnostics",
+    "04_stereo_diagnostics/frames",
+)
+
+
+def _iter_reserved_payload_parents_v1(root: Path):
+    yield PurePosixPath("."), root
+    for relative in _FINAL_ENCODING_RESERVED_PAYLOAD_PARENTS_V1:
+        path = root / relative
+        if not (path.exists() or path.is_symlink()):
+            continue
+        if path.is_symlink() or not path.is_dir():
+            raise ReservationConflictError(
+                f"reserved payload parent is unsafe: {relative}"
+            )
+        yield PurePosixPath(relative), path
+
+
 def _assert_job_control_candidate_has_no_downstream(job_root: Path) -> None:
     root = Path(job_root)
     fixed = root / SETTINGS_ARTIFACT_RELATIVE_PATH
@@ -3167,14 +3397,17 @@ def _assert_job_control_candidate_has_no_downstream(job_root: Path) -> None:
                 raise ReservationConflictError(
                     "job control candidate has unindexed reservation artifacts"
                 )
-    with os.scandir(root) as entries:
-        for entry in entries:
-            if entry.name.startswith(".depth-surge-r-") or entry.name.startswith(
-                ".depth-surge-final-v4-"
-            ):
-                raise ReservationConflictError(
-                    "job control candidate has an unindexed reserved payload"
-                )
+    for _relative_parent, parent in _iter_reserved_payload_parents_v1(root):
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                if (
+                    entry.name.startswith(".depth-surge-r-")
+                    or entry.name.startswith(".depth-surge-final-v4-")
+                    or entry.name.startswith(".depth-surge-prune-v2-")
+                ):
+                    raise ReservationConflictError(
+                        "job control candidate has an unindexed reserved payload"
+                    )
 
 
 def assert_only_job_control_owned_reservations_v1(
@@ -3205,17 +3438,24 @@ def assert_only_job_control_owned_reservations_v1(
                     raise ReservationConflictError(
                         f"unindexed reservation artifact is present: {relative}"
                     )
-    with os.scandir(root) as entries:
-        for entry in entries:
-            if not (
-                entry.name.startswith(".depth-surge-r-")
-                or entry.name.startswith(".depth-surge-final-v4-")
-            ):
-                continue
-            if PurePosixPath(entry.name).as_posix() not in allowed:
-                raise ReservationConflictError(
-                    f"unindexed reserved payload is present: {entry.name}"
-                )
+    for relative_parent, parent in _iter_reserved_payload_parents_v1(root):
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                if not (
+                    entry.name.startswith(".depth-surge-r-")
+                    or entry.name.startswith(".depth-surge-final-v4-")
+                    or entry.name.startswith(".depth-surge-prune-v2-")
+                ):
+                    continue
+                relative = (
+                    PurePosixPath(entry.name)
+                    if relative_parent == PurePosixPath(".")
+                    else relative_parent / entry.name
+                ).as_posix()
+                if relative not in allowed:
+                    raise ReservationConflictError(
+                        f"unindexed reserved payload is present: {relative}"
+                    )
 
 
 def assert_index_owned_reservation_namespace_v1(
@@ -3245,7 +3485,9 @@ def assert_index_owned_reservation_namespace_v1(
         source_path = root / source.as_posix()
         local_names.setdefault(source_path.parent, set()).add(source_path.name)
         if entry["reservation_kind"] == "prune_marker":
-            target = root / entry["target_relative_path"]
+            target_relative = PurePosixPath(entry["target_relative_path"])
+            allowed.add(target_relative.as_posix())
+            target = root / target_relative.as_posix()
             local_names.setdefault(target.parent, set()).add(target.name)
     assert_only_job_control_owned_reservations_v1(
         root,

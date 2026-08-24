@@ -157,6 +157,55 @@ def test_quality_file_pipeline_uses_one_slot_and_publishes_compact_diagnostics(
     assert (tmp_path / "04_stereo_diagnostics" / "stereo_coverage_summary.json").exists()
 
 
+def test_writer_queue_keeps_serialized_stats_not_dense_histograms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame_files, depth_files, directories = _make_file_inputs(
+        tmp_path,
+        count=1,
+        frame_shape=(8, 16),
+        depth_shape=(4, 8),
+    )
+    calling_thread = threading.get_ident()
+    original_prepare = stereo_generator.prepare_quality_frame
+    original_publish = stereo_generator.publish_quality_frame
+    prepared_threads: list[int] = []
+    published_threads: list[int] = []
+
+    def prepare(publication):
+        prepared_threads.append(threading.get_ident())
+        return original_prepare(publication)
+
+    def publish(publication):
+        published_threads.append(threading.get_ident())
+        assert not hasattr(publication, "compact")
+        assert isinstance(publication.stats_raw, bytes)
+        assert not any(
+            isinstance(value, np.ndarray) and value.dtype == np.uint64 and value.ndim == 1
+            for value in vars(publication).values()
+        )
+        return original_publish(publication)
+
+    monkeypatch.setattr(stereo_generator, "prepare_quality_frame", prepare)
+    monkeypatch.setattr(stereo_generator, "publish_quality_frame", publish)
+
+    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_files(
+        frame_files,
+        depth_files,
+        directories,
+        _settings(
+            stereo_render_mode="quality",
+            occlusion_fill_max_px=8,
+            stereo_strength=0.0,
+            keep_intermediates=True,
+        ),
+    )
+    assert prepared_threads == [calling_thread]
+    assert len(published_threads) == 1
+    assert published_threads[0] != calling_thread
+
+
 def test_quality_resume_rebuilds_damaged_aggregates_without_rerendering(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

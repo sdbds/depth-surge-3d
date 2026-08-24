@@ -81,11 +81,46 @@ class MetricStereoPrimitiveInput:
 
 
 @dataclass(frozen=True)
+class DenseHistogramPairs:
+    """Canonical `[bucket,count]` pairs backed by one dense uint64 array."""
+
+    bins: np.ndarray
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.bins, np.ndarray)
+            or self.bins.dtype != np.uint64
+            or self.bins.ndim != 1
+            or not self.bins.flags.c_contiguous
+        ):
+            raise TypeError("dense histogram bins must be contiguous one-dimensional uint64")
+
+
+@dataclass(frozen=True)
 class HoleRunDiagnostics:
     """Bounded per-eye histograms collected without retaining fine lanes."""
 
-    lane_count_histogram: tuple[tuple[int, int], ...]
-    touched_pixel_span_histogram: tuple[tuple[int, int], ...]
+    lane_count_histogram: np.ndarray
+    touched_pixel_span_histogram: np.ndarray
+
+    def __post_init__(self) -> None:
+        lane = self.lane_count_histogram
+        span = self.touched_pixel_span_histogram
+        for name, value in (
+            ("lane_count_histogram", lane),
+            ("touched_pixel_span_histogram", span),
+        ):
+            if (
+                not isinstance(value, np.ndarray)
+                or value.dtype != np.uint64
+                or value.ndim != 1
+                or not value.flags.c_contiguous
+            ):
+                raise TypeError(f"{name} must be a contiguous one-dimensional uint64 array")
+        if lane.size != 16 * span.size:
+            raise ValueError("hole-run histogram widths disagree")
+        lane.setflags(write=False)
+        span.setflags(write=False)
 
 
 @dataclass(frozen=True)

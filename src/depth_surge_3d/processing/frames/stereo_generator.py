@@ -37,12 +37,14 @@ from ...rendering.stereo_renderer import (
 )
 from ...rendering.quality.diagnostic_transaction import (
     DiagnosticsStageContext,
+    PreparedQualityFramePublication,
     QualityFramePublication,
     audit_diagnostics_stage,
     begin_diagnostics_stage,
     canonical_json_bytes,
     complete_diagnostics_stage,
     migrate_frame_manifests_sync,
+    prepare_quality_frame,
     publish_quality_frame,
 )
 from ...rendering.quality.renderer import (
@@ -50,7 +52,6 @@ from ...rendering.quality.renderer import (
     render_relative_quality_compact,
 )
 from ...rendering.quality.types import (
-    CompactStereoRenderResult,
     MetricStereoPrimitiveInput,
     QualityStereoControls,
     RelativeStereoPrimitiveInput,
@@ -398,7 +399,7 @@ class _WriteItem:
     left_image: np.ndarray
     right_image: np.ndarray
     projection_stats: MetricProjectionStats | None = None
-    compact_result: CompactStereoRenderResult | None = None
+    quality_publication: PreparedQualityFramePublication | None = None
     geometry_mode: str = "relative"
     occlusion_fill: Literal["none", "background"] = "background"
     rgb_stage_fingerprint: str = ""
@@ -450,23 +451,8 @@ def _stereo_creation_failed(error: Exception) -> bool:
 
 def _write_pair(item: _WriteItem) -> None:
     try:
-        if item.compact_result is not None:
-            publish_quality_frame(
-                QualityFramePublication(
-                    job_root=item.work.left_path.parent.parent,
-                    frame_name=item.work.frame_name,
-                    left_rgb_path=item.work.left_path,
-                    right_rgb_path=item.work.right_path,
-                    compact=item.compact_result,
-                    geometry_mode=(
-                        "metric" if item.geometry_mode == "metric_camera" else "relative"
-                    ),
-                    occlusion_fill=item.occlusion_fill,
-                    rgb_stage_fingerprint=item.rgb_stage_fingerprint,
-                    keep_masks=item.keep_masks,
-                    render_mode=item.render_mode,
-                )
-            )
+        if item.quality_publication is not None:
+            publish_quality_frame(item.quality_publication)
         else:
             _atomic_write_png(item.work.left_path, item.left_image)
             _atomic_write_png(item.work.right_path, item.right_image)
@@ -489,7 +475,7 @@ def _write_pair(item: _WriteItem) -> None:
         item.work.right_path.unlink(missing_ok=True)
         if item.work.stat_path is not None:
             item.work.stat_path.unlink(missing_ok=True)
-        if item.compact_result is not None:
+        if item.quality_publication is not None:
             diagnostic_dir = (
                 item.work.left_path.parent.parent
                 / "04_stereo_diagnostics"
@@ -777,16 +763,34 @@ class _StereoFilePipeline:
         if compact is not None:
             left_image = compact.left_image
             right_image = compact.right_image
+            quality_publication = prepare_quality_frame(
+                QualityFramePublication(
+                    job_root=message.work.left_path.parent.parent,
+                    frame_name=message.work.frame_name,
+                    left_rgb_path=message.work.left_path,
+                    right_rgb_path=message.work.right_path,
+                    compact=compact,
+                    geometry_mode=(
+                        "metric" if self.geometry_mode == "metric_camera" else "relative"
+                    ),
+                    occlusion_fill=self.occlusion_fill,
+                    rgb_stage_fingerprint=self.rgb_stage_fingerprint,
+                    keep_masks=self.keep_masks,
+                    render_mode=self.render_mode,
+                )
+            )
+            del compact
         else:
             assert result is not None
             left_image = result.left_image
             right_image = result.right_image
+            quality_publication = None
         return _WriteItem(
             work=message.work,
             left_image=left_image,
             right_image=right_image,
             projection_stats=projection_stats,
-            compact_result=compact,
+            quality_publication=quality_publication,
             geometry_mode=self.geometry_mode,
             occlusion_fill=self.occlusion_fill,
             rgb_stage_fingerprint=self.rgb_stage_fingerprint,

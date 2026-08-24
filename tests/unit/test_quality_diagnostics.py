@@ -182,6 +182,49 @@ def test_quality_none_stats_stream_exact_hole_runs_without_a_repair_plan() -> No
         assert eye_stats["quality_budgets"]["segment_record_count"] is None
 
 
+def test_frame_stats_keep_dense_histograms_until_canonical_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+    from src.depth_surge_3d.rendering.quality.diagnostics import (
+        build_quality_frame_stats,
+    )
+    from src.depth_surge_3d.rendering.quality.renderer import (
+        render_relative_quality_compact,
+    )
+    from src.depth_surge_3d.rendering.quality.types import DenseHistogramPairs
+
+    compact = render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=np.full((2, 32, 3), 100, dtype=np.uint8),
+        canonical=np.ones((1, 8), dtype=np.float32),
+        settings=StereoRenderSettings(
+            stereo_strength=5.0,
+            convergence=0.0,
+            occlusion_fill="none",
+            stereo_render_mode="quality",
+        ),
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.rendering.quality.diagnostics.np.flatnonzero",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("dense histogram expansion is forbidden")
+        ),
+    )
+
+    stats = build_quality_frame_stats(
+        compact,
+        frame_name="frame_000000",
+        geometry_mode="relative",
+        occlusion_fill="none",
+    )
+
+    dense = stats["eyes"]["left"]["hole_runs"]["lane_count_histogram"]
+    assert isinstance(dense, DenseHistogramPairs)
+    parsed = json.loads(diagnostic_transaction.canonical_json_bytes(stats))
+    assert isinstance(parsed["eyes"]["left"]["hole_runs"]["lane_count_histogram"], list)
+
+
 def test_diagnostics_consolidation_is_source_ordered_and_metadata_last(
     tmp_path: Path,
 ) -> None:

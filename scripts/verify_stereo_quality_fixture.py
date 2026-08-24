@@ -31,6 +31,9 @@ from src.depth_surge_3d.rendering.forward_splat import HORIZONTAL_SUBPIXELS  # n
 from src.depth_surge_3d.rendering.quality.diagnostics import (  # noqa: E402
     build_quality_frame_stats,
 )
+from src.depth_surge_3d.rendering.quality.diagnostic_transaction import (  # noqa: E402
+    canonical_json_bytes as diagnostics_canonical_json_bytes,
+)
 from src.depth_surge_3d.rendering.quality.renderer import (  # noqa: E402
     render_relative_quality_compact,
 )
@@ -586,11 +589,12 @@ def _mode_stats(
         occlusion_fill=fill,
         render_mode=render_mode,
     )
+    serialized_stats = json.loads(diagnostics_canonical_json_bytes(stats))
     return {
         "render_seconds": rendered.seconds,
         "left_pixel_sha256": _array_sha256(compact.left_image),
         "right_pixel_sha256": _array_sha256(compact.right_image),
-        "diagnostics": stats,
+        "diagnostics": serialized_stats,
     }
 
 

@@ -10,7 +10,12 @@ import numpy as np
 
 from ..forward_splat import HORIZONTAL_SUBPIXELS
 from .planner import QualityRepairPlan, QualityRepairPlanSummary
-from .types import CompactStereoRenderResult, FastEyeDiagnostics, HoleRunDiagnostics
+from .types import (
+    CompactStereoRenderResult,
+    DenseHistogramPairs,
+    FastEyeDiagnostics,
+    HoleRunDiagnostics,
+)
 
 
 _STATE_BITS = {
@@ -24,8 +29,19 @@ _STATE_BITS = {
 }
 
 
-def _linear_percentile_from_histogram(histogram: Counter[int], percentile: float) -> float:
-    total = sum(histogram.values())
+def _histogram_total(histogram: np.ndarray) -> int:
+    return int(np.sum(histogram, dtype=np.uint64))
+
+
+def _histogram_max(histogram: np.ndarray) -> int:
+    for value in range(int(histogram.size) - 1, -1, -1):
+        if int(histogram[value]):
+            return value
+    return 0
+
+
+def _linear_percentile_from_histogram(histogram: np.ndarray, percentile: float) -> float:
+    total = _histogram_total(histogram)
     if total == 0:
         return 0.0
     position = percentile * (total - 1)
@@ -34,8 +50,8 @@ def _linear_percentile_from_histogram(histogram: Counter[int], percentile: float
 
     def value_at(index: int) -> int:
         seen = 0
-        for value, count in sorted(histogram.items()):
-            seen += count
+        for value in range(int(histogram.size)):
+            seen += int(histogram[value])
             if index < seen:
                 return value
         raise RuntimeError("histogram index is outside its total")
@@ -49,12 +65,17 @@ def _prefill_run_histograms(
     plan: QualityRepairPlan | QualityRepairPlanSummary | None,
     width: int,
     streamed: HoleRunDiagnostics | None,
-) -> tuple[Counter, Counter]:
-    lane_histogram: Counter[int] = Counter()
-    span_histogram: Counter[int] = Counter()
+) -> tuple[np.ndarray, np.ndarray]:
+    lane_histogram = np.zeros(16 * (width + 1), dtype=np.uint64)
+    span_histogram = np.zeros(width + 1, dtype=np.uint64)
     if streamed is not None:
-        lane_histogram.update(dict(streamed.lane_count_histogram))
-        span_histogram.update(dict(streamed.touched_pixel_span_histogram))
+        if (
+            streamed.lane_count_histogram.shape != lane_histogram.shape
+            or streamed.touched_pixel_span_histogram.shape != span_histogram.shape
+        ):
+            raise ValueError("streamed hole-run histogram width changed")
+        lane_histogram[:] = streamed.lane_count_histogram
+        span_histogram[:] = streamed.touched_pixel_span_histogram
         return lane_histogram, span_histogram
     if plan is None or isinstance(plan, QualityRepairPlanSummary):
         return lane_histogram, span_histogram
@@ -74,17 +95,18 @@ def _prefill_run_histograms(
             continue
         if active_row >= 0:
             length = active_end - active_start + 1
-            lane_histogram[length] += 1
-            span_histogram[active_end // 16 - active_start // 16 + 1] += 1
+            lane_histogram[length] += np.uint64(1)
+            span_histogram[active_end // 16 - active_start // 16 + 1] += np.uint64(1)
         active_row, active_start, active_end = row, start, end
-    length = active_end - active_start + 1
-    lane_histogram[length] += 1
-    span_histogram[active_end // 16 - active_start // 16 + 1] += 1
+    if active_row >= 0:
+        length = active_end - active_start + 1
+        lane_histogram[length] += np.uint64(1)
+        span_histogram[active_end // 16 - active_start // 16 + 1] += np.uint64(1)
     return lane_histogram, span_histogram
 
 
-def _histogram_pairs(histogram: Counter[int]) -> list[list[int]]:
-    return [[int(value), int(count)] for value, count in sorted(histogram.items())]
+def _histogram_pairs(histogram: np.ndarray) -> DenseHistogramPairs:
+    return DenseHistogramPairs(histogram)
 
 
 def _backend_counts(
@@ -223,14 +245,14 @@ def _eye_stats(
         "state_pixel_counts": state_counts,
         "state_pixel_ratios": state_ratios,
         "hole_runs": {
-            "count": int(sum(lane_histogram.values())),
+            "count": _histogram_total(lane_histogram),
             "lane_count_histogram": _histogram_pairs(lane_histogram),
             "touched_pixel_span_histogram": _histogram_pairs(span_histogram),
-            "lane_count_max": int(max(lane_histogram, default=0)),
+            "lane_count_max": _histogram_max(lane_histogram),
             "lane_count_p95": lane_p95,
-            "touched_pixel_span_max": int(max(span_histogram, default=0)),
+            "touched_pixel_span_max": _histogram_max(span_histogram),
             "touched_pixel_span_p95": _linear_percentile_from_histogram(span_histogram, 0.95),
-            "physical_width_px_max": float(max(lane_histogram, default=0)) / 16.0,
+            "physical_width_px_max": float(_histogram_max(lane_histogram)) / 16.0,
             "physical_width_px_p95": lane_p95 / 16.0,
         },
         "backend_lane_counts": backend_lanes,
@@ -312,12 +334,40 @@ def build_quality_frame_stats(
 def _merge_histogram_pairs(
     eyes: list[dict[str, Any]],
     field: str,
-) -> Counter[int]:
-    merged: Counter[int] = Counter()
+) -> np.ndarray:
+    maximum = 0
     for eye in eyes:
-        for value, count in eye["hole_runs"][field]:
-            merged[int(value)] += int(count)
+        pairs = eye["hole_runs"][field]
+        if isinstance(pairs, DenseHistogramPairs):
+            maximum = max(maximum, int(pairs.bins.size) - 1)
+        else:
+            for value, _count in pairs:
+                maximum = max(maximum, int(value))
+    merged = np.zeros(maximum + 1, dtype=np.uint64)
+    for eye in eyes:
+        pairs = eye["hole_runs"][field]
+        if isinstance(pairs, DenseHistogramPairs):
+            merged[: pairs.bins.size] += pairs.bins
+            continue
+        for value, count in pairs:
+            merged[int(value)] += np.uint64(count)
     return merged
+
+
+def _add_histogram_pairs(
+    target: np.ndarray,
+    pairs: DenseHistogramPairs | list[list[int]],
+) -> None:
+    if isinstance(pairs, DenseHistogramPairs):
+        if pairs.bins.shape != target.shape:
+            raise ValueError("dense histogram width changed between frames")
+        target += pairs.bins
+        return
+    for bucket, count in pairs:
+        index = int(bucket)
+        if index < 0 or index >= target.size:
+            raise ValueError("histogram bucket is outside the render width")
+        target[index] += np.uint64(count)
 
 
 def _sum_named_counts(
@@ -435,14 +485,14 @@ def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, An
             name: float(state_counts[name]) / float(pixel_count) for name in state_names
         },
         "hole_runs": {
-            "count": int(sum(lane_histogram.values())),
+            "count": _histogram_total(lane_histogram),
             "lane_count_histogram": _histogram_pairs(lane_histogram),
             "touched_pixel_span_histogram": _histogram_pairs(span_histogram),
-            "lane_count_max": int(max(lane_histogram, default=0)),
+            "lane_count_max": _histogram_max(lane_histogram),
             "lane_count_p95": lane_p95,
-            "touched_pixel_span_max": int(max(span_histogram, default=0)),
+            "touched_pixel_span_max": _histogram_max(span_histogram),
             "touched_pixel_span_p95": _linear_percentile_from_histogram(span_histogram, 0.95),
-            "physical_width_px_max": float(max(lane_histogram, default=0)) / 16.0,
+            "physical_width_px_max": float(_histogram_max(lane_histogram)) / 16.0,
             "physical_width_px_p95": lane_p95 / 16.0,
         },
         "backend_lane_counts": _sum_named_counts(eyes, "backend_lane_counts", backend_names),
@@ -474,8 +524,11 @@ def build_diagnostics_summary(  # noqa: C901
         return {
             "pixel_count": 0,
             "state_counts": Counter(),
-            "lane_histogram": Counter(),
-            "span_histogram": Counter(),
+            "lane_histogram": np.zeros(
+                16 * (int(render_shape[1]) + 1),
+                dtype=np.uint64,
+            ),
+            "span_histogram": np.zeros(int(render_shape[1]) + 1, dtype=np.uint64),
             "backend_lane_counts": Counter(),
             "backend_pixel_counts": Counter(),
             "component_availability": None,
@@ -514,8 +567,10 @@ def build_diagnostics_summary(  # noqa: C901
                 ("lane_count_histogram", "lane_histogram"),
                 ("touched_pixel_span_histogram", "span_histogram"),
             ):
-                for bucket, count in eye["hole_runs"][histogram_name]:
-                    accumulator[target_name][int(bucket)] += int(count)
+                _add_histogram_pairs(
+                    accumulator[target_name],
+                    eye["hole_runs"][histogram_name],
+                )
             for name in backend_names:
                 accumulator["backend_lane_counts"][name] += int(eye["backend_lane_counts"][name])
                 accumulator["backend_pixel_counts"][name] += int(eye["backend_pixel_counts"][name])
@@ -661,14 +716,14 @@ def build_diagnostics_summary(  # noqa: C901
                 name: float(state_counts[name]) / float(pixel_count) for name in state_names
             },
             "hole_runs": {
-                "count": int(sum(lane_histogram.values())),
+                "count": _histogram_total(lane_histogram),
                 "lane_count_histogram": _histogram_pairs(lane_histogram),
                 "touched_pixel_span_histogram": _histogram_pairs(span_histogram),
-                "lane_count_max": int(max(lane_histogram, default=0)),
+                "lane_count_max": _histogram_max(lane_histogram),
                 "lane_count_p95": lane_p95,
-                "touched_pixel_span_max": int(max(span_histogram, default=0)),
+                "touched_pixel_span_max": _histogram_max(span_histogram),
                 "touched_pixel_span_p95": _linear_percentile_from_histogram(span_histogram, 0.95),
-                "physical_width_px_max": float(max(lane_histogram, default=0)) / 16.0,
+                "physical_width_px_max": float(_histogram_max(lane_histogram)) / 16.0,
                 "physical_width_px_p95": lane_p95 / 16.0,
             },
             "backend_lane_counts": {

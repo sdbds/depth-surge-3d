@@ -5,7 +5,6 @@ from __future__ import annotations
 import gc
 import math
 from contextlib import contextmanager
-from collections import Counter
 from dataclasses import dataclass
 from typing import Iterator, Literal
 
@@ -20,7 +19,6 @@ from ..stereo_renderer import (
     StereoRenderSettings,
     _convert_image_band,
     _downsample_subpixel_band,
-    calculate_band_height,
 )
 from . import native_kd
 from .geometry import (
@@ -55,6 +53,20 @@ QUALITY_RUNTIME_OVERHEAD_BYTES = 16 * 1024 * 1024
 QUALITY_RECORD_ARENA_BYTES = 64 * 1024 * 1024
 QUALITY_GRAPH_ARENA_BYTES = 64 * 1024 * 1024
 QUALITY_REPAIR_ARENA_BYTES = 64 * 1024 * 1024
+QUALITY_SPLAT_BYTES_PER_PIXEL = 1536
+
+
+def _calculate_quality_band_height(
+    render_width: int,
+    render_height: int,
+    temporary_budget_bytes: int,
+) -> int:
+    if render_width <= 0 or render_height <= 0:
+        raise ValueError("Quality render width and height must be positive")
+    if temporary_budget_bytes <= 0:
+        raise ValueError("Quality temporary GPU budget must be positive")
+    rows = temporary_budget_bytes // (render_width * QUALITY_SPLAT_BYTES_PER_PIXEL)
+    return min(render_height, max(1, rows))
 
 
 def _quality_public_memory_preflight(
@@ -152,22 +164,21 @@ def _retry_after_oom(
     operation,
     **kwargs,
 ):
-    try:
-        return operation(band_height=state.current_height, **kwargs)
-    except torch.cuda.OutOfMemoryError as error:
-        if state.retry_used:
-            width = int(kwargs["source"].shape[1])
-            height = int(kwargs["source"].shape[0])
+    while True:
+        try:
+            return operation(band_height=state.current_height, **kwargs)
+        except torch.cuda.OutOfMemoryError as error:
             _release_after_oom(owner)
-            raise RuntimeError(
-                "CUDA Quality stereo rendering ran out of memory for frame "
-                f"{width}x{height}; attempted band heights "
-                f"{state.initial_height} and {state.retry_height}"
-            ) from error
-        _release_after_oom(owner)
-        state.retry_used = True
-        state.current_height = state.retry_height
-        return operation(band_height=state.current_height, **kwargs)
+            if state.retry_used:
+                width = int(kwargs["source"].shape[1])
+                height = int(kwargs["source"].shape[0])
+                raise RuntimeError(
+                    "CUDA Quality stereo rendering ran out of memory for frame "
+                    f"{width}x{height}; attempted band heights "
+                    f"{state.initial_height} and {state.retry_height}"
+                ) from error
+            state.retry_used = True
+            state.current_height = state.retry_height
 
 
 def _quality_splat(
@@ -364,8 +375,8 @@ def _render_none_eye_once(
     height, width = source.shape[:2]
     output = np.empty_like(source)
     coverage = np.empty((height, width), dtype=np.uint8)
-    lane_histogram: Counter[int] = Counter()
-    span_histogram: Counter[int] = Counter()
+    lane_histogram = np.zeros(16 * (width + 1), dtype=np.uint64)
+    span_histogram = np.zeros(width + 1, dtype=np.uint64)
     for start_row in range(0, height, band_height):
         end_row = min(height, start_row + band_height)
         band = _quality_splat(renderer, source, geometry, offsets, start_row, end_row)
@@ -388,15 +399,17 @@ def _render_none_eye_once(
                 ):
                     end_cursor += 1
                 end = int(missing[end_cursor - 1])
-                lane_histogram[end - start + 1] += 1
-                span_histogram[end // HORIZONTAL_SUBPIXELS - start // HORIZONTAL_SUBPIXELS + 1] += 1
+                lane_histogram[end - start + 1] += np.uint64(1)
+                span_histogram[
+                    end // HORIZONTAL_SUBPIXELS - start // HORIZONTAL_SUBPIXELS + 1
+                ] += np.uint64(1)
                 cursor = end_cursor
         downsampled = _downsample_subpixel_band(band.splat.colour)
         output[start_row:end_row] = _convert_image_band(downsampled, source.dtype)
         del band, lane_valid, lane_valid_host, downsampled
     hole_runs = HoleRunDiagnostics(
-        lane_count_histogram=tuple(sorted(lane_histogram.items())),
-        touched_pixel_span_histogram=tuple(sorted(span_histogram.items())),
+        lane_count_histogram=lane_histogram,
+        touched_pixel_span_histogram=span_histogram,
     )
     return _CompactEyeResult(
         output,
@@ -410,8 +423,18 @@ def _render_none_eye_once(
 def _background_repair_bits(
     coverage: np.ndarray,
     records: np.ndarray,
+    *,
+    out: np.ndarray,
 ) -> np.ndarray:
-    result = np.zeros(coverage.shape, dtype=np.uint8)
+    if (
+        not isinstance(out, np.ndarray)
+        or out.dtype != np.uint8
+        or out.shape != coverage.shape
+        or not out.flags.c_contiguous
+    ):
+        raise TypeError("repair-bit output must be the contiguous Pass A B plane")
+    result = out
+    result.fill(0)
     result[(coverage > 0) & (coverage < HORIZONTAL_SUBPIXELS)] |= np.uint8(0x01)
     result[coverage == 0] |= np.uint8(0x02)
     flat = result.reshape(-1)
@@ -452,12 +475,8 @@ def _plan_hole_runs(records: np.ndarray, width: int) -> HoleRunDiagnostics:
         lane_histogram[active_end - active_start + 1] += np.uint64(1)
         span_histogram[active_end // 16 - active_start // 16 + 1] += np.uint64(1)
     return HoleRunDiagnostics(
-        lane_count_histogram=tuple(
-            (int(index), int(count)) for index, count in enumerate(lane_histogram) if count
-        ),
-        touched_pixel_span_histogram=tuple(
-            (int(index), int(count)) for index, count in enumerate(span_histogram) if count
-        ),
+        lane_count_histogram=lane_histogram,
+        touched_pixel_span_histogram=span_histogram,
     )
 
 
@@ -567,11 +586,16 @@ def _render_background_eye(
         budgets=budgets,
     )
     coverage = analyzed.analysis.coverage_count
-    repair_bits = _background_repair_bits(coverage, plan.records)
+    repair_bits = _background_repair_bits(
+        coverage,
+        plan.records,
+        out=analyzed.analysis.pure_bgr[0],
+    )
     hole_runs = _plan_hole_runs(plan.records, int(source.shape[1]))
     summary = summarize_quality_repair_plan(plan, repair_bits)
     records = plan.records
     del plan
+    del analyzed
     image = _retry_after_oom(
         renderer,
         band_state,
@@ -582,7 +606,7 @@ def _render_background_eye(
         offsets=offsets,
         records=records,
     )
-    del analyzed, records
+    del records
     return _CompactEyeResult(image, coverage, repair_bits, summary, hole_runs)
 
 
@@ -649,7 +673,7 @@ def _render_metric_quality_eyes(
     controls: QualityStereoControls,
 ) -> tuple[_CompactEyeResult, _CompactEyeResult]:
     height, width = source.shape[:2]
-    initial_height = calculate_band_height(
+    initial_height = _calculate_quality_band_height(
         width,
         height,
         renderer.temporary_budget_bytes,
@@ -724,7 +748,7 @@ def render_relative_quality_compact(
         stereo_strength=settings.stereo_strength,
         convergence=settings.convergence,
     )
-    initial_height = calculate_band_height(
+    initial_height = _calculate_quality_band_height(
         width,
         height,
         renderer.temporary_budget_bytes,

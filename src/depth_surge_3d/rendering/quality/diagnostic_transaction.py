@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import uuid
@@ -14,7 +15,7 @@ import cv2
 import numpy as np
 
 from .diagnostics import build_diagnostics_summary, build_quality_frame_stats
-from .types import CompactStereoRenderResult
+from .types import CompactStereoRenderResult, DenseHistogramPairs
 
 
 FaultHook = Callable[[str], None]
@@ -22,13 +23,67 @@ _HEX_64 = frozenset("0123456789abcdef")
 
 
 def canonical_json_bytes(value: object) -> bytes:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    ).encode("ascii")
+    """Encode canonical JSON while streaming dense histogram pairs."""
+
+    output = io.BytesIO()
+
+    def write(current: object) -> None:  # noqa: C901
+        if isinstance(current, DenseHistogramPairs):
+            output.write(b"[")
+            first = True
+            for bucket in range(int(current.bins.size)):
+                count = int(current.bins[bucket])
+                if count == 0:
+                    continue
+                if not first:
+                    output.write(b",")
+                output.write(f"[{bucket},{count}]".encode("ascii"))
+                first = False
+            output.write(b"]")
+            return
+        if current is None:
+            output.write(b"null")
+            return
+        if isinstance(current, (bool, np.bool_)):
+            output.write(b"true" if bool(current) else b"false")
+            return
+        if isinstance(current, (int, np.integer)):
+            output.write(str(int(current)).encode("ascii"))
+            return
+        if isinstance(current, (float, np.floating)):
+            output.write(
+                json.dumps(float(current), allow_nan=False, separators=(",", ":")).encode(
+                    "ascii"
+                )
+            )
+            return
+        if isinstance(current, str):
+            output.write(json.dumps(current, ensure_ascii=True).encode("ascii"))
+            return
+        if isinstance(current, dict):
+            if not all(isinstance(key, str) for key in current):
+                raise TypeError("canonical JSON object keys must be strings")
+            output.write(b"{")
+            for index, key in enumerate(sorted(current)):
+                if index:
+                    output.write(b",")
+                write(key)
+                output.write(b":")
+                write(current[key])
+            output.write(b"}")
+            return
+        if isinstance(current, (list, tuple)):
+            output.write(b"[")
+            for index, item in enumerate(current):
+                if index:
+                    output.write(b",")
+                write(item)
+            output.write(b"]")
+            return
+        raise TypeError(f"unsupported canonical JSON value: {type(current).__name__}")
+
+    write(value)
+    return output.getvalue()
 
 
 def self_fingerprint(value: dict[str, Any]) -> str:
@@ -71,6 +126,67 @@ class QualityFramePublication:
                 raise ValueError(f"{name} must be contained by job_root") from error
             object.__setattr__(self, name, path)
         object.__setattr__(self, "job_root", root)
+
+
+@dataclass(frozen=True)
+class PreparedQualityFramePublication:
+    """Writer payload with frame statistics serialized and planning state released."""
+
+    job_root: Path
+    frame_name: str
+    left_rgb_path: Path
+    right_rgb_path: Path
+    left_image: np.ndarray
+    right_image: np.ndarray
+    left_coverage_count: np.ndarray
+    right_coverage_count: np.ndarray
+    left_repair_bits: np.ndarray
+    right_repair_bits: np.ndarray
+    stats_raw: bytes
+    render_shape: tuple[int, int]
+    geometry_mode: str
+    occlusion_fill: str
+    rgb_stage_fingerprint: str
+    keep_masks: bool
+    render_mode: Literal["fast", "quality"]
+    quality_limits: dict[str, dict[str, int | float]] | None
+
+
+def prepare_quality_frame(
+    publication: QualityFramePublication,
+) -> PreparedQualityFramePublication:
+    """Serialize variable diagnostics before crossing the writer queue boundary."""
+
+    if not isinstance(publication, QualityFramePublication):
+        raise TypeError("publication must be QualityFramePublication")
+    compact = publication.compact
+    stats = build_quality_frame_stats(
+        compact,
+        frame_name=publication.frame_name,
+        geometry_mode=publication.geometry_mode,
+        occlusion_fill=publication.occlusion_fill,
+        render_mode=publication.render_mode,
+    )
+    return PreparedQualityFramePublication(
+        job_root=publication.job_root,
+        frame_name=publication.frame_name,
+        left_rgb_path=publication.left_rgb_path,
+        right_rgb_path=publication.right_rgb_path,
+        left_image=compact.left_image,
+        right_image=compact.right_image,
+        left_coverage_count=compact.left_coverage_count,
+        right_coverage_count=compact.right_coverage_count,
+        left_repair_bits=compact.left_repair_bits,
+        right_repair_bits=compact.right_repair_bits,
+        stats_raw=canonical_json_bytes(stats),
+        render_shape=(int(compact.left_image.shape[0]), int(compact.left_image.shape[1])),
+        geometry_mode=publication.geometry_mode,
+        occlusion_fill=publication.occlusion_fill,
+        rgb_stage_fingerprint=publication.rgb_stage_fingerprint,
+        keep_masks=publication.keep_masks,
+        render_mode=publication.render_mode,
+        quality_limits=compact.quality_limits,
+    )
 
 
 @dataclass(frozen=True)
@@ -207,14 +323,16 @@ def _call_fault(fault: FaultHook | None, stage: str) -> None:
 
 
 def publish_quality_frame(
-    publication: QualityFramePublication,
+    publication: QualityFramePublication | PreparedQualityFramePublication,
     *,
     fault: FaultHook | None = None,
 ) -> dict[str, Any]:
     """Publish every payload first and the authenticated manifest last."""
 
-    if not isinstance(publication, QualityFramePublication):
-        raise TypeError("publication must be QualityFramePublication")
+    if isinstance(publication, QualityFramePublication):
+        publication = prepare_quality_frame(publication)
+    elif not isinstance(publication, PreparedQualityFramePublication):
+        raise TypeError("publication must be a Quality frame publication")
     root = publication.job_root
     frame_dir = root / "04_stereo_diagnostics" / "frames" / publication.frame_name
     stats_path = frame_dir / "stats.json"
@@ -224,43 +342,36 @@ def publish_quality_frame(
         "right_coverage": frame_dir / "right_coverage.png",
         "right_repair": frame_dir / "right_repair.png",
     }
-    stats = build_quality_frame_stats(
-        publication.compact,
-        frame_name=publication.frame_name,
-        geometry_mode=publication.geometry_mode,
-        occlusion_fill=publication.occlusion_fill,
-        render_mode=publication.render_mode,
-    )
     raw_payloads: dict[str, tuple[Path, bytes] | None] = {
-        "left_rgb": (publication.left_rgb_path, _png_bytes(publication.compact.left_image)),
+        "left_rgb": (publication.left_rgb_path, _png_bytes(publication.left_image)),
         "right_rgb": (
             publication.right_rgb_path,
-            _png_bytes(publication.compact.right_image),
+            _png_bytes(publication.right_image),
         ),
         "left_coverage": None,
         "left_repair": None,
         "right_coverage": None,
         "right_repair": None,
-        "stats": (stats_path, canonical_json_bytes(stats)),
+        "stats": (stats_path, publication.stats_raw),
     }
     if publication.keep_masks:
         raw_payloads.update(
             {
                 "left_coverage": (
                     mask_paths["left_coverage"],
-                    _png_bytes(publication.compact.left_coverage_count),
+                    _png_bytes(publication.left_coverage_count),
                 ),
                 "left_repair": (
                     mask_paths["left_repair"],
-                    _png_bytes(publication.compact.left_repair_bits),
+                    _png_bytes(publication.left_repair_bits),
                 ),
                 "right_coverage": (
                     mask_paths["right_coverage"],
-                    _png_bytes(publication.compact.right_coverage_count),
+                    _png_bytes(publication.right_coverage_count),
                 ),
                 "right_repair": (
                     mask_paths["right_repair"],
-                    _png_bytes(publication.compact.right_repair_bits),
+                    _png_bytes(publication.right_repair_bits),
                 ),
             }
         )
@@ -268,7 +379,7 @@ def publish_quality_frame(
         name: None if item is None else _identity(root, item[0], item[1])
         for name, item in raw_payloads.items()
     }
-    limits = publication.compact.quality_limits
+    limits = publication.quality_limits
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "algorithm_version": "stereo-coverage-sidecar-v1",
@@ -277,8 +388,8 @@ def publish_quality_frame(
         "geometry_mode": publication.geometry_mode,
         "occlusion_fill": publication.occlusion_fill,
         "render_shape": [
-            int(publication.compact.left_image.shape[0]),
-            int(publication.compact.left_image.shape[1]),
+            int(publication.render_shape[0]),
+            int(publication.render_shape[1]),
         ],
         "rgb_stage_fingerprint": publication.rgb_stage_fingerprint,
         "mask_payloads_enabled": publication.keep_masks,
