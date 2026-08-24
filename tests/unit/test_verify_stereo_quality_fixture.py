@@ -8,6 +8,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 import scripts.verify_stereo_quality_fixture as verifier
 from scripts.verify_stereo_quality_fixture import (
@@ -145,6 +146,17 @@ def test_half_pixel_nearest_diagnostic_has_frozen_mapping() -> None:
     )
 
 
+def test_cpu_affinity_parser_expands_a_canonical_processor_set() -> None:
+    assert verifier._parse_cpu_affinity("0-3,6,8-9") == (0, 1, 2, 3, 6, 8, 9)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        verifier._parse_cpu_affinity("0-2,2")
+    with pytest.raises(ValueError, match="ascending"):
+        verifier._parse_cpu_affinity("3-1")
+    with pytest.raises(ValueError, match="nonnegative"):
+        verifier._parse_cpu_affinity("-1")
+
+
 def test_missing_hash_bound_fixture_writes_nonzero_report(tmp_path: Path) -> None:
     config = _write_fixture(tmp_path)
     missing = config.frames[0]
@@ -182,6 +194,7 @@ def test_tiny_fixture_writes_four_modes_diagnostics_and_review_crops(tmp_path: P
         benchmark_warmups=0,
         benchmark_measured=0,
         temporal_radius=0,
+        benchmark_command=("python", "verify.py", "--device", "cpu"),
     )
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -190,6 +203,12 @@ def test_tiny_fixture_writes_four_modes_diagnostics_and_review_crops(tmp_path: P
     assert report["status"] == "machine_pass_human_review_required"
     assert report["gates"]["fast_byte_compatibility"] is True
     assert report["gates"]["quality_final_unresolved_lanes_zero"] is True
+    assert report["benchmark_commands"] == [
+        {
+            "argv": ["python", "verify.py", "--device", "cpu"],
+            "cwd": str(Path.cwd().resolve()),
+        }
+    ]
     assert set(frame["modes"]) == {"fast", "quality", "quality_without_fill", "nearest"}
     assert Path(frame["diagnostics"]["coverage_path"]).is_file()
     assert Path(frame["diagnostics"]["repair_path"]).is_file()

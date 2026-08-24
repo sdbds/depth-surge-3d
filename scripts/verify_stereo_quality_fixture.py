@@ -753,6 +753,69 @@ def _linear_p95(values: list[float]) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
+def _parse_cpu_affinity(value: str) -> tuple[int, ...]:  # noqa: C901
+    """Parse a comma-separated processor list with inclusive ranges."""
+
+    if not value.strip():
+        raise ValueError("CPU affinity must not be empty")
+    processors: set[int] = set()
+    for raw_part in value.split(","):
+        part = raw_part.strip()
+        if not part:
+            raise ValueError("CPU affinity contains an empty processor")
+        if part.startswith("-"):
+            raise ValueError("CPU affinity processors must be nonnegative")
+        if "-" in part:
+            if part.count("-") != 1:
+                raise ValueError(f"invalid CPU affinity range: {part!r}")
+            start_text, end_text = part.split("-", maxsplit=1)
+            if not start_text.isdecimal() or not end_text.isdecimal():
+                raise ValueError(f"invalid CPU affinity range: {part!r}")
+            start, end = int(start_text), int(end_text)
+            if end < start:
+                raise ValueError("CPU affinity ranges must be ascending")
+            expanded = tuple(range(start, end + 1))
+        else:
+            if not part.isdecimal():
+                raise ValueError(f"invalid CPU affinity processor: {part!r}")
+            expanded = (int(part),)
+        for processor in expanded:
+            if processor in processors:
+                raise ValueError(f"duplicate CPU affinity processor: {processor}")
+            processors.add(processor)
+    return tuple(sorted(processors))
+
+
+def _set_process_cpu_affinity(processors: tuple[int, ...]) -> None:
+    if not processors:
+        raise ValueError("CPU affinity must not be empty")
+    if os.name == "nt":
+        pointer_bits = ctypes.sizeof(ctypes.c_size_t) * 8
+        if processors[-1] >= pointer_bits:
+            raise ValueError(
+                f"processor {processors[-1]} exceeds the {pointer_bits}-bit affinity mask"
+            )
+        mask = sum(1 << processor for processor in processors)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        kernel32.SetProcessAffinityMask.restype = ctypes.c_int
+        if not kernel32.SetProcessAffinityMask(kernel32.GetCurrentProcess(), ctypes.c_size_t(mask)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return
+    setter = getattr(os, "sched_setaffinity", None)
+    if setter is None:
+        raise RuntimeError("CPU affinity control is unsupported on this platform")
+    setter(0, set(processors))
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("value must be positive")
+    return parsed
+
+
 def _benchmark_mode(
     operation: Callable[[], CompactStereoRenderResult],
     *,
@@ -994,6 +1057,56 @@ def _physical_memory_bytes() -> int | None:
     return int(status.total_physical)
 
 
+def _optional_psutil() -> Any | None:
+    try:
+        import psutil  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    return psutil
+
+
+def _physical_core_count() -> int | None:
+    psutil = _optional_psutil()
+    if psutil is None:
+        return None
+    count = psutil.cpu_count(logical=False)
+    return int(count) if count is not None else None
+
+
+def _process_cpu_affinity() -> list[int] | None:
+    psutil = _optional_psutil()
+    if psutil is not None:
+        affinity = getattr(psutil.Process(), "cpu_affinity", None)
+        if affinity is not None:
+            return sorted(int(processor) for processor in affinity())
+    getter = getattr(os, "sched_getaffinity", None)
+    if getter is not None:
+        return sorted(int(processor) for processor in getter(0))
+    if os.name != "nt":
+        return None
+    process_mask = ctypes.c_size_t()
+    system_mask = ctypes.c_size_t()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.GetProcessAffinityMask.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    kernel32.GetProcessAffinityMask.restype = ctypes.c_int
+    if not kernel32.GetProcessAffinityMask(
+        kernel32.GetCurrentProcess(),
+        ctypes.byref(process_mask),
+        ctypes.byref(system_mask),
+    ):
+        return None
+    return [
+        processor
+        for processor in range(ctypes.sizeof(ctypes.c_size_t) * 8)
+        if process_mask.value & (1 << processor)
+    ]
+
+
 def _command_first_line(argv: list[str]) -> str | None:
     try:
         result = subprocess.run(argv, check=True, capture_output=True, text=True, timeout=10)
@@ -1009,7 +1122,9 @@ def _runtime_metadata(device: str) -> dict[str, Any]:
         "platform": platform.platform(),
         "python_version": platform.python_version(),
         "cpu_model": os.environ.get("PROCESSOR_IDENTIFIER") or platform.processor(),
+        "physical_core_count": _physical_core_count(),
         "logical_core_count": os.cpu_count(),
+        "process_cpu_affinity": _process_cpu_affinity(),
         "physical_memory_bytes": _physical_memory_bytes(),
         "numpy_version": np.__version__,
         "opencv_version": cv2.__version__,
@@ -1034,6 +1149,7 @@ def _base_report(
     inputs: dict[str, Any],
     config: VerificationConfig,
     device: str,
+    benchmark_command: tuple[str, ...] | None,
 ) -> dict[str, Any]:
     task0 = PROJECT_ROOT / "docs/superpowers/reports/2026-08-24-stereo-quality-task0.json"
     return {
@@ -1042,6 +1158,11 @@ def _base_report(
         "stereo_stage_algorithm_version": STEREO_STAGE_ALGORITHM_VERSION,
         "source": _git_state(),
         "runtime": _runtime_metadata(device),
+        "benchmark_commands": (
+            [{"argv": list(benchmark_command), "cwd": str(Path.cwd().resolve())}]
+            if benchmark_command is not None
+            else []
+        ),
         "fixture_root": str(fixture_root.resolve()),
         "artifacts_dir": str(artifacts_dir.resolve()),
         "inputs": inputs,
@@ -1101,6 +1222,7 @@ def run_verification(  # noqa: C901
     benchmark_warmups: int = 5,
     benchmark_measured: int = 30,
     temporal_radius: int = 1,
+    benchmark_command: tuple[str, ...] | None = None,
 ) -> int:
     """Run the release gate and always leave a machine-readable report."""
 
@@ -1108,7 +1230,14 @@ def run_verification(  # noqa: C901
         raise ValueError("benchmark counts and temporal radius must be nonnegative")
     resolved_device = _resolve_device(device)
     inputs, available = _inspect_inputs(fixture_root, config)
-    report = _base_report(fixture_root, artifacts_dir, inputs, config, resolved_device)
+    report = _base_report(
+        fixture_root,
+        artifacts_dir,
+        inputs,
+        config,
+        resolved_device,
+        benchmark_command,
+    )
     if not available:
         report["status"] = "fixture_unavailable"
         _write_report(report_json, report)
@@ -1193,11 +1322,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark-warmups", type=int, default=5)
     parser.add_argument("--benchmark-measured", type=int, default=30)
     parser.add_argument("--temporal-radius", type=int, default=1)
+    parser.add_argument(
+        "--cpu-affinity",
+        type=_parse_cpu_affinity,
+        help="Comma-separated logical processors or inclusive ranges (for example 0-15)",
+    )
+    parser.add_argument(
+        "--torch-intraop-threads",
+        type=_positive_int,
+        help="Explicit Torch intra-op thread count for a reproducible reference run",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
+    if args.cpu_affinity is not None:
+        _set_process_cpu_affinity(args.cpu_affinity)
+    if args.torch_intraop_threads is not None:
+        torch.set_num_threads(args.torch_intraop_threads)
     exit_code = run_verification(
         args.fixture_root,
         args.report_json,
@@ -1206,6 +1349,11 @@ def main() -> int:
         benchmark_warmups=args.benchmark_warmups,
         benchmark_measured=args.benchmark_measured,
         temporal_radius=args.temporal_radius,
+        benchmark_command=(
+            sys.executable,
+            str(Path(__file__).resolve()),
+            *sys.argv[1:],
+        ),
     )
     print(args.report_json.resolve())
     return exit_code
