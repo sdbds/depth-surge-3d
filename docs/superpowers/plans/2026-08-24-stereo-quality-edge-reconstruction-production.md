@@ -491,16 +491,25 @@ The isolated CPython 3.11 wheel built successfully, loaded the wheel-root native
 extension, printed CLI help, and reproduced deterministic fixture SHA-256
 `774b23e2f8f33b7b3169c70b72dd9097f911110b0ac056425e8ec28a1d329b5c`.
 
-- [ ] **Step 5: Render the user fixture in both modes**
+- [x] **Step 5: Render the user fixture in both modes**
 
 Use `H:\3dtest\1787051840_f908a5f038277cf447b8a6a9b5072311_20260818_191720\f908a5f038277cf447b8a6a9b5072311_1787051942-settings.json`. Freeze source hashes, render the seven-frame review set, export matching Fast/Quality crops around curls, feather, gun barrels, and ribbon, and record coverage/repair statistics.
 
-- [ ] **Step 6: Inspect the actual crops and reject regressions**
+- [x] **Step 6: Inspect the actual crops and reject regressions**
 
 Verify Quality removes boundary stretching/halos without foreground erosion, temporal flicker, black holes, or cross-depth donor leakage; Fast outputs must match the pre-change hashes.
 
-- [ ] **Step 7: Publish the canonical production report and commit**
+- [x] **Step 7: Publish the canonical production report and commit**
 
 ```text
 feat: complete stereo quality production gate
 ```
+
+Production-gate evidence (2026-08-24): the hash-pinned seven-frame CUDA run
+passed all machine gates on clean commit `af1b310205bd8b9059c55170b506d7c99a83715d`.
+With logical processors 0-15 and eight Torch intra-op threads explicitly
+recorded in the report, Fast renderer p95 was 1.113 seconds, Quality renderer
+p95 was 4.615 seconds, and the ratio was 4.148. All 30 Quality measurements
+produced the same left/right pixel hashes. Agent review passed every exported
+400-percent crop and adjacent-frame window; user visual approval remains
+explicitly pending.
