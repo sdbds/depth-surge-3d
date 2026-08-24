@@ -1090,8 +1090,8 @@
                             <div class="mb-3">
                                 <label class="form-label" for="stereoRenderMode">Stereo Renderer</label>
                                 <select class="form-select" id="stereoRenderMode">
-                                    <option value="quality" selected>Quality</option>
-                                    <option value="fast">Fast</option>
+                                    <option value="quality">Quality</option>
+                                    <option value="fast" selected>Fast</option>
                                 </select>
                             </div>
                             <div class="mb-3">
@@ -1849,6 +1849,7 @@
         let uploadedOutputDir = null;
         let currentVideoInfo = null;
         let systemCudaAvailable = null;
+        let stereoRenderModeExplicit = false;
 
         // Initialize socket connection
         function initSocket() {
@@ -2149,6 +2150,7 @@
                 document.getElementById('gpuDevice').textContent = data.gpu_device || '--';
                 document.getElementById('vramUsage').textContent = data.vram_usage || '--';
                 document.getElementById('deviceMode').textContent = data.device_mode || '--';
+                applyStereoRenderModeDefault();
                 updateStereoQualityControls();
             })
             .catch(error => {
@@ -2157,8 +2159,18 @@
                 document.getElementById('gpuDevice').textContent = '--';
                 document.getElementById('vramUsage').textContent = '--';
                 document.getElementById('deviceMode').textContent = '--';
+                applyStereoRenderModeDefault();
                 updateStereoQualityControls();
             });
+        }
+
+        function applyStereoRenderModeDefault() {
+            if (stereoRenderModeExplicit) return;
+            const requestedDevice = document.getElementById('device').value;
+            const qualityDefault = requestedDevice === 'cuda'
+                || (requestedDevice === 'auto' && systemCudaAvailable === true);
+            document.getElementById('stereoRenderMode').value =
+                qualityDefault ? 'quality' : 'fast';
         }
 
         function updateStereoQualityControls() {
@@ -2987,10 +2999,14 @@
             updateStep1Display();
         });
         document.getElementById('device').addEventListener('change', function() {
+            applyStereoRenderModeDefault();
             updateStereoQualityControls();
             updateSystemInfo();
         });
-        document.getElementById('stereoRenderMode').addEventListener('change', updateStereoQualityControls);
+        document.getElementById('stereoRenderMode').addEventListener('change', function() {
+            stereoRenderModeExplicit = true;
+            updateStereoQualityControls();
+        });
 
         // Toggle fisheye distortion options
         document.getElementById('applyDistortion').addEventListener('change', function() {
@@ -3218,6 +3234,9 @@
                     localStorage.removeItem('stereoProjectorSettings');
                     return; // Will use defaults from HTML
                 }
+                stereoRenderModeExplicit = Object.prototype.hasOwnProperty.call(
+                    settings, 'stereoRenderMode'
+                );
                 
                 // Apply settings to form elements
                 Object.keys(settings).forEach(key => {
@@ -3278,7 +3297,7 @@
                 stereoStrength: '2.0',
                 convergence: '0.5',
                 occlusionFill: 'background',
-                stereoRenderMode: 'quality',
+                stereoRenderMode: 'fast',
                 occlusionFillMaxPx: '8',
                 stereoGeometryMode: 'relative',
                 virtualBaselineMm: '63.0',
@@ -3331,6 +3350,8 @@
             // Trigger change events
             document.getElementById('applyDistortion').dispatchEvent(new Event('change'));
             document.getElementById('applyUpscaling').dispatchEvent(new Event('change'));
+            stereoRenderModeExplicit = false;
+            applyStereoRenderModeDefault();
             updateStereoQualityControls();
 
             // Update optional step styling

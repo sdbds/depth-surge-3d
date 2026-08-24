@@ -751,6 +751,52 @@ def commit_final_media_producer_marker(
     return transaction.commit()
 
 
+def commit_cleanup_pending_status(
+    settings_file: Path,
+    *,
+    reservation: Any | None = None,
+) -> ProcessingSettingsArtifactV5:
+    """Durably authorize cleanup-only recovery before deleting any payload."""
+
+    settings_file = Path(settings_file)
+    if settings_file.name != SETTINGS_ARTIFACT_RELATIVE_PATH.name:
+        raise ValueError("cleanup pending requires processing-settings-v5.json")
+    job_root = settings_file.parent
+    active_index = job_root / ".depth-surge-reservations-v1" / "final-encoding-reservation-v1.json"
+    if reservation is None and active_index.is_file():
+        from ..processing.video.final_publication import (
+            load_final_encoding_reservation_v1,
+        )
+
+        current = recover_settings_job_v1(
+            job_root,
+            allocation_adapter=platform_allocation_adapter,
+            allocation_counter=platform_allocation_counter,
+        )
+        reservation = load_final_encoding_reservation_v1(job_root, current)
+    if reservation is not None:
+        return reservation.commit_cleanup_pending_settings()
+    current = recover_settings_job_v1(
+        job_root,
+        allocation_adapter=platform_allocation_adapter,
+        allocation_counter=platform_allocation_counter,
+    )
+    if current.to_object()["metadata"]["cleanup_status"] == "pending":
+        return current
+    target = current.cleanup_pending(updated_at=_utc_now_usec())
+    transaction = SettingsArtifactTransactionV1.begin(
+        job_root=job_root,
+        current=current,
+        target=target,
+        allocation_adapter=platform_allocation_adapter,
+        allocation_counter=platform_allocation_counter,
+        allocation_unit=allocation_unit_for_path(job_root),
+        reservation_generation=secrets.token_hex(16),
+        reservation_id=secrets.token_hex(16),
+    )
+    return transaction.commit()
+
+
 def recover_processing_settings_artifact(
     settings_file: Path,
 ) -> ProcessingSettingsArtifactV5:

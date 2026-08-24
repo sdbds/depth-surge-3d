@@ -12,6 +12,7 @@ from typing import Any, Iterable, Iterator, Literal, Sequence
 
 import numpy as np
 
+from ..core.resource_errors import QualityHostBudgetError
 from . import metric_npz
 
 
@@ -19,19 +20,6 @@ QUALITY_CONTENT_STREAM_BYTES = metric_npz.METRIC_NPZ_WRITE_STREAM_BYTES
 QUALITY_METRIC_AUDIT_PHASE = "metric-content-audit"
 _CONTENT_READ_BYTES = 1024 * 1024
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-
-
-class QualityHostBudgetError(MemoryError):
-    """A phase could not acquire its explicitly budgeted host ownership."""
-
-    def __init__(self, phase: str, path: Path, requested_bytes: int) -> None:
-        self.phase = phase
-        self.path = Path(path)
-        self.requested_bytes = int(requested_bytes)
-        super().__init__(
-            f"{phase} host allocation failed for {self.path} "
-            f"({self.requested_bytes} requested bytes)"
-        )
 
 
 @dataclass(frozen=True)

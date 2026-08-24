@@ -8,7 +8,7 @@ import os
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 import cv2
 import numpy as np
@@ -632,22 +632,58 @@ def complete_diagnostics_stage(
 ) -> dict[str, Any]:
     """Consolidate committed frames and publish complete metadata last."""
 
-    manifest_identities: list[dict[str, str]] = []
-    frame_stats: list[dict[str, Any]] = []
-    for frame_name in context.frame_names:
-        _manifest, raw_manifest, stats = _audit_frame_transaction(context, frame_name)
-        manifest_identities.append(
-            {
-                "frame_name": frame_name,
-                "manifest_sha256": hashlib.sha256(raw_manifest).hexdigest(),
-            }
-        )
-        frame_stats.append(stats)
-    ordered_fingerprint = hashlib.sha256(canonical_json_bytes(manifest_identities)).hexdigest()
-    jsonl_raw = b"".join(canonical_json_bytes(value) + b"\n" for value in frame_stats)
-    jsonl_sha = hashlib.sha256(jsonl_raw).hexdigest()
+    root = context.job_root / "04_stereo_diagnostics"
+    jsonl_path = root / "stereo_coverage_frames.jsonl"
+    jsonl_temporary = jsonl_path.with_name(f".{jsonl_path.name}.{uuid.uuid4().hex}.tmp")
+    ordered_digest = hashlib.sha256()
+    ordered_digest.update(b"[")
+    jsonl_digest = hashlib.sha256()
+    try:
+        with jsonl_temporary.open("xb", buffering=0) as handle:
+            for index, frame_name in enumerate(context.frame_names):
+                _manifest, raw_manifest, stats = _audit_frame_transaction(context, frame_name)
+                if index:
+                    ordered_digest.update(b",")
+                ordered_digest.update(
+                    canonical_json_bytes(
+                        {
+                            "frame_name": frame_name,
+                            "manifest_sha256": hashlib.sha256(raw_manifest).hexdigest(),
+                        }
+                    )
+                )
+                line = canonical_json_bytes(stats) + b"\n"
+                if handle.write(line) != len(line):
+                    raise OSError("short diagnostics JSONL write")
+                jsonl_digest.update(line)
+            _call_fault(fault, "after_frames_jsonl_temporary_write")
+            handle.flush()
+            os.fsync(handle.fileno())
+            _call_fault(fault, "after_frames_jsonl_temporary_sync")
+        ordered_digest.update(b"]")
+        ordered_fingerprint = ordered_digest.hexdigest()
+        jsonl_sha = jsonl_digest.hexdigest()
+        _call_fault(fault, "before_frames_jsonl_replace")
+        os.replace(jsonl_temporary, jsonl_path)
+        _call_fault(fault, "after_frames_jsonl_replace")
+        _sync_parent(jsonl_path.parent)
+        _call_fault(fault, "after_frames_jsonl_directory_sync")
+    finally:
+        jsonl_temporary.unlink(missing_ok=True)
+
+    def replay_frame_stats():
+        count = 0
+        with jsonl_path.open("rb", buffering=0) as handle:
+            for line in handle:
+                if not line.endswith(b"\n"):
+                    raise ValueError("diagnostics JSONL row is not LF-terminated")
+                count += 1
+                yield _parse_canonical_object(line[:-1])
+        if count != len(context.frame_names):
+            raise ValueError("diagnostics JSONL row count differs from the frame sequence")
+
     summary = build_diagnostics_summary(
-        frame_stats,
+        replay_frame_stats(),
         frame_names=context.frame_names,
         render_shape=context.render_shape,
         render_mode=context.render_mode,
@@ -656,11 +692,8 @@ def complete_diagnostics_stage(
         ordered_frame_manifest_fingerprint=ordered_fingerprint,
         frames_jsonl_sha256=jsonl_sha,
     )
-    root = context.job_root / "04_stereo_diagnostics"
-    jsonl_path = root / "stereo_coverage_frames.jsonl"
     summary_path = root / "stereo_coverage_summary.json"
     summary_raw = canonical_json_bytes(summary)
-    _atomic_replace_raw(jsonl_path, jsonl_raw, fault=fault, label="frames_jsonl")
     _atomic_replace_raw(summary_path, summary_raw, fault=fault, label="root_summary")
     clamp_sha = None
     if context.geometry_mode == "metric":
@@ -693,7 +726,7 @@ def complete_diagnostics_stage(
 
 def migrate_frame_manifests_sync(
     context: DiagnosticsStageContext,
-    frame_names: tuple[str, ...],
+    frame_names: Iterable[str] | Callable[[], Iterable[str]],
     *,
     fault: FaultHook | None = None,
 ) -> None:
@@ -701,8 +734,9 @@ def migrate_frame_manifests_sync(
 
     if context.mask_payloads_enabled:
         raise ValueError("mask manifest migration requires a disabled target policy")
+    replay = frame_names if callable(frame_names) else lambda: iter(frame_names)
     previous = replace(context, mask_payloads_enabled=True)
-    for source_index, frame_name in enumerate(frame_names):
+    for source_index, frame_name in enumerate(replay()):
         manifest, _raw, _stats = _audit_frame_transaction(previous, frame_name)
         payloads = dict(manifest["payloads"])
         for name in (
@@ -727,7 +761,7 @@ def migrate_frame_manifests_sync(
             label=f"mask_migration_{source_index}",
         )
         _audit_frame_transaction(context, frame_name)
-    for frame_name in frame_names:
+    for frame_name in replay():
         frame_dir = context.job_root / "04_stereo_diagnostics" / "frames" / frame_name
         for name in (
             "left_coverage.png",
@@ -800,6 +834,71 @@ def _aggregates_match(
     return True
 
 
+def _payload_pruned_matches(  # noqa: C901
+    metadata: dict[str, Any],
+    context: DiagnosticsStageContext,
+) -> bool:
+    if (
+        metadata.get("status") != "payload_pruned"
+        or metadata.get("mask_payloads_enabled") is not False
+        or metadata.get("ordered_frame_manifest_fingerprint") is not None
+        or metadata.get("metric_clamp_summary_sha256") is not None
+        or not _metadata_matches_context(metadata, context)
+        or not _is_hex64(metadata.get("frames_jsonl_sha256"))
+        or not _is_hex64(metadata.get("summary_sha256"))
+        or not _is_hex64(metadata.get("final_video_manifest_sha256"))
+        or not isinstance(metadata.get("prune_entries"), list)
+    ):
+        return False
+    pruned_from = metadata.get("pruned_from")
+    if not isinstance(pruned_from, dict) or set(pruned_from) != {
+        "previous_status",
+        "previous_diagnostics_fingerprint",
+        "ordered_frame_manifest_fingerprint",
+        "frames_jsonl_sha256",
+        "summary_sha256",
+        "metric_clamp_summary_sha256",
+    }:
+        return False
+    if (
+        pruned_from["previous_status"] not in {"complete", "legacy_fast_unavailable"}
+        or not _is_hex64(pruned_from["previous_diagnostics_fingerprint"])
+        or not _is_hex64(pruned_from["ordered_frame_manifest_fingerprint"])
+        or pruned_from["frames_jsonl_sha256"] != metadata["frames_jsonl_sha256"]
+        or pruned_from["summary_sha256"] != metadata["summary_sha256"]
+    ):
+        return False
+    root = context.job_root / "04_stereo_diagnostics"
+    try:
+        jsonl_raw = (root / "stereo_coverage_frames.jsonl").read_bytes()
+        summary, summary_raw = _read_canonical_object(root / "stereo_coverage_summary.json")
+        final_manifest_raw = (context.job_root / "final_video_manifest.json").read_bytes()
+        if hashlib.sha256(jsonl_raw).hexdigest() != metadata["frames_jsonl_sha256"]:
+            return False
+        if hashlib.sha256(summary_raw).hexdigest() != metadata["summary_sha256"]:
+            return False
+        if summary.get("frames_jsonl_sha256") != metadata["frames_jsonl_sha256"]:
+            return False
+        if (
+            summary.get("ordered_frame_manifest_fingerprint")
+            != pruned_from["ordered_frame_manifest_fingerprint"]
+        ):
+            return False
+        if (
+            hashlib.sha256(final_manifest_raw).hexdigest()
+            != metadata["final_video_manifest_sha256"]
+        ):
+            return False
+        _parse_canonical_object(final_manifest_raw)
+        if context.render_mode == "quality":
+            content_raw = (root / "quality_input_manifest.json").read_bytes()
+            if hashlib.sha256(content_raw).hexdigest() != context.quality_input_manifest_sha256:
+                return False
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return True
+
+
 def audit_diagnostics_stage(  # noqa: C901
     context: DiagnosticsStageContext,
 ) -> DiagnosticsAudit:
@@ -809,6 +908,18 @@ def audit_diagnostics_stage(  # noqa: C901
     metadata_path = root / "metadata.json"
     if not root.exists():
         return DiagnosticsAudit("absent", (), context.frame_names, False)
+    try:
+        metadata, _raw = _read_canonical_object(metadata_path)
+    except (OSError, ValueError):
+        metadata = {}
+    if metadata.get("status") == "payload_pruned":
+        historical_valid = _payload_pruned_matches(metadata, context)
+        return DiagnosticsAudit(
+            "payload_pruned",
+            (),
+            context.frame_names,
+            historical_valid,
+        )
     reusable: list[str] = []
     invalid: list[str] = []
     migrate: list[str] = []
@@ -830,10 +941,6 @@ def audit_diagnostics_stage(  # noqa: C901
                 invalid.append(frame_name)
         else:
             reusable.append(frame_name)
-    try:
-        metadata, _raw = _read_canonical_object(metadata_path)
-    except (OSError, ValueError):
-        metadata = {}
     if invalid or migrate or not _metadata_matches_context(metadata, context):
         return DiagnosticsAudit(
             "building",
@@ -842,10 +949,7 @@ def audit_diagnostics_stage(  # noqa: C901
             False,
             tuple(migrate),
         )
-    status = metadata.get("status")
-    if status == "payload_pruned":
-        return DiagnosticsAudit("payload_pruned", (), context.frame_names, True)
-    aggregates_valid = status == "complete" and _aggregates_match(metadata, context)
+    aggregates_valid = metadata.get("status") == "complete" and _aggregates_match(metadata, context)
     return DiagnosticsAudit(
         "complete" if aggregates_valid else "building",
         tuple(reusable),

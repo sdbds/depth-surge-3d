@@ -7,6 +7,20 @@ import numpy as np
 from scripts.quality_task0 import repair_records as prototype_records
 
 
+def test_maximum_referenced_region_does_not_iterate_python_records() -> None:
+    planner = importlib.import_module("src.depth_surge_3d.rendering.quality.planner")
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
+
+    class NoPythonIteration(np.ndarray):
+        def __iter__(self):
+            raise AssertionError("record vector was expanded into Python objects")
+
+    records = np.zeros(3, dtype=repair_records.REPAIR_RECORD_DTYPE).view(NoPythonIteration)
+    records["region_id"] = np.array([repair_records.NO_REGION, 17, 4], dtype=np.uint32)
+
+    assert planner._maximum_referenced_region(records) == 17
+
+
 def _fallback_fixture():
     local = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
     records_module = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")

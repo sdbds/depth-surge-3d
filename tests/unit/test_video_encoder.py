@@ -217,7 +217,11 @@ def test_direct_command_omits_scale_for_exact_size_and_uses_hstack(tmp_path):
     )
 
     graph = command[command.index("-filter_complex") + 1]
-    assert graph == "[0:v][1:v]hstack=inputs=2:shortest=1[vr]"
+    assert graph == (
+        "[0:v]setsar=1[left];[1:v]setsar=1[right];"
+        "[left][right]hstack=inputs=2:shortest=1[stacked];"
+        "[stacked]setsar=1[vr]"
+    )
     assert "scale=" not in graph
     assert command.count("-framerate") == 2
     assert command.count("24000/1001") == 2
@@ -255,8 +259,9 @@ def test_direct_command_scales_both_eyes_and_uses_vstack(tmp_path):
     )
 
     graph = command[command.index("-filter_complex") + 1]
-    assert graph.count("scale=8:6:flags=bicubic+accurate_rnd") == 2
-    assert "[left][right]vstack=inputs=2:shortest=1[vr]" in graph
+    assert graph.count("scale=8:6:flags=bicubic+accurate_rnd,setsar=1") == 2
+    assert "[left][right]vstack=inputs=2:shortest=1[stacked]" in graph
+    assert graph.endswith("[stacked]setsar=1[vr]")
 
 
 def test_direct_command_maps_audio_from_third_input(tmp_path):
@@ -1199,12 +1204,171 @@ def test_schema5_assembled_encode_publishes_bound_video_and_manifests(tmp_path, 
     assert (job / "final_video_manifest.json").is_file()
     assert audit_final_media_v1(job, artifact).final_video_authenticated is True
     assert (job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json").is_file()
+    assert launches[0][launches[0].index("-start_number") + 1] == "1"
+    assert launches[0][launches[0].index("-vf") + 1] == "setsar=1"
 
     resumed = VideoEncoder(defer_final_reservation_retirement=True)
     assert resumed.create_video(frames, job, str(source), settings)
     assert len(launches) == 1
     resumed.retire_final_encoding_reservation(success=True)
     assert not (job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json").exists()
+
+
+def test_schema5_failed_encode_keeps_reservation_available_for_terminal_retirement(
+    tmp_path, monkeypatch
+):
+    from src.depth_surge_3d.core.settings import validate_settings
+    from src.depth_surge_3d.io.operations import save_processing_settings
+    from src.depth_surge_3d.processing.video.final_publication import (
+        FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+    )
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    job = tmp_path / "job"
+    frames = job / "99_vr_frames"
+    frames.mkdir(parents=True)
+    assert cv2.imwrite(str(frames / "frame_000007.png"), np.zeros((4, 8, 3), np.uint8))
+    settings = validate_settings(
+        {
+            "preserve_audio": False,
+            "video_encoder": "libx264",
+            "vr_resolution": "custom:4x4",
+            "per_eye_width": 4,
+            "per_eye_height": 4,
+            "vr_output_width": 8,
+            "vr_output_height": 4,
+        },
+        source="explicit",
+    )
+    save_processing_settings(
+        job,
+        "job",
+        settings,
+        {
+            "width": 4,
+            "height": 4,
+            "fps": 24.0,
+            "frame_count": 1,
+            "duration": 1.0 / 24.0,
+            "codec": 0,
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+            "sample_aspect_ratio": "1:1",
+        },
+        str(source),
+        transactional_v5=True,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "_run_schema5_ffmpeg_with_progress",
+        lambda *_args, **_kwargs: (1, ("forced failure",)),
+    )
+
+    encoder = VideoEncoder(defer_final_reservation_retirement=True)
+    assert not encoder.create_video(frames, job, str(source), settings)
+    assert encoder._pending_final_reservation is not None
+    assert (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).is_file()
+
+    encoder.retire_final_encoding_reservation(success=False)
+    assert encoder._pending_final_reservation is None
+    assert not (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).exists()
+
+
+def test_schema5_manifest_staging_failure_keeps_new_reservation_for_terminal_retirement(
+    tmp_path, monkeypatch
+):
+    from src.depth_surge_3d.core.settings import validate_settings
+    from src.depth_surge_3d.io.operations import save_processing_settings
+    from src.depth_surge_3d.processing.video.final_publication import (
+        FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+    )
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    job = tmp_path / "job"
+    frames = job / "99_vr_frames"
+    frames.mkdir(parents=True)
+    assert cv2.imwrite(str(frames / "frame_000007.png"), np.zeros((4, 8, 3), np.uint8))
+    settings = validate_settings(
+        {
+            "preserve_audio": False,
+            "video_encoder": "libx264",
+            "vr_resolution": "custom:4x4",
+            "per_eye_width": 4,
+            "per_eye_height": 4,
+            "vr_output_width": 8,
+            "vr_output_height": 4,
+        },
+        source="explicit",
+    )
+    save_processing_settings(
+        job,
+        "job",
+        settings,
+        {
+            "width": 4,
+            "height": 4,
+            "fps": 24.0,
+            "frame_count": 1,
+            "duration": 1.0 / 24.0,
+            "codec": 0,
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+            "sample_aspect_ratio": "1:1",
+        },
+        str(source),
+        transactional_v5=True,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "_stage_encoding_manifest_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("forced staging failure")),
+    )
+
+    encoder = VideoEncoder(defer_final_reservation_retirement=True)
+
+    assert not encoder.create_video(frames, job, str(source), settings)
+    assert encoder._pending_final_reservation is not None
+    assert (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).is_file()
+
+    encoder.retire_final_encoding_reservation(success=False)
+    assert encoder._pending_final_reservation is None
+    assert not (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).exists()
+
+
+def test_schema5_incomplete_reservation_stays_retryable_instead_of_becoming_failed(
+    tmp_path, monkeypatch
+):
+    from src.depth_surge_3d.io.reservation_protocol import ReservationIncompleteError
+
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "_prepare_schema5_assembled_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ReservationIncompleteError("persistent ENOSPC after final index")
+        ),
+    )
+
+    with pytest.raises(ReservationIncompleteError, match="persistent ENOSPC"):
+        VideoEncoder(defer_final_reservation_retirement=True).create_video(
+            tmp_path,
+            tmp_path,
+            str(tmp_path / "source.mp4"),
+            {},
+        )
 
 
 def test_schema5_direct_encode_uses_provider_and_same_publication_contract(tmp_path, monkeypatch):

@@ -47,6 +47,89 @@ class QualityRepairPlan:
     exemplar_donor_evaluation_count: int
 
 
+@dataclass(frozen=True)
+class QualityRepairPlanSummary:
+    """Fixed-size diagnostics retained after an eye's repair arenas are released."""
+
+    segment_record_count: int
+    segment_table_bytes: int
+    backend_lane_counts: tuple[int, int, int]
+    backend_pixel_counts: tuple[int, int, int]
+    backend_component_counts: tuple[int, int, int]
+    local_evaluated_slot_count: int
+    local_physical_sample_read_count: int
+    local_budget_skipped_run_count: int
+    fallback_indexed_donor_count: int
+    fallback_query_count: int
+    fallback_anchor_count: int
+    fallback_visited_nodes_total: int
+    fallback_visited_nodes_max: int
+    fallback_visited_nodes_p95: float
+    exemplar_donor_evaluation_count: int
+
+
+def _maximum_referenced_region(records: np.ndarray) -> int:
+    """Return the largest non-sentinel region without Python object expansion."""
+
+    regions = records["region_id"]
+    valid = regions != NO_REGION
+    if not bool(np.any(valid)):
+        return 0
+    return int(np.max(regions, where=valid, initial=np.uint32(0)))
+
+
+def summarize_quality_repair_plan(
+    plan: QualityRepairPlan,
+    repair_bits: np.ndarray,
+) -> QualityRepairPlanSummary:
+    """Collapse variable repair tables to bounded scalar diagnostics."""
+
+    records = plan.records
+    backends = records["backend"]
+    lane_counts = tuple(
+        sum(int(mask).bit_count() for mask in records["lane_mask"][backends == np.uint8(backend)])
+        for backend in (1, 2, 3)
+    )
+    backend_lane_counts = (lane_counts[0], lane_counts[1], lane_counts[2])
+    pixel_counts = tuple(
+        int(np.count_nonzero(repair_bits & np.uint8(bit))) for bit in (0x04, 0x10, 0x20)
+    )
+    backend_pixel_counts = (pixel_counts[0], pixel_counts[1], pixel_counts[2])
+    component_backend_bits = np.zeros(plan.component_count, dtype=np.uint8)
+    if records.size:
+        np.bitwise_or.at(
+            component_backend_bits,
+            plan.record_component_ids,
+            np.left_shift(np.uint8(1), backends),
+        )
+    component_counts = tuple(
+        int(np.count_nonzero(component_backend_bits & np.uint8(1 << backend)))
+        for backend in (1, 2, 3)
+    )
+    backend_component_counts = (
+        component_counts[0],
+        component_counts[1],
+        component_counts[2],
+    )
+    return QualityRepairPlanSummary(
+        segment_record_count=int(records.size),
+        segment_table_bytes=int(records.nbytes),
+        backend_lane_counts=backend_lane_counts,
+        backend_pixel_counts=backend_pixel_counts,
+        backend_component_counts=backend_component_counts,
+        local_evaluated_slot_count=plan.local_evaluated_slot_count,
+        local_physical_sample_read_count=plan.local_physical_sample_read_count,
+        local_budget_skipped_run_count=plan.local_budget_skipped_run_count,
+        fallback_indexed_donor_count=plan.fallback_indexed_donor_count,
+        fallback_query_count=plan.fallback_query_count,
+        fallback_anchor_count=plan.fallback_anchor_count,
+        fallback_visited_nodes_total=plan.fallback_visited_nodes_total,
+        fallback_visited_nodes_max=plan.fallback_visited_nodes_max,
+        fallback_visited_nodes_p95=plan.fallback_visited_nodes_p95,
+        exemplar_donor_evaluation_count=plan.exemplar_donor_evaluation_count,
+    )
+
+
 def _least_set_bit(mask: int) -> int:
     return (mask & -mask).bit_length() - 1
 
@@ -265,10 +348,7 @@ def plan_quality_repairs(
         component_ids,
         component_count,
     )
-    referenced_regions = [
-        int(value) for value in local.records["region_id"] if int(value) != int(NO_REGION)
-    ]
-    region_count = max(referenced_regions, default=0)
+    region_count = _maximum_referenced_region(local.records)
     provisional = fallback.precompute_native_fallbacks(
         local.records,
         analysis,

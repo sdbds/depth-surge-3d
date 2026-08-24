@@ -56,6 +56,7 @@ from ...rendering.quality.types import (
     RelativeStereoPrimitiveInput,
 )
 from .metric_geometry import MetricGeometryStore
+from .stereo_control import PackedStereoActions, StereoAction
 
 STEREO_STAGE_SCHEMA_VERSION = 1
 STEREO_STAGE_ALGORITHM_VERSION = "torch-horizontal-16x-zbuffer-v3"
@@ -242,6 +243,43 @@ class _FileWorkItem:
     left_path: Path
     right_path: Path
     stat_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class _FileWorkPlan:
+    """Packed source-order actions plus a replayable O(1)-item work stream."""
+
+    frame_files: list[Path]
+    depth_files: list[Path]
+    left_dir: Path
+    right_dir: Path
+    actions: PackedStereoActions
+    render_count: int
+    reuse_count: int
+    migrate_count: int
+    repaired_outputs: bool
+    metric_mode: bool
+
+    def iter_render(self):
+        stat_dir = self.left_dir / "clamp_stats"
+        for index, (frame_file, depth_file) in enumerate(zip(self.frame_files, self.depth_files)):
+            if self.actions.get(index) is not StereoAction.RENDER:
+                continue
+            frame_name = frame_file.stem
+            yield _FileWorkItem(
+                index=index,
+                frame_path=frame_file,
+                depth_path=depth_file,
+                frame_name=frame_name,
+                left_path=self.left_dir / f"{frame_name}.png",
+                right_path=self.right_dir / f"{frame_name}.png",
+                stat_path=(stat_dir / f"{frame_name}.json" if self.metric_mode else None),
+            )
+
+    def iter_frame_names(self, action: StereoAction):
+        for index, frame_file in enumerate(self.frame_files):
+            if self.actions.get(index) is action:
+                yield frame_file.stem
 
 
 _DecodeFrame = Callable[
@@ -523,7 +561,8 @@ class _StereoFilePipeline:
         self,
         *,
         renderer: StereoRenderer,
-        work_items: list[_FileWorkItem],
+        work_factory: Callable[[], Any],
+        work_count: int,
         decode: _DecodeFrame,
         render_settings: StereoRenderSettings | StereoSplatSettings | QualityStereoControls,
         render_mode: Literal["fast", "quality"],
@@ -538,7 +577,8 @@ class _StereoFilePipeline:
         report_progress: Callable[..., None],
     ) -> None:
         self.renderer = renderer
-        self.work_items = work_items
+        self.work_factory = work_factory
+        self.work_count = work_count
         self.decode = decode
         self.render_settings = render_settings
         self.render_mode = render_mode
@@ -588,7 +628,7 @@ class _StereoFilePipeline:
             thread.start()
         self.feeder.start()
 
-        for _ in self.work_items:
+        for _ in range(self.work_count):
             message = self.decoded_frames.get()
             try:
                 assert isinstance(message, _DecodedMessage)
@@ -616,7 +656,7 @@ class _StereoFilePipeline:
         return stats
 
     def _feed_decoder(self) -> None:
-        for work in self.work_items:
+        for work in self.work_factory():
             _timed_put(self.decode_requests, work, self.metrics)
         for _ in range(self.workers):
             _timed_put(self.decode_requests, _QUEUE_SENTINEL, self.metrics)
@@ -1062,12 +1102,13 @@ class StereoPairGenerator:
                 diagnostic_audit = audit_diagnostics_stage(quality_context)
                 if diagnostic_audit.disposition != "complete":
                     begin_diagnostics_stage(quality_context)
-                work_items, completed, repaired_outputs = self._build_quality_work_items(
+                work_plan = self._build_quality_work_items(
                     frame_files,
                     depth_files,
                     left_dir,
                     right_dir,
-                    (diagnostic_audit.reusable_frame_names + diagnostic_audit.migrate_frame_names),
+                    diagnostic_audit.reusable_frame_names,
+                    diagnostic_audit.migrate_frame_names,
                 )
             else:
                 stage_metadata = self._stereo_stage_metadata(
@@ -1108,18 +1149,16 @@ class StereoPairGenerator:
                     diagnostic_audit = audit_diagnostics_stage(quality_context)
                     if diagnostic_audit.disposition != "complete":
                         begin_diagnostics_stage(quality_context)
-                    work_items, completed, repaired_outputs = self._build_quality_work_items(
+                    work_plan = self._build_quality_work_items(
                         frame_files,
                         depth_files,
                         left_dir,
                         right_dir,
-                        (
-                            diagnostic_audit.reusable_frame_names
-                            + diagnostic_audit.migrate_frame_names
-                        ),
+                        diagnostic_audit.reusable_frame_names,
+                        diagnostic_audit.migrate_frame_names,
                     )
                 else:
-                    work_items, completed, repaired_outputs = self._build_file_work_items(
+                    work_plan = self._build_file_work_items(
                         frame_files,
                         depth_files,
                         left_dir,
@@ -1129,15 +1168,15 @@ class StereoPairGenerator:
                     )
             if stage_changed:
                 self._reset_downstream_stages(directories)
-            if repaired_outputs and not stage_changed:
+            if work_plan.repaired_outputs and not stage_changed:
                 self._reset_downstream_stages(directories)
-            if not work_items:
-                print(f"  Reusing {completed} existing stereo pairs")
+            if work_plan.render_count == 0:
+                print(f"  Reusing {work_plan.reuse_count} existing stereo pairs")
                 if quality_context is not None:
-                    if diagnostic_audit.migrate_frame_names:
+                    if work_plan.migrate_count:
                         migrate_frame_manifests_sync(
                             quality_context,
-                            diagnostic_audit.migrate_frame_names,
+                            lambda: work_plan.iter_frame_names(StereoAction.MIGRATE),
                         )
                     if diagnostic_audit.disposition != "complete":
                         complete_diagnostics_stage(quality_context)
@@ -1157,11 +1196,12 @@ class StereoPairGenerator:
             )
             if plan.render_mode == "quality":
                 capacity = 1
+                workers = 1
             print(
                 f"  Using {workers} stereo I/O workers with " f"{capacity} bounded frame slots..."
             )
             self._run_file_pipeline(
-                work_items,
+                work_plan,
                 decode=plan.decode,
                 render_settings=plan.render_settings,
                 render_mode=plan.render_mode,
@@ -1171,15 +1211,15 @@ class StereoPairGenerator:
                 keep_masks=bool(settings.get("keep_intermediates", True)),
                 workers=workers,
                 capacity=capacity,
-                completed=completed,
+                completed=work_plan.reuse_count,
                 total_frames=len(frame_files),
                 progress_tracker=progress_tracker,
             )
             if quality_context is not None:
-                if diagnostic_audit.migrate_frame_names:
+                if work_plan.migrate_count:
                     migrate_frame_manifests_sync(
                         quality_context,
-                        diagnostic_audit.migrate_frame_names,
+                        lambda: work_plan.iter_frame_names(StereoAction.MIGRATE),
                     )
                 complete_diagnostics_stage(quality_context)
                 if plan.geometry_mode == "metric_camera":
@@ -1457,14 +1497,25 @@ class StereoPairGenerator:
         left_dir: Path,
         right_dir: Path,
         reusable_frame_names: tuple[str, ...],
-    ) -> tuple[list[_FileWorkItem], int, bool]:
+        migrate_frame_names: tuple[str, ...],
+    ) -> _FileWorkPlan:
         reusable = set(reusable_frame_names)
-        work_items: list[_FileWorkItem] = []
+        migrate = set(migrate_frame_names)
+        if reusable & migrate:
+            raise ValueError("diagnostics reuse and migration actions overlap")
+        actions = PackedStereoActions(len(frame_files))
+        render_count = 0
         repaired_outputs = False
         for index, (frame_file, depth_file) in enumerate(zip(frame_files, depth_files)):
             frame_name = frame_file.stem
             if frame_name in reusable:
+                actions.set(index, StereoAction.REUSE)
                 continue
+            if frame_name in migrate:
+                actions.set(index, StereoAction.MIGRATE)
+                continue
+            actions.set(index, StereoAction.RENDER)
+            render_count += 1
             left_path = left_dir / f"{frame_name}.png"
             right_path = right_dir / f"{frame_name}.png"
             diagnostic_dir = left_dir.parent / "04_stereo_diagnostics" / "frames" / frame_name
@@ -1474,18 +1525,20 @@ class StereoPairGenerator:
             left_path.unlink(missing_ok=True)
             right_path.unlink(missing_ok=True)
             shutil.rmtree(diagnostic_dir, ignore_errors=True)
-            work_items.append(
-                _FileWorkItem(
-                    index=index,
-                    frame_path=frame_file,
-                    depth_path=depth_file,
-                    frame_name=frame_name,
-                    left_path=left_path,
-                    right_path=right_path,
-                    stat_path=None,
-                )
-            )
-        return work_items, len(reusable), repaired_outputs
+        if len(reusable) + len(migrate) + render_count != len(frame_files):
+            raise ValueError("diagnostics action cardinality differs from the frame sequence")
+        return _FileWorkPlan(
+            frame_files=frame_files,
+            depth_files=depth_files,
+            left_dir=left_dir,
+            right_dir=right_dir,
+            actions=actions,
+            render_count=render_count,
+            reuse_count=len(reusable),
+            migrate_count=len(migrate),
+            repaired_outputs=repaired_outputs,
+            metric_mode=False,
+        )
 
     def _load_quality_metric_summary(self, left_dir: Path) -> None:
         path = left_dir / "clamp_summary.json"
@@ -1551,7 +1604,7 @@ class StereoPairGenerator:
 
     def _run_file_pipeline(
         self,
-        work_items: list[_FileWorkItem],
+        work_plan: _FileWorkPlan,
         *,
         decode: _DecodeFrame,
         render_settings: StereoRenderSettings | StereoSplatSettings | QualityStereoControls,
@@ -1568,7 +1621,8 @@ class StereoPairGenerator:
     ) -> None:
         pipeline = _StereoFilePipeline(
             renderer=self.renderer,
-            work_items=work_items,
+            work_factory=work_plan.iter_render,
+            work_count=work_plan.render_count,
             decode=decode,
             render_settings=render_settings,
             render_mode=render_mode,
@@ -1632,8 +1686,9 @@ class StereoPairGenerator:
         render_shape: tuple[int, int],
         *,
         metric_mode: bool,
-    ) -> tuple[list[_FileWorkItem], int, bool]:
-        work_items: list[_FileWorkItem] = []
+    ) -> _FileWorkPlan:
+        actions = PackedStereoActions(len(frame_files))
+        render_count = 0
         completed = 0
         repaired_outputs = False
         stat_dir = left_dir / "clamp_stats"
@@ -1655,26 +1710,29 @@ class StereoPairGenerator:
                 frame_name,
                 render_shape,
             ):
+                actions.set(index, StereoAction.REUSE)
                 completed += 1
                 continue
+            actions.set(index, StereoAction.RENDER)
+            render_count += 1
             output_paths = [left_path, right_path]
             if stat_path is not None:
                 output_paths.append(stat_path)
             repaired_outputs = repaired_outputs or any(path.exists() for path in output_paths)
             for path in output_paths:
                 path.unlink(missing_ok=True)
-            work_items.append(
-                _FileWorkItem(
-                    index=index,
-                    frame_path=frame_file,
-                    depth_path=depth_file,
-                    frame_name=frame_name,
-                    left_path=left_path,
-                    right_path=right_path,
-                    stat_path=stat_path,
-                )
-            )
-        return work_items, completed, repaired_outputs
+        return _FileWorkPlan(
+            frame_files=frame_files,
+            depth_files=depth_files,
+            left_dir=left_dir,
+            right_dir=right_dir,
+            actions=actions,
+            render_count=render_count,
+            reuse_count=completed,
+            migrate_count=0,
+            repaired_outputs=repaired_outputs,
+            metric_mode=metric_mode,
+        )
 
     @staticmethod
     def _stereo_outputs_are_valid(

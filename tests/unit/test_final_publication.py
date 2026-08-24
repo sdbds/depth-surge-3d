@@ -2,9 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 
 import pytest
 
+from src.depth_surge_3d.core.settings import validate_settings
+from src.depth_surge_3d.rendering.quality.diagnostic_transaction import (
+    canonical_json_bytes,
+    self_fingerprint,
+)
+from src.depth_surge_3d.rendering.quality.cleanup_transaction import (
+    commit_payload_pruned,
+    run_authorized_cleanup,
+)
 from src.depth_surge_3d.processing.video.final_publication import (
     EncodingInputPublicationSource,
     FinalMediaAuditDispositionV1,
@@ -52,6 +62,59 @@ def _producer_artifact():
         generation="44" * 16,
         updated_at="2026-08-24T12:34:57.123456Z",
     )
+
+
+def _pruning_artifact():
+    return _artifact(
+        processing_settings=validate_settings(
+            {"keep_intermediates": False},
+            source="explicit",
+        )
+    )
+
+
+def _complete_prune_diagnostics(root) -> None:
+    diagnostics = root / "04_stereo_diagnostics"
+    diagnostics.mkdir(parents=True)
+    frames_jsonl = canonical_json_bytes({"frame_name": "frame_000000"}) + b"\n"
+    summary = canonical_json_bytes({"schema_version": 1})
+    (diagnostics / "stereo_coverage_frames.jsonl").write_bytes(frames_jsonl)
+    (diagnostics / "stereo_coverage_summary.json").write_bytes(summary)
+    metadata = {
+        "schema_version": 1,
+        "algorithm_version": "stereo-coverage-sidecar-v1",
+        "status": "complete",
+        "rgb_stage_fingerprint": "rgb",
+        "source_guide_fingerprint": "guide",
+        "native_geometry_fingerprint": None,
+        "quality_input_manifest_sha256": None,
+        "frame_names": ["frame_000000"],
+        "render_shape": [2, 3],
+        "render_mode": "fast",
+        "geometry_mode": "relative",
+        "occlusion_fill": "background",
+        "mask_payloads_enabled": False,
+        "stats_schema_version": 1,
+        "frame_manifest_schema_version": 1,
+        "ordered_frame_manifest_fingerprint": "a" * 64,
+        "frames_jsonl_sha256": hashlib.sha256(frames_jsonl).hexdigest(),
+        "summary_sha256": hashlib.sha256(summary).hexdigest(),
+        "metric_clamp_summary_sha256": None,
+        "pruned_from": None,
+        "final_video_manifest_sha256": None,
+        "prune_entries": None,
+    }
+    metadata["fingerprint"] = self_fingerprint(metadata)
+    (diagnostics / "metadata.json").write_bytes(canonical_json_bytes(metadata))
+    for relative in (
+        "00_original_frames",
+        "04_left_frames",
+        "04_right_frames",
+        "04_stereo_diagnostics/frames",
+    ):
+        directory = root / relative
+        directory.mkdir(parents=True)
+        (directory / "payload.bin").write_bytes(relative.encode("ascii"))
 
 
 def _test_allocation(path, logical):
@@ -267,6 +330,291 @@ def test_final_encoding_reservation_publishes_index_before_owned_namespace(tmp_p
     assert recovery.action == "encode"
 
 
+def test_pruning_final_reservation_preallocates_every_post_publication_extent(tmp_path) -> None:
+    artifact = _pruning_artifact()
+    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _complete_prune_diagnostics(tmp_path)
+
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+
+    assert [entry["reservation_kind"] for entry in reservation.index.extent_entries] == [
+        "producer_settings",
+        "encoding_input_manifest",
+        "final_video_manifest",
+        "prune_marker",
+        "prune_marker",
+        "prune_marker",
+        "prune_marker",
+        "diagnostics_payload_pruned",
+        "cleanup_pending_settings",
+    ]
+    assert reservation.producer_settings_transaction is not None
+    assert len(reservation.prune_marker_transactions) == 4
+    assert reservation.diagnostics_payload_pruned_transaction is not None
+    assert reservation.cleanup_pending_settings_transaction is not None
+    assert (
+        reservation.index.diagnostics_metadata_raw_sha256_at_preflight
+        == hashlib.sha256(
+            (tmp_path / "04_stereo_diagnostics" / "metadata.json").read_bytes()
+        ).hexdigest()
+    )
+    for _entry, transaction, _payload in reservation.prune_marker_transactions:
+        assert transaction.target_path.stat().st_size == 0
+        assert transaction.source_path.stat().st_size == transaction.descriptor.logical_byte_count
+
+
+def test_pruning_final_reservation_reopens_every_indexed_extent(tmp_path) -> None:
+    artifact = _pruning_artifact()
+    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _complete_prune_diagnostics(tmp_path)
+    prepared = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+
+    reopened = load_final_encoding_reservation_v1(
+        tmp_path,
+        artifact,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+
+    assert reopened.producer_settings_transaction is not None
+    assert reopened.producer_settings_payload is None
+    assert len(reopened.prune_marker_transactions) == 4
+    assert all(transaction is not None for _, transaction, _ in reopened.prune_marker_transactions)
+    assert reopened.diagnostics_payload_pruned_transaction is not None
+    assert reopened.cleanup_pending_settings_transaction is not None
+    assert reopened.cleanup_pending_settings_payload is None
+
+    producer = reopened.commit_producer_settings()
+    assert producer.to_object()["metadata"]["final_media_publication_generation"] == "44" * 16
+    pending = reopened.commit_cleanup_pending_settings()
+    assert pending.to_object()["metadata"]["cleanup_status"] == "pending"
+
+
+def test_partial_producer_settings_source_is_reset_before_any_dependent_mutation(
+    tmp_path,
+) -> None:
+    artifact = _pruning_artifact()
+    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _complete_prune_diagnostics(tmp_path)
+    prepared = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    assert prepared.producer_settings_transaction is not None
+    with prepared.producer_settings_transaction.source_path.open("r+b", buffering=0) as handle:
+        handle.write(b'{"content_fingerprint":"partial')
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    reopened = load_final_encoding_reservation_v1(
+        tmp_path,
+        artifact,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    committed = reopened.commit_producer_settings()
+
+    assert committed.to_object()["metadata"]["final_media_publication_generation"] == "44" * 16
+
+
+def test_pruning_failure_retirement_leaves_no_unindexed_reservation_objects(tmp_path) -> None:
+    artifact = _pruning_artifact()
+    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _complete_prune_diagnostics(tmp_path)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    owned_paths = []
+    for entry in reservation.index.extent_entries:
+        if entry["reservation_kind"] == "job_terminal_settings":
+            continue
+        descriptor = (
+            tmp_path
+            / ".depth-surge-reservations-v1"
+            / (
+                f"d-r-{entry['generation']}-{entry['reservation_kind']}-"
+                f"{entry['reservation_id']}.json"
+            )
+        )
+        target = tmp_path / entry["target_relative_path"]
+        source = target.parent / (
+            f".depth-surge-r-{entry['generation']}-{entry['reservation_kind']}-"
+            f"{entry['reservation_id']}.reserved"
+        )
+        owned_paths.extend((descriptor, source))
+
+    reservation.retire_terminal_failure()
+
+    assert not reservation.index_path.exists()
+    assert not reservation.target_descriptor_path.exists()
+    assert all(not path.exists() for path in owned_paths)
+
+
+def test_pruning_success_consumes_all_extents_before_index_last_retirement(tmp_path) -> None:
+    artifact = _pruning_artifact()
+    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _complete_prune_diagnostics(tmp_path)
+    raw, fingerprint = _input_manifest()
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=len(raw),
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    producer = reservation.commit_producer_settings()
+    assert reservation.input_manifest_transaction is not None
+    reservation.input_manifest_transaction.stage_complete_full(raw)
+    reservation.sibling_path.write_bytes(b"validated-pruning-video")
+    FinalPublicationTransactionV4(
+        job_root=tmp_path,
+        settings=producer,
+        sibling_relative_path=reservation.sibling_path.name,
+        encoding_input_manifest_raw=raw,
+        input_stage_fingerprint=fingerprint,
+        resolved_encoding_arguments=(
+            "ffmpeg",
+            "@output:path64="
+            + FinalPublicationTransactionV4.path64(
+                producer.to_object()["output_info"]["expected_final_relative_path"]
+            ),
+        ),
+        container_validator=lambda _path: True,
+        reservation=reservation,
+        retire_reservation=False,
+    ).publish()
+
+    pruned = commit_payload_pruned(tmp_path, reservation=reservation)
+    pending = reservation.commit_cleanup_pending_settings()
+    removed = run_authorized_cleanup(tmp_path, metadata=pruned)
+    reservation.retire()
+
+    assert pending.to_object()["metadata"]["cleanup_status"] == "pending"
+    assert removed > 0
+    assert not reservation.index_path.exists()
+    assert not reservation.target_descriptor_path.exists()
+    reservation_dir = tmp_path / ".depth-surge-reservations-v1"
+    assert not list(reservation_dir.glob("d-r-55*"))
+
+
+def test_pruning_crash_after_markers_reopens_the_remaining_ordered_prefix(tmp_path) -> None:
+    artifact = _pruning_artifact()
+    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _complete_prune_diagnostics(tmp_path)
+    raw, fingerprint = _input_manifest()
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=len(raw),
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    producer = reservation.commit_producer_settings()
+    assert reservation.input_manifest_transaction is not None
+    reservation.input_manifest_transaction.stage_complete_full(raw)
+    reservation.sibling_path.write_bytes(b"validated-pruning-recovery-video")
+    FinalPublicationTransactionV4(
+        job_root=tmp_path,
+        settings=producer,
+        sibling_relative_path=reservation.sibling_path.name,
+        encoding_input_manifest_raw=raw,
+        input_stage_fingerprint=fingerprint,
+        resolved_encoding_arguments=(
+            "ffmpeg",
+            "@output:path64="
+            + FinalPublicationTransactionV4.path64(
+                producer.to_object()["output_info"]["expected_final_relative_path"]
+            ),
+        ),
+        container_validator=lambda _path: True,
+        reservation=reservation,
+        retire_reservation=False,
+    ).publish()
+
+    def crash_after_markers(stage: str) -> None:
+        if stage == "after_prune_markers":
+            raise RuntimeError(stage)
+
+    with pytest.raises(RuntimeError, match="after_prune_markers"):
+        commit_payload_pruned(
+            tmp_path,
+            reservation=reservation,
+            fault=crash_after_markers,
+        )
+
+    reopened = load_final_encoding_reservation_v1(
+        tmp_path,
+        producer,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    assert all(transaction is None for _, transaction, _ in reopened.prune_marker_transactions)
+    assert reopened.diagnostics_payload_pruned_transaction is not None
+    assert reopened.cleanup_pending_settings_transaction is not None
+
+    pruned = commit_payload_pruned(tmp_path, reservation=reopened)
+    reopened.commit_cleanup_pending_settings()
+    run_authorized_cleanup(tmp_path, metadata=pruned)
+    reopened.retire()
+
+    assert not reopened.index_path.exists()
+
+
 @pytest.mark.parametrize(
     "stop_event",
     [
@@ -417,6 +765,92 @@ def test_reserved_post_video_crash_keeps_index_as_recovery_authority(tmp_path) -
     recovery = loaded.observe()
     assert recovery.phase == "video_replaced_input_intent"
     assert recovery.action == "commit-input-manifest"
+
+
+def test_reserved_input_manifest_refuses_a_replaced_preflight_target(tmp_path) -> None:
+    artifact = _producer_artifact()
+    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    old_raw, _old_fingerprint = _input_manifest()
+    input_target = tmp_path / "encoding_input_manifest.json"
+    input_target.write_bytes(old_raw)
+    new_raw, new_fingerprint = _input_manifest()
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=len(new_raw),
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    assert reservation.input_manifest_transaction is not None
+    reservation.input_manifest_transaction.stage_complete_full(new_raw)
+    replacement = tmp_path / "replacement-input.json"
+    replacement.write_bytes(old_raw)
+    os.replace(replacement, input_target)
+    reservation.sibling_path.write_bytes(b"validated-predecessor-video")
+
+    with pytest.raises(Exception, match="preflight target"):
+        FinalPublicationTransactionV4(
+            job_root=tmp_path,
+            settings=artifact,
+            sibling_relative_path=reservation.sibling_path.name,
+            encoding_input_manifest_raw=new_raw,
+            input_stage_fingerprint=new_fingerprint,
+            resolved_encoding_arguments=(
+                "ffmpeg",
+                "@output:path64="
+                + FinalPublicationTransactionV4.path64(
+                    artifact.to_object()["output_info"]["expected_final_relative_path"]
+                ),
+            ),
+            container_validator=lambda _path: True,
+            reservation=reservation,
+            retire_reservation=False,
+        ).publish()
+
+    assert input_target.read_bytes() == old_raw
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows replacement gaps are platform-specific")
+def test_reserved_windows_video_replacement_gap_moves_indexed_sibling_forward(tmp_path) -> None:
+    artifact = _producer_artifact()
+    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    raw, _fingerprint = _input_manifest()
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=len(raw),
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    assert reservation.input_manifest_transaction is not None
+    reservation.input_manifest_transaction.stage_complete_full(raw)
+    reservation.sibling_path.write_bytes(b"validated-replacement-gap-video")
+    reservation.final_video_path.unlink()
+
+    loaded = load_final_encoding_reservation_v1(
+        tmp_path,
+        artifact,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+
+    assert loaded.observe().phase == "windows_video_replace_gap_before_input_commit"
+    loaded.recover_video_replacement_gap()
+    assert loaded.final_video_path.read_bytes() == b"validated-replacement-gap-video"
+    assert not loaded.sibling_path.exists()
+    assert loaded.observe().phase == "video_replaced_input_intent"
 
 
 @pytest.mark.parametrize(

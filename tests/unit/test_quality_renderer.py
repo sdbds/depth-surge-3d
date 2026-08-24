@@ -92,6 +92,64 @@ def test_quality_background_finishes_every_lane_and_public_holes_are_clear() -> 
     assert result.right_image.dtype == frame.dtype
 
 
+def test_quality_compact_result_releases_dense_eye_plans_before_return() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    diagnostics = importlib.import_module("src.depth_surge_3d.rendering.quality.diagnostics")
+    frame = np.arange(7 * 33 * 3, dtype=np.uint8).reshape(7, 33, 3)
+    canonical = np.tile(
+        np.concatenate(
+            (
+                np.full(11, 0.1, dtype=np.float32),
+                np.full(11, 0.9, dtype=np.float32),
+                np.full(11, 0.2, dtype=np.float32),
+            )
+        ),
+        (7, 1),
+    )
+
+    compact = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(stereo_strength=4.0, convergence=0.45),
+    )
+
+    assert compact.left_plan is not None and compact.right_plan is not None
+    assert not hasattr(compact.left_plan, "records")
+    assert not hasattr(compact.right_plan, "records")
+    stats = diagnostics.build_quality_frame_stats(
+        compact,
+        frame_name="frame_000001",
+        geometry_mode="relative",
+        occlusion_fill="background",
+    )
+    assert stats["eyes"]["left"]["quality_budgets"]["availability"] == ("quality_repair_plan")
+
+
+def test_quality_public_budget_rejects_before_materializing_broadcast_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    content_manifest = importlib.import_module("src.depth_surge_3d.io.content_manifest")
+    frame = np.broadcast_to(np.zeros((1, 1, 3), dtype=np.uint8), (10_000, 10_000, 3))
+    canonical = np.zeros((1, 1), dtype=np.float32)
+    monkeypatch.setattr(
+        quality,
+        "build_relative_quality_geometry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("geometry allocation preceded host budget preflight")
+        ),
+    )
+
+    with pytest.raises(content_manifest.QualityHostBudgetError, match="quality-public"):
+        quality.render_relative_quality_public(
+            renderer=StereoRenderer(device="cpu"),
+            frame=frame,
+            canonical=canonical,
+            settings=_quality_settings(),
+        )
+
+
 def test_quality_band_height_does_not_change_rgb_or_compact_masks() -> None:
     quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
     generator = np.random.default_rng(37)

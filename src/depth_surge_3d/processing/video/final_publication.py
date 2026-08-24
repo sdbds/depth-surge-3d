@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 import hashlib
 import os
 import re
@@ -11,6 +12,9 @@ import secrets
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
+
+from ...rendering.quality.cleanup_transaction import plan_prune_markers_v1
+from ...rendering.quality.diagnostic_transaction import self_fingerprint
 
 from ...io.canonical_json import (
     CanonicalJsonError,
@@ -36,6 +40,7 @@ from ...io.reservation_protocol import (
     platform_allocation_adapter,
     platform_allocation_counter,
     publish_write_ahead_intent,
+    same_parent_replace_v1,
     sha256_canonical,
     load_job_control,
     validate_final_encoding_entry_order,
@@ -309,6 +314,14 @@ class PreparedFinalEncodingReservationV1:
     input_manifest_transaction: ReservedArtifactTransaction | None
     final_manifest_transaction: ReservedArtifactTransaction | None
     event: Callable[[str], None] | None = None
+    producer_settings_transaction: ReservedArtifactTransaction | None = None
+    producer_settings_payload: bytes | None = None
+    prune_marker_transactions: tuple[
+        tuple[dict, ReservedArtifactTransaction | None, bytes], ...
+    ] = ()
+    diagnostics_payload_pruned_transaction: ReservedArtifactTransaction | None = None
+    cleanup_pending_settings_transaction: ReservedArtifactTransaction | None = None
+    cleanup_pending_settings_payload: bytes | None = None
 
     @property
     def index_path(self) -> Path:
@@ -326,12 +339,184 @@ class PreparedFinalEncodingReservationV1:
     def final_video_path(self) -> Path:
         return self.job_root / self.index.final_video_relative_path
 
+    @property
+    def has_post_publication_work(self) -> bool:
+        return bool(
+            self.prune_marker_transactions
+            or self.diagnostics_payload_pruned_transaction is not None
+            or self.cleanup_pending_settings_transaction is not None
+        )
+
     def validate_reserved_target(self) -> None:
         if (
             _reservation_identity(self.final_video_path)
             != self.target_descriptor.reserved_target_identity
         ):
             raise ReservationConflictError("final video target no longer has its reserved identity")
+
+    def _consume_reserved_payload(
+        self,
+        transaction: ReservedArtifactTransaction,
+        payload: bytes,
+    ) -> None:
+        phase = transaction.validate_physical_phase(payload)
+        if phase in {"full-source", "short-source"}:
+            self.validate_indexed_predecessor(transaction)
+        if phase == "full-source":
+            transaction.consume(payload)
+        else:
+            transaction.recover(payload)
+
+    def validate_indexed_predecessor(
+        self,
+        transaction: ReservedArtifactTransaction,
+    ) -> None:
+        if not transaction.source_path.exists() or not transaction.target_path.exists():
+            return
+        matches = [
+            entry
+            for entry in self.index.extent_entries
+            if entry.get("reservation_kind") == transaction.descriptor.reservation_kind
+            and entry.get("reservation_id") == transaction.descriptor.reservation_id
+            and entry.get("generation") == transaction.descriptor.generation
+        ]
+        if len(matches) != 1:
+            raise ReservationConflictError("extent descriptor has no unique indexed plan")
+        entry = matches[0]
+        if transaction.descriptor.publication_method != "replace_existing":
+            return
+        if transaction.descriptor.reservation_kind in {
+            "producer_settings",
+            "cleanup_pending_settings",
+            "job_terminal_settings",
+        }:
+            return
+        expected = entry.get("preflight_target_identity")
+        expected_count = entry.get("preflight_target_byte_count")
+        expected_hash = entry.get("preflight_target_raw_sha256")
+        target = transaction.target_path
+        if (
+            expected is None
+            or type(expected_count) is not int
+            or not isinstance(expected_hash, str)
+            or _reservation_identity(target) != ReservationFileIdentity.from_object(expected)
+            or _hash_file(target) != (expected_hash, expected_count)
+        ):
+            raise ReservationConflictError(
+                f"{transaction.descriptor.reservation_kind} preflight target changed"
+            )
+
+    @staticmethod
+    def _reset_uncommitted_settings_source(
+        transaction: ReservedArtifactTransaction,
+        expected_payload: bytes,
+    ) -> None:
+        if transaction.validate_physical_phase(expected_payload) != "full-source":
+            raise ReservationConflictError("only an unconsumed full settings source may be reset")
+        zeroes = b"\x00" * (64 * 1024)
+        with transaction.source_path.open("r+b", buffering=0) as handle:
+            handle.seek(0)
+            remaining = transaction.descriptor.logical_byte_count
+            while remaining:
+                chunk = zeroes[: min(len(zeroes), remaining)]
+                if handle.write(chunk) != len(chunk):
+                    raise OSError("short settings reservation reset")
+                remaining -= len(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if transaction.validate_physical_phase(expected_payload) != "full-source":
+            raise ReservationConflictError("settings reservation reset changed physical phase")
+
+    def commit_producer_settings(self) -> ProcessingSettingsArtifactV5:
+        payload = self.producer_settings_payload
+        transaction = self.producer_settings_transaction
+        if transaction is not None:
+            current = ProcessingSettingsArtifactV5.parse(
+                (self.job_root / "processing-settings-v5.json").read_bytes()
+            )
+            if payload is None:
+                payload = current.with_producer_marker(
+                    generation=self.index.publication_generation,
+                    updated_at=_utc_now_usec(),
+                ).encode()
+                self.producer_settings_payload = payload
+                self._reset_uncommitted_settings_source(transaction, payload)
+            intended = ProcessingSettingsArtifactV5.parse(payload)
+            timestamp = intended.to_object()["metadata"]["last_updated_at"]
+            if intended != current.with_producer_marker(
+                generation=self.index.publication_generation,
+                updated_at=timestamp,
+            ):
+                raise ReservationConflictError(
+                    "producer settings intent is not its exact successor"
+                )
+            self._consume_reserved_payload(transaction, payload)
+            self.producer_settings_transaction = None
+        current = ProcessingSettingsArtifactV5.parse(
+            (self.job_root / "processing-settings-v5.json").read_bytes()
+        )
+        metadata = current.to_object()["metadata"]
+        if (
+            metadata["final_media_producer_contract_version"] != 4
+            or metadata["final_media_publication_generation"] != self.index.publication_generation
+        ):
+            raise ReservationConflictError("producer settings transition did not commit")
+        return current
+
+    def commit_prune_markers(self) -> tuple[dict, ...]:
+        committed: list[tuple[dict, ReservedArtifactTransaction | None, bytes]] = []
+        entries: list[dict] = []
+        for entry, transaction, payload in self.prune_marker_transactions:
+            if transaction is not None:
+                self._consume_reserved_payload(transaction, payload)
+            target = self.job_root / entry["relative_path"] / entry["marker"]["name"]
+            if not _regular_nonlink(target) or _hash_file(target) != (
+                entry["marker"]["sha256"],
+                len(payload),
+            ):
+                raise ReservationConflictError("indexed prune marker did not commit")
+            committed.append((entry, None, payload))
+            entries.append(entry)
+        self.prune_marker_transactions = tuple(committed)
+        return tuple(entries)
+
+    def commit_payload_pruned_metadata(self, payload: bytes) -> None:
+        transaction = self.diagnostics_payload_pruned_transaction
+        if transaction is None:
+            target = self.job_root / "04_stereo_diagnostics" / "metadata.json"
+            if target.read_bytes() != payload:
+                raise ReservationConflictError(
+                    "payload-pruned metadata differs from committed target"
+                )
+            return
+        self._consume_reserved_payload(transaction, payload)
+        self.diagnostics_payload_pruned_transaction = None
+
+    def commit_cleanup_pending_settings(self) -> ProcessingSettingsArtifactV5:
+        payload = self.cleanup_pending_settings_payload
+        transaction = self.cleanup_pending_settings_transaction
+        if transaction is not None:
+            current = ProcessingSettingsArtifactV5.parse(
+                (self.job_root / "processing-settings-v5.json").read_bytes()
+            )
+            if payload is None:
+                payload = current.cleanup_pending(updated_at=_utc_now_usec()).encode()
+                self.cleanup_pending_settings_payload = payload
+                self._reset_uncommitted_settings_source(transaction, payload)
+            intended = ProcessingSettingsArtifactV5.parse(payload)
+            timestamp = intended.to_object()["metadata"]["last_updated_at"]
+            if intended != current.cleanup_pending(updated_at=timestamp):
+                raise ReservationConflictError(
+                    "cleanup-pending settings intent is not its exact successor"
+                )
+            self._consume_reserved_payload(transaction, payload)
+            self.cleanup_pending_settings_transaction = None
+        current = ProcessingSettingsArtifactV5.parse(
+            (self.job_root / "processing-settings-v5.json").read_bytes()
+        )
+        if current.to_object()["metadata"]["cleanup_status"] != "pending":
+            raise ReservationConflictError("cleanup-pending settings transition did not commit")
+        return current
 
     @staticmethod
     def _canonical_prefix_byte_count(path: Path) -> int | None:
@@ -451,6 +636,32 @@ class PreparedFinalEncodingReservationV1:
             )
         )
 
+    def recover_video_replacement_gap(self) -> None:
+        """Move the indexed sibling forward after Windows removed the old target."""
+
+        recovery = self.observe()
+        if recovery.phase not in {
+            "windows_video_replace_gap_before_input_commit",
+            "windows_video_replace_gap_after_input_commit",
+        }:
+            raise ReservationConflictError("final video is not in a replacement gap")
+        if os.name != "nt":
+            raise ReservationConflictError("final-video replacement gaps are Windows-only")
+        if not _regular_nonlink(self.sibling_path):
+            raise ReservationConflictError("indexed replacement-gap sibling is unsafe")
+        if self.final_video_path.exists() or self.final_video_path.is_symlink():
+            raise ReservationConflictError("replacement-gap final target reappeared")
+        same_parent_replace_v1(
+            self.sibling_path,
+            self.final_video_path,
+            expected_source_identity=_reservation_identity(self.sibling_path),
+            expected_target_identity=None,
+            expected_parent_identity=self.target_descriptor.target_parent_identity,
+            replace_existing=False,
+        )
+        if self._video_state() != "committed-new":
+            raise ReservationConflictError("replacement-gap video forward move did not commit")
+
     def reset_incomplete_manifest_sources(self) -> None:
         """Wholly zero only indexed zero/partial source frames before reconstruction."""
 
@@ -509,6 +720,7 @@ class PreparedFinalEncodingReservationV1:
         source = self.input_publication_source()
         if source is None:
             raise ReservationConflictError("input manifest has no complete recovery intent")
+        self.validate_indexed_predecessor(transaction)
         transaction.recover_streamed_prefix(
             prefix_byte_count=source.raw_byte_count,
             prefix_sha256=source.raw_sha256,
@@ -534,6 +746,7 @@ class PreparedFinalEncodingReservationV1:
         )
         if input_source.fingerprint != manifest.input_stage_fingerprint:
             raise ReservationConflictError("final manifest no longer binds the input manifest")
+        self.validate_indexed_predecessor(transaction)
         transaction.recover(raw)
         self.final_manifest_transaction = None
         return manifest
@@ -548,16 +761,16 @@ class PreparedFinalEncodingReservationV1:
             raise ReservationConflictError(
                 "indexed sibling remains at final reservation retirement"
             )
-        if (
-            self.input_manifest_transaction is not None
-            and self.input_manifest_transaction.descriptor_path.exists()
-        ):
-            raise ReservationConflictError("input manifest descriptor remains active")
-        if (
-            self.final_manifest_transaction is not None
-            and self.final_manifest_transaction.descriptor_path.exists()
-        ):
-            raise ReservationConflictError("final manifest descriptor remains active")
+        for entry in self.index.extent_entries:
+            if entry["reservation_kind"] == "job_terminal_settings":
+                continue
+            descriptor, source = _indexed_extent_paths(self.job_root, entry)
+            if descriptor.exists() or descriptor.is_symlink():
+                raise ReservationConflictError(
+                    f"{entry['reservation_kind']} descriptor remains active"
+                )
+            if source.exists() or source.is_symlink():
+                raise ReservationConflictError(f"{entry['reservation_kind']} source remains active")
         self.target_descriptor_path.unlink(missing_ok=True)
         _sync_parent(self.target_descriptor_path.parent)
         emit = event or self.event
@@ -580,10 +793,15 @@ class PreparedFinalEncodingReservationV1:
             _reservation_identity(self.sibling_path)
             self.sibling_path.unlink()
             _sync_parent(self.sibling_path.parent)
-        for transaction in (
+        transactions = [
+            self.producer_settings_transaction,
             self.input_manifest_transaction,
             self.final_manifest_transaction,
-        ):
+            *(transaction for _entry, transaction, _payload in self.prune_marker_transactions),
+            self.diagnostics_payload_pruned_transaction,
+            self.cleanup_pending_settings_transaction,
+        ]
+        for transaction in transactions:
             if transaction is None or not transaction.descriptor_path.exists():
                 continue
             if transaction.source_path.exists():
@@ -663,6 +881,44 @@ def _extent_plan(
     }
 
 
+def _indexed_extent_paths(root: Path, entry: dict) -> tuple[Path, Path]:
+    kind = entry["reservation_kind"]
+    descriptor = (
+        root
+        / ".depth-surge-reservations-v1"
+        / f"d-r-{entry['generation']}-{kind}-{entry['reservation_id']}.json"
+    )
+    target = root / entry["target_relative_path"]
+    source = target.parent / (
+        f".depth-surge-r-{entry['generation']}-{kind}-{entry['reservation_id']}.reserved"
+    )
+    return descriptor, source
+
+
+def _utc_now_usec() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _diagnostics_prune_preflight(job_root: Path) -> tuple[bytes, str]:
+    path = Path(job_root) / "04_stereo_diagnostics" / "metadata.json"
+    raw = path.read_bytes()
+    try:
+        value = strict_canonical_json_loads(raw, max_bytes=16 * 1024 * 1024)
+    except CanonicalJsonError as error:
+        raise FinalPublicationValidationError(
+            "diagnostics metadata is not canonical at final preflight"
+        ) from error
+    if (
+        not isinstance(value, dict)
+        or value.get("status") not in {"complete", "legacy_fast_unavailable"}
+        or value.get("fingerprint") != self_fingerprint(value)
+    ):
+        raise FinalPublicationValidationError(
+            "diagnostics metadata is not complete at final preflight"
+        )
+    return raw, value["fingerprint"]
+
+
 def prepare_final_encoding_reservation_v1(  # noqa: C901
     *,
     job_root: Path,
@@ -721,6 +977,22 @@ def prepare_final_encoding_reservation_v1(  # noqa: C901
         if not re.fullmatch(r"[0-9a-f]{32}", token, flags=re.ASCII):
             raise FinalPublicationValidationError(f"{label} is invalid")
     unit = allocation_unit or allocation_unit_for_path(root)
+    producer_target = settings.with_producer_marker(
+        generation=publication_generation,
+        updated_at=_utc_now_usec(),
+    )
+    producer_payload = producer_target.encode() if producer_target != settings else None
+    producer_plan = None
+    if producer_payload is not None:
+        producer_plan = _extent_plan(
+            kind="producer_settings",
+            target=Path("processing-settings-v5.json"),
+            raw_max=512 * 1024,
+            allocation_unit=unit,
+            generation=reserve_generation,
+            reservation_id=secrets.token_hex(16),
+            job_root=root,
+        )
     input_plan = _extent_plan(
         kind="encoding_input_manifest",
         target=ENCODING_INPUT_MANIFEST_RELATIVE_PATH,
@@ -730,6 +1002,56 @@ def prepare_final_encoding_reservation_v1(  # noqa: C901
         reservation_id=input_id,
         job_root=root,
     )
+    keep_intermediates = values["processing_settings"]["keep_intermediates"]
+    diagnostics_raw: bytes | None = None
+    diagnostics_fingerprint: str | None = None
+    marker_specs = ()
+    marker_plans: list[dict] = []
+    diagnostics_plan = None
+    cleanup_plan = None
+    cleanup_payload: bytes | None = None
+    if not keep_intermediates:
+        diagnostics_raw, diagnostics_fingerprint = _diagnostics_prune_preflight(root)
+        marker_specs = plan_prune_markers_v1(root)
+        for marker in marker_specs:
+            plan = _extent_plan(
+                kind="prune_marker",
+                target=Path(marker.relative_path) / marker.marker_name,
+                raw_max=len(marker.payload),
+                allocation_unit=unit,
+                generation=reserve_generation,
+                reservation_id=secrets.token_hex(16),
+                job_root=root,
+            )
+            plan.update(
+                {
+                    "prune_root_relative_path": marker.relative_path,
+                    "marker_name": marker.marker_name,
+                    "marker_payload_sha256": marker.payload_sha256,
+                    "prune_entry": marker.prune_entry(),
+                }
+            )
+            marker_plans.append(plan)
+        diagnostics_plan = _extent_plan(
+            kind="diagnostics_payload_pruned",
+            target=Path("04_stereo_diagnostics/metadata.json"),
+            raw_max=16 * 1024 * 1024,
+            allocation_unit=unit,
+            generation=reserve_generation,
+            reservation_id=secrets.token_hex(16),
+            job_root=root,
+        )
+        cleanup_target = producer_target.cleanup_pending(updated_at=_utc_now_usec())
+        cleanup_payload = cleanup_target.encode()
+        cleanup_plan = _extent_plan(
+            kind="cleanup_pending_settings",
+            target=Path("processing-settings-v5.json"),
+            raw_max=512 * 1024,
+            allocation_unit=unit,
+            generation=reserve_generation,
+            reservation_id=secrets.token_hex(16),
+            job_root=root,
+        )
     final_plan = _extent_plan(
         kind="final_video_manifest",
         target=FINAL_VIDEO_MANIFEST_RELATIVE_PATH,
@@ -743,7 +1065,15 @@ def prepare_final_encoding_reservation_v1(  # noqa: C901
         Path(".depth-surge-reservations-v1")
         / f"final-video-target-p-{publication_generation}-r-{reserve_generation}.json"
     )
-    extent_entries: list[dict] = [input_plan, final_plan]
+    extent_entries: list[dict] = []
+    if producer_plan is not None:
+        extent_entries.append(producer_plan)
+    extent_entries.extend((input_plan, final_plan))
+    extent_entries.extend(marker_plans)
+    if diagnostics_plan is not None:
+        extent_entries.append(diagnostics_plan)
+    if cleanup_plan is not None:
+        extent_entries.append(cleanup_plan)
     job_control_path = root / "job-control-v1.json"
     if job_control_path.is_file():
         control = load_job_control(root)
@@ -769,8 +1099,10 @@ def prepare_final_encoding_reservation_v1(  # noqa: C901
         final_video_target_descriptor_relative_path=target_descriptor_relative.as_posix(),
         sibling_video_temporary_relative_path=sibling_relative,
         sibling_video_parent_identity=_reservation_directory_identity(root),
-        diagnostics_metadata_raw_sha256_at_preflight=None,
-        diagnostics_metadata_fingerprint_at_preflight=None,
+        diagnostics_metadata_raw_sha256_at_preflight=(
+            hashlib.sha256(diagnostics_raw).hexdigest() if diagnostics_raw is not None else None
+        ),
+        diagnostics_metadata_fingerprint_at_preflight=diagnostics_fingerprint,
         extent_entries=tuple(extent_entries),
     )
     index_path = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
@@ -810,47 +1142,62 @@ def prepare_final_encoding_reservation_v1(  # noqa: C901
             return None
         return lambda value: event(f"{kind}:{value}")
 
-    input_transaction = ReservedArtifactTransaction.create(
-        job_root=root,
-        index_relative_path=FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
-        target_relative_path=ENCODING_INPUT_MANIFEST_RELATIVE_PATH,
-        reservation_kind="encoding_input_manifest",
-        payload_raw_max=input_manifest_raw_max,
-        allocation_unit=unit,
-        allocation_adapter=allocation_adapter,
-        generation=reserve_generation,
-        reservation_id=input_id,
-        allocation_counter=allocation_counter,
-        expected_publication_method=input_plan["publication_method"],
-        event=extent_event("input-manifest"),
-    )
-    final_transaction = ReservedArtifactTransaction.create(
-        job_root=root,
-        index_relative_path=FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
-        target_relative_path=FINAL_VIDEO_MANIFEST_RELATIVE_PATH,
-        reservation_kind="final_video_manifest",
-        payload_raw_max=final_manifest_raw_max,
-        allocation_unit=unit,
-        allocation_adapter=allocation_adapter,
-        generation=reserve_generation,
-        reservation_id=final_id,
-        allocation_counter=allocation_counter,
-        expected_publication_method=final_plan["publication_method"],
-        event=extent_event("final-manifest"),
-    )
-    for transaction, plan in (
-        (input_transaction, input_plan),
-        (final_transaction, final_plan),
-    ):
+    def create_extent(plan: dict, label: str) -> ReservedArtifactTransaction:
+        transaction = ReservedArtifactTransaction.create(
+            job_root=root,
+            index_relative_path=FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+            target_relative_path=Path(plan["target_relative_path"]),
+            reservation_kind=plan["reservation_kind"],
+            payload_raw_max=plan["payload_raw_max"],
+            allocation_unit=unit,
+            allocation_adapter=allocation_adapter,
+            generation=reserve_generation,
+            reservation_id=plan["reservation_id"],
+            allocation_counter=allocation_counter,
+            expected_publication_method=plan["publication_method"],
+            event=extent_event(label),
+        )
         if transaction.descriptor.publication_method != plan["publication_method"]:
             raise ReservationConflictError("extent publication method changed after preflight")
+        return transaction
+
+    producer_transaction = (
+        create_extent(producer_plan, "producer-settings") if producer_plan is not None else None
+    )
+    input_transaction = create_extent(input_plan, "input-manifest")
+    final_transaction = create_extent(final_plan, "final-manifest")
+    marker_transactions: list[tuple[dict, ReservedArtifactTransaction, bytes]] = []
+    for marker, plan in zip(marker_specs, marker_plans, strict=True):
+        marker_transactions.append(
+            (
+                marker.prune_entry(),
+                create_extent(plan, f"prune-marker:{marker.stage_key}"),
+                marker.payload,
+            )
+        )
+    diagnostics_transaction = (
+        create_extent(diagnostics_plan, "diagnostics-payload-pruned")
+        if diagnostics_plan is not None
+        else None
+    )
+    cleanup_transaction = (
+        create_extent(cleanup_plan, "cleanup-pending-settings")
+        if cleanup_plan is not None
+        else None
+    )
     return PreparedFinalEncodingReservationV1(
-        root,
-        index,
-        target_descriptor,
-        input_transaction,
-        final_transaction,
-        event,
+        job_root=root,
+        index=index,
+        target_descriptor=target_descriptor,
+        input_manifest_transaction=input_transaction,
+        final_manifest_transaction=final_transaction,
+        event=event,
+        producer_settings_transaction=producer_transaction,
+        producer_settings_payload=producer_payload,
+        prune_marker_transactions=tuple(marker_transactions),
+        diagnostics_payload_pruned_transaction=diagnostics_transaction,
+        cleanup_pending_settings_transaction=cleanup_transaction,
+        cleanup_pending_settings_payload=cleanup_payload,
     )
 
 
@@ -867,21 +1214,17 @@ def _load_indexed_extent(  # noqa: C901
     *,
     root: Path,
     index: FinalEncodingReservationIndexV1,
-    kind: str,
+    entry: dict,
     allocation_adapter: AllocationAdapter,
     allocation_counter: AllocationCounter | None,
+    committed: bool = False,
 ) -> ReservedArtifactTransaction | None:
-    entries = [entry for entry in index.extent_entries if entry.get("reservation_kind") == kind]
-    if len(entries) != 1:
-        raise ReservationConflictError(f"final index has no unique {kind} entry")
-    entry = entries[0]
-    descriptor_name = f"d-r-{entry['generation']}-{kind}-{entry['reservation_id']}.json"
-    descriptor_path = root / ".depth-surge-reservations-v1" / descriptor_name
+    kind = entry.get("reservation_kind")
+    if not isinstance(kind, str):
+        raise ReservationConflictError("final index extent kind is invalid")
+    descriptor_path, source_path = _indexed_extent_paths(root, entry)
     if not descriptor_path.exists():
         target_path = root / entry["target_relative_path"]
-        source_path = target_path.parent / (
-            f".depth-surge-r-{entry['generation']}-{kind}-{entry['reservation_id']}.reserved"
-        )
         target_is_preflight = False
         if target_path.exists() or target_path.is_symlink():
             if entry["preflight_target_identity"] is None:
@@ -898,12 +1241,18 @@ def _load_indexed_extent(  # noqa: C901
                     entry["preflight_target_raw_sha256"],
                     entry["preflight_target_byte_count"],
                 )
+        if not source_path.exists() and committed:
+            return None
         if not source_path.exists() and not target_is_preflight and target_path.exists():
             try:
                 if kind == "encoding_input_manifest":
                     _stream_input_manifest_identity(target_path)
-                else:
+                elif kind == "final_video_manifest":
                     parse_final_video_manifest_v4(target_path.read_bytes())
+                else:
+                    raise FinalPublicationValidationError(
+                        f"descriptorless {kind} target has no consumption evidence"
+                    )
             except FinalPublicationValidationError as error:
                 raise ReservationConflictError(
                     f"descriptorless {kind} target is not committed evidence"
@@ -945,6 +1294,82 @@ def _load_indexed_extent(  # noqa: C901
     return transaction
 
 
+def _unique_extent_entry(index: FinalEncodingReservationIndexV1, kind: str) -> dict:
+    entries = [entry for entry in index.extent_entries if entry.get("reservation_kind") == kind]
+    if len(entries) != 1:
+        raise ReservationConflictError(f"final index has no unique {kind} entry")
+    return entries[0]
+
+
+def _settings_payload_intent(
+    transaction: ReservedArtifactTransaction | None,
+) -> bytes | None:
+    if transaction is None:
+        return None
+    path = transaction.source_path if transaction.source_path.exists() else transaction.target_path
+    prefix = PreparedFinalEncodingReservationV1._canonical_prefix_byte_count(path)
+    if prefix in {None, 0}:
+        return None
+    if prefix > transaction.descriptor.payload_raw_max:
+        raise ReservationConflictError("indexed settings payload exceeds its raw bound")
+    with path.open("rb", buffering=0) as handle:
+        raw = handle.read(prefix)
+    try:
+        artifact = ProcessingSettingsArtifactV5.parse(raw)
+    except SettingsArtifactSchemaError:
+        return None
+    if artifact.encode() != raw:
+        raise ReservationConflictError("indexed settings payload intent is noncanonical")
+    return raw
+
+
+def _marker_payload_from_entry(entry: dict) -> tuple[dict, bytes]:
+    prune_entry = entry.get("prune_entry")
+    if not isinstance(prune_entry, dict):
+        raise ReservationConflictError("prune marker entry has no durable authorization")
+    marker = prune_entry.get("marker")
+    relative_path = prune_entry.get("relative_path")
+    if not isinstance(marker, dict) or not isinstance(relative_path, str):
+        raise ReservationConflictError("prune marker authorization is malformed")
+    name = marker.get("name")
+    if not isinstance(name, str) or not re.fullmatch(
+        r"\.depth-surge-prune-v2-[0-9a-f]{32}\.marker", name, flags=re.ASCII
+    ):
+        raise ReservationConflictError("prune marker name is invalid")
+    token = name.removeprefix(".depth-surge-prune-v2-").removesuffix(".marker")
+    payload = (
+        canonical_json_bytes(
+            {
+                "cleanup_contract_version": 2,
+                "relative_path": relative_path,
+                "token": token,
+            }
+        )
+        + b"\n"
+    )
+    if (
+        entry.get("prune_root_relative_path") != relative_path
+        or entry.get("marker_name") != name
+        or entry.get("marker_payload_sha256") != hashlib.sha256(payload).hexdigest()
+        or marker.get("sha256") != hashlib.sha256(payload).hexdigest()
+        or entry.get("target_relative_path") != f"{relative_path}/{name}"
+    ):
+        raise ReservationConflictError("prune marker plan differs from its authorization")
+    return dict(prune_entry), payload
+
+
+def _load_diagnostics_metadata(root: Path) -> tuple[dict, bytes]:
+    path = root / "04_stereo_diagnostics" / "metadata.json"
+    raw = path.read_bytes()
+    try:
+        value = strict_canonical_json_loads(raw, max_bytes=16 * 1024 * 1024)
+    except CanonicalJsonError as error:
+        raise ReservationConflictError("diagnostics metadata is noncanonical") from error
+    if not isinstance(value, dict) or value.get("fingerprint") != self_fingerprint(value):
+        raise ReservationConflictError("diagnostics metadata fingerprint is invalid")
+    return value, raw
+
+
 def load_final_encoding_reservation_v1(
     job_root: Path,
     settings: ProcessingSettingsArtifactV5,
@@ -971,6 +1396,37 @@ def load_final_encoding_reservation_v1(
         or index.sibling_video_parent_identity != _reservation_directory_identity(root)
     ):
         raise ReservationConflictError("active final index belongs to different job settings")
+    producer_entries = [
+        entry
+        for entry in index.extent_entries
+        if entry.get("reservation_kind") == "producer_settings"
+    ]
+    marker_entries = [
+        entry for entry in index.extent_entries if entry.get("reservation_kind") == "prune_marker"
+    ]
+    diagnostics_entries = [
+        entry
+        for entry in index.extent_entries
+        if entry.get("reservation_kind") == "diagnostics_payload_pruned"
+    ]
+    cleanup_entries = [
+        entry
+        for entry in index.extent_entries
+        if entry.get("reservation_kind") == "cleanup_pending_settings"
+    ]
+    if len(producer_entries) > 1 or len(diagnostics_entries) > 1 or len(cleanup_entries) > 1:
+        raise ReservationConflictError("final index has duplicate singleton extents")
+    producer_consumed = (
+        metadata["final_media_publication_generation"] == index.publication_generation
+    )
+    cleanup_consumed = metadata["cleanup_status"] not in {"not_started", "not_requested"}
+    diagnostics_value: dict | None = None
+    diagnostics_raw: bytes | None = None
+    if marker_entries or diagnostics_entries:
+        diagnostics_value, diagnostics_raw = _load_diagnostics_metadata(root)
+    diagnostics_consumed = bool(
+        diagnostics_value is not None and diagnostics_value.get("status") == "payload_pruned"
+    )
     target_path = root / index.final_video_target_descriptor_relative_path
     if target_path.exists():
         target = FinalVideoTargetReservationV1.from_object(
@@ -1019,6 +1475,74 @@ def load_final_encoding_reservation_v1(
         or target.publication_method != index.final_video_publication_method
     ):
         raise ReservationConflictError("final target descriptor differs from its index")
+    producer_transaction = (
+        _load_indexed_extent(
+            root=root,
+            index=index,
+            entry=producer_entries[0],
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+            committed=producer_consumed,
+        )
+        if producer_entries
+        else None
+    )
+    prune_transactions: list[tuple[dict, ReservedArtifactTransaction | None, bytes]] = []
+    committed_prune_entries = (
+        diagnostics_value.get("prune_entries")
+        if diagnostics_consumed and diagnostics_value is not None
+        else None
+    )
+    for marker_index, entry in enumerate(marker_entries):
+        prune_entry, payload = _marker_payload_from_entry(entry)
+        target = root / entry["target_relative_path"]
+        marker_committed = (
+            _regular_nonlink(target)
+            and _hash_file(target) == (hashlib.sha256(payload).hexdigest(), len(payload))
+        ) or (
+            isinstance(committed_prune_entries, list)
+            and marker_index < len(committed_prune_entries)
+            and committed_prune_entries[marker_index] == prune_entry
+            and not (target.exists() or target.is_symlink())
+        )
+        prune_transactions.append(
+            (
+                prune_entry,
+                _load_indexed_extent(
+                    root=root,
+                    index=index,
+                    entry=entry,
+                    allocation_adapter=allocation_adapter,
+                    allocation_counter=allocation_counter,
+                    committed=marker_committed,
+                ),
+                payload,
+            )
+        )
+    diagnostics_transaction = (
+        _load_indexed_extent(
+            root=root,
+            index=index,
+            entry=diagnostics_entries[0],
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+            committed=diagnostics_consumed,
+        )
+        if diagnostics_entries
+        else None
+    )
+    cleanup_transaction = (
+        _load_indexed_extent(
+            root=root,
+            index=index,
+            entry=cleanup_entries[0],
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+            committed=cleanup_consumed,
+        )
+        if cleanup_entries
+        else None
+    )
     return PreparedFinalEncodingReservationV1(
         job_root=root,
         index=index,
@@ -1026,18 +1550,24 @@ def load_final_encoding_reservation_v1(
         input_manifest_transaction=_load_indexed_extent(
             root=root,
             index=index,
-            kind="encoding_input_manifest",
+            entry=_unique_extent_entry(index, "encoding_input_manifest"),
             allocation_adapter=allocation_adapter,
             allocation_counter=allocation_counter,
         ),
         final_manifest_transaction=_load_indexed_extent(
             root=root,
             index=index,
-            kind="final_video_manifest",
+            entry=_unique_extent_entry(index, "final_video_manifest"),
             allocation_adapter=allocation_adapter,
             allocation_counter=allocation_counter,
         ),
         event=event,
+        producer_settings_transaction=producer_transaction,
+        producer_settings_payload=_settings_payload_intent(producer_transaction),
+        prune_marker_transactions=tuple(prune_transactions),
+        diagnostics_payload_pruned_transaction=diagnostics_transaction,
+        cleanup_pending_settings_transaction=cleanup_transaction,
+        cleanup_pending_settings_payload=_settings_payload_intent(cleanup_transaction),
     )
 
 
@@ -1086,19 +1616,10 @@ def recover_final_encoding_terminal_retirement_v1(  # noqa: C901
     if descriptor_temporary.exists() or descriptor_temporary.is_symlink():
         raise ReservationConflictError("retirement prefix retains target descriptor temporary")
     for entry in index.extent_entries:
-        if entry.get("reservation_kind") not in {
-            "encoding_input_manifest",
-            "final_video_manifest",
-        }:
+        if entry.get("reservation_kind") == "job_terminal_settings":
             continue
-        kind = entry["reservation_kind"]
-        descriptor_name = f"d-r-{entry['generation']}-{kind}-{entry['reservation_id']}.json"
-        descriptor = root / ".depth-surge-reservations-v1" / descriptor_name
+        descriptor, source = _indexed_extent_paths(root, entry)
         descriptor_temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
-        target = root / entry["target_relative_path"]
-        source = target.parent / (
-            f".depth-surge-r-{entry['generation']}-{kind}-{entry['reservation_id']}.reserved"
-        )
         if any(
             path.exists() or path.is_symlink()
             for path in (descriptor, descriptor_temporary, source)
@@ -1584,8 +2105,25 @@ class FinalPublicationTransactionV4:
             handle.flush()
             os.fsync(handle.fileno())
         video_sha256, video_byte_count = _hash_file(sibling)
-        os.replace(sibling, final_path)
-        _sync_parent(final_path.parent)
+        if self.reservation is not None:
+            expected_target_identity = (
+                self.reservation.target_descriptor.reserved_target_identity
+                if reservation_phase == "ready_pre_video"
+                else _reservation_identity(final_path)
+            )
+            same_parent_replace_v1(
+                sibling,
+                final_path,
+                expected_source_identity=_reservation_identity(sibling),
+                expected_target_identity=expected_target_identity,
+                expected_parent_identity=(
+                    self.reservation.target_descriptor.target_parent_identity
+                ),
+                replace_existing=True,
+            )
+        else:
+            os.replace(sibling, final_path)
+            _sync_parent(final_path.parent)
         if not _regular_nonlink(final_path):
             raise FinalPublicationValidationError("final video target failed reopen")
         reopened_hash, reopened_count = _hash_file(final_path)
@@ -1605,6 +2143,7 @@ class FinalPublicationTransactionV4:
                         "committed input manifest fingerprint differs"
                     )
             elif self.encoding_input_manifest_raw is not None:
+                self.reservation.validate_indexed_predecessor(input_transaction)
                 input_transaction.consume(self.encoding_input_manifest_raw)
                 self.reservation.input_manifest_transaction = None
             else:
@@ -1614,6 +2153,7 @@ class FinalPublicationTransactionV4:
                     raise FinalPublicationValidationError(
                         "streamed input source is not the indexed extent"
                     )
+                self.reservation.validate_indexed_predecessor(input_transaction)
                 input_transaction.consume_streamed_prefix(
                     prefix_byte_count=source.raw_byte_count,
                     prefix_sha256=source.raw_sha256,
@@ -1649,6 +2189,7 @@ class FinalPublicationTransactionV4:
             if final_transaction is None:
                 raise FinalPublicationValidationError("final manifest reservation is consumed")
             try:
+                self.reservation.validate_indexed_predecessor(final_transaction)
                 final_transaction.consume(
                     final_manifest.encode(),
                     crash_at=(

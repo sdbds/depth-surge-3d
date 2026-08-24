@@ -7,20 +7,34 @@ Coordinates the complete video processing pipeline across all specialized proces
 from __future__ import annotations
 
 import time
+import json
 from pathlib import Path
 from typing import Any, Callable
 
 from ...io.operations import (
     cleanup_intermediate_files,
+    commit_cleanup_pending_status,
     create_output_directories,
     save_processing_settings,
     prepare_processing_settings_artifact,
+    recover_processing_settings_artifact,
     load_processing_settings,
     update_processing_status,
 )
 from ...io.job_lock import JobWriterLock
+from ...io.reservation_protocol import ReservationIncompleteError
 from ...vdpp_work import cleanup_vdpp_private_work
 from ...core.render_disparity import validate_render_disparity_input
+from ...rendering.quality.cleanup_transaction import (
+    cleanup_status_for_error,
+    commit_payload_pruned,
+    run_authorized_cleanup,
+)
+from ..video.final_publication import (
+    FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+    audit_final_media_v1,
+    load_final_encoding_reservation_v1,
+)
 from ...utils.path_utils import generate_output_filename
 from ...utils import (
     step_complete,
@@ -108,6 +122,79 @@ class ProcessingOrchestrator:
             print(f"Error: Could not retire final encoding reservation: {error}")
             return False
 
+    def _resume_cleanup_only(self, output_dir: Path) -> bool | None:  # noqa: C901
+        """Finish a committed prune generation without reopening the media pipeline."""
+
+        settings_file = Path(output_dir) / "processing-settings-v5.json"
+        if not settings_file.is_file():
+            return None
+        try:
+            artifact = recover_processing_settings_artifact(settings_file)
+        except Exception as error:
+            print(f"Error: Could not recover processing settings: {error}")
+            return False
+        if artifact.status != "in_progress":
+            return None
+        value = artifact.to_object()
+        cleanup_pending = value["metadata"]["cleanup_status"] == "pending"
+        metadata_path = Path(output_dir) / "04_stereo_diagnostics" / "metadata.json"
+        payload_pruned = False
+        try:
+            diagnostics_metadata = json.loads(metadata_path.read_text(encoding="ascii"))
+            payload_pruned = (
+                isinstance(diagnostics_metadata, dict)
+                and diagnostics_metadata.get("status") == "payload_pruned"
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            diagnostics_metadata = None
+        if not cleanup_pending and not payload_pruned:
+            return None
+        self._settings_file = settings_file
+        audit = audit_final_media_v1(output_dir, artifact)
+        if not audit.final_video_authenticated:
+            print("Error: Cleanup-only recovery requires authenticated final media")
+            return False
+        reservation = None
+        if (Path(output_dir) / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).is_file():
+            try:
+                reservation = load_final_encoding_reservation_v1(output_dir, artifact)
+            except Exception as error:
+                print(f"Error: Could not recover final cleanup reservation: {error}")
+                return False
+        if not cleanup_pending:
+            try:
+                artifact = commit_cleanup_pending_status(
+                    settings_file,
+                    reservation=reservation,
+                )
+            except Exception as error:
+                print(f"Error: Could not commit cleanup-pending settings: {error}")
+                return False
+        try:
+            removed_count = run_authorized_cleanup(output_dir)
+        except Exception as error:
+            cleanup_status = cleanup_status_for_error(error)
+            print(f"Warning: Intermediate cleanup remains incomplete: {error}")
+        else:
+            cleanup_status = "complete"
+            print(f"Removed {removed_count} temporary processing files")
+        info: dict[str, Any] = {
+            "frames_processed": value["video_properties"]["frame_count"],
+            "cleanup_status": cleanup_status,
+        }
+        metric_summary = value["runtime_info"].get("metric_clamp_summary")
+        if metric_summary is not None:
+            info["metric_clamp_summary"] = metric_summary
+        if not update_processing_status(settings_file, "completed", info):
+            print("Error: Could not commit terminal settings after cleanup")
+            return False
+        try:
+            recover_processing_settings_artifact(settings_file)
+        except Exception as error:
+            print(f"Error: Could not retire cleanup reservation: {error}")
+            return False
+        return True
+
     def process(
         self,
         video_path: Path,
@@ -150,6 +237,10 @@ class ProcessingOrchestrator:
                 raise ValueError("The supplied job writer lock belongs to another output directory")
             cleanup_vdpp_private_work(output_dir, job_lock)
 
+            cleanup_resume = self._resume_cleanup_only(output_dir)
+            if cleanup_resume is not None:
+                return cleanup_resume
+
             # Setup processing environment
             output_path, directories, self._settings_file = self._setup_processing(
                 str(video_path), str(output_dir), settings, video_properties
@@ -169,6 +260,9 @@ class ProcessingOrchestrator:
 
         except InterruptedError:
             raise
+        except ReservationIncompleteError as error:
+            print(f"Finalization reservation remains retryable: {error}")
+            return False
         except Exception as e:
             print(f"Error in video processing: {e}")
             if self._settings_file:
@@ -543,7 +637,7 @@ class ProcessingOrchestrator:
 
         return output_path, directories, settings_file
 
-    def _finalize_processing(
+    def _finalize_processing(  # noqa: C901
         self,
         success: bool,
         output_path: Path,
@@ -576,9 +670,51 @@ class ProcessingOrchestrator:
 
             cleanup_status = "not_requested"
             if not settings.get("keep_intermediates", True):
-                removed_count = cleanup_intermediate_files(output_path)
-                cleanup_status = "complete"
-                print(f"Removed {removed_count} temporary processing files")
+                if (
+                    self._settings_file is not None
+                    and self._settings_file.name == "processing-settings-v5.json"
+                ):
+                    try:
+                        settings_artifact = recover_processing_settings_artifact(
+                            self._settings_file
+                        )
+                        audit = audit_final_media_v1(output_path, settings_artifact)
+                        if not audit.final_video_authenticated:
+                            print(
+                                "Error: Refusing cleanup because final media is not authenticated"
+                            )
+                            return False
+                        reservation = getattr(
+                            self.video_encoder,
+                            "pending_final_encoding_reservation",
+                            None,
+                        )
+                        pruned = commit_payload_pruned(
+                            output_path,
+                            reservation=reservation,
+                        )
+                        commit_cleanup_pending_status(
+                            self._settings_file,
+                            reservation=reservation,
+                        )
+                    except Exception as error:
+                        print(f"Error: Could not commit cleanup authorization: {error}")
+                        return False
+                    try:
+                        removed_count = run_authorized_cleanup(
+                            output_path,
+                            metadata=pruned,
+                        )
+                    except Exception as error:
+                        cleanup_status = cleanup_status_for_error(error)
+                        print(f"Warning: Intermediate cleanup remains incomplete: {error}")
+                    else:
+                        cleanup_status = "complete"
+                        print(f"Removed {removed_count} temporary processing files")
+                else:
+                    removed_count = cleanup_intermediate_files(output_path)
+                    cleanup_status = "complete"
+                    print(f"Removed {removed_count} temporary processing files")
 
             # Update settings file
             if self._settings_file:

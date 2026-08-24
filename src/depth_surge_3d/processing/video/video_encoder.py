@@ -20,12 +20,14 @@ from pathlib import PurePosixPath
 from typing import Any, Literal, cast
 
 from ...io.operations import (
-    commit_final_media_producer_marker,
     get_frame_files,
     get_video_info_ffprobe,
     verify_ffmpeg_installation,
 )
-from ...io.reservation_protocol import SETTINGS_ARTIFACT_RELATIVE_PATH
+from ...io.reservation_protocol import (
+    SETTINGS_ARTIFACT_RELATIVE_PATH,
+    ReservationIncompleteError,
+)
 from ...io.settings_artifact import ProcessingSettingsArtifactV5
 from ...utils.path_utils import (
     calculate_frame_range,
@@ -123,6 +125,10 @@ class VideoEncoder:
         self.defer_final_reservation_retirement = defer_final_reservation_retirement
         self._pending_final_reservation: PreparedFinalEncodingReservationV1 | None = None
 
+    @property
+    def pending_final_encoding_reservation(self) -> PreparedFinalEncodingReservationV1 | None:
+        return self._pending_final_reservation
+
     def retire_final_encoding_reservation(self, *, success: bool) -> None:
         reservation = self._pending_final_reservation
         if reservation is None:
@@ -156,21 +162,41 @@ class VideoEncoder:
             - Executes FFmpeg subprocess
             - Writes video file to disk
         """
-        if not verify_ffmpeg_installation():
+        active_index = output_dir / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+        recover_before_dependency_gate = active_index.is_file()
+        if not recover_before_dependency_gate and not verify_ffmpeg_installation():
             print("Error: FFmpeg not found. Cannot create output video.")
             return False
 
-        schema5_context = self._prepare_schema5_assembled_context(
-            vr_frames_dir=vr_frames_dir,
-            output_dir=output_dir,
-            settings=settings,
-        )
+        try:
+            schema5_context = self._prepare_schema5_assembled_context(
+                vr_frames_dir=vr_frames_dir,
+                output_dir=output_dir,
+                settings=settings,
+            )
+        except InterruptedError:
+            raise
+        except ReservationIncompleteError:
+            raise
+        except Exception as error:
+            print(f"Error preparing schema-5 video publication: {error}")
+            return False
+        if schema5_context is not None and self.defer_final_reservation_retirement:
+            self._pending_final_reservation = schema5_context.reservation
         if schema5_context is not None and schema5_context.already_authenticated:
-            if self.defer_final_reservation_retirement:
-                self._pending_final_reservation = schema5_context.reservation
-            else:
+            defer_retirement = (
+                self.defer_final_reservation_retirement
+                or schema5_context.reservation.has_post_publication_work
+            )
+            if not defer_retirement:
                 schema5_context.reservation.retire()
+                self._pending_final_reservation = None
+            else:
+                self._pending_final_reservation = schema5_context.reservation
             return True
+        if recover_before_dependency_gate and not verify_ffmpeg_installation():
+            print("Error: FFmpeg not found. Cannot create output video.")
+            return False
         if schema5_context is None:
             output_filename = generate_output_filename(
                 Path(original_video).name,
@@ -187,14 +213,10 @@ class VideoEncoder:
         cmd = ["ffmpeg", "-y"]
         if schema5_context is not None:
             cmd.extend(["-v", "error", "-xerror", "-nostats", "-progress", "pipe:1"])
-        cmd.extend(
-            [
-                "-framerate",
-                str(base_fps),
-                "-i",
-                str(vr_frames_dir / "frame_%06d.png"),
-            ]
-        )
+        cmd.extend(["-framerate", str(base_fps)])
+        if schema5_context is not None:
+            cmd.extend(["-start_number", str(schema5_context.provider.first_index)])
+        cmd.extend(["-i", str(vr_frames_dir / "frame_%06d.png")])
 
         selected_audio: SelectedAudioIdentityV1 | None = None
         # Legacy jobs retain their historical optional-map behavior. Schema 5
@@ -209,7 +231,7 @@ class VideoEncoder:
                 fps=str(base_fps),
             )
             cmd.extend(selected_audio.input_arguments())
-            cmd.extend(["-map", "0:v:0"])
+            cmd.extend(["-vf", "setsar=1", "-map", "0:v:0"])
             cmd.extend(selected_audio.output_arguments(1))
             cmd.extend(["-frames:v", str(schema5_context.provider.frame_count)])
         elif settings.get("preserve_audio", True):
@@ -268,6 +290,10 @@ class VideoEncoder:
                     input_stage_fingerprint=(schema5_context.staged_manifest.fingerprint),
                     final_relative_path=schema5_context.expected_relative_path,
                 )
+                defer_retirement = (
+                    self.defer_final_reservation_retirement
+                    or schema5_context.reservation.has_post_publication_work
+                )
                 FinalPublicationTransactionV4(
                     job_root=output_dir,
                     settings=schema5_context.settings,
@@ -284,11 +310,15 @@ class VideoEncoder:
                         selected_audio.audio_end_sample,
                     ),
                     reservation=schema5_context.reservation,
-                    retire_reservation=not self.defer_final_reservation_retirement,
+                    retire_reservation=not defer_retirement,
                 ).publish()
-                if self.defer_final_reservation_retirement:
+                if defer_retirement:
                     self._pending_final_reservation = schema5_context.reservation
+                else:
+                    self._pending_final_reservation = None
             return True
+        except ReservationIncompleteError:
+            raise
         except Exception as e:
             print(f"Error creating output video: {e}")
             return False
@@ -396,7 +426,14 @@ class VideoEncoder:
         active_index = output_dir / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
         if active_index.is_file():
             reservation = load_final_encoding_reservation_v1(output_dir, artifact)
+            self._pending_final_reservation = reservation
             recovery = reservation.observe()
+            if recovery.phase in {
+                "windows_video_replace_gap_before_input_commit",
+                "windows_video_replace_gap_after_input_commit",
+            }:
+                reservation.recover_video_replacement_gap()
+                recovery = reservation.observe()
             if recovery.phase == "video_replaced_input_intent":
                 reservation.recover_input_manifest_intent()
                 recovery = reservation.observe()
@@ -450,23 +487,31 @@ class VideoEncoder:
         else:
             if publication_generation is None:
                 publication_generation = secrets.token_hex(16)
-            reservation = prepare_final_encoding_reservation_v1(
-                job_root=output_dir,
-                settings=artifact,
-                publication_generation=publication_generation,
-                input_manifest_raw_max=self._encoding_manifest_raw_bound(provider),
-                final_manifest_raw_max=1024 * 1024,
-            )
+            try:
+                reservation = prepare_final_encoding_reservation_v1(
+                    job_root=output_dir,
+                    settings=artifact,
+                    publication_generation=publication_generation,
+                    input_manifest_raw_max=self._encoding_manifest_raw_bound(provider),
+                    final_manifest_raw_max=1024 * 1024,
+                )
+            except ReservationIncompleteError:
+                raise
+            except BaseException:
+                if active_index.is_file():
+                    self._pending_final_reservation = load_final_encoding_reservation_v1(
+                        output_dir,
+                        artifact,
+                    )
+                raise
+            self._pending_final_reservation = reservation
             staged, manifest_source = self._stage_encoding_manifest_file(
                 provider=provider,
                 output_dir=output_dir,
                 settings=settings,
                 reservation=reservation,
             )
-        artifact = commit_final_media_producer_marker(
-            settings_path,
-            generation=publication_generation,
-        )
+        artifact = reservation.commit_producer_settings()
         return _Schema5EncodingContext(
             settings=artifact,
             provider=provider,
@@ -811,12 +856,19 @@ class VideoEncoder:
             and sequence.right_header.height == per_eye_height
         )
         if left_matches_target and right_matches_target:
-            filter_graph = f"[0:v][1:v]{stack_filter}=inputs=2:shortest=1[vr]"
+            filter_graph = (
+                "[0:v]setsar=1[left];[1:v]setsar=1[right];"
+                f"[left][right]{stack_filter}=inputs=2:shortest=1[stacked];"
+                "[stacked]setsar=1[vr]"
+            )
         else:
             filter_graph = (
-                f"[0:v]scale={per_eye_width}:{per_eye_height}:flags=bicubic+accurate_rnd[left];"
-                f"[1:v]scale={per_eye_width}:{per_eye_height}:flags=bicubic+accurate_rnd[right];"
-                f"[left][right]{stack_filter}=inputs=2:shortest=1[vr]"
+                f"[0:v]scale={per_eye_width}:{per_eye_height}:"
+                "flags=bicubic+accurate_rnd,setsar=1[left];"
+                f"[1:v]scale={per_eye_width}:{per_eye_height}:"
+                "flags=bicubic+accurate_rnd,setsar=1[right];"
+                f"[left][right]{stack_filter}=inputs=2:shortest=1[stacked];"
+                "[stacked]setsar=1[vr]"
             )
 
         command.extend(["-filter_complex", filter_graph, "-map", "[vr]"])
@@ -988,7 +1040,9 @@ class VideoEncoder:
             temporary = legacy_output_path.with_name(f".{legacy_output_path.stem}.direct.tmp.mp4")
             temporary.unlink(missing_ok=True)
         try:
-            if not verify_ffmpeg_installation():
+            active_index = output_dir / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+            recover_before_dependency_gate = active_index.is_file()
+            if not recover_before_dependency_gate and not verify_ffmpeg_installation():
                 print("Error: FFmpeg not found. Cannot create output video.")
                 return False
             sequence = self._validate_direct_stereo_sequence(
@@ -999,12 +1053,22 @@ class VideoEncoder:
                 output_dir=output_dir,
                 settings=settings,
             )
+            if schema5_context is not None and self.defer_final_reservation_retirement:
+                self._pending_final_reservation = schema5_context.reservation
             if schema5_context is not None and schema5_context.already_authenticated:
-                if self.defer_final_reservation_retirement:
-                    self._pending_final_reservation = schema5_context.reservation
-                else:
+                defer_retirement = (
+                    self.defer_final_reservation_retirement
+                    or schema5_context.reservation.has_post_publication_work
+                )
+                if not defer_retirement:
                     schema5_context.reservation.retire()
+                    self._pending_final_reservation = None
+                else:
+                    self._pending_final_reservation = schema5_context.reservation
                 return True
+            if recover_before_dependency_gate and not verify_ffmpeg_installation():
+                print("Error: FFmpeg not found. Cannot create output video.")
+                return False
             selected_audio = (
                 prepare_selected_audio_v1(
                     output_dir=output_dir,
@@ -1069,6 +1133,10 @@ class VideoEncoder:
                     input_stage_fingerprint=(schema5_context.staged_manifest.fingerprint),
                     final_relative_path=schema5_context.expected_relative_path,
                 )
+                defer_retirement = (
+                    self.defer_final_reservation_retirement
+                    or schema5_context.reservation.has_post_publication_work
+                )
                 FinalPublicationTransactionV4(
                     job_root=output_dir,
                     settings=schema5_context.settings,
@@ -1085,12 +1153,16 @@ class VideoEncoder:
                         selected_audio.audio_end_sample,
                     ),
                     reservation=schema5_context.reservation,
-                    retire_reservation=not self.defer_final_reservation_retirement,
+                    retire_reservation=not defer_retirement,
                 ).publish()
-                if self.defer_final_reservation_retirement:
+                if defer_retirement:
                     self._pending_final_reservation = schema5_context.reservation
+                else:
+                    self._pending_final_reservation = None
             return True
         except InterruptedError:
+            raise
+        except ReservationIncompleteError:
             raise
         except Exception as error:
             print(f"Error creating direct VR output video: {error}")

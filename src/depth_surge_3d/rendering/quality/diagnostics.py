@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 
 from ..forward_splat import HORIZONTAL_SUBPIXELS
-from .planner import QualityRepairPlan
+from .planner import QualityRepairPlan, QualityRepairPlanSummary
 from .types import CompactStereoRenderResult, FastEyeDiagnostics, HoleRunDiagnostics
 
 
@@ -46,7 +46,7 @@ def _linear_percentile_from_histogram(histogram: Counter[int], percentile: float
 
 
 def _prefill_run_histograms(
-    plan: QualityRepairPlan | None,
+    plan: QualityRepairPlan | QualityRepairPlanSummary | None,
     width: int,
     streamed: HoleRunDiagnostics | None,
 ) -> tuple[Counter, Counter]:
@@ -56,7 +56,9 @@ def _prefill_run_histograms(
         lane_histogram.update(dict(streamed.lane_count_histogram))
         span_histogram.update(dict(streamed.touched_pixel_span_histogram))
         return lane_histogram, span_histogram
-    if plan is None or plan.records.size == 0:
+    if plan is None or isinstance(plan, QualityRepairPlanSummary):
+        return lane_histogram, span_histogram
+    if plan.records.size == 0:
         return lane_histogram, span_histogram
     active_row = -1
     active_start = -1
@@ -86,24 +88,33 @@ def _histogram_pairs(histogram: Counter[int]) -> list[list[int]]:
 
 
 def _backend_counts(
-    plan: QualityRepairPlan | None,
+    plan: QualityRepairPlan | QualityRepairPlanSummary | None,
 ) -> tuple[dict[str, int], dict[str, int], dict[str, Any]]:
     names = {1: "local", 2: "exemplar", 3: "fallback"}
     lane_counts = {name: 0 for name in names.values()}
     pixels: dict[str, set[int]] = {name: set() for name in names.values()}
     components: dict[str, set[int]] = {name: set() for name in names.values()}
+    if isinstance(plan, QualityRepairPlanSummary):
+        ordered = ("local", "exemplar", "fallback")
+        lane_counts = dict(zip(ordered, plan.backend_lane_counts, strict=True))
+        pixel_counts = dict(zip(ordered, plan.backend_pixel_counts, strict=True))
+        component_count_payload: dict[str, Any] = {
+            "availability": "quality_segment_graph",
+            **dict(zip(ordered, plan.backend_component_counts, strict=True)),
+        }
+        return lane_counts, pixel_counts, component_count_payload
     if plan is not None:
         for index, record in enumerate(plan.records):
             backend = names[int(record["backend"])]
             lane_counts[backend] += int(record["lane_mask"]).bit_count()
             pixels[backend].add(int(record["pixel_index"]))
             components[backend].add(int(plan.record_component_ids[index]))
-        component_counts: dict[str, Any] = {
+        component_count_payload = {
             "availability": "quality_segment_graph",
             **{name: len(values) for name, values in components.items()},
         }
     else:
-        component_counts = {
+        component_count_payload = {
             "availability": "unavailable_quality_none_no_repair_graph",
             "local": None,
             "exemplar": None,
@@ -112,14 +123,14 @@ def _backend_counts(
     return (
         lane_counts,
         {name: len(values) for name, values in pixels.items()},
-        component_counts,
+        component_count_payload,
     )
 
 
 def _eye_stats(
     coverage: np.ndarray,
     repair_bits: np.ndarray,
-    plan: QualityRepairPlan | None,
+    plan: QualityRepairPlan | QualityRepairPlanSummary | None,
     *,
     quality_limits: dict[str, int | float] | None,
     streamed_hole_runs: HoleRunDiagnostics | None,
@@ -186,10 +197,16 @@ def _eye_stats(
         }
     elif render_mode == "quality":
         assert plan is not None
+        if isinstance(plan, QualityRepairPlanSummary):
+            segment_record_count = plan.segment_record_count
+            segment_table_bytes = plan.segment_table_bytes
+        else:
+            segment_record_count = int(plan.records.size)
+            segment_table_bytes = int(plan.records.nbytes)
         quality_budgets = {
             "availability": "quality_repair_plan",
-            "segment_record_count": int(plan.records.size),
-            "segment_table_bytes": int(plan.records.nbytes),
+            "segment_record_count": segment_record_count,
+            "segment_table_bytes": segment_table_bytes,
             "local_slot_charge": int(plan.local_evaluated_slot_count),
             "local_neighborhood_sample_charge": int(plan.local_physical_sample_read_count),
             "local_budget_skipped_run_count": int(plan.local_budget_skipped_run_count),
@@ -437,8 +454,8 @@ def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, An
     }
 
 
-def build_diagnostics_summary(
-    frame_stats: list[dict[str, Any]],
+def build_diagnostics_summary(  # noqa: C901
+    frame_stats: Iterable[dict[str, Any]],
     *,
     frame_names: tuple[str, ...],
     render_shape: tuple[int, int],
@@ -450,56 +467,241 @@ def build_diagnostics_summary(
 ) -> dict[str, Any]:
     """Aggregate validated source-ordered frame statistics."""
 
-    if [value["frame_name"] for value in frame_stats] != list(frame_names):
-        raise ValueError("frame statistics are not in exact source order")
-    eyes = {
-        name: _aggregate_eye([value["eyes"][name] for value in frame_stats], render_mode)
-        for name in ("left", "right")
+    state_names = tuple(_STATE_BITS)
+    backend_names = ("local", "exemplar", "fallback")
+
+    def eye_accumulator() -> dict[str, Any]:
+        return {
+            "pixel_count": 0,
+            "state_counts": Counter(),
+            "lane_histogram": Counter(),
+            "span_histogram": Counter(),
+            "backend_lane_counts": Counter(),
+            "backend_pixel_counts": Counter(),
+            "component_availability": None,
+            "component_counts": Counter(),
+            "final_unresolved_lane_count": 0,
+            "limit_mode": None,
+            "limit_ranges": {},
+            "budget_availability": None,
+            "budget_sums": Counter(),
+            "budget_maxima": {},
+        }
+
+    eye_accumulators = {name: eye_accumulator() for name in ("left", "right")}
+    valid_count = 0
+    clamped_count = 0
+    clamped_fractions: list[float] = []
+    nearest = {
+        "indexed_sample_count": 0,
+        "query_count": 0,
+        "visited_nodes_total": 0,
+        "visited_nodes_max": 0,
     }
+    frame_count = 0
+
+    for index, value in enumerate(frame_stats):
+        if index >= len(frame_names) or value["frame_name"] != frame_names[index]:
+            raise ValueError("frame statistics are not in exact source order")
+        frame_count += 1
+        for eye_name in ("left", "right"):
+            eye = value["eyes"][eye_name]
+            accumulator = eye_accumulators[eye_name]
+            accumulator["pixel_count"] += int(eye["pixel_count"])
+            for name in state_names:
+                accumulator["state_counts"][name] += int(eye["state_pixel_counts"][name])
+            for histogram_name, target_name in (
+                ("lane_count_histogram", "lane_histogram"),
+                ("touched_pixel_span_histogram", "span_histogram"),
+            ):
+                for bucket, count in eye["hole_runs"][histogram_name]:
+                    accumulator[target_name][int(bucket)] += int(count)
+            for name in backend_names:
+                accumulator["backend_lane_counts"][name] += int(eye["backend_lane_counts"][name])
+                accumulator["backend_pixel_counts"][name] += int(eye["backend_pixel_counts"][name])
+            components = eye["backend_component_counts"]
+            availability = components["availability"]
+            previous_availability = accumulator["component_availability"]
+            if previous_availability not in {None, availability}:
+                raise ValueError("backend component availability changed between frames")
+            accumulator["component_availability"] = availability
+            if availability == "quality_segment_graph":
+                for name in backend_names:
+                    accumulator["component_counts"][name] += int(components[name])
+            accumulator["final_unresolved_lane_count"] += int(eye["final_unresolved_lane_count"])
+
+            limits = eye["quality_limits"]
+            limit_mode = "none" if limits is None else "value"
+            if accumulator["limit_mode"] not in {None, limit_mode}:
+                raise ValueError("quality limit availability changed between frames")
+            accumulator["limit_mode"] = limit_mode
+            if limits is not None:
+                ranges = accumulator["limit_ranges"]
+                for field, target_prefix, convert in (
+                    ("max_neighbour_abs_q_jump_px", "max_neighbour_abs_q_jump_px", float),
+                    ("predicted_gap_px", "predicted_gap_px", int),
+                    ("local_limit_px", "local_limit_px", int),
+                ):
+                    current = convert(limits[field])
+                    minimum = f"{target_prefix}_min"
+                    maximum = f"{target_prefix}_max"
+                    ranges[minimum] = min(ranges.get(minimum, current), current)
+                    ranges[maximum] = max(ranges.get(maximum, current), current)
+
+            if render_mode != "fast":
+                budgets = eye["quality_budgets"]
+                budget_availability = budgets["availability"]
+                if accumulator["budget_availability"] not in {
+                    None,
+                    budget_availability,
+                }:
+                    raise ValueError("quality budget availability changed between frames")
+                accumulator["budget_availability"] = budget_availability
+                if budget_availability == "quality_repair_plan":
+                    for field in (
+                        "segment_record_count",
+                        "local_slot_charge",
+                        "local_neighborhood_sample_charge",
+                        "local_budget_skipped_run_count",
+                        "exemplar_evaluations",
+                        "fallback_indexed_donor_count",
+                        "fallback_query_count",
+                        "fallback_anchor_count",
+                        "fallback_visited_nodes_total",
+                    ):
+                        accumulator["budget_sums"][field] += int(budgets[field])
+                    for field in (
+                        "segment_table_bytes",
+                        "fallback_visited_nodes_max",
+                        "fallback_visited_nodes_p95",
+                    ):
+                        current = float(budgets[field])
+                        accumulator["budget_maxima"][field] = max(
+                            accumulator["budget_maxima"].get(field, current),
+                            current,
+                        )
+
+        projection = value["metric_projection"]
+        if geometry_mode == "metric":
+            if projection is None:
+                raise ValueError("metric diagnostics require projection statistics")
+            valid_count += int(projection["valid_pixel_count"])
+            clamped_count += int(projection["clamped_pixel_count"])
+            clamped_fractions.append(float(projection["clamped_fraction"]))
+        elif projection is not None:
+            raise ValueError("relative diagnostics cannot contain metric statistics")
+
+        nearest_value = value["geometry_nearest"]
+        if render_mode == "quality":
+            if nearest_value is None:
+                raise ValueError("Quality diagnostics require geometry-nearest statistics")
+            for field in ("indexed_sample_count", "query_count", "visited_nodes_total"):
+                nearest[field] += int(nearest_value[field])
+            nearest["visited_nodes_max"] = max(
+                nearest["visited_nodes_max"],
+                int(nearest_value["visited_nodes_max"]),
+            )
+
+    if frame_count != len(frame_names):
+        raise ValueError("frame statistics ended before the source sequence")
+
+    eyes: dict[str, Any] = {}
+    for eye_name, accumulator in eye_accumulators.items():
+        pixel_count = int(accumulator["pixel_count"])
+        lane_histogram = accumulator["lane_histogram"]
+        span_histogram = accumulator["span_histogram"]
+        lane_p95 = _linear_percentile_from_histogram(lane_histogram, 0.95)
+        availability = accumulator["component_availability"]
+        if availability == "quality_segment_graph":
+            component_counts = {
+                "availability": availability,
+                **{name: int(accumulator["component_counts"][name]) for name in backend_names},
+            }
+        else:
+            component_counts = {
+                "availability": availability,
+                **{name: None for name in backend_names},
+            }
+        budget_totals: dict[str, Any] | None
+        if render_mode == "fast":
+            budget_totals = None
+        elif accumulator["budget_availability"] == "unavailable_quality_none_no_repair_plan":
+            budget_totals = {
+                "availability": "unavailable_quality_none_no_repair_plan",
+                "segment_record_count": None,
+                "segment_table_bytes_max": None,
+                "local_slot_charge": None,
+                "local_neighborhood_sample_charge": None,
+                "local_budget_skipped_run_count": None,
+                "exemplar_evaluations": None,
+                "fallback_indexed_donor_count": None,
+                "fallback_query_count": None,
+                "fallback_anchor_count": None,
+                "fallback_visited_nodes_total": None,
+                "fallback_visited_nodes_max": None,
+                "fallback_visited_nodes_frame_p95_max": None,
+            }
+        elif accumulator["budget_availability"] == "quality_repair_plan":
+            sums = accumulator["budget_sums"]
+            maxima = accumulator["budget_maxima"]
+            budget_totals = {
+                "availability": "quality_repair_plan",
+                **{field: int(sums[field]) for field in sums},
+                "segment_table_bytes_max": int(maxima["segment_table_bytes"]),
+                "fallback_visited_nodes_max": int(maxima["fallback_visited_nodes_max"]),
+                "fallback_visited_nodes_frame_p95_max": float(maxima["fallback_visited_nodes_p95"]),
+            }
+        else:
+            raise ValueError("quality budget availability changed between frames")
+        state_counts = {name: int(accumulator["state_counts"][name]) for name in state_names}
+        eyes[eye_name] = {
+            "pixel_count": pixel_count,
+            "state_pixel_counts": state_counts,
+            "state_pixel_ratios": {
+                name: float(state_counts[name]) / float(pixel_count) for name in state_names
+            },
+            "hole_runs": {
+                "count": int(sum(lane_histogram.values())),
+                "lane_count_histogram": _histogram_pairs(lane_histogram),
+                "touched_pixel_span_histogram": _histogram_pairs(span_histogram),
+                "lane_count_max": int(max(lane_histogram, default=0)),
+                "lane_count_p95": lane_p95,
+                "touched_pixel_span_max": int(max(span_histogram, default=0)),
+                "touched_pixel_span_p95": _linear_percentile_from_histogram(span_histogram, 0.95),
+                "physical_width_px_max": float(max(lane_histogram, default=0)) / 16.0,
+                "physical_width_px_p95": lane_p95 / 16.0,
+            },
+            "backend_lane_counts": {
+                name: int(accumulator["backend_lane_counts"][name]) for name in backend_names
+            },
+            "backend_pixel_counts": {
+                name: int(accumulator["backend_pixel_counts"][name]) for name in backend_names
+            },
+            "backend_component_counts": component_counts,
+            "final_unresolved_lane_count": int(accumulator["final_unresolved_lane_count"]),
+            "quality_limit_ranges": (
+                dict(accumulator["limit_ranges"]) if accumulator["limit_mode"] == "value" else None
+            ),
+            "quality_budget_totals": budget_totals,
+        }
+
     if geometry_mode == "metric":
-        projections = [value["metric_projection"] for value in frame_stats]
-        if any(value is None for value in projections):
-            raise ValueError("metric diagnostics require projection statistics")
-        concrete = [value for value in projections if value is not None]
-        valid_count = sum(int(value["valid_pixel_count"]) for value in concrete)
-        clamped_count = sum(int(value["clamped_pixel_count"]) for value in concrete)
-        fractions = [float(value["clamped_fraction"]) for value in concrete]
         metric_projection = {
             "valid_pixel_count": valid_count,
             "clamped_pixel_count": clamped_count,
             "clamped_fraction": (float(clamped_count) / float(valid_count) if valid_count else 0.0),
-            "clamped_fractions": fractions,
-            "affected_frame_count": sum(value > 0.0 for value in fractions),
+            "clamped_fractions": clamped_fractions,
+            "affected_frame_count": sum(value > 0.0 for value in clamped_fractions),
             "mean_clamped_fraction": (
-                sum(fractions, 0.0) / float(len(fractions)) if fractions else 0.0
+                sum(clamped_fractions, 0.0) / float(len(clamped_fractions))
+                if clamped_fractions
+                else 0.0
             ),
-            "max_clamped_fraction": max(fractions, default=0.0),
+            "max_clamped_fraction": max(clamped_fractions, default=0.0),
         }
     else:
-        if any(value["metric_projection"] is not None for value in frame_stats):
-            raise ValueError("relative diagnostics cannot contain metric statistics")
         metric_projection = None
-
-    nearest_values = [value["geometry_nearest"] for value in frame_stats]
-    if render_mode == "quality":
-        if any(value is None for value in nearest_values):
-            raise ValueError("Quality diagnostics require geometry-nearest statistics")
-        concrete_nearest = [value for value in nearest_values if value is not None]
-        geometry_nearest = {
-            "indexed_sample_count": sum(
-                int(value["indexed_sample_count"]) for value in concrete_nearest
-            ),
-            "query_count": sum(int(value["query_count"]) for value in concrete_nearest),
-            "visited_nodes_total": sum(
-                int(value["visited_nodes_total"]) for value in concrete_nearest
-            ),
-            "visited_nodes_max": max(
-                (int(value["visited_nodes_max"]) for value in concrete_nearest),
-                default=0,
-            ),
-        }
-    else:
-        geometry_nearest = None
+    geometry_nearest = nearest if render_mode == "quality" else None
     return {
         "schema_version": 1,
         "algorithm_version": "stereo-coverage-sidecar-v1",

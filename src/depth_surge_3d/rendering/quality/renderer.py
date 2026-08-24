@@ -11,6 +11,7 @@ from typing import Literal
 import numpy as np
 import torch
 
+from ...core.resource_errors import QualityHostBudgetError
 from ..forward_splat import HORIZONTAL_SUBPIXELS
 from ..stereo_renderer import (
     StereoRenderResult,
@@ -30,6 +31,7 @@ from .geometry import (
 )
 from .local_strip import QualityRepairBudgets, QualityVisibilityAnalysis
 from .planner import QualityRepairPlan, plan_quality_repairs
+from .planner import QualityRepairPlanSummary, summarize_quality_repair_plan
 from .repair_records import (
     NO_REGION,
     QUALITY_REPAIR_RECORD_CAP,
@@ -47,6 +49,74 @@ from .types import (
 from .visibility import QualitySplatBand, quality_splat_band
 
 
+QUALITY_HOST_BUDGET_BYTES = 512 * 1024 * 1024
+QUALITY_RUNTIME_OVERHEAD_BYTES = 16 * 1024 * 1024
+QUALITY_RECORD_ARENA_BYTES = 64 * 1024 * 1024
+QUALITY_GRAPH_ARENA_BYTES = 64 * 1024 * 1024
+QUALITY_REPAIR_ARENA_BYTES = 64 * 1024 * 1024
+
+
+def _quality_public_memory_preflight(
+    *,
+    render_shape: tuple[int, int],
+    native_shape: tuple[int, int],
+    occlusion_fill: Literal["none", "background"],
+    materialize_public_masks: bool,
+) -> None:
+    height, width = render_shape
+    native_height, native_width = native_shape
+    if min(height, width, native_height, native_width) <= 0:
+        raise ValueError("Quality render and native shapes must be positive")
+    output_pixels = height * width
+    native_pixels = native_height * native_width
+    if 16 * output_pixels > np.iinfo(np.uint32).max:
+        raise QualityHostBudgetError.for_limit(
+            "quality-index-range",
+            16 * output_pixels,
+            int(np.iinfo(np.uint32).max),
+        )
+    if native_pixels + 1 > np.iinfo(np.uint32).max:
+        raise QualityHostBudgetError.for_limit(
+            "quality-native-index-range",
+            native_pixels + 1,
+            int(np.iinfo(np.uint32).max),
+        )
+    histogram_bytes = 272 * (width + 1)
+    runtime = QUALITY_RUNTIME_OVERHEAD_BYTES
+    phases = {
+        "quality-lowres-region": 3 * output_pixels + 22 * native_pixels + runtime,
+        "quality-geometry-nearest": 32 * output_pixels + 25 * native_pixels + runtime,
+        "quality-region": 40 * output_pixels + 13 * native_pixels + runtime,
+    }
+    if occlusion_fill == "background":
+        planning = (
+            37 * output_pixels
+            + histogram_bytes
+            + QUALITY_RECORD_ARENA_BYTES
+            + QUALITY_GRAPH_ARENA_BYTES
+            + QUALITY_REPAIR_ARENA_BYTES
+            + runtime
+        )
+        pass_b = 42 * output_pixels + histogram_bytes + QUALITY_RECORD_ARENA_BYTES + runtime
+        phases["quality-planning"] = planning
+        phases["quality-pass-b"] = pass_b
+        if materialize_public_masks:
+            phases["quality-public"] = pass_b + 4 * output_pixels
+    else:
+        visibility = 34 * output_pixels + histogram_bytes + runtime
+        phases["quality-none-visibility"] = visibility
+        if materialize_public_masks:
+            phases["quality-none-public"] = visibility + 4 * output_pixels
+    phase, required = max(phases.items(), key=lambda item: item[1])
+    if required > QUALITY_HOST_BUDGET_BYTES:
+        label = "quality-public" if materialize_public_masks else phase
+        raise QualityHostBudgetError.for_limit(
+            label,
+            required,
+            QUALITY_HOST_BUDGET_BYTES,
+        )
+
+
 @dataclass(frozen=True)
 class _EyeAnalysisResult:
     analysis: QualityVisibilityAnalysis
@@ -58,7 +128,7 @@ class _CompactEyeResult:
     image: np.ndarray
     coverage_count: np.ndarray
     repair_bits: np.ndarray
-    plan: QualityRepairPlan | None
+    plan: QualityRepairPlanSummary | None
     hole_runs: HoleRunDiagnostics | None = None
 
 
@@ -358,6 +428,38 @@ def _background_repair_bits(
     return result
 
 
+def _plan_hole_runs(records: np.ndarray, width: int) -> HoleRunDiagnostics:
+    lane_histogram = np.zeros(16 * (width + 1), dtype=np.uint64)
+    span_histogram = np.zeros(width + 1, dtype=np.uint64)
+    active_row = -1
+    active_start = -1
+    active_end = -1
+    for record in records:
+        pixel = int(record["pixel_index"])
+        row, column = divmod(pixel, width)
+        mask = int(record["lane_mask"])
+        start = column * 16 + (mask & -mask).bit_length() - 1
+        end = column * 16 + mask.bit_length() - 1
+        if row == active_row and start == active_end + 1:
+            active_end = end
+            continue
+        if active_row >= 0:
+            lane_histogram[active_end - active_start + 1] += np.uint64(1)
+            span_histogram[active_end // 16 - active_start // 16 + 1] += np.uint64(1)
+        active_row, active_start, active_end = row, start, end
+    if active_row >= 0:
+        lane_histogram[active_end - active_start + 1] += np.uint64(1)
+        span_histogram[active_end // 16 - active_start // 16 + 1] += np.uint64(1)
+    return HoleRunDiagnostics(
+        lane_count_histogram=tuple(
+            (int(index), int(count)) for index, count in enumerate(lane_histogram) if count
+        ),
+        touched_pixel_span_histogram=tuple(
+            (int(index), int(count)) for index, count in enumerate(span_histogram) if count
+        ),
+    )
+
+
 def _band_records(
     records: np.ndarray,
     *,
@@ -469,7 +571,10 @@ def _render_background_eye(
         offsets=offsets,
         plan=plan,
     )
-    return _CompactEyeResult(image, coverage, repair_bits, plan)
+    hole_runs = _plan_hole_runs(plan.records, int(source.shape[1]))
+    summary = summarize_quality_repair_plan(plan, repair_bits)
+    del analyzed, plan
+    return _CompactEyeResult(image, coverage, repair_bits, summary, hole_runs)
 
 
 def _build_eye_offsets(
@@ -587,7 +692,17 @@ def render_relative_quality_compact(
         raise TypeError("renderer must be StereoRenderer")
     if not isinstance(settings, StereoRenderSettings) or settings.stereo_render_mode != "quality":
         raise ValueError("Quality rendering requires StereoRenderSettings in quality mode")
-    source = np.ascontiguousarray(np.asarray(frame))
+    frame_values = np.asarray(frame)
+    canonical_input = np.asarray(canonical)
+    if frame_values.ndim != 3 or frame_values.shape[2] != 3 or canonical_input.ndim != 2:
+        raise TypeError("Quality rendering requires BGR frames and a 2D canonical map")
+    _quality_public_memory_preflight(
+        render_shape=(int(frame_values.shape[0]), int(frame_values.shape[1])),
+        native_shape=(int(canonical_input.shape[0]), int(canonical_input.shape[1])),
+        occlusion_fill=settings.occlusion_fill,
+        materialize_public_masks=False,
+    )
+    source = np.ascontiguousarray(frame_values)
     if source.dtype != np.uint8:
         raise TypeError("Quality rendering requires uint8 BGR input")
     canonical_values = np.ascontiguousarray(np.asarray(canonical, dtype=np.float32))
@@ -690,13 +805,25 @@ def render_metric_primitives_compact(
         raise TypeError("primitives must be MetricStereoPrimitiveInput")
     if not isinstance(controls, QualityStereoControls):
         raise TypeError("controls must be QualityStereoControls")
-    source = np.ascontiguousarray(np.asarray(frame))
-    if source.dtype != np.uint8 or source.ndim != 3 or source.shape[2] != 3:
+    frame_values = np.asarray(frame)
+    if frame_values.ndim != 3 or frame_values.shape[2] != 3:
         raise TypeError("Quality rendering requires uint8 BGR input")
     metric = primitives.metric
     for name in ("inverse_depth", "valid", "focal_x_normalized"):
         if not hasattr(metric, name):
             raise TypeError("metric primitive is missing native geometry fields")
+    metric_shape = np.asarray(metric.inverse_depth).shape
+    if len(metric_shape) != 2:
+        raise TypeError("metric inverse depth must be two-dimensional")
+    _quality_public_memory_preflight(
+        render_shape=(int(frame_values.shape[0]), int(frame_values.shape[1])),
+        native_shape=(int(metric_shape[0]), int(metric_shape[1])),
+        occlusion_fill=controls.occlusion_fill,
+        materialize_public_masks=False,
+    )
+    source = np.ascontiguousarray(frame_values)
+    if source.dtype != np.uint8 or source.ndim != 3 or source.shape[2] != 3:
+        raise TypeError("Quality rendering requires uint8 BGR input")
     height, width = source.shape[:2]
     geometry = build_metric_quality_geometry(
         source,
@@ -753,6 +880,16 @@ def render_relative_quality_public(
 ) -> StereoRenderResult:
     """Materialize the four legacy boolean masks for the public API."""
 
+    frame_values = np.asarray(frame)
+    canonical_values = np.asarray(canonical)
+    if frame_values.ndim != 3 or canonical_values.ndim != 2:
+        raise TypeError("Quality rendering requires BGR frames and a 2D canonical map")
+    _quality_public_memory_preflight(
+        render_shape=(int(frame_values.shape[0]), int(frame_values.shape[1])),
+        native_shape=(int(canonical_values.shape[0]), int(canonical_values.shape[1])),
+        occlusion_fill=settings.occlusion_fill,
+        materialize_public_masks=True,
+    )
     compact = render_relative_quality_compact(
         renderer=renderer,
         frame=frame,

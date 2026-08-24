@@ -393,6 +393,212 @@ class TestFinalizeProcessing:
         additional_info = update_status.call_args.args[2]
         assert additional_info["metric_clamp_summary"] == summary
 
+    def test_schema_five_cleanup_commits_authorization_and_pending_before_deletion(self, tmp_path):
+        events = []
+        video_encoder = Mock()
+        reservation = object()
+        video_encoder.pending_final_encoding_reservation = reservation
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), video_encoder)
+        orchestrator._start_time = 0.0
+        orchestrator._settings_file = tmp_path / "processing-settings-v5.json"
+        authenticated = Mock(final_video_authenticated=True)
+
+        with (
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "recover_processing_settings_artifact",
+                side_effect=lambda _path: events.append("recover") or Mock(),
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "audit_final_media_v1",
+                side_effect=lambda *_args, **_kwargs: events.append("audit") or authenticated,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "commit_payload_pruned",
+                side_effect=lambda _path, **_kwargs: events.append("payload_pruned")
+                or {"status": "payload_pruned"},
+            ) as commit_pruned,
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "commit_cleanup_pending_status",
+                side_effect=lambda _path, **_kwargs: events.append("pending") or Mock(),
+            ) as commit_pending,
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "run_authorized_cleanup",
+                side_effect=lambda *_args, **_kwargs: events.append("delete") or 7,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "update_processing_status",
+                side_effect=lambda *_args, **_kwargs: events.append("terminal") or True,
+            ) as update_status,
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.completion_banner"
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time",
+                return_value=1.0,
+            ),
+        ):
+            assert orchestrator._finalize_processing(
+                True,
+                tmp_path,
+                str(tmp_path / "source.mp4"),
+                {
+                    "vr_format": "side_by_side",
+                    "vr_resolution": "16x9-1080p",
+                    "keep_intermediates": False,
+                },
+                3,
+            )
+
+        assert events == [
+            "recover",
+            "audit",
+            "payload_pruned",
+            "pending",
+            "delete",
+            "terminal",
+        ]
+        assert update_status.call_args.args[2]["cleanup_status"] == "complete"
+        assert commit_pruned.call_args.kwargs == {"reservation": reservation}
+        assert commit_pending.call_args.kwargs == {"reservation": reservation}
+        video_encoder.retire_final_encoding_reservation.assert_called_once_with(success=True)
+
+    def test_schema_five_cleanup_identity_failure_preserves_successful_media(self, tmp_path):
+        from src.depth_surge_3d.rendering.quality.cleanup_transaction import (
+            CleanupIdentityMismatchError,
+        )
+
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator._start_time = 0.0
+        orchestrator._settings_file = tmp_path / "processing-settings-v5.json"
+
+        with (
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "recover_processing_settings_artifact",
+                return_value=Mock(),
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "audit_final_media_v1",
+                return_value=Mock(final_video_authenticated=True),
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "commit_payload_pruned",
+                return_value={"status": "payload_pruned"},
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "commit_cleanup_pending_status",
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "run_authorized_cleanup",
+                side_effect=CleanupIdentityMismatchError("changed"),
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "update_processing_status",
+                return_value=True,
+            ) as update_status,
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.completion_banner"
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time",
+                return_value=1.0,
+            ),
+        ):
+            assert orchestrator._finalize_processing(
+                True,
+                tmp_path,
+                str(tmp_path / "source.mp4"),
+                {
+                    "vr_format": "side_by_side",
+                    "vr_resolution": "16x9-1080p",
+                    "keep_intermediates": False,
+                },
+                3,
+            )
+
+        assert update_status.call_args.args[2]["cleanup_status"] == "incomplete_identity_mismatch"
+
+
+class TestCleanupOnlyResume:
+    def test_process_returns_after_cleanup_only_resume(self, tmp_path):
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+
+        with (
+            patch.object(orchestrator, "_resume_cleanup_only", return_value=True) as resume,
+            patch.object(orchestrator, "_setup_processing") as setup,
+        ):
+            result = orchestrator.process(
+                tmp_path / "source.mp4",
+                tmp_path,
+                {"fps": 24.0, "frame_count": 3},
+                {"keep_intermediates": False},
+            )
+
+        assert result is True
+        resume.assert_called_once_with(tmp_path)
+        setup.assert_not_called()
+
+    def test_payload_pruned_resume_persists_pending_then_finishes(self, tmp_path):
+        settings_file = tmp_path / "processing-settings-v5.json"
+        settings_file.write_bytes(b"settings")
+        diagnostics = tmp_path / "04_stereo_diagnostics"
+        diagnostics.mkdir()
+        (diagnostics / "metadata.json").write_text('{"status":"payload_pruned"}', encoding="ascii")
+        artifact = Mock(status="in_progress")
+        artifact.to_object.return_value = {
+            "metadata": {"cleanup_status": "not_requested"},
+            "processing_settings": {"keep_intermediates": False},
+            "video_properties": {"frame_count": 3},
+            "output_info": {"expected_final_relative_path": "result.mp4"},
+            "runtime_info": {"metric_clamp_summary": None},
+        }
+        events = []
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+
+        with (
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "recover_processing_settings_artifact",
+                side_effect=lambda _path: events.append("recover") or artifact,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "audit_final_media_v1",
+                side_effect=lambda *_args, **_kwargs: events.append("audit")
+                or Mock(final_video_authenticated=True),
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "commit_cleanup_pending_status",
+                side_effect=lambda _path, **_kwargs: events.append("pending") or artifact,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "run_authorized_cleanup",
+                side_effect=lambda _path: events.append("delete") or 2,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "update_processing_status",
+                side_effect=lambda *_args, **_kwargs: events.append("terminal") or True,
+            ) as update,
+        ):
+            assert orchestrator._resume_cleanup_only(tmp_path) is True
+
+        assert events == ["recover", "audit", "pending", "delete", "terminal", "recover"]
+        assert update.call_args.args[2]["cleanup_status"] == "complete"
+
 
 class TestExecutePipeline:
     def test_releases_depth_model_before_starting_step_3(self, tmp_path):
@@ -1079,3 +1285,39 @@ class TestProcessMethod:
                 )
 
         update_status.assert_not_called()
+
+    def test_process_keeps_reservation_incomplete_retryable_without_terminalizing(self, tmp_path):
+        from src.depth_surge_3d.io.reservation_protocol import ReservationIncompleteError
+
+        video_encoder = Mock()
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), video_encoder)
+        settings_file = tmp_path / "processing-settings-v5.json"
+
+        with (
+            patch.object(
+                orchestrator,
+                "_setup_processing",
+                return_value=(tmp_path, {"base": tmp_path}, settings_file),
+            ),
+            patch.object(
+                orchestrator,
+                "_execute_pipeline",
+                side_effect=ReservationIncompleteError("reservation materialization ENOSPC"),
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "update_processing_status"
+            ) as update_status,
+        ):
+            assert (
+                orchestrator.process(
+                    video_path=tmp_path / "source.mp4",
+                    output_dir=tmp_path,
+                    video_properties={"fps": 30, "frame_count": 1},
+                    settings={"keep_intermediates": False, "direct_vr_encode": True},
+                )
+                is False
+            )
+
+        update_status.assert_not_called()
+        video_encoder.retire_final_encoding_reservation.assert_not_called()

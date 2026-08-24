@@ -35,6 +35,7 @@ def _publication(
     *,
     keep_masks: bool = True,
     frame_name: str = "frame_0001",
+    render_mode: str = "quality",
 ):
     return module.QualityFramePublication(
         job_root=root,
@@ -46,6 +47,7 @@ def _publication(
         occlusion_fill="background",
         rgb_stage_fingerprint="rgb-stage",
         keep_masks=keep_masks,
+        render_mode=render_mode,
     )
 
 
@@ -262,3 +264,71 @@ def test_diagnostics_audit_identifies_only_the_corrupt_frame(tmp_path: Path) -> 
     assert audit.disposition == "building"
     assert audit.invalid_frame_names == ("frame_0001",)
     assert audit.reusable_frame_names == ("frame_0000",)
+
+
+def test_payload_pruned_audit_does_not_require_deleted_frame_payloads(tmp_path: Path) -> None:
+    import shutil
+
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    content_raw = diagnostic_transaction.canonical_json_bytes({"schema_version": 1})
+    final_manifest_raw = diagnostic_transaction.canonical_json_bytes({"schema_version": 4})
+
+    context = diagnostic_transaction.DiagnosticsStageContext(
+        job_root=tmp_path,
+        frame_names=("frame_0000",),
+        render_shape=(2, 3),
+        render_mode="quality",
+        geometry_mode="relative",
+        occlusion_fill="background",
+        mask_payloads_enabled=False,
+        rgb_stage_fingerprint="rgb-stage",
+        source_guide_fingerprint="guide-stage",
+        native_geometry_fingerprint="geometry-stage",
+        quality_input_manifest_sha256=hashlib.sha256(content_raw).hexdigest(),
+    )
+    diagnostic_transaction.begin_diagnostics_stage(context)
+    diagnostic_transaction.publish_quality_frame(
+        _publication(
+            diagnostic_transaction,
+            tmp_path,
+            keep_masks=False,
+            frame_name="frame_0000",
+        )
+    )
+    complete = diagnostic_transaction.complete_diagnostics_stage(context)
+    (tmp_path / "04_stereo_diagnostics" / "quality_input_manifest.json").write_bytes(content_raw)
+    (tmp_path / "final_video_manifest.json").write_bytes(final_manifest_raw)
+    pruned_from = {
+        "previous_status": "complete",
+        "previous_diagnostics_fingerprint": complete["fingerprint"],
+        "ordered_frame_manifest_fingerprint": complete["ordered_frame_manifest_fingerprint"],
+        "frames_jsonl_sha256": complete["frames_jsonl_sha256"],
+        "summary_sha256": complete["summary_sha256"],
+        "metric_clamp_summary_sha256": None,
+    }
+    pruned = dict(complete)
+    pruned.update(
+        {
+            "status": "payload_pruned",
+            "ordered_frame_manifest_fingerprint": None,
+            "metric_clamp_summary_sha256": None,
+            "pruned_from": pruned_from,
+            "final_video_manifest_sha256": hashlib.sha256(final_manifest_raw).hexdigest(),
+            "prune_entries": [],
+        }
+    )
+    pruned["fingerprint"] = diagnostic_transaction.self_fingerprint(pruned)
+    (tmp_path / "04_stereo_diagnostics" / "metadata.json").write_bytes(
+        diagnostic_transaction.canonical_json_bytes(pruned)
+    )
+    shutil.rmtree(tmp_path / "04_stereo_diagnostics" / "frames")
+    (tmp_path / "04_left_frames" / "frame_0000.png").unlink()
+    (tmp_path / "04_right_frames" / "frame_0000.png").unlink()
+
+    audit = diagnostic_transaction.audit_diagnostics_stage(context)
+
+    assert audit.disposition == "payload_pruned"
+    assert audit.reusable_frame_names == ()
+    assert audit.invalid_frame_names == context.frame_names
+    assert audit.aggregates_valid is True

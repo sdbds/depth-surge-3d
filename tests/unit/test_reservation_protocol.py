@@ -39,6 +39,35 @@ def test_platform_allocation_adapter_proves_a_fsynced_full_extent(tmp_path: Path
     assert reservation_protocol.platform_allocation_counter(path) >= logical
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle-relative rename contract")
+@pytest.mark.parametrize("target_present", [False, True])
+def test_windows_same_parent_rename_moves_the_authenticated_source(
+    tmp_path: Path, target_present: bool
+) -> None:
+    source = tmp_path / "source.tmp"
+    target = tmp_path / "target.json"
+    source.write_bytes(b"new-generation")
+    expected_source = reservation_protocol._identity(source)
+    expected_target = None
+    if target_present:
+        target.write_bytes(b"old-generation")
+        expected_target = reservation_protocol._identity(target)
+
+    result = reservation_protocol.windows_same_parent_rename_v1(
+        source,
+        target,
+        expected_source_identity=expected_source,
+        expected_target_identity=expected_target,
+        expected_parent_identity=reservation_protocol._directory_identity(tmp_path),
+        replace_existing=target_present,
+    )
+
+    assert result == "committed"
+    assert not source.exists()
+    assert target.read_bytes() == b"new-generation"
+    assert reservation_protocol._identity(target) == expected_source
+
+
 def test_reservation_forecast_keeps_payload_padding_and_directory_entries_distinct() -> None:
     allocation_unit = 4096
 
@@ -220,6 +249,31 @@ def test_rename_parent_sync_crash_recovers_committed_target_without_full_adapter
 
     assert loaded.recover(payload) == "committed-target"
     assert loaded.target_path.read_bytes() == payload
+    assert not loaded.descriptor_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows replacement gaps are platform-specific")
+def test_windows_replacement_gap_recovers_short_source_to_missing_target(
+    tmp_path: Path,
+) -> None:
+    transaction = _create_transaction(tmp_path)
+    payload = b'{"schema_version":1,"value":"replacement-gap"}'
+
+    with pytest.raises(reservation_protocol.InjectedReservationCrash):
+        transaction.consume(payload, crash_at="after-truncate-sync")
+    transaction._short_release_recovery(payload)
+    transaction.target_path.unlink()
+    loaded = reservation_protocol.ReservedArtifactTransaction.load(
+        transaction.descriptor_path,
+        allocation_adapter=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("replacement-gap recovery must not call readiness adapter")
+        ),
+    )
+
+    assert loaded.validate_physical_phase(payload) == "replacement-gap"
+    assert loaded.recover(payload) == "committed-target"
+    assert loaded.target_path.read_bytes() == payload
+    assert not loaded.source_path.exists()
     assert not loaded.descriptor_path.exists()
 
 

@@ -344,6 +344,292 @@ def _directory_identity(path: Path) -> ReservationFileIdentity:
     return ReservationFileIdentity(int(metadata.st_dev), int(metadata.st_ino))
 
 
+def _identity_token(value: ReservationFileIdentity | None) -> str | None:
+    if value is None:
+        return None
+    return f"{value.device}:{value.inode}"
+
+
+def windows_same_parent_rename_v1(  # noqa: C901
+    source_path: Path,
+    target_path: Path,
+    *,
+    expected_source_identity: ReservationFileIdentity,
+    expected_target_identity: ReservationFileIdentity | None,
+    expected_parent_identity: ReservationFileIdentity,
+    replace_existing: bool,
+) -> str:
+    """Perform the frozen handle-relative Windows rename and classify disk state."""
+
+    if os.name != "nt":
+        raise ReservationCapabilityError("Windows rename adapter requires Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    source = Path(source_path)
+    target = Path(target_path)
+    if source.parent.resolve() != target.parent.resolve() or target.name in {"", ".", ".."}:
+        raise ReservationConflictError("Windows rename requires one authenticated parent")
+    if any(separator in target.name for separator in ("/", "\\")):
+        raise ReservationConflictError("Windows rename target must be one component")
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    invalid_handle = wintypes.HANDLE(-1).value
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    flush = kernel32.FlushFileBuffers
+    flush.argtypes = (wintypes.HANDLE,)
+    flush.restype = wintypes.BOOL
+    ntdll = ctypes.WinDLL("ntdll")
+
+    class IoStatusBlock(ctypes.Structure):
+        _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+    rename = ntdll.NtSetInformationFile
+    rename.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(IoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.c_int,
+    )
+    rename.restype = ctypes.c_long
+    ntstatus_to_error = ntdll.RtlNtStatusToDosError
+    ntstatus_to_error.argtypes = (ctypes.c_long,)
+    ntstatus_to_error.restype = wintypes.DWORD
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("link_count", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    get_info = kernel32.GetFileInformationByHandle
+    get_info.argtypes = (wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation))
+    get_info.restype = wintypes.BOOL
+
+    class RenameUnion(ctypes.Union):
+        _fields_ = [("replace_if_exists", ctypes.c_ubyte), ("flags", wintypes.DWORD)]
+
+    class RenameInfo(ctypes.Structure):
+        _anonymous_ = ("mode",)
+        _fields_ = [
+            ("mode", RenameUnion),
+            ("root_directory", wintypes.HANDLE),
+            ("file_name_length", wintypes.DWORD),
+            ("file_name", wintypes.WCHAR * 1),
+        ]
+
+    def win_error(code: int | None = None) -> OSError:
+        return ctypes.WinError(ctypes.get_last_error() if code is None else code)
+
+    def open_handle(path: Path, access: int, *, directory: bool) -> int:
+        flags = 0x00200000 | (0x02000000 if directory else 0)
+        handle = create_file(
+            str(path),
+            access,
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            3,
+            flags,
+            None,
+        )
+        if handle == invalid_handle:
+            raise win_error()
+        return int(handle)
+
+    def handle_identity(handle: int, *, directory: bool) -> ReservationFileIdentity:
+        info = ByHandleFileInformation()
+        if not get_info(wintypes.HANDLE(handle), ctypes.byref(info)):
+            raise win_error()
+        is_directory = bool(info.file_attributes & 0x10)
+        if is_directory != directory or info.file_attributes & 0x400:
+            raise ReservationConflictError("Windows rename handle type is unsafe")
+        if not directory and int(info.link_count) != 1:
+            raise ReservationConflictError("Windows rename source is not single-link")
+        return ReservationFileIdentity(
+            int(info.volume_serial),
+            (int(info.file_index_high) << 32) | int(info.file_index_low),
+        )
+
+    def observe(path: Path) -> ReservationFileIdentity | None:
+        if not (path.exists() or path.is_symlink()):
+            return None
+        return _identity(path)
+
+    parent_handle = open_handle(
+        source.parent,
+        0x00000002 | 0x00100000,
+        directory=True,
+    )
+    source_handle = -1
+    try:
+        parent_identity = handle_identity(parent_handle, directory=True)
+        if parent_identity != expected_parent_identity:
+            raise ReservationConflictError("Windows rename parent identity changed")
+        source_handle = open_handle(
+            source,
+            0x80000000 | 0x40000000 | 0x00010000 | 0x00100000,
+            directory=False,
+        )
+        if handle_identity(source_handle, directory=False) != expected_source_identity:
+            raise ReservationConflictError("Windows rename source identity changed")
+        if expected_source_identity.device != expected_parent_identity.device:
+            raise ReservationConflictError("Windows rename source volume differs from parent")
+        current_target = observe(target)
+        if replace_existing:
+            if expected_target_identity is None or current_target != expected_target_identity:
+                raise ReservationConflictError("Windows rename old target identity changed")
+        elif current_target is not None:
+            raise ReservationConflictError("Windows create-new rename target is present")
+        if not flush(wintypes.HANDLE(source_handle)):
+            raise win_error()
+
+        encoded_name = target.name.encode("utf-16-le")
+        offset = RenameInfo.file_name.offset
+        buffer_size = offset + len(encoded_name) + 2
+        raw = ctypes.create_string_buffer(buffer_size)
+        info = RenameInfo.from_buffer(raw)
+        info.replace_if_exists = int(replace_existing)
+        info.root_directory = wintypes.HANDLE(parent_handle)
+        info.file_name_length = len(encoded_name)
+        ctypes.memmove(ctypes.addressof(raw) + offset, encoded_name, len(encoded_name))
+
+        def invoke(replace_target: bool) -> tuple[bool, int]:
+            info.replace_if_exists = int(replace_target)
+            if handle_identity(parent_handle, directory=True) != expected_parent_identity:
+                raise ReservationConflictError("Windows rename parent changed before call")
+            io_status = IoStatusBlock()
+            status = int(
+                rename(
+                    wintypes.HANDLE(source_handle),
+                    ctypes.byref(io_status),
+                    ctypes.byref(raw),
+                    buffer_size,
+                    10,
+                )
+            )
+            returned = status >= 0
+            saved_error = 0 if returned else int(ntstatus_to_error(status))
+            if not flush(wintypes.HANDLE(source_handle)):
+                raise win_error()
+            if handle_identity(parent_handle, directory=True) != expected_parent_identity:
+                raise ReservationConflictError("Windows rename parent changed after call")
+            return returned, saved_error
+
+        returned, saved_error = invoke(replace_existing)
+        source_token = _identity_token(observe(source))
+        target_token = _identity_token(observe(target))
+        expected_source_token = _identity_token(expected_source_identity)
+        assert expected_source_token is not None
+        if replace_existing:
+            expected_old_token = _identity_token(expected_target_identity)
+            assert expected_old_token is not None
+            classification = classify_windows_rename_return(
+                source_identity=source_token,
+                target_identity=target_token,
+                expected_source_identity=expected_source_token,
+                expected_old_target_identity=expected_old_token,
+                api_return=returned,
+            )
+        elif source_token == expected_source_token and target_token is None:
+            if returned:
+                raise WindowsRenameProtocolError(
+                    "true create-new rename return left the source unchanged"
+                )
+            classification = "unchanged"
+        elif source_token is None and target_token == expected_source_token:
+            classification = "committed"
+        else:
+            raise ReservationConflictError(
+                "Windows create-new rename returned an unauthorized identity combination"
+            )
+        if classification == "replacement-gap":
+            returned, saved_error = invoke(False)
+            source_token = _identity_token(observe(source))
+            target_token = _identity_token(observe(target))
+            if source_token is None and target_token == expected_source_token:
+                classification = "committed"
+            elif source_token == expected_source_token and target_token is None and not returned:
+                if saved_error == 112:
+                    raise ReservationIncompleteError("Windows rename gap recovery ran out of space")
+                raise win_error(saved_error)
+            else:
+                raise ReservationConflictError(
+                    "Windows rename gap recovery produced an unauthorized state"
+                )
+        if classification == "unchanged":
+            if saved_error == 112:
+                raise ReservationIncompleteError("Windows rename ran out of space")
+            raise win_error(saved_error)
+        if classification != "committed":
+            raise WindowsRenameProtocolError("Windows rename did not reach committed state")
+        return classification
+    finally:
+        if source_handle not in {-1, invalid_handle}:
+            close_handle(wintypes.HANDLE(source_handle))
+        close_handle(wintypes.HANDLE(parent_handle))
+
+
+def same_parent_replace_v1(
+    source_path: Path,
+    target_path: Path,
+    *,
+    expected_source_identity: ReservationFileIdentity,
+    expected_target_identity: ReservationFileIdentity | None,
+    expected_parent_identity: ReservationFileIdentity,
+    replace_existing: bool,
+) -> None:
+    """Use the frozen platform replacement primitive for an authenticated pair."""
+
+    if os.name == "nt":
+        windows_same_parent_rename_v1(
+            source_path,
+            target_path,
+            expected_source_identity=expected_source_identity,
+            expected_target_identity=expected_target_identity,
+            expected_parent_identity=expected_parent_identity,
+            replace_existing=replace_existing,
+        )
+        return
+    if _directory_identity(Path(source_path).parent) != expected_parent_identity:
+        raise ReservationConflictError("rename parent identity changed")
+    if _identity(Path(source_path)) != expected_source_identity:
+        raise ReservationConflictError("rename source identity changed")
+    if replace_existing:
+        if (
+            expected_target_identity is None
+            or _identity(Path(target_path)) != expected_target_identity
+        ):
+            raise ReservationConflictError("rename old target identity changed")
+        os.replace(source_path, target_path)
+    else:
+        if Path(target_path).exists() or Path(target_path).is_symlink():
+            raise ReservationConflictError("create-new rename target appeared")
+        os.rename(source_path, target_path)
+    _sync_parent(Path(target_path).parent)
+
+
 @dataclass(frozen=True)
 class ReservationDescriptor:
     index_relative_path: str
@@ -932,8 +1218,18 @@ class ReservedArtifactTransaction:
         if source_exists:
             if _identity(self.source_path) != self.descriptor.filesystem_identity:
                 raise ReservationConflictError("reservation source identity changed")
-            self._validate_placeholder()
             size = self.source_path.stat().st_size
+            if not target_exists:
+                if (
+                    os.name == "nt"
+                    and size == len(expected_payload)
+                    and self.source_path.read_bytes() == expected_payload
+                ):
+                    return "replacement-gap"
+                raise ReservationConflictError(
+                    "missing replacement target has no complete-short intent"
+                )
+            self._validate_placeholder()
             if size == self.descriptor.logical_byte_count:
                 evidence = self.allocation_adapter(self.source_path, size)
                 if evidence != self.descriptor.allocation_evidence_at_readiness:
@@ -1050,8 +1346,20 @@ class ReservedArtifactTransaction:
         if source_exists:
             if _identity(self.source_path) != self.descriptor.filesystem_identity:
                 raise ReservationConflictError("reservation source identity changed")
-            self._validate_placeholder()
             size = self.source_path.stat().st_size
+            if not target_exists:
+                if os.name != "nt" or size != prefix_byte_count:
+                    raise ReservationConflictError(
+                        "missing streamed replacement target has no complete-short intent"
+                    )
+                self._stream_prefix_and_zero_tail(
+                    self.source_path,
+                    prefix_byte_count=prefix_byte_count,
+                    expected_sha256=prefix_sha256,
+                    expected_total_byte_count=size,
+                )
+                return "replacement-gap"
+            self._validate_placeholder()
             if size == self.descriptor.logical_byte_count:
                 evidence = self.allocation_adapter(self.source_path, size)
                 if evidence != self.descriptor.allocation_evidence_at_readiness:
@@ -1121,10 +1429,24 @@ class ReservedArtifactTransaction:
         if self.allocation_counter(self.source_path) > threshold:
             raise ReservationIncompleteError("streamed short-source release remains unproved")
 
-    def _rename_and_sync(self) -> None:
-        self._validate_placeholder()
-        os.replace(self.source_path, self.target_path)
-        _sync_parent(self.target_path.parent)
+    def _rename_and_sync(self, *, replacement_gap: bool = False) -> None:
+        if replacement_gap:
+            if self.target_path.exists() or self.target_path.is_symlink():
+                raise ReservationConflictError("replacement-gap target reappeared")
+            expected_target = None
+        else:
+            self._validate_placeholder()
+            expected_target = self.descriptor.placeholder_identity
+            if self.descriptor.publication_method == "replace_existing":
+                expected_target = _identity(self.target_path)
+        same_parent_replace_v1(
+            self.source_path,
+            self.target_path,
+            expected_source_identity=self.descriptor.filesystem_identity,
+            expected_target_identity=expected_target,
+            expected_parent_identity=_directory_identity(self.target_path.parent),
+            replace_existing=not replacement_gap,
+        )
 
     def _retire_descriptor(self) -> None:
         self.descriptor_path.unlink(missing_ok=True)
@@ -1162,6 +1484,9 @@ class ReservedArtifactTransaction:
         if phase == "short-source":
             self._short_release_recovery(payload)
             self._rename_and_sync()
+            phase = "committed-target"
+        if phase == "replacement-gap":
+            self._rename_and_sync(replacement_gap=True)
             phase = "committed-target"
         if phase == "committed-target":
             if self.validate_physical_phase(payload) != "committed-target":
@@ -1230,6 +1555,9 @@ class ReservedArtifactTransaction:
                 prefix_sha256=prefix_sha256,
             )
             self._rename_and_sync()
+            phase = "committed-target"
+        if phase == "replacement-gap":
+            self._rename_and_sync(replacement_gap=True)
             phase = "committed-target"
         if phase == "committed-target":
             self.validate_streamed_physical_phase(

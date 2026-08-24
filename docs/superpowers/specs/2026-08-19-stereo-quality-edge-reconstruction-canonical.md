@@ -294,7 +294,7 @@ defects.
 | Fixed-path final publication promised rollback after the old video had already been replaced | Declare the physical removal of the authorized old final target as the irreversible boundary, admit only ordered mixed-generation prefixes while the final index is active, and classify the retained paths through the ordinary audit matrix after retirement. |
 | A crash between short-source truncate and file sync had no release-recovery action | Add `ShortSourceReleaseRecoveryV1`: sync/reopen/check, retry one same-length truncate plus sync/reopen/check, then preserve the transaction as retryable incomplete. |
 | FIEMAP paging left zero, short non-`LAST`, and nonadvancing batches ambiguous | Freeze zero-before-coverage as an unready gap and malformed/nonadvancing pagination as `FIEMAP_PROTOCOL_ERROR` capability failure. |
-| `ReplaceFileW` can return failure after moving or deleting an old target | Forbid it and freeze one handle-relative `SetFileInformationByHandle(FileRenameInfo)` adapter whose post-call path/identity table, not its Boolean return alone, decides unchanged, committed, recoverable gap, or conflict. |
+| `ReplaceFileW` can return failure after moving or deleting an old target | Forbid it and freeze one handle-relative `NtSetInformationFile(FileRenameInformation)` adapter whose post-call path/identity table, not its NTSTATUS alone, decides unchanged, committed, recoverable gap, or conflict. |
 | Manifest recovery ignored durable complete source frames | Make encoding-input prepass `complete-full` the one explicitly staged exception, promote it to exact intent only after the video boundary, and discriminate zero/partial/complete/committed final-manifest phases before deciding to reencode. |
 | Existing manifest targets had no durable preflight byte/identity binding | Add an exact preflight identity/byte-count/raw-hash triple to each fixed-artifact `replace_existing` entry and descriptor; keep future settings targets on their separate typed predecessor-transition contract. |
 | A post-boundary reencode could leave a retry sibling beside a replaced target that the global table called conflicting | Add one phase-specific `post_boundary_retry_sibling_present` state; remove only the exact indexed safe sibling, sync, revalidate, and reencode without adopting it. |
@@ -1840,7 +1840,7 @@ such live/recovery states: `committed`, where the sibling is absent and an
 ordinary final-target identity differs from `reserved_target_identity` (the live
 adapter additionally observes source identity `S` there), and the Windows
 `replacement_gap`, where the exact safe sibling remains and the final path is
-absent. The adapter's Boolean return does not define the boundary. This revision
+absent. The adapter's NTSTATUS does not define the boundary. This revision
 reserves no backup, hard link, or rollback copy, so the prior video is not
 promised recoverable in either state.
 Target-parent durability and target reopen/hash validation still follow, but do
@@ -2078,7 +2078,10 @@ gap state below is already past that boundary even when the API returned failure
 
 Every Windows same-parent rename in this specification uses
 `WindowsSameParentRenameV1`, implemented only as
-`SetFileInformationByHandle(source_handle, FileRenameInfo, ...)`. Its
+`NtSetInformationFile(source_handle, io_status, FILE_RENAME_INFORMATION, ...,
+FileRenameInformation)`. The Win32 `SetFileInformationByHandle(FileRenameInfo)`
+surface is not used because its public wrapper does not reliably accept the
+non-null handle-relative `RootDirectory` form required by this contract. Its
 `RootDirectory` is always one `WindowsTargetParentHandleV1`, opened exactly as:
 
 ```text
@@ -2114,44 +2117,43 @@ algorithm.
 The source is opened by its authorized identity with
 `GENERIC_READ|GENERIC_WRITE|DELETE|SYNCHRONIZE`, exactly
 `FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE`, and the no-follow/reparse
-checks already required by its artifact contract. `FILE_RENAME_INFO` contains
+checks already required by its artifact contract. `FILE_RENAME_INFORMATION` contains
 only `ReplaceIfExists=TRUE` for replacement or `FALSE` for create-new,
 `RootDirectory=target_parent_handle`, `FileNameLength` equal to the checked UTF-16
 byte length of the exact one-component target name excluding its terminator, and
 a buffer containing that name followed by one uncounted zero `WCHAR`. There is no
-`FileRenameInfoEx`, flag word, absolute/process-current-directory path,
+`FileRenameInformationEx`, flag word, absolute/process-current-directory path,
 `ReplaceFileW`, `MoveFileExW`, backup name, or alternate old-target name. The
 zero-initialized buffer and `dwBufferSize` are exactly checked
-`offsetof(FILE_RENAME_INFO,FileName)+FileNameLength+sizeof(WCHAR)`; padding and
-unused union bytes are zero. The handle-relative structure and Boolean semantics
+`offsetof(FILE_RENAME_INFORMATION,FileName)+FileNameLength+sizeof(WCHAR)`; padding and
+unused union bytes are zero. The handle-relative structure and NTSTATUS semantics
 follow Microsoft's
-[`FILE_RENAME_INFO`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_rename_info)
-and
-[`SetFileInformationByHandle`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle)
-contracts. `GENERIC_WRITE` is mandatory because every durability step invokes
+[`FileRenameInformation`](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/87f86c9b-6c2a-4803-84b7-131a74a434fa)
+contract. `GENERIC_WRITE` is mandatory because every durability step invokes
 [`FlushFileBuffers`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers)
 on that still-open handle.
 
 Before a replacement call, file-sync and reopen the source, authenticate the
 applicable old target, capture the exact source identity `S`, and close every
 child handle which could deny rename sharing while retaining the authenticated
-parent handle. Immediately after the API returns, save its Boolean; if it is
-false, also save `GetLastError` before another Windows call. After **every**
+parent handle. Immediately after the API returns, save its NTSTATUS and derive
+the one DOS error through `RtlNtStatusToDosError` before another Windows call.
+After **every**
 return, success or failure, flush the still-open source handle and reopen both
 declared names without following links, and classify physical identity before
 interpreting the saved error:
 
 | Source path | Target path | Replacement classification and sole action |
 |---|---|---|
-| exact `S` | exact authorized old target | `unchanged`; a false return propagates its typed I/O/capability result with all paths preserved, while a true return is `WindowsRenameProtocolError` |
-| absent | exact `S` | `committed`; complete target flush/reopen validation even if the saved Boolean was false, then retire only through the ordinary descriptor/index order |
+| exact `S` | exact authorized old target | `unchanged`; a failing NTSTATUS propagates its typed I/O/capability result with all paths preserved, while a successful NTSTATUS is `WindowsRenameProtocolError` |
+| absent | exact `S` | `committed`; complete target flush/reopen validation even if the saved NTSTATUS was failure, then retire only through the ordinary descriptor/index order |
 | exact `S` | absent | `replacement_gap`; the old target is irrecoverable and the boundary is crossed, so forward-rename the same source handle to the absent exact target with `ReplaceIfExists=FALSE`, without resetting, deleting, reallocating, or re-deriving `S` |
 | any other combination | any other identity/type/link/parent state | `ReservationConflictError`; preserve every observable owned path and never scan for an old target |
 
 If the post-call flush or either path observation itself fails, return that typed
 I/O/capability error with the authority and every observable path preserved. The
 next recovery reopens and reclassifies before any cleanup or retry; neither the
-saved Boolean nor saved API error may substitute for missing physical evidence.
+saved NTSTATUS nor saved API error may substitute for missing physical evidence.
 
 For a bounded artifact, gap recovery requires the descriptor's exact `S` and its
 complete semantic payload. For final video, it requires the active index's exact
@@ -2164,7 +2166,7 @@ unless durable manifest intent proves
 otherwise. An unchanged false return remains retryable; the exact source-present/
 target-absent state remains the same gap, not a new transition. An ENOSPC/error
 112 during forward recovery is `ReservationIncompleteError` with the active
-authority and source preserved. No Boolean return can move a state backward or
+authority and source preserved. No NTSTATUS can move a state backward or
 restore old bytes.
 
 A `replacement_gap` is a monotonic forward obligation, never an authenticated-
@@ -7460,7 +7462,7 @@ It is not a setting, saved mode, resume identity, or production branch.
    inode is rejected. Windows fixtures require exactly 16 lowercase hex
    volume digits plus 32 file-ID digits in reservation, prune, and reclaim. They
    also prove every same-parent operation uses only
-   `SetFileInformationByHandle(FileRenameInfo)`, a fresh
+   `NtSetInformationFile(FileRenameInformation)`, a fresh
    `WindowsTargetParentHandleV1` matching the persisted parent identity, and one-
    component UTF-16 target. Parent-handle fixtures assert `CreateFileW` with exact
    `FILE_ADD_FILE|SYNCHRONIZE` desired access, full share mode,
@@ -7471,7 +7473,8 @@ It is not a setting, saved mode, resume identity, or production branch.
    for replacement and `FALSE` for create-new/gap recovery, with exact zeroed
    buffer/size arithmetic and immediate false-return error capture;
    `ReplaceFileW`, `MoveFileExW`,
-   `FileRenameInfoEx`, and a backup name are never invoked. Injected true/false
+   `FileRenameInformationEx`, `SetFileInformationByHandle`, and a backup name are
+   never invoked. Injected success/failure NTSTATUS values
    returns separately classify the exact source/authorized-target unchanged pair,
    committed, target-absent gap, every other both-present anomaly, wrong identity,
    and no-progress retry from actual reopened paths/file IDs. The higher-level
@@ -8048,7 +8051,7 @@ filesystem-superblock parsers are explicitly outside implementation authority.
   declares video replacement irreversible and audits the actual retained prefix.
 - **Windows `ReplaceFileW`:** its unsupported write-through flag and documented
   failure outcomes can already have removed or renamed the old target. The frozen
-  handle-relative `FileRenameInfo` adapter instead classifies every return from
+  handle-relative `FileRenameInformation` adapter instead classifies every return from
   reopened path/file-ID state and carries an explicit forward-only gap state.
 
 ## Approval Criteria
@@ -8176,7 +8179,8 @@ Approval of this canonical specification accepts:
     scans owns one isolated fixed one-MiB stream and no overlapping JSON/payload
     state. Evolving settings targets instead use their typed predecessor
     transition. Windows publication uses only the frozen handle-relative
-    `FileRenameInfo` adapter with the exact `WindowsTargetParentHandleV1`,
+    `NtSetInformationFile(FileRenameInformation)` adapter with the exact
+    `WindowsTargetParentHandleV1`,
     reclassifies parent and child path/file-ID state after every return, and
     forward-recovers an exact target-absent gap without claiming the old artifact
     survives. Final
