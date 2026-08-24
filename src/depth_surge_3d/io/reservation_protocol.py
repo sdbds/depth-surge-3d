@@ -1677,19 +1677,60 @@ def final_index_retirement_order(
     return tuple(steps)
 
 
+def _validate_restart_terminal_entry(
+    value: object,
+    target: ProcessingSettingsArtifactV5,
+) -> dict | None:
+    if value is None:
+        return None
+    expected = {
+        "reservation_kind",
+        "generation",
+        "reservation_id",
+        "index_relative_path",
+        "target_relative_path",
+        "publication_method",
+        "payload_raw_max",
+        "allocation_unit",
+    }
+    if type(value) is not dict or set(value) != expected:
+        raise ReservationConflictError("restart terminal entry schema is invalid")
+    assert isinstance(value, dict)
+    metadata = target.to_object()["metadata"]
+    if (
+        value["reservation_kind"] != "job_terminal_settings"
+        or value["generation"] != metadata["job_reservation_generation"]
+        or value["reservation_id"] != metadata["job_terminal_reservation_id"]
+        or value["index_relative_path"] != JOB_CONTROL_RELATIVE_PATH.as_posix()
+        or value["target_relative_path"] != SETTINGS_ARTIFACT_RELATIVE_PATH.as_posix()
+        or value["publication_method"] != "replace_existing"
+        or value["payload_raw_max"] != 512 * 1024
+        or type(value["allocation_unit"]) is not int
+        or value["allocation_unit"] <= 0
+    ):
+        raise ReservationConflictError("restart terminal entry does not match job control")
+    _require_lower_hex(value["generation"], 32, "restart terminal generation")
+    _require_lower_hex(value["reservation_id"], 32, "restart terminal reservation id")
+    return dict(value)
+
+
 @dataclass(frozen=True)
 class SettingsTransitionIntentV1:
-    """Durable semantic payload for one schema-5 settings replacement."""
+    """Durable semantic and physical plan for one schema-5 replacement."""
 
     job_id: str
     settings_identity_fingerprint: str
     reservation_generation: str
     reservation_id: str
+    allocation_unit: int
     source_settings_revision: int
+    source_settings_raw_sha256: str
     target_settings_revision: int
     target_settings_content_fingerprint: str
     target_settings_raw_sha256: str
     target_settings_payload: dict
+    transition_kind: Literal["nonterminal_rewrite", "attempt_restart"]
+    replacement_terminal_entry: dict | None
     fingerprint: str
 
     def _base_object(self) -> dict:
@@ -1702,11 +1743,15 @@ class SettingsTransitionIntentV1:
             "reservation_generation": self.reservation_generation,
             "reservation_id": self.reservation_id,
             "reservation_kind": "settings_transition",
+            "allocation_unit": self.allocation_unit,
             "source_settings_revision": self.source_settings_revision,
+            "source_settings_raw_sha256": self.source_settings_raw_sha256,
             "target_settings_revision": self.target_settings_revision,
             "target_settings_content_fingerprint": self.target_settings_content_fingerprint,
             "target_settings_raw_sha256": self.target_settings_raw_sha256,
             "target_settings_payload": self.target_settings_payload,
+            "transition_kind": self.transition_kind,
+            "replacement_terminal_entry": self.replacement_terminal_entry,
         }
 
     def to_object(self) -> dict:
@@ -1720,9 +1765,13 @@ class SettingsTransitionIntentV1:
         target: ProcessingSettingsArtifactV5,
         reservation_generation: str,
         reservation_id: str,
+        allocation_unit: int,
+        replacement_terminal_entry: dict | None = None,
     ) -> SettingsTransitionIntentV1:
         _require_lower_hex(reservation_generation, 32, "settings reservation generation")
         _require_lower_hex(reservation_id, 32, "settings reservation id")
+        if type(allocation_unit) is not int or allocation_unit <= 0:
+            raise ReservationConflictError("settings allocation unit is invalid")
         current_value = current.to_object()
         target_value = target.to_object()
         current_metadata = current_value["metadata"]
@@ -1739,17 +1788,49 @@ class SettingsTransitionIntentV1:
         )
         if any(current_metadata[key] != target_metadata[key] for key in immutable_identity):
             raise ReservationConflictError("settings transition changed immutable identity")
-        raw = target.encode()
+        if any(
+            current_value[key] != target_value[key] for key in ("video_properties", "output_info")
+        ):
+            raise ReservationConflictError("settings transition changed immutable job inputs")
+        attempt_restart = (
+            current.status in {"completed", "failed"} and target.status == "in_progress"
+        )
+        if attempt_restart:
+            if (
+                replacement_terminal_entry is None
+                or target_metadata["processing_attempt"]
+                != current_metadata["processing_attempt"] + 1
+            ):
+                raise ReservationConflictError(
+                    "attempt restart lacks its replacement terminal extent"
+                )
+            transition_kind: Literal["nonterminal_rewrite", "attempt_restart"] = "attempt_restart"
+        else:
+            if (
+                current.status != "in_progress"
+                or target.status != "in_progress"
+                or replacement_terminal_entry is not None
+                or target_metadata["processing_attempt"] != current_metadata["processing_attempt"]
+            ):
+                raise ReservationConflictError("settings transition status delta is invalid")
+            transition_kind = "nonterminal_rewrite"
+        terminal_entry = _validate_restart_terminal_entry(replacement_terminal_entry, target)
+        current_raw = current.encode()
+        target_raw = target.encode()
         provisional = cls(
             job_id=target_metadata["job_id"],
             settings_identity_fingerprint=target_metadata["settings_identity_fingerprint"],
             reservation_generation=reservation_generation,
             reservation_id=reservation_id,
+            allocation_unit=allocation_unit,
             source_settings_revision=current.revision,
+            source_settings_raw_sha256=hashlib.sha256(current_raw).hexdigest(),
             target_settings_revision=target.revision,
             target_settings_content_fingerprint=target_value["content_fingerprint"],
-            target_settings_raw_sha256=hashlib.sha256(raw).hexdigest(),
+            target_settings_raw_sha256=hashlib.sha256(target_raw).hexdigest(),
             target_settings_payload=target_value,
+            transition_kind=transition_kind,
+            replacement_terminal_entry=terminal_entry,
             fingerprint="",
         )
         return cls(
@@ -1772,11 +1853,15 @@ class SettingsTransitionIntentV1:
             "reservation_generation",
             "reservation_id",
             "reservation_kind",
+            "allocation_unit",
             "source_settings_revision",
+            "source_settings_raw_sha256",
             "target_settings_revision",
             "target_settings_content_fingerprint",
             "target_settings_raw_sha256",
             "target_settings_payload",
+            "transition_kind",
+            "replacement_terminal_entry",
             "fingerprint",
         }
         if type(value) is not dict or set(value) != expected:
@@ -1796,9 +1881,19 @@ class SettingsTransitionIntentV1:
                 raise ReservationConflictError(f"{key} is invalid")
         if value["target_settings_revision"] != value["source_settings_revision"] + 1:
             raise ReservationConflictError("settings intent revision equation is invalid")
+        if type(value["allocation_unit"]) is not int or value["allocation_unit"] <= 0:
+            raise ReservationConflictError("settings intent allocation unit is invalid")
         target = ProcessingSettingsArtifactV5.from_object(value["target_settings_payload"])
         target_value = target.to_object()
-        raw = target.encode()
+        transition_kind = value["transition_kind"]
+        if transition_kind not in {"nonterminal_rewrite", "attempt_restart"}:
+            raise ReservationConflictError("settings transition kind is invalid")
+        terminal_entry = _validate_restart_terminal_entry(
+            value["replacement_terminal_entry"], target
+        )
+        if (transition_kind == "attempt_restart") != (terminal_entry is not None):
+            raise ReservationConflictError("settings transition terminal entry is inconsistent")
+        target_raw = target.encode()
         result = cls(
             job_id=_require_lower_hex(value["job_id"], 32, "job id"),
             settings_identity_fingerprint=_require_lower_hex(
@@ -1810,7 +1905,11 @@ class SettingsTransitionIntentV1:
             reservation_id=_require_lower_hex(
                 value["reservation_id"], 32, "settings reservation id"
             ),
+            allocation_unit=value["allocation_unit"],
             source_settings_revision=value["source_settings_revision"],
+            source_settings_raw_sha256=_require_lower_hex(
+                value["source_settings_raw_sha256"], 64, "source settings raw hash"
+            ),
             target_settings_revision=value["target_settings_revision"],
             target_settings_content_fingerprint=_require_lower_hex(
                 value["target_settings_content_fingerprint"], 64, "target content fingerprint"
@@ -1819,6 +1918,8 @@ class SettingsTransitionIntentV1:
                 value["target_settings_raw_sha256"], 64, "target settings raw hash"
             ),
             target_settings_payload=target_value,
+            transition_kind=transition_kind,
+            replacement_terminal_entry=terminal_entry,
             fingerprint=_require_lower_hex(value["fingerprint"], 64, "settings intent fingerprint"),
         )
         if (
@@ -1827,7 +1928,7 @@ class SettingsTransitionIntentV1:
             or target_value["metadata"]["settings_identity_fingerprint"]
             != result.settings_identity_fingerprint
             or target_value["content_fingerprint"] != result.target_settings_content_fingerprint
-            or hashlib.sha256(raw).hexdigest() != result.target_settings_raw_sha256
+            or hashlib.sha256(target_raw).hexdigest() != result.target_settings_raw_sha256
             or sha256_canonical(result._base_object()) != result.fingerprint
         ):
             raise ReservationConflictError("settings transition intent hashes or identity differ")
@@ -1843,14 +1944,228 @@ class SettingsArtifactTransactionV1:
         job_root: Path,
         intent: SettingsTransitionIntentV1,
         transaction: ReservedArtifactTransaction,
+        replacement_terminal: ReservedArtifactTransaction | None = None,
     ) -> None:
         self.job_root = Path(job_root)
         self.intent = intent
         self.transaction = transaction
+        self.replacement_terminal = replacement_terminal
 
     @property
     def index_path(self) -> Path:
         return self.job_root / SETTINGS_TRANSITION_INDEX_RELATIVE_PATH
+
+    @staticmethod
+    def _descriptor_path(
+        job_root: Path,
+        *,
+        generation: str,
+        reservation_kind: str,
+        reservation_id: str,
+    ) -> Path:
+        return (
+            Path(job_root)
+            / ".depth-surge-reservations-v1"
+            / f"d-r-{generation}-{reservation_kind}-{reservation_id}.json"
+        )
+
+    @staticmethod
+    def _validate_transaction_plan(
+        transaction: ReservedArtifactTransaction,
+        *,
+        index_relative_path: Path,
+        reservation_kind: str,
+        generation: str,
+        reservation_id: str,
+        allocation_unit: int,
+    ) -> None:
+        descriptor = transaction.descriptor
+        if (
+            descriptor.index_relative_path != index_relative_path.as_posix()
+            or descriptor.target_relative_path != SETTINGS_ARTIFACT_RELATIVE_PATH.as_posix()
+            or descriptor.reservation_kind != reservation_kind
+            or descriptor.publication_method != "replace_existing"
+            or descriptor.payload_raw_max != 512 * 1024
+            or descriptor.logical_byte_count != payload_logical_bytes(512 * 1024, allocation_unit)
+            or descriptor.allocation_unit != allocation_unit
+            or descriptor.generation != generation
+            or descriptor.reservation_id != reservation_id
+        ):
+            raise ReservationConflictError("settings reservation descriptor differs from intent")
+
+    @classmethod
+    def _load_or_create_primary(
+        cls,
+        *,
+        job_root: Path,
+        intent: SettingsTransitionIntentV1,
+        allocation_adapter: AllocationAdapter,
+        allocation_counter: AllocationCounter | None,
+    ) -> ReservedArtifactTransaction:
+        descriptor_path = cls._descriptor_path(
+            job_root,
+            generation=intent.reservation_generation,
+            reservation_kind="settings_transition",
+            reservation_id=intent.reservation_id,
+        )
+        if descriptor_path.is_file():
+            transaction = ReservedArtifactTransaction.load(
+                descriptor_path,
+                allocation_adapter=allocation_adapter,
+                allocation_counter=allocation_counter,
+            )
+        else:
+            transaction = ReservedArtifactTransaction.create(
+                job_root=job_root,
+                index_relative_path=SETTINGS_TRANSITION_INDEX_RELATIVE_PATH,
+                target_relative_path=SETTINGS_ARTIFACT_RELATIVE_PATH,
+                reservation_kind="settings_transition",
+                payload_raw_max=512 * 1024,
+                allocation_unit=intent.allocation_unit,
+                allocation_adapter=allocation_adapter,
+                allocation_counter=allocation_counter,
+                generation=intent.reservation_generation,
+                reservation_id=intent.reservation_id,
+                expected_publication_method="replace_existing",
+            )
+        cls._validate_transaction_plan(
+            transaction,
+            index_relative_path=SETTINGS_TRANSITION_INDEX_RELATIVE_PATH,
+            reservation_kind="settings_transition",
+            generation=intent.reservation_generation,
+            reservation_id=intent.reservation_id,
+            allocation_unit=intent.allocation_unit,
+        )
+        return transaction
+
+    @classmethod
+    def _load_or_create_replacement_terminal(
+        cls,
+        *,
+        job_root: Path,
+        intent: SettingsTransitionIntentV1,
+        target: ProcessingSettingsArtifactV5,
+        allocation_adapter: AllocationAdapter,
+        allocation_counter: AllocationCounter | None,
+    ) -> ReservedArtifactTransaction | None:
+        entry = intent.replacement_terminal_entry
+        if entry is None:
+            return None
+        descriptor_path = cls._descriptor_path(
+            job_root,
+            generation=entry["generation"],
+            reservation_kind=entry["reservation_kind"],
+            reservation_id=entry["reservation_id"],
+        )
+        if descriptor_path.is_file():
+            terminal = ReservedArtifactTransaction.load(
+                descriptor_path,
+                allocation_adapter=allocation_adapter,
+                allocation_counter=allocation_counter,
+            )
+        else:
+            terminal = ReservedArtifactTransaction.create(
+                job_root=job_root,
+                index_relative_path=JOB_CONTROL_RELATIVE_PATH,
+                target_relative_path=SETTINGS_ARTIFACT_RELATIVE_PATH,
+                reservation_kind="job_terminal_settings",
+                payload_raw_max=512 * 1024,
+                allocation_unit=entry["allocation_unit"],
+                allocation_adapter=allocation_adapter,
+                allocation_counter=allocation_counter,
+                generation=entry["generation"],
+                reservation_id=entry["reservation_id"],
+                expected_publication_method="replace_existing",
+            )
+        cls._validate_transaction_plan(
+            terminal,
+            index_relative_path=JOB_CONTROL_RELATIVE_PATH,
+            reservation_kind="job_terminal_settings",
+            generation=entry["generation"],
+            reservation_id=entry["reservation_id"],
+            allocation_unit=entry["allocation_unit"],
+        )
+        target_raw = target.encode()
+        if terminal.validate_physical_phase(target_raw) != "full-source":
+            raise ReservationConflictError("replacement terminal extent is not full-length")
+        if classify_payload_frame(terminal.source_path.read_bytes(), target_raw) != "zero":
+            raise ReservationConflictError("replacement terminal extent is not a zero frame")
+        return terminal
+
+    @staticmethod
+    def _restart_terminal_entry(job_root: Path, target: ProcessingSettingsArtifactV5) -> dict:
+        control = load_job_control(job_root)
+        metadata = target.to_object()["metadata"]
+        if (
+            control.job_id != metadata["job_id"]
+            or control.settings_identity_fingerprint != metadata["settings_identity_fingerprint"]
+            or control.job_reservation_generation != metadata["job_reservation_generation"]
+            or control.job_terminal_reservation_id != metadata["job_terminal_reservation_id"]
+        ):
+            raise ReservationConflictError("restart target differs from immutable job control")
+        matches = [
+            entry
+            for entry in control.bootstrap_extent_entries
+            if entry.get("reservation_kind") == "job_terminal_settings"
+        ]
+        if len(matches) != 1:
+            raise ReservationConflictError("job control has no unique terminal extent plan")
+        return dict(matches[0])
+
+    @staticmethod
+    def _validate_source_or_target(
+        *,
+        fixed_path: Path,
+        intent: SettingsTransitionIntentV1,
+        target: ProcessingSettingsArtifactV5,
+    ) -> str:
+        if not fixed_path.is_file() or fixed_path.is_symlink():
+            raise ReservationConflictError("fixed settings target is missing or unsafe")
+        raw = fixed_path.read_bytes()
+        target_raw = target.encode()
+        if raw == target_raw:
+            return "target"
+        if hashlib.sha256(raw).hexdigest() != intent.source_settings_raw_sha256:
+            raise ReservationConflictError("fixed settings bytes match neither transition endpoint")
+        try:
+            from .settings_artifact import ProcessingSettingsArtifactV5
+
+            current = ProcessingSettingsArtifactV5.parse(raw)
+        except Exception as error:
+            raise ReservationConflictError("preflight settings artifact is invalid") from error
+        recreated = SettingsTransitionIntentV1.create(
+            current=current,
+            target=target,
+            reservation_generation=intent.reservation_generation,
+            reservation_id=intent.reservation_id,
+            allocation_unit=intent.allocation_unit,
+            replacement_terminal_entry=intent.replacement_terminal_entry,
+        )
+        if recreated != intent:
+            raise ReservationConflictError("settings transition no longer matches its preflight")
+        return "source"
+
+    @staticmethod
+    def _consume_or_recover(
+        transaction: ReservedArtifactTransaction,
+        target_raw: bytes,
+        *,
+        crash_at: str | None = None,
+    ) -> None:
+        phase = transaction.validate_physical_phase(target_raw)
+        if phase == "full-source":
+            raw = transaction.source_path.read_bytes()
+            state = classify_payload_frame(raw, target_raw)
+            if state == "complete-full":
+                transaction.recover(target_raw)
+                return
+            if any(raw[len(target_raw) :]):
+                raise ReservationConflictError(
+                    "settings reservation has nonzero bytes beyond the intended payload"
+                )
+            transaction.consume(target_raw, crash_at=crash_at)
+            return
+        transaction.recover(target_raw)
 
     @classmethod
     def begin(
@@ -1871,27 +2186,39 @@ class SettingsArtifactTransactionV1:
             raise ReservationConflictError("fixed settings target is missing or unsafe")
         if fixed_path.read_bytes() != current.encode():
             raise ReservationConflictError("current settings bytes changed before transaction")
+        attempt_restart = (
+            current.status in {"completed", "failed"} and target.status == "in_progress"
+        )
+        terminal_entry = cls._restart_terminal_entry(job_root, target) if attempt_restart else None
         intent = SettingsTransitionIntentV1.create(
             current=current,
             target=target,
             reservation_generation=reservation_generation,
             reservation_id=reservation_id,
+            allocation_unit=allocation_unit,
+            replacement_terminal_entry=terminal_entry,
         )
         index_path = job_root / SETTINGS_TRANSITION_INDEX_RELATIVE_PATH
         publish_write_ahead_intent(index_path, intent.to_object())
-        transaction = ReservedArtifactTransaction.create(
+        transaction = cls._load_or_create_primary(
             job_root=job_root,
-            index_relative_path=SETTINGS_TRANSITION_INDEX_RELATIVE_PATH,
-            target_relative_path=SETTINGS_ARTIFACT_RELATIVE_PATH,
-            reservation_kind="settings_transition",
-            payload_raw_max=512 * 1024,
-            allocation_unit=allocation_unit,
+            intent=intent,
             allocation_adapter=allocation_adapter,
             allocation_counter=allocation_counter,
-            generation=reservation_generation,
-            reservation_id=reservation_id,
         )
-        return cls(job_root=job_root, intent=intent, transaction=transaction)
+        replacement_terminal = cls._load_or_create_replacement_terminal(
+            job_root=job_root,
+            intent=intent,
+            target=target,
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+        )
+        return cls(
+            job_root=job_root,
+            intent=intent,
+            transaction=transaction,
+            replacement_terminal=replacement_terminal,
+        )
 
     @staticmethod
     def _retire_index(index_path: Path) -> None:
@@ -1904,14 +2231,49 @@ class SettingsArtifactTransactionV1:
         from .settings_artifact import ProcessingSettingsArtifactV5
 
         target = ProcessingSettingsArtifactV5.from_object(self.intent.target_settings_payload)
+        fixed_path = self.job_root / SETTINGS_ARTIFACT_RELATIVE_PATH
+        if (
+            self._validate_source_or_target(
+                fixed_path=fixed_path,
+                intent=self.intent,
+                target=target,
+            )
+            != "source"
+        ):
+            raise ReservationConflictError(
+                "settings transaction target was committed before commit"
+            )
+        replacement_terminal = self._load_or_create_replacement_terminal(
+            job_root=self.job_root,
+            intent=self.intent,
+            target=target,
+            allocation_adapter=self.transaction.allocation_adapter,
+            allocation_counter=self.transaction.allocation_counter,
+        )
         nested_crash = (
             crash_at
-            if crash_at in {"after-truncate", "after-truncate-sync", "after-rename-parent-sync"}
+            if crash_at
+            in {
+                "after-complete-full-sync",
+                "after-truncate",
+                "after-truncate-sync",
+                "after-rename-parent-sync",
+            }
             else None
         )
-        self.transaction.consume(target.encode(), crash_at=nested_crash)
+        self._consume_or_recover(self.transaction, target.encode(), crash_at=nested_crash)
         if crash_at == "after-target-commit":
             raise InjectedReservationCrash(crash_at)
+        if fixed_path.read_bytes() != target.encode():
+            raise ReservationConflictError("settings target changed after commit")
+        if replacement_terminal is not None:
+            self._load_or_create_replacement_terminal(
+                job_root=self.job_root,
+                intent=self.intent,
+                target=target,
+                allocation_adapter=self.transaction.allocation_adapter,
+                allocation_counter=self.transaction.allocation_counter,
+            )
         self._retire_index(self.index_path)
         return target
 
@@ -1936,24 +2298,42 @@ class SettingsArtifactTransactionV1:
             ) from error
         intent = SettingsTransitionIntentV1.from_object(value)
         target = ProcessingSettingsArtifactV5.from_object(intent.target_settings_payload)
-        descriptor_name = (
-            f"d-r-{intent.reservation_generation}-settings_transition-"
-            f"{intent.reservation_id}.json"
+        fixed_path = job_root / SETTINGS_ARTIFACT_RELATIVE_PATH
+        endpoint = cls._validate_source_or_target(
+            fixed_path=fixed_path,
+            intent=intent,
+            target=target,
         )
-        descriptor_path = job_root / ".depth-surge-reservations-v1" / descriptor_name
-        if descriptor_path.exists():
-            transaction = ReservedArtifactTransaction.load(
-                descriptor_path,
+        cls._load_or_create_replacement_terminal(
+            job_root=job_root,
+            intent=intent,
+            target=target,
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+        )
+        descriptor_path = cls._descriptor_path(
+            job_root,
+            generation=intent.reservation_generation,
+            reservation_kind="settings_transition",
+            reservation_id=intent.reservation_id,
+        )
+        if descriptor_path.is_file() or endpoint == "source":
+            transaction = cls._load_or_create_primary(
+                job_root=job_root,
+                intent=intent,
                 allocation_adapter=allocation_adapter,
                 allocation_counter=allocation_counter,
             )
-            transaction.recover(target.encode())
-        else:
-            fixed_path = job_root / SETTINGS_ARTIFACT_RELATIVE_PATH
-            if not fixed_path.is_file() or fixed_path.read_bytes() != target.encode():
-                raise ReservationConflictError(
-                    "settings transition has neither descriptor nor committed target"
-                )
+            cls._consume_or_recover(transaction, target.encode())
+        if fixed_path.read_bytes() != target.encode():
+            raise ReservationConflictError("settings transition did not commit its exact target")
+        cls._load_or_create_replacement_terminal(
+            job_root=job_root,
+            intent=intent,
+            target=target,
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+        )
         cls._retire_index(index_path)
         return target
 

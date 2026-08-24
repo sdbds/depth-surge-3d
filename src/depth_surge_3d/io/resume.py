@@ -9,7 +9,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from ..core.settings import (
     parse_saved_processing_settings,
@@ -1209,13 +1209,14 @@ def _validate_stabilized_stage(  # noqa: C901
             ),
             None,
         )
+    assert native_shape is not None
     if metadata.get("status") == "building":
         try:
             shot_audit = audit_stabilized_shot_records(
                 stabilized_dir,
                 metadata=metadata,
                 frame_names=[path.name for path in frame_files],
-                shot_plan=semantic.get("shot_plan"),
+                shot_plan=cast(list[dict[str, int]], semantic.get("shot_plan")),
                 native_shape=native_shape,
             )
         except (KeyError, TypeError, ValueError) as exc:

@@ -276,13 +276,7 @@ def _png_header(raw: bytes) -> dict[str, int]:
     width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(
         ">IIBBBBB", raw[16:29]
     )
-    if (
-        width <= 0
-        or height <= 0
-        or compression != 0
-        or filtering != 0
-        or interlace not in {0, 1}
-    ):
+    if width <= 0 or height <= 0 or compression != 0 or filtering != 0 or interlace not in {0, 1}:
         raise ValueError("Quality input PNG has an unsupported IHDR")
     return {
         "width": int(width),
@@ -302,10 +296,7 @@ def _png_identity(
 ) -> dict[str, Any]:
     sha256, byte_count, raw_header = _hash_regular_file(path)
     header = _png_header(raw_header)
-    if (
-        header["bit_depth"] != expected_bit_depth
-        or header["color_type"] != expected_color_type
-    ):
+    if header["bit_depth"] != expected_bit_depth or header["color_type"] != expected_color_type:
         raise ValueError(f"Quality input PNG format is invalid: {path}")
     if path.name != f"{frame_name}.png":
         raise ValueError("Quality input filename does not match its frame name")
@@ -325,7 +316,7 @@ def _float32_bits(value: np.float32) -> str:
     return f"{struct.unpack('<I', struct.pack('<f', float(scalar)))[0]:08x}"
 
 
-def build_quality_input_manifest(
+def build_quality_input_manifest(  # noqa: C901
     *,
     job_root: Path,
     frame_files: Sequence[Path],
@@ -361,15 +352,15 @@ def build_quality_input_manifest(
             )
         )
         if geometry_mode == "relative":
-            identity = _png_identity(
+            png_identity = _png_identity(
                 root,
                 geometry_path,
                 frame_name,
                 expected_bit_depth=16,
                 expected_color_type=0,
             )
-            identity["payload_kind"] = "canonical_png"
-            geometry.append(identity)
+            png_identity["payload_kind"] = "canonical_png"
+            geometry.append(png_identity)
         elif geometry_mode == "metric":
             if metric_native_shape is None:
                 raise ValueError("Metric Quality inputs require native shape")
@@ -377,23 +368,23 @@ def build_quality_input_manifest(
                 geometry_path,
                 expected_shape=metric_native_shape,
             ) as audited:
-                identity = audited.identity()
+                metric_identity = audited.identity()
                 if geometry_path.name != f"{frame_name}.npz":
                     raise ValueError("Metric filename does not match its frame name")
                 geometry.append(
                     {
                         "frame_name": frame_name,
                         "relative_path": _contained_relative_path(root, geometry_path),
-                        "sha256": identity.sha256,
-                        "byte_count": identity.byte_count,
+                        "sha256": metric_identity.sha256,
+                        "byte_count": metric_identity.byte_count,
                         "payload_kind": "metric_npz",
-                        "native_shape": list(identity.native_shape),
+                        "native_shape": list(metric_identity.native_shape),
                         "payload_contract": "metric-npz-v1",
-                        "archive_form": identity.archive_form,
+                        "archive_form": metric_identity.archive_form,
                         "inverse_depth_dtype": "float32",
                         "valid_dtype": "bool",
                         "focal_x_normalized_float32_bits": (
-                            identity.focal_x_normalized_float32_bits
+                            metric_identity.focal_x_normalized_float32_bits
                         ),
                         "members": [
                             "inverse_depth.npy",
@@ -413,9 +404,7 @@ def build_quality_input_manifest(
             raise ValueError("Metric Quality inputs cannot carry relative encoding scale")
         scale_bits = None
     source_guide_fingerprint = hashlib.sha256(_canonical_json_bytes(guides)).hexdigest()
-    native_geometry_fingerprint = hashlib.sha256(
-        _canonical_json_bytes(geometry)
-    ).hexdigest()
+    native_geometry_fingerprint = hashlib.sha256(_canonical_json_bytes(geometry)).hexdigest()
     payload: dict[str, Any] = {
         "schema_version": 1,
         "algorithm_version": "quality-input-content-v4",

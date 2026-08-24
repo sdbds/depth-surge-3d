@@ -387,6 +387,7 @@ class _PipelineHarness:
             "fps": 24.0,
             "frame_count": _FRAME_COUNT,
             "duration": _FRAME_COUNT / 24.0,
+            "codec": 0,
             "sample_aspect_ratio": "1:1",
             "sample_aspect_ratio_numerator": 1,
             "sample_aspect_ratio_denominator": 1,
@@ -567,7 +568,7 @@ def _assert_clean_stage_contract(result: _PipelineResult, geometry_mode: str) ->
             assert header is not None
             assert (header.height, header.width, header.channels, header.bit_depth) == (6, 8, 1, 16)
         assert not (left_dir / "clamp_summary.json").exists()
-        assert "metric_clamp_summary" not in job["runtime_info"]
+        assert job["runtime_info"]["metric_clamp_summary"] is None
         _assert_frozen_relative_renderer_boundary()
     else:
         assert not any(relative_dir.iterdir())

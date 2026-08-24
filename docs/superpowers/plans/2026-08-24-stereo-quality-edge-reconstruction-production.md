@@ -466,21 +466,30 @@ feat: expose offline stereo quality mode
 **Interfaces:**
 - Produces: one canonical production gate report tied to the tested commit/diff and user fixture settings.
 
-- [ ] **Step 1: Run focused Quality and Fast compatibility tests**
+- [x] **Step 1: Run focused Quality and Fast compatibility tests**
 
 Run: `python -m pytest tests/unit/test_quality_*.py tests/unit/test_stereo_renderer.py tests/unit/test_stereo_generator.py tests/unit/test_resume.py tests/unit/test_video_encoder.py -q`
 
-- [ ] **Step 2: Run the complete repository suite in the supported environment**
+- [x] **Step 2: Run the complete repository suite in the supported environment**
 
 Run: `$env:PATH='E:\Code\depth-surge-3d\.venv\Scripts;' + $env:PATH; python -m pytest -q`
 
-- [ ] **Step 3: Run formatting, lint, type, and diff checks**
+- [x] **Step 3: Run formatting, lint, type, and diff checks**
 
 Run scoped Black/flake8/mypy for every changed production/test file, record pre-existing unrelated baseline debt, then run `git diff --check` and inspect `git status --short`.
 
-- [ ] **Step 4: Build and smoke-test the wheel**
+- [x] **Step 4: Build and smoke-test the wheel**
 
 Install the wheel into a clean temporary virtual environment, import the native extension, run CLI help, and render the deterministic Quality edge fixture.
+
+Verification evidence (2026-08-24): the focused gate passed 639 tests and the
+repository suite passed 2522 tests with one CUDA-only skip. Black and Flake8
+passed every changed Python file. Scoped mypy passed every changed production
+file; the full source-tree invocation retained six pre-existing errors only in
+unchanged `core/vdpp_calibration.py` and `processing/frames/temporal_stabilizer.py`.
+The isolated CPython 3.11 wheel built successfully, loaded the wheel-root native
+extension, printed CLI help, and reproduced deterministic fixture SHA-256
+`774b23e2f8f33b7b3169c70b72dd9097f911110b0ac056425e8ec28a1d329b5c`.
 
 - [ ] **Step 5: Render the user fixture in both modes**
 

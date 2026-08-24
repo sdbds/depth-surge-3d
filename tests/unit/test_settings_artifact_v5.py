@@ -220,6 +220,36 @@ def test_settings_transaction_recovers_exact_durable_semantic_payload(tmp_path) 
     ).exists()
 
 
+def test_settings_transaction_recovers_ready_zero_extent_from_durable_intent(tmp_path) -> None:
+    initial = _artifact()
+    target_path = tmp_path / "processing-settings-v5.json"
+    target_path.write_bytes(initial.encode())
+    intended = initial.with_processing_settings(
+        validate_settings(
+            {"stereo_render_mode": "quality", "occlusion_fill_max_px": 7},
+            source="explicit",
+        ),
+        updated_at="2026-08-24T12:34:57.123456Z",
+    )
+    reservation_protocol.SettingsArtifactTransactionV1.begin(
+        job_root=tmp_path,
+        current=initial,
+        target=intended,
+        allocation_adapter=_allocation_adapter,
+        allocation_unit=4096,
+        reservation_generation="55" * 16,
+        reservation_id="66" * 16,
+    )
+
+    recovered = reservation_protocol.SettingsArtifactTransactionV1.recover(
+        tmp_path,
+        allocation_adapter=_allocation_adapter,
+    )
+
+    assert recovered == intended
+    assert target_path.read_bytes() == intended.encode()
+
+
 def test_bootstrap_publishes_locator_then_settings_and_retains_terminal_extent(tmp_path) -> None:
     artifact = _artifact()
     control = reservation_protocol.bootstrap_settings_job_v1(
@@ -320,10 +350,150 @@ def test_lifecycle_terminal_extent_recovers_complete_full_intent(tmp_path) -> No
     )
 
 
+def test_attempt_restart_updates_settings_and_recreates_terminal_extent(tmp_path) -> None:
+    initial = _artifact()
+    reservation_protocol.bootstrap_settings_job_v1(
+        job_root=tmp_path,
+        artifact=initial,
+        initial_settings_reservation_id="77" * 16,
+        allocation_adapter=_allocation_adapter,
+        allocation_unit=4096,
+    )
+    failed = initial.failed(
+        terminal_at="2026-08-24T12:35:01.123456Z",
+        diagnostic_code="IO_ERROR",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=initial,
+        target=failed,
+        allocation_adapter=_allocation_adapter,
+    )
+    assert (
+        reservation_protocol.recover_settings_job_v1(
+            tmp_path,
+            allocation_adapter=_allocation_adapter,
+        )
+        == failed
+    )
+
+    changed = validate_settings(
+        {"stereo_render_mode": "quality", "occlusion_fill_max_px": 7},
+        source="explicit",
+    )
+    restarted = failed.restart(
+        started_at="2026-08-24T12:36:00.123456Z",
+        processing_settings=changed,
+    )
+    transaction = reservation_protocol.SettingsArtifactTransactionV1.begin(
+        job_root=tmp_path,
+        current=failed,
+        target=restarted,
+        allocation_adapter=_allocation_adapter,
+        allocation_unit=4096,
+        reservation_generation="88" * 16,
+        reservation_id="99" * 16,
+    )
+    transaction.commit()
+
+    recovered = reservation_protocol.recover_settings_job_v1(
+        tmp_path,
+        allocation_adapter=_allocation_adapter,
+    )
+    metadata = initial.to_object()["metadata"]
+    terminal_descriptor = (
+        tmp_path
+        / ".depth-surge-reservations-v1"
+        / (
+            f"d-r-{metadata['job_reservation_generation']}-job_terminal_settings-"
+            f"{metadata['job_terminal_reservation_id']}.json"
+        )
+    )
+    assert recovered == restarted
+    assert recovered.to_object()["processing_settings"]["stereo_render_mode"] == "quality"
+    assert recovered.to_object()["metadata"]["processing_attempt"] == 2
+    assert terminal_descriptor.is_file()
+
+
+@pytest.mark.parametrize("crash_at", [None, "after-target-commit"])
+def test_attempt_restart_recovers_before_and_after_settings_commit(
+    tmp_path,
+    crash_at: str | None,
+) -> None:
+    initial = _artifact()
+    reservation_protocol.bootstrap_settings_job_v1(
+        job_root=tmp_path,
+        artifact=initial,
+        initial_settings_reservation_id="77" * 16,
+        allocation_adapter=_allocation_adapter,
+        allocation_unit=4096,
+    )
+    failed = initial.failed(
+        terminal_at="2026-08-24T12:35:01.123456Z",
+        diagnostic_code="IO_ERROR",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=initial,
+        target=failed,
+        allocation_adapter=_allocation_adapter,
+    )
+    reservation_protocol.recover_settings_job_v1(
+        tmp_path,
+        allocation_adapter=_allocation_adapter,
+    )
+    restarted = failed.restart(started_at="2026-08-24T12:36:00.123456Z")
+    transaction = reservation_protocol.SettingsArtifactTransactionV1.begin(
+        job_root=tmp_path,
+        current=failed,
+        target=restarted,
+        allocation_adapter=_allocation_adapter,
+        allocation_unit=4096,
+        reservation_generation="88" * 16,
+        reservation_id="99" * 16,
+    )
+
+    if crash_at is not None:
+        with pytest.raises(reservation_protocol.InjectedReservationCrash):
+            transaction.commit(crash_at=crash_at)
+
+    recovered = reservation_protocol.recover_settings_job_v1(
+        tmp_path,
+        allocation_adapter=_allocation_adapter,
+    )
+
+    assert recovered == restarted
+    assert not (
+        tmp_path / ".depth-surge-reservations-v1/settings-transition-reservation-v1.json"
+    ).exists()
+
+
+def test_in_progress_settings_rewrite_preserves_attempt_and_terminal_reserve() -> None:
+    initial = _artifact()
+    changed = validate_settings(
+        {"stereo_render_mode": "quality", "occlusion_fill_max_px": 6},
+        source="explicit",
+    )
+
+    rewritten = initial.with_processing_settings(
+        changed,
+        updated_at="2026-08-24T12:35:00.123456Z",
+    )
+
+    before = initial.to_object()
+    after = rewritten.to_object()
+    assert rewritten.status == "in_progress"
+    assert rewritten.revision == initial.revision + 1
+    assert after["metadata"]["processing_attempt"] == before["metadata"]["processing_attempt"]
+    assert after["metadata"]["attempt_started_at"] == before["metadata"]["attempt_started_at"]
+    assert after["processing_settings"]["stereo_render_mode"] == "quality"
+
+
 def test_operations_new_job_path_uses_schema5_locator_and_terminal_extent(tmp_path) -> None:
     from src.depth_surge_3d.io.operations import (
         commit_final_media_producer_marker,
         load_processing_settings,
+        prepare_processing_settings_artifact,
         save_processing_settings,
         update_processing_status,
     )
@@ -331,21 +501,22 @@ def test_operations_new_job_path_uses_schema5_locator_and_terminal_extent(tmp_pa
     source = tmp_path / "source.mp4"
     source.write_bytes(b"source-fixture")
     output = tmp_path / "job"
+    video_properties = {
+        "width": 8,
+        "height": 8,
+        "fps": 24.0,
+        "frame_count": 2,
+        "duration": 2.0 / 24.0,
+        "codec": 0,
+        "sample_aspect_ratio_numerator": 1,
+        "sample_aspect_ratio_denominator": 1,
+        "sample_aspect_ratio": "1:1",
+    }
     path = save_processing_settings(
         output,
         "job",
         validate_settings({}, source="explicit"),
-        {
-            "width": 8,
-            "height": 8,
-            "fps": 24.0,
-            "frame_count": 2,
-            "duration": 2.0 / 24.0,
-            "codec": 0,
-            "sample_aspect_ratio_numerator": 1,
-            "sample_aspect_ratio_denominator": 1,
-            "sample_aspect_ratio": "1:1",
-        },
+        video_properties,
         str(source),
         transactional_v5=True,
     )
@@ -362,6 +533,27 @@ def test_operations_new_job_path_uses_schema5_locator_and_terminal_extent(tmp_pa
         {"terminal_diagnostic_code": "TEST_FAILURE", "error": "fixture"},
     )
     assert ProcessingSettingsArtifactV5.parse(path.read_bytes()).status == "failed"
+
+    restarted = prepare_processing_settings_artifact(
+        path,
+        settings=validate_settings(
+            {"stereo_render_mode": "quality", "occlusion_fill_max_px": 7},
+            source="explicit",
+        ),
+        video_properties=video_properties,
+        source_video_path=str(source),
+    )
+    assert restarted.status == "in_progress"
+    assert restarted.to_object()["metadata"]["processing_attempt"] == 2
+    assert restarted.to_object()["processing_settings"]["stereo_render_mode"] == "quality"
+    assert (
+        reservation_protocol.recover_settings_job_v1(
+            output,
+            allocation_adapter=reservation_protocol.platform_allocation_adapter,
+            allocation_counter=reservation_protocol.platform_allocation_counter,
+        )
+        == restarted
+    )
 
 
 def test_legacy_completed_migration_is_revision_zero_and_preserves_target() -> None:

@@ -876,13 +876,40 @@ class ProcessingSettingsArtifactV5:
         return str(self._value["metadata"]["processing_status"])
 
     def _replace(
-        self, *, metadata: dict[str, Any], runtime: dict[str, Any]
+        self,
+        *,
+        metadata: dict[str, Any],
+        runtime: dict[str, Any],
+        processing_settings: dict[str, Any] | None = None,
     ) -> "ProcessingSettingsArtifactV5":
         value = self.to_object()
         value["metadata"] = metadata
         value["runtime_info"] = runtime
+        if processing_settings is not None:
+            value["processing_settings"] = processing_settings
         value = _with_fingerprints(value)
         return ProcessingSettingsArtifactV5.from_object(value)
+
+    def with_processing_settings(
+        self,
+        processing_settings: dict[str, Any],
+        *,
+        updated_at: str,
+    ) -> "ProcessingSettingsArtifactV5":
+        if self.status != "in_progress":
+            raise SettingsArtifactTransitionError(
+                "processing settings rewrite requires an in-progress job"
+            )
+        utc_ordinal_usec_v1(updated_at)
+        materialized = _materialize_processing_settings(processing_settings)
+        metadata = copy.deepcopy(self._value["metadata"])
+        metadata["settings_revision"] += 1
+        metadata["last_updated_at"] = updated_at
+        return self._replace(
+            metadata=metadata,
+            runtime=copy.deepcopy(self._value["runtime_info"]),
+            processing_settings=materialized,
+        )
 
     def with_producer_marker(
         self, *, generation: str, updated_at: str
@@ -981,10 +1008,20 @@ class ProcessingSettingsArtifactV5:
         }
         return self._replace(metadata=metadata, runtime=runtime)
 
-    def restart(self, *, started_at: str) -> "ProcessingSettingsArtifactV5":
+    def restart(
+        self,
+        *,
+        started_at: str,
+        processing_settings: dict[str, Any] | None = None,
+    ) -> "ProcessingSettingsArtifactV5":
         if self.status not in {"completed", "failed"}:
             raise SettingsArtifactTransitionError("restart requires terminal settings")
         utc_ordinal_usec_v1(started_at)
+        materialized = (
+            copy.deepcopy(self._value["processing_settings"])
+            if processing_settings is None
+            else _materialize_processing_settings(processing_settings)
+        )
         metadata = copy.deepcopy(self._value["metadata"])
         metadata["settings_revision"] += 1
         metadata["processing_attempt"] += 1
@@ -995,7 +1032,11 @@ class ProcessingSettingsArtifactV5:
         metadata["processing_status"] = "in_progress"
         metadata["cleanup_status"] = "not_started"
         runtime = {key: None for key in RUNTIME_INFO_V5_KEYS}
-        return self._replace(metadata=metadata, runtime=runtime)
+        return self._replace(
+            metadata=metadata,
+            runtime=runtime,
+            processing_settings=materialized,
+        )
 
 
 def create_processing_settings_artifact_v5(

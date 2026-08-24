@@ -36,9 +36,7 @@ class StereoRenderSettings:
     stereo_strength: float = 2.0
     convergence: float = 0.5
     occlusion_fill: Literal["none", "background"] = "background"
-    stereo_render_mode: Literal["fast", "quality"] = field(
-        default="fast", kw_only=True
-    )
+    stereo_render_mode: Literal["fast", "quality"] = field(default="fast", kw_only=True)
     occlusion_fill_max_px: int = field(default=8, kw_only=True)
 
     def __post_init__(self) -> None:
@@ -322,9 +320,7 @@ def _update_hole_histograms(
                 end_cursor += 1
             end = int(missing[end_cursor - 1])
             lane_histogram[end - start + 1] += 1
-            span_histogram[
-                end // HORIZONTAL_SUBPIXELS - start // HORIZONTAL_SUBPIXELS + 1
-            ] += 1
+            span_histogram[end // HORIZONTAL_SUBPIXELS - start // HORIZONTAL_SUBPIXELS + 1] += 1
             cursor = end_cursor
 
 
@@ -665,9 +661,7 @@ class StereoRenderer:
             stereo_strength=settings.stereo_strength,
             convergence=settings.convergence,
         )
-        legacy_near_score = torch.from_numpy(
-            np.array(geometry.near_score, copy=True, order="C")
-        )
+        legacy_near_score = torch.from_numpy(np.array(geometry.near_score, copy=True, order="C"))
         eye_offsets = calculate_eye_sample_offsets(legacy_near_score, settings)
         return self._render_fast_compact_core(
             source,
@@ -692,9 +686,7 @@ class StereoRenderer:
         source = np.asarray(frame)
         self._validate_geometry_inputs(source, geometry, settings)
         source = np.ascontiguousarray(source)
-        eye_offsets = calculate_geometry_eye_sample_offsets(
-            geometry.total_disparity_fraction
-        )
+        eye_offsets = calculate_geometry_eye_sample_offsets(geometry.total_disparity_fraction)
         return self._render_fast_compact_core(
             source,
             geometry,
@@ -811,9 +803,9 @@ class StereoRenderer:
         with torch.inference_mode():
             for start_row in range(0, height, band_height):
                 end_row = min(height, start_row + band_height)
-                source_band = torch.from_numpy(
-                    np.ascontiguousarray(source[start_row:end_row])
-                ).to(self.device)
+                source_band = torch.from_numpy(np.ascontiguousarray(source[start_row:end_row])).to(
+                    self.device
+                )
                 near_score_band = torch.from_numpy(
                     np.array(
                         geometry.near_score[start_row:end_row],
@@ -828,9 +820,7 @@ class StereoRenderer:
                         order="C",
                     )
                 ).to(self.device)
-                offset_band = self._transfer_offset_band(
-                    sample_offsets[start_row:end_row]
-                )
+                offset_band = self._transfer_offset_band(sample_offsets[start_row:end_row])
                 splat = forward_splat_band(
                     source_band,
                     near_score_band,
@@ -850,21 +840,19 @@ class StereoRenderer:
                 if not torch.isfinite(rendered).all():
                     raise ValueError("Rendered image contains non-finite values")
                 row_count = end_row - start_row
-                prefill = np.ascontiguousarray(
-                    splat.valid.detach().cpu().numpy()
-                ).reshape(row_count, width, HORIZONTAL_SUBPIXELS)
-                filled = np.ascontiguousarray(
-                    fillable.detach().cpu().numpy()
-                ).reshape(row_count, width, HORIZONTAL_SUBPIXELS)
-                unresolved = np.ascontiguousarray(
-                    hole_mask.detach().cpu().numpy()
-                ).reshape(row_count, width, HORIZONTAL_SUBPIXELS)
+                prefill = np.ascontiguousarray(splat.valid.detach().cpu().numpy()).reshape(
+                    row_count, width, HORIZONTAL_SUBPIXELS
+                )
+                filled = np.ascontiguousarray(fillable.detach().cpu().numpy()).reshape(
+                    row_count, width, HORIZONTAL_SUBPIXELS
+                )
+                unresolved = np.ascontiguousarray(hole_mask.detach().cpu().numpy()).reshape(
+                    row_count, width, HORIZONTAL_SUBPIXELS
+                )
                 coverage = np.sum(prefill, axis=2, dtype=np.uint16).astype(np.uint8)
                 coverage_output[start_row:end_row] = coverage
                 repair = repair_output[start_row:end_row]
-                repair[(coverage > 0) & (coverage < HORIZONTAL_SUBPIXELS)] |= np.uint8(
-                    0x01
-                )
+                repair[(coverage > 0) & (coverage < HORIZONTAL_SUBPIXELS)] |= np.uint8(0x01)
                 repair[coverage == 0] |= np.uint8(0x02)
                 repair[np.any(filled, axis=2)] |= np.uint8(0x04)
                 unresolved_pixels = np.any(unresolved, axis=2)

@@ -28,9 +28,7 @@ def _result_signature(result) -> tuple[object, ...]:
 
 
 def test_production_relative_geometry_matches_gate_prototype() -> None:
-    production = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.geometry"
-    )
+    production = importlib.import_module("src.depth_surge_3d.rendering.quality.geometry")
     guide = np.array(
         [
             [[0, 0, 0], [0, 0, 0], [220, 220, 220], [220, 220, 220], [20, 40, 80]],
@@ -56,9 +54,7 @@ def test_production_relative_geometry_matches_gate_prototype() -> None:
 
 
 def test_production_single_eye_offset_builders_match_gate_prototype() -> None:
-    production = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.geometry"
-    )
+    production = importlib.import_module("src.depth_surge_3d.rendering.quality.geometry")
     near_score = np.array(
         [[0.9052734375, np.nextafter(np.float32(0.5), np.float32(1.0))]],
         dtype=np.float32,

@@ -60,11 +60,13 @@ def test_current_examples_and_docs_do_not_advertise_removed_stereo_controls():
             assert control not in text, f"{path.name} still contains {control}"
 
 
-def test_example_settings_use_schema_v4_with_vdpp_disabled_by_default() -> None:
+def test_example_settings_use_schema_v5_quality_with_vdpp_disabled() -> None:
     example = json.loads((PROJECT_ROOT / "example_settings.json").read_text(encoding="utf-8"))
 
-    assert example["metadata"]["settings_schema_version"] == 4
+    assert example["metadata"]["settings_schema_version"] == 5
     assert example["processing_settings"]["temporal_postprocessor"] == "off"
+    assert example["processing_settings"]["stereo_render_mode"] == "quality"
+    assert example["processing_settings"]["occlusion_fill_max_px"] == 8
     parsed = parse_saved_processing_settings(
         example["processing_settings"],
         saved_version=example["metadata"]["settings_schema_version"],

@@ -19,4 +19,4 @@ def test_direct_vr_encode_is_sent_and_persisted():
 
 
 def test_direct_vr_encode_does_not_force_browser_settings_reset():
-    assert TEMPLATE.count("const SETTINGS_VERSION = 3") == 2
+    assert TEMPLATE.count("const SETTINGS_VERSION = 4") == 2

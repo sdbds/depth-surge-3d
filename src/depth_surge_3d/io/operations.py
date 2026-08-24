@@ -776,6 +776,51 @@ def recover_processing_settings_artifact(
     return artifact
 
 
+def prepare_processing_settings_artifact(
+    settings_file: Path,
+    *,
+    settings: dict[str, Any],
+    video_properties: dict[str, Any],
+    source_video_path: str,
+) -> ProcessingSettingsArtifactV5:
+    """Recover a schema-5 job and durably enter the caller's processing attempt."""
+
+    settings_file = Path(settings_file)
+    current = recover_processing_settings_artifact(settings_file)
+    value = current.to_object()
+    source_path = Path(source_video_path)
+    source_fingerprint = file_sample_fingerprint(source_path) if source_path.is_file() else None
+    metadata = value["metadata"]
+    if (
+        metadata["source_video"] != str(source_video_path)
+        or metadata["source_video_name"] != source_path.name
+        or metadata["source_video_fingerprint"] != source_fingerprint
+        or value["video_properties"] != video_properties
+        or value["output_info"]["output_directory"] != str(settings_file.parent)
+    ):
+        raise ValueError("existing schema-5 job belongs to different immutable inputs")
+
+    now = _utc_now_usec()
+    if current.status == "in_progress":
+        target = current.with_processing_settings(settings, updated_at=now)
+        if target.to_object()["processing_settings"] == value["processing_settings"]:
+            return current
+    else:
+        target = current.restart(started_at=now, processing_settings=settings)
+
+    transaction = SettingsArtifactTransactionV1.begin(
+        job_root=settings_file.parent,
+        current=current,
+        target=target,
+        allocation_adapter=platform_allocation_adapter,
+        allocation_counter=platform_allocation_counter,
+        allocation_unit=allocation_unit_for_path(settings_file.parent),
+        reservation_generation=secrets.token_hex(16),
+        reservation_id=secrets.token_hex(16),
+    )
+    return transaction.commit()
+
+
 def _update_processing_status_v5(
     settings_file: Path,
     *,

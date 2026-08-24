@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path
+import sys
+
+import hatch_build
 
 
 def test_pyproject_registers_non_jit_native_wheel_build_hook() -> None:
@@ -25,3 +28,21 @@ def test_ci_builds_every_supported_native_wheel_cell() -> None:
     assert "python -m hatchling build -t wheel" in workflow
     assert "runtime_jit" in workflow
     assert "actions/upload-artifact@v4" in workflow
+
+
+def test_hatch_hook_loads_builder_without_project_root_on_sys_path(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    project_root = Path(hatch_build.__file__).resolve().parent
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [entry for entry in sys.path if Path(entry or ".").resolve() != project_root],
+    )
+
+    builder = hatch_build._load_native_builder()
+
+    assert builder.ROOT == project_root
+    assert builder.SOURCE == project_root / "native" / "quality_kd_native.cpp"

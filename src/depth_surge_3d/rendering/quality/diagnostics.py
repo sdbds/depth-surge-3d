@@ -90,8 +90,8 @@ def _backend_counts(
 ) -> tuple[dict[str, int], dict[str, int], dict[str, Any]]:
     names = {1: "local", 2: "exemplar", 3: "fallback"}
     lane_counts = {name: 0 for name in names.values()}
-    pixels = {name: set() for name in names.values()}
-    components = {name: set() for name in names.values()}
+    pixels: dict[str, set[int]] = {name: set() for name in names.values()}
+    components: dict[str, set[int]] = {name: set() for name in names.values()}
     if plan is not None:
         for index, record in enumerate(plan.records):
             backend = names[int(record["backend"])]
@@ -141,6 +141,7 @@ def _eye_stats(
         streamed_hole_runs,
     )
     lane_p95 = _linear_percentile_from_histogram(lane_histogram, 0.95)
+    quality_budgets: dict[str, Any] | None
     if render_mode == "fast":
         if fast_diagnostics is None:
             raise ValueError("Fast diagnostics require producer-attested counters")
@@ -168,7 +169,7 @@ def _eye_stats(
             int(np.sum(HORIZONTAL_SUBPIXELS - coverage, dtype=np.uint64)) if plan is None else 0
         )
     if render_mode == "quality" and plan is None:
-        quality_budgets: dict[str, Any] = {
+        quality_budgets = {
             "availability": "unavailable_quality_none_no_repair_plan",
             "segment_record_count": None,
             "segment_table_bytes": None,
@@ -358,6 +359,7 @@ def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, An
         }
 
     budgets = [eye["quality_budgets"] for eye in eyes]
+    budget_totals: dict[str, Any] | None
     if render_mode == "fast":
         budget_totals = None
     elif all(

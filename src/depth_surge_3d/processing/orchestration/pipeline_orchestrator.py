@@ -14,7 +14,7 @@ from ...io.operations import (
     cleanup_intermediate_files,
     create_output_directories,
     save_processing_settings,
-    recover_processing_settings_artifact,
+    prepare_processing_settings_artifact,
     load_processing_settings,
     update_processing_status,
 )
@@ -503,18 +503,15 @@ class ProcessingOrchestrator:
             omitted_intermediates.add("disparity_stabilized")
         if settings.get("direct_vr_encode", False):
             omitted_intermediates.add("vr_frames")
-        if omitted_intermediates:
-            directories = create_output_directories(
-                output_path,
-                settings["keep_intermediates"],
-                omitted_intermediates=omitted_intermediates,
-            )
-        else:
-            directories = create_output_directories(output_path, settings["keep_intermediates"])
         batch_name = f"{Path(video_path).stem}_{int(time.time())}"
         fixed_settings = output_path / "processing-settings-v5.json"
         if fixed_settings.is_file():
-            recover_processing_settings_artifact(fixed_settings)
+            prepare_processing_settings_artifact(
+                fixed_settings,
+                settings=settings,
+                video_properties=video_properties,
+                source_video_path=video_path,
+            )
             settings_file = fixed_settings
         else:
             settings_file = save_processing_settings(
@@ -525,6 +522,14 @@ class ProcessingOrchestrator:
                 video_path,
                 transactional_v5=True,
             )
+        if omitted_intermediates:
+            directories = create_output_directories(
+                output_path,
+                settings["keep_intermediates"],
+                omitted_intermediates=omitted_intermediates,
+            )
+        else:
+            directories = create_output_directories(output_path, settings["keep_intermediates"])
 
         print(f"\n{title_bar('=== Depth Surge 3D Video Processing ===')}")
         print(f"Input: {video_path}")

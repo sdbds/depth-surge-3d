@@ -273,6 +273,8 @@ def _validate_optional_setting(name: str, value: object) -> Any:
     if name in _OPTIONAL_INTEGER_SETTINGS:
         return _validate_optional_integer(name, value)
     if name in {"source_fps", "preview_update_interval"}:
+        if value is None:
+            return None
         return _number(name, value, 0.0, 1_000_000.0)
     if name in {"start_time", "end_time", "model_path", "model_size", "video_path"}:
         return _validate_optional_text(name, value)

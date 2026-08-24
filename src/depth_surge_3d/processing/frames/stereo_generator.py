@@ -268,7 +268,7 @@ class _FastRelativePlan:
             raise ValueError("Fast relative plan requires fast settings")
 
     geometry_mode = "relative"
-    render_mode = "fast"
+    render_mode: Literal["fast"] = "fast"
     retained_crop_width = None
     effective_convergence = None
 
@@ -291,7 +291,7 @@ class _QualityRelativePlan:
             raise ValueError("Quality relative plan requires quality settings")
 
     geometry_mode = "relative"
-    render_mode = "quality"
+    render_mode: Literal["quality"] = "quality"
     retained_crop_width = None
     effective_convergence = None
 
@@ -314,7 +314,7 @@ class _FastMetricPlan:
             raise TypeError("Fast metric plan requires StereoSplatSettings")
 
     geometry_mode = "metric_camera"
-    render_mode = "fast"
+    render_mode: Literal["fast"] = "fast"
 
     @property
     def render_settings(self) -> StereoSplatSettings:
@@ -335,7 +335,7 @@ class _QualityMetricPlan:
             raise TypeError("Quality metric plan requires QualityStereoControls")
 
     geometry_mode = "metric_camera"
-    render_mode = "quality"
+    render_mode: Literal["quality"] = "quality"
 
     @property
     def render_settings(self) -> QualityStereoControls:
@@ -508,9 +508,9 @@ def _decode_metric_work_item(
         )
     primitive = MetricStereoPrimitiveInput(
         metric=store.load(work.depth_path),
-        virtual_baseline_mm=virtual_baseline_mm,
-        convergence_distance_m=convergence_distance_m,
-        max_disparity_percent=max_disparity_percent,
+        virtual_baseline_mm=np.float64(virtual_baseline_mm),
+        convergence_distance_m=np.float64(convergence_distance_m),
+        max_disparity_percent=np.float64(max_disparity_percent),
         retained_crop_width=retained_crop_width,
     )
     return frame, primitive, None
@@ -648,7 +648,7 @@ class _StereoFilePipeline:
             projection_stats=projection_stats,
         )
 
-    def _render_decoded(self, message: _DecodedMessage) -> _WriteItem | None:
+    def _render_decoded(self, message: _DecodedMessage) -> _WriteItem | None:  # noqa: C901
         if message.error is not None:
             self._record_error("decode", message.work, message.error)
             return None
@@ -702,7 +702,7 @@ class _StereoFilePipeline:
                         metric.inverse_depth,
                         metric.valid,
                         metric.focal_x_normalized,
-                        message.frame.shape[:2],
+                        (int(message.frame.shape[0]), int(message.frame.shape[1])),
                         virtual_baseline_mm=float(primitive.virtual_baseline_mm),
                         convergence_distance_m=float(primitive.convergence_distance_m),
                         max_disparity_percent=float(primitive.max_disparity_percent),
@@ -734,10 +734,17 @@ class _StereoFilePipeline:
             self._record_error("render", message.work, error)
             return None
         self.metrics.increment("rendered_frames")
+        if compact is not None:
+            left_image = compact.left_image
+            right_image = compact.right_image
+        else:
+            assert result is not None
+            left_image = result.left_image
+            right_image = result.right_image
         return _WriteItem(
             work=message.work,
-            left_image=(compact.left_image if compact is not None else result.left_image),
-            right_image=(compact.right_image if compact is not None else result.right_image),
+            left_image=left_image,
+            right_image=right_image,
             projection_stats=projection_stats,
             compact_result=compact,
             geometry_mode=self.geometry_mode,
@@ -984,7 +991,7 @@ class StereoPairGenerator:
             effective_convergence=effective_convergence,
         )
 
-    def create_stereo_pairs_from_files(
+    def create_stereo_pairs_from_files(  # noqa: C901
         self,
         frame_files: list[Path],
         depth_files: list[Path],

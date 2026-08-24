@@ -91,16 +91,15 @@ class DiagnosticsStageContext:
     left_rgb_parent: Path | None = None
     right_rgb_parent: Path | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901
         root = Path(self.job_root).resolve()
         if not self.frame_names or len(set(self.frame_names)) != len(self.frame_names):
             raise ValueError("diagnostics frame_names must be nonempty and unique")
         for name in self.frame_names:
             if not name or Path(name).name != name or Path(name).suffix:
                 raise ValueError("diagnostics frame names must be plain stems")
-        if (
-            len(self.render_shape) != 2
-            or any(isinstance(value, bool) or int(value) <= 0 for value in self.render_shape)
+        if len(self.render_shape) != 2 or any(
+            isinstance(value, bool) or int(value) <= 0 for value in self.render_shape
         ):
             raise ValueError("diagnostics render_shape must be positive")
         if self.render_mode not in {"fast", "quality"}:
@@ -520,7 +519,7 @@ _PAYLOAD_KEYS = {
 }
 
 
-def _audit_frame_transaction(
+def _audit_frame_transaction(  # noqa: C901
     context: DiagnosticsStageContext,
     frame_name: str,
 ) -> tuple[dict[str, Any], bytes, dict[str, Any]]:
@@ -549,6 +548,8 @@ def _audit_frame_transaction(
     payloads = manifest["payloads"]
     if not isinstance(payloads, dict) or set(payloads) != _PAYLOAD_KEYS:
         raise ValueError("diagnostic frame manifest payload map is invalid")
+    assert context.left_rgb_parent is not None
+    assert context.right_rgb_parent is not None
     left_raw = _audit_payload_identity(
         root,
         payloads["left_rgb"],
@@ -601,9 +602,11 @@ def _audit_frame_transaction(
         "geometry_nearest",
     }:
         raise ValueError("diagnostic frame statistics have the wrong keys")
-    if manifest["quality_limits"] != {
-        eye: stats["eyes"][eye]["quality_limits"] for eye in ("left", "right")
-    } and manifest["quality_limits"] is not None:
+    if (
+        manifest["quality_limits"]
+        != {eye: stats["eyes"][eye]["quality_limits"] for eye in ("left", "right")}
+        and manifest["quality_limits"] is not None
+    ):
         raise ValueError("manifest and statistics Quality limits disagree")
     return manifest, raw_manifest, stats
 
@@ -640,9 +643,7 @@ def complete_diagnostics_stage(
             }
         )
         frame_stats.append(stats)
-    ordered_fingerprint = hashlib.sha256(
-        canonical_json_bytes(manifest_identities)
-    ).hexdigest()
+    ordered_fingerprint = hashlib.sha256(canonical_json_bytes(manifest_identities)).hexdigest()
     jsonl_raw = b"".join(canonical_json_bytes(value) + b"\n" for value in frame_stats)
     jsonl_sha = hashlib.sha256(jsonl_raw).hexdigest()
     summary = build_diagnostics_summary(
@@ -716,11 +717,7 @@ def migrate_frame_manifests_sync(
         migrated["payloads"] = payloads
         migrated["fingerprint"] = self_fingerprint(migrated)
         manifest_path = (
-            context.job_root
-            / "04_stereo_diagnostics"
-            / "frames"
-            / frame_name
-            / "manifest.json"
+            context.job_root / "04_stereo_diagnostics" / "frames" / frame_name / "manifest.json"
         )
         _call_fault(fault, f"before_mask_migration_{source_index}_temporary_write")
         _atomic_replace_raw(
@@ -731,9 +728,7 @@ def migrate_frame_manifests_sync(
         )
         _audit_frame_transaction(context, frame_name)
     for frame_name in frame_names:
-        frame_dir = (
-            context.job_root / "04_stereo_diagnostics" / "frames" / frame_name
-        )
+        frame_dir = context.job_root / "04_stereo_diagnostics" / "frames" / frame_name
         for name in (
             "left_coverage.png",
             "left_repair.png",
@@ -767,9 +762,11 @@ def _metadata_matches_context(
         "stats_schema_version",
         "frame_manifest_schema_version",
     }
-    return set(metadata) == set(expected) and all(
-        metadata.get(key) == expected[key] for key in identity_keys
-    ) and metadata.get("fingerprint") == self_fingerprint(metadata)
+    return (
+        set(metadata) == set(expected)
+        and all(metadata.get(key) == expected[key] for key in identity_keys)
+        and metadata.get("fingerprint") == self_fingerprint(metadata)
+    )
 
 
 def _aggregates_match(
@@ -779,9 +776,7 @@ def _aggregates_match(
     root = context.job_root / "04_stereo_diagnostics"
     try:
         jsonl_raw = (root / "stereo_coverage_frames.jsonl").read_bytes()
-        summary, summary_raw = _read_canonical_object(
-            root / "stereo_coverage_summary.json"
-        )
+        summary, summary_raw = _read_canonical_object(root / "stereo_coverage_summary.json")
         if hashlib.sha256(jsonl_raw).hexdigest() != metadata["frames_jsonl_sha256"]:
             return False
         if hashlib.sha256(summary_raw).hexdigest() != metadata["summary_sha256"]:
@@ -795,12 +790,8 @@ def _aggregates_match(
             return False
         if context.geometry_mode == "metric":
             assert context.left_rgb_parent is not None
-            clamp_raw = (
-                context.left_rgb_parent / "clamp_summary.json"
-            ).read_bytes()
-            if hashlib.sha256(clamp_raw).hexdigest() != metadata[
-                "metric_clamp_summary_sha256"
-            ]:
+            clamp_raw = (context.left_rgb_parent / "clamp_summary.json").read_bytes()
+            if hashlib.sha256(clamp_raw).hexdigest() != metadata["metric_clamp_summary_sha256"]:
                 return False
         elif metadata["metric_clamp_summary_sha256"] is not None:
             return False
@@ -809,7 +800,9 @@ def _aggregates_match(
     return True
 
 
-def audit_diagnostics_stage(context: DiagnosticsStageContext) -> DiagnosticsAudit:
+def audit_diagnostics_stage(  # noqa: C901
+    context: DiagnosticsStageContext,
+) -> DiagnosticsAudit:
     """Read-only disposition for frame reuse and aggregate rebuilding."""
 
     root = context.job_root / "04_stereo_diagnostics"
@@ -820,9 +813,7 @@ def audit_diagnostics_stage(context: DiagnosticsStageContext) -> DiagnosticsAudi
     invalid: list[str] = []
     migrate: list[str] = []
     previous_mask_context = (
-        replace(context, mask_payloads_enabled=True)
-        if not context.mask_payloads_enabled
-        else None
+        replace(context, mask_payloads_enabled=True) if not context.mask_payloads_enabled else None
     )
     for frame_name in context.frame_names:
         try:

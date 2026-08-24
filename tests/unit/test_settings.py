@@ -156,6 +156,23 @@ def test_v5_rejects_unknown_fields_instead_of_filtering_them() -> None:
         )
 
 
+def test_v5_accepts_materialized_nullable_numeric_fields() -> None:
+    loaded = parse_saved_processing_settings(
+        {
+            "temporal_postprocessor": "off",
+            "stereo_render_mode": "quality",
+            "occlusion_fill_max_px": 8,
+            "source_fps": None,
+            "preview_update_interval": None,
+        },
+        saved_version=5,
+    )
+
+    assert loaded.migrated is False
+    assert loaded.settings["source_fps"] is None
+    assert loaded.settings["preview_update_interval"] is None
+
+
 def test_future_schema_fails_without_mutating_input() -> None:
     raw = {"temporal_postprocessor": "vdpp", "future_knob": True}
     original = dict(raw)
@@ -226,9 +243,7 @@ def test_occlusion_fill_max_px_rejects_non_integral_or_out_of_range_values(
 
 
 def test_occlusion_fill_max_px_normalizes_numpy_integer() -> None:
-    settings = validate_settings(
-        {"occlusion_fill_max_px": np.int64(9)}, source="explicit"
-    )
+    settings = validate_settings({"occlusion_fill_max_px": np.int64(9)}, source="explicit")
 
     assert settings["occlusion_fill_max_px"] == 9
     assert type(settings["occlusion_fill_max_px"]) is int
@@ -236,9 +251,10 @@ def test_occlusion_fill_max_px_normalizes_numpy_integer() -> None:
 
 @pytest.mark.parametrize("value", ["fast", "quality"])
 def test_stereo_render_mode_accepts_only_frozen_modes(value: str) -> None:
-    assert validate_settings({"stereo_render_mode": value}, source="explicit")[
-        "stereo_render_mode"
-    ] == value
+    assert (
+        validate_settings({"stereo_render_mode": value}, source="explicit")["stereo_render_mode"]
+        == value
+    )
 
 
 def test_schema_four_migrates_to_fast_and_limit_eight() -> None:
@@ -270,12 +286,15 @@ def test_stereo_render_mode_presence_aware_resolution(
     device: str,
     expected: str,
 ) -> None:
-    assert resolve_stereo_render_mode(
-        persisted=persisted,
-        override=override,
-        is_resume=is_resume,
-        renderer_device_type=device,
-    ) == expected
+    assert (
+        resolve_stereo_render_mode(
+            persisted=persisted,
+            override=override,
+            is_resume=is_resume,
+            renderer_device_type=device,
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -289,9 +308,7 @@ def test_stereo_render_mode_presence_aware_resolution(
     ],
 )
 def test_vr_resolution_accepts_frozen_portable_values(value: str) -> None:
-    assert validate_settings({"vr_resolution": value}, source="explicit")[
-        "vr_resolution"
-    ] == value
+    assert validate_settings({"vr_resolution": value}, source="explicit")["vr_resolution"] == value
 
 
 @pytest.mark.parametrize(

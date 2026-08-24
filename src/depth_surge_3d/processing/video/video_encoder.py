@@ -619,9 +619,7 @@ class VideoEncoder:
             height=height,
             fps=canonical_fps,
             frame_count=frame_count,
-            resolved_encoder=cast(
-                Literal["libx264", "libx265", "hevc_nvenc"], resolved_encoder
-            ),
+            resolved_encoder=cast(Literal["libx264", "libx265", "hevc_nvenc"], resolved_encoder),
             audio_expected=audio_end_sample is not None,
             audio_packet_upper_bound=packet_bound,
         )
