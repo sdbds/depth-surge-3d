@@ -155,6 +155,67 @@ def test_fallback_fails_when_no_safe_donor_exists_within_the_limit() -> None:
         )
 
 
+def test_fallback_uses_full_pure_core_when_a_thin_region_has_no_safe_interior() -> None:
+    precompute = _api("precompute_native_fallbacks")
+    height = width = 9
+    coverage = np.full((height, width), 16, dtype=np.uint8)
+    regions = np.full((height, width), 2, dtype=np.uint32)
+    regions[:, 4] = np.uint32(1)
+    coverage[4, 4] = np.uint8(0)
+    regions[4, 4] = np.uint32(0xFFFFFFFF)
+    values = np.arange(height * width, dtype=np.uint8).reshape(height, width)
+    analysis = local_strip.QualityVisibilityAnalysis(
+        coverage,
+        regions,
+        (
+            values.copy(),
+            np.ascontiguousarray(values + np.uint8(40)),
+            np.ascontiguousarray(values + np.uint8(80)),
+        ),
+    )
+    records = np.zeros(1, dtype=repair_records.REPAIR_RECORD_DTYPE)
+    records["pixel_index"] = np.uint32(4 * width + 4)
+    records["lane_mask"] = np.uint16(0xFFFF)
+    records["region_id"] = np.uint32(1)
+    records["far_side"] = np.uint8(0)
+
+    result = precompute(
+        records,
+        analysis,
+        render_shape=(height, width),
+        region_count=2,
+        budgets=local_strip.QualityRepairBudgets(),
+    )
+
+    assert result.records["fill_bgr"].tolist() == [
+        [int(analysis.pure_bgr[channel][3, 4]) for channel in range(3)]
+    ]
+    assert result.indexed_donor_count == 8
+
+
+def test_seeded_boundary_colour_is_retained_only_when_no_proxy_donor_exists() -> None:
+    precompute = _api("precompute_native_fallbacks")
+    analysis, records = _fallback_fixture()
+    analysis = local_strip.QualityVisibilityAnalysis(
+        np.zeros_like(analysis.coverage_count),
+        np.full_like(analysis.pure_region_id, np.uint32(0xFFFFFFFF)),
+        analysis.pure_bgr,
+        anchor_fallbacks_seeded=True,
+    )
+    records["fill_bgr"] = [7, 8, 9]
+
+    result = precompute(
+        records,
+        analysis,
+        render_shape=(9, 9),
+        region_count=1,
+        budgets=local_strip.QualityRepairBudgets(),
+    )
+
+    assert result.records["fill_bgr"].tolist() == [[7, 8, 9]]
+    assert result.anchor_fallback_count == 1
+
+
 def test_fallback_visit_cap_is_fatal_before_returning_a_current_best() -> None:
     precompute = _api("precompute_native_fallbacks")
     analysis, records = _fallback_fixture()

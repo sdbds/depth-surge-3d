@@ -7,10 +7,10 @@ import math
 
 import numpy as np
 
+from . import native_kd
 from .repair_records import (
     REPAIR_RECORD_DTYPE,
     QualityRepairBudgetError,
-    reconstruct_repair_runs,
 )
 
 
@@ -34,6 +34,7 @@ class QualityVisibilityAnalysis:
     coverage_count: np.ndarray
     pure_region_id: np.ndarray
     pure_bgr: tuple[np.ndarray, np.ndarray, np.ndarray]
+    anchor_fallbacks_seeded: bool = False
 
 
 @dataclass
@@ -124,51 +125,49 @@ def plan_local_strips(
         local_limit_px,
         budgets,
     )
-    runs = reconstruct_repair_runs(records, render_shape=render_shape)
-    output = np.array(records, copy=True, order="C")
-    diagnostics = _LocalDiagnostics()
+    raw_records = records.view(np.uint8).reshape(records.size, REPAIR_RECORD_DTYPE.itemsize)
+    raw_runs = native_kd._require_native().reconstruct_repair_runs(
+        raw_records,
+        height,
+        width,
+    )
     search_limit = max(1, math.floor((64 * height) / 1080.0 + 0.5))
     safe_radius = max(1, math.floor(height / 1080.0 + 0.5))
-    support = _checked_square(_checked_add(_checked_product(2, safe_radius), 1))
-
-    for run in runs:
-        start_fine = int(run["start_fine"])
-        end_fine = int(run["end_fine"])
-        lane_count = end_fine - start_fine + 1
-        if lane_count > 16 * local_limit_px:
-            continue
-        first_pixel = start_fine // 16
-        last_pixel = end_fine // 16
-        touched_pixels = last_pixel - first_pixel + 1
-        slot_charge = _checked_product(5, search_limit)
-        per_slot = _checked_add(3, _checked_product(touched_pixels, support))
-        sample_charge = _checked_add(3, _checked_product(slot_charge, per_slot))
-        if not budgets.reserve_local(slot_charge, sample_charge):
-            continue
-        diagnostics.evaluated_slots = _checked_add(
-            diagnostics.evaluated_slots,
-            slot_charge,
-        )
-        if _plan_one_run(
-            output,
-            run,
-            analysis,
-            height=height,
-            width=width,
-            search_limit=search_limit,
-            safe_radius=safe_radius,
-            diagnostics=diagnostics,
-        ):
-            diagnostics.filled_runs += 1
-
+    raw_output, statistics = native_kd._require_native().plan_local_strips(
+        raw_records,
+        raw_runs,
+        analysis.coverage_count,
+        analysis.pure_region_id,
+        analysis.pure_bgr[0],
+        analysis.pure_bgr[1],
+        analysis.pure_bgr[2],
+        int(local_limit_px),
+        search_limit,
+        safe_radius,
+        budgets.local_slot_cap - budgets.local_slots_consumed,
+        budgets.local_neighbor_sample_cap - budgets.local_neighbor_samples_consumed,
+    )
+    output = raw_output.reshape(-1).view(REPAIR_RECORD_DTYPE)
+    budgets.local_slots_consumed = _checked_add(
+        budgets.local_slots_consumed,
+        int(statistics["slot_consumed"]),
+    )
+    budgets.local_neighbor_samples_consumed = _checked_add(
+        budgets.local_neighbor_samples_consumed,
+        int(statistics["sample_consumed"]),
+    )
+    budgets.local_budget_skipped_run_count = _checked_add(
+        budgets.local_budget_skipped_run_count,
+        int(statistics["budget_skipped_runs"]),
+    )
     output.setflags(write=False)
     return LocalStripPlanResult(
         records=output,
-        evaluated_slot_count=diagnostics.evaluated_slots,
-        physical_sample_read_count=diagnostics.physical_sample_reads,
-        local_filled_run_count=diagnostics.filled_runs,
-        eligible_slot_count=diagnostics.eligible_slots,
-        unsafe_donor_slot_count=diagnostics.unsafe_donor_slots,
+        evaluated_slot_count=int(statistics["evaluated_slots"]),
+        physical_sample_read_count=int(statistics["physical_sample_reads"]),
+        local_filled_run_count=int(statistics["filled_runs"]),
+        eligible_slot_count=int(statistics["eligible_slots"]),
+        unsafe_donor_slot_count=int(statistics["unsafe_donor_slots"]),
     )
 
 

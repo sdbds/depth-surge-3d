@@ -75,6 +75,25 @@ def test_quality_repair_plan_covers_every_invalid_lane_once() -> None:
     assert plan.fallback_query_count == 1
 
 
+def test_production_record_coverage_uses_native_exact_validator(monkeypatch) -> None:
+    records_module = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
+    invalid = np.zeros((1, 32), dtype=np.bool_)
+    invalid[0, 3:21] = True
+    records = np.zeros(2, dtype=records_module.REPAIR_RECORD_DTYPE)
+    records["pixel_index"] = [0, 1]
+    records["lane_mask"] = [0xFFF8, 0x001F]
+    records["region_id"] = 1
+    monkeypatch.setattr(
+        records_module,
+        "_accumulate_record_masks",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("production entered scalar record coverage validation")
+        ),
+    )
+
+    assert records_module.validate_record_coverage(records, invalid) == 18
+
+
 def test_repair_components_join_vertical_record_adjacency() -> None:
     planner = importlib.import_module("src.depth_surge_3d.rendering.quality.planner")
     records_module = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
@@ -93,6 +112,64 @@ def test_repair_components_join_vertical_record_adjacency() -> None:
 
     assert count == 1
     assert component_ids.tolist() == [0, 0]
+
+
+def test_production_component_builder_uses_native_exact_graph(monkeypatch) -> None:
+    planner = importlib.import_module("src.depth_surge_3d.rendering.quality.planner")
+    records_module = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
+    records = np.zeros(3, dtype=records_module.REPAIR_RECORD_DTYPE)
+    records["pixel_index"] = [0, 1, 3]
+    records["lane_mask"] = [0x8000, 0x0001, 0x0001]
+    records["region_id"] = 1
+    monkeypatch.setattr(
+        planner,
+        "_union_group_pairs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("production entered scalar component graph")
+        ),
+    )
+
+    component_ids, component_count = planner.build_record_component_ids(
+        records,
+        render_shape=(2, 2),
+    )
+
+    assert component_ids.tolist() == [0, 0, 0]
+    assert component_count == 1
+
+
+def test_native_component_member_order_matches_canonical_counting_sort() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    component_ids = np.array([2, 0, 2, 1, 0, 2], dtype=np.uint32)
+
+    members, offsets = native_kd._require_native().build_component_member_order(
+        component_ids,
+        3,
+    )
+
+    assert offsets.tolist() == [0, 2, 3, 6]
+    assert members.tolist() == [1, 4, 3, 0, 2, 5]
+
+
+def test_native_repair_scatter_expands_lanes_in_canonical_order() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    records_module = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
+    records = np.zeros(2, dtype=records_module.REPAIR_RECORD_DTYPE)
+    records["pixel_index"] = [0, 1]
+    records["lane_mask"] = [0x0003, 0x8000]
+    records["region_id"] = 1
+    records["fill_bgr"] = [[10, 20, 30], [40, 50, 60]]
+    records["backend"] = [1, 3]
+    raw = records.view(np.uint8).reshape(records.size, records.dtype.itemsize)
+
+    indexes, colours = native_kd._require_native().expand_repair_scatter(raw, 1, 2)
+
+    assert indexes.tolist() == [0, 1, 31]
+    assert colours.tolist() == [
+        [10.0, 20.0, 30.0],
+        [10.0, 20.0, 30.0],
+        [40.0, 50.0, 60.0],
+    ]
 
 
 def test_quality_repair_plan_accepts_a_fully_covered_eye() -> None:
@@ -117,3 +194,492 @@ def test_quality_repair_plan_accepts_a_fully_covered_eye() -> None:
     assert plan.records.size == 0
     assert plan.component_count == 0
     assert plan.fallback_query_count == 0
+
+
+def test_native_exemplar_donor_selection_matches_scalar_score_oracle() -> None:
+    exemplar = importlib.import_module("src.depth_surge_3d.rendering.quality.exemplar")
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    rows, columns = np.indices((15, 15), dtype=np.uint16)
+    working = np.empty((15, 15, 3), dtype=np.uint8)
+    working[..., 0] = ((rows * 17 + columns * 3) % 251).astype(np.uint8)
+    working[..., 1] = ((rows * 5 + columns * 19) % 253).astype(np.uint8)
+    working[..., 2] = ((rows * 11 + columns * 7) % 255).astype(np.uint8)
+    processed = np.ones((15, 15), dtype=np.bool_)
+    processed[7, 7] = False
+    level = exemplar.ExemplarLevel(
+        np.ascontiguousarray(working),
+        np.ones((15, 15), dtype=np.bool_),
+        np.zeros((15, 15), dtype=np.bool_),
+        processed,
+        np.zeros((15, 15), dtype=np.bool_),
+    )
+    candidates = np.array([[4, 4], [4, 10], [10, 4], [10, 10]], dtype=np.uint32)
+    selected = np.array([0, 1, 2, 3], dtype=np.uint32)
+    expected = min(
+        (
+            exemplar.score_exemplar_patch(
+                level,
+                target_center=(7, 7),
+                donor_center=(int(row), int(column)),
+            ),
+            int(row),
+            int(column),
+        )
+        for row, column in candidates
+    )
+
+    actual = native_kd._require_native().select_exemplar_donor(
+        level.working_bgr,
+        level.processed_mask,
+        level.barrier_mask,
+        7,
+        7,
+        candidates,
+        selected,
+    )
+    gradient_x, gradient_y = native_kd._require_native().build_exemplar_sobel_planes(
+        level.working_bgr
+    )
+    actual_cached = native_kd._require_native().select_exemplar_donor(
+        level.working_bgr,
+        level.processed_mask,
+        level.barrier_mask,
+        7,
+        7,
+        candidates,
+        selected,
+        gradient_x,
+        gradient_y,
+    )
+
+    assert tuple(actual) == expected
+    assert tuple(actual_cached) == expected
+
+
+def test_native_exemplar_sobel_planes_match_scalar_oracle() -> None:
+    exemplar = importlib.import_module("src.depth_surge_3d.rendering.quality.exemplar")
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    rows, columns = np.indices((15, 17), dtype=np.uint16)
+    working = np.empty((15, 17, 3), dtype=np.uint8)
+    working[..., 0] = ((rows * 31 + columns * 7) % 251).astype(np.uint8)
+    working[..., 1] = ((rows * 13 + columns * 23) % 253).astype(np.uint8)
+    working[..., 2] = ((rows * 19 + columns * 11) % 255).astype(np.uint8)
+
+    gradient_x, gradient_y = native_kd._require_native().build_exemplar_sobel_planes(
+        np.ascontiguousarray(working)
+    )
+
+    assert gradient_x.dtype == np.int16
+    assert gradient_y.dtype == np.int16
+    assert gradient_x.shape == working.shape[:2]
+    assert gradient_y.shape == working.shape[:2]
+    for row in range(1, working.shape[0] - 1):
+        for column in range(1, working.shape[1] - 1):
+            expected_x, expected_y = exemplar._direct_sobel(working, row, column)
+            assert int(gradient_x[row, column]) == expected_x
+            assert int(gradient_y[row, column]) == expected_y
+
+
+def test_production_exemplar_does_not_enter_scalar_candidate_scoring(monkeypatch) -> None:
+    exemplar = importlib.import_module("src.depth_surge_3d.rendering.quality.exemplar")
+    local = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    records_module = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
+    height = width = 25
+    coverage = np.full((height, width), 16, dtype=np.uint8)
+    regions = np.ones((height, width), dtype=np.uint32)
+    coverage[12, 12] = np.uint8(0)
+    regions[12, 12] = np.uint32(0xFFFFFFFF)
+    analysis = local.QualityVisibilityAnalysis(
+        coverage,
+        regions,
+        tuple(np.full((height, width), value, dtype=np.uint8) for value in (10, 20, 30)),
+    )
+    safe_donor = np.ones((height, width), dtype=np.bool_)
+    safe_donor[11:14, 11:14] = False
+    records = np.zeros(1, dtype=records_module.REPAIR_RECORD_DTYPE)
+    records["pixel_index"] = 12 * width + 12
+    records["lane_mask"] = np.uint16(0xFFFF)
+    records["region_id"] = np.uint32(1)
+    records["fill_bgr"] = [99, 98, 97]
+    monkeypatch.setattr(
+        exemplar,
+        "_score_patch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("production entered scalar exemplar scoring")
+        ),
+    )
+
+    result = exemplar.repair_component_exemplar(
+        records,
+        analysis,
+        safe_donor,
+        region_id=1,
+        render_shape=(height, width),
+        budgets=local.QualityRepairBudgets(),
+    )
+
+    assert result.records["backend"].tolist() == [2]
+
+
+def test_production_exemplar_reuses_one_native_sobel_pair_per_level(monkeypatch) -> None:
+    exemplar = importlib.import_module("src.depth_surge_3d.rendering.quality.exemplar")
+    local = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    records_module = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
+    native = native_kd._require_native()
+    built_planes: list[tuple[np.ndarray, np.ndarray]] = []
+    selection_count = 0
+
+    class RecordingNative:
+        @staticmethod
+        def build_exemplar_sobel_planes(working_bgr):
+            planes = native.build_exemplar_sobel_planes(working_bgr)
+            built_planes.append(planes)
+            return planes
+
+        @staticmethod
+        def select_exemplar_donor(
+            working_bgr,
+            processed_mask,
+            barrier_mask,
+            target_row,
+            target_column,
+            candidates,
+            selected_indexes,
+            donor_gradient_x,
+            donor_gradient_y,
+        ):
+            nonlocal selection_count
+            selection_count += 1
+            assert any(
+                donor_gradient_x is planes[0] and donor_gradient_y is planes[1]
+                for planes in built_planes
+            )
+            return native.select_exemplar_donor(
+                working_bgr,
+                processed_mask,
+                barrier_mask,
+                target_row,
+                target_column,
+                candidates,
+                selected_indexes,
+                donor_gradient_x,
+                donor_gradient_y,
+            )
+
+    monkeypatch.setattr(native_kd, "_require_native", lambda: RecordingNative())
+    height = width = 33
+    coverage = np.full((height, width), 16, dtype=np.uint8)
+    regions = np.ones((height, width), dtype=np.uint32)
+    coverage[16, 16] = np.uint8(0)
+    regions[16, 16] = np.uint32(0xFFFFFFFF)
+    analysis = local.QualityVisibilityAnalysis(
+        coverage,
+        regions,
+        tuple(np.full((height, width), value, dtype=np.uint8) for value in (10, 20, 30)),
+    )
+    safe_donor = np.ones((height, width), dtype=np.bool_)
+    safe_donor[15:18, 15:18] = False
+    records = np.zeros(1, dtype=records_module.REPAIR_RECORD_DTYPE)
+    records["pixel_index"] = 16 * width + 16
+    records["lane_mask"] = np.uint16(0xFFFF)
+    records["region_id"] = np.uint32(1)
+    records["fill_bgr"] = [99, 98, 97]
+
+    result = exemplar.repair_component_exemplar(
+        records,
+        analysis,
+        safe_donor,
+        region_id=1,
+        render_shape=(height, width),
+        budgets=local.QualityRepairBudgets(),
+    )
+
+    assert result.records["backend"].tolist() == [2]
+    assert selection_count > 0
+    assert len(built_planes) <= 3
+
+
+def test_production_exemplar_downsample_is_vectorized_and_oracle_exact(monkeypatch) -> None:
+    production = importlib.import_module("src.depth_surge_3d.rendering.quality.exemplar")
+    prototype = importlib.import_module("scripts.quality_task0.exemplar")
+    rng = np.random.default_rng(7301)
+    working = rng.integers(0, 256, size=(17, 19, 3), dtype=np.uint8)
+    donor = rng.integers(0, 2, size=(17, 19), dtype=np.uint8).astype(np.bool_)
+    target = rng.integers(0, 2, size=(17, 19), dtype=np.uint8).astype(np.bool_)
+    processed = rng.integers(0, 2, size=(17, 19), dtype=np.uint8).astype(np.bool_)
+    barrier = rng.integers(0, 5, size=(17, 19), dtype=np.uint8) == 0
+    expected = prototype.downsample_exemplar_level(
+        prototype.ExemplarLevel(working, donor, target, processed, barrier)
+    )
+    monkeypatch.setattr(
+        production,
+        "_child_coordinates",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("production entered scalar pyramid reduction")
+        ),
+    )
+
+    actual = production.downsample_exemplar_level(
+        production.ExemplarLevel(working, donor, target, processed, barrier)
+    )
+
+    for field in (
+        "working_bgr",
+        "donor_mask",
+        "target_mask",
+        "processed_mask",
+        "barrier_mask",
+    ):
+        assert np.array_equal(getattr(actual, field), getattr(expected, field))
+
+
+def test_production_local_strip_uses_native_exact_planner(monkeypatch) -> None:
+    production = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    prototype = importlib.import_module("scripts.quality_task0.local_strip")
+    built, analysis, _, _ = _fallback_fixture()
+    expected_budgets = prototype.QualityRepairBudgets()
+    expected_analysis = prototype.QualityVisibilityAnalysis(
+        analysis.coverage_count,
+        analysis.pure_region_id,
+        analysis.pure_bgr,
+    )
+    expected = prototype.plan_local_strips(
+        built.records,
+        expected_analysis,
+        render_shape=(9, 9),
+        local_limit_px=1,
+        budgets=expected_budgets,
+    )
+    monkeypatch.setattr(
+        production,
+        "_plan_one_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("production entered scalar local-strip planning")
+        ),
+    )
+    actual_budgets = production.QualityRepairBudgets()
+
+    actual = production.plan_local_strips(
+        built.records,
+        analysis,
+        render_shape=(9, 9),
+        local_limit_px=1,
+        budgets=actual_budgets,
+    )
+
+    assert actual.records.tobytes() == expected.records.tobytes()
+    for field in (
+        "evaluated_slot_count",
+        "physical_sample_read_count",
+        "local_filled_run_count",
+        "eligible_slot_count",
+        "unsafe_donor_slot_count",
+    ):
+        assert getattr(actual, field) == getattr(expected, field)
+    assert actual_budgets.local_slots_consumed == expected_budgets.local_slots_consumed
+    assert (
+        actual_budgets.local_neighbor_samples_consumed
+        == expected_budgets.local_neighbor_samples_consumed
+    )
+
+
+def test_production_local_strip_uses_native_run_reconstruction(monkeypatch) -> None:
+    production = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    built, analysis, budgets, _ = _fallback_fixture()
+    monkeypatch.setattr(
+        production,
+        "reconstruct_repair_runs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("production entered scalar repair-run reconstruction")
+        ),
+        raising=False,
+    )
+
+    result = production.plan_local_strips(
+        built.records,
+        analysis,
+        render_shape=(9, 9),
+        local_limit_px=1,
+        budgets=budgets,
+    )
+
+    assert result.records.size == built.records.size
+
+
+def test_native_repair_run_reconstruction_matches_scalar_oracle() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    records_module = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
+    records = np.zeros(5, dtype=records_module.REPAIR_RECORD_DTYPE)
+    records["pixel_index"] = [0, 1, 2, 2, 5]
+    records["lane_mask"] = [0xF000, 0xFFFF, 0x0003, 0x0030, 0x0007]
+    records["region_id"] = [7, 7, 7, 7, 9]
+    records["far_side"] = [0, 0, 0, 0, 1]
+    expected = records_module.reconstruct_repair_runs(records, render_shape=(2, 3))
+    raw = records.view(np.uint8).reshape(records.size, records.dtype.itemsize)
+
+    actual_raw = native_kd._require_native().reconstruct_repair_runs(raw, 2, 3)
+    actual = actual_raw.reshape(-1).view(records_module.REPAIR_RUN_DTYPE)
+
+    assert actual.tobytes() == expected.tobytes()
+
+
+def test_planner_skips_exemplar_when_the_region_has_no_strict_safe_donor(
+    monkeypatch,
+) -> None:
+    planner = importlib.import_module("src.depth_surge_3d.rendering.quality.planner")
+    local = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    records_module = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
+    height = width = 9
+    coverage = np.full((height, width), 16, dtype=np.uint8)
+    regions = np.full((height, width), 2, dtype=np.uint32)
+    regions[:, 4] = np.uint32(1)
+    coverage[4, 4] = np.uint8(0)
+    regions[4, 4] = np.uint32(0xFFFFFFFF)
+    analysis = local.QualityVisibilityAnalysis(
+        coverage,
+        regions,
+        tuple(np.full((height, width), value, dtype=np.uint8) for value in (9, 19, 29)),
+    )
+    records = np.zeros(1, dtype=records_module.REPAIR_RECORD_DTYPE)
+    records["pixel_index"] = np.uint32(4 * width + 4)
+    records["lane_mask"] = np.uint16(0xFFFF)
+    records["region_id"] = np.uint32(1)
+    monkeypatch.setattr(
+        planner.exemplar,
+        "repair_component_exemplar",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("donorless region entered exemplar construction")
+        ),
+    )
+
+    result = planner.plan_quality_repairs(
+        analysis,
+        records=records,
+        render_shape=(height, width),
+        local_limit_px=1,
+        budgets=local.QualityRepairBudgets(),
+    )
+
+    assert result.records["backend"].tolist() == [3]
+    assert result.exemplar_donor_evaluation_count == 0
+
+
+def test_planner_skips_exemplar_when_no_complete_donor_patch_exists(
+    monkeypatch,
+) -> None:
+    planner = importlib.import_module("src.depth_surge_3d.rendering.quality.planner")
+    local = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    records_module = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
+    height = width = 25
+    coverage = np.full((height, width), 16, dtype=np.uint8)
+    regions = np.full((height, width), 2, dtype=np.uint32)
+    regions[:, 10:15] = np.uint32(1)
+    coverage[12, 12] = np.uint8(0)
+    regions[12, 12] = np.uint32(0xFFFFFFFF)
+    analysis = local.QualityVisibilityAnalysis(
+        coverage,
+        regions,
+        tuple(np.full((height, width), value, dtype=np.uint8) for value in (9, 19, 29)),
+    )
+    records = np.zeros(1, dtype=records_module.REPAIR_RECORD_DTYPE)
+    records["pixel_index"] = np.uint32(12 * width + 12)
+    records["lane_mask"] = np.uint16(0xFFFF)
+    records["region_id"] = np.uint32(1)
+    monkeypatch.setattr(
+        planner.exemplar,
+        "repair_component_exemplar",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("candidate-free region entered exemplar construction")
+        ),
+    )
+
+    result = planner.plan_quality_repairs(
+        analysis,
+        records=records,
+        render_shape=(height, width),
+        local_limit_px=1,
+        budgets=local.QualityRepairBudgets(),
+    )
+
+    assert result.records["backend"].tolist() == [3]
+    assert result.exemplar_donor_evaluation_count == 0
+
+
+def test_planner_skips_exemplar_when_no_pyramid_level_can_score(monkeypatch) -> None:
+    planner = importlib.import_module("src.depth_surge_3d.rendering.quality.planner")
+    local = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    records_module = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
+    height = width = 25
+    coverage = np.full((height, width), 16, dtype=np.uint8)
+    regions = np.full((height, width), 2, dtype=np.uint32)
+    regions[:, :12] = np.uint32(1)
+    coverage[12, 11] = np.uint8(0)
+    regions[12, 11] = np.uint32(0xFFFFFFFF)
+    analysis = local.QualityVisibilityAnalysis(
+        coverage,
+        regions,
+        tuple(np.full((height, width), value, dtype=np.uint8) for value in (9, 19, 29)),
+    )
+    records = np.zeros(1, dtype=records_module.REPAIR_RECORD_DTYPE)
+    records["pixel_index"] = np.uint32(12 * width + 11)
+    records["lane_mask"] = np.uint16(0xFFFF)
+    records["region_id"] = np.uint32(1)
+    records["far_side"] = np.uint8(1)
+    monkeypatch.setattr(
+        planner.exemplar,
+        "repair_component_exemplar",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("non-scoring pyramid entered exemplar construction")
+        ),
+    )
+
+    result = planner.plan_quality_repairs(
+        analysis,
+        records=records,
+        render_shape=(height, width),
+        local_limit_px=1,
+        budgets=local.QualityRepairBudgets(),
+    )
+
+    assert result.records["backend"].tolist() == [3]
+    assert result.exemplar_donor_evaluation_count == 0
+
+
+def test_planner_uses_stable_fallback_for_a_micro_target_component(monkeypatch) -> None:
+    planner = importlib.import_module("src.depth_surge_3d.rendering.quality.planner")
+    local = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    records_module = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
+    height = width = 25
+    coverage = np.full((height, width), 16, dtype=np.uint8)
+    regions = np.ones((height, width), dtype=np.uint32)
+    coverage[9:15, 8:16] = np.uint8(0)
+    regions[9:15, 8:16] = np.uint32(0xFFFFFFFF)
+    analysis = local.QualityVisibilityAnalysis(
+        coverage,
+        regions,
+        tuple(np.full((height, width), value, dtype=np.uint8) for value in (9, 19, 29)),
+    )
+    target_pixels = [row * width + column for row in range(9, 15) for column in range(8, 16)]
+    records = np.zeros(len(target_pixels), dtype=records_module.REPAIR_RECORD_DTYPE)
+    records["pixel_index"] = np.asarray(target_pixels, dtype=np.uint32)
+    records["lane_mask"] = np.uint16(0xFFFF)
+    records["region_id"] = np.uint32(1)
+    monkeypatch.setattr(
+        planner.exemplar,
+        "repair_component_exemplar",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("micro target component entered exemplar synthesis")
+        ),
+    )
+
+    result = planner.plan_quality_repairs(
+        analysis,
+        records=records,
+        render_shape=(height, width),
+        local_limit_px=1,
+        budgets=local.QualityRepairBudgets(local_slot_cap=0),
+    )
+
+    assert result.records["backend"].tolist() == [3] * 48
+    assert result.exemplar_donor_evaluation_count == 0

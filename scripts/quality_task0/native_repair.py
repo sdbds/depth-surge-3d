@@ -11,6 +11,8 @@ def build_native_repair_records(
     valid: np.ndarray,
     winner_near_score: np.ndarray,
     winner_region_id: np.ndarray,
+    *,
+    winner_bgr: np.ndarray | None = None,
 ) -> repair_records.RepairRecordBuildResult:
     """Construct the fixed record table without Python objects per run."""
 
@@ -19,11 +21,19 @@ def build_native_repair_records(
         winner_near_score,
         winner_region_id,
     )
+    if winner_bgr is not None and (
+        not isinstance(winner_bgr, np.ndarray)
+        or winner_bgr.dtype != np.float32
+        or winner_bgr.shape != (*valid.shape, 3)
+        or not winner_bgr.flags.c_contiguous
+    ):
+        raise TypeError("winner_bgr must be a matching C-contiguous float32 [H,W,3] raster")
     native = native_kd._require_native()
     raw_records, statistics = native.build_repair_records(
         valid,
         winner_near_score,
         winner_region_id,
+        winner_bgr,
     )
     records = raw_records.reshape(-1).view(repair_records.REPAIR_RECORD_DTYPE)
     records.setflags(write=False)

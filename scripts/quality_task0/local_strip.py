@@ -34,6 +34,7 @@ class QualityVisibilityAnalysis:
     coverage_count: np.ndarray
     pure_region_id: np.ndarray
     pure_bgr: tuple[np.ndarray, np.ndarray, np.ndarray]
+    anchor_fallbacks_seeded: bool = False
 
 
 @dataclass

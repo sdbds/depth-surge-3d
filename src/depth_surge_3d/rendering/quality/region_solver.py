@@ -8,6 +8,7 @@ from typing import Iterator
 
 import numpy as np
 
+from . import native_kd
 from .indexed_heap import IndexedRegionHeap, QualityRegionQueueBudgetError
 
 
@@ -58,7 +59,32 @@ def build_low_resolution_regions(
     sample_count = height * width
     if sample_count + 1 > int(np.iinfo(np.uint32).max):
         raise ValueError("low-resolution sample count exceeds uint32 contract")
+    (
+        region_map,
+        canonical_keys,
+        region_rank_bits,
+    ) = native_kd._require_native().build_low_resolution_regions(
+        one_eye_displacement_px,
+        metric_validity,
+        near_score,
+    )
+    for values in (region_map, canonical_keys, region_rank_bits):
+        values.setflags(write=False)
+    return LowResolutionRegionResult(
+        region_map=region_map,
+        canonical_keys=canonical_keys,
+        region_rank_bits=region_rank_bits,
+    )
 
+
+def _build_low_resolution_regions_scalar(
+    one_eye_displacement_px: np.ndarray,
+    metric_validity: np.ndarray,
+    near_score: np.ndarray,
+) -> LowResolutionRegionResult:
+    """Retain the readable oracle path for targeted differential tests."""
+
+    height, width = one_eye_displacement_px.shape
     parent, canonical_key = _union_connected_low_resolution_samples(
         one_eye_displacement_px,
         metric_validity,
@@ -156,13 +182,11 @@ def nearest_label_upsample(
     _validate_region_map(low_resolution_regions)
     destination_height = _validate_positive_dimension("render_height", render_height)
     destination_width = _validate_positive_dimension("render_width", render_width)
-    source_height, source_width = low_resolution_regions.shape
-    output = np.empty((destination_height, destination_width), dtype=np.uint32)
-    for y in range(destination_height):
-        source_y = _nearest_source_index(y, source_height, destination_height)
-        for x in range(destination_width):
-            source_x = _nearest_source_index(x, source_width, destination_width)
-            output[y, x] = low_resolution_regions[source_y, source_x]
+    output = native_kd._require_native().nearest_label_upsample(
+        low_resolution_regions,
+        destination_height,
+        destination_width,
+    )
     output.setflags(write=False)
     return output
 
@@ -214,21 +238,10 @@ def build_four_connected_edge_band(
 
     _validate_region_map(mapped_regions)
     dilation_radius = _validate_nonnegative_integer("radius", radius)
-    height, width = mapped_regions.shape
-    boundary = np.zeros((height, width), dtype=np.bool_)
-    for y in range(height):
-        for x in range(width):
-            region = np.uint32(mapped_regions[y, x])
-            if not _is_region(region):
-                continue
-            if x + 1 < width and _different_regions(region, np.uint32(mapped_regions[y, x + 1])):
-                boundary[y, x] = True
-                boundary[y, x + 1] = True
-            if y + 1 < height and _different_regions(region, np.uint32(mapped_regions[y + 1, x])):
-                boundary[y, x] = True
-                boundary[y + 1, x] = True
-    for _ in range(dilation_radius):
-        boundary = _cross_dilate(boundary)
+    boundary = native_kd._require_native().build_four_connected_edge_band(
+        mapped_regions,
+        dilation_radius,
+    )
     boundary.setflags(write=False)
     return boundary
 

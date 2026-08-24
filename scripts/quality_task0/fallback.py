@@ -34,6 +34,7 @@ class FallbackPrecomputeResult:
     index_bytes: int
     query_count: int
     retained_safe_donor_mask_bytes: int
+    anchor_fallback_count: int
 
 
 def is_safe_donor(
@@ -89,7 +90,7 @@ def precompute_native_fallbacks(
         output.setflags(write=False)
         visits = np.empty(0, dtype=np.uint32)
         visits.setflags(write=False)
-        return FallbackPrecomputeResult(output, visits, 0, 0, 0, 0)
+        return FallbackPrecomputeResult(output, visits, 0, 0, 0, 0, 0)
     referenced = np.zeros(count + 1, dtype=np.bool_)
     for record in output:
         if int(record["backend"]) == 0:
@@ -100,6 +101,7 @@ def precompute_native_fallbacks(
         analysis.coverage_count,
         analysis.pure_region_id,
         referenced,
+        True,
     )
     members.setflags(write=False)
     offsets.setflags(write=False)
@@ -121,7 +123,7 @@ def precompute_native_fallbacks(
     raw_records = output.view(np.uint8).reshape(output.size, 16)
     fallback_limit = max(1, math.floor((256 * height) / 1080.0 + 0.5))
     try:
-        visits = native.query_fallback_records(
+        visits, anchor_fallback_count = native.query_fallback_records(
             index.member_index,
             index.region_offsets,
             height,
@@ -132,6 +134,7 @@ def precompute_native_fallbacks(
             analysis.pure_bgr[2],
             fallback_limit,
             budget_state,
+            analysis.anchor_fallbacks_seeded,
         )
     except RuntimeError as error:
         message = str(error)
@@ -153,6 +156,7 @@ def precompute_native_fallbacks(
         index_bytes=index.index_bytes,
         query_count=query_count,
         retained_safe_donor_mask_bytes=0,
+        anchor_fallback_count=int(anchor_fallback_count),
     )
 
 

@@ -342,9 +342,7 @@ class _QualityMetricPlan:
         return self.settings
 
 
-_StereoStagePlan = (
-    _FastRelativePlan | _QualityRelativePlan | _FastMetricPlan | _QualityMetricPlan
-)
+_StereoStagePlan = _FastRelativePlan | _QualityRelativePlan | _FastMetricPlan | _QualityMetricPlan
 
 
 @dataclass(frozen=True)
@@ -706,12 +704,8 @@ class _StereoFilePipeline:
                         metric.focal_x_normalized,
                         message.frame.shape[:2],
                         virtual_baseline_mm=float(primitive.virtual_baseline_mm),
-                        convergence_distance_m=float(
-                            primitive.convergence_distance_m
-                        ),
-                        max_disparity_percent=float(
-                            primitive.max_disparity_percent
-                        ),
+                        convergence_distance_m=float(primitive.convergence_distance_m),
+                        max_disparity_percent=float(primitive.max_disparity_percent),
                         retained_crop_width=primitive.retained_crop_width,
                     )
                     if hasattr(self.renderer, "render_geometry_fast_compact"):
@@ -967,10 +961,7 @@ class StereoPairGenerator:
         else:
             render_settings = StereoSplatSettings(
                 max_eye_shift_fraction=(
-                    max_disparity_percent
-                    / 100.0
-                    * (retained_crop_width / render_shape[1])
-                    / 2.0
+                    max_disparity_percent / 100.0 * (retained_crop_width / render_shape[1]) / 2.0
                 ),
                 occlusion_fill=occlusion_fill,
             )
@@ -1064,17 +1055,12 @@ class StereoPairGenerator:
                 diagnostic_audit = audit_diagnostics_stage(quality_context)
                 if diagnostic_audit.disposition != "complete":
                     begin_diagnostics_stage(quality_context)
-                work_items, completed, repaired_outputs = (
-                    self._build_quality_work_items(
-                        frame_files,
-                        depth_files,
-                        left_dir,
-                        right_dir,
-                        (
-                            diagnostic_audit.reusable_frame_names
-                            + diagnostic_audit.migrate_frame_names
-                        ),
-                    )
+                work_items, completed, repaired_outputs = self._build_quality_work_items(
+                    frame_files,
+                    depth_files,
+                    left_dir,
+                    right_dir,
+                    (diagnostic_audit.reusable_frame_names + diagnostic_audit.migrate_frame_names),
                 )
             else:
                 stage_metadata = self._stereo_stage_metadata(
@@ -1087,9 +1073,7 @@ class StereoPairGenerator:
                     retained_crop_width=plan.retained_crop_width,
                     effective_convergence=plan.effective_convergence,
                 )
-                stage_changed = self._prepare_stereo_stage(
-                    left_dir, right_dir, stage_metadata
-                )
+                stage_changed = self._prepare_stereo_stage(left_dir, right_dir, stage_metadata)
                 compact_fast = (
                     plan.geometry_mode == "relative"
                     and hasattr(self.renderer, "render_relative_fast_compact")
@@ -1117,28 +1101,24 @@ class StereoPairGenerator:
                     diagnostic_audit = audit_diagnostics_stage(quality_context)
                     if diagnostic_audit.disposition != "complete":
                         begin_diagnostics_stage(quality_context)
-                    work_items, completed, repaired_outputs = (
-                        self._build_quality_work_items(
-                            frame_files,
-                            depth_files,
-                            left_dir,
-                            right_dir,
-                            (
-                                diagnostic_audit.reusable_frame_names
-                                + diagnostic_audit.migrate_frame_names
-                            ),
-                        )
+                    work_items, completed, repaired_outputs = self._build_quality_work_items(
+                        frame_files,
+                        depth_files,
+                        left_dir,
+                        right_dir,
+                        (
+                            diagnostic_audit.reusable_frame_names
+                            + diagnostic_audit.migrate_frame_names
+                        ),
                     )
                 else:
-                    work_items, completed, repaired_outputs = (
-                        self._build_file_work_items(
-                            frame_files,
-                            depth_files,
-                            left_dir,
-                            right_dir,
-                            render_shape,
-                            metric_mode=plan.geometry_mode == "metric_camera",
-                        )
+                    work_items, completed, repaired_outputs = self._build_file_work_items(
+                        frame_files,
+                        depth_files,
+                        left_dir,
+                        right_dir,
+                        render_shape,
+                        metric_mode=plan.geometry_mode == "metric_camera",
                     )
             if stage_changed:
                 self._reset_downstream_stages(directories)
@@ -1230,9 +1210,7 @@ class StereoPairGenerator:
         render_mode = str(settings.get("stereo_render_mode", "fast"))
         if render_mode == "quality":
             metadata["render_mode"] = "quality"
-            metadata["occlusion_fill_max_px"] = int(
-                settings.get("occlusion_fill_max_px", 8)
-            )
+            metadata["occlusion_fill_max_px"] = int(settings.get("occlusion_fill_max_px", 8))
         if geometry_mode == "relative":
             metadata.update(
                 {
@@ -1282,9 +1260,7 @@ class StereoPairGenerator:
                 frame_files=frame_files,
                 geometry_files=depth_files,
                 geometry_mode="relative",
-                relative_encoding_scale=np.float32(
-                    plan.source_metadata["encoding_scale"]
-                ),
+                relative_encoding_scale=np.float32(plan.source_metadata["encoding_scale"]),
                 metric_native_shape=None,
             )
         return build_quality_input_manifest(
@@ -1326,12 +1302,8 @@ class StereoPairGenerator:
                 "requested_convergence_distance": (
                     "auto" if requested == "auto" else float(requested)
                 ),
-                "effective_convergence_distance_m": float(
-                    plan.effective_convergence
-                ),
-                "max_disparity_percent": float(
-                    settings.get("max_disparity_percent", 2.0)
-                ),
+                "effective_convergence_distance_m": float(plan.effective_convergence),
+                "max_disparity_percent": float(settings.get("max_disparity_percent", 2.0)),
             }
             geometry_mode = "metric"
         if occlusion_fill == "background":
@@ -1354,18 +1326,14 @@ class StereoPairGenerator:
             }
         metadata: dict[str, Any] = {
             "schema_version": 2,
-            "algorithm_version": "torch-horizontal-16x-rgb-geodesic-repair-v8",
+            "algorithm_version": "torch-horizontal-16x-rgb-geodesic-repair-v9",
             "geometry_mode": geometry_mode,
             "frame_names": list(content_payload["frame_names"]),
             "render_shape": [int(render_shape[0]), int(render_shape[1])],
             "occlusion_fill": occlusion_fill,
             "encoding": "uint8_png",
-            "source_guide_fingerprint": content_payload[
-                "source_guide_fingerprint"
-            ],
-            "native_geometry_fingerprint": content_payload[
-                "native_geometry_fingerprint"
-            ],
+            "source_guide_fingerprint": content_payload["source_guide_fingerprint"],
+            "native_geometry_fingerprint": content_payload["native_geometry_fingerprint"],
             "quality_input_manifest_sha256": content.raw_sha256,
             "projection": projection,
             "repair_policy": repair_policy,
@@ -1431,16 +1399,12 @@ class StereoPairGenerator:
             frame_names=tuple(content.payload["frame_names"]),
             render_shape=tuple(metadata["render_shape"]),
             render_mode="quality",
-            geometry_mode=(
-                "relative" if isinstance(plan, _QualityRelativePlan) else "metric"
-            ),
+            geometry_mode=("relative" if isinstance(plan, _QualityRelativePlan) else "metric"),
             occlusion_fill=occlusion_fill,
             mask_payloads_enabled=keep_masks,
             rgb_stage_fingerprint=str(metadata["fingerprint"]),
             source_guide_fingerprint=str(metadata["source_guide_fingerprint"]),
-            native_geometry_fingerprint=str(
-                metadata["native_geometry_fingerprint"]
-            ),
+            native_geometry_fingerprint=str(metadata["native_geometry_fingerprint"]),
             quality_input_manifest_sha256=content.raw_sha256,
             left_rgb_parent=left_rgb_parent,
             right_rgb_parent=right_rgb_parent,
@@ -1496,12 +1460,7 @@ class StereoPairGenerator:
                 continue
             left_path = left_dir / f"{frame_name}.png"
             right_path = right_dir / f"{frame_name}.png"
-            diagnostic_dir = (
-                left_dir.parent
-                / "04_stereo_diagnostics"
-                / "frames"
-                / frame_name
-            )
+            diagnostic_dir = left_dir.parent / "04_stereo_diagnostics" / "frames" / frame_name
             repaired_outputs = repaired_outputs or any(
                 path.exists() for path in (left_path, right_path, diagnostic_dir)
             )

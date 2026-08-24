@@ -149,20 +149,12 @@ def test_quality_file_pipeline_uses_one_slot_and_publishes_compact_diagnostics(
         (directories["left_frames"] / "metadata.json").read_text(encoding="ascii")
     )
     assert rgb_metadata["schema_version"] == 2
-    assert rgb_metadata["algorithm_version"] == (
-        "torch-horizontal-16x-rgb-geodesic-repair-v8"
-    )
+    assert rgb_metadata["algorithm_version"] == ("torch-horizontal-16x-rgb-geodesic-repair-v9")
     diagnostics_metadata = json.loads(
-        (tmp_path / "04_stereo_diagnostics" / "metadata.json").read_text(
-            encoding="ascii"
-        )
+        (tmp_path / "04_stereo_diagnostics" / "metadata.json").read_text(encoding="ascii")
     )
     assert diagnostics_metadata["status"] == "complete"
-    assert (
-        tmp_path
-        / "04_stereo_diagnostics"
-        / "stereo_coverage_summary.json"
-    ).exists()
+    assert (tmp_path / "04_stereo_diagnostics" / "stereo_coverage_summary.json").exists()
 
 
 def test_quality_resume_rebuilds_damaged_aggregates_without_rerendering(
@@ -285,12 +277,7 @@ def test_quality_mask_true_to_false_migrates_manifests_without_rerendering(
     )
 
     for frame_file in frame_files:
-        frame_dir = (
-            tmp_path
-            / "04_stereo_diagnostics"
-            / "frames"
-            / frame_file.stem
-        )
+        frame_dir = tmp_path / "04_stereo_diagnostics" / "frames" / frame_file.stem
         manifest = json.loads((frame_dir / "manifest.json").read_text(encoding="ascii"))
         assert manifest["mask_payloads_enabled"] is False
         assert manifest["payloads"]["left_coverage"] is None
@@ -1263,19 +1250,14 @@ def test_metric_quality_pipeline_uses_native_renderer_and_persists_stats(
 
     assert generator.last_pipeline_stats is not None
     assert generator.last_pipeline_stats.permit_count == 1
-    frame_manifest = (
-        tmp_path
-        / "04_stereo_diagnostics"
-        / "frames"
-        / "frame_0000"
-        / "manifest.json"
-    )
+    frame_manifest = tmp_path / "04_stereo_diagnostics" / "frames" / "frame_0000" / "manifest.json"
     manifest = json.loads(frame_manifest.read_text(encoding="ascii"))
     assert manifest["geometry_mode"] == "metric"
     stats_path = frame_manifest.with_name("stats.json")
-    assert json.loads(stats_path.read_text(encoding="ascii"))[
-        "metric_projection"
-    ]["valid_pixel_count"] > 0
+    assert (
+        json.loads(stats_path.read_text(encoding="ascii"))["metric_projection"]["valid_pixel_count"]
+        > 0
+    )
     assert not (directories["left_frames"] / "clamp_stats").exists()
     assert (directories["left_frames"] / "clamp_summary.json").exists()
 

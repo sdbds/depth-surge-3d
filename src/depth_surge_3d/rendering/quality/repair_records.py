@@ -7,6 +7,8 @@ from typing import Iterator
 
 import numpy as np
 
+from . import native_kd
+
 
 HORIZONTAL_SUBPIXELS = 16
 QUALITY_REPAIR_RECORD_ARENA_BYTES = 64 * 1024 * 1024
@@ -137,16 +139,16 @@ def validate_record_coverage(records: np.ndarray, invalid_mask: np.ndarray) -> i
 
     _validate_record_array(records)
     _validate_bool_invalid_mask(invalid_mask)
-    height, fine_width = invalid_mask.shape
-    width = fine_width // 16
-    pixel_count = height * width
-    accumulated, record_popcount = _accumulate_record_masks(records, pixel_count)
-    expected_popcount = _compare_invalid_masks(accumulated, invalid_mask, width)
-    if record_popcount != expected_popcount:
-        raise QualityRepairRecordCoverageError(
-            "record popcount does not equal the invalid-lane count"
+    raw_records = records.view(np.uint8).reshape(records.size, REPAIR_RECORD_DTYPE.itemsize)
+    try:
+        return int(
+            native_kd._require_native().validate_repair_record_coverage(
+                raw_records,
+                invalid_mask,
+            )
         )
-    return record_popcount
+    except (RuntimeError, ValueError) as error:
+        raise QualityRepairRecordCoverageError(str(error)) from error
 
 
 def _accumulate_record_masks(

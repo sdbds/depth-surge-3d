@@ -151,6 +151,24 @@ def test_native_record_builder_is_byte_exact_with_the_scalar_builder() -> None:
     assert actual.invalid_lane_count == expected.invalid_lane_count
 
 
+def test_native_record_builder_seeds_each_run_from_its_selected_boundary_colour() -> None:
+    build_native = _api(native_repair, "build_native_repair_records")
+    valid, near_score, region_id = _winner_rasters(32)
+    valid[0, :16] = False
+    winner_bgr = np.zeros((1, 32, 3), dtype=np.float32)
+    winner_bgr[0, 16] = [11, 22, 33]
+
+    result = build_native(
+        valid,
+        near_score,
+        region_id,
+        winner_bgr=winner_bgr,
+    )
+
+    assert result.records["fill_bgr"].tolist() == [[11, 22, 33]]
+    assert result.records["far_side"].tolist() == [1]
+
+
 def test_record_coverage_detects_overlap_missing_bits_and_wrong_popcount() -> None:
     validate = _api(repair_records, "validate_record_coverage")
     coverage_error = _api(repair_records, "QualityRepairRecordCoverageError")

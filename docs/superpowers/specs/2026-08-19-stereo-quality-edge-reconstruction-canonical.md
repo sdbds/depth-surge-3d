@@ -236,6 +236,7 @@ defects.
 | Final encoding still depended on eager source lists | Replace the interface with a replayable `EncodingSequenceProvider`, scalar image2 command construction, and an independent eight-MiB coordinator cap. |
 | Pre-publication videos had no non-destructive audit state | Add an unauthenticated legacy-final-media disposition which preserves historical video, forbids manifest synthesis and pruning, and reencodes only explicitly from retained inputs. |
 | One local `safe_donor` charge hid a neighbourhood scan | Charge a conservative full Chebyshev support for every donor predicate without allocating a dense mask, and advance Quality RGB identity to v8. |
+| Microscopic source regions had no strict 3x3 donor and made otherwise valid anime frames fail | Advance Quality RGB identity to v9; retain strict donors for local/exemplar, add a same-region full-pure fallback tier only when the region has zero strict donors, and finally retain the selected boundary anchor with an explicit counter when no indexed donor is in range. Components smaller than one 7x7 patch bypass exemplar because they contain no patch-scale texture to synthesize. |
 | Canonical U64 frame indexes exceeded the unspecified image2 domain | Fix the supported image2 maximum to signed-int max, use checked last-index arithmetic, and require boundary integration fixtures. |
 | Legacy final-media classification and states were not closed | Persist the pre-migration source settings schema, define `FinalMediaAuditDispositionV1` and its complete artifact-presence matrix, add `not_present`, and remove the redundant `final_video_valid` field. |
 | Metric NPZ acceptance delegated syntax to NumPy/ZIP readers | Define `MetricNpzPayloadContractV1`, exact owned plus CPython-dependent historical archive forms, strict ZIP/NPY grammar, a project-owned schema-5 writer, and malformed plus supported-runtime fixture gates. |
@@ -2564,7 +2565,7 @@ The stereo RGB and diagnostics algorithm identities are:
 
 ```text
 Fast RGB schema/algorithm: 1 / torch-horizontal-16x-zbuffer-v3
-Quality RGB schema/algorithm: 2 / torch-horizontal-16x-rgb-geodesic-repair-v8
+Quality RGB schema/algorithm: 2 / torch-horizontal-16x-rgb-geodesic-repair-v9
 Diagnostics schema/algorithm: 1 / stereo-coverage-sidecar-v1
 ```
 
@@ -2611,7 +2612,7 @@ metadata copy. `StereoRgbMetadataV2` has exactly:
 
 ```text
 schema_version:                 2
-algorithm_version:              "torch-horizontal-16x-rgb-geodesic-repair-v8"
+algorithm_version:              "torch-horizontal-16x-rgb-geodesic-repair-v9"
 geometry_mode:                  "relative" | "metric"
 frame_names:                    list[string]
 render_shape:                   [H, W]
@@ -3612,7 +3613,7 @@ round to nearest with ties to even. The planar layout is semantic storage, not a
 temporary interleaved copy. A pixel containing winners from two regions is never
 a pure proxy, even if one region owns 15 of 16 lanes.
 
-`pure_proxy` is context only. A pixel is a `safe_donor` for region `r` only
+`pure_proxy` is context only. A pixel is a strict `safe_donor` for region `r` only
 when it is a pure proxy, `coverage_count == 16`, and every in-frame pixel in its
 clipped Chebyshev neighbourhood of radius
 `max(1, floor(H / 1080 + 0.5))` also has coverage 16 and pure region `r`. Thus a
@@ -3668,11 +3669,14 @@ the left boundary and 1 for the right boundary. The reserved byte is zero and
 participates in plan hashing. Records are ordered by pixel index, least set
 lane, region ID, then far side. Multiple records may exist for one pixel when
 its unresolved runs bind to different source regions.
-An unplanned record initially has zero `fill_bgr` and backend 0. After the
-deterministic fallback-precompute phase, a still-unplanned backend-0 record may
-hold its provisional fallback colour in `fill_bgr`; Pass B never scatters a
-backend-0 value. Exemplar success overwrites it and sets backend 2, while final
-fallback retains it and sets backend 3.
+An unplanned record initially has the selected valid boundary anchor's exact
+winner BGR in `fill_bgr` and backend 0. This seed is not scattered while the
+record remains backend 0. After the deterministic fallback-precompute phase, a
+found indexed donor overwrites it with the provisional fallback colour. If no
+indexed donor is in range, the seed is retained and the per-eye
+`fallback_anchor_count` is incremented. Exemplar success overwrites either
+provisional value and sets backend 2, while final fallback retains the current
+value and sets backend 3.
 
 Every record mask is nonzero and contiguous within its output pixel. Masks in
 one pixel are pairwise disjoint. Convert a record to its inclusive full-row
@@ -3826,7 +3830,7 @@ QUALITY_REPAIR_FALLBACK_VISIT_CAP  = 268_435_456
 
 All three counters are checked uint64 values initialized once before either eye
 is planned. They are output semantics and therefore participate in Quality RGB
-algorithm v8. A new eye does not reset them, and CUDA OOM rollback restores them
+algorithm v9. A new eye does not reset them, and CUDA OOM rollback restores them
 to the exact value at that eye/pass checkpoint rather than granting more work.
 
 ### Local Limit and Strip Fill
@@ -3978,6 +3982,16 @@ clipped ROI as absence from the frame. It returns a full-level colour only for
 targets actually completed by exemplar iteration. Other targets remain backend
 0 for the outer planner.
 
+Before constructing an exemplar ROI, count the component's unique target
+pixels. A count below 49, the area of one 7x7 copy patch, bypasses exemplar and
+retains the already computed fallback value. The planner also bypasses exemplar
+when the region has no strict safe donor, when the component's expanded search
+bbox contains no complete strict 9x9 donor centre, or when an exact mask-only
+pyramid preflight proves that no level can produce both an eligible frontier
+and candidate. These are semantic zero-work proofs: they do not inspect colour,
+consume an evaluation budget, or alter the result of any exemplar iteration
+that could legally score a candidate.
+
 Let the component target bbox be half-open `[y0,y1) x [x0,x1)`. Its read/search
 domain is that bbox expanded by 128 actual output pixels and clipped to frame.
 Partition the unexpanded bbox into nonoverlapping half-open interiors with
@@ -4126,11 +4140,16 @@ proceeds to outer fallback in canonical component/record order.
 ### Fallback and Memory Failure
 
 After local planning and before exemplar work, the outer full-frame planner
-indexes original safe donors by source-region ID for every still-backend-0
-record. It computes and stores one provisional colour per such record. After
-exemplar, every record still at backend 0 adopts that already stored colour as
-backend 3. The nearest same-region safe donor must be within this
-1080p-equivalent distance:
+indexes donors by source-region ID for every still-backend-0 record. The primary
+index contains the original strict safe donors. For a referenced region with
+zero strict donors in the complete frame, and only for that region, the index
+instead contains every original same-region pure proxy with
+`coverage_count == 16`. A region that has at least one strict donor never mixes
+in this relaxed tier. Pure-but-partial proxies, mixed proxies, synthesized
+pixels, and pixels from another source region are always ineligible.
+
+The planner computes and stores one provisional colour per record. The nearest
+indexed same-region donor must be within this 1080p-equivalent distance:
 
 ```text
 fallback_limit_px = max(1, floor(256 * H / 1080 + 0.5))
@@ -4138,14 +4157,21 @@ fallback_limit_px = max(1, floor(256 * H / 1080 + 0.5))
 
 Distance between output-pixel coordinates is exact integer squared Euclidean;
 ties use donor row then column. The search sees the full analysis frame, not the
-128-pixel exemplar expansion. Set backend 3. Pure-but-partial proxies and
-synthesized pixels are ineligible. If no safe donor exists within the limit,
-fail the frame explicitly rather than pulling foreground colour or leaving a
-black hole.
+128-pixel exemplar expansion. If no indexed donor exists within the limit, keep
+the selected valid boundary-anchor seed described above and increment
+`fallback_anchor_count`; that seed is bound to the repair run's source region
+and is never selected across a depth-region edge. After exemplar, every record
+still at backend 0 adopts its stored donor or anchor colour as backend 3. This
+terminal anchor tier prevents a microscopic same-region structure from turning
+an otherwise valid frame into a no-donor failure, without pulling a foreground
+colour, copying a partial proxy, or leaving a black hole.
 
-The scalar fallback oracle enumerates every same-region safe donor inside the
-clipped square search window in row-major order, rejects `distance2` above the
-squared limit, and applies the distance/row/column key.
+The scalar fallback oracle first determines whether the referenced region has
+any strict donor in the complete frame, enumerates the selected strict or
+full-pure tier inside the clipped square search window in row-major order,
+rejects `distance2` above the squared limit, and applies the
+distance/row/column key. If none is found, it returns the boundary-anchor seed
+and the counted anchor disposition.
 
 Production uses a deterministic per-region implicit two-dimensional k-d index:
 
@@ -4184,10 +4210,11 @@ maximum, and scalar p95 in place before resetting this arena. Build complexity i
 working memory is `O(N)`, expected query work is `O(log N)`, and exact worst case
 remains `O(N)`; the only termination boundary is the fatal frame-level visit
 cap, never a partial query result.
-Diagnostics record indexed donor count, query count, total visited nodes,
-maximum, and p95 visited nodes, plus local slot charges, local neighbourhood-
-sample reservations, and whole-run budget skips. The two eye totals must add exactly to the
-shared frame counters and the fallback total may not exceed its cap. Query p95
+Diagnostics record indexed donor count, query count, anchor fallback count,
+total visited nodes, maximum, and p95 visited nodes, plus local slot charges,
+local neighbourhood-sample reservations, and whole-run budget skips. The two
+eye totals must add exactly to the shared frame counters and the fallback total
+may not exceed its cap. Query p95
 applies the exact scalar linear rule
 below to the per-query visit counts and is `0.0` when there are no queries.
 Wall-clock build time is benchmark telemetry, never hashed frame diagnostics.
@@ -4205,12 +4232,14 @@ and exemplar state are therefore never simultaneous allocations.
 If either preallocation, index construction, or any later allocation raises
 `MemoryError`, fail the frame and commit no RGB or diagnostics. Earlier planned
 values are discarded. Runtime memory pressure never selects fallback and never
-changes output under one RGB identity. Only the fixed core/component/eye
-evaluation budgets may deterministically route records to backend 3.
+changes output under one RGB identity. Only the fixed semantic zero-work gates
+and core/component/eye evaluation budgets may deterministically route records
+to backend 3.
 
-If any residual record has no safe donor within the limit or required index
-state exceeds its 48 MiB partition, propagate an actionable render error. There
-is no unconstrained
+If a record lacks an indexed donor within the limit, the exact seeded-anchor
+terminal rule applies. A missing/invalid anchor, a region mismatch, or required
+index state exceeding its 48 MiB partition propagates an actionable render
+error. There is no unconstrained
 OpenCV inpaint path and no silent Fast downgrade.
 
 ## Compact Coverage and Statistics
@@ -7885,7 +7914,7 @@ Task 0 also includes the million-one-lane-run local fixture and degenerate
 repair k-d fixture. It verifies exact whole-run local charges/skips, shared
 left-then-right frame budgets, fatal fallback-node overflow without a current-
 best result, full-neighbourhood sample reservation with no dense local helper,
-and algorithm-v8 diagnostics. It separately traces the ten-step
+and algorithm-v9 diagnostics. It separately traces the ten-step
 geometry order and proves `quality_region_peak` ends before
 `quality_geometry_build_with_nearest_index_peak` begins.
 

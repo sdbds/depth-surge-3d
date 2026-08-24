@@ -161,15 +161,11 @@ def _eye_stats(
             "fallback": None,
         }
         quality_budgets = None
-        final_unresolved_lane_count = int(
-            fast_diagnostics.final_unresolved_lane_count
-        )
+        final_unresolved_lane_count = int(fast_diagnostics.final_unresolved_lane_count)
     else:
         backend_lanes, backend_pixels, backend_components = _backend_counts(plan)
         final_unresolved_lane_count = (
-            int(np.sum(HORIZONTAL_SUBPIXELS - coverage, dtype=np.uint64))
-            if plan is None
-            else 0
+            int(np.sum(HORIZONTAL_SUBPIXELS - coverage, dtype=np.uint64)) if plan is None else 0
         )
     if render_mode == "quality" and plan is None:
         quality_budgets: dict[str, Any] = {
@@ -182,6 +178,7 @@ def _eye_stats(
             "exemplar_evaluations": None,
             "fallback_indexed_donor_count": None,
             "fallback_query_count": None,
+            "fallback_anchor_count": None,
             "fallback_visited_nodes_total": None,
             "fallback_visited_nodes_max": None,
             "fallback_visited_nodes_p95": None,
@@ -194,12 +191,11 @@ def _eye_stats(
             "segment_table_bytes": int(plan.records.nbytes),
             "local_slot_charge": int(plan.local_evaluated_slot_count),
             "local_neighborhood_sample_charge": int(plan.local_physical_sample_read_count),
-            "local_budget_skipped_run_count": int(
-                plan.local_budget_skipped_run_count
-            ),
+            "local_budget_skipped_run_count": int(plan.local_budget_skipped_run_count),
             "exemplar_evaluations": int(plan.exemplar_donor_evaluation_count),
             "fallback_indexed_donor_count": int(plan.fallback_indexed_donor_count),
             "fallback_query_count": int(plan.fallback_query_count),
+            "fallback_anchor_count": int(plan.fallback_anchor_count),
             "fallback_visited_nodes_total": int(plan.fallback_visited_nodes_total),
             "fallback_visited_nodes_max": int(plan.fallback_visited_nodes_max),
             "fallback_visited_nodes_p95": float(plan.fallback_visited_nodes_p95),
@@ -215,9 +211,7 @@ def _eye_stats(
             "lane_count_max": int(max(lane_histogram, default=0)),
             "lane_count_p95": lane_p95,
             "touched_pixel_span_max": int(max(span_histogram, default=0)),
-            "touched_pixel_span_p95": _linear_percentile_from_histogram(
-                span_histogram, 0.95
-            ),
+            "touched_pixel_span_p95": _linear_percentile_from_histogram(span_histogram, 0.95),
             "physical_width_px_max": float(max(lane_histogram, default=0)) / 16.0,
             "physical_width_px_p95": lane_p95 / 16.0,
         },
@@ -313,10 +307,7 @@ def _sum_named_counts(
     field: str,
     names: tuple[str, ...],
 ) -> dict[str, int]:
-    return {
-        name: sum(int(value[field][name]) for value in values)
-        for name in names
-    }
+    return {name: sum(int(value[field][name]) for value in values) for name in names}
 
 
 def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, Any]:
@@ -327,9 +318,7 @@ def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, An
     lane_histogram = _merge_histogram_pairs(eyes, "lane_count_histogram")
     span_histogram = _merge_histogram_pairs(eyes, "touched_pixel_span_histogram")
     lane_p95 = _linear_percentile_from_histogram(lane_histogram, 0.95)
-    component_availability = {
-        eye["backend_component_counts"]["availability"] for eye in eyes
-    }
+    component_availability = {eye["backend_component_counts"]["availability"] for eye in eyes}
     if len(component_availability) != 1:
         raise ValueError("backend component availability changed between frames")
     availability = next(iter(component_availability))
@@ -364,20 +353,15 @@ def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, An
             "predicted_gap_px_max": int(
                 max(value["predicted_gap_px"] for value in concrete_limits)
             ),
-            "local_limit_px_min": int(
-                min(value["local_limit_px"] for value in concrete_limits)
-            ),
-            "local_limit_px_max": int(
-                max(value["local_limit_px"] for value in concrete_limits)
-            ),
+            "local_limit_px_min": int(min(value["local_limit_px"] for value in concrete_limits)),
+            "local_limit_px_max": int(max(value["local_limit_px"] for value in concrete_limits)),
         }
 
     budgets = [eye["quality_budgets"] for eye in eyes]
     if render_mode == "fast":
         budget_totals = None
     elif all(
-        value["availability"] == "unavailable_quality_none_no_repair_plan"
-        for value in budgets
+        value["availability"] == "unavailable_quality_none_no_repair_plan" for value in budgets
     ):
         budget_totals = {
             "availability": "unavailable_quality_none_no_repair_plan",
@@ -389,6 +373,7 @@ def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, An
             "exemplar_evaluations": None,
             "fallback_indexed_donor_count": None,
             "fallback_query_count": None,
+            "fallback_anchor_count": None,
             "fallback_visited_nodes_total": None,
             "fallback_visited_nodes_max": None,
             "fallback_visited_nodes_frame_p95_max": None,
@@ -396,30 +381,21 @@ def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, An
     elif all(value["availability"] == "quality_repair_plan" for value in budgets):
         budget_totals = {
             "availability": "quality_repair_plan",
-            "segment_record_count": sum(
-                int(value["segment_record_count"]) for value in budgets
-            ),
-            "segment_table_bytes_max": max(
-                int(value["segment_table_bytes"]) for value in budgets
-            ),
-            "local_slot_charge": sum(
-                int(value["local_slot_charge"]) for value in budgets
-            ),
+            "segment_record_count": sum(int(value["segment_record_count"]) for value in budgets),
+            "segment_table_bytes_max": max(int(value["segment_table_bytes"]) for value in budgets),
+            "local_slot_charge": sum(int(value["local_slot_charge"]) for value in budgets),
             "local_neighborhood_sample_charge": sum(
                 int(value["local_neighborhood_sample_charge"]) for value in budgets
             ),
             "local_budget_skipped_run_count": sum(
                 int(value["local_budget_skipped_run_count"]) for value in budgets
             ),
-            "exemplar_evaluations": sum(
-                int(value["exemplar_evaluations"]) for value in budgets
-            ),
+            "exemplar_evaluations": sum(int(value["exemplar_evaluations"]) for value in budgets),
             "fallback_indexed_donor_count": sum(
                 int(value["fallback_indexed_donor_count"]) for value in budgets
             ),
-            "fallback_query_count": sum(
-                int(value["fallback_query_count"]) for value in budgets
-            ),
+            "fallback_query_count": sum(int(value["fallback_query_count"]) for value in budgets),
+            "fallback_anchor_count": sum(int(value["fallback_anchor_count"]) for value in budgets),
             "fallback_visited_nodes_total": sum(
                 int(value["fallback_visited_nodes_total"]) for value in budgets
             ),
@@ -437,8 +413,7 @@ def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, An
         "pixel_count": pixel_count,
         "state_pixel_counts": state_counts,
         "state_pixel_ratios": {
-            name: float(state_counts[name]) / float(pixel_count)
-            for name in state_names
+            name: float(state_counts[name]) / float(pixel_count) for name in state_names
         },
         "hole_runs": {
             "count": int(sum(lane_histogram.values())),
@@ -447,22 +422,14 @@ def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, An
             "lane_count_max": int(max(lane_histogram, default=0)),
             "lane_count_p95": lane_p95,
             "touched_pixel_span_max": int(max(span_histogram, default=0)),
-            "touched_pixel_span_p95": _linear_percentile_from_histogram(
-                span_histogram, 0.95
-            ),
+            "touched_pixel_span_p95": _linear_percentile_from_histogram(span_histogram, 0.95),
             "physical_width_px_max": float(max(lane_histogram, default=0)) / 16.0,
             "physical_width_px_p95": lane_p95 / 16.0,
         },
-        "backend_lane_counts": _sum_named_counts(
-            eyes, "backend_lane_counts", backend_names
-        ),
-        "backend_pixel_counts": _sum_named_counts(
-            eyes, "backend_pixel_counts", backend_names
-        ),
+        "backend_lane_counts": _sum_named_counts(eyes, "backend_lane_counts", backend_names),
+        "backend_pixel_counts": _sum_named_counts(eyes, "backend_pixel_counts", backend_names),
         "backend_component_counts": component_counts,
-        "final_unresolved_lane_count": sum(
-            int(eye["final_unresolved_lane_count"]) for eye in eyes
-        ),
+        "final_unresolved_lane_count": sum(int(eye["final_unresolved_lane_count"]) for eye in eyes),
         "quality_limit_ranges": limit_ranges,
         "quality_budget_totals": budget_totals,
     }
@@ -498,9 +465,7 @@ def build_diagnostics_summary(
         metric_projection = {
             "valid_pixel_count": valid_count,
             "clamped_pixel_count": clamped_count,
-            "clamped_fraction": (
-                float(clamped_count) / float(valid_count) if valid_count else 0.0
-            ),
+            "clamped_fraction": (float(clamped_count) / float(valid_count) if valid_count else 0.0),
             "clamped_fractions": fractions,
             "affected_frame_count": sum(value > 0.0 for value in fractions),
             "mean_clamped_fraction": (

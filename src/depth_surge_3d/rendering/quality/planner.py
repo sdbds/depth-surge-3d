@@ -17,8 +17,10 @@ from .repair_records import (
     NO_REGION,
     QUALITY_REPAIR_RECORD_CAP,
     REPAIR_RECORD_DTYPE,
-    reconstruct_repair_runs,
 )
+
+
+QUALITY_EXEMPLAR_MIN_TARGET_PIXELS = 49
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,7 @@ class QualityRepairPlan:
     fallback_indexed_donor_count: int
     fallback_index_bytes: int
     fallback_query_count: int
+    fallback_anchor_count: int
     fallback_visited_nodes_total: int
     fallback_visited_nodes_max: int
     fallback_visited_nodes_p95: float
@@ -128,97 +131,32 @@ def build_record_component_ids(  # noqa: C901
         raise ValueError("render_shape must be positive and fit uint32 fine indexes")
     if records.size > QUALITY_REPAIR_RECORD_CAP:
         raise ValueError("repair record count exceeds the fixed arena")
-    reconstruct_repair_runs(records, render_shape=render_shape)
     count = int(records.size)
     if count == 0:
         result = np.empty(0, dtype=np.uint32)
         result.setflags(write=False)
         return result, 0
-
-    parent = np.arange(count, dtype=np.uint32)
-    rank = np.zeros(count, dtype=np.uint8)
-    previous_starts = np.full(width, -1, dtype=np.int32)
-    previous_ends = np.full(width, -1, dtype=np.int32)
-    cursor = 0
-    for row in range(height):
-        current_starts = np.full(width, -1, dtype=np.int32)
-        current_ends = np.full(width, -1, dtype=np.int32)
-        row_end_pixel = (row + 1) * width
-        while cursor < count and int(records[cursor]["pixel_index"]) < row_end_pixel:
-            pixel = int(records[cursor]["pixel_index"])
-            if pixel < row * width:
-                raise ValueError("records are not ordered by output pixel")
-            column = pixel - row * width
-            start = cursor
-            while cursor < count and int(records[cursor]["pixel_index"]) == pixel:
-                cursor += 1
-            end = cursor
-            current_starts[column] = np.int32(start)
-            current_ends[column] = np.int32(end)
-            _union_group_pairs(records, parent, rank, start, end, start, end, "same")
-            if column > 0 and int(current_starts[column - 1]) >= 0:
-                _union_group_pairs(
-                    records,
-                    parent,
-                    rank,
-                    int(current_starts[column - 1]),
-                    int(current_ends[column - 1]),
-                    start,
-                    end,
-                    "horizontal",
-                )
-            if int(previous_starts[column]) >= 0:
-                _union_group_pairs(
-                    records,
-                    parent,
-                    rank,
-                    int(previous_starts[column]),
-                    int(previous_ends[column]),
-                    start,
-                    end,
-                    "vertical",
-                )
-        previous_starts = current_starts
-        previous_ends = current_ends
-    if cursor != count:
-        raise ValueError("record pixel lies outside render_shape")
-
-    for index in range(count):
-        parent[index] = np.uint32(_find(parent, index))
-    unassigned = np.uint32(np.iinfo(np.uint32).max)
-    root_component = np.full(count, unassigned, dtype=np.uint32)
-    component_ids = np.empty(count, dtype=np.uint32)
-    component_count = 0
-    for index in range(count):
-        root = int(parent[index])
-        component = int(root_component[root])
-        if component == int(unassigned):
-            component = component_count
-            root_component[root] = np.uint32(component)
-            component_count += 1
-        component_ids[index] = np.uint32(component)
+    raw_records = records.view(np.uint8).reshape(count, REPAIR_RECORD_DTYPE.itemsize)
+    (
+        component_ids,
+        component_count,
+    ) = fallback.native_kd._require_native().build_record_component_ids(
+        raw_records,
+        height,
+        width,
+    )
     component_ids.setflags(write=False)
-    return component_ids, component_count
+    return component_ids, int(component_count)
 
 
 def _component_member_order(
     component_ids: np.ndarray,
     component_count: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    offsets = np.zeros(component_count + 1, dtype=np.uint32)
-    for component in component_ids:
-        offsets[int(component) + 1] += np.uint32(1)
-    running = 0
-    for index in range(1, offsets.size):
-        running += int(offsets[index])
-        offsets[index] = np.uint32(running)
-    cursors = np.array(offsets[:-1], copy=True)
-    members = np.empty(component_ids.size, dtype=np.uint32)
-    for record_index, component_value in enumerate(component_ids):
-        component = int(component_value)
-        position = int(cursors[component])
-        members[position] = np.uint32(record_index)
-        cursors[component] = np.uint32(position + 1)
+    members, offsets = fallback.native_kd._require_native().build_component_member_order(
+        component_ids,
+        component_count,
+    )
     offsets.setflags(write=False)
     members.setflags(write=False)
     return members, offsets
@@ -228,20 +166,45 @@ def _materialize_safe_donor_mask(
     records: np.ndarray,
     analysis: QualityVisibilityAnalysis,
     region_count: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     referenced = np.zeros(region_count + 1, dtype=np.bool_)
     for record in records:
         if int(record["backend"]) == 0:
             referenced[int(record["region_id"])] = True
     native = fallback.native_kd._require_native()
-    members, _offsets = native.build_safe_donor_index(
+    members, offsets = native.build_safe_donor_index(
         analysis.coverage_count,
         analysis.pure_region_id,
         referenced,
     )
     safe = np.zeros(analysis.coverage_count.shape, dtype=np.bool_)
     safe.reshape(-1)[members] = True
-    return safe
+    region_has_safe_donor = np.zeros(region_count + 1, dtype=np.bool_)
+    region_has_safe_donor[1:] = offsets[1:] != offsets[:-1]
+    return safe, region_has_safe_donor
+
+
+def _component_has_exemplar_candidate(
+    records: np.ndarray,
+    candidate_mask: np.ndarray,
+    pure_region_id: np.ndarray,
+    *,
+    region_id: int,
+    render_shape: tuple[int, int],
+) -> bool:
+    height, width = render_shape
+    pixels = records["pixel_index"]
+    rows = pixels // np.uint32(width)
+    columns = pixels % np.uint32(width)
+    y0 = max(0, int(rows.min()) - 128)
+    y1 = min(height, int(rows.max()) + 129)
+    x0 = max(0, int(columns.min()) - 128)
+    x1 = min(width, int(columns.max()) + 129)
+    return bool(
+        np.any(
+            candidate_mask[y0:y1, x0:x1] & (pure_region_id[y0:y1, x0:x1] == np.uint32(region_id))
+        )
+    )
 
 
 def _linear_p95(values: np.ndarray) -> float:
@@ -291,6 +254,7 @@ def plan_quality_repairs(
             fallback_indexed_donor_count=0,
             fallback_index_bytes=0,
             fallback_query_count=0,
+            fallback_anchor_count=0,
             fallback_visited_nodes_total=0,
             fallback_visited_nodes_max=0,
             fallback_visited_nodes_p95=0.0,
@@ -314,11 +278,16 @@ def plan_quality_repairs(
         region_count=region_count,
         budgets=budgets,
     )
-    safe_donor_mask = _materialize_safe_donor_mask(
+    safe_donor_mask, region_has_safe_donor = _materialize_safe_donor_mask(
         provisional.records,
         analysis,
         region_count,
     )
+    exemplar_candidate_mask = fallback.native_kd._require_native().build_exemplar_candidate_mask(
+        safe_donor_mask,
+        analysis.pure_region_id,
+    )
+    exemplar_candidate_mask.setflags(write=False)
     working = np.array(provisional.records, copy=True, order="C")
     exemplar_processed = 0
     exemplar_unfinished = 0
@@ -332,6 +301,27 @@ def plan_quality_repairs(
             continue
         component_records = np.ascontiguousarray(working[indexes])
         region_id = int(component_records[0]["region_id"])
+        if not bool(region_has_safe_donor[region_id]):
+            continue
+        target_pixels = np.unique(component_records["pixel_index"])
+        if target_pixels.size < QUALITY_EXEMPLAR_MIN_TARGET_PIXELS:
+            continue
+        if not _component_has_exemplar_candidate(
+            component_records,
+            exemplar_candidate_mask,
+            analysis.pure_region_id,
+            region_id=region_id,
+            render_shape=render_shape,
+        ):
+            continue
+        if not fallback.native_kd._require_native().component_may_score_exemplar(
+            analysis.coverage_count,
+            analysis.pure_region_id,
+            safe_donor_mask,
+            target_pixels,
+            region_id,
+        ):
+            continue
         repaired = exemplar.repair_component_exemplar(
             component_records,
             analysis,
@@ -354,12 +344,11 @@ def plan_quality_repairs(
         local_evaluated_slot_count=local.evaluated_slot_count,
         local_physical_sample_read_count=local.physical_sample_read_count,
         local_filled_run_count=local.local_filled_run_count,
-        local_budget_skipped_run_count=(
-            budgets.local_budget_skipped_run_count - skipped_before
-        ),
+        local_budget_skipped_run_count=(budgets.local_budget_skipped_run_count - skipped_before),
         fallback_indexed_donor_count=provisional.indexed_donor_count,
         fallback_index_bytes=provisional.index_bytes,
         fallback_query_count=provisional.query_count,
+        fallback_anchor_count=provisional.anchor_fallback_count,
         fallback_visited_nodes_total=int(np.sum(visited, dtype=np.uint64)),
         fallback_visited_nodes_max=int(visited.max(initial=np.uint32(0))),
         fallback_visited_nodes_p95=_linear_p95(visited),

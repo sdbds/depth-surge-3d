@@ -20,6 +20,7 @@ from ..stereo_renderer import (
     _downsample_subpixel_band,
     calculate_band_height,
 )
+from . import native_kd
 from .geometry import (
     QualityGeometryResult,
     build_geometry_eye_offsets_into,
@@ -132,7 +133,7 @@ def _write_analysis_band(
     source_regions: np.ndarray,
     start_row: int,
     end_row: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     row_count = end_row - start_row
     width = analysis.coverage_count.shape[1]
     valid = np.ascontiguousarray(band.splat.valid.detach().cpu().numpy())
@@ -174,7 +175,15 @@ def _write_analysis_band(
         output.fill(0)
         output[pure] = rounded[..., channel][pure]
     near_score = np.ascontiguousarray(band.splat.disparity.detach().cpu().numpy())
-    return valid, near_score, np.ascontiguousarray(winner_regions)
+    return (
+        valid,
+        near_score,
+        np.ascontiguousarray(winner_regions),
+        np.ascontiguousarray(
+            lane_colours.reshape(row_count, width * HORIZONTAL_SUBPIXELS, 3),
+            dtype=np.float32,
+        ),
+    )
 
 
 def _analyze_eye_once(
@@ -189,13 +198,18 @@ def _analyze_eye_once(
     coverage = np.empty((height, width), dtype=np.uint8)
     pure_regions = np.empty((height, width), dtype=np.uint32)
     pure_bgr = tuple(np.empty((height, width), dtype=np.uint8) for _ in range(3))
-    analysis = QualityVisibilityAnalysis(coverage, pure_regions, pure_bgr)
+    analysis = QualityVisibilityAnalysis(
+        coverage,
+        pure_regions,
+        pure_bgr,
+        anchor_fallbacks_seeded=True,
+    )
     record_arena = np.zeros(QUALITY_REPAIR_RECORD_CAP, dtype=REPAIR_RECORD_DTYPE)
     record_count = 0
     for start_row in range(0, height, band_height):
         end_row = min(height, start_row + band_height)
         band = _quality_splat(renderer, source, geometry, offsets, start_row, end_row)
-        valid, winner_near_score, winner_regions = _write_analysis_band(
+        valid, winner_near_score, winner_regions, winner_bgr = _write_analysis_band(
             analysis,
             band,
             geometry.final_region_map,
@@ -203,7 +217,12 @@ def _analyze_eye_once(
             end_row,
         )
         if not valid.all():
-            built = build_native_repair_records(valid, winner_near_score, winner_regions)
+            built = build_native_repair_records(
+                valid,
+                winner_near_score,
+                winner_regions,
+                winner_bgr=winner_bgr,
+            )
             next_count = record_count + int(built.records.size)
             if next_count > QUALITY_REPAIR_RECORD_CAP:
                 raise QualityRepairBudgetError("64 MiB repair record arena exceeded")
@@ -211,7 +230,7 @@ def _analyze_eye_once(
             destination[:] = built.records
             destination["pixel_index"] += np.uint32(start_row * width)
             record_count = next_count
-        del band, valid, winner_near_score, winner_regions
+        del band, valid, winner_near_score, winner_regions, winner_bgr
     records = record_arena[:record_count]
     records.setflags(write=False)
     return _EyeAnalysisResult(analysis=analysis, records=records)
@@ -323,23 +342,15 @@ def _scatter_repair_records(
     *,
     width: int,
 ) -> int:
-    lane_count = sum(int(record["lane_mask"]).bit_count() for record in records)
-    if lane_count == 0:
+    if records.size == 0:
         return 0
-    indexes = np.empty(lane_count, dtype=np.int64)
-    colours = np.empty((lane_count, 3), dtype=np.float32)
-    cursor = 0
-    for record in records:
-        pixel = int(record["pixel_index"])
-        row, column = divmod(pixel, width)
-        mask = int(record["lane_mask"])
-        for lane in range(HORIZONTAL_SUBPIXELS):
-            if mask & (1 << lane):
-                indexes[cursor] = row * width * HORIZONTAL_SUBPIXELS + column * 16 + lane
-                colours[cursor] = record["fill_bgr"]
-                cursor += 1
-    if cursor != lane_count:
-        raise RuntimeError("Quality repair scatter count changed")
+    raw_records = records.view(np.uint8).reshape(records.size, REPAIR_RECORD_DTYPE.itemsize)
+    indexes, colours = native_kd._require_native().expand_repair_scatter(
+        raw_records,
+        int(colour.shape[0]),
+        width,
+    )
+    lane_count = int(indexes.size)
     device_indexes = torch.from_numpy(indexes).to(colour.device)
     device_colours = torch.from_numpy(colours).to(colour.device)
     colour.reshape(-1, 3).index_copy_(0, device_indexes, device_colours)
@@ -472,9 +483,7 @@ def _quality_limits(
     local_limit = min(safe_limit, geometry.predicted_gap_px)
     return {
         eye: {
-            "max_neighbour_abs_q_jump_px": float(
-                geometry.max_neighbour_abs_q_jump_px
-            ),
+            "max_neighbour_abs_q_jump_px": float(geometry.max_neighbour_abs_q_jump_px),
             "predicted_gap_px": int(geometry.predicted_gap_px),
             "local_limit_px": int(local_limit),
         }
@@ -600,9 +609,7 @@ def render_relative_quality_compact(
     quality_limits = (
         {
             eye: {
-                "max_neighbour_abs_q_jump_px": float(
-                    geometry.max_neighbour_abs_q_jump_px
-                ),
+                "max_neighbour_abs_q_jump_px": float(geometry.max_neighbour_abs_q_jump_px),
                 "predicted_gap_px": int(geometry.predicted_gap_px),
                 "local_limit_px": int(local_limit),
             }

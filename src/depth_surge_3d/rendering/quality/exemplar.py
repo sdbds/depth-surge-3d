@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from . import local_strip
+from . import local_strip, native_kd
 from .local_strip import QualityRepairBudgets, QualityVisibilityAnalysis
 from .repair_records import REPAIR_RECORD_DTYPE
 
@@ -141,39 +141,34 @@ def downsample_exemplar_level(level: ExemplarLevel) -> ExemplarLevel:
     child_height, child_width = level.working_bgr.shape[:2]
     parent_height = (child_height + 1) // 2
     parent_width = (child_width + 1) // 2
-    working = np.zeros((parent_height, parent_width, 3), dtype=np.uint8)
-    donor = np.zeros((parent_height, parent_width), dtype=np.bool_)
+    totals = np.zeros((parent_height, parent_width, 3), dtype=np.uint16)
+    counts = np.zeros((parent_height, parent_width), dtype=np.uint8)
+    donor = np.ones((parent_height, parent_width), dtype=np.bool_)
     target = np.zeros((parent_height, parent_width), dtype=np.bool_)
-    processed = np.zeros((parent_height, parent_width), dtype=np.bool_)
+    processed = np.ones((parent_height, parent_width), dtype=np.bool_)
     barrier = np.zeros((parent_height, parent_width), dtype=np.bool_)
-
-    for parent_row in range(parent_height):
-        for parent_column in range(parent_width):
-            children = _child_coordinates(
-                parent_row,
-                parent_column,
-                child_height,
-                child_width,
-            )
-            is_barrier = any(level.barrier_mask[row, column] for row, column in children)
-            barrier[parent_row, parent_column] = is_barrier
-            if is_barrier:
-                continue
-            is_target = any(level.target_mask[row, column] for row, column in children)
-            target[parent_row, parent_column] = is_target
-            donor[parent_row, parent_column] = all(
-                level.donor_mask[row, column] for row, column in children
-            )
-            processed[parent_row, parent_column] = not is_target and all(
-                level.processed_mask[row, column] for row, column in children
-            )
-            for channel in range(3):
-                total = 0
-                for row, column in children:
-                    total += int(level.working_bgr[row, column, channel])
-                working[parent_row, parent_column, channel] = np.uint8(
-                    _divide_ties_to_even(total, len(children))
-                )
+    for delta_row, delta_column in ((0, 0), (0, 1), (1, 0), (1, 1)):
+        child = level.working_bgr[delta_row::2, delta_column::2]
+        rows, columns = child.shape[:2]
+        if rows == 0 or columns == 0:
+            continue
+        destination = (slice(0, rows), slice(0, columns))
+        totals[destination] += child.astype(np.uint16)
+        counts[destination] += np.uint8(1)
+        donor[destination] &= level.donor_mask[delta_row::2, delta_column::2]
+        target[destination] |= level.target_mask[delta_row::2, delta_column::2]
+        processed[destination] &= level.processed_mask[delta_row::2, delta_column::2]
+        barrier[destination] |= level.barrier_mask[delta_row::2, delta_column::2]
+    divisors = counts[..., None].astype(np.uint16)
+    quotients = totals // divisors
+    remainders = totals % divisors
+    doubled = remainders * np.uint16(2)
+    rounded = quotients + ((doubled > divisors) | ((doubled == divisors) & ((quotients & 1) != 0)))
+    working = np.ascontiguousarray(rounded.astype(np.uint8))
+    working[barrier] = np.uint8(0)
+    target &= ~barrier
+    donor &= ~barrier
+    processed &= ~target & ~barrier
     return ExemplarLevel(working, donor, target, processed, barrier)
 
 
@@ -513,6 +508,12 @@ def _repair_level(
     ):
         return iterations, evaluations
     candidates = enumerate_donor_centres(level.donor_mask)
+    if candidates.size == 0:
+        return iterations, evaluations
+    native = native_kd._require_native()
+    donor_gradient_x, donor_gradient_y = native.build_exemplar_sobel_planes(level.working_bgr)
+    donor_gradient_x.setflags(write=False)
+    donor_gradient_y.setflags(write=False)
     while iterations < _PATCH_ITERATION_CAP:
         if np.all(level.processed_mask[level.target_mask]):
             break
@@ -525,7 +526,7 @@ def _repair_level(
         if remaining <= 0:
             break
         frontier = select_frontier_target(level)
-        if frontier is None or candidates.size == 0:
+        if frontier is None:
             break
         selected = subsample_candidate_indexes(
             candidate_count=int(candidates.shape[0]),
@@ -534,25 +535,21 @@ def _repair_level(
         if selected.size == 0:
             break
         target_row, target_column, _ = frontier
-        best: tuple[int, int, int] | None = None
-        for candidate_index in selected:
-            donor_row = int(candidates[int(candidate_index), 0])
-            donor_column = int(candidates[int(candidate_index), 1])
-            score = _score_patch(
-                level,
-                target_row,
-                target_column,
-                donor_row,
-                donor_column,
-            )
-            key = (score, donor_row, donor_column)
-            if best is None or key < best:
-                best = key
+        selected_best = native.select_exemplar_donor(
+            level.working_bgr,
+            level.processed_mask,
+            level.barrier_mask,
+            target_row,
+            target_column,
+            candidates,
+            selected,
+            donor_gradient_x,
+            donor_gradient_y,
+        )
+        best = tuple(int(value) for value in selected_best)
         charge = int(selected.size)
         evaluations += charge
         budgets.exemplar_eye_evaluations_consumed += charge
-        if best is None:
-            break
         _copy_patch(level, target_row, target_column, best[1], best[2])
         iterations += 1
     return iterations, evaluations

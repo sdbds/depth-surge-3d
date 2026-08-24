@@ -270,7 +270,7 @@ def test_current_numpy_payload_classifies_as_the_frozen_historical_form(tmp_path
     }
 
 
-def test_current_atomic_save_npz_output_is_the_same_frozen_historical_cell(
+def test_current_atomic_save_npz_output_uses_the_owned_zip32_form(
     tmp_path: Path,
 ) -> None:
     from src.depth_surge_3d.processing.frames.metric_geometry import (
@@ -281,15 +281,15 @@ def test_current_atomic_save_npz_output_is_the_same_frozen_historical_cell(
     inverse, valid, focal = _metric_values()
     frame = MetricGeometryFrame(inverse, valid, focal)
     path = tmp_path / "current-atomic.npz"
+    expected_path = tmp_path / "expected-owned.npz"
 
     _atomic_save_npz(path, frame, required_bytes=0)
+    _write_owned(expected_path)
     audit = metric_npz.audit_metric_npz(path, expected_shape=(2, 3))
+    expected = metric_npz.audit_metric_npz(expected_path, expected_shape=(2, 3))
 
-    assert audit.layout.archive_form in {
-        "numpy-force-zip64-local-u32-v1",
-        "numpy-force-zip64-local-sentinel-v1",
-    }
-    assert audit.sha256 == hashlib.sha256(_numpy_history_bytes()).hexdigest()
+    assert audit.layout.archive_form == "owned-zip32-v1"
+    assert audit.sha256 == expected.sha256
 
 
 def test_version_20_historical_golden_classifies_without_runtime_branch(tmp_path: Path) -> None:
