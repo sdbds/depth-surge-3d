@@ -1226,6 +1226,40 @@ class TestProcessMethod:
         assert model.loaded is False
         assert model.unload_count == 1
 
+    def test_process_recovers_root_control_before_vdpp_or_ordinary_audit(self, tmp_path):
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        order: list[str] = []
+        lock = JobWriterLock(tmp_path).acquire()
+        try:
+            with (
+                patch(
+                    "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                    "recover_processing_control_prefix_v1",
+                    side_effect=lambda _root: order.append("control"),
+                ),
+                patch(
+                    "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                    "cleanup_vdpp_private_work",
+                    side_effect=lambda _root, _lock: order.append("vdpp"),
+                ),
+                patch.object(
+                    orchestrator,
+                    "_resume_cleanup_only",
+                    side_effect=lambda _root: order.append("audit") or True,
+                ),
+            ):
+                assert orchestrator.process(
+                    video_path=tmp_path / "source.mp4",
+                    output_dir=tmp_path,
+                    video_properties={"fps": 30, "frame_count": 1},
+                    settings={"keep_intermediates": True},
+                    job_lock=lock,
+                )
+        finally:
+            lock.release()
+
+        assert order == ["control", "vdpp", "audit"]
+
     def test_process_reuses_preacquired_writer_lock_without_releasing_it(self, tmp_path):
         orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
         lock = JobWriterLock(tmp_path).acquire()

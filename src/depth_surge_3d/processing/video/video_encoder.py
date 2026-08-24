@@ -22,6 +22,7 @@ from typing import Any, Literal, cast
 from ...io.operations import (
     get_frame_files,
     get_video_info_ffprobe,
+    recover_processing_control_prefix_v1,
     verify_ffmpeg_installation,
 )
 from ...io.reservation_protocol import (
@@ -168,6 +169,15 @@ class VideoEncoder:
             - Executes FFmpeg subprocess
             - Writes video file to disk
         """
+        try:
+            recover_processing_control_prefix_v1(output_dir)
+        except InterruptedError:
+            raise
+        except ReservationIncompleteError:
+            raise
+        except Exception as error:
+            print(f"Error recovering schema-5 video publication: {error}")
+            return False
         active_index = output_dir / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
         recover_before_dependency_gate = active_index.is_file()
         if not recover_before_dependency_gate and not verify_ffmpeg_installation():
@@ -354,9 +364,9 @@ class VideoEncoder:
         settings: dict[str, Any],
     ) -> _Schema5EncodingContext | None:
         settings_path = output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH
-        if not settings_path.is_file():
+        artifact = recover_processing_control_prefix_v1(output_dir)
+        if artifact is None:
             return None
-        artifact = ProcessingSettingsArtifactV5.parse(settings_path.read_bytes())
         frame_count = 0
         first_index: int | None = None
         last_index: int | None = None
@@ -397,9 +407,9 @@ class VideoEncoder:
         settings: dict[str, Any],
     ) -> _Schema5EncodingContext | None:
         settings_path = output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH
-        if not settings_path.is_file():
+        artifact = recover_processing_control_prefix_v1(output_dir)
+        if artifact is None:
             return None
-        artifact = ProcessingSettingsArtifactV5.parse(settings_path.read_bytes())
         root = output_dir.resolve()
         left_parent = sequence.left_pattern.parent.resolve().relative_to(root)
         right_parent = sequence.right_pattern.parent.resolve().relative_to(root)
@@ -1038,6 +1048,15 @@ class VideoEncoder:
     ) -> bool:
         """Encode validated eye sequences and atomically publish the final video."""
 
+        try:
+            recover_processing_control_prefix_v1(output_dir)
+        except InterruptedError:
+            raise
+        except ReservationIncompleteError:
+            raise
+        except Exception as error:
+            print(f"Error recovering schema-5 video publication: {error}")
+            return False
         temporary: Path | None = None
         legacy_output_path: Path | None = None
         if not (output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH).is_file():

@@ -7,10 +7,13 @@ import errno
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import re
 import struct
 import sys
 import time
+from contextlib import contextmanager
+from io import BufferedIOBase
 from typing import TYPE_CHECKING, Callable, Literal
 
 from .canonical_json import CanonicalJsonError, strict_canonical_json_loads
@@ -21,6 +24,8 @@ from .file_identity import (
     PersistentIdentitySchemaError,
     capture_directory_identity,
     capture_file_identity,
+    directory_identity_from_posix_fd,
+    file_identity_from_posix_fd,
     windows_identity_from_handle,
 )
 
@@ -79,6 +84,19 @@ def canonical_json_bytes(value: object) -> bytes:
 
 def sha256_canonical(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _stream_file_sha256_count(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    count = 0
+    with Path(path).open("rb", buffering=0) as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            count += len(chunk)
+    return digest.hexdigest(), count
 
 
 def _allocate(raw: int, allocation_unit: int) -> int:
@@ -171,36 +189,396 @@ def _sync_parent(path: Path) -> None:
         os.close(descriptor)
 
 
+@contextmanager
+def _open_relative_regular_file(
+    path: Path,
+    *,
+    writable: bool,
+    create: bool,
+    exclusive: bool = False,
+):
+    """Open one child without following it while retaining its authenticated parent."""
+
+    path = Path(path)
+    if path.name in {"", ".", ".."}:
+        raise ReservationConflictError("relative control filename is invalid")
+    if os.name != "nt":
+        parent_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        parent_fd = os.open(path.parent, parent_flags)
+        child_fd = -1
+        try:
+            parent_identity = directory_identity_from_posix_fd(parent_fd)
+            child_flags = (
+                (os.O_RDWR if writable else os.O_RDONLY)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            if create:
+                child_flags |= os.O_CREAT
+            if exclusive:
+                child_flags |= os.O_EXCL
+            child_fd = os.open(path.name, child_flags, 0o600, dir_fd=parent_fd)
+            identity = file_identity_from_posix_fd(child_fd)
+            if identity.link_count != 1:
+                raise ReservationConflictError("control file is not single-link")
+            mode = "r+b" if writable else "rb"
+            with os.fdopen(child_fd, mode, buffering=0, closefd=True) as handle:
+                child_fd = -1
+                yield handle, identity, parent_identity
+            if directory_identity_from_posix_fd(parent_fd) != parent_identity:
+                raise ReservationConflictError("control parent identity changed")
+        finally:
+            if child_fd >= 0:
+                os.close(child_fd)
+            os.close(parent_fd)
+        return
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class IoStatusBlock(ctypes.Structure):
+        _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_void_p)]
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.USHORT),
+            ("maximum_length", wintypes.USHORT),
+            ("buffer", wintypes.LPWSTR),
+        ]
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.ULONG),
+            ("root_directory", wintypes.HANDLE),
+            ("object_name", ctypes.POINTER(UnicodeString)),
+            ("attributes", wintypes.ULONG),
+            ("security_descriptor", wintypes.LPVOID),
+            ("security_qos", wintypes.LPVOID),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    nt_create_file = ntdll.NtCreateFile
+    nt_create_file.argtypes = (
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        ctypes.POINTER(ObjectAttributes),
+        ctypes.POINTER(IoStatusBlock),
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    nt_create_file.restype = ctypes.c_long
+    ntstatus_to_error = ntdll.RtlNtStatusToDosError
+    ntstatus_to_error.argtypes = (ctypes.c_long,)
+    ntstatus_to_error.restype = wintypes.DWORD
+    invalid_handle = ctypes.c_void_p(-1).value
+    parent_handle = create_file(
+        str(path.parent),
+        0x80000000 | 0x00100000,
+        0x1 | 0x2 | 0x4,
+        None,
+        3,
+        0x00200000 | 0x02000000,
+        None,
+    )
+    if parent_handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    raw_parent = int(parent_handle)
+    child_value = -1
+    child_fd = -1
+    try:
+        parent_inner, _links, _attributes = windows_identity_from_handle(
+            raw_parent,
+            require_directory=True,
+        )
+        parent_identity = DirectoryIdentity("windows", parent_inner)
+        name_buffer = ctypes.create_unicode_buffer(path.name)
+        name_bytes = path.name.encode("utf-16-le")
+        unicode_name = UnicodeString(
+            len(name_bytes),
+            len(name_bytes) + 2,
+            ctypes.cast(name_buffer, wintypes.LPWSTR),
+        )
+        attributes = ObjectAttributes(
+            ctypes.sizeof(ObjectAttributes),
+            wintypes.HANDLE(raw_parent),
+            ctypes.pointer(unicode_name),
+            0x40,
+            None,
+            None,
+        )
+        child = wintypes.HANDLE()
+        io_status = IoStatusBlock()
+        access = 0x80000000 | 0x00100000
+        if writable:
+            access |= 0x40000000 | 0x00010000
+        status = int(
+            nt_create_file(
+                ctypes.byref(child),
+                access,
+                ctypes.byref(attributes),
+                ctypes.byref(io_status),
+                None,
+                0,
+                0x1 | 0x2 | 0x4,
+                2 if exclusive else 3 if create else 1,
+                0x00200000 | 0x20 | 0x40,
+                None,
+                0,
+            )
+        )
+        if status < 0:
+            raise ctypes.WinError(int(ntstatus_to_error(status)))
+        if child.value is None:
+            raise ReservationCapabilityError("NtCreateFile returned a null control handle")
+        child_value = int(child.value)
+        inner, link_count, _attributes = windows_identity_from_handle(
+            child_value,
+            require_directory=False,
+        )
+        if link_count != 1:
+            raise ReservationConflictError("control file is not single-link")
+        identity = ReservationFileIdentity("windows", inner, link_count)
+        flags = (os.O_RDWR if writable else os.O_RDONLY) | getattr(os, "O_BINARY", 0)
+        child_fd = msvcrt.open_osfhandle(child_value, flags)
+        child_value = -1
+        mode = "r+b" if writable else "rb"
+        with os.fdopen(child_fd, mode, buffering=0, closefd=True) as handle:
+            child_fd = -1
+            yield handle, identity, parent_identity
+        current_parent, _links, _attributes = windows_identity_from_handle(
+            raw_parent,
+            require_directory=True,
+        )
+        if DirectoryIdentity("windows", current_parent) != parent_identity:
+            raise ReservationConflictError("control parent identity changed")
+    finally:
+        if child_fd >= 0:
+            os.close(child_fd)
+        if child_value not in {-1, invalid_handle}:
+            close_handle(wintypes.HANDLE(child_value))
+        close_handle(wintypes.HANDLE(raw_parent))
+
+
+def _read_bounded_regular_file(path: Path, *, max_bytes: int) -> bytes:
+    if max_bytes <= 0:
+        raise ValueError("bounded read limit must be positive")
+    try:
+        with _open_relative_regular_file(
+            path,
+            writable=False,
+            create=False,
+        ) as (handle, _identity_value, _parent_identity):
+            assert isinstance(handle, BufferedIOBase) or hasattr(handle, "read")
+            size = os.fstat(handle.fileno()).st_size
+            if size > max_bytes:
+                raise ReservationConflictError(f"control artifact exceeds {max_bytes} bytes")
+            raw = handle.read(size + 1)
+            if len(raw) != size:
+                raise ReservationConflictError("control artifact changed during bounded read")
+            return raw
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        if getattr(error, "winerror", None) in {2, 3} or error.errno == errno.ENOENT:
+            raise FileNotFoundError(path) from error
+        raise
+
+
+def _write_control_temporary(
+    path: Path,
+    raw: bytes,
+    *,
+    event: Callable[[str], None] | None,
+) -> tuple[ReservationFileIdentity, DirectoryIdentity]:
+    with _open_relative_regular_file(
+        path,
+        writable=True,
+        create=True,
+        exclusive=True,
+    ) as (handle, identity, parent_identity):
+        handle.truncate(0)
+        handle.seek(0)
+        for offset in range(0, len(raw), CONTROL_ARTIFACT_WRITE_CHUNK_BYTES):
+            chunk = raw[offset : offset + CONTROL_ARTIFACT_WRITE_CHUNK_BYTES]
+            if handle.write(chunk) != len(chunk):
+                raise OSError("short control-artifact write")
+        if event is not None:
+            event("index:temporary")
+        handle.flush()
+        os.fsync(handle.fileno())
+        if os.fstat(handle.fileno()).st_size != len(raw):
+            raise ReservationConflictError("control temporary EOF changed")
+        return identity, parent_identity
+
+
+def _unlink_safe_control_temporary(
+    path: Path,
+    *,
+    expected_identity: ReservationFileIdentity | None = None,
+    expected_parent_identity: DirectoryIdentity | None = None,
+) -> None:
+    path = Path(path)
+    if not (path.exists() or path.is_symlink()):
+        return
+    if os.name != "nt":
+        parent_fd = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        child_fd = -1
+        try:
+            parent_identity = directory_identity_from_posix_fd(parent_fd)
+            child_fd = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            identity = file_identity_from_posix_fd(child_fd)
+            if expected_parent_identity is not None and parent_identity != expected_parent_identity:
+                raise ReservationConflictError("control temporary parent identity changed")
+            if expected_identity is not None and identity != expected_identity:
+                raise ReservationConflictError("control temporary identity changed")
+            if identity.link_count != 1:
+                raise ReservationConflictError("control temporary is not single-link")
+            os.unlink(path.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            if directory_identity_from_posix_fd(parent_fd) != parent_identity:
+                raise ReservationConflictError("control temporary parent changed")
+        finally:
+            if child_fd >= 0:
+                os.close(child_fd)
+            os.close(parent_fd)
+        return
+    with _open_relative_regular_file(
+        path,
+        writable=True,
+        create=False,
+    ) as (handle, opened_identity, parent_identity):
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        class FileDispositionInfo(ctypes.Structure):
+            _fields_ = [("delete_file", wintypes.BOOL)]
+
+        native = msvcrt.get_osfhandle(handle.fileno())
+        current_inner, link_count, _attributes = windows_identity_from_handle(
+            native,
+            require_directory=False,
+        )
+        current_identity = ReservationFileIdentity("windows", current_inner, link_count)
+        if current_identity != opened_identity:
+            raise ReservationConflictError("control temporary identity changed")
+        if expected_identity is not None and current_identity != expected_identity:
+            raise ReservationConflictError("control temporary identity changed")
+        if expected_parent_identity is not None and parent_identity != expected_parent_identity:
+            raise ReservationConflictError("control temporary parent identity changed")
+        set_information = ctypes.WinDLL(
+            "kernel32", use_last_error=True
+        ).SetFileInformationByHandle
+        set_information.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        set_information.restype = wintypes.BOOL
+        disposition = FileDispositionInfo(True)
+        if not set_information(
+            wintypes.HANDLE(native),
+            4,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if parent_identity != _directory_identity(path.parent):
+            raise ReservationConflictError("control temporary parent changed")
+
+
 def _write_json_file(path: Path, payload: dict, *, event: Callable[[str], None] | None) -> None:
     raw = canonical_json_bytes(payload)
     temporary = path.with_name(f".{path.name}.create-new.tmp")
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        if path.read_bytes() != raw:
+    if path.exists() or path.is_symlink():
+        if _read_bounded_regular_file(path, max_bytes=max(len(raw), 1)) != raw:
             raise ReservationConflictError(f"authoritative control artifact differs: {path}")
-        temporary.unlink(missing_ok=True)
+        _unlink_safe_control_temporary(temporary)
         return
-    try:
-        with temporary.open("w+b") as handle:
-            for offset in range(0, len(raw), CONTROL_ARTIFACT_WRITE_CHUNK_BYTES):
-                chunk = raw[offset : offset + CONTROL_ARTIFACT_WRITE_CHUNK_BYTES]
-                if handle.write(chunk) != len(chunk):
-                    raise OSError("short control-artifact write")
-            if event is not None:
-                event("index:temporary")
-            handle.flush()
-            os.fsync(handle.fileno())
-        if path.exists():
-            raise ReservationConflictError(f"control artifact appeared during publication: {path}")
-        os.replace(temporary, path)
-        _sync_parent(path.parent)
-        if path.read_bytes() != raw:
-            raise ReservationConflictError(f"published control artifact failed reopen: {path}")
+    if temporary.exists() or temporary.is_symlink():
+        if _read_bounded_regular_file(temporary, max_bytes=max(len(raw), 1)) != raw:
+            raise ReservationIncompleteError(
+                f"control temporary is an incomplete durable prefix: {temporary}"
+            )
+        with _open_relative_regular_file(
+            temporary,
+            writable=False,
+            create=False,
+        ) as (_handle, source_identity, parent_identity):
+            pass
+        same_parent_replace_v1(
+            temporary,
+            path,
+            expected_source_identity=source_identity,
+            expected_target_identity=None,
+            expected_parent_identity=parent_identity,
+            replace_existing=False,
+        )
+        if _read_bounded_regular_file(path, max_bytes=max(len(raw), 1)) != raw:
+            raise ReservationConflictError(
+                f"published control artifact failed reopen: {path}"
+            )
         if event is not None:
             event("index:published")
-    finally:
-        if not path.exists():
-            temporary.unlink(missing_ok=True)
+        return
+    source_identity, parent_identity = _write_control_temporary(
+        temporary,
+        raw,
+        event=event,
+    )
+    if _read_bounded_regular_file(temporary, max_bytes=max(len(raw), 1)) != raw:
+        raise ReservationConflictError("control temporary failed reopen validation")
+    same_parent_replace_v1(
+        temporary,
+        path,
+        expected_source_identity=source_identity,
+        expected_target_identity=None,
+        expected_parent_identity=parent_identity,
+        replace_existing=False,
+    )
+    if _read_bounded_regular_file(path, max_bytes=max(len(raw), 1)) != raw:
+        raise ReservationConflictError(f"published control artifact failed reopen: {path}")
+    if event is not None:
+        event("index:published")
 
 
 def publish_write_ahead_intent(
@@ -215,6 +593,78 @@ def publish_write_ahead_intent(
         if error.errno == errno.ENOSPC or getattr(error, "winerror", None) == 112:
             raise ReservationIncompleteError(f"namespace reservation incomplete: {path}") from error
         raise
+
+
+def recover_control_artifact_pair_v1(
+    path: Path,
+    *,
+    max_bytes: int,
+    parser: Callable[[bytes], object],
+    prepublish_validate: Callable[[object], None] | None = None,
+    preunlink_validate: Callable[[], None] | None = None,
+) -> object | None:
+    """Recover one deterministic create-new final/temporary pair without caller state."""
+
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.create-new.tmp")
+    final_present = path.exists() or path.is_symlink()
+    temporary_present = temporary.exists() or temporary.is_symlink()
+    if not final_present and not temporary_present:
+        return None
+    if final_present:
+        raw = _read_bounded_regular_file(path, max_bytes=max_bytes)
+        try:
+            result = parser(raw)
+        except Exception as error:
+            raise ReservationConflictError(
+                f"authoritative control artifact is malformed: {path}"
+            ) from error
+        if temporary_present:
+            _unlink_safe_control_temporary(temporary)
+            _sync_parent(temporary.parent)
+        return result
+    raw = _read_bounded_regular_file(temporary, max_bytes=max_bytes)
+    try:
+        result = parser(raw)
+    except Exception:
+        if preunlink_validate is not None:
+            preunlink_validate()
+        _unlink_safe_control_temporary(temporary)
+        _sync_parent(temporary.parent)
+        return None
+    if prepublish_validate is not None:
+        try:
+            prepublish_validate(result)
+        except ReservationError:
+            raise
+        except Exception as error:
+            raise ReservationConflictError(
+                f"control temporary prepublication validation failed: {temporary}"
+            ) from error
+    with _open_relative_regular_file(
+        temporary,
+        writable=False,
+        create=False,
+    ) as (_handle, source_identity, parent_identity):
+        pass
+    same_parent_replace_v1(
+        temporary,
+        path,
+        expected_source_identity=source_identity,
+        expected_target_identity=None,
+        expected_parent_identity=parent_identity,
+        replace_existing=False,
+    )
+    reopened = _read_bounded_regular_file(path, max_bytes=max_bytes)
+    try:
+        reparsed = parser(reopened)
+    except Exception as error:
+        raise ReservationConflictError(
+            f"recovered control artifact failed reopen: {path}"
+        ) from error
+    if reparsed != result:
+        raise ReservationConflictError("control artifact changed across recovery rename")
+    return reparsed
 
 
 def materialize_after_index(
@@ -701,65 +1151,188 @@ def same_parent_replace_v1(
             replace_existing=replace_existing,
         )
         return
-    if _directory_identity(Path(source_path).parent) != expected_parent_identity:
-        raise ReservationConflictError("rename parent identity changed")
-    if _identity(Path(source_path)) != expected_source_identity:
-        raise ReservationConflictError("rename source identity changed")
-    if replace_existing:
-        if (
-            expected_target_identity is None
-            or _identity(Path(target_path)) != expected_target_identity
-        ):
-            raise ReservationConflictError("rename old target identity changed")
-        os.replace(source_path, target_path)
-    else:
-        if Path(target_path).exists() or Path(target_path).is_symlink():
-            raise ReservationConflictError("create-new rename target appeared")
-        os.rename(source_path, target_path)
-    _sync_parent(Path(target_path).parent)
+    source = Path(source_path)
+    target = Path(target_path)
+    if source.parent != target.parent:
+        raise ReservationConflictError("rename paths do not share one parent")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    parent_fd = os.open(source.parent, flags)
+    source_fd = -1
+    try:
+        if directory_identity_from_posix_fd(parent_fd) != expected_parent_identity:
+            raise ReservationConflictError("rename parent identity changed")
+        source_fd = os.open(
+            source.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        if file_identity_from_posix_fd(source_fd) != expected_source_identity:
+            raise ReservationConflictError("rename source identity changed")
+        try:
+            target_identity = _identity(target)
+        except FileNotFoundError:
+            target_identity = None
+        if replace_existing:
+            if expected_target_identity is None or target_identity != expected_target_identity:
+                raise ReservationConflictError("rename old target identity changed")
+            os.replace(
+                source.name,
+                target.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+        else:
+            if target_identity is not None:
+                raise ReservationConflictError("create-new rename target appeared")
+            if not sys.platform.startswith("linux"):
+                raise ReservationCapabilityError("atomic no-replace rename is Linux-only")
+            import ctypes
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            renameat2 = getattr(libc, "renameat2", None)
+            if renameat2 is None:
+                raise ReservationCapabilityError("renameat2 is unavailable")
+            renameat2.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            renameat2.restype = ctypes.c_int
+            if renameat2(
+                parent_fd,
+                os.fsencode(source.name),
+                parent_fd,
+                os.fsencode(target.name),
+                1,
+            ) != 0:
+                code = ctypes.get_errno()
+                if code in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise ReservationConflictError("create-new rename target appeared")
+                if code in {errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTTY}:
+                    raise ReservationCapabilityError("renameat2 no-replace is unsupported")
+                raise OSError(code, os.strerror(code))
+        os.fsync(parent_fd)
+        if directory_identity_from_posix_fd(parent_fd) != expected_parent_identity:
+            raise ReservationConflictError("rename parent identity changed after sync")
+        if _identity(target) != expected_source_identity:
+            raise ReservationConflictError("renamed target identity changed after sync")
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        os.close(parent_fd)
 
 
 @dataclass(frozen=True)
 class ReservationDescriptor:
-    index_relative_path: str
-    descriptor_relative_path: str
-    source_relative_path: str
-    target_relative_path: str
+    job_id: str
+    settings_artifact_relative_path: str
+    settings_identity_fingerprint: str
+    settings_revision_at_creation: int | None
+    settings_raw_sha256_at_creation: str | None
+    publication_generation: str | None
+    reservation_generation: str
+    reservation_id: str
     reservation_kind: str
+    transaction_index_relative_path: str
+    transaction_index_fingerprint: str
+    source_extent_relative_path: str
+    temporary_relative_path: str
+    target_relative_path: str
+    target_parent_identity: DirectoryIdentity
     publication_method: PublicationMethod
+    existing_target_identity_at_preflight: ReservationFileIdentity | None
+    existing_target_byte_count_at_preflight: int | None
+    existing_target_raw_sha256_at_preflight: str | None
+    reserved_placeholder_identity: ReservationFileIdentity | None
+    payload_role: str
     payload_raw_max: int
     logical_byte_count: int
-    allocation_unit: int
-    generation: str
-    reservation_id: str
-    filesystem_identity: ReservationFileIdentity
-    placeholder_identity: ReservationFileIdentity | None
     allocation_evidence_at_readiness: ReservationAllocationEvidence
+    allocation_unit: int
+    filesystem_identity: ReservationFileIdentity
+    prune_root_relative_path: str | None
+    marker_name: str | None
+    marker_payload_sha256: str | None
     fingerprint: str
 
     def _base_object(self) -> dict:
         return {
             "schema_version": 1,
-            "algorithm_version": "reservation-extent-task0-v1",
-            "index_relative_path": self.index_relative_path,
-            "descriptor_relative_path": self.descriptor_relative_path,
-            "source_relative_path": self.source_relative_path,
-            "target_relative_path": self.target_relative_path,
-            "reservation_kind": self.reservation_kind,
-            "publication_method": self.publication_method,
-            "payload_raw_max": self.payload_raw_max,
-            "logical_byte_count": self.logical_byte_count,
-            "allocation_unit": self.allocation_unit,
-            "generation": self.generation,
+            "algorithm_version": "reservation-extent-v1",
+            "job_id": self.job_id,
+            "settings_artifact_relative_path": self.settings_artifact_relative_path,
+            "settings_identity_fingerprint": self.settings_identity_fingerprint,
+            "settings_revision_at_creation": self.settings_revision_at_creation,
+            "settings_raw_sha256_at_creation": self.settings_raw_sha256_at_creation,
+            "publication_generation": self.publication_generation,
+            "reservation_generation": self.reservation_generation,
             "reservation_id": self.reservation_id,
-            "filesystem_identity": self.filesystem_identity.to_object(),
-            "placeholder_identity": (
-                self.placeholder_identity.to_object()
-                if self.placeholder_identity is not None
+            "reservation_kind": self.reservation_kind,
+            "transaction_index_relative_path": self.transaction_index_relative_path,
+            "transaction_index_fingerprint": self.transaction_index_fingerprint,
+            "source_extent_relative_path": self.source_extent_relative_path,
+            "temporary_relative_path": self.temporary_relative_path,
+            "target_relative_path": self.target_relative_path,
+            "target_parent_identity": self.target_parent_identity.to_object(),
+            "publication_method": self.publication_method,
+            "existing_target_identity_at_preflight": (
+                self.existing_target_identity_at_preflight.to_object()
+                if self.existing_target_identity_at_preflight is not None
                 else None
             ),
+            "existing_target_byte_count_at_preflight": (
+                self.existing_target_byte_count_at_preflight
+            ),
+            "existing_target_raw_sha256_at_preflight": (
+                self.existing_target_raw_sha256_at_preflight
+            ),
+            "reserved_placeholder_identity": (
+                self.reserved_placeholder_identity.to_object()
+                if self.reserved_placeholder_identity is not None
+                else None
+            ),
+            "payload_role": self.payload_role,
+            "payload_raw_max": self.payload_raw_max,
+            "logical_byte_count": self.logical_byte_count,
             "allocation_evidence_at_readiness": self.allocation_evidence_at_readiness.to_object(),
+            "allocation_unit": self.allocation_unit,
+            "filesystem_identity": self.filesystem_identity.to_object(),
+            "prune_root_relative_path": self.prune_root_relative_path,
+            "marker_name": self.marker_name,
+            "marker_payload_sha256": self.marker_payload_sha256,
         }
+
+    @property
+    def index_relative_path(self) -> str:
+        return self.transaction_index_relative_path
+
+    @property
+    def generation(self) -> str:
+        return self.reservation_generation
+
+    @property
+    def source_relative_path(self) -> str:
+        return self.source_extent_relative_path
+
+    @property
+    def placeholder_identity(self) -> ReservationFileIdentity | None:
+        return self.reserved_placeholder_identity
+
+    @property
+    def descriptor_relative_path(self) -> str:
+        publication = self.publication_generation or "none"
+        name = (
+            f"d-p-{publication}-r-{self.reservation_generation}-"
+            f"{self.reservation_kind}-{self.reservation_id}.json"
+        )
+        return (Path(".depth-surge-reservations-v1") / name).as_posix()
 
     def to_object(self) -> dict:
         return {**self._base_object(), "fingerprint": self.fingerprint}
@@ -771,32 +1344,393 @@ class ReservationDescriptor:
 
     @classmethod
     def from_object(cls, value: dict) -> ReservationDescriptor:
+        expected = {
+            "schema_version",
+            "algorithm_version",
+            "job_id",
+            "settings_artifact_relative_path",
+            "settings_identity_fingerprint",
+            "settings_revision_at_creation",
+            "settings_raw_sha256_at_creation",
+            "publication_generation",
+            "reservation_generation",
+            "reservation_id",
+            "reservation_kind",
+            "transaction_index_relative_path",
+            "transaction_index_fingerprint",
+            "source_extent_relative_path",
+            "temporary_relative_path",
+            "target_relative_path",
+            "target_parent_identity",
+            "publication_method",
+            "existing_target_identity_at_preflight",
+            "existing_target_byte_count_at_preflight",
+            "existing_target_raw_sha256_at_preflight",
+            "reserved_placeholder_identity",
+            "payload_role",
+            "payload_raw_max",
+            "logical_byte_count",
+            "allocation_evidence_at_readiness",
+            "allocation_unit",
+            "filesystem_identity",
+            "prune_root_relative_path",
+            "marker_name",
+            "marker_payload_sha256",
+            "fingerprint",
+        }
+        if type(value) is not dict or set(value) != expected:
+            raise ReservationConflictError("reservation descriptor schema is not closed")
+        if (
+            type(value["schema_version"]) is not int
+            or value["schema_version"] != 1
+            or value["algorithm_version"] != "reservation-extent-v1"
+            or value["settings_artifact_relative_path"]
+            != SETTINGS_ARTIFACT_RELATIVE_PATH.as_posix()
+        ):
+            raise ReservationConflictError("reservation descriptor version is invalid")
+        nullable_revision = value["settings_revision_at_creation"]
+        nullable_settings_hash = value["settings_raw_sha256_at_creation"]
+        if (nullable_revision is None) != (nullable_settings_hash is None):
+            raise ReservationConflictError("reservation settings preflight pair is incomplete")
+        if nullable_revision is not None and (
+            type(nullable_revision) is not int or not 0 <= nullable_revision <= 2**64 - 1
+        ):
+            raise ReservationConflictError("reservation settings revision is invalid")
+        if nullable_settings_hash is not None:
+            _require_lower_hex(nullable_settings_hash, 64, "reservation settings hash")
+        publication = value["publication_generation"]
+        if publication is not None:
+            _require_lower_hex(publication, 32, "reservation publication generation")
+        for key, digits, label in (
+            ("job_id", 32, "reservation job id"),
+            ("settings_identity_fingerprint", 64, "reservation settings identity"),
+            ("reservation_generation", 32, "reservation generation"),
+            ("reservation_id", 32, "reservation id"),
+            ("transaction_index_fingerprint", 64, "reservation index fingerprint"),
+            ("fingerprint", 64, "reservation descriptor fingerprint"),
+        ):
+            _require_lower_hex(value[key], digits, label)
+        if value["reservation_kind"] not in _RESERVATION_KINDS:
+            raise ReservationConflictError("reservation descriptor kind is invalid")
+        for key in (
+            "transaction_index_relative_path",
+            "source_extent_relative_path",
+            "temporary_relative_path",
+            "target_relative_path",
+        ):
+            _canonical_job_relative_path(value[key], key.replace("_", " "))
+        if value["source_extent_relative_path"] != value["temporary_relative_path"]:
+            raise ReservationConflictError("reservation source/temporary paths differ")
+        if value["publication_method"] not in {"replace_placeholder", "replace_existing"}:
+            raise ReservationConflictError("reservation publication method is invalid")
+        for key in ("payload_raw_max", "logical_byte_count", "allocation_unit"):
+            if type(value[key]) is not int or value[key] <= 0:
+                raise ReservationConflictError(f"{key} is invalid")
+        if value["logical_byte_count"] != payload_logical_bytes(
+            value["payload_raw_max"], value["allocation_unit"]
+        ):
+            raise ReservationConflictError("reservation logical length equation is invalid")
         descriptor = cls(
-            index_relative_path=value["index_relative_path"],
-            descriptor_relative_path=value["descriptor_relative_path"],
-            source_relative_path=value["source_relative_path"],
-            target_relative_path=value["target_relative_path"],
-            reservation_kind=value["reservation_kind"],
-            publication_method=value["publication_method"],
-            payload_raw_max=int(value["payload_raw_max"]),
-            logical_byte_count=int(value["logical_byte_count"]),
-            allocation_unit=int(value["allocation_unit"]),
-            generation=value["generation"],
+            job_id=value["job_id"],
+            settings_artifact_relative_path=value["settings_artifact_relative_path"],
+            settings_identity_fingerprint=value["settings_identity_fingerprint"],
+            settings_revision_at_creation=value["settings_revision_at_creation"],
+            settings_raw_sha256_at_creation=value["settings_raw_sha256_at_creation"],
+            publication_generation=value["publication_generation"],
+            reservation_generation=value["reservation_generation"],
             reservation_id=value["reservation_id"],
-            filesystem_identity=ReservationFileIdentity.from_object(value["filesystem_identity"]),
-            placeholder_identity=(
-                ReservationFileIdentity.from_object(value["placeholder_identity"])
-                if value["placeholder_identity"] is not None
+            reservation_kind=value["reservation_kind"],
+            transaction_index_relative_path=value["transaction_index_relative_path"],
+            transaction_index_fingerprint=value["transaction_index_fingerprint"],
+            source_extent_relative_path=value["source_extent_relative_path"],
+            temporary_relative_path=value["temporary_relative_path"],
+            target_relative_path=value["target_relative_path"],
+            target_parent_identity=DirectoryIdentity.from_object(value["target_parent_identity"]),
+            publication_method=value["publication_method"],
+            existing_target_identity_at_preflight=(
+                ReservationFileIdentity.from_object(
+                    value["existing_target_identity_at_preflight"]
+                )
+                if value["existing_target_identity_at_preflight"] is not None
                 else None
             ),
+            existing_target_byte_count_at_preflight=value[
+                "existing_target_byte_count_at_preflight"
+            ],
+            existing_target_raw_sha256_at_preflight=value[
+                "existing_target_raw_sha256_at_preflight"
+            ],
+            reserved_placeholder_identity=(
+                ReservationFileIdentity.from_object(value["reserved_placeholder_identity"])
+                if value["reserved_placeholder_identity"] is not None
+                else None
+            ),
+            payload_role=value["payload_role"],
+            payload_raw_max=value["payload_raw_max"],
+            logical_byte_count=value["logical_byte_count"],
             allocation_evidence_at_readiness=ReservationAllocationEvidence.from_object(
                 value["allocation_evidence_at_readiness"]
             ),
+            allocation_unit=value["allocation_unit"],
+            filesystem_identity=ReservationFileIdentity.from_object(value["filesystem_identity"]),
+            prune_root_relative_path=value["prune_root_relative_path"],
+            marker_name=value["marker_name"],
+            marker_payload_sha256=value["marker_payload_sha256"],
             fingerprint=value["fingerprint"],
         )
         if descriptor.fingerprint != sha256_canonical(descriptor._base_object()):
             raise ReservationConflictError("reservation descriptor fingerprint is invalid")
         return descriptor
+
+
+_RESERVATION_ENTRY_KEYS = {
+    "reservation_generation",
+    "reservation_id",
+    "reservation_kind",
+    "descriptor_publication_generation",
+    "descriptor_relative_path",
+    "source_extent_relative_path",
+    "temporary_relative_path",
+    "target_relative_path",
+    "target_parent_identity",
+    "publication_method",
+    "existing_target_identity_at_preflight",
+    "existing_target_byte_count_at_preflight",
+    "existing_target_raw_sha256_at_preflight",
+    "payload_role",
+    "payload_raw_max",
+    "logical_byte_count",
+    "allocation_unit",
+    "prune_root_relative_path",
+    "marker_name",
+    "marker_payload_sha256",
+}
+_RESERVATION_KINDS = {
+    "initial_settings",
+    "migration_settings",
+    "job_terminal_settings",
+    "nonterminal_settings",
+    "producer_settings",
+    "cleanup_pending_settings",
+    "encoding_input_manifest",
+    "final_video_manifest",
+    "prune_marker",
+    "diagnostics_payload_pruned",
+}
+_PAYLOAD_ROLES = {
+    "initial_settings": "settings_initial",
+    "migration_settings": "settings_migration",
+    "job_terminal_settings": "settings_terminal",
+    "nonterminal_settings": "settings_nonterminal",
+    "producer_settings": "settings_producer",
+    "cleanup_pending_settings": "settings_cleanup_pending",
+    "encoding_input_manifest": "encoding_input_manifest",
+    "final_video_manifest": "final_video_manifest",
+    "prune_marker": "prune_marker",
+    "diagnostics_payload_pruned": "diagnostics_payload_pruned",
+}
+
+
+def _canonical_job_relative_path(value: object, label: str) -> str:
+    if type(value) is not str or not value or "\\" in value or "\x00" in value:
+        raise ReservationConflictError(f"{label} is not a canonical relative path")
+    path = PurePosixPath(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ReservationConflictError(f"{label} is not a canonical relative path")
+    if path.as_posix() != value:
+        raise ReservationConflictError(f"{label} is not a canonical relative path")
+    return value
+
+
+def validate_reservation_entry_v1(value: object) -> dict:
+    """Parse the exact pre-materialization authority for one reserved extent."""
+
+    if type(value) is not dict or set(value) != _RESERVATION_ENTRY_KEYS:
+        raise ReservationConflictError("reservation entry schema is not closed")
+    assert isinstance(value, dict)
+    generation = _require_lower_hex(
+        value["reservation_generation"], 32, "reservation generation"
+    )
+    reservation_id = _require_lower_hex(value["reservation_id"], 32, "reservation id")
+    kind = value["reservation_kind"]
+    if kind not in _RESERVATION_KINDS:
+        raise ReservationConflictError("reservation entry kind is invalid")
+    publication = value["descriptor_publication_generation"]
+    if publication is not None:
+        publication = _require_lower_hex(publication, 32, "descriptor publication generation")
+    descriptor = _canonical_job_relative_path(
+        value["descriptor_relative_path"], "descriptor relative path"
+    )
+    expected_descriptor = (
+        Path(".depth-surge-reservations-v1")
+        / (
+            f"d-p-{publication or 'none'}-r-{generation}-{kind}-{reservation_id}.json"
+        )
+    ).as_posix()
+    if descriptor != expected_descriptor:
+        raise ReservationConflictError("reservation descriptor name is not canonical")
+    source = _canonical_job_relative_path(
+        value["source_extent_relative_path"], "source extent relative path"
+    )
+    temporary = _canonical_job_relative_path(
+        value["temporary_relative_path"], "temporary relative path"
+    )
+    target = _canonical_job_relative_path(value["target_relative_path"], "target relative path")
+    expected_source_name = f".depth-surge-r-{generation}-{kind}-{reservation_id}.reserved"
+    if source != temporary or PurePosixPath(source).name != expected_source_name:
+        raise ReservationConflictError("reservation source/temporary mapping is invalid")
+    if PurePosixPath(source).parent != PurePosixPath(target).parent:
+        raise ReservationConflictError("reservation source is not target-local")
+    DirectoryIdentity.from_object(value["target_parent_identity"])
+    method = value["publication_method"]
+    if method not in {"replace_placeholder", "replace_existing"}:
+        raise ReservationConflictError("reservation publication method is invalid")
+    triple = (
+        value["existing_target_identity_at_preflight"],
+        value["existing_target_byte_count_at_preflight"],
+        value["existing_target_raw_sha256_at_preflight"],
+    )
+    if any(item is not None for item in triple):
+        if any(item is None for item in triple) or method != "replace_existing":
+            raise ReservationConflictError("reservation existing-target triple is incomplete")
+        ReservationFileIdentity.from_object(triple[0])
+        if type(triple[1]) is not int or not 0 <= triple[1] <= 2**64 - 1:
+            raise ReservationConflictError("reservation existing-target size is invalid")
+        _require_lower_hex(triple[2], 64, "reservation existing-target hash")
+    settings_kinds = {
+        "initial_settings",
+        "migration_settings",
+        "job_terminal_settings",
+        "nonterminal_settings",
+        "producer_settings",
+        "cleanup_pending_settings",
+    }
+    if kind in settings_kinds and target != SETTINGS_ARTIFACT_RELATIVE_PATH.as_posix():
+        raise ReservationConflictError("settings reservation target is not fixed")
+    fixed_targets = {
+        "encoding_input_manifest": "encoding_input_manifest.json",
+        "final_video_manifest": "final_video_manifest.json",
+        "diagnostics_payload_pruned": "04_stereo_diagnostics/metadata.json",
+    }
+    if kind in fixed_targets and target != fixed_targets[kind]:
+        raise ReservationConflictError(f"{kind} reservation target is not fixed")
+    placeholder_only = {"initial_settings", "migration_settings", "prune_marker"}
+    replace_existing_only = {
+        "job_terminal_settings",
+        "nonterminal_settings",
+        "producer_settings",
+        "cleanup_pending_settings",
+        "diagnostics_payload_pruned",
+    }
+    if kind in placeholder_only and method != "replace_placeholder":
+        raise ReservationConflictError(f"{kind} must reserve a placeholder")
+    if kind in replace_existing_only and method != "replace_existing":
+        raise ReservationConflictError(f"{kind} must replace an existing target")
+    preflight_bound = kind in {
+        "encoding_input_manifest",
+        "final_video_manifest",
+        "diagnostics_payload_pruned",
+    } and method == "replace_existing"
+    if preflight_bound != all(item is not None for item in triple):
+        raise ReservationConflictError("reservation preflight target binding is invalid")
+    if kind in settings_kinds and any(item is not None for item in triple):
+        raise ReservationConflictError("typed settings reservation has a raw target triple")
+    if value["payload_role"] != _PAYLOAD_ROLES[kind]:
+        raise ReservationConflictError("reservation payload role differs from its kind")
+    raw_max = value["payload_raw_max"]
+    logical = value["logical_byte_count"]
+    unit = value["allocation_unit"]
+    if any(type(item) is not int or item <= 0 for item in (raw_max, logical, unit)):
+        raise ReservationConflictError("reservation byte bounds are invalid")
+    if logical != payload_logical_bytes(raw_max, unit):
+        raise ReservationConflictError("reservation logical length equation is invalid")
+    prune = (
+        value["prune_root_relative_path"],
+        value["marker_name"],
+        value["marker_payload_sha256"],
+    )
+    if kind == "prune_marker":
+        if any(type(item) is not str for item in prune):
+            raise ReservationConflictError("prune reservation triple is incomplete")
+        root = _canonical_job_relative_path(prune[0], "prune root relative path")
+        if (
+            re.fullmatch(r"\.depth-surge-prune-v2-[0-9a-f]{32}\.marker", prune[1])
+            is None
+            or target != f"{root}/{prune[1]}"
+            or PurePosixPath(source).parent != PurePosixPath(root)
+        ):
+            raise ReservationConflictError("prune reservation target differs from its marker")
+        _require_lower_hex(prune[2], 64, "prune marker payload hash")
+    elif any(item is not None for item in prune):
+        raise ReservationConflictError("non-prune reservation has prune fields")
+    return dict(value)
+
+
+def validate_descriptor_against_entry_v1(
+    descriptor: ReservationDescriptor,
+    entry: object,
+    *,
+    job_id: str,
+    settings_identity_fingerprint: str,
+    settings_revision_at_creation: int | None,
+    settings_raw_sha256_at_creation: str | None,
+    transaction_index_relative_path: Path,
+    transaction_index_fingerprint: str,
+) -> None:
+    """Require a materialized descriptor to equal its complete indexed plan."""
+
+    plan = validate_reservation_entry_v1(entry)
+    comparisons = {
+        "job_id": job_id,
+        "settings_identity_fingerprint": settings_identity_fingerprint,
+        "settings_revision_at_creation": settings_revision_at_creation,
+        "settings_raw_sha256_at_creation": settings_raw_sha256_at_creation,
+        "publication_generation": plan["descriptor_publication_generation"],
+        "reservation_generation": plan["reservation_generation"],
+        "reservation_id": plan["reservation_id"],
+        "reservation_kind": plan["reservation_kind"],
+        "transaction_index_relative_path": Path(
+            transaction_index_relative_path
+        ).as_posix(),
+        "transaction_index_fingerprint": transaction_index_fingerprint,
+        "source_extent_relative_path": plan["source_extent_relative_path"],
+        "temporary_relative_path": plan["temporary_relative_path"],
+        "target_relative_path": plan["target_relative_path"],
+        "target_parent_identity": DirectoryIdentity.from_object(
+            plan["target_parent_identity"]
+        ),
+        "publication_method": plan["publication_method"],
+        "existing_target_identity_at_preflight": (
+            ReservationFileIdentity.from_object(
+                plan["existing_target_identity_at_preflight"]
+            )
+            if plan["existing_target_identity_at_preflight"] is not None
+            else None
+        ),
+        "existing_target_byte_count_at_preflight": plan[
+            "existing_target_byte_count_at_preflight"
+        ],
+        "existing_target_raw_sha256_at_preflight": plan[
+            "existing_target_raw_sha256_at_preflight"
+        ],
+        "payload_role": plan["payload_role"],
+        "payload_raw_max": plan["payload_raw_max"],
+        "logical_byte_count": plan["logical_byte_count"],
+        "allocation_unit": plan["allocation_unit"],
+        "prune_root_relative_path": plan["prune_root_relative_path"],
+        "marker_name": plan["marker_name"],
+        "marker_payload_sha256": plan["marker_payload_sha256"],
+    }
+    for field, expected in comparisons.items():
+        if getattr(descriptor, field) != expected:
+            raise ReservationConflictError(
+                f"reservation descriptor {field} differs from its index"
+            )
+    expected_descriptor_path = plan["descriptor_relative_path"]
+    if descriptor.descriptor_relative_path != expected_descriptor_path:
+        raise ReservationConflictError(
+            "reservation descriptor filename differs from its index"
+        )
 
 
 @dataclass
@@ -1137,16 +2071,104 @@ class ReservedArtifactTransaction:
         index_path = job_root / index_relative_path
         if not index_path.is_file():
             raise ReservationConflictError("reservation extent has no durable write-ahead index")
+        index_raw = _read_bounded_regular_file(index_path, max_bytes=1024 * 1024)
+        try:
+            index_value = strict_canonical_json_loads(index_raw, max_bytes=1024 * 1024)
+        except CanonicalJsonError as error:
+            raise ReservationConflictError("reservation write-ahead index is malformed") from error
+        if type(index_value) is not dict:
+            raise ReservationConflictError("reservation write-ahead index is not an object")
+        index_fingerprint = index_value.get("fingerprint")
+        if type(index_fingerprint) is not str or len(index_fingerprint) != 64:
+            index_fingerprint = hashlib.sha256(index_raw).hexdigest()
+        indexed_entries = index_value.get("extent_entries")
+        if not isinstance(indexed_entries, list):
+            indexed_entries = index_value.get("bootstrap_extent_entries")
+        indexed_entry = None
+        if isinstance(indexed_entries, list):
+            matches = [
+                entry
+                for entry in indexed_entries
+                if isinstance(entry, dict)
+                and entry.get("reservation_kind") == reservation_kind
+                and entry.get("reservation_id") == reservation_id
+                and entry.get("reservation_generation", entry.get("generation")) == generation
+            ]
+            if len(matches) > 1:
+                raise ReservationConflictError("reservation index contains duplicate extent entries")
+            indexed_entry = matches[0] if matches else None
+        strict_index = index_value.get("algorithm_version") in {
+            "final-encoding-reservation-v1",
+            "job-control-v1",
+            "settings-transition-reservation-v1",
+        }
+        if strict_index:
+            persisted_fingerprint = index_value.get("fingerprint")
+            unsigned_index = dict(index_value)
+            unsigned_index.pop("fingerprint", None)
+            if (
+                type(persisted_fingerprint) is not str
+                or persisted_fingerprint != sha256_canonical(unsigned_index)
+            ):
+                raise ReservationConflictError("reservation index fingerprint is invalid")
+            if indexed_entry is None:
+                raise ReservationConflictError("reservation index has no unique complete extent entry")
+            indexed_entry = validate_reservation_entry_v1(indexed_entry)
+            preflight_comparisons = {
+                "target_relative_path": Path(target_relative_path).as_posix(),
+                "reservation_kind": reservation_kind,
+                "reservation_generation": generation,
+                "reservation_id": reservation_id,
+                "payload_raw_max": payload_raw_max,
+                "logical_byte_count": payload_logical_bytes(payload_raw_max, allocation_unit),
+                "allocation_unit": allocation_unit,
+            }
+            for field, actual in preflight_comparisons.items():
+                if indexed_entry[field] != actual:
+                    raise ReservationConflictError(f"indexed {field} changed before readiness")
+            if (
+                expected_publication_method is not None
+                and indexed_entry["publication_method"] != expected_publication_method
+            ):
+                raise ReservationConflictError("indexed publication method changed before readiness")
         target_path = job_root / target_relative_path
-        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if strict_index:
+            if not target_path.parent.is_dir() or target_path.parent.is_symlink():
+                raise ReservationConflictError("indexed reservation target parent is unavailable")
+        else:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_parent_identity = _directory_identity(target_path.parent)
+        if strict_index and DirectoryIdentity.from_object(
+            indexed_entry["target_parent_identity"]
+        ) != target_parent_identity:
+            raise ReservationConflictError("indexed reservation target parent changed")
         target_exists = target_path.exists() or target_path.is_symlink()
-        publication_method: PublicationMethod = expected_publication_method or (
+        publication_method: PublicationMethod = (
+            indexed_entry["publication_method"]
+            if strict_index
+            else expected_publication_method
+        ) or (
             "replace_existing" if target_exists else "replace_placeholder"
         )
+        old_target_identity: ReservationFileIdentity | None = None
+        old_target_byte_count: int | None = None
+        old_target_sha256: str | None = None
         if publication_method == "replace_existing":
             if not target_exists:
                 raise ReservationConflictError("declared existing reservation target is absent")
-            _identity(target_path)
+            old_target_identity = _identity(target_path)
+            old_target_sha256, old_target_byte_count = _stream_file_sha256_count(target_path)
+            if strict_index:
+                expected_identity = indexed_entry["existing_target_identity_at_preflight"]
+                expected_count = indexed_entry["existing_target_byte_count_at_preflight"]
+                expected_hash = indexed_entry["existing_target_raw_sha256_at_preflight"]
+                if expected_identity is not None and (
+                    ReservationFileIdentity.from_object(expected_identity)
+                    != old_target_identity
+                    or expected_count != old_target_byte_count
+                    or expected_hash != old_target_sha256
+                ):
+                    raise ReservationConflictError("indexed existing target changed before readiness")
             placeholder_identity = None
         elif publication_method == "replace_placeholder" and target_exists:
             if target_path.stat(follow_symlinks=False).st_size != 0:
@@ -1231,23 +2253,149 @@ class ReservedArtifactTransaction:
         if event is not None:
             event("extent:ready")
         source_identity = _identity(source_path)
-        descriptor_name = f"d-r-{generation}-{reservation_kind}-{reservation_id}.json"
+        publication_generation = (
+            indexed_entry["descriptor_publication_generation"]
+            if strict_index
+            else index_value.get("publication_generation")
+        )
+        if publication_generation is not None and (
+            type(publication_generation) is not str or len(publication_generation) != 32
+        ):
+            raise ReservationConflictError("reservation publication generation is invalid")
+        publication_token = publication_generation or "none"
+        descriptor_name = (
+            f"d-p-{publication_token}-r-{generation}-{reservation_kind}-{reservation_id}.json"
+        )
         descriptor_relative = Path(".depth-surge-reservations-v1") / descriptor_name
+        settings_value = None
+        settings_path = job_root / SETTINGS_ARTIFACT_RELATIVE_PATH
+        if settings_path.is_file():
+            try:
+                settings_value = strict_canonical_json_loads(
+                    _read_bounded_regular_file(settings_path, max_bytes=512 * 1024),
+                    max_bytes=1024 * 1024,
+                )
+            except (OSError, CanonicalJsonError):
+                settings_value = None
+        if settings_value is None:
+            bootstrap_intent = index_value.get("bootstrap_settings_intent")
+            if isinstance(bootstrap_intent, dict):
+                settings_value = bootstrap_intent.get("target_settings_payload")
+        metadata = (
+            settings_value.get("metadata")
+            if isinstance(settings_value, dict)
+            and isinstance(settings_value.get("metadata"), dict)
+            else {}
+        )
+        fallback_identity = hashlib.sha256(index_raw).hexdigest()
+        job_id = index_value.get("job_id", metadata.get("job_id", fallback_identity[:32]))
+        settings_identity = index_value.get(
+            "settings_identity_fingerprint",
+            metadata.get("settings_identity_fingerprint", fallback_identity),
+        )
+        settings_revision = index_value.get(
+            "settings_revision_at_preflight",
+            index_value.get("source_settings_revision"),
+        )
+        settings_raw_sha256 = index_value.get(
+            "settings_raw_sha256_at_preflight",
+            index_value.get("source_settings_raw_sha256"),
+        )
+        payload_roles = {
+            "initial_settings": "settings_initial",
+            "migration_settings": "settings_migration",
+            "job_terminal_settings": "settings_terminal",
+            "nonterminal_settings": "settings_nonterminal",
+            "settings_transition": "settings_nonterminal",
+            "producer_settings": "settings_producer",
+            "cleanup_pending_settings": "settings_cleanup_pending",
+        }
+        payload_role = payload_roles.get(reservation_kind, reservation_kind)
+        prune_root = None
+        marker_name = None
+        marker_sha256 = None
+        if indexed_entry is not None:
+            indexed_source = indexed_entry.get("source_extent_relative_path")
+            indexed_temporary = indexed_entry.get("temporary_relative_path")
+            indexed_descriptor = indexed_entry.get("descriptor_relative_path")
+            comparisons = {
+                "target_relative_path": Path(target_relative_path).as_posix(),
+                "publication_method": publication_method,
+                "payload_raw_max": payload_raw_max,
+                "allocation_unit": allocation_unit,
+            }
+            for field, actual in comparisons.items():
+                if field in indexed_entry and indexed_entry[field] != actual:
+                    raise ReservationConflictError(f"indexed {field} changed before readiness")
+            if indexed_source is not None and indexed_source != source_path.relative_to(job_root).as_posix():
+                raise ReservationConflictError("indexed reservation source path changed")
+            if indexed_temporary is not None and indexed_temporary != indexed_source:
+                raise ReservationConflictError("indexed reservation temporary path differs")
+            if indexed_descriptor is not None and indexed_descriptor != descriptor_relative.as_posix():
+                raise ReservationConflictError("indexed reservation descriptor path changed")
+            indexed_parent = indexed_entry.get("target_parent_identity")
+            if indexed_parent is not None and DirectoryIdentity.from_object(indexed_parent) != target_parent_identity:
+                raise ReservationConflictError("indexed reservation target parent changed")
+            payload_role = indexed_entry.get("payload_role", payload_role)
+            prune_root = indexed_entry.get("prune_root_relative_path")
+            marker_name = indexed_entry.get("marker_name")
+            marker_sha256 = indexed_entry.get("marker_payload_sha256")
+            indexed_existing = indexed_entry.get("existing_target_identity_at_preflight")
+            indexed_count = indexed_entry.get("existing_target_byte_count_at_preflight")
+            indexed_hash = indexed_entry.get("existing_target_raw_sha256_at_preflight")
+            if publication_method == "replace_existing" and indexed_existing is not None:
+                if (
+                    ReservationFileIdentity.from_object(indexed_existing) != old_target_identity
+                    or indexed_count != old_target_byte_count
+                    or indexed_hash != old_target_sha256
+                ):
+                    raise ReservationConflictError("indexed existing target changed before readiness")
+        descriptor_existing_identity = old_target_identity
+        descriptor_existing_count = old_target_byte_count
+        descriptor_existing_hash = old_target_sha256
+        if strict_index:
+            indexed_existing = indexed_entry["existing_target_identity_at_preflight"]
+            descriptor_existing_identity = (
+                ReservationFileIdentity.from_object(indexed_existing)
+                if indexed_existing is not None
+                else None
+            )
+            descriptor_existing_count = indexed_entry[
+                "existing_target_byte_count_at_preflight"
+            ]
+            descriptor_existing_hash = indexed_entry[
+                "existing_target_raw_sha256_at_preflight"
+            ]
         descriptor = ReservationDescriptor.build(
-            index_relative_path=Path(index_relative_path).as_posix(),
-            descriptor_relative_path=descriptor_relative.as_posix(),
-            source_relative_path=source_path.relative_to(job_root).as_posix(),
-            target_relative_path=Path(target_relative_path).as_posix(),
+            job_id=job_id,
+            settings_artifact_relative_path=SETTINGS_ARTIFACT_RELATIVE_PATH.as_posix(),
+            settings_identity_fingerprint=settings_identity,
+            settings_revision_at_creation=settings_revision,
+            settings_raw_sha256_at_creation=settings_raw_sha256,
+            publication_generation=publication_generation,
+            reservation_generation=generation,
+            reservation_id=reservation_id,
             reservation_kind=reservation_kind,
+            transaction_index_relative_path=Path(index_relative_path).as_posix(),
+            transaction_index_fingerprint=index_fingerprint,
+            source_extent_relative_path=source_path.relative_to(job_root).as_posix(),
+            temporary_relative_path=source_path.relative_to(job_root).as_posix(),
+            target_relative_path=Path(target_relative_path).as_posix(),
+            target_parent_identity=target_parent_identity,
             publication_method=publication_method,
+            existing_target_identity_at_preflight=descriptor_existing_identity,
+            existing_target_byte_count_at_preflight=descriptor_existing_count,
+            existing_target_raw_sha256_at_preflight=descriptor_existing_hash,
+            reserved_placeholder_identity=placeholder_identity,
+            payload_role=payload_role,
             payload_raw_max=payload_raw_max,
             logical_byte_count=logical,
-            allocation_unit=allocation_unit,
-            generation=generation,
-            reservation_id=reservation_id,
-            filesystem_identity=source_identity,
-            placeholder_identity=placeholder_identity,
             allocation_evidence_at_readiness=evidence,
+            allocation_unit=allocation_unit,
+            filesystem_identity=source_identity,
+            prune_root_relative_path=prune_root,
+            marker_name=marker_name,
+            marker_payload_sha256=marker_sha256,
         )
         descriptor_path = job_root / descriptor_relative
         _write_json_file(descriptor_path, descriptor.to_object(), event=None)
@@ -1272,7 +2420,7 @@ class ReservedArtifactTransaction:
         allocation_counter: AllocationCounter | None = None,
     ) -> ReservedArtifactTransaction:
         descriptor_path = Path(descriptor_path)
-        raw = descriptor_path.read_bytes()
+        raw = _read_bounded_regular_file(descriptor_path, max_bytes=1024 * 1024)
         try:
             value = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -1527,13 +2675,25 @@ class ReservedArtifactTransaction:
             self._validate_placeholder()
             expected_target = self.descriptor.placeholder_identity
             if self.descriptor.publication_method == "replace_existing":
-                expected_target = _identity(self.target_path)
+                expected_target = self.descriptor.existing_target_identity_at_preflight
+                if expected_target is not None:
+                    digest, count = _stream_file_sha256_count(self.target_path)
+                    if (
+                        _identity(self.target_path) != expected_target
+                        or count != self.descriptor.existing_target_byte_count_at_preflight
+                        or digest != self.descriptor.existing_target_raw_sha256_at_preflight
+                    ):
+                        raise ReservationConflictError(
+                            "reservation existing target changed before replacement"
+                        )
+                else:
+                    expected_target = _identity(self.target_path)
         same_parent_replace_v1(
             self.source_path,
             self.target_path,
             expected_source_identity=self.descriptor.filesystem_identity,
             expected_target_identity=expected_target,
-            expected_parent_identity=_directory_identity(self.target_path.parent),
+            expected_parent_identity=self.descriptor.target_parent_identity,
             replace_existing=not replacement_gap,
         )
 
@@ -1760,6 +2920,83 @@ def _require_lower_hex(value: object, digits: int, label: str) -> str:
     return value
 
 
+def _validate_legacy_settings_component(value: object) -> None:
+    if value is None:
+        return
+    if type(value) is not str:
+        raise ReservationConflictError("legacy settings component is invalid")
+    if (
+        not value.endswith("-settings.json")
+        or value in {".", ".."}
+        or any(character in value for character in ("\x00", "/", "\\"))
+        or (
+            len(value) >= 2
+            and value[0].isascii()
+            and value[0].isalpha()
+            and value[1] == ":"
+        )
+    ):
+        raise ReservationConflictError("legacy settings component is not contained")
+
+
+def _validate_job_control_contract(control: JobControlV1) -> None:
+    """Validate every semantic and physical cross-binding in JobControlV1."""
+
+    _validate_legacy_settings_component(control.legacy_settings_artifact_relative_path)
+    entries = tuple(validate_reservation_entry_v1(entry) for entry in control.bootstrap_extent_entries)
+    expected_initial_kind = (
+        "migration_settings"
+        if control.legacy_settings_artifact_relative_path is not None
+        else "initial_settings"
+    )
+    if len(entries) != 2 or [entry["reservation_kind"] for entry in entries] != [
+        expected_initial_kind,
+        "job_terminal_settings",
+    ]:
+        raise ReservationConflictError("job-control bootstrap entry order is invalid")
+    initial, terminal = entries
+    expected_common = {
+        "reservation_generation": control.job_reservation_generation,
+        "descriptor_publication_generation": None,
+        "target_relative_path": SETTINGS_ARTIFACT_RELATIVE_PATH.as_posix(),
+        "target_parent_identity": control.job_root_identity.to_object(),
+        "payload_raw_max": 512 * 1024,
+        "prune_root_relative_path": None,
+        "marker_name": None,
+        "marker_payload_sha256": None,
+    }
+    for entry in entries:
+        for field, expected in expected_common.items():
+            if entry[field] != expected:
+                raise ReservationConflictError(
+                    f"job-control {field} differs from its locator"
+                )
+        if any(
+            entry[field] is not None
+            for field in (
+                "existing_target_identity_at_preflight",
+                "existing_target_byte_count_at_preflight",
+                "existing_target_raw_sha256_at_preflight",
+            )
+        ):
+            raise ReservationConflictError("job-control bootstrap target triple must be null")
+    if (
+        initial["reservation_id"] != control.initial_settings_reservation_id
+        or initial["publication_method"] != "replace_placeholder"
+        or terminal["reservation_id"] != control.job_terminal_reservation_id
+        or terminal["publication_method"] != "replace_existing"
+        or initial["allocation_unit"] != terminal["allocation_unit"]
+    ):
+        raise ReservationConflictError("job-control reservation plan differs from locator IDs")
+    artifact = _parse_bootstrap_target(control)
+    metadata = artifact.to_object()["metadata"]
+    if (
+        metadata["job_reservation_generation"] != control.job_reservation_generation
+        or metadata["job_terminal_reservation_id"] != control.job_terminal_reservation_id
+    ):
+        raise ReservationConflictError("bootstrap payload differs from job reservation identity")
+
+
 @dataclass(frozen=True)
 class JobControlV1:
     """Closed Task 0 form of the fixed schema-5 job locator."""
@@ -1813,21 +3050,11 @@ class JobControlV1:
         _require_lower_hex(job_reservation_generation, 32, "job reservation generation")
         _require_lower_hex(initial_settings_reservation_id, 32, "initial reservation id")
         _require_lower_hex(job_terminal_reservation_id, 32, "terminal reservation id")
-        if legacy_settings_artifact_relative_path is not None:
-            legacy = legacy_settings_artifact_relative_path
-            if (
-                not legacy.endswith("-settings.json")
-                or legacy in {".", ".."}
-                or any(character in legacy for character in ("\x00", "/", "\\"))
-                or (
-                    len(legacy) >= 2
-                    and legacy[0].isascii()
-                    and legacy[0].isalpha()
-                    and legacy[1] == ":"
-                )
-            ):
-                raise ReservationConflictError("legacy settings component is not contained")
-        kinds = [entry.get("reservation_kind") for entry in bootstrap_extent_entries]
+        _validate_legacy_settings_component(legacy_settings_artifact_relative_path)
+        bootstrap_extent_entries = [
+            validate_reservation_entry_v1(entry) for entry in bootstrap_extent_entries
+        ]
+        kinds = [entry["reservation_kind"] for entry in bootstrap_extent_entries]
         if kinds not in (
             ["initial_settings", "job_terminal_settings"],
             ["migration_settings", "job_terminal_settings"],
@@ -1845,12 +3072,14 @@ class JobControlV1:
             bootstrap_settings_intent=bootstrap_settings_intent,
             fingerprint="",
         )
-        return cls(
+        result = cls(
             **{
                 **provisional.__dict__,
                 "fingerprint": sha256_canonical(provisional._base_object()),
             }
         )
+        _validate_job_control_contract(result)
+        return result
 
     @classmethod
     def from_object(cls, value: object) -> JobControlV1:
@@ -1881,6 +3110,7 @@ class JobControlV1:
         intent = value["bootstrap_settings_intent"]
         if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
             raise ReservationConflictError("job control bootstrap entries are invalid")
+        entries = [validate_reservation_entry_v1(entry) for entry in entries]
         if not isinstance(intent, dict):
             raise ReservationConflictError("job control bootstrap intent is invalid")
         result = cls(
@@ -1905,6 +3135,7 @@ class JobControlV1:
         )
         if result.fingerprint != sha256_canonical(result._base_object()):
             raise ReservationConflictError("job control fingerprint is invalid")
+        _validate_job_control_contract(result)
         return result
 
 
@@ -1915,15 +3146,153 @@ def publish_job_control(job_root: Path, control: JobControlV1) -> None:
     publish_write_ahead_intent(job_root / JOB_CONTROL_RELATIVE_PATH, control.to_object())
 
 
+def _assert_job_control_candidate_has_no_downstream(job_root: Path) -> None:
+    root = Path(job_root)
+    fixed = root / SETTINGS_ARTIFACT_RELATIVE_PATH
+    if fixed.exists() or fixed.is_symlink():
+        raise ReservationConflictError(
+            "job control candidate has an unindexed fixed settings target"
+        )
+    reservation_dir = root / ".depth-surge-reservations-v1"
+    if reservation_dir.exists() or reservation_dir.is_symlink():
+        if reservation_dir.is_symlink() or not reservation_dir.is_dir():
+            raise ReservationConflictError("reservation namespace is unsafe")
+        with os.scandir(reservation_dir) as entries:
+            if next(entries, None) is not None:
+                raise ReservationConflictError(
+                    "job control candidate has unindexed reservation artifacts"
+                )
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if entry.name.startswith(".depth-surge-r-") or entry.name.startswith(
+                ".depth-surge-final-v4-"
+            ):
+                raise ReservationConflictError(
+                    "job control candidate has an unindexed reserved payload"
+                )
+
+
+def assert_only_job_control_owned_reservations_v1(
+    job_root: Path,
+    control: JobControlV1,
+    *,
+    allowed_relative_paths: tuple[str, ...] = (),
+) -> None:
+    """Reject reservation-named objects not authorized by JobControl or a candidate."""
+
+    root = Path(job_root)
+    allowed = {PurePosixPath(value).as_posix() for value in allowed_relative_paths}
+    for entry in control.bootstrap_extent_entries:
+        descriptor = PurePosixPath(entry["descriptor_relative_path"])
+        allowed.add(descriptor.as_posix())
+        allowed.add(
+            (descriptor.parent / f".{descriptor.name}.create-new.tmp").as_posix()
+        )
+        allowed.add(PurePosixPath(entry["source_extent_relative_path"]).as_posix())
+    reservation_dir = root / ".depth-surge-reservations-v1"
+    if reservation_dir.exists() or reservation_dir.is_symlink():
+        if reservation_dir.is_symlink() or not reservation_dir.is_dir():
+            raise ReservationConflictError("reservation namespace is unsafe")
+        with os.scandir(reservation_dir) as entries:
+            for entry in entries:
+                relative = PurePosixPath(".depth-surge-reservations-v1", entry.name).as_posix()
+                if relative not in allowed:
+                    raise ReservationConflictError(
+                        f"unindexed reservation artifact is present: {relative}"
+                    )
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if not (
+                entry.name.startswith(".depth-surge-r-")
+                or entry.name.startswith(".depth-surge-final-v4-")
+            ):
+                continue
+            if PurePosixPath(entry.name).as_posix() not in allowed:
+                raise ReservationConflictError(
+                    f"unindexed reserved payload is present: {entry.name}"
+                )
+
+
+def assert_index_owned_reservation_namespace_v1(
+    job_root: Path,
+    control: JobControlV1,
+    *,
+    index_relative_path: str,
+    extent_entries: tuple[dict, ...],
+    extra_relative_paths: tuple[str, ...] = (),
+) -> None:
+    root = Path(job_root)
+    index = PurePosixPath(index_relative_path)
+    allowed = {
+        index.as_posix(),
+        (index.parent / f".{index.name}.create-new.tmp").as_posix(),
+        *extra_relative_paths,
+    }
+    local_names: dict[Path, set[str]] = {}
+    for entry in extent_entries:
+        descriptor = PurePosixPath(entry["descriptor_relative_path"])
+        source = PurePosixPath(entry["source_extent_relative_path"])
+        allowed.add(descriptor.as_posix())
+        allowed.add(
+            (descriptor.parent / f".{descriptor.name}.create-new.tmp").as_posix()
+        )
+        allowed.add(source.as_posix())
+        source_path = root / source.as_posix()
+        local_names.setdefault(source_path.parent, set()).add(source_path.name)
+        if entry["reservation_kind"] == "prune_marker":
+            target = root / entry["target_relative_path"]
+            local_names.setdefault(target.parent, set()).add(target.name)
+    assert_only_job_control_owned_reservations_v1(
+        root,
+        control,
+        allowed_relative_paths=tuple(sorted(allowed)),
+    )
+    for parent, names in local_names.items():
+        if parent == root or not parent.exists():
+            continue
+        if parent.is_symlink() or not parent.is_dir():
+            raise ReservationConflictError("indexed reservation parent is unsafe")
+        with os.scandir(parent) as children:
+            for child in children:
+                if (
+                    child.name.startswith(".depth-surge-r-")
+                    or child.name.startswith(".depth-surge-prune-v2-")
+                ) and child.name not in names:
+                    raise ReservationConflictError(
+                        f"unindexed target-local reservation artifact is present: {child.name}"
+                    )
+
+
 def load_job_control(job_root: Path) -> JobControlV1:
     job_root = Path(job_root)
     path = job_root / JOB_CONTROL_RELATIVE_PATH
+    def parse(raw: bytes) -> JobControlV1:
+        return JobControlV1.from_object(
+            strict_canonical_json_loads(raw, max_bytes=1024 * 1024)
+        )
+
+    def validate_before_publish(value: object) -> None:
+        if not isinstance(value, JobControlV1):
+            raise ReservationConflictError("job control temporary has the wrong type")
+        if _directory_identity(job_root) != value.job_root_identity:
+            raise ReservationConflictError("job control belongs to a different job root")
+        _assert_job_control_candidate_has_no_downstream(job_root)
+
     try:
-        raw = path.read_bytes()
-        value = strict_canonical_json_loads(raw, max_bytes=1024 * 1024)
+        recovered = recover_control_artifact_pair_v1(
+            path,
+            max_bytes=1024 * 1024,
+            parser=parse,
+            prepublish_validate=validate_before_publish,
+            preunlink_validate=lambda: _assert_job_control_candidate_has_no_downstream(
+                job_root
+            ),
+        )
     except (OSError, CanonicalJsonError) as error:
         raise ReservationConflictError("job control is missing or malformed") from error
-    control = JobControlV1.from_object(value)
+    if not isinstance(recovered, JobControlV1):
+        raise ReservationConflictError("job control is missing or malformed")
+    control = recovered
     if _directory_identity(job_root) != control.job_root_identity:
         raise ReservationConflictError("job root identity differs from job control")
     return control
@@ -2100,25 +3469,12 @@ def _validate_restart_terminal_entry(
 ) -> dict | None:
     if value is None:
         return None
-    expected = {
-        "reservation_kind",
-        "generation",
-        "reservation_id",
-        "index_relative_path",
-        "target_relative_path",
-        "publication_method",
-        "payload_raw_max",
-        "allocation_unit",
-    }
-    if type(value) is not dict or set(value) != expected:
-        raise ReservationConflictError("restart terminal entry schema is invalid")
-    assert isinstance(value, dict)
+    value = validate_reservation_entry_v1(value)
     metadata = target.to_object()["metadata"]
     if (
         value["reservation_kind"] != "job_terminal_settings"
-        or value["generation"] != metadata["job_reservation_generation"]
+        or value["reservation_generation"] != metadata["job_reservation_generation"]
         or value["reservation_id"] != metadata["job_terminal_reservation_id"]
-        or value["index_relative_path"] != JOB_CONTROL_RELATIVE_PATH.as_posix()
         or value["target_relative_path"] != SETTINGS_ARTIFACT_RELATIVE_PATH.as_posix()
         or value["publication_method"] != "replace_existing"
         or value["payload_raw_max"] != 512 * 1024
@@ -2126,8 +3482,6 @@ def _validate_restart_terminal_entry(
         or value["allocation_unit"] <= 0
     ):
         raise ReservationConflictError("restart terminal entry does not match job control")
-    _require_lower_hex(value["generation"], 32, "restart terminal generation")
-    _require_lower_hex(value["reservation_id"], 32, "restart terminal reservation id")
     return dict(value)
 
 
@@ -2137,17 +3491,16 @@ class SettingsTransitionIntentV1:
 
     job_id: str
     settings_identity_fingerprint: str
-    reservation_generation: str
-    reservation_id: str
-    allocation_unit: int
-    source_settings_revision: int
-    source_settings_raw_sha256: str
+    settings_revision_at_preflight: int
+    settings_raw_sha256_at_preflight: str
     target_settings_revision: int
     target_settings_content_fingerprint: str
     target_settings_raw_sha256: str
     target_settings_payload: dict
     transition_kind: Literal["nonterminal_rewrite", "attempt_restart"]
-    replacement_terminal_entry: dict | None
+    publication_generation: str | None
+    reservation_generation: str
+    extent_entries: tuple[dict, ...]
     fingerprint: str
 
     def _base_object(self) -> dict:
@@ -2155,21 +3508,39 @@ class SettingsTransitionIntentV1:
             "schema_version": 1,
             "algorithm_version": "settings-transition-reservation-v1",
             "job_id": self.job_id,
-            "settings_identity_fingerprint": self.settings_identity_fingerprint,
             "settings_artifact_relative_path": SETTINGS_ARTIFACT_RELATIVE_PATH.as_posix(),
-            "reservation_generation": self.reservation_generation,
-            "reservation_id": self.reservation_id,
-            "reservation_kind": "settings_transition",
-            "allocation_unit": self.allocation_unit,
-            "source_settings_revision": self.source_settings_revision,
-            "source_settings_raw_sha256": self.source_settings_raw_sha256,
+            "settings_identity_fingerprint": self.settings_identity_fingerprint,
+            "settings_revision_at_preflight": self.settings_revision_at_preflight,
+            "settings_raw_sha256_at_preflight": self.settings_raw_sha256_at_preflight,
             "target_settings_revision": self.target_settings_revision,
             "target_settings_content_fingerprint": self.target_settings_content_fingerprint,
             "target_settings_raw_sha256": self.target_settings_raw_sha256,
             "target_settings_payload": self.target_settings_payload,
             "transition_kind": self.transition_kind,
-            "replacement_terminal_entry": self.replacement_terminal_entry,
+            "publication_generation": self.publication_generation,
+            "reservation_generation": self.reservation_generation,
+            "extent_entries": list(self.extent_entries),
         }
+
+    @property
+    def source_settings_revision(self) -> int:
+        return self.settings_revision_at_preflight
+
+    @property
+    def source_settings_raw_sha256(self) -> str:
+        return self.settings_raw_sha256_at_preflight
+
+    @property
+    def reservation_id(self) -> str:
+        return self.extent_entries[0]["reservation_id"]
+
+    @property
+    def allocation_unit(self) -> int:
+        return self.extent_entries[0]["allocation_unit"]
+
+    @property
+    def replacement_terminal_entry(self) -> dict | None:
+        return dict(self.extent_entries[1]) if len(self.extent_entries) == 2 else None
 
     def to_object(self) -> dict:
         return {**self._base_object(), "fingerprint": self.fingerprint}
@@ -2178,6 +3549,7 @@ class SettingsTransitionIntentV1:
     def create(
         cls,
         *,
+        job_root: Path,
         current: ProcessingSettingsArtifactV5,
         target: ProcessingSettingsArtifactV5,
         reservation_generation: str,
@@ -2234,20 +3606,55 @@ class SettingsTransitionIntentV1:
         terminal_entry = _validate_restart_terminal_entry(replacement_terminal_entry, target)
         current_raw = current.encode()
         target_raw = target.encode()
+        publication_generation = target_metadata["final_media_publication_generation"]
+        source_name = (
+            f".depth-surge-r-{reservation_generation}-nonterminal_settings-"
+            f"{reservation_id}.reserved"
+        )
+        descriptor_name = (
+            f"d-p-{publication_generation or 'none'}-r-{reservation_generation}-"
+            f"nonterminal_settings-{reservation_id}.json"
+        )
+        primary_entry = validate_reservation_entry_v1(
+            {
+                "reservation_generation": reservation_generation,
+                "reservation_id": reservation_id,
+                "reservation_kind": "nonterminal_settings",
+                "descriptor_publication_generation": publication_generation,
+                "descriptor_relative_path": (
+                    Path(".depth-surge-reservations-v1") / descriptor_name
+                ).as_posix(),
+                "source_extent_relative_path": source_name,
+                "temporary_relative_path": source_name,
+                "target_relative_path": SETTINGS_ARTIFACT_RELATIVE_PATH.as_posix(),
+                "target_parent_identity": _directory_identity(Path(job_root)).to_object(),
+                "publication_method": "replace_existing",
+                "existing_target_identity_at_preflight": None,
+                "existing_target_byte_count_at_preflight": None,
+                "existing_target_raw_sha256_at_preflight": None,
+                "payload_role": "settings_nonterminal",
+                "payload_raw_max": 512 * 1024,
+                "logical_byte_count": payload_logical_bytes(512 * 1024, allocation_unit),
+                "allocation_unit": allocation_unit,
+                "prune_root_relative_path": None,
+                "marker_name": None,
+                "marker_payload_sha256": None,
+            }
+        )
+        entries = (primary_entry,) + ((terminal_entry,) if terminal_entry is not None else ())
         provisional = cls(
             job_id=target_metadata["job_id"],
             settings_identity_fingerprint=target_metadata["settings_identity_fingerprint"],
-            reservation_generation=reservation_generation,
-            reservation_id=reservation_id,
-            allocation_unit=allocation_unit,
-            source_settings_revision=current.revision,
-            source_settings_raw_sha256=hashlib.sha256(current_raw).hexdigest(),
+            settings_revision_at_preflight=current.revision,
+            settings_raw_sha256_at_preflight=hashlib.sha256(current_raw).hexdigest(),
             target_settings_revision=target.revision,
             target_settings_content_fingerprint=target_value["content_fingerprint"],
             target_settings_raw_sha256=hashlib.sha256(target_raw).hexdigest(),
             target_settings_payload=target_value,
             transition_kind=transition_kind,
-            replacement_terminal_entry=terminal_entry,
+            publication_generation=publication_generation,
+            reservation_generation=reservation_generation,
+            extent_entries=entries,
             fingerprint="",
         )
         return cls(
@@ -2265,20 +3672,18 @@ class SettingsTransitionIntentV1:
             "schema_version",
             "algorithm_version",
             "job_id",
-            "settings_identity_fingerprint",
             "settings_artifact_relative_path",
-            "reservation_generation",
-            "reservation_id",
-            "reservation_kind",
-            "allocation_unit",
-            "source_settings_revision",
-            "source_settings_raw_sha256",
+            "settings_identity_fingerprint",
+            "settings_revision_at_preflight",
+            "settings_raw_sha256_at_preflight",
             "target_settings_revision",
             "target_settings_content_fingerprint",
             "target_settings_raw_sha256",
             "target_settings_payload",
             "transition_kind",
-            "replacement_terminal_entry",
+            "publication_generation",
+            "reservation_generation",
+            "extent_entries",
             "fingerprint",
         }
         if type(value) is not dict or set(value) != expected:
@@ -2290,42 +3695,48 @@ class SettingsTransitionIntentV1:
             or value["algorithm_version"] != "settings-transition-reservation-v1"
             or value["settings_artifact_relative_path"]
             != SETTINGS_ARTIFACT_RELATIVE_PATH.as_posix()
-            or value["reservation_kind"] != "settings_transition"
         ):
             raise ReservationConflictError("settings transition intent version is invalid")
-        for key in ("source_settings_revision", "target_settings_revision"):
+        for key in ("settings_revision_at_preflight", "target_settings_revision"):
             if type(value[key]) is not int or not 0 <= value[key] <= 2**64 - 1:
                 raise ReservationConflictError(f"{key} is invalid")
-        if value["target_settings_revision"] != value["source_settings_revision"] + 1:
+        if value["target_settings_revision"] != value["settings_revision_at_preflight"] + 1:
             raise ReservationConflictError("settings intent revision equation is invalid")
-        if type(value["allocation_unit"]) is not int or value["allocation_unit"] <= 0:
-            raise ReservationConflictError("settings intent allocation unit is invalid")
         target = ProcessingSettingsArtifactV5.from_object(value["target_settings_payload"])
         target_value = target.to_object()
         transition_kind = value["transition_kind"]
         if transition_kind not in {"nonterminal_rewrite", "attempt_restart"}:
             raise ReservationConflictError("settings transition kind is invalid")
+        raw_entries = value["extent_entries"]
+        if not isinstance(raw_entries, list):
+            raise ReservationConflictError("settings transition entries are invalid")
+        entries = tuple(validate_reservation_entry_v1(entry) for entry in raw_entries)
+        if not entries or len(entries) > 2 or entries[0]["reservation_kind"] != "nonterminal_settings":
+            raise ReservationConflictError("settings transition primary entry is invalid")
         terminal_entry = _validate_restart_terminal_entry(
-            value["replacement_terminal_entry"], target
+            entries[1] if len(entries) == 2 else None,
+            target,
         )
         if (transition_kind == "attempt_restart") != (terminal_entry is not None):
             raise ReservationConflictError("settings transition terminal entry is inconsistent")
+        publication_generation = value["publication_generation"]
+        if publication_generation is not None:
+            publication_generation = _require_lower_hex(
+                publication_generation, 32, "settings publication generation"
+            )
+        if entries[0]["descriptor_publication_generation"] != publication_generation:
+            raise ReservationConflictError("settings entry publication generation differs")
         target_raw = target.encode()
         result = cls(
             job_id=_require_lower_hex(value["job_id"], 32, "job id"),
             settings_identity_fingerprint=_require_lower_hex(
                 value["settings_identity_fingerprint"], 64, "settings identity"
             ),
-            reservation_generation=_require_lower_hex(
-                value["reservation_generation"], 32, "settings reservation generation"
-            ),
-            reservation_id=_require_lower_hex(
-                value["reservation_id"], 32, "settings reservation id"
-            ),
-            allocation_unit=value["allocation_unit"],
-            source_settings_revision=value["source_settings_revision"],
-            source_settings_raw_sha256=_require_lower_hex(
-                value["source_settings_raw_sha256"], 64, "source settings raw hash"
+            settings_revision_at_preflight=value["settings_revision_at_preflight"],
+            settings_raw_sha256_at_preflight=_require_lower_hex(
+                value["settings_raw_sha256_at_preflight"],
+                64,
+                "source settings raw hash",
             ),
             target_settings_revision=value["target_settings_revision"],
             target_settings_content_fingerprint=_require_lower_hex(
@@ -2336,7 +3747,11 @@ class SettingsTransitionIntentV1:
             ),
             target_settings_payload=target_value,
             transition_kind=transition_kind,
-            replacement_terminal_entry=terminal_entry,
+            publication_generation=publication_generation,
+            reservation_generation=_require_lower_hex(
+                value["reservation_generation"], 32, "settings reservation generation"
+            ),
+            extent_entries=entries,
             fingerprint=_require_lower_hex(value["fingerprint"], 64, "settings intent fingerprint"),
         )
         if (
@@ -2383,32 +3798,31 @@ class SettingsArtifactTransactionV1:
         return (
             Path(job_root)
             / ".depth-surge-reservations-v1"
-            / f"d-r-{generation}-{reservation_kind}-{reservation_id}.json"
+            / f"d-p-none-r-{generation}-{reservation_kind}-{reservation_id}.json"
         )
 
     @staticmethod
     def _validate_transaction_plan(
         transaction: ReservedArtifactTransaction,
         *,
+        entry: dict,
+        job_id: str,
+        settings_identity_fingerprint: str,
+        settings_revision_at_creation: int | None,
+        settings_raw_sha256_at_creation: str | None,
         index_relative_path: Path,
-        reservation_kind: str,
-        generation: str,
-        reservation_id: str,
-        allocation_unit: int,
+        index_fingerprint: str,
     ) -> None:
-        descriptor = transaction.descriptor
-        if (
-            descriptor.index_relative_path != index_relative_path.as_posix()
-            or descriptor.target_relative_path != SETTINGS_ARTIFACT_RELATIVE_PATH.as_posix()
-            or descriptor.reservation_kind != reservation_kind
-            or descriptor.publication_method != "replace_existing"
-            or descriptor.payload_raw_max != 512 * 1024
-            or descriptor.logical_byte_count != payload_logical_bytes(512 * 1024, allocation_unit)
-            or descriptor.allocation_unit != allocation_unit
-            or descriptor.generation != generation
-            or descriptor.reservation_id != reservation_id
-        ):
-            raise ReservationConflictError("settings reservation descriptor differs from intent")
+        validate_descriptor_against_entry_v1(
+            transaction.descriptor,
+            entry,
+            job_id=job_id,
+            settings_identity_fingerprint=settings_identity_fingerprint,
+            settings_revision_at_creation=settings_revision_at_creation,
+            settings_raw_sha256_at_creation=settings_raw_sha256_at_creation,
+            transaction_index_relative_path=index_relative_path,
+            transaction_index_fingerprint=index_fingerprint,
+        )
 
     @classmethod
     def _load_or_create_primary(
@@ -2419,12 +3833,12 @@ class SettingsArtifactTransactionV1:
         allocation_adapter: AllocationAdapter,
         allocation_counter: AllocationCounter | None,
     ) -> ReservedArtifactTransaction:
-        descriptor_path = cls._descriptor_path(
-            job_root,
-            generation=intent.reservation_generation,
-            reservation_kind="settings_transition",
-            reservation_id=intent.reservation_id,
-        )
+        entry = intent.extent_entries[0]
+        descriptor_path = Path(job_root) / entry["descriptor_relative_path"]
+        if descriptor_path.is_symlink() or (
+            descriptor_path.exists() and not descriptor_path.is_file()
+        ):
+            raise ReservationConflictError("settings descriptor path is unsafe")
         if descriptor_path.is_file():
             transaction = ReservedArtifactTransaction.load(
                 descriptor_path,
@@ -2436,7 +3850,7 @@ class SettingsArtifactTransactionV1:
                 job_root=job_root,
                 index_relative_path=SETTINGS_TRANSITION_INDEX_RELATIVE_PATH,
                 target_relative_path=SETTINGS_ARTIFACT_RELATIVE_PATH,
-                reservation_kind="settings_transition",
+                reservation_kind="nonterminal_settings",
                 payload_raw_max=512 * 1024,
                 allocation_unit=intent.allocation_unit,
                 allocation_adapter=allocation_adapter,
@@ -2447,11 +3861,13 @@ class SettingsArtifactTransactionV1:
             )
         cls._validate_transaction_plan(
             transaction,
+            entry=entry,
+            job_id=intent.job_id,
+            settings_identity_fingerprint=intent.settings_identity_fingerprint,
+            settings_revision_at_creation=intent.settings_revision_at_preflight,
+            settings_raw_sha256_at_creation=intent.settings_raw_sha256_at_preflight,
             index_relative_path=SETTINGS_TRANSITION_INDEX_RELATIVE_PATH,
-            reservation_kind="settings_transition",
-            generation=intent.reservation_generation,
-            reservation_id=intent.reservation_id,
-            allocation_unit=intent.allocation_unit,
+            index_fingerprint=intent.fingerprint,
         )
         return transaction
 
@@ -2468,12 +3884,11 @@ class SettingsArtifactTransactionV1:
         entry = intent.replacement_terminal_entry
         if entry is None:
             return None
-        descriptor_path = cls._descriptor_path(
-            job_root,
-            generation=entry["generation"],
-            reservation_kind=entry["reservation_kind"],
-            reservation_id=entry["reservation_id"],
-        )
+        descriptor_path = Path(job_root) / entry["descriptor_relative_path"]
+        if descriptor_path.is_symlink() or (
+            descriptor_path.exists() and not descriptor_path.is_file()
+        ):
+            raise ReservationConflictError("terminal descriptor path is unsafe")
         if descriptor_path.is_file():
             terminal = ReservedArtifactTransaction.load(
                 descriptor_path,
@@ -2490,17 +3905,20 @@ class SettingsArtifactTransactionV1:
                 allocation_unit=entry["allocation_unit"],
                 allocation_adapter=allocation_adapter,
                 allocation_counter=allocation_counter,
-                generation=entry["generation"],
+                generation=entry["reservation_generation"],
                 reservation_id=entry["reservation_id"],
                 expected_publication_method="replace_existing",
             )
+        control = load_job_control(job_root)
         cls._validate_transaction_plan(
             terminal,
+            entry=entry,
+            job_id=control.job_id,
+            settings_identity_fingerprint=control.settings_identity_fingerprint,
+            settings_revision_at_creation=None,
+            settings_raw_sha256_at_creation=None,
             index_relative_path=JOB_CONTROL_RELATIVE_PATH,
-            reservation_kind="job_terminal_settings",
-            generation=entry["generation"],
-            reservation_id=entry["reservation_id"],
-            allocation_unit=entry["allocation_unit"],
+            index_fingerprint=control.fingerprint,
         )
         target_raw = target.encode()
         if terminal.validate_physical_phase(target_raw) != "full-source":
@@ -2536,8 +3954,12 @@ class SettingsArtifactTransactionV1:
         intent: SettingsTransitionIntentV1,
         target: ProcessingSettingsArtifactV5,
     ) -> str:
-        if not fixed_path.is_file() or fixed_path.is_symlink():
-            raise ReservationConflictError("fixed settings target is missing or unsafe")
+        if fixed_path.is_symlink():
+            raise ReservationConflictError("fixed settings target is unsafe")
+        if not fixed_path.exists():
+            return "gap"
+        if not fixed_path.is_file():
+            raise ReservationConflictError("fixed settings target is unsafe")
         raw = fixed_path.read_bytes()
         target_raw = target.encode()
         if raw == target_raw:
@@ -2551,6 +3973,7 @@ class SettingsArtifactTransactionV1:
         except Exception as error:
             raise ReservationConflictError("preflight settings artifact is invalid") from error
         recreated = SettingsTransitionIntentV1.create(
+            job_root=fixed_path.parent,
             current=current,
             target=target,
             reservation_generation=intent.reservation_generation,
@@ -2576,6 +3999,19 @@ class SettingsArtifactTransactionV1:
             if state == "complete-full":
                 transaction.recover(target_raw)
                 return
+            nul = raw.find(b"\x00")
+            candidate = raw[:nul] if nul > 0 and not any(raw[nul:]) else None
+            if candidate is not None:
+                try:
+                    from .settings_artifact import ProcessingSettingsArtifactV5
+
+                    parsed = ProcessingSettingsArtifactV5.parse(candidate)
+                except Exception:
+                    parsed = None
+                if parsed is not None and parsed.encode() == candidate:
+                    raise ReservationConflictError(
+                        "settings reservation contains a different complete intent"
+                    )
             if any(raw[len(target_raw) :]):
                 raise ReservationConflictError(
                     "settings reservation has nonzero bytes beyond the intended payload"
@@ -2608,6 +4044,7 @@ class SettingsArtifactTransactionV1:
         )
         terminal_entry = cls._restart_terminal_entry(job_root, target) if attempt_restart else None
         intent = SettingsTransitionIntentV1.create(
+            job_root=job_root,
             current=current,
             target=target,
             reservation_generation=reservation_generation,
@@ -2706,14 +4143,121 @@ class SettingsArtifactTransactionV1:
 
         job_root = Path(job_root)
         index_path = job_root / SETTINGS_TRANSITION_INDEX_RELATIVE_PATH
+        def parse(raw: bytes) -> SettingsTransitionIntentV1:
+            return SettingsTransitionIntentV1.from_object(
+                strict_canonical_json_loads(raw, max_bytes=1024 * 1024)
+            )
+
+        def validate_before_publish(value: object) -> None:
+            if not isinstance(value, SettingsTransitionIntentV1):
+                raise ReservationConflictError("settings transition temporary has the wrong type")
+            control = load_job_control(job_root)
+            if (
+                value.job_id != control.job_id
+                or value.settings_identity_fingerprint
+                != control.settings_identity_fingerprint
+                or _directory_identity(job_root) != control.job_root_identity
+            ):
+                raise ReservationConflictError(
+                    "settings transition temporary belongs to another job"
+                )
+            final_index = job_root / (
+                ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
+            )
+            final_index_temporary = final_index.with_name(
+                f".{final_index.name}.create-new.tmp"
+            )
+            if any(
+                path.exists() or path.is_symlink()
+                for path in (final_index, final_index_temporary)
+            ):
+                raise ReservationConflictError(
+                    "settings candidate overlaps a final-encoding authority"
+                )
+            candidate_temporary = index_path.with_name(
+                f".{index_path.name}.create-new.tmp"
+            )
+            assert_only_job_control_owned_reservations_v1(
+                job_root,
+                control,
+                allowed_relative_paths=(
+                    candidate_temporary.relative_to(job_root).as_posix(),
+                ),
+            )
+            for entry in value.extent_entries:
+                descriptor = job_root / entry["descriptor_relative_path"]
+                descriptor_temporary = descriptor.with_name(
+                    f".{descriptor.name}.create-new.tmp"
+                )
+                source = job_root / entry["source_extent_relative_path"]
+                if any(
+                    path.exists() or path.is_symlink()
+                    for path in (descriptor, descriptor_temporary, source)
+                ):
+                    raise ReservationConflictError(
+                        "settings candidate has downstream reservation artifacts"
+                    )
+            target_artifact = ProcessingSettingsArtifactV5.from_object(
+                value.target_settings_payload
+            )
+            cls._validate_source_or_target(
+                fixed_path=job_root / SETTINGS_ARTIFACT_RELATIVE_PATH,
+                intent=value,
+                target=target_artifact,
+            )
+
+        def validate_before_unlink() -> None:
+            control = load_job_control(job_root)
+            candidate_temporary = index_path.with_name(
+                f".{index_path.name}.create-new.tmp"
+            )
+            assert_only_job_control_owned_reservations_v1(
+                job_root,
+                control,
+                allowed_relative_paths=(
+                    candidate_temporary.relative_to(job_root).as_posix(),
+                ),
+            )
+
         try:
-            raw = index_path.read_bytes()
-            value = strict_canonical_json_loads(raw, max_bytes=1024 * 1024)
+            recovered = recover_control_artifact_pair_v1(
+                index_path,
+                max_bytes=1024 * 1024,
+                parser=parse,
+                prepublish_validate=validate_before_publish,
+                preunlink_validate=validate_before_unlink,
+            )
         except (OSError, CanonicalJsonError) as error:
             raise ReservationConflictError(
                 "settings transition index is missing or malformed"
             ) from error
-        intent = SettingsTransitionIntentV1.from_object(value)
+        if recovered is None:
+            fixed = job_root / SETTINGS_ARTIFACT_RELATIVE_PATH
+            current = ProcessingSettingsArtifactV5.parse(
+                _read_bounded_regular_file(fixed, max_bytes=512 * 1024)
+            )
+            control = load_job_control(job_root)
+            metadata = current.to_object()["metadata"]
+            if (
+                metadata["job_id"] != control.job_id
+                or metadata["settings_identity_fingerprint"]
+                != control.settings_identity_fingerprint
+            ):
+                raise ReservationConflictError(
+                    "settings target differs after discarding an incomplete index"
+                )
+            return current
+        if not isinstance(recovered, SettingsTransitionIntentV1):
+            raise ReservationConflictError(
+                "settings transition index is missing or malformed"
+            )
+        intent = recovered
+        assert_index_owned_reservation_namespace_v1(
+            job_root,
+            load_job_control(job_root),
+            index_relative_path=SETTINGS_TRANSITION_INDEX_RELATIVE_PATH.as_posix(),
+            extent_entries=intent.extent_entries,
+        )
         target = ProcessingSettingsArtifactV5.from_object(intent.target_settings_payload)
         fixed_path = job_root / SETTINGS_ARTIFACT_RELATIVE_PATH
         endpoint = cls._validate_source_or_target(
@@ -2728,13 +4272,12 @@ class SettingsArtifactTransactionV1:
             allocation_adapter=allocation_adapter,
             allocation_counter=allocation_counter,
         )
-        descriptor_path = cls._descriptor_path(
-            job_root,
-            generation=intent.reservation_generation,
-            reservation_kind="settings_transition",
-            reservation_id=intent.reservation_id,
-        )
-        if descriptor_path.is_file() or endpoint == "source":
+        descriptor_path = job_root / intent.extent_entries[0]["descriptor_relative_path"]
+        if endpoint == "gap" and not descriptor_path.is_file():
+            raise ReservationConflictError(
+                "settings replacement gap has no authoritative descriptor"
+            )
+        if descriptor_path.is_file() or endpoint in {"source", "gap"}:
             transaction = cls._load_or_create_primary(
                 job_root=job_root,
                 intent=intent,
@@ -2765,7 +4308,7 @@ def _settings_descriptor_path(
     return (
         Path(job_root)
         / ".depth-surge-reservations-v1"
-        / f"d-r-{generation}-{reservation_kind}-{reservation_id}.json"
+        / f"d-p-none-r-{generation}-{reservation_kind}-{reservation_id}.json"
     )
 
 
@@ -2789,22 +4332,49 @@ def _bootstrap_settings_intent(
 
 def _bootstrap_entry(
     *,
+    job_root: Path,
     reservation_kind: str,
     generation: str,
     reservation_id: str,
     publication_method: PublicationMethod,
     allocation_unit: int,
 ) -> dict:
-    return {
-        "reservation_kind": reservation_kind,
-        "generation": generation,
+    target = SETTINGS_ARTIFACT_RELATIVE_PATH
+    source = target.parent / (
+        f".depth-surge-r-{generation}-{reservation_kind}-{reservation_id}.reserved"
+    )
+    descriptor = Path(".depth-surge-reservations-v1") / (
+        f"d-p-none-r-{generation}-{reservation_kind}-{reservation_id}.json"
+    )
+    payload_role = (
+        "settings_initial"
+        if reservation_kind == "initial_settings"
+        else "settings_migration"
+        if reservation_kind == "migration_settings"
+        else "settings_terminal"
+    )
+    return validate_reservation_entry_v1({
+        "reservation_generation": generation,
         "reservation_id": reservation_id,
-        "index_relative_path": JOB_CONTROL_RELATIVE_PATH.as_posix(),
-        "target_relative_path": SETTINGS_ARTIFACT_RELATIVE_PATH.as_posix(),
+        "reservation_kind": reservation_kind,
+        "descriptor_publication_generation": None,
+        "descriptor_relative_path": descriptor.as_posix(),
+        "source_extent_relative_path": source.as_posix(),
+        "temporary_relative_path": source.as_posix(),
+        "target_relative_path": target.as_posix(),
+        "target_parent_identity": _directory_identity(Path(job_root)).to_object(),
         "publication_method": publication_method,
+        "existing_target_identity_at_preflight": None,
+        "existing_target_byte_count_at_preflight": None,
+        "existing_target_raw_sha256_at_preflight": None,
+        "payload_role": payload_role,
         "payload_raw_max": 512 * 1024,
+        "logical_byte_count": payload_logical_bytes(512 * 1024, allocation_unit),
         "allocation_unit": allocation_unit,
-    }
+        "prune_root_relative_path": None,
+        "marker_name": None,
+        "marker_payload_sha256": None,
+    })
 
 
 def bootstrap_settings_job_v1(  # noqa: C901
@@ -2842,6 +4412,7 @@ def bootstrap_settings_job_v1(  # noqa: C901
         else "initial_settings"
     )
     initial_entry = _bootstrap_entry(
+        job_root=job_root,
         reservation_kind=initial_kind,
         generation=generation,
         reservation_id=initial_settings_reservation_id,
@@ -2849,6 +4420,7 @@ def bootstrap_settings_job_v1(  # noqa: C901
         allocation_unit=allocation_unit,
     )
     terminal_entry = _bootstrap_entry(
+        job_root=job_root,
         reservation_kind="job_terminal_settings",
         generation=generation,
         reservation_id=terminal_id,
@@ -2938,6 +4510,18 @@ def _parse_bootstrap_target(control: JobControlV1) -> ProcessingSettingsArtifact
         or type(intent["target_settings_revision"]) is not int
     ):
         raise ReservationConflictError("bootstrap settings intent identity is invalid")
+    _require_lower_hex(
+        intent["settings_identity_fingerprint"], 64, "bootstrap settings identity"
+    )
+    _require_lower_hex(intent["reservation_generation"], 32, "bootstrap generation")
+    _require_lower_hex(
+        intent["target_settings_content_fingerprint"],
+        64,
+        "bootstrap content fingerprint",
+    )
+    _require_lower_hex(
+        intent["target_settings_raw_sha256"], 64, "bootstrap settings raw hash"
+    )
     artifact = ProcessingSettingsArtifactV5.from_object(intent["target_settings_payload"])
     value = artifact.to_object()
     if (
@@ -2945,6 +4529,10 @@ def _parse_bootstrap_target(control: JobControlV1) -> ProcessingSettingsArtifact
         or value["metadata"]["job_id"] != control.job_id
         or value["metadata"]["settings_identity_fingerprint"]
         != control.settings_identity_fingerprint
+        or value["metadata"]["job_reservation_generation"]
+        != control.job_reservation_generation
+        or value["metadata"]["job_terminal_reservation_id"]
+        != control.job_terminal_reservation_id
         or value["content_fingerprint"] != intent["target_settings_content_fingerprint"]
         or hashlib.sha256(artifact.encode()).hexdigest() != intent["target_settings_raw_sha256"]
     ):
@@ -3051,6 +4639,52 @@ def _parse_terminal_source_payload(
         ) from error
 
 
+def _load_or_create_job_control_extent(
+    *,
+    job_root: Path,
+    control: JobControlV1,
+    entry: dict,
+    allocation_adapter: AllocationAdapter,
+    allocation_counter: AllocationCounter | None,
+) -> ReservedArtifactTransaction:
+    descriptor_path = Path(job_root) / entry["descriptor_relative_path"]
+    if descriptor_path.is_symlink() or (
+        descriptor_path.exists() and not descriptor_path.is_file()
+    ):
+        raise ReservationConflictError("job-control descriptor path is unsafe")
+    if descriptor_path.is_file():
+        transaction = ReservedArtifactTransaction.load(
+            descriptor_path,
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+        )
+    else:
+        transaction = ReservedArtifactTransaction.create(
+            job_root=job_root,
+            index_relative_path=JOB_CONTROL_RELATIVE_PATH,
+            target_relative_path=Path(entry["target_relative_path"]),
+            reservation_kind=entry["reservation_kind"],
+            payload_raw_max=entry["payload_raw_max"],
+            allocation_unit=entry["allocation_unit"],
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+            generation=entry["reservation_generation"],
+            reservation_id=entry["reservation_id"],
+            expected_publication_method=entry["publication_method"],
+        )
+    validate_descriptor_against_entry_v1(
+        transaction.descriptor,
+        entry,
+        job_id=control.job_id,
+        settings_identity_fingerprint=control.settings_identity_fingerprint,
+        settings_revision_at_creation=None,
+        settings_raw_sha256_at_creation=None,
+        transaction_index_relative_path=JOB_CONTROL_RELATIVE_PATH,
+        transaction_index_fingerprint=control.fingerprint,
+    )
+    return transaction
+
+
 def recover_settings_job_v1(  # noqa: C901
     job_root: Path,
     *,
@@ -3063,30 +4697,84 @@ def recover_settings_job_v1(  # noqa: C901
 
     job_root = Path(job_root)
     control = load_job_control(job_root)
-    if (job_root / SETTINGS_TRANSITION_INDEX_RELATIVE_PATH).exists():
-        SettingsArtifactTransactionV1.recover(
+    bootstrap_target = _parse_bootstrap_target(control)
+    fixed_path = job_root / SETTINGS_ARTIFACT_RELATIVE_PATH
+    if fixed_path.is_symlink() or (fixed_path.exists() and not fixed_path.is_file()):
+        raise ReservationConflictError("fixed settings target is unsafe during bootstrap")
+    current: ProcessingSettingsArtifactV5 | None = None
+    if fixed_path.is_file() and fixed_path.stat().st_size:
+        try:
+            current = ProcessingSettingsArtifactV5.parse(fixed_path.read_bytes())
+        except Exception as error:
+            raise ReservationConflictError("fixed settings target is malformed") from error
+    initial_entry, terminal_entry = control.bootstrap_extent_entries
+    initial_descriptor = job_root / initial_entry["descriptor_relative_path"]
+    if current is None:
+        initial = _load_or_create_job_control_extent(
+            job_root=job_root,
+            control=control,
+            entry=initial_entry,
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+        )
+        initial_phase = initial.validate_physical_phase(bootstrap_target.encode())
+        if initial_phase == "replacement-gap":
+            initial.recover(bootstrap_target.encode())
+            current = bootstrap_target
+        terminal = _load_or_create_job_control_extent(
+            job_root=job_root,
+            control=control,
+            entry=terminal_entry,
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+        )
+        terminal_raw = terminal.source_path.read_bytes()
+        if (
+            terminal.validate_physical_phase(bootstrap_target.encode()) != "full-source"
+            or classify_payload_frame(terminal_raw, bootstrap_target.encode()) != "zero"
+        ):
+            raise ReservationConflictError(
+                "bootstrap terminal reserve is not a complete zero frame"
+            )
+        if current is None:
+            SettingsArtifactTransactionV1._consume_or_recover(
+                initial,
+                bootstrap_target.encode(),
+            )
+            current = bootstrap_target
+    elif initial_descriptor.is_file():
+        initial = _load_or_create_job_control_extent(
+            job_root=job_root,
+            control=control,
+            entry=initial_entry,
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+        )
+        if current == bootstrap_target:
+            initial.recover(bootstrap_target.encode())
+        elif initial.source_path.exists():
+            raise ReservationConflictError(
+                "later settings revision retains an initial source extent"
+            )
+        else:
+            initial._retire_descriptor()
+    if not fixed_path.is_file() or fixed_path.is_symlink():
+        raise ReservationConflictError("fixed settings target is missing after bootstrap")
+    settings_index_path = job_root / SETTINGS_TRANSITION_INDEX_RELATIVE_PATH
+    settings_index_temporary = settings_index_path.with_name(
+        f".{settings_index_path.name}.create-new.tmp"
+    )
+    if any(
+        path.exists() or path.is_symlink()
+        for path in (settings_index_path, settings_index_temporary)
+    ):
+        current = SettingsArtifactTransactionV1.recover(
             job_root,
             allocation_adapter=allocation_adapter,
             allocation_counter=allocation_counter,
         )
-    bootstrap_target = _parse_bootstrap_target(control)
-    fixed_path = job_root / SETTINGS_ARTIFACT_RELATIVE_PATH
-    initial_descriptor = _settings_descriptor_path(
-        job_root,
-        generation=control.job_reservation_generation,
-        reservation_kind=control.bootstrap_extent_entries[0]["reservation_kind"],
-        reservation_id=control.initial_settings_reservation_id,
-    )
-    if initial_descriptor.exists():
-        initial = ReservedArtifactTransaction.load(
-            initial_descriptor,
-            allocation_adapter=allocation_adapter,
-            allocation_counter=allocation_counter,
-        )
-        initial.recover(bootstrap_target.encode())
-    if not fixed_path.is_file() or fixed_path.is_symlink():
-        raise ReservationConflictError("fixed settings target is missing after bootstrap")
-    current = ProcessingSettingsArtifactV5.parse(fixed_path.read_bytes())
+    else:
+        current = ProcessingSettingsArtifactV5.parse(fixed_path.read_bytes())
     current_value = current.to_object()
     if (
         current_value["metadata"]["job_id"] != control.job_id
@@ -3094,15 +4782,12 @@ def recover_settings_job_v1(  # noqa: C901
         != control.settings_identity_fingerprint
     ):
         raise ReservationConflictError("current settings do not belong to job control")
-    terminal_descriptor = _settings_descriptor_path(
-        job_root,
-        generation=control.job_reservation_generation,
-        reservation_kind="job_terminal_settings",
-        reservation_id=control.job_terminal_reservation_id,
-    )
-    if terminal_descriptor.is_file():
-        terminal = ReservedArtifactTransaction.load(
-            terminal_descriptor,
+    terminal_descriptor = job_root / terminal_entry["descriptor_relative_path"]
+    if terminal_descriptor.is_file() or current.status == "in_progress":
+        terminal = _load_or_create_job_control_extent(
+            job_root=job_root,
+            control=control,
+            entry=terminal_entry,
             allocation_adapter=allocation_adapter,
             allocation_counter=allocation_counter,
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 
 import pytest
 
@@ -186,10 +187,20 @@ def _allocation_adapter(path, logical: int) -> reservation_protocol.ReservationA
     )
 
 
+def _bootstrap_settings(tmp_path, artifact: ProcessingSettingsArtifactV5) -> None:
+    reservation_protocol.bootstrap_settings_job_v1(
+        job_root=tmp_path,
+        artifact=artifact,
+        initial_settings_reservation_id="77" * 16,
+        allocation_adapter=_allocation_adapter,
+        allocation_unit=4096,
+    )
+
+
 def test_settings_transaction_recovers_exact_durable_semantic_payload(tmp_path) -> None:
     initial = _artifact()
     target_path = tmp_path / "processing-settings-v5.json"
-    target_path.write_bytes(initial.encode())
+    _bootstrap_settings(tmp_path, initial)
     intended = initial.with_producer_marker(
         generation="44" * 16,
         updated_at="2026-08-24T12:34:57.123456Z",
@@ -220,10 +231,44 @@ def test_settings_transaction_recovers_exact_durable_semantic_payload(tmp_path) 
     ).exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows replacement gaps are platform-specific")
+def test_settings_transaction_recovers_missing_fixed_target_from_descriptor(tmp_path) -> None:
+    initial = _artifact()
+    target_path = tmp_path / "processing-settings-v5.json"
+    _bootstrap_settings(tmp_path, initial)
+    intended = initial.with_producer_marker(
+        generation="44" * 16,
+        updated_at="2026-08-24T12:34:57.123456Z",
+    )
+    transaction = reservation_protocol.SettingsArtifactTransactionV1.begin(
+        job_root=tmp_path,
+        current=initial,
+        target=intended,
+        allocation_adapter=_allocation_adapter,
+        allocation_unit=4096,
+        reservation_generation="55" * 16,
+        reservation_id="66" * 16,
+    )
+    transaction.transaction.stage_complete_full(intended.encode())
+    transaction.transaction.truncate_to_payload(intended.encode())
+    transaction.transaction._short_release_recovery(intended.encode())
+    target_path.unlink()
+
+    recovered = reservation_protocol.SettingsArtifactTransactionV1.recover(
+        tmp_path,
+        allocation_adapter=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("replacement-gap recovery must not rerun readiness evidence")
+        ),
+    )
+
+    assert recovered == intended
+    assert target_path.read_bytes() == intended.encode()
+
+
 def test_settings_transaction_recovers_ready_zero_extent_from_durable_intent(tmp_path) -> None:
     initial = _artifact()
     target_path = tmp_path / "processing-settings-v5.json"
-    target_path.write_bytes(initial.encode())
+    _bootstrap_settings(tmp_path, initial)
     intended = initial.with_processing_settings(
         validate_settings(
             {"stereo_render_mode": "quality", "occlusion_fill_max_px": 7},
@@ -250,6 +295,44 @@ def test_settings_transaction_recovers_ready_zero_extent_from_durable_intent(tmp
     assert target_path.read_bytes() == intended.encode()
 
 
+def test_settings_transaction_rejects_a_different_complete_source_intent(tmp_path) -> None:
+    initial = _artifact()
+    target_path = tmp_path / "processing-settings-v5.json"
+    _bootstrap_settings(tmp_path, initial)
+    intended = initial.with_producer_marker(
+        generation="44" * 16,
+        updated_at="2026-08-24T12:34:57.123456Z",
+    )
+    different = initial.with_producer_marker(
+        generation="45" * 16,
+        updated_at="2026-08-24T12:34:58.123456Z",
+    )
+    transaction = reservation_protocol.SettingsArtifactTransactionV1.begin(
+        job_root=tmp_path,
+        current=initial,
+        target=intended,
+        allocation_adapter=_allocation_adapter,
+        allocation_unit=4096,
+        reservation_generation="55" * 16,
+        reservation_id="66" * 16,
+    )
+    with transaction.transaction.source_path.open("r+b", buffering=0) as handle:
+        handle.write(different.encode())
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="different complete intent",
+    ):
+        reservation_protocol.SettingsArtifactTransactionV1.recover(
+            tmp_path,
+            allocation_adapter=_allocation_adapter,
+        )
+
+    assert target_path.read_bytes() == initial.encode()
+
+
 def test_bootstrap_publishes_locator_then_settings_and_retains_terminal_extent(tmp_path) -> None:
     artifact = _artifact()
     control = reservation_protocol.bootstrap_settings_job_v1(
@@ -267,7 +350,7 @@ def test_bootstrap_publishes_locator_then_settings_and_retains_terminal_extent(t
         tmp_path
         / ".depth-surge-reservations-v1"
         / (
-            "d-r-"
+            "d-p-none-r-"
             + artifact.to_object()["metadata"]["job_reservation_generation"]
             + "-job_terminal_settings-"
             + artifact.to_object()["metadata"]["job_terminal_reservation_id"]
@@ -275,13 +358,91 @@ def test_bootstrap_publishes_locator_then_settings_and_retains_terminal_extent(t
         )
     )
     assert terminal_descriptor.is_file()
-
     recovered = reservation_protocol.recover_settings_job_v1(
         tmp_path,
         allocation_adapter=_allocation_adapter,
     )
     assert recovered == artifact
     assert terminal_descriptor.is_file()
+
+
+@pytest.mark.parametrize("stop_event", ["initial-settings:ready", "terminal-settings:ready"])
+def test_bootstrap_recovery_materializes_both_extents_before_settings(
+    tmp_path,
+    stop_event: str,
+) -> None:
+    artifact = _artifact()
+
+    def crash(event: str) -> None:
+        if event == stop_event:
+            raise RuntimeError(stop_event)
+
+    with pytest.raises(RuntimeError, match=stop_event):
+        reservation_protocol.bootstrap_settings_job_v1(
+            job_root=tmp_path,
+            artifact=artifact,
+            initial_settings_reservation_id="77" * 16,
+            allocation_adapter=_allocation_adapter,
+            allocation_unit=4096,
+            event=crash,
+        )
+
+    recovered = reservation_protocol.recover_settings_job_v1(
+        tmp_path,
+        allocation_adapter=_allocation_adapter,
+    )
+
+    assert recovered == artifact
+    assert (tmp_path / "processing-settings-v5.json").read_bytes() == artifact.encode()
+    metadata = artifact.to_object()["metadata"]
+    terminal_descriptor = (
+        tmp_path
+        / ".depth-surge-reservations-v1"
+        / (
+            f"d-p-none-r-{metadata['job_reservation_generation']}-"
+            f"job_terminal_settings-{metadata['job_terminal_reservation_id']}.json"
+        )
+    )
+    assert terminal_descriptor.is_file()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows replacement gaps are platform-specific")
+def test_bootstrap_initial_replacement_gap_is_forward_recovered_before_terminal_check(
+    tmp_path,
+) -> None:
+    artifact = _artifact()
+
+    def crash(event: str) -> None:
+        if event == "terminal-settings:ready":
+            raise RuntimeError(event)
+
+    with pytest.raises(RuntimeError, match="terminal-settings:ready"):
+        reservation_protocol.bootstrap_settings_job_v1(
+            job_root=tmp_path,
+            artifact=artifact,
+            initial_settings_reservation_id="77" * 16,
+            allocation_adapter=_allocation_adapter,
+            allocation_unit=4096,
+            event=crash,
+        )
+    control = reservation_protocol.load_job_control(tmp_path)
+    initial_entry = control.bootstrap_extent_entries[0]
+    initial = reservation_protocol.ReservedArtifactTransaction.load(
+        tmp_path / initial_entry["descriptor_relative_path"],
+        allocation_adapter=_allocation_adapter,
+    )
+    initial.stage_complete_full(artifact.encode())
+    initial.truncate_to_payload(artifact.encode())
+    initial._short_release_recovery(artifact.encode())
+    (tmp_path / "processing-settings-v5.json").unlink()
+
+    recovered = reservation_protocol.recover_settings_job_v1(
+        tmp_path,
+        allocation_adapter=_allocation_adapter,
+    )
+
+    assert recovered == artifact
+    assert (tmp_path / "processing-settings-v5.json").read_bytes() == artifact.encode()
 
 
 def test_lifecycle_terminal_extent_recovers_short_failed_intent(tmp_path) -> None:
@@ -405,7 +566,7 @@ def test_attempt_restart_updates_settings_and_recreates_terminal_extent(tmp_path
         tmp_path
         / ".depth-surge-reservations-v1"
         / (
-            f"d-r-{metadata['job_reservation_generation']}-job_terminal_settings-"
+            f"d-p-none-r-{metadata['job_reservation_generation']}-job_terminal_settings-"
             f"{metadata['job_terminal_reservation_id']}.json"
         )
     )

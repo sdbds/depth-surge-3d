@@ -525,6 +525,11 @@ def directory_identity_from_posix_fd(descriptor: int) -> DirectoryIdentityV1:
     return DirectoryIdentityV1("posix", identity)
 
 
+def file_identity_from_posix_fd(descriptor: int) -> PersistedFileIdentityV1:
+    identity, links = _capture_posix_fd(descriptor, require_directory=False)
+    return PersistedFileIdentityV1("posix", identity, links)
+
+
 def capture_file_identity(path: Path) -> PersistedFileIdentityV1:
     path = Path(path)
     if os.name == "nt":

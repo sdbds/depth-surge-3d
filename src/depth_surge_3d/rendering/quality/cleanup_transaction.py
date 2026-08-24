@@ -18,6 +18,7 @@ from ...io.file_identity import (
     PersistentIdentitySchemaError,
     capture_directory_identity,
     directory_identity_from_posix_fd,
+    file_identity_from_posix_fd,
     windows_identity_from_handle,
 )
 from .diagnostic_transaction import (
@@ -334,6 +335,33 @@ def plan_prune_markers_v1(job_root: Path) -> tuple[PlannedPruneMarkerV1, ...]:
     return tuple(planned)
 
 
+def prune_entry_from_reservation_v1(
+    *,
+    relative_path: str,
+    directory_identity: object,
+    marker_name: str,
+    marker_payload_sha256: str,
+) -> dict[str, Any]:
+    """Rebuild the fixed cleanup authorization carried by a marker extent."""
+
+    matches = [stage_key for stage_key, relative in _PRUNE_ROOT_ORDER if relative == relative_path]
+    if len(matches) != 1:
+        raise CleanupTransactionError("reserved prune root is outside cleanup contract v2")
+    entry = {
+        "stage_key": matches[0],
+        "relative_path": relative_path,
+        "operation": "delete_tree",
+        "cleanup_contract_version": 2,
+        "directory_identity": _DirectoryIdentity.from_object(directory_identity).to_object(),
+        "marker": {
+            "name": marker_name,
+            "sha256": marker_payload_sha256,
+        },
+    }
+    _validate_prune_entry(entry, previous_index=-1)
+    return entry
+
+
 def _is_hex64(value: object) -> bool:
     return isinstance(value, str) and _HEX64.fullmatch(value) is not None
 
@@ -527,16 +555,21 @@ def commit_payload_pruned(  # noqa: C901
 
     root = Path(job_root).resolve()
     active_index = root / ".depth-surge-reservations-v1" / "final-encoding-reservation-v1.json"
-    if reservation is None and active_index.is_file():
-        from ...io.settings_artifact import ProcessingSettingsArtifactV5
+    index_temporary = active_index.with_name(f".{active_index.name}.create-new.tmp")
+    if reservation is None:
+        from ...io.operations import recover_processing_control_prefix_v1
         from ...processing.video.final_publication import (
             load_final_encoding_reservation_v1,
         )
 
-        settings = ProcessingSettingsArtifactV5.parse(
-            (root / "processing-settings-v5.json").read_bytes()
+        settings = recover_processing_control_prefix_v1(root)
+        active_pair = any(
+            path.exists() or path.is_symlink() for path in (active_index, index_temporary)
         )
-        reservation = load_final_encoding_reservation_v1(root, settings)
+        if active_pair:
+            if settings is None:
+                raise CleanupTransactionError("schema-5 cleanup has no recovered job control")
+            reservation = load_final_encoding_reservation_v1(root, settings)
     metadata_path = root / "04_stereo_diagnostics" / "metadata.json"
     final_manifest_path = root / "final_video_manifest.json"
     metadata_raw = metadata_path.read_bytes()
@@ -807,11 +840,25 @@ def _delete_tree_posix(  # noqa: C901
                 raise CleanupIdentityMismatchError(
                     f"prune marker is missing from a nonempty root: {root}"
                 )
-            os.close(root_fd)
-            root_fd = -1
-            os.rmdir(relative_parts[-1], dir_fd=parent_fd)
+            reopened_root = os.open(
+                relative_parts[-1],
+                os.O_RDONLY | directory_flag | nofollow,
+                dir_fd=parent_fd,
+            )
+            try:
+                if directory_identity_from_posix_fd(reopened_root) != opened_identity:
+                    raise CleanupIdentityMismatchError(
+                        f"empty prune root identity changed: {root}"
+                    )
+                os.rmdir(relative_parts[-1], dir_fd=parent_fd)
+            finally:
+                os.close(reopened_root)
             return 0
-        marker_fd = os.open(marker_name, os.O_RDONLY | nofollow, dir_fd=root_fd)
+        marker_fd = os.open(
+            marker_name,
+            os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=root_fd,
+        )
         try:
             marker_metadata = os.fstat(marker_fd)
             if not stat.S_ISREG(marker_metadata.st_mode) or int(marker_metadata.st_dev) != volume:
@@ -821,29 +868,54 @@ def _delete_tree_posix(  # noqa: C901
                 marker_raw = marker_handle.read(64 * 1024)
                 if marker_handle.read(1):
                     raise CleanupIdentityMismatchError("prune marker exceeds its bound")
+            marker_identity = file_identity_from_posix_fd(marker_fd)
+            _validate_marker_raw(entry, marker_raw, marker_name)
+            attest_tree(root_fd)
+            visit(root_fd)
+            remaining_count = 0
+            remaining_marker = False
+            with os.scandir(root_fd) as iterator:
+                for directory_entry in iterator:
+                    remaining_count += 1
+                    remaining_marker = directory_entry.name == marker_name
+            if remaining_count != 1 or not remaining_marker:
+                raise CleanupIdentityMismatchError(
+                    f"prune marker is not the sole final entry: {root}"
+                )
+            reopened_marker = os.open(
+                marker_name,
+                os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=root_fd,
+            )
+            try:
+                if file_identity_from_posix_fd(reopened_marker) != marker_identity:
+                    raise CleanupIdentityMismatchError(
+                        f"prune marker identity changed during cleanup: {root / marker_name}"
+                    )
+                os.unlink(marker_name, dir_fd=root_fd)
+            finally:
+                os.close(reopened_marker)
         finally:
             os.close(marker_fd)
-        _validate_marker_raw(entry, marker_raw, marker_name)
-        attest_tree(root_fd)
-        visit(root_fd)
-        remaining_count = 0
-        remaining_marker = False
-        with os.scandir(root_fd) as iterator:
-            for directory_entry in iterator:
-                remaining_count += 1
-                remaining_marker = directory_entry.name == marker_name
-        if remaining_count != 1 or not remaining_marker:
-            raise CleanupIdentityMismatchError(f"prune marker is not the sole final entry: {root}")
-        os.unlink(marker_name, dir_fd=root_fd)
         removed += 1
         after_marker_unlink()
         with os.scandir(root_fd) as iterator:
             repopulated = next(iterator, None) is not None
         if repopulated:
             raise CleanupIdentityMismatchError(f"prune root repopulated during cleanup: {root}")
-        os.close(root_fd)
-        root_fd = -1
-        os.rmdir(relative_parts[-1], dir_fd=parent_fd)
+        reopened_root = os.open(
+            relative_parts[-1],
+            os.O_RDONLY | directory_flag | nofollow,
+            dir_fd=parent_fd,
+        )
+        try:
+            if directory_identity_from_posix_fd(reopened_root) != opened_identity:
+                raise CleanupIdentityMismatchError(
+                    f"prune root identity changed before removal: {root}"
+                )
+            os.rmdir(relative_parts[-1], dir_fd=parent_fd)
+        finally:
+            os.close(reopened_root)
         return removed
     finally:
         if root_fd >= 0:
@@ -1186,21 +1258,19 @@ def _delete_tree_windows(  # noqa: C901
             if marker_identity.volume_serial != volume or marker_attributes & file_attribute_reparse:
                 raise CleanupIdentityMismatchError(f"prune marker is unsafe: {root / marker_name}")
             marker_raw = read_marker(marker_handle)
-        finally:
-            close_handle(wintypes.HANDLE(marker_handle))
-        _validate_marker_raw(entry, marker_raw, marker_name)
-        visit(root_handle, marker_name)
-        remaining_count = 0
-        marker_still_present = False
-        for name, _attributes in iter_names(root_handle):
-            remaining_count += 1
-            marker_still_present = marker_still_present or name == marker_name
-            if remaining_count > 1:
-                break
-        if remaining_count != 1 or not marker_still_present:
-            raise CleanupIdentityMismatchError(f"prune marker is not the sole final entry: {root}")
-        marker_handle = open_relative(root_handle, marker_name, directory=False)
-        try:
+            _validate_marker_raw(entry, marker_raw, marker_name)
+            visit(root_handle, marker_name)
+            remaining_count = 0
+            marker_still_present = False
+            for name, _attributes in iter_names(root_handle):
+                remaining_count += 1
+                marker_still_present = marker_still_present or name == marker_name
+                if remaining_count > 1:
+                    break
+            if remaining_count != 1 or not marker_still_present:
+                raise CleanupIdentityMismatchError(
+                    f"prune marker is not the sole final entry: {root}"
+                )
             delete_on_close(marker_handle)
         finally:
             close_handle(wintypes.HANDLE(marker_handle))

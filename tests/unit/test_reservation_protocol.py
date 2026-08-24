@@ -10,6 +10,7 @@ import os
 import pytest
 
 from src.depth_surge_3d.io import reservation_protocol
+from tests.unit.test_settings_artifact_v5 import _artifact
 
 
 def _adapter(path: Path, logical: int) -> reservation_protocol.ReservationAllocationEvidence:
@@ -175,6 +176,85 @@ def _create_transaction(
         generation="cd" * 16,
         reservation_id="ef" * 16,
     )
+
+
+def test_control_publication_preserves_a_preplaced_hardlink_temporary(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"do-not-truncate")
+    final = tmp_path / "job-control-v1.json"
+    temporary = tmp_path / ".job-control-v1.json.create-new.tmp"
+    os.link(outside, temporary)
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="single-link",
+    ):
+        reservation_protocol.publish_write_ahead_intent(
+            final,
+            {"algorithm_version": "test-control-v1"},
+        )
+
+    assert outside.read_bytes() == b"do-not-truncate"
+    assert temporary.exists()
+    assert not final.exists()
+
+
+def test_control_publication_adopts_only_the_exact_durable_temporary(tmp_path: Path) -> None:
+    final = tmp_path / "job-control-v1.json"
+    temporary = tmp_path / ".job-control-v1.json.create-new.tmp"
+    payload = {"algorithm_version": "test-control-v1"}
+    raw = reservation_protocol.canonical_json_bytes(payload)
+    reservation_protocol._write_control_temporary(temporary, raw, event=None)
+
+    reservation_protocol.publish_write_ahead_intent(final, payload)
+
+    assert final.read_bytes() == raw
+    assert not temporary.exists()
+
+
+def test_control_publication_never_overwrites_a_different_durable_temporary(
+    tmp_path: Path,
+) -> None:
+    final = tmp_path / "job-control-v1.json"
+    temporary = tmp_path / ".job-control-v1.json.create-new.tmp"
+    original = reservation_protocol.canonical_json_bytes(
+        {"algorithm_version": "first-control-v1"}
+    )
+    reservation_protocol._write_control_temporary(temporary, original, event=None)
+
+    with pytest.raises(reservation_protocol.ReservationIncompleteError):
+        reservation_protocol.publish_write_ahead_intent(
+            final,
+            {"algorithm_version": "second-control-v1"},
+        )
+
+    assert temporary.read_bytes() == original
+    assert not final.exists()
+
+
+def test_control_recovery_checks_preconditions_before_promoting_temporary(
+    tmp_path: Path,
+) -> None:
+    final = tmp_path / "job-control-v1.json"
+    temporary = tmp_path / ".job-control-v1.json.create-new.tmp"
+    raw = reservation_protocol.canonical_json_bytes(
+        {"algorithm_version": "test-control-v1"}
+    )
+    reservation_protocol._write_control_temporary(temporary, raw, event=None)
+
+    def reject(_value: object) -> None:
+        raise reservation_protocol.ReservationConflictError("foreign root")
+
+    with pytest.raises(reservation_protocol.ReservationConflictError, match="foreign root"):
+        reservation_protocol.recover_control_artifact_pair_v1(
+            final,
+            max_bytes=4096,
+            parser=lambda value: value,
+            prepublish_validate=reject,
+        )
+
+    assert temporary.read_bytes() == raw
+    assert not final.exists()
 
 
 def test_streamed_prefix_consumption_never_requires_a_payload_bytes_object(tmp_path: Path) -> None:
@@ -521,19 +601,41 @@ def test_namespace_enospc_is_retryable_incomplete_not_conflict(tmp_path: Path) -
 
 
 def _job_control(job_root: Path) -> reservation_protocol.JobControlV1:
+    artifact = _artifact()
+    metadata = artifact.to_object()["metadata"]
+    generation = metadata["job_reservation_generation"]
+    initial_id = "04" * 16
+    terminal_id = metadata["job_terminal_reservation_id"]
     return reservation_protocol.JobControlV1.create(
         job_root=job_root,
-        job_id="01" * 16,
-        settings_identity_fingerprint="02" * 32,
-        job_reservation_generation="03" * 16,
-        initial_settings_reservation_id="04" * 16,
-        job_terminal_reservation_id="05" * 16,
+        job_id=metadata["job_id"],
+        settings_identity_fingerprint=metadata["settings_identity_fingerprint"],
+        job_reservation_generation=generation,
+        initial_settings_reservation_id=initial_id,
+        job_terminal_reservation_id=terminal_id,
         legacy_settings_artifact_relative_path=None,
         bootstrap_extent_entries=[
-            {"reservation_kind": "initial_settings"},
-            {"reservation_kind": "job_terminal_settings"},
+            reservation_protocol._bootstrap_entry(
+                job_root=job_root,
+                reservation_kind="initial_settings",
+                generation=generation,
+                reservation_id=initial_id,
+                publication_method="replace_placeholder",
+                allocation_unit=4096,
+            ),
+            reservation_protocol._bootstrap_entry(
+                job_root=job_root,
+                reservation_kind="job_terminal_settings",
+                generation=generation,
+                reservation_id=terminal_id,
+                publication_method="replace_existing",
+                allocation_unit=4096,
+            ),
         ],
-        bootstrap_settings_intent={"target_settings_revision": 0},
+        bootstrap_settings_intent=reservation_protocol._bootstrap_settings_intent(
+            artifact,
+            reservation_generation=generation,
+        ),
     )
 
 
@@ -548,6 +650,29 @@ def test_job_control_is_the_only_settings_locator_after_bootstrap(tmp_path: Path
 
     assert reservation_protocol.resolve_fixed_settings_path(tmp_path, loaded) == fixed
     assert loaded == control
+
+
+def test_job_control_temporary_from_another_root_is_never_promoted(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    control = _job_control(source_root)
+    temporary = target_root / ".job-control-v1.json.create-new.tmp"
+    reservation_protocol._write_control_temporary(
+        temporary,
+        reservation_protocol.canonical_json_bytes(control.to_object()),
+        event=None,
+    )
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="different job root",
+    ):
+        reservation_protocol.load_job_control(target_root)
+
+    assert temporary.is_file()
+    assert not (target_root / "job-control-v1.json").exists()
 
 
 def test_fixed_settings_locator_never_adopts_a_legacy_glob_match(tmp_path: Path) -> None:

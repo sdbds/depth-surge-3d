@@ -17,6 +17,7 @@ from ...io.operations import (
     create_output_directories,
     save_processing_settings,
     prepare_processing_settings_artifact,
+    recover_processing_control_prefix_v1,
     recover_processing_settings_artifact,
     load_processing_settings,
     update_processing_status,
@@ -257,6 +258,7 @@ class ProcessingOrchestrator:
                 raise ValueError("The supplied job writer lock is not acquired")
             elif job_lock.output_dir.resolve() != output_dir.resolve():
                 raise ValueError("The supplied job writer lock belongs to another output directory")
+            recover_processing_control_prefix_v1(output_dir)
             cleanup_vdpp_private_work(output_dir, job_lock)
 
             cleanup_resume = self._resume_cleanup_only(output_dir)

@@ -43,7 +43,10 @@ from ..utils.path_utils import (
 )
 from .canonical_json import canonical_json_bytes
 from .reservation_protocol import (
+    JOB_CONTROL_RELATIVE_PATH,
     SETTINGS_ARTIFACT_RELATIVE_PATH,
+    SETTINGS_TRANSITION_INDEX_RELATIVE_PATH,
+    ReservationConflictError,
     SettingsArtifactTransactionV1,
     allocation_unit_for_path,
     bootstrap_settings_job_v1,
@@ -51,6 +54,7 @@ from .reservation_protocol import (
     platform_allocation_adapter,
     platform_allocation_counter,
     recover_settings_job_v1,
+    _assert_job_control_candidate_has_no_downstream,
 )
 from .settings_artifact import (
     ProcessingSettingsArtifactV5,
@@ -727,11 +731,27 @@ def commit_final_media_producer_marker(
     if settings_file.name != SETTINGS_ARTIFACT_RELATIVE_PATH.name:
         raise ValueError("producer marker requires processing-settings-v5.json")
     job_root = settings_file.parent
-    current = recover_settings_job_v1(
-        job_root,
-        allocation_adapter=platform_allocation_adapter,
-        allocation_counter=platform_allocation_counter,
+    current = recover_processing_control_prefix_v1(job_root)
+    if current is None:
+        raise ReservationConflictError("producer marker has no schema-5 job")
+    final_index = job_root / (
+        ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
     )
+    final_index_temporary = final_index.with_name(
+        f".{final_index.name}.create-new.tmp"
+    )
+    if any(
+        path.exists() or path.is_symlink()
+        for path in (final_index, final_index_temporary)
+    ):
+        from ..processing.video.final_publication import (
+            load_final_encoding_reservation_v1,
+        )
+
+        reservation = load_final_encoding_reservation_v1(job_root, current)
+        if reservation.index.publication_generation != generation:
+            raise ReservationConflictError("producer marker generation differs from active index")
+        return reservation.commit_producer_settings()
     target = current.with_producer_marker(
         generation=generation,
         updated_at=_utc_now_usec(),
@@ -762,25 +782,27 @@ def commit_cleanup_pending_status(
     if settings_file.name != SETTINGS_ARTIFACT_RELATIVE_PATH.name:
         raise ValueError("cleanup pending requires processing-settings-v5.json")
     job_root = settings_file.parent
+    current = recover_processing_control_prefix_v1(job_root)
+    if current is None:
+        raise ReservationConflictError("cleanup pending has no schema-5 job")
     active_index = job_root / ".depth-surge-reservations-v1" / "final-encoding-reservation-v1.json"
-    if reservation is None and active_index.is_file():
+    active_index_temporary = active_index.with_name(
+        f".{active_index.name}.create-new.tmp"
+    )
+    active_final = any(
+        path.exists() or path.is_symlink()
+        for path in (active_index, active_index_temporary)
+    )
+    if active_final:
         from ..processing.video.final_publication import (
             load_final_encoding_reservation_v1,
         )
 
-        current = recover_settings_job_v1(
-            job_root,
-            allocation_adapter=platform_allocation_adapter,
-            allocation_counter=platform_allocation_counter,
-        )
         reservation = load_final_encoding_reservation_v1(job_root, current)
+    elif reservation is not None:
+        raise ReservationConflictError("cleanup reservation is no longer authoritative")
     if reservation is not None:
         return reservation.commit_cleanup_pending_settings()
-    current = recover_settings_job_v1(
-        job_root,
-        allocation_adapter=platform_allocation_adapter,
-        allocation_counter=platform_allocation_counter,
-    )
     if current.to_object()["metadata"]["cleanup_status"] == "pending":
         return current
     target = current.cleanup_pending(updated_at=_utc_now_usec())
@@ -803,22 +825,103 @@ def recover_processing_settings_artifact(
     settings_file = Path(settings_file)
     if settings_file.name != SETTINGS_ARTIFACT_RELATIVE_PATH.name:
         raise ValueError("schema-5 recovery requires processing-settings-v5.json")
-    artifact = recover_settings_job_v1(
-        settings_file.parent,
-        allocation_adapter=platform_allocation_adapter,
-        allocation_counter=platform_allocation_counter,
-    )
-    if artifact.status in {"completed", "failed"}:
-        from ..processing.video.final_publication import (
-            recover_final_encoding_terminal_retirement_v1,
-        )
+    artifact = recover_processing_control_prefix_v1(settings_file.parent)
+    if artifact is None:
+        raise ReservationConflictError("schema-5 settings job is absent")
+    return artifact
 
-        recover_final_encoding_terminal_retirement_v1(
-            settings_file.parent,
-            artifact,
-            allocation_adapter=platform_allocation_adapter,
-            allocation_counter=platform_allocation_counter,
-        )
+
+def recover_processing_control_prefix_v1(
+    job_root: Path,
+    *,
+    allocation_adapter=platform_allocation_adapter,
+    allocation_counter=platform_allocation_counter,
+) -> ProcessingSettingsArtifactV5 | None:
+    """Recover every fixed schema-5 control authority before ordinary job mutation."""
+
+    root = Path(job_root)
+    job_control = root / JOB_CONTROL_RELATIVE_PATH
+    job_control_temporary = job_control.with_name(
+        f".{job_control.name}.create-new.tmp"
+    )
+    has_locator = any(
+        path.exists() or path.is_symlink()
+        for path in (job_control, job_control_temporary)
+    )
+    fixed_settings = root / SETTINGS_ARTIFACT_RELATIVE_PATH
+    if not has_locator:
+        _assert_job_control_candidate_has_no_downstream(root)
+        return None
+
+    # Strict-load first so a complete durable locator temporary becomes authoritative.
+    from .reservation_protocol import load_job_control
+
+    try:
+        load_job_control(root)
+    except ReservationConflictError:
+        if not any(
+            path.exists() or path.is_symlink()
+            for path in (job_control, job_control_temporary)
+        ):
+            _assert_job_control_candidate_has_no_downstream(root)
+            return None
+        raise
+    settings_index = root / SETTINGS_TRANSITION_INDEX_RELATIVE_PATH
+    settings_index_temporary = settings_index.with_name(
+        f".{settings_index.name}.create-new.tmp"
+    )
+    from ..processing.video.final_publication import (
+        FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+        load_final_encoding_reservation_v1,
+        recover_final_encoding_index_pair_v1,
+        recover_final_encoding_terminal_retirement_v1,
+        recover_settings_replacement_gap_from_final_index_v1,
+    )
+
+    final_index = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+    final_index_temporary = final_index.with_name(
+        f".{final_index.name}.create-new.tmp"
+    )
+    settings_active = any(
+        path.exists() or path.is_symlink()
+        for path in (settings_index, settings_index_temporary)
+    )
+    final_active = any(
+        path.exists() or path.is_symlink()
+        for path in (final_index, final_index_temporary)
+    )
+    if settings_active and final_active:
+        raise ReservationConflictError("both fixed reservation indexes are active")
+    if final_active:
+        recovered_final_index = recover_final_encoding_index_pair_v1(root)
+        final_active = recovered_final_index is not None
+        if final_active and not fixed_settings.exists():
+            recover_settings_replacement_gap_from_final_index_v1(
+                root,
+                allocation_adapter=allocation_adapter,
+                allocation_counter=allocation_counter,
+            )
+    artifact = recover_settings_job_v1(
+        root,
+        allocation_adapter=allocation_adapter,
+        allocation_counter=allocation_counter,
+    )
+    if final_active:
+        if artifact.status in {"completed", "failed"}:
+            recover_final_encoding_terminal_retirement_v1(
+                root,
+                artifact,
+                allocation_adapter=allocation_adapter,
+                allocation_counter=allocation_counter,
+            )
+        else:
+            reservation = load_final_encoding_reservation_v1(
+                root,
+                artifact,
+                allocation_adapter=allocation_adapter,
+                allocation_counter=allocation_counter,
+            )
+            reservation.recover_publication_prefix()
     return artifact
 
 
@@ -833,6 +936,16 @@ def prepare_processing_settings_artifact(
 
     settings_file = Path(settings_file)
     current = recover_processing_settings_artifact(settings_file)
+    final_index = settings_file.parent / (
+        ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
+    )
+    final_index_temporary = final_index.with_name(
+        f".{final_index.name}.create-new.tmp"
+    )
+    final_active = any(
+        path.exists() or path.is_symlink()
+        for path in (final_index, final_index_temporary)
+    )
     value = current.to_object()
     source_path = Path(source_video_path)
     source_fingerprint = file_sample_fingerprint(source_path) if source_path.is_file() else None
@@ -853,6 +966,11 @@ def prepare_processing_settings_artifact(
             return current
     else:
         target = current.restart(started_at=now, processing_settings=settings)
+
+    if final_active:
+        raise ReservationConflictError(
+            "processing settings cannot change while final encoding is active"
+        )
 
     transaction = SettingsArtifactTransactionV1.begin(
         job_root=settings_file.parent,
@@ -877,11 +995,9 @@ def _update_processing_status_v5(
 
     try:
         job_root = settings_file.parent
-        current = recover_settings_job_v1(
-            job_root,
-            allocation_adapter=platform_allocation_adapter,
-            allocation_counter=platform_allocation_counter,
-        )
+        current = recover_processing_control_prefix_v1(job_root)
+        if current is None:
+            raise ReservationConflictError("terminal update has no schema-5 job")
         now = _utc_now_usec()
         info = dict(additional_info or {})
         if status == "completed":
@@ -934,6 +1050,7 @@ def _update_processing_status_v5(
             allocation_adapter=platform_allocation_adapter,
             allocation_counter=platform_allocation_counter,
         )
+        recover_processing_control_prefix_v1(job_root)
         return True
     except Exception as error:
         print(f"Warning: Could not commit schema-5 processing status: {error}")

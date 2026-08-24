@@ -27,14 +27,16 @@ from src.depth_surge_3d.processing.video.final_publication import (
     recover_final_encoding_terminal_retirement_v1,
     audit_final_media_v1,
 )
+from src.depth_surge_3d.io import reservation_protocol
+from src.depth_surge_3d.io.operations import recover_processing_control_prefix_v1
 from src.depth_surge_3d.io.reservation_protocol import ReservationAllocationEvidence
 from tests.unit.test_settings_artifact_v5 import _artifact
 
 
-def _input_manifest() -> tuple[bytes, str]:
+def _input_manifest(frame_count: int = 2) -> tuple[bytes, str]:
     base = {
         "algorithm_version": "encoding-input-sequence-v2",
-        "frame_count": 2,
+        "frame_count": frame_count,
         "schema_version": 1,
     }
     fingerprint = hashlib.sha256(
@@ -124,6 +126,30 @@ def _test_allocation(path, logical):
 def _test_allocation_counter(path):
     size = path.stat().st_size
     return ((size + 4095) // 4096) * 4096
+
+
+def _install_schema5_job(root, artifact) -> None:
+    initial = artifact if artifact.revision == 0 else _artifact()
+    reservation_protocol.bootstrap_settings_job_v1(
+        job_root=root,
+        artifact=initial,
+        initial_settings_reservation_id="aa" * 16,
+        allocation_adapter=_test_allocation,
+        allocation_unit=4096,
+        allocation_counter=_test_allocation_counter,
+    )
+    if artifact != initial:
+        transition = reservation_protocol.SettingsArtifactTransactionV1.begin(
+            job_root=root,
+            current=initial,
+            target=artifact,
+            allocation_adapter=_test_allocation,
+            allocation_unit=4096,
+            allocation_counter=_test_allocation_counter,
+            reservation_generation="bb" * 16,
+            reservation_id="cc" * 16,
+        )
+        transition.commit()
 
 
 def test_final_video_manifest_has_closed_canonical_self_fingerprint() -> None:
@@ -291,7 +317,7 @@ def test_publication_streams_staged_input_manifest_without_read_bytes(
 
 def test_final_encoding_reservation_publishes_index_before_owned_namespace(tmp_path) -> None:
     artifact = _producer_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     events: list[str] = []
 
     reservation = prepare_final_encoding_reservation_v1(
@@ -332,7 +358,7 @@ def test_final_encoding_reservation_publishes_index_before_owned_namespace(tmp_p
 
 def test_pruning_final_reservation_preallocates_every_post_publication_extent(tmp_path) -> None:
     artifact = _pruning_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     _complete_prune_diagnostics(tmp_path)
 
     reservation = prepare_final_encoding_reservation_v1(
@@ -359,6 +385,7 @@ def test_pruning_final_reservation_preallocates_every_post_publication_extent(tm
         "prune_marker",
         "diagnostics_payload_pruned",
         "cleanup_pending_settings",
+        "job_terminal_settings",
     ]
     assert reservation.producer_settings_transaction is not None
     assert len(reservation.prune_marker_transactions) == 4
@@ -377,9 +404,9 @@ def test_pruning_final_reservation_preallocates_every_post_publication_extent(tm
 
 def test_pruning_final_reservation_reopens_every_indexed_extent(tmp_path) -> None:
     artifact = _pruning_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     _complete_prune_diagnostics(tmp_path)
-    prepared = prepare_final_encoding_reservation_v1(
+    prepare_final_encoding_reservation_v1(
         job_root=tmp_path,
         settings=artifact,
         publication_generation="44" * 16,
@@ -418,7 +445,7 @@ def test_partial_producer_settings_source_is_reset_before_any_dependent_mutation
     tmp_path,
 ) -> None:
     artifact = _pruning_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     _complete_prune_diagnostics(tmp_path)
     prepared = prepare_final_encoding_reservation_v1(
         job_root=tmp_path,
@@ -452,7 +479,7 @@ def test_partial_producer_settings_source_is_reset_before_any_dependent_mutation
 
 def test_pruning_failure_retirement_leaves_no_unindexed_reservation_objects(tmp_path) -> None:
     artifact = _pruning_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     _complete_prune_diagnostics(tmp_path)
     reservation = prepare_final_encoding_reservation_v1(
         job_root=tmp_path,
@@ -471,21 +498,22 @@ def test_pruning_failure_retirement_leaves_no_unindexed_reservation_objects(tmp_
     for entry in reservation.index.extent_entries:
         if entry["reservation_kind"] == "job_terminal_settings":
             continue
-        descriptor = (
-            tmp_path
-            / ".depth-surge-reservations-v1"
-            / (
-                f"d-r-{entry['generation']}-{entry['reservation_kind']}-"
-                f"{entry['reservation_id']}.json"
-            )
-        )
-        target = tmp_path / entry["target_relative_path"]
-        source = target.parent / (
-            f".depth-surge-r-{entry['generation']}-{entry['reservation_kind']}-"
-            f"{entry['reservation_id']}.reserved"
-        )
+        descriptor = tmp_path / entry["descriptor_relative_path"]
+        source = tmp_path / entry["source_extent_relative_path"]
         owned_paths.extend((descriptor, source))
 
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
     reservation.retire_terminal_failure()
 
     assert not reservation.index_path.exists()
@@ -495,7 +523,7 @@ def test_pruning_failure_retirement_leaves_no_unindexed_reservation_objects(tmp_
 
 def test_pruning_success_consumes_all_extents_before_index_last_retirement(tmp_path) -> None:
     artifact = _pruning_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     _complete_prune_diagnostics(tmp_path)
     raw, fingerprint = _input_manifest()
     reservation = prepare_final_encoding_reservation_v1(
@@ -548,7 +576,7 @@ def test_pruning_success_consumes_all_extents_before_index_last_retirement(tmp_p
 
 def test_pruning_crash_after_markers_reopens_the_remaining_ordered_prefix(tmp_path) -> None:
     artifact = _pruning_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     _complete_prune_diagnostics(tmp_path)
     raw, fingerprint = _input_manifest()
     reservation = prepare_final_encoding_reservation_v1(
@@ -625,7 +653,7 @@ def test_pruning_crash_after_markers_reopens_the_remaining_ordered_prefix(tmp_pa
 )
 def test_final_reservation_construction_recovers_every_indexed_prefix(tmp_path, stop_event) -> None:
     artifact = _producer_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
 
     def stop(value: str) -> None:
         if value == stop_event:
@@ -662,7 +690,7 @@ def test_final_reservation_construction_recovers_every_indexed_prefix(tmp_path, 
 
 def test_reserved_publication_retires_descriptors_then_index_last(tmp_path) -> None:
     artifact = _producer_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     raw, fingerprint = _input_manifest()
     reservation = prepare_final_encoding_reservation_v1(
         job_root=tmp_path,
@@ -714,7 +742,7 @@ def test_reserved_publication_retires_descriptors_then_index_last(tmp_path) -> N
 
 def test_reserved_post_video_crash_keeps_index_as_recovery_authority(tmp_path) -> None:
     artifact = _producer_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     raw, fingerprint = _input_manifest()
     reservation = prepare_final_encoding_reservation_v1(
         job_root=tmp_path,
@@ -769,7 +797,7 @@ def test_reserved_post_video_crash_keeps_index_as_recovery_authority(tmp_path) -
 
 def test_reserved_input_manifest_refuses_a_replaced_preflight_target(tmp_path) -> None:
     artifact = _producer_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     old_raw, _old_fingerprint = _input_manifest()
     input_target = tmp_path / "encoding_input_manifest.json"
     input_target.write_bytes(old_raw)
@@ -819,7 +847,7 @@ def test_reserved_input_manifest_refuses_a_replaced_preflight_target(tmp_path) -
 @pytest.mark.skipif(os.name != "nt", reason="Windows replacement gaps are platform-specific")
 def test_reserved_windows_video_replacement_gap_moves_indexed_sibling_forward(tmp_path) -> None:
     artifact = _producer_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     raw, _fingerprint = _input_manifest()
     reservation = prepare_final_encoding_reservation_v1(
         job_root=tmp_path,
@@ -872,7 +900,7 @@ def test_reserved_manifest_crash_prefix_reopens_to_one_phase(
     tmp_path, crash_at, phase, action
 ) -> None:
     artifact = _producer_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     raw, fingerprint = _input_manifest()
     reservation = prepare_final_encoding_reservation_v1(
         job_root=tmp_path,
@@ -922,9 +950,67 @@ def test_reserved_manifest_crash_prefix_reopens_to_one_phase(
         assert not loaded.index_path.exists()
 
 
+def test_descriptorless_committed_manifests_require_three_way_binding(tmp_path) -> None:
+    artifact = _producer_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    raw, fingerprint = _input_manifest()
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    assert reservation.input_manifest_transaction is not None
+    assert reservation.final_manifest_transaction is not None
+    input_descriptor_path = reservation.input_manifest_transaction.descriptor_path
+    final_descriptor_path = reservation.final_manifest_transaction.descriptor_path
+    reservation.input_manifest_transaction.stage_complete_full(raw)
+    reservation.sibling_path.write_bytes(b"validated-reserved-video")
+    FinalPublicationTransactionV4(
+        job_root=tmp_path,
+        settings=artifact,
+        sibling_relative_path=reservation.sibling_path.name,
+        encoding_input_manifest_raw=raw,
+        input_stage_fingerprint=fingerprint,
+        resolved_encoding_arguments=(
+            "ffmpeg",
+            "@output:path64="
+            + FinalPublicationTransactionV4.path64(
+                artifact.to_object()["output_info"]["expected_final_relative_path"]
+            ),
+        ),
+        container_validator=lambda _path: True,
+        reservation=reservation,
+        retire_reservation=False,
+    ).publish()
+    assert not input_descriptor_path.exists()
+    assert not final_descriptor_path.exists()
+    wrong_raw, _wrong_fingerprint = _input_manifest(frame_count=3)
+    (tmp_path / "encoding_input_manifest.json").write_bytes(wrong_raw)
+
+    loaded = load_final_encoding_reservation_v1(
+        tmp_path,
+        artifact,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="three-way bound",
+    ):
+        loaded.observe()
+
+
 def test_terminal_retirement_recovers_after_target_descriptor_unlink(tmp_path) -> None:
     artifact = _producer_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     raw, fingerprint = _input_manifest()
     reservation = prepare_final_encoding_reservation_v1(
         job_root=tmp_path,
@@ -963,6 +1049,13 @@ def test_terminal_retirement_recovers_after_target_descriptor_unlink(tmp_path) -
         frames_processed=12,
         cleanup_status="not_requested",
     )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=completed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
 
     with pytest.raises(InjectedFinalPublicationCrash):
         reservation.retire(crash_at="after-target-descriptor-retirement")
@@ -978,7 +1071,7 @@ def test_terminal_retirement_recovers_after_target_descriptor_unlink(tmp_path) -
 
 def test_terminal_failure_retirement_removes_only_unused_placeholders(tmp_path) -> None:
     artifact = _producer_artifact()
-    (tmp_path / "processing-settings-v5.json").write_bytes(artifact.encode())
+    _install_schema5_job(tmp_path, artifact)
     expected = artifact.to_object()["output_info"]["expected_final_relative_path"]
     reservation = prepare_final_encoding_reservation_v1(
         job_root=tmp_path,
@@ -999,6 +1092,13 @@ def test_terminal_failure_retirement_removes_only_unused_placeholders(tmp_path) 
         diagnostic_code="FINAL_ENCODING_FAILED",
         diagnostic_message="fixture",
     )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
 
     assert recover_final_encoding_terminal_retirement_v1(
         tmp_path,
@@ -1011,3 +1111,213 @@ def test_terminal_failure_retirement_removes_only_unused_placeholders(tmp_path) 
     assert not (tmp_path / "encoding_input_manifest.json").exists()
     assert not (tmp_path / "final_video_manifest.json").exists()
     assert not reservation.index_path.exists()
+
+
+def test_terminal_failure_retirement_resumes_without_recreating_cleaned_extents(
+    tmp_path,
+) -> None:
+    artifact = _producer_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    first_entry = reservation.index.extent_entries[0]
+    first_descriptor = tmp_path / first_entry["descriptor_relative_path"]
+    first_source = tmp_path / first_entry["source_extent_relative_path"]
+
+    with pytest.raises(InjectedFinalPublicationCrash):
+        recover_final_encoding_terminal_retirement_v1(
+            tmp_path,
+            failed,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+            crash_at="failure-retirement:0:descriptor",
+        )
+
+    assert not first_descriptor.exists()
+    assert not first_source.exists()
+    assert recover_final_encoding_terminal_retirement_v1(
+        tmp_path,
+        failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+    assert not first_descriptor.exists()
+    assert not first_source.exists()
+    assert not reservation.index_path.exists()
+
+
+def test_terminal_failure_discards_descriptor_temporaries_and_zero_placeholders(
+    tmp_path,
+) -> None:
+    artifact = _producer_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    entry = next(
+        item
+        for item in reservation.index.extent_entries
+        if item["reservation_kind"] == "encoding_input_manifest"
+    )
+    descriptor = tmp_path / entry["descriptor_relative_path"]
+    source = tmp_path / entry["source_extent_relative_path"]
+    descriptor.unlink()
+    source.unlink()
+    (tmp_path / entry["target_relative_path"]).unlink()
+    descriptor_temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
+    descriptor_temporary.write_bytes(b'{"partial":')
+    target_descriptor = reservation.target_descriptor_path
+    target_descriptor.unlink()
+    reservation.final_video_path.unlink()
+    target_descriptor_temporary = target_descriptor.with_name(
+        f".{target_descriptor.name}.create-new.tmp"
+    )
+    target_descriptor_temporary.write_bytes(b'{"partial":')
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+
+    assert recover_final_encoding_terminal_retirement_v1(
+        tmp_path,
+        failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+
+    assert not descriptor_temporary.exists()
+    assert not target_descriptor_temporary.exists()
+    assert not (tmp_path / entry["target_relative_path"]).exists()
+    assert not reservation.final_video_path.exists()
+    assert not reservation.index_path.exists()
+
+
+def test_terminal_failure_preserves_descriptorless_zero_placeholder(tmp_path) -> None:
+    artifact = _producer_artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    entry = next(
+        item
+        for item in reservation.index.extent_entries
+        if item["reservation_kind"] == "encoding_input_manifest"
+    )
+    descriptor = tmp_path / entry["descriptor_relative_path"]
+    (tmp_path / entry["source_extent_relative_path"]).unlink()
+    descriptor.unlink()
+    placeholder = tmp_path / entry["target_relative_path"]
+    failed = artifact.failed(
+        terminal_at="2026-08-24T12:35:00.000000Z",
+        diagnostic_code="FINAL_ENCODING_FAILED",
+        diagnostic_message="fixture",
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path,
+        current=artifact,
+        target=failed,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="descriptorless extent target",
+    ):
+        recover_final_encoding_terminal_retirement_v1(
+            tmp_path,
+            failed,
+            allocation_adapter=_test_allocation,
+            allocation_counter=_test_allocation_counter,
+        )
+
+    assert placeholder.is_file()
+    assert placeholder.stat().st_size == 0
+    assert reservation.index_path.is_file()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows replacement gaps are platform-specific")
+def test_root_control_recovery_restores_final_index_owned_missing_settings(tmp_path) -> None:
+    artifact = _artifact()
+    _install_schema5_job(tmp_path, artifact)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=artifact,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        allocation_unit=4096,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+        reservation_generation="55" * 16,
+        input_reservation_id="66" * 16,
+        final_reservation_id="77" * 16,
+    )
+    transaction = reservation.producer_settings_transaction
+    payload = reservation.producer_settings_payload
+    assert transaction is not None and payload is not None
+    transaction.stage_complete_full(payload)
+    transaction.truncate_to_payload(payload)
+    transaction._short_release_recovery(payload)
+    (tmp_path / "processing-settings-v5.json").unlink()
+
+    recovered = recover_processing_control_prefix_v1(
+        tmp_path,
+        allocation_adapter=_test_allocation,
+        allocation_counter=_test_allocation_counter,
+    )
+
+    assert recovered is not None
+    assert recovered.to_object()["metadata"]["final_media_publication_generation"] == "44" * 16
+    assert (tmp_path / "processing-settings-v5.json").read_bytes() == payload
