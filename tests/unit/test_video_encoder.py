@@ -125,8 +125,6 @@ def test_validate_direct_sequence_accepts_canonical_consecutive_names(tmp_path, 
 
     assert sequence.start_number == start
     assert sequence.frame_count == 2
-    assert sequence.left_files == tuple(left)
-    assert sequence.right_files == tuple(right)
     assert sequence.left_pattern == tmp_path / "left" / "frame_%06d.png"
     assert sequence.right_pattern == tmp_path / "right" / "frame_%06d.png"
     assert sequence.left_header == header

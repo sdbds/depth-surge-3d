@@ -74,6 +74,7 @@ def precompute_native_fallbacks(
     render_shape: tuple[int, int],
     region_count: int,
     budgets: QualityRepairBudgets,
+    in_place: bool = False,
 ) -> FallbackPrecomputeResult:
     """Store one provisional colour for every still-unplanned record."""
 
@@ -84,7 +85,11 @@ def precompute_native_fallbacks(
         region_count,
         budgets,
     )
-    output = np.array(records, copy=True, order="C")
+    if in_place:
+        output = records
+        output.setflags(write=True)
+    else:
+        output = np.array(records, copy=True, order="C")
     query_count = int(np.count_nonzero(output["backend"] == np.uint8(0)))
     if query_count == 0:
         output.setflags(write=False)
@@ -160,7 +165,7 @@ def precompute_native_fallbacks(
     )
 
 
-def finalize_safe_fallbacks(records: np.ndarray) -> np.ndarray:
+def finalize_safe_fallbacks(records: np.ndarray, *, in_place: bool = False) -> np.ndarray:
     """Commit every residual provisional colour as backend 3."""
 
     if (
@@ -170,7 +175,11 @@ def finalize_safe_fallbacks(records: np.ndarray) -> np.ndarray:
         or not records.flags.c_contiguous
     ):
         raise TypeError("records must be a C-contiguous repair record vector")
-    output = np.array(records, copy=True, order="C")
+    if in_place:
+        output = records
+        output.setflags(write=True)
+    else:
+        output = np.array(records, copy=True, order="C")
     output["backend"][output["backend"] == np.uint8(0)] = np.uint8(3)
     output.setflags(write=False)
     return output

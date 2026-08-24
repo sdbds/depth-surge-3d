@@ -1,59 +1,45 @@
-"""I/O operations for Depth Surge 3D.
+"""I/O package with lazy public exports to keep low-level adapters acyclic."""
 
-This module handles all file system operations including:
-- Video validation and properties
-- Directory management
-- Frame I/O (loading/saving)
-- Processing state persistence
-"""
+from __future__ import annotations
 
-from .operations import (
-    # Video operations
-    validate_video_file,
-    validate_image_file,
-    get_video_properties,
-    get_video_info_ffprobe,
-    # Directory operations
-    create_output_directories,
-    get_frame_files,
-    calculate_directory_size,
-    cleanup_intermediate_files,
-    get_available_space,
-    # Processing state
-    save_processing_settings,
-    load_processing_settings,
-    update_processing_status,
-    find_settings_file,
-    can_resume_processing,
-    analyze_processing_progress,
-    # FFmpeg
-    verify_ffmpeg_installation,
-)
-from .resume import ResumeReport, ResumeStage, apply_legacy_migration, build_resume_report
+from importlib import import_module
+from typing import Any
 
-__all__ = [
-    # Video operations
+
+_OPERATION_EXPORTS = {
     "validate_video_file",
     "validate_image_file",
     "get_video_properties",
     "get_video_info_ffprobe",
-    # Directory operations
     "create_output_directories",
     "get_frame_files",
     "calculate_directory_size",
     "cleanup_intermediate_files",
     "get_available_space",
-    # Processing state
     "save_processing_settings",
     "load_processing_settings",
     "update_processing_status",
     "find_settings_file",
     "can_resume_processing",
     "analyze_processing_progress",
-    # FFmpeg
     "verify_ffmpeg_installation",
+}
+_RESUME_EXPORTS = {
     "ResumeReport",
     "ResumeStage",
     "build_resume_report",
     "apply_legacy_migration",
-]
+}
+
+__all__ = sorted(_OPERATION_EXPORTS | _RESUME_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _OPERATION_EXPORTS:
+        value = getattr(import_module(".operations", __name__), name)
+    elif name in _RESUME_EXPORTS:
+        value = getattr(import_module(".resume", __name__), name)
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value

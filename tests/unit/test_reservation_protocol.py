@@ -22,6 +22,34 @@ def _adapter(path: Path, logical: int) -> reservation_protocol.ReservationAlloca
     )
 
 
+def test_persisted_file_and_directory_identities_use_the_frozen_nested_schema(
+    tmp_path: Path,
+) -> None:
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"identity")
+
+    file_identity = reservation_protocol._identity(payload)
+    directory_identity = reservation_protocol._directory_identity(tmp_path)
+
+    file_object = file_identity.to_object()
+    directory_object = directory_identity.to_object()
+    assert set(file_object) == {"platform", "file_identity", "link_count"}
+    assert set(directory_object) == {"kind", "file_identity"}
+    assert file_object["platform"] == directory_object["kind"]
+    if os.name == "nt":
+        assert set(file_object["file_identity"]) == {"volume_serial", "file_id"}
+        assert len(file_object["file_identity"]["volume_serial"]) == 16
+        assert len(file_object["file_identity"]["file_id"]) == 32
+    else:
+        assert set(file_object["file_identity"]) == {
+            "filesystem_uuid",
+            "handle_type",
+            "file_handle_hex",
+        }
+    assert reservation_protocol.ReservationFileIdentity.from_object(file_object) == file_identity
+    assert reservation_protocol.DirectoryIdentity.from_object(directory_object) == directory_identity
+
+
 def test_platform_allocation_adapter_proves_a_fsynced_full_extent(tmp_path: Path) -> None:
     path = tmp_path / "allocation-evidence.bin"
     logical = reservation_protocol.payload_logical_bytes(70_000, 4096)

@@ -8,13 +8,21 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import stat
 import struct
 import sys
 import time
 from typing import TYPE_CHECKING, Callable, Literal
 
 from .canonical_json import CanonicalJsonError, strict_canonical_json_loads
+from .file_identity import (
+    DirectoryIdentityV1 as DirectoryIdentity,
+    PersistedFileIdentityV1 as ReservationFileIdentity,
+    PersistentIdentityCapabilityError,
+    PersistentIdentitySchemaError,
+    capture_directory_identity,
+    capture_file_identity,
+    windows_identity_from_handle,
+)
 
 if TYPE_CHECKING:
     from .settings_artifact import ProcessingSettingsArtifactV5
@@ -317,37 +325,31 @@ class ReservationAllocationEvidence:
         )
 
 
-@dataclass(frozen=True)
-class ReservationFileIdentity:
-    device: int
-    inode: int
-
-    def to_object(self) -> dict:
-        return {"device": self.device, "inode": self.inode}
-
-    @classmethod
-    def from_object(cls, value: dict) -> ReservationFileIdentity:
-        return cls(int(value["device"]), int(value["inode"]))
-
-
 def _identity(path: Path) -> ReservationFileIdentity:
-    metadata = path.stat(follow_symlinks=False)
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ReservationConflictError(f"reservation path is not a regular file: {path}")
-    return ReservationFileIdentity(int(metadata.st_dev), int(metadata.st_ino))
+    try:
+        identity = capture_file_identity(Path(path))
+    except PersistentIdentityCapabilityError as error:
+        raise ReservationCapabilityError(str(error)) from error
+    except (OSError, PersistentIdentitySchemaError) as error:
+        raise ReservationConflictError(f"reservation path identity is invalid: {path}") from error
+    if identity.link_count != 1:
+        raise ReservationConflictError(f"reservation path is not single-link: {path}")
+    return identity
 
 
-def _directory_identity(path: Path) -> ReservationFileIdentity:
-    metadata = path.stat(follow_symlinks=False)
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise ReservationConflictError(f"job root is not a directory: {path}")
-    return ReservationFileIdentity(int(metadata.st_dev), int(metadata.st_ino))
+def _directory_identity(path: Path) -> DirectoryIdentity:
+    try:
+        return capture_directory_identity(Path(path))
+    except PersistentIdentityCapabilityError as error:
+        raise ReservationCapabilityError(str(error)) from error
+    except (OSError, PersistentIdentitySchemaError) as error:
+        raise ReservationConflictError(f"directory identity is invalid: {path}") from error
 
 
 def _identity_token(value: ReservationFileIdentity | None) -> str | None:
     if value is None:
         return None
-    return f"{value.device}:{value.inode}"
+    return sha256_canonical(value.to_object())
 
 
 def windows_same_parent_rename_v1(  # noqa: C901
@@ -356,7 +358,7 @@ def windows_same_parent_rename_v1(  # noqa: C901
     *,
     expected_source_identity: ReservationFileIdentity,
     expected_target_identity: ReservationFileIdentity | None,
-    expected_parent_identity: ReservationFileIdentity,
+    expected_parent_identity: DirectoryIdentity,
     replace_existing: bool,
 ) -> str:
     """Perform the frozen handle-relative Windows rename and classify disk state."""
@@ -397,6 +399,23 @@ def windows_same_parent_rename_v1(  # noqa: C901
     class IoStatusBlock(ctypes.Structure):
         _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
 
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.USHORT),
+            ("maximum_length", wintypes.USHORT),
+            ("buffer", wintypes.LPWSTR),
+        ]
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.ULONG),
+            ("root_directory", wintypes.HANDLE),
+            ("object_name", ctypes.POINTER(UnicodeString)),
+            ("attributes", wintypes.ULONG),
+            ("security_descriptor", wintypes.LPVOID),
+            ("security_qos", wintypes.LPVOID),
+        ]
+
     rename = ntdll.NtSetInformationFile
     rename.argtypes = (
         wintypes.HANDLE,
@@ -409,24 +428,21 @@ def windows_same_parent_rename_v1(  # noqa: C901
     ntstatus_to_error = ntdll.RtlNtStatusToDosError
     ntstatus_to_error.argtypes = (ctypes.c_long,)
     ntstatus_to_error.restype = wintypes.DWORD
-
-    class ByHandleFileInformation(ctypes.Structure):
-        _fields_ = [
-            ("file_attributes", wintypes.DWORD),
-            ("creation_time", wintypes.FILETIME),
-            ("last_access_time", wintypes.FILETIME),
-            ("last_write_time", wintypes.FILETIME),
-            ("volume_serial", wintypes.DWORD),
-            ("file_size_high", wintypes.DWORD),
-            ("file_size_low", wintypes.DWORD),
-            ("link_count", wintypes.DWORD),
-            ("file_index_high", wintypes.DWORD),
-            ("file_index_low", wintypes.DWORD),
-        ]
-
-    get_info = kernel32.GetFileInformationByHandle
-    get_info.argtypes = (wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation))
-    get_info.restype = wintypes.BOOL
+    nt_create_file = ntdll.NtCreateFile
+    nt_create_file.argtypes = (
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        ctypes.POINTER(ObjectAttributes),
+        ctypes.POINTER(IoStatusBlock),
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    nt_create_file.restype = ctypes.c_long
 
     class RenameUnion(ctypes.Union):
         _fields_ = [("replace_if_exists", ctypes.c_ubyte), ("flags", wintypes.DWORD)]
@@ -458,24 +474,89 @@ def windows_same_parent_rename_v1(  # noqa: C901
             raise win_error()
         return int(handle)
 
-    def handle_identity(handle: int, *, directory: bool) -> ReservationFileIdentity:
-        info = ByHandleFileInformation()
-        if not get_info(wintypes.HANDLE(handle), ctypes.byref(info)):
-            raise win_error()
-        is_directory = bool(info.file_attributes & 0x10)
-        if is_directory != directory or info.file_attributes & 0x400:
-            raise ReservationConflictError("Windows rename handle type is unsafe")
-        if not directory and int(info.link_count) != 1:
-            raise ReservationConflictError("Windows rename source is not single-link")
-        return ReservationFileIdentity(
-            int(info.volume_serial),
-            (int(info.file_index_high) << 32) | int(info.file_index_low),
+    def open_relative_file(parent: int, name: str, access: int) -> int:
+        name_buffer = ctypes.create_unicode_buffer(name)
+        name_bytes = name.encode("utf-16-le")
+        unicode_name = UnicodeString(
+            len(name_bytes),
+            len(name_bytes) + 2,
+            ctypes.cast(name_buffer, wintypes.LPWSTR),
         )
+        attributes = ObjectAttributes(
+            ctypes.sizeof(ObjectAttributes),
+            wintypes.HANDLE(parent),
+            ctypes.pointer(unicode_name),
+            0x40,
+            None,
+            None,
+        )
+        child = wintypes.HANDLE()
+        io_status = IoStatusBlock()
+        status = int(
+            nt_create_file(
+                ctypes.byref(child),
+                access,
+                ctypes.byref(attributes),
+                ctypes.byref(io_status),
+                None,
+                0,
+                0x1 | 0x2 | 0x4,
+                1,
+                0x00200000 | 0x20 | 0x40,
+                None,
+                0,
+            )
+        )
+        if status < 0:
+            raise win_error(int(ntstatus_to_error(status)))
+        if child.value is None:
+            raise ReservationCapabilityError("NtCreateFile returned a null child handle")
+        return int(child.value)
 
-    def observe(path: Path) -> ReservationFileIdentity | None:
-        if not (path.exists() or path.is_symlink()):
-            return None
-        return _identity(path)
+    def handle_identity(
+        handle: int,
+        *,
+        directory: bool,
+    ) -> ReservationFileIdentity | DirectoryIdentity:
+        try:
+            inner, link_count, _attributes = windows_identity_from_handle(
+                handle,
+                require_directory=directory,
+            )
+        except PersistentIdentityCapabilityError as error:
+            raise ReservationCapabilityError(str(error)) from error
+        except PersistentIdentitySchemaError as error:
+            raise ReservationConflictError("Windows rename handle type is unsafe") from error
+        if directory:
+            return DirectoryIdentity("windows", inner)
+        if link_count != 1:
+            raise ReservationConflictError("Windows rename source is not single-link")
+        return ReservationFileIdentity("windows", inner, link_count)
+
+    def observe_relative(
+        parent: int,
+        name: str,
+        *,
+        flush_present: bool,
+    ) -> ReservationFileIdentity | None:
+        try:
+            handle = open_relative_file(
+                parent,
+                name,
+                0x80000000 | 0x40000000 | 0x00100000,
+            )
+        except OSError as error:
+            if getattr(error, "winerror", None) in {2, 3}:
+                return None
+            raise
+        try:
+            value = handle_identity(handle, directory=False)
+            assert isinstance(value, ReservationFileIdentity)
+            if flush_present and not flush(wintypes.HANDLE(handle)):
+                raise win_error()
+            return value
+        finally:
+            close_handle(wintypes.HANDLE(handle))
 
     parent_handle = open_handle(
         source.parent,
@@ -487,16 +568,16 @@ def windows_same_parent_rename_v1(  # noqa: C901
         parent_identity = handle_identity(parent_handle, directory=True)
         if parent_identity != expected_parent_identity:
             raise ReservationConflictError("Windows rename parent identity changed")
-        source_handle = open_handle(
-            source,
+        source_handle = open_relative_file(
+            parent_handle,
+            source.name,
             0x80000000 | 0x40000000 | 0x00010000 | 0x00100000,
-            directory=False,
         )
         if handle_identity(source_handle, directory=False) != expected_source_identity:
             raise ReservationConflictError("Windows rename source identity changed")
-        if expected_source_identity.device != expected_parent_identity.device:
+        if expected_source_identity.volume_key != expected_parent_identity.volume_key:
             raise ReservationConflictError("Windows rename source volume differs from parent")
-        current_target = observe(target)
+        current_target = observe_relative(parent_handle, target.name, flush_present=False)
         if replace_existing:
             if expected_target_identity is None or current_target != expected_target_identity:
                 raise ReservationConflictError("Windows rename old target identity changed")
@@ -538,8 +619,12 @@ def windows_same_parent_rename_v1(  # noqa: C901
             return returned, saved_error
 
         returned, saved_error = invoke(replace_existing)
-        source_token = _identity_token(observe(source))
-        target_token = _identity_token(observe(target))
+        source_token = _identity_token(
+            observe_relative(parent_handle, source.name, flush_present=False)
+        )
+        target_token = _identity_token(
+            observe_relative(parent_handle, target.name, flush_present=True)
+        )
         expected_source_token = _identity_token(expected_source_identity)
         assert expected_source_token is not None
         if replace_existing:
@@ -566,8 +651,12 @@ def windows_same_parent_rename_v1(  # noqa: C901
             )
         if classification == "replacement-gap":
             returned, saved_error = invoke(False)
-            source_token = _identity_token(observe(source))
-            target_token = _identity_token(observe(target))
+            source_token = _identity_token(
+                observe_relative(parent_handle, source.name, flush_present=False)
+            )
+            target_token = _identity_token(
+                observe_relative(parent_handle, target.name, flush_present=True)
+            )
             if source_token is None and target_token == expected_source_token:
                 classification = "committed"
             elif source_token == expected_source_token and target_token is None and not returned:
@@ -597,7 +686,7 @@ def same_parent_replace_v1(
     *,
     expected_source_identity: ReservationFileIdentity,
     expected_target_identity: ReservationFileIdentity | None,
-    expected_parent_identity: ReservationFileIdentity,
+    expected_parent_identity: DirectoryIdentity,
     replace_existing: bool,
 ) -> None:
     """Use the frozen platform replacement primitive for an authenticated pair."""
@@ -1681,7 +1770,7 @@ class JobControlV1:
     job_reservation_generation: str
     initial_settings_reservation_id: str
     job_terminal_reservation_id: str
-    job_root_identity: ReservationFileIdentity
+    job_root_identity: DirectoryIdentity
     bootstrap_extent_entries: tuple[dict, ...]
     bootstrap_settings_intent: dict
     fingerprint: str
@@ -1809,7 +1898,7 @@ class JobControlV1:
             job_terminal_reservation_id=_require_lower_hex(
                 value["job_terminal_reservation_id"], 32, "terminal reservation id"
             ),
-            job_root_identity=ReservationFileIdentity.from_object(value["job_root_identity"]),
+            job_root_identity=DirectoryIdentity.from_object(value["job_root_identity"]),
             bootstrap_extent_entries=tuple(entries),
             bootstrap_settings_intent=intent,
             fingerprint=_require_lower_hex(value["fingerprint"], 64, "job control fingerprint"),

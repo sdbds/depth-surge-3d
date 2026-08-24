@@ -137,6 +137,23 @@ class ProcessingOrchestrator:
             return None
         value = artifact.to_object()
         cleanup_pending = value["metadata"]["cleanup_status"] == "pending"
+        reservation = None
+        publication_authenticated = False
+        active_index = Path(output_dir) / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+        if active_index.is_file():
+            try:
+                reservation = load_final_encoding_reservation_v1(output_dir, artifact)
+                recovery = reservation.recover_publication_prefix()
+            except Exception as error:
+                print(f"Error: Could not recover active final publication: {error}")
+                return False
+            publication_authenticated = recovery.phase == "publication_authenticated"
+            if publication_authenticated:
+                adopt = getattr(self.video_encoder, "adopt_final_encoding_reservation", None)
+                if not callable(adopt):
+                    print("Error: Video encoder cannot adopt active final publication")
+                    return False
+                adopt(reservation)
         metadata_path = Path(output_dir) / "04_stereo_diagnostics" / "metadata.json"
         payload_pruned = False
         try:
@@ -147,37 +164,40 @@ class ProcessingOrchestrator:
             )
         except (OSError, UnicodeError, json.JSONDecodeError):
             diagnostics_metadata = None
-        if not cleanup_pending and not payload_pruned:
+        if not cleanup_pending and not payload_pruned and not publication_authenticated:
             return None
         self._settings_file = settings_file
         audit = audit_final_media_v1(output_dir, artifact)
         if not audit.final_video_authenticated:
             print("Error: Cleanup-only recovery requires authenticated final media")
             return False
-        reservation = None
-        if (Path(output_dir) / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).is_file():
-            try:
-                reservation = load_final_encoding_reservation_v1(output_dir, artifact)
-            except Exception as error:
-                print(f"Error: Could not recover final cleanup reservation: {error}")
-                return False
-        if not cleanup_pending:
-            try:
-                artifact = commit_cleanup_pending_status(
-                    settings_file,
-                    reservation=reservation,
-                )
-            except Exception as error:
-                print(f"Error: Could not commit cleanup-pending settings: {error}")
-                return False
-        try:
-            removed_count = run_authorized_cleanup(output_dir)
-        except Exception as error:
-            cleanup_status = cleanup_status_for_error(error)
-            print(f"Warning: Intermediate cleanup remains incomplete: {error}")
+        keep_intermediates = bool(value["processing_settings"]["keep_intermediates"])
+        if keep_intermediates:
+            cleanup_status = "not_requested"
         else:
-            cleanup_status = "complete"
-            print(f"Removed {removed_count} temporary processing files")
+            if not payload_pruned:
+                try:
+                    commit_payload_pruned(output_dir, reservation=reservation)
+                except Exception as error:
+                    print(f"Error: Could not commit payload-pruned diagnostics: {error}")
+                    return False
+            if not cleanup_pending:
+                try:
+                    artifact = commit_cleanup_pending_status(
+                        settings_file,
+                        reservation=reservation,
+                    )
+                except Exception as error:
+                    print(f"Error: Could not commit cleanup-pending settings: {error}")
+                    return False
+            try:
+                removed_count = run_authorized_cleanup(output_dir)
+            except Exception as error:
+                cleanup_status = cleanup_status_for_error(error)
+                print(f"Warning: Intermediate cleanup remains incomplete: {error}")
+            else:
+                cleanup_status = "complete"
+                print(f"Removed {removed_count} temporary processing files")
         info: dict[str, Any] = {
             "frames_processed": value["video_properties"]["frame_count"],
             "cleanup_status": cleanup_status,
@@ -192,6 +212,8 @@ class ProcessingOrchestrator:
             recover_processing_settings_artifact(settings_file)
         except Exception as error:
             print(f"Error: Could not retire cleanup reservation: {error}")
+            return False
+        if reservation is not None and not self._retire_final_encoding_reservation(success=True):
             return False
         return True
 

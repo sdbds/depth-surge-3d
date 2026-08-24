@@ -599,6 +599,60 @@ class TestCleanupOnlyResume:
         assert events == ["recover", "audit", "pending", "delete", "terminal", "recover"]
         assert update.call_args.args[2]["cleanup_status"] == "complete"
 
+    def test_authenticated_active_index_finishes_before_pipeline_setup(self, tmp_path):
+        settings_file = tmp_path / "processing-settings-v5.json"
+        settings_file.write_bytes(b"settings")
+        active_index = (
+            tmp_path
+            / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
+        )
+        active_index.parent.mkdir()
+        active_index.write_bytes(b"index")
+        artifact = Mock(status="in_progress")
+        artifact.to_object.return_value = {
+            "metadata": {"cleanup_status": "not_requested"},
+            "processing_settings": {"keep_intermediates": True},
+            "video_properties": {"frame_count": 3},
+            "output_info": {"expected_final_relative_path": "result.mp4"},
+            "runtime_info": {"metric_clamp_summary": None},
+        }
+        reservation = Mock()
+        reservation.recover_publication_prefix.return_value = Mock(
+            phase="publication_authenticated"
+        )
+        encoder = Mock()
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), encoder)
+        events = []
+
+        with (
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "recover_processing_settings_artifact",
+                side_effect=lambda _path: events.append("settings") or artifact,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "load_final_encoding_reservation_v1",
+                side_effect=lambda *_args: events.append("index") or reservation,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "audit_final_media_v1",
+                side_effect=lambda *_args: events.append("audit")
+                or Mock(final_video_authenticated=True),
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "update_processing_status",
+                side_effect=lambda *_args, **_kwargs: events.append("terminal") or True,
+            ),
+        ):
+            assert orchestrator._resume_cleanup_only(tmp_path) is True
+
+        assert events == ["settings", "index", "audit", "terminal", "settings"]
+        encoder.adopt_final_encoding_reservation.assert_called_once_with(reservation)
+        encoder.retire_final_encoding_reservation.assert_called_once_with(success=True)
+
 
 class TestExecutePipeline:
     def test_releases_depth_model_before_starting_step_3(self, tmp_path):

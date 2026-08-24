@@ -317,18 +317,26 @@ def plan_quality_repairs(
         local_limit_px=local_limit_px,
         budgets=budgets,
     )
+    local_evaluated_slot_count = local.evaluated_slot_count
+    local_physical_sample_read_count = local.physical_sample_read_count
+    local_filled_run_count = local.local_filled_run_count
+    if local.records is not records:
+        records.setflags(write=True)
+        records[:] = local.records
+        records.setflags(write=False)
+    del local
     component_ids, component_count = build_record_component_ids(
-        local.records,
+        records,
         render_shape=render_shape,
     )
-    if local.records.size == 0:
+    if records.size == 0:
         return QualityRepairPlan(
-            records=local.records,
+            records=records,
             record_component_ids=component_ids,
             component_count=0,
-            local_evaluated_slot_count=local.evaluated_slot_count,
-            local_physical_sample_read_count=local.physical_sample_read_count,
-            local_filled_run_count=local.local_filled_run_count,
+            local_evaluated_slot_count=local_evaluated_slot_count,
+            local_physical_sample_read_count=local_physical_sample_read_count,
+            local_filled_run_count=local_filled_run_count,
             local_budget_skipped_run_count=(
                 budgets.local_budget_skipped_run_count - skipped_before
             ),
@@ -348,13 +356,14 @@ def plan_quality_repairs(
         component_ids,
         component_count,
     )
-    region_count = _maximum_referenced_region(local.records)
+    region_count = _maximum_referenced_region(records)
     provisional = fallback.precompute_native_fallbacks(
-        local.records,
+        records,
         analysis,
         render_shape=render_shape,
         region_count=region_count,
         budgets=budgets,
+        in_place=True,
     )
     safe_donor_mask, region_has_safe_donor = _materialize_safe_donor_mask(
         provisional.records,
@@ -366,7 +375,8 @@ def plan_quality_repairs(
         analysis.pure_region_id,
     )
     exemplar_candidate_mask.setflags(write=False)
-    working = np.array(provisional.records, copy=True, order="C")
+    working = provisional.records
+    working.setflags(write=True)
     exemplar_processed = 0
     exemplar_unfinished = 0
     exemplar_iterations = 0
@@ -407,21 +417,22 @@ def plan_quality_repairs(
             region_id=region_id,
             render_shape=render_shape,
             budgets=budgets,
+            in_place=True,
         )
         working[indexes] = repaired.records
         exemplar_processed += repaired.processed_target_count
         exemplar_unfinished += repaired.unfinished_target_count
         exemplar_iterations += repaired.patch_iteration_count
         exemplar_evaluations += repaired.donor_evaluation_count
-    final_records = fallback.finalize_safe_fallbacks(working)
+    final_records = fallback.finalize_safe_fallbacks(working, in_place=True)
     visited = provisional.visited_nodes
     return QualityRepairPlan(
         records=final_records,
         record_component_ids=component_ids,
         component_count=component_count,
-        local_evaluated_slot_count=local.evaluated_slot_count,
-        local_physical_sample_read_count=local.physical_sample_read_count,
-        local_filled_run_count=local.local_filled_run_count,
+        local_evaluated_slot_count=local_evaluated_slot_count,
+        local_physical_sample_read_count=local_physical_sample_read_count,
+        local_filled_run_count=local_filled_run_count,
         local_budget_skipped_run_count=(budgets.local_budget_skipped_run_count - skipped_before),
         fallback_indexed_donor_count=provisional.indexed_donor_count,
         fallback_index_bytes=provisional.index_bytes,

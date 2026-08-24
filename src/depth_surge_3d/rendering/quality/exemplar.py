@@ -316,6 +316,7 @@ def repair_component_exemplar(
     region_id: int,
     render_shape: tuple[int, int],
     budgets: QualityRepairBudgets,
+    in_place: bool = False,
 ) -> ExemplarRepairResult:
     """Run the exact bounded exemplar state machine for one component."""
 
@@ -327,7 +328,11 @@ def repair_component_exemplar(
         render_shape,
         budgets,
     )
-    output = np.array(records, copy=True, order="C")
+    if in_place:
+        output = records
+        output.setflags(write=True)
+    else:
+        output = np.array(records, copy=True, order="C")
     residual_indexes = np.flatnonzero(output["backend"] == np.uint8(0))
     if residual_indexes.size == 0:
         output.setflags(write=False)

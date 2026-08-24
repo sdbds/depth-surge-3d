@@ -34,6 +34,7 @@ from ...io.reservation_protocol import (
     FinalPublicationObservation,
     InjectedReservationCrash,
     ReservationConflictError,
+    DirectoryIdentity,
     ReservationFileIdentity,
     ReservedArtifactTransaction,
     allocation_unit_for_path,
@@ -45,6 +46,8 @@ from ...io.reservation_protocol import (
     load_job_control,
     validate_final_encoding_entry_order,
     classify_final_publication_observation,
+    _directory_identity,
+    _identity,
 )
 
 
@@ -78,19 +81,11 @@ class InjectedFinalPublicationCrash(RuntimeError):
 
 
 def _reservation_identity(path: Path) -> ReservationFileIdentity:
-    metadata = path.stat(follow_symlinks=False)
-    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink() or metadata.st_nlink != 1:
-        raise ReservationConflictError(
-            f"reservation target is not a single-link regular file: {path}"
-        )
-    return ReservationFileIdentity(int(metadata.st_dev), int(metadata.st_ino))
+    return _identity(Path(path))
 
 
-def _reservation_directory_identity(path: Path) -> ReservationFileIdentity:
-    metadata = path.stat(follow_symlinks=False)
-    if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
-        raise ReservationConflictError(f"reservation parent is not a safe directory: {path}")
-    return ReservationFileIdentity(int(metadata.st_dev), int(metadata.st_ino))
+def _reservation_directory_identity(path: Path) -> DirectoryIdentity:
+    return _directory_identity(Path(path))
 
 
 @dataclass(frozen=True)
@@ -106,7 +101,7 @@ class FinalEncodingReservationIndexV1:
     final_video_existing_target_identity_at_preflight: ReservationFileIdentity | None
     final_video_target_descriptor_relative_path: str
     sibling_video_temporary_relative_path: str
-    sibling_video_parent_identity: ReservationFileIdentity
+    sibling_video_parent_identity: DirectoryIdentity
     diagnostics_metadata_raw_sha256_at_preflight: str | None
     diagnostics_metadata_fingerprint_at_preflight: str | None
     extent_entries: tuple[dict, ...]
@@ -194,7 +189,7 @@ class FinalEncodingReservationIndexV1:
                 "final_video_target_descriptor_relative_path"
             ],
             sibling_video_temporary_relative_path=value["sibling_video_temporary_relative_path"],
-            sibling_video_parent_identity=ReservationFileIdentity.from_object(
+            sibling_video_parent_identity=DirectoryIdentity.from_object(
                 value["sibling_video_parent_identity"]
             ),
             diagnostics_metadata_raw_sha256_at_preflight=value[
@@ -222,7 +217,7 @@ class FinalVideoTargetReservationV1:
     transaction_index_fingerprint: str
     final_video_relative_path: str
     sibling_video_temporary_relative_path: str
-    target_parent_identity: ReservationFileIdentity
+    target_parent_identity: DirectoryIdentity
     publication_method: Literal["replace_placeholder", "replace_existing"]
     reserved_target_identity: ReservationFileIdentity
     fingerprint: str
@@ -292,7 +287,7 @@ class FinalVideoTargetReservationV1:
             transaction_index_fingerprint=value["transaction_index_fingerprint"],
             final_video_relative_path=value["final_video_relative_path"],
             sibling_video_temporary_relative_path=value["sibling_video_temporary_relative_path"],
-            target_parent_identity=ReservationFileIdentity.from_object(
+            target_parent_identity=DirectoryIdentity.from_object(
                 value["target_parent_identity"]
             ),
             publication_method=value["publication_method"],
@@ -750,6 +745,26 @@ class PreparedFinalEncodingReservationV1:
         transaction.recover(raw)
         self.final_manifest_transaction = None
         return manifest
+
+    def recover_publication_prefix(self) -> FinalPublicationRecovery:
+        """Finish every deterministic, index-owned publication prefix step."""
+
+        for _ in range(5):
+            recovery = self.observe()
+            if recovery.phase in {
+                "windows_video_replace_gap_before_input_commit",
+                "windows_video_replace_gap_after_input_commit",
+            }:
+                self.recover_video_replacement_gap()
+                continue
+            if recovery.phase == "video_replaced_input_intent":
+                self.recover_input_manifest_intent()
+                continue
+            if recovery.phase == "final_manifest_intent":
+                self.recover_final_manifest_intent()
+                continue
+            return recovery
+        raise ReservationConflictError("final publication recovery did not converge")
 
     def retire(
         self,

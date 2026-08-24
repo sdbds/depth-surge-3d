@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import gc
 import math
+from contextlib import contextmanager
 from collections import Counter
 from dataclasses import dataclass
-from typing import Literal
+from typing import Iterator, Literal
 
 import numpy as np
 import torch
@@ -30,7 +31,7 @@ from .geometry import (
     build_relative_quality_geometry,
 )
 from .local_strip import QualityRepairBudgets, QualityVisibilityAnalysis
-from .planner import QualityRepairPlan, plan_quality_repairs
+from .planner import plan_quality_repairs
 from .planner import QualityRepairPlanSummary, summarize_quality_repair_plan
 from .repair_records import (
     NO_REGION,
@@ -460,18 +461,24 @@ def _plan_hole_runs(records: np.ndarray, width: int) -> HoleRunDiagnostics:
     )
 
 
-def _band_records(
+@contextmanager
+def _relative_band_records(
     records: np.ndarray,
     *,
     start_pixel: int,
     end_pixel: int,
-) -> np.ndarray:
+) -> Iterator[np.ndarray]:
     pixels = records["pixel_index"]
     start = int(np.searchsorted(pixels, np.uint32(start_pixel), side="left"))
     end = int(np.searchsorted(pixels, np.uint32(end_pixel), side="left"))
-    selected = np.array(records[start:end], copy=True, order="C")
+    selected = records[start:end]
+    selected.setflags(write=True)
     selected["pixel_index"] -= np.uint32(start_pixel)
-    return selected
+    try:
+        yield selected
+    finally:
+        selected["pixel_index"] += np.uint32(start_pixel)
+        selected.setflags(write=False)
 
 
 def _scatter_repair_records(
@@ -501,31 +508,31 @@ def _replay_background_eye_once(
     source: np.ndarray,
     geometry: QualityGeometryResult,
     offsets: np.ndarray,
-    plan: QualityRepairPlan,
+    records: np.ndarray,
     band_height: int,
 ) -> np.ndarray:
     height, width = source.shape[:2]
     output = np.empty_like(source)
     scattered = 0
-    planned = sum(int(value).bit_count() for value in plan.records["lane_mask"])
+    planned = sum(int(value).bit_count() for value in records["lane_mask"])
     for start_row in range(0, height, band_height):
         end_row = min(height, start_row + band_height)
         band = _quality_splat(renderer, source, geometry, offsets, start_row, end_row)
         valid = np.ascontiguousarray(band.splat.valid.detach().cpu().numpy())
-        records = _band_records(
-            plan.records,
+        with _relative_band_records(
+            records,
             start_pixel=start_row * width,
             end_pixel=end_row * width,
-        )
-        validate_record_coverage(records, ~valid)
-        scattered += _scatter_repair_records(
-            band.splat.colour,
-            records,
-            width=width,
-        )
+        ) as band_records:
+            validate_record_coverage(band_records, ~valid)
+            scattered += _scatter_repair_records(
+                band.splat.colour,
+                band_records,
+                width=width,
+            )
         downsampled = _downsample_subpixel_band(band.splat.colour)
         output[start_row:end_row] = _convert_image_band(downsampled, source.dtype)
-        del band, valid, records, downsampled
+        del band, valid, downsampled
     if scattered != planned:
         raise RuntimeError("Quality Pass B scatter total does not match the repair plan")
     return output
@@ -561,6 +568,10 @@ def _render_background_eye(
     )
     coverage = analyzed.analysis.coverage_count
     repair_bits = _background_repair_bits(coverage, plan.records)
+    hole_runs = _plan_hole_runs(plan.records, int(source.shape[1]))
+    summary = summarize_quality_repair_plan(plan, repair_bits)
+    records = plan.records
+    del plan
     image = _retry_after_oom(
         renderer,
         band_state,
@@ -569,11 +580,9 @@ def _render_background_eye(
         source=source,
         geometry=geometry,
         offsets=offsets,
-        plan=plan,
+        records=records,
     )
-    hole_runs = _plan_hole_runs(plan.records, int(source.shape[1]))
-    summary = summarize_quality_repair_plan(plan, repair_bits)
-    del analyzed, plan
+    del analyzed, records
     return _CompactEyeResult(image, coverage, repair_bits, summary, hole_runs)
 
 

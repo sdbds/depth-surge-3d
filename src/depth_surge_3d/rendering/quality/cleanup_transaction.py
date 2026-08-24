@@ -12,6 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Protocol
 
+from ...io.file_identity import (
+    DirectoryIdentityV1 as _DirectoryIdentity,
+    PersistentIdentityCapabilityError,
+    PersistentIdentitySchemaError,
+    capture_directory_identity,
+    directory_identity_from_posix_fd,
+    windows_identity_from_handle,
+)
 from .diagnostic_transaction import (
     _parse_canonical_object,
     canonical_json_bytes,
@@ -104,28 +112,6 @@ _PRUNE_ENTRY_KEYS = {
 }
 _HEX32 = re.compile(r"[0-9a-f]{32}", flags=re.ASCII)
 _HEX64 = re.compile(r"[0-9a-f]{64}", flags=re.ASCII)
-
-
-@dataclass(frozen=True)
-class _DirectoryIdentity:
-    device: int
-    inode: int
-
-    def to_object(self) -> dict[str, int]:
-        return {"device": self.device, "inode": self.inode}
-
-    @classmethod
-    def from_object(cls, value: object) -> "_DirectoryIdentity":
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"device", "inode"}
-            or type(value["device"]) is not int
-            or type(value["inode"]) is not int
-            or value["device"] < 0
-            or value["inode"] < 0
-        ):
-            raise CleanupTransactionError("prune directory identity schema is invalid")
-        return cls(value["device"], value["inode"])
 
 
 @dataclass(frozen=True)
@@ -272,14 +258,14 @@ def _sync_parent(path: Path) -> None:
 
 
 def _directory_identity(path: Path) -> _DirectoryIdentity:
-    metadata = path.stat(follow_symlinks=False)
-    if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
-        raise CleanupIdentityMismatchError(f"prune root is not an ordinary directory: {path}")
-    if getattr(metadata, "st_file_attributes", 0) & getattr(
-        stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
-    ):
-        raise CleanupIdentityMismatchError(f"prune root is a reparse point: {path}")
-    return _DirectoryIdentity(int(metadata.st_dev), int(metadata.st_ino))
+    try:
+        return capture_directory_identity(Path(path))
+    except PersistentIdentityCapabilityError as error:
+        raise CleanupCapabilityError(str(error)) from error
+    except (OSError, PersistentIdentitySchemaError) as error:
+        raise CleanupIdentityMismatchError(
+            f"prune root is not an ordinary directory: {path}"
+        ) from error
 
 
 def _safe_relative_path(job_root: Path, path: Path) -> str:
@@ -319,7 +305,7 @@ def plan_prune_markers_v1(job_root: Path) -> tuple[PlannedPruneMarkerV1, ...]:
     planned: list[PlannedPruneMarkerV1] = []
     for stage_key, prune_root in discover_prune_roots(root):
         identity = _directory_identity(prune_root)
-        if identity.device != root_identity.device:
+        if identity.volume_key != root_identity.volume_key:
             raise CleanupIdentityMismatchError(f"prune root crosses the job volume: {prune_root}")
         if root_mount is not None and _path_mount_identity(prune_root) != root_mount:
             raise CleanupIdentityMismatchError(f"prune root crosses a mount: {prune_root}")
@@ -503,7 +489,8 @@ def _publish_marker(root: Path, relative_path: str) -> dict[str, str]:
 
 def _replace_metadata(path: Path, raw: bytes) -> None:
     from ...io.reservation_protocol import (
-        ReservationFileIdentity,
+        _directory_identity as reservation_directory_identity,
+        _identity as reservation_file_identity,
         same_parent_replace_v1,
     )
 
@@ -515,26 +502,15 @@ def _replace_metadata(path: Path, raw: bytes) -> None:
                 raise OSError("short payload-pruned metadata write")
             handle.flush()
             os.fsync(handle.fileno())
-        source_identity = ReservationFileIdentity.from_object(
-            {
-                "device": int(temporary.stat(follow_symlinks=False).st_dev),
-                "inode": int(temporary.stat(follow_symlinks=False).st_ino),
-            }
-        )
-        target_metadata = path.stat(follow_symlinks=False)
-        target_identity = ReservationFileIdentity(
-            int(target_metadata.st_dev), int(target_metadata.st_ino)
-        )
-        parent_identity = _directory_identity(path.parent)
+        source_identity = reservation_file_identity(temporary)
+        target_identity = reservation_file_identity(path)
+        parent_identity = reservation_directory_identity(path.parent)
         same_parent_replace_v1(
             temporary,
             path,
             expected_source_identity=source_identity,
             expected_target_identity=target_identity,
-            expected_parent_identity=ReservationFileIdentity(
-                parent_identity.device,
-                parent_identity.inode,
-            ),
+            expected_parent_identity=parent_identity,
             replace_existing=True,
         )
     finally:
@@ -622,7 +598,7 @@ def commit_payload_pruned(  # noqa: C901
         entries = []
         for stage_key, prune_root in discover_prune_roots(root):
             identity = _directory_identity(prune_root)
-            if identity.device != root_identity.device:
+            if identity.volume_key != root_identity.volume_key:
                 raise CleanupIdentityMismatchError(
                     f"prune root crosses the job volume: {prune_root}"
                 )
@@ -704,9 +680,11 @@ def _entry_is_reparse(metadata: os.stat_result) -> bool:
 
 
 def _delete_tree_posix(  # noqa: C901
+    job_root: Path,
     root: Path,
     entry: dict[str, Any],
     expected: _DirectoryIdentity,
+    expected_job_root: _DirectoryIdentity,
     volume: int,
     mount_identity: _InvocationMountIdentity,
     *,
@@ -716,17 +694,17 @@ def _delete_tree_posix(  # noqa: C901
         raise AssertionError("POSIX cleanup adapter selected on Windows")
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory_flag = getattr(os, "O_DIRECTORY", 0)
-    parent_fd = os.open(root.parent, os.O_RDONLY | directory_flag | nofollow)
+    job_root_fd = os.open(job_root, os.O_RDONLY | directory_flag | nofollow)
+    opened_parent_fds: list[int] = []
+    parent_fd = job_root_fd
     root_fd = -1
     removed = 0
 
-    def checked_identity(descriptor: int) -> _DirectoryIdentity:
+    def checked_identity(descriptor: int) -> None:
         metadata = os.fstat(descriptor)
-        identity = _DirectoryIdentity(int(metadata.st_dev), int(metadata.st_ino))
-        if not stat.S_ISDIR(metadata.st_mode) or identity.device != volume:
+        if not stat.S_ISDIR(metadata.st_mode) or int(metadata.st_dev) != volume:
             raise CleanupIdentityMismatchError(f"cleanup crossed a mount: {root}")
         _require_same_invocation_mount(descriptor, mount_identity, root)
-        return identity
 
     def attest_tree(directory_fd: int) -> None:
         checked_identity(directory_fd)
@@ -777,12 +755,44 @@ def _delete_tree_posix(  # noqa: C901
                 removed += 1
 
     try:
+        try:
+            opened_job_root_identity = directory_identity_from_posix_fd(job_root_fd)
+        except PersistentIdentityCapabilityError as error:
+            raise CleanupCapabilityError(str(error)) from error
+        if opened_job_root_identity != expected_job_root:
+            raise CleanupIdentityMismatchError("job root identity changed during cleanup")
+        _require_same_invocation_mount(job_root_fd, mount_identity, job_root)
+        relative_parts = PurePosixPath(entry["relative_path"]).parts
+        for part in relative_parts[:-1]:
+            child = os.open(
+                part,
+                os.O_RDONLY | directory_flag | nofollow,
+                dir_fd=parent_fd,
+            )
+            try:
+                _require_same_invocation_mount(child, mount_identity, part)
+                if int(os.fstat(child).st_dev) != volume:
+                    raise CleanupIdentityMismatchError(
+                        f"cleanup crossed a mount at {part}"
+                    )
+            except BaseException:
+                os.close(child)
+                raise
+            opened_parent_fds.append(child)
+            parent_fd = child
         root_fd = os.open(
-            root.name,
+            relative_parts[-1],
             os.O_RDONLY | directory_flag | nofollow,
             dir_fd=parent_fd,
         )
-        if checked_identity(root_fd) != expected:
+        checked_identity(root_fd)
+        try:
+            opened_identity = directory_identity_from_posix_fd(root_fd)
+        except PersistentIdentityCapabilityError as error:
+            raise CleanupCapabilityError(str(error)) from error
+        except PersistentIdentitySchemaError as error:
+            raise CleanupIdentityMismatchError(f"prune root is unsafe: {root}") from error
+        if opened_identity != expected:
             raise CleanupIdentityMismatchError(f"prune root identity differs: {root}")
         marker_name = str(entry["marker"]["name"])
         marker_present = False
@@ -799,7 +809,7 @@ def _delete_tree_posix(  # noqa: C901
                 )
             os.close(root_fd)
             root_fd = -1
-            os.rmdir(root.name, dir_fd=parent_fd)
+            os.rmdir(relative_parts[-1], dir_fd=parent_fd)
             return 0
         marker_fd = os.open(marker_name, os.O_RDONLY | nofollow, dir_fd=root_fd)
         try:
@@ -833,19 +843,23 @@ def _delete_tree_posix(  # noqa: C901
             raise CleanupIdentityMismatchError(f"prune root repopulated during cleanup: {root}")
         os.close(root_fd)
         root_fd = -1
-        os.rmdir(root.name, dir_fd=parent_fd)
+        os.rmdir(relative_parts[-1], dir_fd=parent_fd)
         return removed
     finally:
         if root_fd >= 0:
             os.close(root_fd)
-        os.close(parent_fd)
+        for descriptor in reversed(opened_parent_fds):
+            os.close(descriptor)
+        os.close(job_root_fd)
 
 
 def _delete_tree_windows(  # noqa: C901
+    job_root: Path,
     root: Path,
     entry: dict[str, Any],
     expected: _DirectoryIdentity,
-    volume: int,
+    expected_job_root: _DirectoryIdentity,
+    volume: str,
     *,
     after_marker_unlink: Callable[[], None],
 ) -> int:  # noqa: C901
@@ -900,24 +914,6 @@ def _delete_tree_windows(  # noqa: C901
     )
     read_file.restype = wintypes.BOOL
 
-    class ByHandleFileInformation(ctypes.Structure):
-        _fields_ = [
-            ("file_attributes", wintypes.DWORD),
-            ("creation_time", wintypes.FILETIME),
-            ("last_access_time", wintypes.FILETIME),
-            ("last_write_time", wintypes.FILETIME),
-            ("volume_serial", wintypes.DWORD),
-            ("file_size_high", wintypes.DWORD),
-            ("file_size_low", wintypes.DWORD),
-            ("link_count", wintypes.DWORD),
-            ("file_index_high", wintypes.DWORD),
-            ("file_index_low", wintypes.DWORD),
-        ]
-
-    get_info = kernel32.GetFileInformationByHandle
-    get_info.argtypes = (wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation))
-    get_info.restype = wintypes.BOOL
-
     class UnicodeString(ctypes.Structure):
         _fields_ = [
             ("length", wintypes.USHORT),
@@ -960,24 +956,22 @@ def _delete_tree_windows(  # noqa: C901
     def win_error(code: int | None = None) -> OSError:
         return ctypes.WinError(ctypes.get_last_error() if code is None else code)
 
-    def identity(handle: int, *, require_directory: bool | None) -> tuple[_DirectoryIdentity, int]:
-        info = ByHandleFileInformation()
-        if not get_info(wintypes.HANDLE(handle), ctypes.byref(info)):
-            raise win_error()
-        is_directory = bool(info.file_attributes & file_attribute_directory)
-        if require_directory is not None and is_directory != require_directory:
-            raise CleanupIdentityMismatchError("cleanup handle type changed")
-        return (
-            _DirectoryIdentity(
-                int(info.volume_serial),
-                (int(info.file_index_high) << 32) | int(info.file_index_low),
-            ),
-            int(info.file_attributes),
-        )
+    def identity(handle: int, *, require_directory: bool, allow_reparse: bool = False):
+        try:
+            value, _links, attributes = windows_identity_from_handle(
+                handle,
+                require_directory=require_directory,
+                allow_reparse=allow_reparse,
+            )
+        except PersistentIdentityCapabilityError as error:
+            raise CleanupCapabilityError(str(error)) from error
+        except PersistentIdentitySchemaError as error:
+            raise CleanupIdentityMismatchError("cleanup handle type changed") from error
+        return value, attributes
 
-    def open_root() -> int:
+    def open_job_root() -> int:
         handle = create_file(
-            str(root),
+            str(job_root),
             0x00010000 | 0x00000001 | 0x00000080 | 0x00100000,
             0x1 | 0x2 | 0x4,
             None,
@@ -1029,8 +1023,9 @@ def _delete_tree_windows(  # noqa: C901
             raise CleanupTransactionError("NtCreateFile returned a null child handle")
         return int(child.value)
 
-    def enumerate_names(handle: int) -> list[tuple[str, int]]:
-        values: list[tuple[str, int]] = []
+    def iter_names(handle: int):
+        """Yield one fixed-buffer directory page at a time."""
+
         restart = True
         while True:
             buffer = ctypes.create_string_buffer(64 * 1024)
@@ -1042,7 +1037,7 @@ def _delete_tree_windows(  # noqa: C901
             ):
                 code = ctypes.get_last_error()
                 if code == 18:
-                    return values
+                    return
                 raise win_error(code)
             restart = False
             offset = 0
@@ -1052,10 +1047,18 @@ def _delete_tree_windows(  # noqa: C901
                 name_length = ctypes.c_uint32.from_buffer(buffer, offset + 60).value
                 name = ctypes.wstring_at(ctypes.addressof(buffer) + offset + 104, name_length // 2)
                 if name not in {".", ".."}:
-                    values.append((name, int(attributes)))
+                    yield name, int(attributes)
                 if next_offset == 0:
                     break
                 offset += int(next_offset)
+
+    def first_name(handle: int, *, excluded: str | None = None) -> tuple[str, int] | None:
+        # Restart after each deletion. Continuing a Windows directory cursor across
+        # namespace mutation may skip the entry which moved into the current slot.
+        for name, attributes in iter_names(handle):
+            if name != excluded:
+                return name, attributes
+        return None
 
     def delete_on_close(handle: int) -> None:
         delete = wintypes.BOOL(True)
@@ -1094,19 +1097,22 @@ def _delete_tree_windows(  # noqa: C901
     def visit(directory_handle: int, marker_name: str | None = None) -> None:
         nonlocal removed
         directory_identity, attributes = identity(directory_handle, require_directory=True)
-        if directory_identity.device != volume or attributes & file_attribute_reparse:
+        if directory_identity.volume_serial != volume or attributes & file_attribute_reparse:
             raise CleanupIdentityMismatchError("cleanup crossed a volume or reparse point")
-        for name, child_attributes in enumerate_names(directory_handle):
-            if marker_name is not None and name == marker_name:
-                continue
+        while True:
+            next_entry = first_name(directory_handle, excluded=marker_name)
+            if next_entry is None:
+                return
+            name, child_attributes = next_entry
             is_directory = bool(child_attributes & file_attribute_directory)
             child = open_relative(directory_handle, name, directory=is_directory)
             try:
                 child_identity, current_attributes = identity(
                     child,
                     require_directory=is_directory,
+                    allow_reparse=True,
                 )
-                if child_identity.device != volume:
+                if child_identity.volume_serial != volume:
                     raise CleanupIdentityMismatchError(f"cleanup crossed a volume at {name}")
                 if is_directory and not current_attributes & file_attribute_reparse:
                     visit(child)
@@ -1115,16 +1121,57 @@ def _delete_tree_windows(  # noqa: C901
                 close_handle(wintypes.HANDLE(child))
             removed += 1
 
-    root_handle = open_root()
+    job_root_handle = open_job_root()
+    opened_parent_handles: list[int] = []
+    root_handle = -1
     try:
-        actual, attributes = identity(root_handle, require_directory=True)
-        if actual != expected or actual.device != volume or attributes & file_attribute_reparse:
+        job_root_file_identity, job_root_attributes = identity(
+            job_root_handle,
+            require_directory=True,
+        )
+        if (
+            _DirectoryIdentity("windows", job_root_file_identity) != expected_job_root
+            or job_root_file_identity.volume_serial != volume
+            or job_root_attributes & file_attribute_reparse
+        ):
+            raise CleanupIdentityMismatchError("job root identity changed during cleanup")
+        parent_handle = job_root_handle
+        relative_parts = PurePosixPath(entry["relative_path"]).parts
+        for part_index, part in enumerate(relative_parts):
+            child_handle = open_relative(parent_handle, part, directory=True)
+            child_identity, child_attributes = identity(
+                child_handle,
+                require_directory=True,
+            )
+            if (
+                child_identity.volume_serial != volume
+                or child_attributes & file_attribute_reparse
+            ):
+                close_handle(wintypes.HANDLE(child_handle))
+                raise CleanupIdentityMismatchError(f"cleanup crossed a volume at {part}")
+            if part_index == len(relative_parts) - 1:
+                root_handle = child_handle
+            else:
+                opened_parent_handles.append(child_handle)
+                parent_handle = child_handle
+        if root_handle < 0:
+            raise CleanupTransactionError("prune root path is empty")
+        actual_file_identity, attributes = identity(root_handle, require_directory=True)
+        actual = _DirectoryIdentity("windows", actual_file_identity)
+        if (
+            actual != expected
+            or actual_file_identity.volume_serial != volume
+            or attributes & file_attribute_reparse
+        ):
             raise CleanupIdentityMismatchError(f"prune root identity differs: {root}")
         marker_name = str(entry["marker"]["name"])
-        names = enumerate_names(root_handle)
-        present_names = [name for name, _attributes in names]
-        if marker_name not in present_names:
-            if present_names:
+        marker_present = False
+        other_present = False
+        for name, _attributes in iter_names(root_handle):
+            marker_present = marker_present or name == marker_name
+            other_present = other_present or name != marker_name
+        if not marker_present:
+            if other_present:
                 raise CleanupIdentityMismatchError(
                     f"prune marker is missing from a nonempty root: {root}"
                 )
@@ -1136,15 +1183,21 @@ def _delete_tree_windows(  # noqa: C901
                 marker_handle,
                 require_directory=False,
             )
-            if marker_identity.device != volume or marker_attributes & file_attribute_reparse:
+            if marker_identity.volume_serial != volume or marker_attributes & file_attribute_reparse:
                 raise CleanupIdentityMismatchError(f"prune marker is unsafe: {root / marker_name}")
             marker_raw = read_marker(marker_handle)
         finally:
             close_handle(wintypes.HANDLE(marker_handle))
         _validate_marker_raw(entry, marker_raw, marker_name)
         visit(root_handle, marker_name)
-        remaining = enumerate_names(root_handle)
-        if [name for name, _attributes in remaining] != [marker_name]:
+        remaining_count = 0
+        marker_still_present = False
+        for name, _attributes in iter_names(root_handle):
+            remaining_count += 1
+            marker_still_present = marker_still_present or name == marker_name
+            if remaining_count > 1:
+                break
+        if remaining_count != 1 or not marker_still_present:
             raise CleanupIdentityMismatchError(f"prune marker is not the sole final entry: {root}")
         marker_handle = open_relative(root_handle, marker_name, directory=False)
         try:
@@ -1153,37 +1206,51 @@ def _delete_tree_windows(  # noqa: C901
             close_handle(wintypes.HANDLE(marker_handle))
         removed += 1
         after_marker_unlink()
-        if enumerate_names(root_handle):
+        if first_name(root_handle) is not None:
             raise CleanupIdentityMismatchError(f"prune root repopulated during cleanup: {root}")
         delete_on_close(root_handle)
         return removed
     finally:
-        close_handle(wintypes.HANDLE(root_handle))
+        if root_handle >= 0:
+            close_handle(wintypes.HANDLE(root_handle))
+        for handle in reversed(opened_parent_handles):
+            close_handle(wintypes.HANDLE(handle))
+        close_handle(wintypes.HANDLE(job_root_handle))
 
 
 def _delete_descendants_no_follow(
+    job_root: Path,
     root: Path,
     entry: dict[str, Any],
     expected: _DirectoryIdentity,
-    volume: int,
+    expected_job_root: _DirectoryIdentity,
+    volume: int | str,
     mount_identity: _InvocationMountIdentity | None = None,
     *,
     after_marker_unlink: Callable[[], None],
 ) -> int:
     if os.name == "nt":
+        if not isinstance(volume, str):
+            raise CleanupCapabilityError("Windows cleanup has no stable volume identity")
         return _delete_tree_windows(
+            job_root,
             root,
             entry,
             expected,
+            expected_job_root,
             volume,
             after_marker_unlink=after_marker_unlink,
         )
     if mount_identity is None:
         raise CleanupCapabilityError("POSIX cleanup has no job-root mount identity")
+    if not isinstance(volume, int):
+        raise CleanupCapabilityError("POSIX cleanup has no device identity")
     return _delete_tree_posix(
+        job_root,
         root,
         entry,
         expected,
+        expected_job_root,
         volume,
         mount_identity,
         after_marker_unlink=after_marker_unlink,
@@ -1234,17 +1301,23 @@ def run_authorized_cleanup(
             continue
         expected = _DirectoryIdentity.from_object(entry["directory_identity"])
         actual = _directory_identity(prune_root)
-        if actual != expected or actual.device != root_identity.device:
+        if actual != expected or actual.volume_key != root_identity.volume_key:
             raise CleanupIdentityMismatchError(f"prune root identity differs: {prune_root}")
 
         def emit_marker_unlink(index: int = index) -> None:
             _emit(fault, f"after_prune_marker_unlink_{index}")
 
         removed += _delete_descendants_no_follow(
+            root,
             prune_root,
             entry,
             expected,
-            root_identity.device,
+            root_identity,
+            (
+                root_identity.file_identity.volume_serial
+                if root_identity.kind == "windows"
+                else int(root.stat(follow_symlinks=False).st_dev)
+            ),
             mount_identity,
             after_marker_unlink=emit_marker_unlink,
         )

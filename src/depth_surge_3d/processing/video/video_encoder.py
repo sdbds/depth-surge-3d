@@ -76,8 +76,6 @@ _DIRECT_FRAME_NAME = re.compile(r"^frame_(\d{6,})\.png$")
 class _DirectStereoSequence:
     """Validated image2 manifests and the only headers needed for direct encoding."""
 
-    left_files: tuple[Path, ...]
-    right_files: tuple[Path, ...]
     left_pattern: Path
     right_pattern: Path
     start_number: int
@@ -128,6 +126,14 @@ class VideoEncoder:
     @property
     def pending_final_encoding_reservation(self) -> PreparedFinalEncodingReservationV1 | None:
         return self._pending_final_reservation
+
+    def adopt_final_encoding_reservation(
+        self,
+        reservation: PreparedFinalEncodingReservationV1,
+    ) -> None:
+        """Attach an authenticated recovery transaction for index-last retirement."""
+
+        self._pending_final_reservation = reservation
 
     def retire_final_encoding_reservation(self, *, success: bool) -> None:
         reservation = self._pending_final_reservation
@@ -427,19 +433,7 @@ class VideoEncoder:
         if active_index.is_file():
             reservation = load_final_encoding_reservation_v1(output_dir, artifact)
             self._pending_final_reservation = reservation
-            recovery = reservation.observe()
-            if recovery.phase in {
-                "windows_video_replace_gap_before_input_commit",
-                "windows_video_replace_gap_after_input_commit",
-            }:
-                reservation.recover_video_replacement_gap()
-                recovery = reservation.observe()
-            if recovery.phase == "video_replaced_input_intent":
-                reservation.recover_input_manifest_intent()
-                recovery = reservation.observe()
-            if recovery.phase == "final_manifest_intent":
-                reservation.recover_final_manifest_intent()
-                recovery = reservation.observe()
+            recovery = reservation.recover_publication_prefix()
             if recovery.phase == "publication_authenticated":
                 assert publication_generation is not None
                 return _Schema5EncodingContext(
@@ -744,44 +738,60 @@ class VideoEncoder:
 
     def _validate_direct_stereo_sequence(
         self,
-        left_files: list[Path],
-        right_files: list[Path],
+        left_files: Sequence[Path],
+        right_files: Sequence[Path],
         total_frames: int,
     ) -> _DirectStereoSequence:
         """Validate corresponding image2 eye sequences before FFmpeg can start."""
 
         if not left_files or not right_files:
             raise ValueError("Direct stereo sequences must contain frames for both eyes")
-        if len({path.parent for path in left_files}) != 1:
-            raise ValueError("Direct left-eye frames must have one parent directory")
-        if len({path.parent for path in right_files}) != 1:
-            raise ValueError("Direct right-eye frames must have one parent directory")
-
-        sorted_left = tuple(sorted(left_files, key=self._direct_frame_index))
-        sorted_right = tuple(sorted(right_files, key=self._direct_frame_index))
-        left_names = tuple(path.name for path in sorted_left)
-        right_names = tuple(path.name for path in sorted_right)
-        if left_names != right_names:
-            raise ValueError("Direct stereo sequences must have identical frame names")
-        if total_frames > 0 and len(sorted_left) != total_frames:
+        if len(left_files) != len(right_files):
+            raise ValueError("Direct stereo sequences must have identical frame counts")
+        frame_count = len(left_files)
+        if total_frames > 0 and frame_count != total_frames:
             raise ValueError("Direct stereo sequence count does not match total frames")
-
-        indices = tuple(self._direct_frame_index(path) for path in sorted_left)
-        if any(current != previous + 1 for previous, current in zip(indices, indices[1:])):
+        left_parent = Path(left_files[0]).parent
+        right_parent = Path(right_files[0]).parent
+        minimum: int | None = None
+        maximum: int | None = None
+        for position in range(frame_count):
+            left = Path(left_files[position])
+            right = Path(right_files[position])
+            if left.parent != left_parent:
+                raise ValueError("Direct left-eye frames must have one parent directory")
+            if right.parent != right_parent:
+                raise ValueError("Direct right-eye frames must have one parent directory")
+            left_index = self._direct_frame_index(left)
+            right_index = self._direct_frame_index(right)
+            if left_index != right_index:
+                raise ValueError("Direct stereo sequences must have identical frame names")
+            minimum = left_index if minimum is None else min(minimum, left_index)
+            maximum = left_index if maximum is None else max(maximum, left_index)
+        assert minimum is not None and maximum is not None
+        if maximum - minimum + 1 != frame_count:
             raise ValueError("Direct stereo sequence frame indices must be gap-free")
+        seen = bytearray((frame_count + 7) // 8)
+        for path in left_files:
+            relative_index = self._direct_frame_index(Path(path)) - minimum
+            byte_index, bit_index = divmod(relative_index, 8)
+            mask = 1 << bit_index
+            if seen[byte_index] & mask:
+                raise ValueError("Direct stereo sequence frame indices must be unique")
+            seen[byte_index] |= mask
 
-        left_header = read_png_header(sorted_left[0])
-        right_header = read_png_header(sorted_right[0])
+        first_left = left_parent / f"frame_{minimum:06d}.png"
+        first_right = right_parent / f"frame_{minimum:06d}.png"
+        left_header = read_png_header(first_left)
+        right_header = read_png_header(first_right)
         if left_header is None or right_header is None:
             raise ValueError("Direct stereo sequence has an unreadable first PNG")
 
         return _DirectStereoSequence(
-            left_files=sorted_left,
-            right_files=sorted_right,
-            left_pattern=sorted_left[0].parent / "frame_%06d.png",
-            right_pattern=sorted_right[0].parent / "frame_%06d.png",
-            start_number=indices[0],
-            frame_count=len(sorted_left),
+            left_pattern=left_parent / "frame_%06d.png",
+            right_pattern=right_parent / "frame_%06d.png",
+            start_number=minimum,
+            frame_count=frame_count,
             left_header=left_header,
             right_header=right_header,
         )
@@ -1046,7 +1056,9 @@ class VideoEncoder:
                 print("Error: FFmpeg not found. Cannot create output video.")
                 return False
             sequence = self._validate_direct_stereo_sequence(
-                list(left_files), list(right_files), total_frames
+                left_files,
+                right_files,
+                total_frames,
             )
             schema5_context = self._prepare_schema5_direct_context(
                 sequence=sequence,
