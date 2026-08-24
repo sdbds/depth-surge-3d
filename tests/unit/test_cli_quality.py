@@ -56,3 +56,45 @@ def test_cli_rejects_invalid_quality_limit_before_processing(cli_module) -> None
 
     with pytest.raises(SystemExit):
         parser.parse_args(["input.mp4", "--occlusion-fill-max-px", "0"])
+
+
+def test_cli_omitted_quality_limit_uses_new_job_default(cli_module) -> None:
+    args = cli_module.create_argument_parser().parse_args(["input.mp4"])
+
+    settings = cli_module._build_processing_settings(args)
+
+    assert settings["occlusion_fill_max_px"] == 8
+
+
+def test_cli_resume_stereo_overrides_are_presence_aware(cli_module) -> None:
+    parser = cli_module.create_argument_parser()
+    saved = {"stereo_render_mode": "quality", "occlusion_fill_max_px": 11}
+
+    omitted = cli_module._apply_resume_stereo_settings(
+        saved,
+        parser.parse_args(["--resume", "job"]),
+    )
+    explicit = cli_module._apply_resume_stereo_settings(
+        saved,
+        parser.parse_args(
+            [
+                "--resume",
+                "job",
+                "--stereo-render-mode",
+                "fast",
+                "--occlusion-fill-max-px",
+                "6",
+            ]
+        ),
+    )
+
+    assert omitted["stereo_render_mode"] == "quality"
+    assert omitted["occlusion_fill_max_px"] == 11
+    assert explicit["stereo_render_mode"] == "fast"
+    assert explicit["occlusion_fill_max_px"] == 6
+
+
+def test_cli_warns_when_quality_is_explicitly_selected_on_cpu(cli_module, capsys) -> None:
+    cli_module._warn_quality_on_cpu({"stereo_render_mode": "quality"}, renderer_device_type="cpu")
+
+    assert "Quality stereo on CPU" in capsys.readouterr().out

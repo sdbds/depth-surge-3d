@@ -825,6 +825,18 @@
                                 <option value="vdpp">VDPP (Experimental)</option>
                             </select>
                         </div>
+                        <div class="mb-3">
+                            <label for="resumeStereoRenderMode" class="form-label">Stereo Renderer</label>
+                            <select class="form-select" id="resumeStereoRenderMode">
+                                <option value="saved" selected>Use saved setting</option>
+                                <option value="quality">Quality</option>
+                                <option value="fast">Fast</option>
+                            </select>
+                        </div>
+                        <div class="mb-3">
+                            <label for="resumeOcclusionFillMaxPx" class="form-label">Quality Fill Limit</label>
+                            <input type="number" class="form-control" id="resumeOcclusionFillMaxPx" min="1" max="32" step="1" placeholder="Use saved setting">
+                        </div>
                         <button type="button" class="btn btn-secondary" id="resumeBtn">
                             <i class="fas fa-play"></i> Resume Processing
                         </button>
@@ -1074,6 +1086,20 @@
                                     <option value="background" selected>Background propagation</option>
                                     <option value="none">None</option>
                                 </select>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label" for="stereoRenderMode">Stereo Renderer</label>
+                                <select class="form-select" id="stereoRenderMode">
+                                    <option value="quality" selected>Quality</option>
+                                    <option value="fast">Fast</option>
+                                </select>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label" for="occlusionFillMaxPx">Quality Fill Limit (px at 1080p)</label>
+                                <input type="number" class="form-control" id="occlusionFillMaxPx" value="8" step="1" min="1" max="32">
+                            </div>
+                            <div class="alert alert-warning py-2" id="stereoQualityCpuWarning" style="display: none;">
+                                Quality stereo on CPU is intended for slow offline rendering.
                             </div>
                         </div>
                         <div id="metricGeometrySettings" style="display: none;">
@@ -1822,6 +1848,7 @@
         let uploadedFilename = null;
         let uploadedOutputDir = null;
         let currentVideoInfo = null;
+        let systemCudaAvailable = null;
 
         // Initialize socket connection
         function initSocket() {
@@ -2118,16 +2145,30 @@
             fetch('/system_info')
             .then(response => response.json())
             .then(data => {
+                systemCudaAvailable = data.cuda_available === true;
                 document.getElementById('gpuDevice').textContent = data.gpu_device || '--';
                 document.getElementById('vramUsage').textContent = data.vram_usage || '--';
                 document.getElementById('deviceMode').textContent = data.device_mode || '--';
+                updateStereoQualityControls();
             })
             .catch(error => {
+                systemCudaAvailable = null;
                 console.error('Failed to load system info:', error);
                 document.getElementById('gpuDevice').textContent = '--';
                 document.getElementById('vramUsage').textContent = '--';
                 document.getElementById('deviceMode').textContent = '--';
+                updateStereoQualityControls();
             });
+        }
+
+        function updateStereoQualityControls() {
+            const qualitySelected = document.getElementById('stereoRenderMode').value === 'quality';
+            const requestedDevice = document.getElementById('device').value;
+            const cpuSelected = requestedDevice === 'cpu'
+                || (requestedDevice === 'auto' && systemCudaAvailable === false);
+            document.getElementById('occlusionFillMaxPx').disabled = !qualitySelected;
+            document.getElementById('stereoQualityCpuWarning').style.display =
+                qualitySelected && cpuSelected ? 'block' : 'none';
         }
 
         // Update Step 1 display with source and final resolution/FPS
@@ -2243,6 +2284,8 @@
                 stereo_strength: parseFloat(document.getElementById('stereoStrength').value),
                 convergence: parseFloat(document.getElementById('convergence').value),
                 occlusion_fill: document.getElementById('occlusionFill').value,
+                stereo_render_mode: document.getElementById('stereoRenderMode').value,
+                occlusion_fill_max_px: parseInt(document.getElementById('occlusionFillMaxPx').value),
                 stereo_geometry_mode: document.getElementById('stereoGeometryMode').value,
                 virtual_baseline_mm: parseFloat(document.getElementById('virtualBaselineMm').value),
                 metric_convergence_distance: document.getElementById('metricConvergenceMode').value === 'auto'
@@ -2329,6 +2372,14 @@
             const resumeTemporalPostprocessor = document.getElementById('resumeTemporalPostprocessor').value;
             if (resumeTemporalPostprocessor !== 'saved') {
                 resumePayload.temporal_postprocessor = resumeTemporalPostprocessor;
+            }
+            const resumeStereoRenderMode = document.getElementById('resumeStereoRenderMode').value;
+            if (resumeStereoRenderMode !== 'saved') {
+                resumePayload.stereo_render_mode = resumeStereoRenderMode;
+            }
+            const resumeFillLimit = document.getElementById('resumeOcclusionFillMaxPx').value;
+            if (resumeFillLimit !== '') {
+                resumePayload.occlusion_fill_max_px = parseInt(resumeFillLimit);
             }
 
             fetch('/resume', {
@@ -2935,7 +2986,11 @@
             updateRangeInfo();
             updateStep1Display();
         });
-        document.getElementById('device').addEventListener('change', updateSystemInfo);
+        document.getElementById('device').addEventListener('change', function() {
+            updateStereoQualityControls();
+            updateSystemInfo();
+        });
+        document.getElementById('stereoRenderMode').addEventListener('change', updateStereoQualityControls);
 
         // Toggle fisheye distortion options
         document.getElementById('applyDistortion').addEventListener('change', function() {
@@ -3076,7 +3131,7 @@
         }
 
         function saveSettings() {
-            const SETTINGS_VERSION = 3; // Must match version in loadSettings()
+            const SETTINGS_VERSION = 4; // Must match version in loadSettings()
             const settings = {
                 version: SETTINGS_VERSION,
                 // Time range
@@ -3089,6 +3144,8 @@
                 stereoStrength: document.getElementById('stereoStrength').value,
                 convergence: document.getElementById('convergence').value,
                 occlusionFill: document.getElementById('occlusionFill').value,
+                stereoRenderMode: document.getElementById('stereoRenderMode').value,
+                occlusionFillMaxPx: document.getElementById('occlusionFillMaxPx').value,
                 stereoGeometryMode: document.getElementById('stereoGeometryMode').value,
                 virtualBaselineMm: document.getElementById('virtualBaselineMm').value,
                 metricConvergenceMode: document.getElementById('metricConvergenceMode').value,
@@ -3148,7 +3205,7 @@
         }
 
         function loadSettings() {
-            const SETTINGS_VERSION = 3; // Increment to force reset of old settings
+            const SETTINGS_VERSION = 4; // Increment to force reset of old settings
             const savedSettings = localStorage.getItem('stereoProjectorSettings');
             if (!savedSettings) return;
 
@@ -3194,6 +3251,7 @@
                 }
                 updateGeometryControls();
                 updateMetricConvergenceControls();
+                updateStereoQualityControls();
                 
                 // Trigger change events for elements that have dependencies
                 if (settings.applyDistortion !== undefined) {
@@ -3220,6 +3278,8 @@
                 stereoStrength: '2.0',
                 convergence: '0.5',
                 occlusionFill: 'background',
+                stereoRenderMode: 'quality',
+                occlusionFillMaxPx: '8',
                 stereoGeometryMode: 'relative',
                 virtualBaselineMm: '63.0',
                 metricConvergenceMode: 'auto',
@@ -3271,6 +3331,7 @@
             // Trigger change events
             document.getElementById('applyDistortion').dispatchEvent(new Event('change'));
             document.getElementById('applyUpscaling').dispatchEvent(new Event('change'));
+            updateStereoQualityControls();
 
             // Update optional step styling
             updateOptionalStepStyling();
@@ -3285,6 +3346,7 @@
         function setupAutoSave() {
             const settingsElements = [
                 'startTime', 'endTime', 'vrFormat', 'vrResolution', 'stereoStrength', 'convergence', 'occlusionFill',
+                'stereoRenderMode', 'occlusionFillMaxPx',
                 'stereoGeometryMode', 'virtualBaselineMm', 'metricConvergenceMode', 'metricConvergenceDistance', 'maxDisparityPercent',
                 'sceneDetection', 'sceneCutThreshold', 'minSceneFrames', 'rawStorageDtype', 'stereoIoWorkers', 'migrateLegacy',
                 'resolution', 'targetFps', 'superSample', 'device', 'modelSize', 'depthModelVersion', 'depthModelType', 'depthResolution', 'videoEncoder',
@@ -3526,6 +3588,7 @@
 
             updateDepthModelControls();
             updateMetricConvergenceControls();
+            updateStereoQualityControls();
         });
     </script>
 </body>

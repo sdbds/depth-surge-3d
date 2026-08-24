@@ -99,6 +99,36 @@ def _effective_vdpp_device(requested: object) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _apply_resume_stereo_settings(
+    persisted: dict[str, object], args: argparse.Namespace
+) -> dict[str, object]:
+    """Apply only explicitly supplied stereo overrides to a resumed job."""
+
+    settings = dict(persisted)
+    renderer_device = _effective_vdpp_device(settings.get("device", args.device))
+    settings["stereo_render_mode"] = resolve_stereo_render_mode(
+        persisted=settings.get("stereo_render_mode", "fast"),
+        override=args.stereo_render_mode,
+        is_resume=True,
+        renderer_device_type=renderer_device,
+    )
+    if args.occlusion_fill_max_px is not None:
+        settings["occlusion_fill_max_px"] = args.occlusion_fill_max_px
+    else:
+        settings.setdefault("occlusion_fill_max_px", DEFAULT_SETTINGS["occlusion_fill_max_px"])
+    return settings
+
+
+def _warn_quality_on_cpu(settings: dict[str, object], *, renderer_device_type: object) -> None:
+    device_type = str(renderer_device_type).split(":", 1)[0].lower()
+    if settings.get("stereo_render_mode") == "quality" and device_type == "cpu":
+        print(
+            console_warning(
+                "Quality stereo on CPU is supported but intended for slow offline rendering."
+            )
+        )
+
+
 def _print_resume_report(report) -> None:
     """Print the deterministic stage decisions before migration."""
     print("Resume stage report:")
@@ -144,9 +174,7 @@ def _parse_occlusion_fill_max_px(value: str) -> int:
             "occlusion fill maximum must be an integer in 1..32"
         ) from exc
     if str(normalized) != value or not 1 <= normalized <= 32:
-        raise argparse.ArgumentTypeError(
-            "occlusion fill maximum must be an integer in 1..32"
-        )
+        raise argparse.ArgumentTypeError("occlusion fill maximum must be an integer in 1..32")
     return normalized
 
 
@@ -176,7 +204,11 @@ def _build_processing_settings(args: argparse.Namespace) -> dict[str, object]:
                 is_resume=False,
                 renderer_device_type=_effective_vdpp_device(args.device),
             ),
-            "occlusion_fill_max_px": args.occlusion_fill_max_px,
+            "occlusion_fill_max_px": (
+                DEFAULT_SETTINGS["occlusion_fill_max_px"]
+                if args.occlusion_fill_max_px is None
+                else args.occlusion_fill_max_px
+            ),
             "stereo_geometry_mode": args.stereo_geometry_mode,
             "virtual_baseline_mm": args.virtual_baseline_mm,
             "metric_convergence_distance": args.metric_convergence_distance,
@@ -307,8 +339,8 @@ Note: V2 uses fixed shot-aware temporal inference; V3, See-Through, and MoGe-2 i
     parser.add_argument(
         "--occlusion-fill-max-px",
         type=_parse_occlusion_fill_max_px,
-        default=DEFAULT_SETTINGS["occlusion_fill_max_px"],
-        help="Quality local disocclusion limit at 1080p (default: %(default)s)",
+        default=None,
+        help="Quality local disocclusion limit at 1080p (default: 8)",
     )
     parser.add_argument(
         "--stereo-geometry-mode",
@@ -501,6 +533,10 @@ def validate_arguments(args) -> dict[str, object] | None:  # noqa: C901
     except ValueError as exc:
         print(f"Error: {exc}")
         return None
+    _warn_quality_on_cpu(
+        processing_settings,
+        renderer_device_type=_effective_vdpp_device(args.device),
+    )
 
     if (
         args.fisheye_fov < VALIDATION_RANGES["fisheye_fov"][0]
@@ -624,7 +660,7 @@ def main():  # noqa: C901
             settings_data["processing_settings"],
             saved_version=saved_version,
         )
-        processing_settings = loaded_settings.settings
+        processing_settings = _apply_resume_stereo_settings(loaded_settings.settings, args)
         processing_settings["temporal_postprocessor"] = resolve_temporal_postprocessor(
             persisted=processing_settings.get("temporal_postprocessor"),
             override=args.temporal_postprocessor,
@@ -658,6 +694,12 @@ def main():  # noqa: C901
             and resume_spec.capabilities.metric_depth
         )
         processing_settings = validate_settings(processing_settings, source="explicit")
+        _warn_quality_on_cpu(
+            processing_settings,
+            renderer_device_type=_effective_vdpp_device(
+                processing_settings.get("device", args.device)
+            ),
+        )
 
         projector = None
         job_lock = None

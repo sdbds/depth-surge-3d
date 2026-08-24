@@ -1,5 +1,21 @@
 # Web UI Guide
 
+## Stereo Renderer
+
+The Stereo Pair Generation step exposes `Quality` and `Fast`. Quality is the
+offline highest-quality path and defaults to an 8 px local fill limit at 1080p;
+the input accepts `1..32`. Fast retains the historical renderer. Selecting
+Quality with an effective CPU device displays a warning rather than silently
+downgrading the job.
+
+The resume panel defaults to the saved stereo mode. Choosing Fast or Quality is
+an explicit override and invalidates incompatible downstream stereo artifacts.
+Leaving the Quality fill-limit field empty preserves its saved value.
+
+Committed Quality diagnostics are stored under
+`04_stereo_diagnostics/`. Frame manifests authenticate coverage and repair PNGs
+plus scalar statistics. Incomplete generations are not reused.
+
 ## Temporal Post-Processing
 
 The Depth Analysis step exposes one segmented control:

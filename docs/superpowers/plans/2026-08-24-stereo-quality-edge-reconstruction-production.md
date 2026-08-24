@@ -266,31 +266,31 @@ feat: add compact two-pass quality renderer
 - Produces: replayable lazy work provider, capacity-one Quality lifecycle, per-frame `diagnostics-v3/<frame>/manifest.json`, and root summary.
 - Consumes: compact RGB/coverage/repair without public boolean-mask allocation.
 
-- [ ] **Step 1: Add RED file-pipeline tests**
+- [x] **Step 1: Add RED file-pipeline tests**
 
 Assert decoder workers retain uint16 relative payloads/native metric objects, Quality capacity is exactly one, work enumeration is replayable and lazy, and impossible plan/input combinations fail before rendering.
 
-- [ ] **Step 2: Add RED diagnostics transaction and resume tests**
+- [x] **Step 2: Add RED diagnostics transaction and resume tests**
 
 Inject failures after every payload write, payload sync, frame-manifest replace, directory sync, root-summary replace, cleanup transition, and `keep_intermediates=false` pruning boundary. Assert partial generations are never reused as committed frames.
 
-- [ ] **Step 3: Run focused tests and confirm expected failures**
+- [x] **Step 3: Run focused tests and confirm expected failures**
 
 Run: `python -m pytest tests/unit/test_quality_diagnostics.py tests/unit/test_stereo_generator.py tests/unit/test_resume.py -q`
 
-- [ ] **Step 4: Implement the discriminated pipeline and compact writer**
+- [x] **Step 4: Implement the discriminated pipeline and compact writer**
 
 Persist RGB atomically, write coverage/repair PNGs and canonical statistics only for Quality, publish frame manifest last, then update the root summary. Fast writes the same RGB bytes and legacy stage metadata while collecting only its specified bounded counters.
 
-- [ ] **Step 5: Implement strict resume/audit disposition**
+- [x] **Step 5: Implement strict resume/audit disposition**
 
 Validate hashes, schemas, frame order, algorithm identities, source content manifest, and compact pixel counts before reuse; distinguish absent, incomplete, pruned, and validation-failed states exactly.
 
-- [ ] **Step 6: Run file-pipeline and resume suites**
+- [x] **Step 6: Run file-pipeline and resume suites**
 
 Run: `python -m pytest tests/unit/test_quality_diagnostics.py tests/unit/test_stereo_generator.py tests/unit/test_resume.py -q`
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```text
 feat: persist quality diagnostics transaction
@@ -309,23 +309,23 @@ feat: persist quality diagnostics transaction
 - Produces: `write_metric_npz(...)`, `audit_metric_npz(...)`, and `audit_metric_sequence(...)` with one-frame ownership.
 - Preserves: supported historical NumPy NPZ layouts through the frozen allowlist.
 
-- [ ] **Step 1: Add RED production golden/strict-parser tests**
+- [x] **Step 1: Add RED production golden/strict-parser tests**
 
 Reuse all owned/current-Numpy/legacy goldens; reject malformed flags, descriptors, duplicate members, CRCs, dtype/shape mismatch, trailing data, symlinks, and allocation failures.
 
-- [ ] **Step 2: Run tests and confirm production APIs are missing**
+- [x] **Step 2: Run tests and confirm production APIs are missing**
 
 Run: `python -m pytest tests/unit/test_metric_npz.py tests/unit/test_quality_content_manifest.py -q`
 
-- [ ] **Step 3: Promote the gate-proven reader/writer and bind the metric store**
+- [x] **Step 3: Promote the gate-proven reader/writer and bind the metric store**
 
 Ensure no complete second member is resident, validate native arrays in place, freeze them read-only, and release the owned frame before advancing.
 
-- [ ] **Step 4: Run goldens, RSS checks, and metric pipeline tests**
+- [x] **Step 4: Run goldens, RSS checks, and metric pipeline tests**
 
 Run: `python -m pytest tests/unit/test_metric_npz.py tests/unit/test_quality_content_manifest.py tests/unit/test_metric_geometry.py -q`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```text
 feat: add bounded metric content io
@@ -347,31 +347,31 @@ feat: add bounded metric content io
 - Produces: `SettingsArtifactTransactionV1`, `ReservedArtifactTransaction`, `JobControlV1`, and recovery entry order.
 - Produces: `job_output_name_v1`, `PortableFinalComponentV1`, and legacy contained-component audit.
 
-- [ ] **Step 1: Add RED schema and byte-contract tests**
+- [x] **Step 1: Add RED schema and byte-contract tests**
 
 Test the exact six top-level keys, all owned closed subobjects, scalar strings, u64/binary64 distinctions, UTC microseconds, revision equations, canonical bytes, and source schema provenance.
 
-- [ ] **Step 2: Add RED filename and crash-window tests**
+- [x] **Step 2: Add RED filename and crash-window tests**
 
 Freeze every canonical device-name/superscript golden, 239/240/241 byte and UTF-16 boundaries, write-ahead semantic payload recovery, complete-full/complete-short/renamed phases, allocation evidence at readiness, and truncate-before-sync recovery.
 
-- [ ] **Step 3: Run tests and observe missing transaction APIs**
+- [x] **Step 3: Run tests and observe missing transaction APIs**
 
 Run: `python -m pytest tests/unit/test_settings_artifact_v5.py tests/unit/test_reservation_protocol.py -q`
 
-- [ ] **Step 4: Promote reservation core and implement strict settings codec**
+- [x] **Step 4: Promote reservation core and implement strict settings codec**
 
 Use descriptor phase to decide whether readiness allocation evidence is rechecked. Never re-extend an exact complete-short payload; retry sync/truncate release proof and retain it on `ReservationIncompleteError`.
 
-- [ ] **Step 5: Replace ad hoc settings writes with the transaction**
+- [x] **Step 5: Replace ad hoc settings writes with the transaction**
 
 Create/migrate schema 5 before frame mutation, persist immutable expected target and producer marker, and reconcile JobControl-owned terminal extents before ordinary stage reuse.
 
-- [ ] **Step 6: Run all settings/resume/reservation tests**
+- [x] **Step 6: Run all settings/resume/reservation tests**
 
 Run: `python -m pytest tests/unit/test_settings.py tests/unit/test_settings_artifact_v5.py tests/unit/test_reservation_protocol.py tests/unit/test_resume.py -q`
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```text
 feat: add recoverable settings artifact v5
@@ -434,23 +434,23 @@ feat: stream and recover final publication v4
 - Consumes: the single settings validator and resolver from Task 1.
 - Produces: two visible modes (`fast`, `quality`), limit input 1..32, CPU warning, persisted schema-5 overrides, and mode-specific resume identity.
 
-- [ ] **Step 1: Add RED CLI/Web/resume tests**
+- [x] **Step 1: Add RED CLI/Web/resume tests**
 
 Assert new CUDA omission resolves Quality, CPU omission resolves Fast, explicit CPU Quality warns, schema-5 resume retains persisted values, explicit override wins, and schema 1..4 migration stays Fast/8.
 
-- [ ] **Step 2: Run focused tests and confirm UI/settings mismatch**
+- [x] **Step 2: Run focused tests and confirm UI/settings mismatch**
 
 Run: `python -m pytest tests/unit/test_app.py tests/unit/test_cli.py tests/unit/test_resume.py -q`
 
-- [ ] **Step 3: Implement controls and update operational documentation**
+- [x] **Step 3: Implement controls and update operational documentation**
 
 Use a mode selector and bounded numeric input; document that Quality is offline/highest-quality, Fast is legacy-compatible, diagnostics live under the job root, and failures never silently downgrade.
 
-- [ ] **Step 4: Run CLI/Web/resume tests**
+- [x] **Step 4: Run CLI/Web/resume tests**
 
 Run: `python -m pytest tests/unit/test_app.py tests/unit/test_cli.py tests/unit/test_resume.py -q`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```text
 feat: expose offline stereo quality mode

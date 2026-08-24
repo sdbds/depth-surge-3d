@@ -19,6 +19,9 @@ Depth Surge 3D transforms flat videos into stereoscopic 3D for VR headsets using
 - **AI Upscaling**: Optional Real-ESRGAN enhancement (2x/4x) for higher output resolution
 - **CUDA Hardware Acceleration**: NVENC H.265 encoding and GPU-accelerated frame decoding
 - **Configurable Depth Quality**: Adjustable depth map resolution (518px to 4K) for quality vs. speed
+- **Two Stereo Renderers**: Offline `quality` mode reconstructs depth edges and
+  repairs only authenticated disocclusions; `fast` retains the legacy renderer
+  for byte-compatible output and faster iteration
 - **Optional VDPP Stabilization**: Experimental depth-only temporal post-processing for any video depth backend using relative geometry
 - **Multiple VR Formats**: Side-by-side and over-under stereoscopic formats
 - **Flexible Resolutions**: Square (VR-optimized), 16:9 (standard), cinema, and custom resolutions up to 8K
@@ -60,6 +63,12 @@ python depth_surge_3d.py input_video.mp4 -s 01:30 -e 03:45 -f over_under --resol
 
 # Add experimental generic temporal stabilization (CUDA generation only)
 python depth_surge_3d.py input_video.mp4 --temporal-postprocessor vdpp
+
+# Highest-quality offline stereo with a conservative 8 px repair limit at 1080p
+python depth_surge_3d.py input_video.mp4 --stereo-render-mode quality --occlusion-fill-max-px 8
+
+# Retain the legacy-compatible renderer
+python depth_surge_3d.py input_video.mp4 --stereo-render-mode fast
 ```
 
 **UV Command Line**
@@ -111,6 +120,8 @@ Install the optional backend with `uv sync --extra moge2`; see the
 **User Guides:**
 - **[Installation Guide](docs/INSTALLATION.md)** - Detailed setup instructions and troubleshooting
 - **[Usage Guide](docs/USAGE.md)** - Complete usage examples and workflows
+- **[Stereo Quality User Guide](docs/USER_GUIDE.md)** - Fast/Quality selection,
+  diagnostics, resume behavior, and troubleshooting
 - **[Parameters Reference](docs/PARAMETERS.md)** - All command-line options and settings explained
 - **[VR Headset Compatibility](docs/VR_HEADSET_COMPATIBILITY.md)** - Specs and optimal settings for top 10 VR devices
 - **[Performance Benchmarks](docs/PERFORMANCE.md)** - GPU benchmarks, VRAM usage, and optimization guide
@@ -139,6 +150,7 @@ output/
     ├── 00_original_frames/    # Extracted frames
     ├── 03_disparity_maps/     # Canonical relative disparity
     ├── 03_disparity_stabilized/ # Optional VDPP artifact
+    ├── 04_stereo_diagnostics/ # Quality coverage/repair diagnostics and summary
     ├── 99_vr_frames/          # Final VR frames
     └── videoname_3D_side_by_side.mp4  # Final 3D video
 ```

@@ -37,6 +37,7 @@ warnings.filterwarnings("ignore", category=SyntaxWarning)  # moviepy old regex p
 
 # Import our constants and utilities
 from depth_surge_3d.core.constants import (  # noqa: E402
+    DEFAULT_SETTINGS,
     INTERMEDIATE_DIRS,
     SOCKETIO_PING_TIMEOUT,
     SOCKETIO_PING_INTERVAL,
@@ -79,6 +80,7 @@ from depth_surge_3d.inference.depth.backend_registry import (  # noqa: E402
 )
 from depth_surge_3d.core.settings import (  # noqa: E402
     parse_saved_processing_settings,
+    resolve_stereo_render_mode,
     resolve_temporal_postprocessor,
     validate_settings,
 )
@@ -169,6 +171,51 @@ def _validate_web_settings(settings: dict[str, Any], *, source: str) -> dict[str
     if preserve_source_fps:
         validated["target_fps"] = None
     return validated
+
+
+def _effective_web_renderer_device(settings: dict[str, Any]) -> str:
+    requested = str(settings.get("device", "auto"))
+    if requested != "auto":
+        return requested
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _resolve_new_web_stereo_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    """Resolve omitted new-job controls without changing library defaults."""
+
+    values = dict(settings)
+    values["stereo_render_mode"] = resolve_stereo_render_mode(
+        persisted=None,
+        override=values.get("stereo_render_mode"),
+        is_resume=False,
+        renderer_device_type=_effective_web_renderer_device(values),
+    )
+    values.setdefault("occlusion_fill_max_px", DEFAULT_SETTINGS["occlusion_fill_max_px"])
+    return values
+
+
+def _resolve_resume_web_stereo_settings(
+    persisted: dict[str, Any],
+    *,
+    stereo_override: str | None,
+    fill_limit_override: int | None,
+) -> dict[str, Any]:
+    """Preserve schema-5 stereo identity and give legacy jobs Fast/8."""
+
+    values = dict(persisted)
+    values["stereo_render_mode"] = resolve_stereo_render_mode(
+        persisted=values.get("stereo_render_mode", "fast"),
+        override=stereo_override,
+        is_resume=True,
+        renderer_device_type=_effective_web_renderer_device(values),
+    )
+    if fill_limit_override is not None:
+        values["occlusion_fill_max_px"] = fill_limit_override
+    else:
+        values.setdefault("occlusion_fill_max_px", DEFAULT_SETTINGS["occlusion_fill_max_px"])
+    return values
 
 
 def _active_requester_socket_id(data: Any) -> str:
@@ -1064,6 +1111,8 @@ def process_video_async(  # noqa: C901
                 output_dir,
                 default="v3",
             )
+        else:
+            settings = _resolve_new_web_stereo_settings(settings)
         settings = _validate_web_settings(
             _normalize_depth_backend_settings(settings),
             source="explicit",
@@ -1452,6 +1501,7 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:  # noqa:
     settings = data.get("settings", {})
 
     try:
+        settings = _resolve_new_web_stereo_settings(settings)
         settings = _normalize_available_depth_backend_settings(settings)
         settings = _validate_web_settings(settings, source="explicit")
     except (TypeError, ValueError) as exc:
@@ -1566,7 +1616,9 @@ class _ResumeRequestError(ValueError):
         self.status_code = status_code
 
 
-def _prepare_resume_request(data: Any) -> tuple[Path, str, str | None, str | None]:
+def _prepare_resume_request(  # noqa: C901
+    data: Any,
+) -> tuple[Path, str, str | None, str | None, str | None, int | None]:
     """Validate resume overrides and constrain the requested output directory."""
 
     if not isinstance(data, dict):
@@ -1577,11 +1629,19 @@ def _prepare_resume_request(data: Any) -> tuple[Path, str, str | None, str | Non
     raw_storage_dtype = data.get("raw_storage_dtype")
     temporal_present = "temporal_postprocessor" in data
     temporal_override = data.get("temporal_postprocessor") if temporal_present else None
+    stereo_present = "stereo_render_mode" in data
+    stereo_override = data.get("stereo_render_mode") if stereo_present else None
+    fill_limit_present = "occlusion_fill_max_px" in data
+    fill_limit_override = data.get("occlusion_fill_max_px") if fill_limit_present else None
     resume_overrides = {"migrate_legacy": migrate_legacy}
     if raw_storage_dtype is not None:
         resume_overrides["raw_storage_dtype"] = raw_storage_dtype
     if temporal_present:
         resume_overrides["temporal_postprocessor"] = temporal_override
+    if stereo_present:
+        resume_overrides["stereo_render_mode"] = stereo_override
+    if fill_limit_present:
+        resume_overrides["occlusion_fill_max_px"] = fill_limit_override
     try:
         validated = validate_settings(resume_overrides, source="explicit")
     except (TypeError, ValueError) as exc:
@@ -1603,7 +1663,16 @@ def _prepare_resume_request(data: Any) -> tuple[Path, str, str | None, str | Non
 
     selected_dtype = validated.get("raw_storage_dtype") if raw_storage_dtype is not None else None
     selected_temporal = validated["temporal_postprocessor"] if temporal_present else None
-    return output_path, validated["migrate_legacy"], selected_dtype, selected_temporal
+    selected_stereo = validated["stereo_render_mode"] if stereo_present else None
+    selected_fill_limit = validated["occlusion_fill_max_px"] if fill_limit_present else None
+    return (
+        output_path,
+        validated["migrate_legacy"],
+        selected_dtype,
+        selected_temporal,
+        selected_stereo,
+        selected_fill_limit,
+    )
 
 
 @app.route("/resume", methods=["POST"])
@@ -1613,9 +1682,14 @@ def resume_processing():  # noqa: C901
         return jsonify({"error": "Processing already in progress"}), 400
 
     try:
-        output_path, migrate_legacy, raw_storage_dtype, temporal_override = _prepare_resume_request(
-            request.json
-        )
+        (
+            output_path,
+            migrate_legacy,
+            raw_storage_dtype,
+            temporal_override,
+            stereo_override,
+            fill_limit_override,
+        ) = _prepare_resume_request(request.json)
     except _ResumeRequestError as exc:
         return jsonify({"error": str(exc)}), exc.status_code
 
@@ -1647,7 +1721,14 @@ def resume_processing():  # noqa: C901
         override=temporal_override,
         is_resume=True,
     )
+    settings = _resolve_resume_web_stereo_settings(
+        settings,
+        stereo_override=stereo_override,
+        fill_limit_override=fill_limit_override,
+    )
     resolved_temporal = settings["temporal_postprocessor"]
+    resolved_stereo = settings["stereo_render_mode"]
+    resolved_fill_limit = settings["occlusion_fill_max_px"]
 
     try:
         resume_report = build_resume_report(
@@ -1658,6 +1739,8 @@ def resume_processing():  # noqa: C901
         )
         settings = dict(resume_report.migrated_settings)
         settings.setdefault("temporal_postprocessor", resolved_temporal)
+        settings["stereo_render_mode"] = resolved_stereo
+        settings["occlusion_fill_max_px"] = resolved_fill_limit
     except (OSError, TypeError, ValueError) as exc:
         return jsonify({"error": f"Could not migrate resume data: {exc}"}), 409
 
@@ -1696,6 +1779,8 @@ def resume_processing():  # noqa: C901
             "resume_report": resume_report.to_dict(),
             "settings": {
                 "temporal_postprocessor": settings["temporal_postprocessor"],
+                "stereo_render_mode": settings["stereo_render_mode"],
+                "occlusion_fill_max_px": settings["occlusion_fill_max_px"],
             },
         }
     )

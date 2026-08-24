@@ -24,6 +24,12 @@ and stereo output.
   Default: `0.5`; valid range: `0.0` to `1.0`.
 - `--occlusion-fill`: `background` fills horizontal disocclusion gaps from
   farther visible pixels; `none` leaves unresolved subpixel lanes black.
+- `--stereo-render-mode`: `quality` enables the offline edge-aware renderer;
+  `fast` uses the legacy-compatible renderer. When omitted for a new job, CUDA
+  resolves to `quality` and CPU resolves to `fast`. A resumed job keeps its
+  saved mode unless this option is explicitly supplied.
+- `--occlusion-fill-max-px`: Quality-mode local repair limit measured at 1080p
+  and scaled to render height. Default: `8`; valid range: `1` to `32`.
 - `--stereo-io-workers`: bounded decode/encode worker count. Default is derived
   from the host CPU count; valid range: `1` to `8`.
 
@@ -46,6 +52,11 @@ With `--occlusion-fill none`, a partially covered silhouette pixel averages its
 valid lanes with black unresolved lanes because the renderer exposes RGB rather
 than alpha. A dark contour at a disocclusion is therefore intentional in this
 mode. Use `background` when the bounded farther-surface extension is preferred.
+
+Quality mode keeps a compact disocclusion mask through repair and only changes
+invalid subpixel lanes. It does not silently fall back to Fast after an error or
+under memory pressure. CPU Quality is supported for offline use but is much
+slower than CUDA.
 
 ## Scene Scaling
 
