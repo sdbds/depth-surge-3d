@@ -23,22 +23,22 @@ class QualitySplatBand:
     winner_source_index: torch.Tensor
 
 
-def quality_splat_band(
+def _quality_splat_band(
     image: torch.Tensor,
     near_score: torch.Tensor,
     sample_offsets: torch.Tensor,
     *,
     source_index_offset: int,
     source_valid: torch.Tensor,
+    validate_values: bool,
 ) -> QualitySplatBand:
-    """Resolve visibility and retain full-frame winner source identities."""
-
     source, checked_valid = _validate_inputs(
         image,
         near_score,
         sample_offsets,
         source_index_offset,
         source_valid,
+        validate_values=validate_values,
     )
     winners = _winner_keys(
         near_score,
@@ -53,4 +53,42 @@ def quality_splat_band(
     return QualitySplatBand(
         splat=splat,
         winner_source_index=winner_indexes.reshape(splat.valid.shape),
+    )
+
+
+def quality_splat_band(
+    image: torch.Tensor,
+    near_score: torch.Tensor,
+    sample_offsets: torch.Tensor,
+    *,
+    source_index_offset: int,
+    source_valid: torch.Tensor,
+) -> QualitySplatBand:
+    """Resolve visibility and retain full-frame winner source identities."""
+
+    return _quality_splat_band(
+        image,
+        near_score,
+        sample_offsets,
+        source_index_offset=source_index_offset,
+        source_valid=source_valid,
+        validate_values=True,
+    )
+
+
+def _quality_splat_band_prevalidated(
+    image: torch.Tensor,
+    near_score: torch.Tensor,
+    sample_offsets: torch.Tensor,
+    *,
+    source_index_offset: int,
+    source_valid: torch.Tensor,
+) -> QualitySplatBand:
+    return _quality_splat_band(
+        image,
+        near_score,
+        sample_offsets,
+        source_index_offset=source_index_offset,
+        source_valid=source_valid,
+        validate_values=False,
     )

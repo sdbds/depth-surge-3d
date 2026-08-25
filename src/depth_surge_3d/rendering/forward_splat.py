@@ -27,6 +27,8 @@ def _validate_inputs(
     sample_offsets: torch.Tensor,
     source_index_offset: int,
     source_valid: torch.Tensor | None,
+    *,
+    validate_values: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if image.ndim != 3 or near_score.ndim != 2 or sample_offsets.ndim != 2:
         raise ValueError("Splat inputs must be unbatched [H,W,3], [H,W], and [H,W]")
@@ -36,10 +38,13 @@ def _validate_inputs(
         raise ValueError("Near score and sample offsets must match the image")
     if image.device != near_score.device or image.device != sample_offsets.device:
         raise ValueError("Image, near score, and offsets must use the same device")
-    _validate_near_score(near_score)
+    if near_score.dtype != torch.float32:
+        raise ValueError("Near score must use float32")
+    if validate_values:
+        _validate_near_score(near_score)
     if sample_offsets.dtype != torch.int32:
         raise ValueError("Sample offsets must use int32")
-    if image.is_floating_point() and not torch.isfinite(image).all():
+    if validate_values and image.is_floating_point() and not torch.isfinite(image).all():
         raise ValueError("Image values must be finite")
     source_valid = _validate_source_valid(image, near_score, source_valid)
     pixel_count = near_score.numel()

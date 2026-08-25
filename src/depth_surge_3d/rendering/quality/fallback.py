@@ -36,6 +36,7 @@ class FallbackPrecomputeResult:
     query_count: int
     retained_safe_donor_mask_bytes: int
     anchor_fallback_count: int
+    _safe_cache_words: np.ndarray | None = None
 
 
 def is_safe_donor(
@@ -106,16 +107,13 @@ def precompute_native_fallbacks(
         QUALITY_REPAIR_FALLBACK_VISITS_BYTES // np.dtype(np.uint32).itemsize,
         np.uint32,
     )
-    query_count = int(np.count_nonzero(output["backend"] == np.uint8(0)))
-    if query_count == 0:
-        output.setflags(write=False)
-        visits = visits_storage[:0]
-        visits.setflags(write=False)
-        return FallbackPrecomputeResult(output, visits, 0, 0, 0, 0, 0)
     offsets_bytes = (count + 1) * np.dtype(np.uint32).itemsize
     use_full_bytes = count + 1
     referenced_bytes = count + 1
-    member_offset = (offsets_bytes + use_full_bytes + referenced_bytes + 63) // 64 * 64
+    metadata_offset = (
+        offsets_bytes + use_full_bytes + referenced_bytes + 7
+    ) // 8 * 8
+    member_offset = (metadata_offset + 2 * np.dtype(np.uint64).itemsize + 63) // 64 * 64
     if member_offset > QUALITY_REPAIR_FALLBACK_INDEX_BYTES:
         raise QualityRepairFallbackQueryBudgetError(
             "safe-donor descriptors exceed their 48 MiB partition"
@@ -138,12 +136,25 @@ def precompute_native_fallbacks(
         buffer=index_partition,
         offset=offsets_bytes + use_full_bytes,
     )
-    referenced.fill(False)
-    for record in output:
-        if int(record["backend"]) == 0:
-            referenced[int(record["region_id"])] = True
-
     native = native_kd._require_native()
+    raw_records = output.view(np.uint8).reshape(output.size, 16)
+    try:
+        query_count = int(
+            native.build_referenced_unplanned_regions_into(
+                raw_records,
+                height * width,
+                count,
+                referenced,
+            )
+        )
+    except Exception:
+        output.setflags(write=False)
+        raise
+    if query_count == 0:
+        output.setflags(write=False)
+        visits = visits_storage[:0]
+        visits.setflags(write=False)
+        return FallbackPrecomputeResult(output, visits, 0, 0, 0, 0, 0)
     member_capacity = (QUALITY_REPAIR_FALLBACK_INDEX_BYTES - member_offset) // np.dtype(
         np.uint32
     ).itemsize
@@ -153,6 +164,12 @@ def precompute_native_fallbacks(
         buffer=index_partition,
         offset=member_offset,
     )
+    safe_cache_metadata = np.ndarray(
+        (2,),
+        dtype=np.uint64,
+        buffer=index_partition,
+        offset=metadata_offset,
+    )
     donor_count, index_bytes = native.build_safe_donor_index_into(
         analysis.coverage_count,
         analysis.pure_region_id,
@@ -161,7 +178,20 @@ def precompute_native_fallbacks(
         member_storage,
         offsets,
         use_full,
+        safe_cache_metadata,
     )
+    safe_cache_words: np.ndarray | None = None
+    if safe_cache_metadata[0] != np.iinfo(np.uint64).max:
+        cache_start = int(safe_cache_metadata[0])
+        cache_count = int(safe_cache_metadata[1])
+        if (
+            cache_count != (height * width + 31) // 32
+            or cache_start < 0
+            or cache_start + cache_count > member_storage.size
+        ):
+            raise RuntimeError("native safe-donor cache metadata is invalid")
+        safe_cache_words = member_storage[cache_start : cache_start + cache_count]
+        safe_cache_words.setflags(write=False)
     members = member_storage[: int(donor_count)]
     members.setflags(write=False)
     offsets.setflags(write=False)
@@ -185,7 +215,6 @@ def precompute_native_fallbacks(
         ],
         dtype=np.uint64,
     )
-    raw_records = output.view(np.uint8).reshape(output.size, 16)
     fallback_limit = max(1, math.floor((256 * height) / 1080.0 + 0.5))
     try:
         query_count_written, anchor_fallback_count = native.query_fallback_records(
@@ -226,7 +255,68 @@ def precompute_native_fallbacks(
         query_count=query_count,
         retained_safe_donor_mask_bytes=0,
         anchor_fallback_count=int(anchor_fallback_count),
+        _safe_cache_words=safe_cache_words,
     )
+
+
+def materialize_safe_donor_mask(
+    precomputed: FallbackPrecomputeResult,
+    analysis: QualityVisibilityAnalysis,
+    *,
+    region_count: int,
+    arena: QualityByteArena,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Start the exemplar phase from the retired fallback index cache."""
+
+    if not isinstance(precomputed, FallbackPrecomputeResult):
+        raise TypeError("precomputed must be FallbackPrecomputeResult")
+    if not isinstance(analysis, QualityVisibilityAnalysis):
+        raise TypeError("analysis must be QualityVisibilityAnalysis")
+    count = _validate_region_count(region_count)
+    native = native_kd._require_native()
+    cache_words = precomputed._safe_cache_words
+    if cache_words is not None:
+        arena.reset()
+        safe = arena.allocate(analysis.coverage_count.shape, np.bool_)
+        region_has_safe = arena.allocate(count + 1, np.bool_)
+        if not np.shares_memory(cache_words, safe) and not np.shares_memory(
+            cache_words,
+            region_has_safe,
+        ):
+            native.expand_safe_donor_cache_into(
+                cache_words,
+                analysis.pure_region_id,
+                safe,
+                region_has_safe,
+            )
+            safe.setflags(write=False)
+            region_has_safe.setflags(write=False)
+            return safe, region_has_safe
+
+    arena.reset()
+    referenced = arena.allocate(count + 1, np.bool_)
+    raw_records = precomputed.records.view(np.uint8).reshape(
+        precomputed.records.size,
+        REPAIR_RECORD_DTYPE.itemsize,
+    )
+    native.build_referenced_unplanned_regions_into(
+        raw_records,
+        int(analysis.coverage_count.size),
+        count,
+        referenced,
+    )
+    safe = arena.allocate(analysis.coverage_count.shape, np.bool_)
+    region_has_safe = arena.allocate(count + 1, np.bool_)
+    native.build_safe_donor_mask(
+        analysis.coverage_count,
+        analysis.pure_region_id,
+        referenced,
+        safe,
+        region_has_safe,
+    )
+    safe.setflags(write=False)
+    region_has_safe.setflags(write=False)
+    return safe, region_has_safe
 
 
 def finalize_safe_fallbacks(
@@ -262,7 +352,6 @@ def _validate_precompute_inputs(
     height, width = _validate_render_shape(render_shape)
     _validate_precompute_context(analysis, budgets, render_shape)
     count = _validate_region_count(region_count)
-    _validate_unplanned_records(records, height, width, count)
     return height, width, count
 
 
@@ -314,20 +403,3 @@ def _validate_region_count(region_count: int) -> int:
     if count <= 0 or count + 1 > int(np.iinfo(np.uint32).max):
         raise ValueError("region_count plus sentinel must fit uint32")
     return count
-
-
-def _validate_unplanned_records(
-    records: np.ndarray,
-    height: int,
-    width: int,
-    region_count: int,
-) -> None:
-    for record in records:
-        if int(record["backend"]) != 0:
-            continue
-        region = int(record["region_id"])
-        pixel = int(record["pixel_index"])
-        if not 0 < region <= region_count:
-            raise ValueError("unplanned record region exceeds region_count")
-        if not 0 <= pixel < height * width:
-            raise ValueError("record pixel lies outside render_shape")

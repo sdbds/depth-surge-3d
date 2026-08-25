@@ -2111,7 +2111,8 @@ py::tuple build_safe_donor_index_into(
     bool include_full_pure_for_empty_regions,
     py::array members_output,
     py::array offsets_output,
-    py::array use_full_output
+    py::array use_full_output,
+    const py::object& safe_cache_metadata_object
 ) {
     validate_array(coverage_count, py::dtype::of<std::uint8_t>(), "coverage_count");
     validate_array(pure_region_id, py::dtype::of<std::uint32_t>(), "pure_region_id");
@@ -2156,8 +2157,38 @@ py::tuple build_safe_donor_index_into(
     auto* members = static_cast<std::uint32_t*>(members_output.mutable_data());
     auto* offsets = static_cast<std::uint32_t*>(offsets_output.mutable_data());
     auto* use_full = static_cast<std::uint8_t*>(use_full_output.mutable_data());
+    std::uint64_t* safe_cache_metadata = nullptr;
+    if (!safe_cache_metadata_object.is_none()) {
+        py::array metadata = py::cast<py::array>(safe_cache_metadata_object);
+        if (
+            !metadata.dtype().is(py::dtype::of<std::uint64_t>()) ||
+            metadata.ndim() != 1 || metadata.shape(0) != 2 ||
+            (metadata.flags() & py::array::c_style) == 0 || !metadata.writeable()
+        ) {
+            throw py::type_error(
+                "safe_cache_metadata must be a writable contiguous uint64[2] vector"
+            );
+        }
+        safe_cache_metadata = static_cast<std::uint64_t*>(metadata.mutable_data());
+        safe_cache_metadata[0] = std::numeric_limits<std::uint64_t>::max();
+        safe_cache_metadata[1] = 0;
+    }
     std::fill(offsets, offsets + region_count + 1, 0);
     std::fill(use_full, use_full + region_count + 1, 0);
+    const std::uint64_t member_capacity = static_cast<std::uint64_t>(
+        members_output.shape(0)
+    );
+    const std::uint64_t safe_word_count = (
+        static_cast<std::uint64_t>(sample_count) + 31ULL
+    ) / 32ULL;
+    const bool can_stage_safe_bits =
+        safe_cache_metadata != nullptr && safe_word_count <= member_capacity;
+    auto* safe_words = can_stage_safe_bits
+        ? members + (member_capacity - safe_word_count)
+        : nullptr;
+    if (can_stage_safe_bits) {
+        std::fill(safe_words, safe_words + safe_word_count, 0U);
+    }
     const auto radius = static_cast<std::uint32_t>(std::max(
         1.0,
         std::floor(static_cast<double>(height) / 1080.0 + 0.5)
@@ -2174,6 +2205,9 @@ py::tuple build_safe_donor_index_into(
                 )
             ) {
                 continue;
+            }
+            if (can_stage_safe_bits) {
+                safe_words[pixel / 32U] |= 1U << (pixel % 32U);
             }
             ++offsets[region - 1];
             ++donor_count;
@@ -2206,6 +2240,13 @@ py::tuple build_safe_donor_index_into(
         ) {
             throw std::runtime_error("safe-donor index exceeds its 48 MiB partition");
         }
+        const bool retain_safe_bits =
+            can_stage_safe_bits &&
+            static_cast<std::uint64_t>(donor_count) + safe_word_count <= member_capacity;
+        if (retain_safe_bits) {
+            safe_cache_metadata[0] = member_capacity - safe_word_count;
+            safe_cache_metadata[1] = safe_word_count;
+        }
         std::uint32_t running = 0;
         for (std::uint32_t region_index = 0; region_index < region_count; ++region_index) {
             running += offsets[region_index];
@@ -2224,8 +2265,13 @@ py::tuple build_safe_donor_index_into(
                 continue;
             }
             if (
-                use_full[region] == 0 && !is_safe_donor_pixel(
-                    coverage, regions, height, width, pixel, region, radius
+                use_full[region] == 0 &&
+                !(
+                    retain_safe_bits
+                        ? (safe_words[pixel / 32U] & (1U << (pixel % 32U))) != 0
+                        : is_safe_donor_pixel(
+                            coverage, regions, height, width, pixel, region, radius
+                        )
                 )
             ) {
                 continue;
@@ -2259,6 +2305,162 @@ py::tuple build_safe_donor_index_into(
         static_cast<std::uint64_t>(donor_count) * sizeof(std::uint32_t) +
         static_cast<std::uint64_t>(region_count + 1) * sizeof(std::uint32_t);
     return py::make_tuple(donor_count, reported_index_bytes);
+}
+
+std::uint64_t build_referenced_unplanned_regions_into_native(
+    const py::array& raw_records,
+    std::uint32_t pixel_count,
+    std::uint32_t region_count,
+    py::array referenced_output
+) {
+    if (
+        !raw_records.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        raw_records.ndim() != 2 || raw_records.shape(1) != 16 ||
+        (raw_records.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error("raw_records must be a C-contiguous uint8 [n,16] array");
+    }
+    if (pixel_count == 0 || region_count == 0 || region_count == kUint32Max) {
+        throw py::value_error("unplanned repair bounds must be positive uint32 values");
+    }
+    if (
+        !referenced_output.dtype().is(py::dtype::of<bool>()) ||
+        referenced_output.ndim() != 1 ||
+        (referenced_output.flags() & py::array::c_style) == 0 ||
+        !referenced_output.writeable() ||
+        static_cast<std::uint64_t>(referenced_output.shape(0)) !=
+            static_cast<std::uint64_t>(region_count) + 1ULL
+    ) {
+        throw py::type_error(
+            "referenced_output must be a writable bool[region_count+1] vector"
+        );
+    }
+    const auto* records = static_cast<const std::uint8_t*>(raw_records.data());
+    auto* referenced = static_cast<std::uint8_t*>(referenced_output.mutable_data());
+    std::uint64_t query_count = 0;
+    {
+        py::gil_scoped_release release;
+        std::fill(referenced, referenced + region_count + 1, 0U);
+        for (py::ssize_t index = 0; index < raw_records.shape(0); ++index) {
+            const std::uint8_t* record = records + 16 * index;
+            if (record[13] != 0) {
+                continue;
+            }
+            std::uint32_t pixel = 0;
+            std::uint32_t region = 0;
+            std::memcpy(&pixel, record, sizeof(pixel));
+            std::memcpy(&region, record + 6, sizeof(region));
+            if (region == 0 || region > region_count) {
+                throw py::value_error("unplanned record region exceeds region_count");
+            }
+            if (pixel >= pixel_count) {
+                throw py::value_error("record pixel lies outside render_shape");
+            }
+            referenced[region] = 1U;
+            ++query_count;
+        }
+    }
+    return query_count;
+}
+
+void expand_safe_donor_cache_into_native(
+    const py::array& safe_words,
+    const py::array& pure_region_id,
+    py::array safe_output,
+    py::array region_output
+) {
+    if (
+        !safe_words.dtype().is(py::dtype::of<std::uint32_t>()) ||
+        safe_words.ndim() != 1 ||
+        (safe_words.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error("safe_words must be a contiguous uint32 vector");
+    }
+    if (
+        !pure_region_id.dtype().is(py::dtype::of<std::uint32_t>()) ||
+        pure_region_id.ndim() != 2 ||
+        (pure_region_id.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error("pure_region_id must be a contiguous uint32 image");
+    }
+    if (
+        !safe_output.dtype().is(py::dtype::of<bool>()) || safe_output.ndim() != 2 ||
+        (safe_output.flags() & py::array::c_style) == 0 || !safe_output.writeable() ||
+        safe_output.shape(0) != pure_region_id.shape(0) ||
+        safe_output.shape(1) != pure_region_id.shape(1)
+    ) {
+        throw py::type_error(
+            "safe_output must be a matching writable contiguous bool image"
+        );
+    }
+    if (
+        !region_output.dtype().is(py::dtype::of<bool>()) ||
+        region_output.ndim() != 1 || region_output.shape(0) < 2 ||
+        (region_output.flags() & py::array::c_style) == 0 ||
+        !region_output.writeable()
+    ) {
+        throw py::type_error(
+            "region_output must be a writable contiguous bool region vector"
+        );
+    }
+    const std::uint64_t pixel_count =
+        static_cast<std::uint64_t>(pure_region_id.shape(0)) *
+        static_cast<std::uint64_t>(pure_region_id.shape(1));
+    const std::uint64_t expected_words = (pixel_count + 31ULL) / 32ULL;
+    if (static_cast<std::uint64_t>(safe_words.shape(0)) != expected_words) {
+        throw py::value_error("safe_words length does not match pure_region_id");
+    }
+    const auto* words = static_cast<const std::uint32_t*>(safe_words.data());
+    const auto* regions = static_cast<const std::uint32_t*>(pure_region_id.data());
+    auto* safe = static_cast<std::uint8_t*>(safe_output.mutable_data());
+    auto* region_has_safe = static_cast<std::uint8_t*>(region_output.mutable_data());
+    const auto overlaps = [](
+        const void* left,
+        std::uint64_t left_bytes,
+        const void* right,
+        std::uint64_t right_bytes
+    ) {
+        const auto left_start = reinterpret_cast<std::uintptr_t>(left);
+        const auto right_start = reinterpret_cast<std::uintptr_t>(right);
+        return left_start < right_start + right_bytes &&
+            right_start < left_start + left_bytes;
+    };
+    if (
+        overlaps(words, expected_words * 4ULL, safe, pixel_count) ||
+        overlaps(
+            words,
+            expected_words * 4ULL,
+            region_has_safe,
+            static_cast<std::uint64_t>(region_output.shape(0))
+        ) ||
+        overlaps(
+            safe,
+            pixel_count,
+            region_has_safe,
+            static_cast<std::uint64_t>(region_output.shape(0))
+        )
+    ) {
+        throw py::value_error("safe-donor cache expansion arrays overlap");
+    }
+    const std::uint64_t region_count =
+        static_cast<std::uint64_t>(region_output.shape(0) - 1);
+    {
+        py::gil_scoped_release release;
+        std::fill(region_has_safe, region_has_safe + region_output.shape(0), 0U);
+        for (std::uint64_t pixel = 0; pixel < pixel_count; ++pixel) {
+            const bool is_safe =
+                (words[pixel / 32ULL] & (1U << (pixel % 32ULL))) != 0;
+            safe[pixel] = static_cast<std::uint8_t>(is_safe);
+            if (!is_safe) {
+                continue;
+            }
+            const std::uint32_t region = regions[pixel];
+            if (region == 0 || region > region_count) {
+                throw py::value_error("safe-donor cache references an invalid region");
+            }
+            region_has_safe[region] = 1U;
+        }
+    }
 }
 
 py::tuple build_safe_donor_mask(
@@ -4710,6 +4912,218 @@ py::tuple expand_repair_scatter_native(
     return py::make_tuple(std::move(indexes), std::move(colours));
 }
 
+std::uint64_t build_background_repair_bits_into_native(
+    const py::array& raw_records,
+    const py::array& coverage_count,
+    py::array output,
+    py::array backend_lane_counts
+) {
+    if (
+        !raw_records.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        raw_records.ndim() != 2 || raw_records.shape(1) != 16 ||
+        (raw_records.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error("raw_records must be a C-contiguous uint8 [n,16] array");
+    }
+    if (
+        !coverage_count.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        coverage_count.ndim() != 2 ||
+        (coverage_count.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error("coverage_count must be a C-contiguous uint8 image");
+    }
+    if (
+        !output.dtype().is(py::dtype::of<std::uint8_t>()) || output.ndim() != 2 ||
+        (output.flags() & py::array::c_style) == 0 || !output.writeable() ||
+        output.shape(0) != coverage_count.shape(0) ||
+        output.shape(1) != coverage_count.shape(1)
+    ) {
+        throw py::type_error(
+            "output must be a matching writable C-contiguous uint8 image"
+        );
+    }
+    if (
+        !backend_lane_counts.dtype().is(py::dtype::of<std::uint64_t>()) ||
+        backend_lane_counts.ndim() != 1 || backend_lane_counts.shape(0) != 3 ||
+        (backend_lane_counts.flags() & py::array::c_style) == 0 ||
+        !backend_lane_counts.writeable()
+    ) {
+        throw py::type_error(
+            "backend_lane_counts must be a writable C-contiguous uint64[3] vector"
+        );
+    }
+    if (coverage_count.shape(0) <= 0 || coverage_count.shape(1) <= 0) {
+        throw py::value_error("coverage_count shape must be positive");
+    }
+    const std::uint64_t height = static_cast<std::uint64_t>(coverage_count.shape(0));
+    const std::uint64_t width = static_cast<std::uint64_t>(coverage_count.shape(1));
+    const std::uint64_t pixel_count = height * width;
+    if (pixel_count * 16ULL > kUint32Max) {
+        throw py::value_error("coverage_count shape must fit uint32 fine indexes");
+    }
+    const auto* records = static_cast<const std::uint8_t*>(raw_records.data());
+    const auto* coverage = static_cast<const std::uint8_t*>(coverage_count.data());
+    auto* bits = static_cast<std::uint8_t*>(output.mutable_data());
+    auto* lane_counts = static_cast<std::uint64_t*>(backend_lane_counts.mutable_data());
+    std::uint64_t planned_lane_count = 0;
+    {
+        py::gil_scoped_release release;
+        std::fill(lane_counts, lane_counts + 3, 0ULL);
+        for (std::uint64_t pixel = 0; pixel < pixel_count; ++pixel) {
+            const std::uint8_t count = coverage[pixel];
+            if (count > 16) {
+                throw py::value_error("coverage_count contains a value above 16");
+            }
+            bits[pixel] = count == 0 ? 0x02U : (count < 16 ? 0x01U : 0x00U);
+        }
+        for (py::ssize_t index = 0; index < raw_records.shape(0); ++index) {
+            const std::uint8_t* record = records + 16 * index;
+            const std::uint32_t pixel = load_u32_le(record);
+            const std::uint16_t mask = load_u16_le(record + 4);
+            const std::uint8_t backend = record[13];
+            if (pixel >= pixel_count) {
+                throw py::value_error("repair diagnostic pixel lies outside coverage_count");
+            }
+            if (!is_contiguous_u16_mask(mask)) {
+                throw py::value_error(
+                    "repair diagnostic mask must be nonzero and contiguous"
+                );
+            }
+            if (backend < 1 || backend > 3) {
+                throw py::value_error("repair diagnostic backend must be final");
+            }
+            const std::uint64_t lanes = count_u16_bits(mask);
+            if (lanes > std::numeric_limits<std::uint64_t>::max() - planned_lane_count) {
+                throw std::overflow_error("repair diagnostic lane count exceeds uint64");
+            }
+            planned_lane_count += lanes;
+            if (lanes > std::numeric_limits<std::uint64_t>::max() - lane_counts[backend - 1]) {
+                throw std::overflow_error("repair backend lane count exceeds uint64");
+            }
+            lane_counts[backend - 1] += lanes;
+            if (backend == 1) {
+                bits[pixel] |= 0x04U;
+            } else if (backend == 2) {
+                bits[pixel] |= 0x18U;
+            } else {
+                bits[pixel] |= 0x28U;
+            }
+        }
+    }
+    return planned_lane_count;
+}
+
+std::uint64_t build_hole_run_histograms_into_native(
+    const py::array& raw_records,
+    std::uint32_t width,
+    py::array lane_histogram,
+    py::array span_histogram
+) {
+    if (
+        !raw_records.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        raw_records.ndim() != 2 || raw_records.shape(1) != 16 ||
+        (raw_records.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error("raw_records must be a C-contiguous uint8 [n,16] array");
+    }
+    if (width == 0) {
+        throw py::value_error("histogram width must be positive");
+    }
+    const std::uint64_t expected_lane_bins = 16ULL * (
+        static_cast<std::uint64_t>(width) + 1ULL
+    );
+    const std::uint64_t expected_span_bins = static_cast<std::uint64_t>(width) + 1ULL;
+    if (
+        !lane_histogram.dtype().is(py::dtype::of<std::uint64_t>()) ||
+        lane_histogram.ndim() != 1 ||
+        (lane_histogram.flags() & py::array::c_style) == 0 ||
+        !lane_histogram.writeable() ||
+        static_cast<std::uint64_t>(lane_histogram.shape(0)) != expected_lane_bins
+    ) {
+        throw py::type_error(
+            "lane_histogram must be a writable uint64 vector with 16*(width+1) bins"
+        );
+    }
+    if (
+        !span_histogram.dtype().is(py::dtype::of<std::uint64_t>()) ||
+        span_histogram.ndim() != 1 ||
+        (span_histogram.flags() & py::array::c_style) == 0 ||
+        !span_histogram.writeable() ||
+        static_cast<std::uint64_t>(span_histogram.shape(0)) != expected_span_bins
+    ) {
+        throw py::type_error(
+            "span_histogram must be a writable uint64 vector with width+1 bins"
+        );
+    }
+    const auto* records = static_cast<const std::uint8_t*>(raw_records.data());
+    auto* lane_bins = static_cast<std::uint64_t*>(lane_histogram.mutable_data());
+    auto* span_bins = static_cast<std::uint64_t*>(span_histogram.mutable_data());
+    std::uint64_t planned_lane_count = 0;
+    bool active = false;
+    std::uint64_t active_row = 0;
+    std::uint64_t active_start = 0;
+    std::uint64_t active_end = 0;
+    {
+        py::gil_scoped_release release;
+        std::fill(lane_bins, lane_bins + lane_histogram.shape(0), 0ULL);
+        std::fill(span_bins, span_bins + span_histogram.shape(0), 0ULL);
+        const auto flush_active = [&]() {
+            if (!active) {
+                return;
+            }
+            const std::uint64_t lane_length = active_end - active_start + 1ULL;
+            const std::uint64_t pixel_span = active_end / 16ULL - active_start / 16ULL + 1ULL;
+            if (lane_bins[lane_length] == std::numeric_limits<std::uint64_t>::max()) {
+                throw std::overflow_error("hole-run lane histogram exceeds uint64");
+            }
+            if (span_bins[pixel_span] == std::numeric_limits<std::uint64_t>::max()) {
+                throw std::overflow_error("hole-run span histogram exceeds uint64");
+            }
+            ++lane_bins[lane_length];
+            ++span_bins[pixel_span];
+        };
+        for (py::ssize_t index = 0; index < raw_records.shape(0); ++index) {
+            const std::uint8_t* record = records + 16 * index;
+            const std::uint32_t pixel = load_u32_le(record);
+            const std::uint16_t mask = load_u16_le(record + 4);
+            if (!is_contiguous_u16_mask(mask)) {
+                throw py::value_error(
+                    "hole-run mask must be nonzero and contiguous"
+                );
+            }
+            if (record[13] < 1 || record[13] > 3) {
+                throw py::value_error("hole-run backend must be final");
+            }
+            const std::uint64_t lanes = count_u16_bits(mask);
+            if (lanes > std::numeric_limits<std::uint64_t>::max() - planned_lane_count) {
+                throw std::overflow_error("hole-run lane count exceeds uint64");
+            }
+            planned_lane_count += lanes;
+            const std::uint64_t row = static_cast<std::uint64_t>(pixel) / width;
+            const std::uint64_t column = static_cast<std::uint64_t>(pixel) % width;
+            const std::uint64_t start = 16ULL * column + least_u16_bit(mask);
+            const std::uint64_t end = start + lanes - 1ULL;
+            if (
+                active &&
+                (row < active_row || (row == active_row && start <= active_end))
+            ) {
+                throw py::value_error("hole-run records are not in canonical order");
+            }
+            if (active && row == active_row && start == active_end + 1ULL) {
+                active_end = end;
+                continue;
+            }
+            flush_active();
+            active = true;
+            active_row = row;
+            active_start = start;
+            active_end = end;
+        }
+        flush_active();
+    }
+    return planned_lane_count;
+}
+
 std::uint64_t scatter_repair_records_float_into_native(
     const py::array& raw_records,
     std::uint32_t pixel_offset,
@@ -6809,7 +7223,24 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("include_full_pure_for_empty_regions"),
         py::arg("members_output"),
         py::arg("offsets_output"),
-        py::arg("use_full_output")
+        py::arg("use_full_output"),
+        py::arg("safe_cache_metadata") = py::none()
+    );
+    module.def(
+        "build_referenced_unplanned_regions_into",
+        &build_referenced_unplanned_regions_into_native,
+        py::arg("raw_records"),
+        py::arg("pixel_count"),
+        py::arg("region_count"),
+        py::arg("referenced_output")
+    );
+    module.def(
+        "expand_safe_donor_cache_into",
+        &expand_safe_donor_cache_into_native,
+        py::arg("safe_words"),
+        py::arg("pure_region_id"),
+        py::arg("safe_output"),
+        py::arg("region_output")
     );
     module.def(
         "build_safe_donor_mask",
@@ -6994,6 +7425,22 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("raw_records"),
         py::arg("height"),
         py::arg("width")
+    );
+    module.def(
+        "build_background_repair_bits_into",
+        &build_background_repair_bits_into_native,
+        py::arg("raw_records"),
+        py::arg("coverage_count"),
+        py::arg("output"),
+        py::arg("backend_lane_counts")
+    );
+    module.def(
+        "build_hole_run_histograms_into",
+        &build_hole_run_histograms_into_native,
+        py::arg("raw_records"),
+        py::arg("width"),
+        py::arg("lane_histogram"),
+        py::arg("span_histogram")
     );
     module.def(
         "scatter_repair_records_float_into",

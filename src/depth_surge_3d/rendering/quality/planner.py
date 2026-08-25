@@ -90,19 +90,27 @@ def _maximum_referenced_region(records: np.ndarray) -> int:
 def summarize_quality_repair_plan(
     plan: QualityRepairPlan,
     repair_bits: np.ndarray,
+    *,
+    backend_lane_counts: tuple[int, int, int] | None = None,
 ) -> QualityRepairPlanSummary:
     """Collapse variable repair tables to bounded scalar diagnostics."""
 
     records = plan.records
     backends = records["backend"]
-    lane_counts = tuple(
-        sum(
-            int(mask).bit_count()
-            for mask in records["lane_mask"][backends == np.uint8(backend)]
+    if backend_lane_counts is None:
+        lane_counts = tuple(
+            sum(
+                int(mask).bit_count()
+                for mask in records["lane_mask"][backends == np.uint8(backend)]
+            )
+            for backend in (1, 2, 3)
         )
-        for backend in (1, 2, 3)
-    )
-    backend_lane_counts = (lane_counts[0], lane_counts[1], lane_counts[2])
+        backend_lane_counts = (lane_counts[0], lane_counts[1], lane_counts[2])
+    elif len(backend_lane_counts) != 3 or any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in backend_lane_counts
+    ):
+        raise ValueError("backend_lane_counts must contain three nonnegative integers")
     pixel_counts = tuple(
         int(np.count_nonzero(repair_bits & np.uint8(bit))) for bit in (0x04, 0x10, 0x20)
     )
@@ -314,31 +322,6 @@ def _fixed_graph_components(
     return component_ids, members, int(component_count)
 
 
-def _materialize_safe_donor_mask(
-    records: np.ndarray,
-    analysis: QualityVisibilityAnalysis,
-    region_count: int,
-    arena: QualityByteArena,
-) -> tuple[np.ndarray, np.ndarray]:
-    referenced = arena.allocate(region_count + 1, np.bool_, zero=True)
-    for record in records:
-        if int(record["backend"]) == 0:
-            referenced[int(record["region_id"])] = True
-    native = fallback.native_kd._require_native()
-    safe = arena.allocate(analysis.coverage_count.shape, np.bool_)
-    region_has_safe_donor = arena.allocate(region_count + 1, np.bool_)
-    native.build_safe_donor_mask(
-        analysis.coverage_count,
-        analysis.pure_region_id,
-        referenced,
-        safe,
-        region_has_safe_donor,
-    )
-    safe.setflags(write=False)
-    region_has_safe_donor.setflags(write=False)
-    return safe, region_has_safe_donor
-
-
 def _component_target_pixels(
     records: np.ndarray,
     record_indexes: np.ndarray,
@@ -475,14 +458,14 @@ def plan_quality_repairs(
     fallback_query_count = provisional.query_count
     fallback_anchor_count = provisional.anchor_fallback_count
     working = provisional.records
-    del provisional, visited
-    repair_arena.reset()
-    safe_donor_mask, region_has_safe_donor = _materialize_safe_donor_mask(
-        working,
+    del visited
+    safe_donor_mask, region_has_safe_donor = fallback.materialize_safe_donor_mask(
+        provisional,
         analysis,
-        region_count,
-        repair_arena,
+        region_count=region_count,
+        arena=repair_arena,
     )
+    del provisional
     working.setflags(write=True)
     exemplar_processed = 0
     exemplar_unfinished = 0

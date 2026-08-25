@@ -322,10 +322,15 @@ def test_quality_background_transfers_the_pass_a_b_plane_to_repair_bits(
         pass_a_b_planes.append(analyzed.analysis.pure_bgr[0])
         return analyzed
 
-    def capture_transfer(coverage, records, *, out):
+    def capture_transfer(coverage, records, *, out, backend_lane_counts_out=None):
         expected = pass_a_b_planes.pop(0)
         assert out is expected
-        return original_bits(coverage, records, out=out)
+        return original_bits(
+            coverage,
+            records,
+            out=out,
+            backend_lane_counts_out=backend_lane_counts_out,
+        )
 
     monkeypatch.setattr(quality, "_analyze_eye_once", capture_analysis)
     monkeypatch.setattr(quality, "_background_repair_bits", capture_transfer)
@@ -340,6 +345,74 @@ def test_quality_background_transfers_the_pass_a_b_plane_to_repair_bits(
     assert not pass_a_b_planes
     assert result.left_repair_bits.base is None
     assert result.right_repair_bits.base is None
+
+
+def test_quality_renderer_uses_the_frame_level_value_validation_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forward_splat = importlib.import_module(
+        "src.depth_surge_3d.rendering.forward_splat"
+    )
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    monkeypatch.setattr(
+        forward_splat,
+        "_validate_near_score",
+        lambda _value: (_ for _ in ()).throw(
+            AssertionError("Quality repeated a validated full-frame value scan")
+        ),
+    )
+    frame = np.full((3, 17, 3), 80, dtype=np.uint8)
+    canonical = np.tile(np.linspace(0.0, 1.0, 17, dtype=np.float32), (3, 1))
+
+    result = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(stereo_strength=5.0, convergence=0.0),
+    )
+
+    assert result.left_image.shape == frame.shape
+
+
+def test_native_background_diagnostics_match_canonical_record_semantics() -> None:
+    native_kd = importlib.import_module(
+        "src.depth_surge_3d.rendering.quality.native_kd"
+    )
+    repair_records = importlib.import_module(
+        "src.depth_surge_3d.rendering.quality.repair_records"
+    )
+    native = native_kd._require_native()
+    records = np.zeros(3, dtype=repair_records.REPAIR_RECORD_DTYPE)
+    records["pixel_index"] = (1, 1, 2)
+    records["lane_mask"] = (0x0003, 0x000C, 0x00F0)
+    records["backend"] = (1, 2, 3)
+    raw_records = records.view(np.uint8).reshape(3, 16)
+    coverage = np.asarray([[16, 8, 0, 16]], dtype=np.uint8)
+    repair_bits = np.empty_like(coverage)
+    backend_lane_counts = np.empty(3, dtype=np.uint64)
+    lane_histogram = np.empty(16 * (coverage.shape[1] + 1), dtype=np.uint64)
+    span_histogram = np.empty(coverage.shape[1] + 1, dtype=np.uint64)
+
+    repair_lane_count = native.build_background_repair_bits_into(
+        raw_records,
+        coverage,
+        repair_bits,
+        backend_lane_counts,
+    )
+    histogram_lane_count = native.build_hole_run_histograms_into(
+        raw_records,
+        coverage.shape[1],
+        lane_histogram,
+        span_histogram,
+    )
+
+    assert repair_lane_count == histogram_lane_count == 8
+    assert backend_lane_counts.tolist() == [2, 2, 4]
+    assert repair_bits.tolist() == [[0, 0x01 | 0x04 | 0x18, 0x02 | 0x28, 0]]
+    assert np.flatnonzero(lane_histogram).tolist() == [4]
+    assert int(lane_histogram[4]) == 2
+    assert np.flatnonzero(span_histogram).tolist() == [1]
+    assert int(span_histogram[1]) == 2
 
 
 def test_quality_pass_b_releases_graph_and_repair_backing_before_replay(

@@ -51,7 +51,7 @@ from .types import (
     MetricStereoPrimitiveInput,
     QualityStereoControls,
 )
-from .visibility import QualitySplatBand, quality_splat_band
+from .visibility import QualitySplatBand, _quality_splat_band_prevalidated
 
 
 QUALITY_HOST_BUDGET_BYTES = 512 * 1024 * 1024
@@ -210,7 +210,7 @@ def _quality_splat(
         np.array(geometry.source_valid[start_row:end_row], copy=True, order="C")
     ).to(renderer.device)
     offset_band = renderer._transfer_offset_band(offsets[start_row:end_row])
-    return quality_splat_band(
+    return _quality_splat_band_prevalidated(
         source_band,
         near_score_band,
         offset_band,
@@ -448,6 +448,7 @@ def _background_repair_bits(
     records: np.ndarray,
     *,
     out: np.ndarray,
+    backend_lane_counts_out: np.ndarray | None = None,
 ) -> np.ndarray:
     if (
         not isinstance(out, np.ndarray)
@@ -456,47 +457,40 @@ def _background_repair_bits(
         or not out.flags.c_contiguous
     ):
         raise TypeError("repair-bit output must be the contiguous Pass A B plane")
-    result = out
-    result.fill(0)
-    result[(coverage > 0) & (coverage < HORIZONTAL_SUBPIXELS)] |= np.uint8(0x01)
-    result[coverage == 0] |= np.uint8(0x02)
-    flat = result.reshape(-1)
-    for record in records:
-        pixel = int(record["pixel_index"])
-        backend = int(record["backend"])
-        if backend == 1:
-            flat[pixel] |= np.uint8(0x04)
-        elif backend == 2:
-            flat[pixel] |= np.uint8(0x08 | 0x10)
-        elif backend == 3:
-            flat[pixel] |= np.uint8(0x08 | 0x20)
-        else:
-            raise RuntimeError("Quality repair plan contains an unplanned record")
-    return result
+    if backend_lane_counts_out is None:
+        backend_lane_counts_out = np.empty(3, dtype=np.uint64)
+    if (
+        not isinstance(backend_lane_counts_out, np.ndarray)
+        or backend_lane_counts_out.dtype != np.uint64
+        or backend_lane_counts_out.shape != (3,)
+        or not backend_lane_counts_out.flags.c_contiguous
+        or not backend_lane_counts_out.flags.writeable
+    ):
+        raise TypeError("backend lane counts must be a writable uint64[3] vector")
+    raw_records = records.view(np.uint8).reshape(
+        records.size, REPAIR_RECORD_DTYPE.itemsize
+    )
+    native_kd._require_native().build_background_repair_bits_into(
+        raw_records,
+        coverage,
+        out,
+        backend_lane_counts_out,
+    )
+    return out
 
 
 def _plan_hole_runs(records: np.ndarray, width: int) -> HoleRunDiagnostics:
     lane_histogram = np.zeros(16 * (width + 1), dtype=np.uint64)
     span_histogram = np.zeros(width + 1, dtype=np.uint64)
-    active_row = -1
-    active_start = -1
-    active_end = -1
-    for record in records:
-        pixel = int(record["pixel_index"])
-        row, column = divmod(pixel, width)
-        mask = int(record["lane_mask"])
-        start = column * 16 + (mask & -mask).bit_length() - 1
-        end = column * 16 + mask.bit_length() - 1
-        if row == active_row and start == active_end + 1:
-            active_end = end
-            continue
-        if active_row >= 0:
-            lane_histogram[active_end - active_start + 1] += np.uint64(1)
-            span_histogram[active_end // 16 - active_start // 16 + 1] += np.uint64(1)
-        active_row, active_start, active_end = row, start, end
-    if active_row >= 0:
-        lane_histogram[active_end - active_start + 1] += np.uint64(1)
-        span_histogram[active_end // 16 - active_start // 16 + 1] += np.uint64(1)
+    raw_records = records.view(np.uint8).reshape(
+        records.size, REPAIR_RECORD_DTYPE.itemsize
+    )
+    native_kd._require_native().build_hole_run_histograms_into(
+        raw_records,
+        width,
+        lane_histogram,
+        span_histogram,
+    )
     return HoleRunDiagnostics(
         lane_count_histogram=lane_histogram,
         touched_pixel_span_histogram=span_histogram,
@@ -596,11 +590,11 @@ def _replay_background_eye_once(
     offsets: np.ndarray,
     records: np.ndarray,
     band_height: int,
+    planned_lane_count: int,
 ) -> np.ndarray:
     height, width = source.shape[:2]
     output = np.empty_like(source)
     scattered = 0
-    planned = sum(int(value).bit_count() for value in records["lane_mask"])
     if renderer.device.type == "cpu":
         host_colours = None
         host_mask = None
@@ -632,7 +626,7 @@ def _replay_background_eye_once(
         downsampled = _downsample_subpixel_band(band.splat.colour)
         output[start_row:end_row] = _convert_image_band(downsampled, source.dtype)
         del band, valid, downsampled
-    if scattered != planned:
+    if scattered != planned_lane_count:
         raise RuntimeError(
             "Quality Pass B scatter total does not match the repair plan"
         )
@@ -672,13 +666,19 @@ def _render_background_eye(
         arenas=arenas,
     )
     coverage = analyzed.analysis.coverage_count
+    backend_lane_counts = np.empty(3, dtype=np.uint64)
     repair_bits = _background_repair_bits(
         coverage,
         plan.records,
         out=analyzed.analysis.pure_bgr[0],
+        backend_lane_counts_out=backend_lane_counts,
     )
     hole_runs = _plan_hole_runs(plan.records, int(source.shape[1]))
-    summary = summarize_quality_repair_plan(plan, repair_bits)
+    summary = summarize_quality_repair_plan(
+        plan,
+        repair_bits,
+        backend_lane_counts=tuple(int(value) for value in backend_lane_counts),
+    )
     records = plan.records
     del plan
     del analyzed
@@ -692,6 +692,7 @@ def _render_background_eye(
         geometry=geometry,
         offsets=offsets,
         records=records,
+        planned_lane_count=sum(summary.backend_lane_counts),
     )
     del records
     return _CompactEyeResult(image, coverage, repair_bits, summary, hole_runs)

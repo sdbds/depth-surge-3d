@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 
 import numpy as np
+import pytest
 
 from scripts.quality_task0 import repair_records as prototype_records
 
@@ -87,6 +88,65 @@ def test_quality_repair_plan_covers_every_invalid_lane_once() -> None:
     assert budgets.local_budget_skipped_run_count == 1
     assert plan.local_budget_skipped_run_count == 1
     assert plan.fallback_query_count == 1
+
+
+def test_planner_materializes_the_safe_mask_from_the_fixed_index_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    planner = importlib.import_module("src.depth_surge_3d.rendering.quality.planner")
+    built, analysis, budgets, _valid = _fallback_fixture()
+    monkeypatch.setattr(
+        native_kd._require_native(),
+        "build_safe_donor_mask",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("planner recomputed the strict safe-donor predicate")
+        ),
+    )
+
+    plan = planner.plan_quality_repairs(
+        analysis,
+        records=built.records,
+        render_shape=(9, 9),
+        local_limit_px=1,
+        budgets=budgets,
+    )
+
+    assert plan.fallback_query_count == 1
+
+
+def test_fixed_index_cache_expands_to_the_strict_safe_mask_byte_exactly() -> None:
+    arena_module = importlib.import_module("src.depth_surge_3d.rendering.quality.arena")
+    fallback = importlib.import_module("src.depth_surge_3d.rendering.quality.fallback")
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    built, analysis, budgets, _valid = _fallback_fixture()
+    arena = arena_module.QualityByteArena(
+        np.empty(arena_module.QUALITY_REPAIR_ARENA_BYTES, dtype=np.uint8),
+        "test repair",
+    )
+    precomputed = fallback.precompute_native_fallbacks(
+        built.records,
+        analysis,
+        render_shape=(9, 9),
+        region_count=1,
+        budgets=budgets,
+        arena=arena,
+    )
+
+    actual_safe, actual_regions = fallback.materialize_safe_donor_mask(
+        precomputed,
+        analysis,
+        region_count=1,
+        arena=arena,
+    )
+    expected_safe, expected_regions = native_kd._require_native().build_safe_donor_mask(
+        analysis.coverage_count,
+        analysis.pure_region_id,
+        np.asarray([False, True], dtype=np.bool_),
+    )
+
+    assert np.array_equal(actual_safe, expected_safe)
+    assert np.array_equal(actual_regions, expected_regions)
 
 
 def test_production_record_coverage_uses_native_exact_validator(monkeypatch) -> None:
@@ -618,6 +678,73 @@ def test_native_safe_donor_mask_matches_the_strict_index_members() -> None:
 
     assert np.array_equal(actual_mask, expected_mask)
     assert np.array_equal(actual_regions, expected_regions)
+
+
+def test_safe_donor_index_staging_and_capacity_fallback_are_byte_exact() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    native = native_kd._require_native()
+    coverage = np.full((11, 13), 16, dtype=np.uint8)
+    regions = np.ones((11, 13), dtype=np.uint32)
+    regions[:, 7:] = np.uint32(2)
+    coverage[5, 3] = np.uint8(15)
+    coverage[7, 9] = np.uint8(0)
+    referenced = np.array([False, True, True], dtype=np.bool_)
+    expected_members, expected_offsets = native.build_safe_donor_index(
+        coverage,
+        regions,
+        referenced,
+    )
+    staged_capacity = coverage.size + (coverage.size + 31) // 32
+
+    for capacity in (int(expected_members.size), staged_capacity):
+        members = np.empty(capacity, dtype=np.uint32)
+        offsets = np.empty(referenced.size, dtype=np.uint32)
+        use_full = np.empty(referenced.size, dtype=np.bool_)
+        donor_count, _index_bytes = native.build_safe_donor_index_into(
+            coverage,
+            regions,
+            referenced,
+            False,
+            members,
+            offsets,
+            use_full,
+        )
+
+        assert donor_count == expected_members.size
+        assert np.array_equal(members[:donor_count], expected_members)
+        assert np.array_equal(offsets, expected_offsets)
+        assert not np.any(use_full)
+
+
+def test_native_unplanned_region_projection_validates_and_counts_records() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    repair_records = importlib.import_module(
+        "src.depth_surge_3d.rendering.quality.repair_records"
+    )
+    native = native_kd._require_native()
+    records = np.zeros(3, dtype=repair_records.REPAIR_RECORD_DTYPE)
+    records["pixel_index"] = (1, 5, 0xFFFFFFFF)
+    records["region_id"] = (1, 2, 0xFFFFFFFF)
+    records["backend"] = (0, 0, 1)
+    referenced = np.empty(4, dtype=np.bool_)
+
+    query_count = native.build_referenced_unplanned_regions_into(
+        records.view(np.uint8).reshape(3, 16),
+        8,
+        3,
+        referenced,
+    )
+
+    assert query_count == 2
+    assert referenced.tolist() == [False, True, True, False]
+    records[1]["region_id"] = np.uint32(4)
+    with pytest.raises(ValueError, match="region exceeds"):
+        native.build_referenced_unplanned_regions_into(
+            records.view(np.uint8).reshape(3, 16),
+            8,
+            3,
+            referenced,
+        )
 
 
 def test_native_exemplar_candidate_mask_matches_the_complete_support_oracle() -> None:
