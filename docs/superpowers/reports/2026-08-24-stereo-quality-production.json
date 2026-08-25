@@ -2,103 +2,368 @@
   "algorithm_version": "stereo-quality-production-gate-v1",
   "artifacts_dir": "E:\\Code\\depth-surge-3d\\.worktrees\\stereo-quality-edge-reconstruction\\output\\stereo-quality-production-gate",
   "benchmark": {
-    "fast": {
-      "deterministic_output": true,
-      "measured_count": 30,
-      "output_identities": [
-        [
-          "d93cff1398c3263f63c2984682c17c62450fb405051454b8fcbfd0150b133ade",
-          "48fa025f3ab1a6074b0cd8443f1e66b289111af9e8b6981c747b5e87a78a9e72"
-        ]
-      ],
-      "p95_seconds": 1.112638669970329,
-      "seconds": [
-        1.0213170000351965,
-        0.9853274999768473,
-        1.0316012999974191,
-        1.0349599999608472,
-        1.0918887999723665,
-        1.0675889999838546,
-        1.0805647000088356,
-        1.099090099975001,
-        1.039740400039591,
-        1.090731100004632,
-        1.0738345999852754,
-        1.0946850999607705,
-        1.1094479000312276,
-        1.0999477000441402,
-        1.0737884000409395,
-        1.0885659999912605,
-        1.0941011999966577,
-        1.1142853999626823,
-        1.1082949000410736,
-        1.0483498999965377,
-        1.0604635000345297,
-        1.069625400006771,
-        1.099733799987007,
-        1.0880822999752127,
-        1.139702300017234,
-        1.1106259999796748,
-        1.0800616000196896,
-        1.0051919000106864,
-        1.0135988999973051,
-        1.038523300027009
-      ],
-      "warmup_count": 5
+    "gates": {
+      "benchmark_sample_count": true,
+      "full_pipeline_1080_determinism": true,
+      "full_pipeline_1080_timing": true,
+      "full_pipeline_4k_determinism": true,
+      "full_pipeline_4k_timing": true,
+      "gpu_allocation_with_headroom": true,
+      "renderer_1080_determinism": true,
+      "renderer_1080_ratio": true,
+      "renderer_1080_timing": true,
+      "renderer_4k_determinism": true,
+      "renderer_4k_ratio": true,
+      "renderer_4k_timing": true
     },
+    "gpu_peak_allocated_bytes": 141174272,
+    "gpu_peak_with_25_percent_headroom_bytes": 176467840,
     "limits": {
       "minimum_measured": 30,
       "minimum_warmups": 5,
-      "quality_renderer_p95_seconds": 5.0,
+      "quality_full_pipeline_1080_p95_seconds": 6.0,
+      "quality_full_pipeline_4k_p95_seconds": 24.0,
+      "quality_gpu_bytes_per_pixel": 1536,
+      "quality_renderer_1080_p95_seconds": 5.0,
+      "quality_renderer_4k_p95_seconds": 20.0,
       "quality_to_fast_p95_ratio": 12.0
     },
     "passed": true,
     "performance_gate_enabled": true,
-    "quality": {
-      "deterministic_output": true,
-      "measured_count": 30,
-      "output_identities": [
-        [
-          "721572b1562a81f56d2de27da97ef4b1387c1ef6b216319e293fb301d367c843",
-          "2943194634476cccc7dc68bdac2c2c61d62859f01bfbb2d569f6bf149298e069"
-        ]
-      ],
-      "p95_seconds": 4.614885489988955,
-      "seconds": [
-        4.500016400008462,
-        4.508606999996118,
-        4.494864600012079,
-        4.312925400037784,
-        4.433125499985181,
-        4.132286000007298,
-        4.229512799996883,
-        4.14189810003154,
-        4.354264999972656,
-        4.128331400046591,
-        4.324540300003719,
-        4.540219500020612,
-        4.429846299986821,
-        4.393391900055576,
-        4.272472400043625,
-        4.798943900037557,
-        4.189836400037166,
-        3.9909729000064544,
-        4.194077699969057,
-        4.445284900022671,
-        4.556233600014821,
-        4.098458199994639,
-        4.271429900021758,
-        4.448278900003061,
-        4.554792299983092,
-        3.987262200040277,
-        4.18743800005177,
-        4.662873399967793,
-        4.544572199985851,
-        4.371792099962477
-      ],
-      "warmup_count": 5
+    "resolutions": {
+      "1080p": {
+        "fast_renderer": {
+          "deterministic_output": true,
+          "measured_count": 30,
+          "output_identities": [
+            [
+              "d93cff1398c3263f63c2984682c17c62450fb405051454b8fcbfd0150b133ade",
+              "48fa025f3ab1a6074b0cd8443f1e66b289111af9e8b6981c747b5e87a78a9e72"
+            ]
+          ],
+          "p95_seconds": 0.9595371349962079,
+          "seconds": [
+            0.8318407000042498,
+            0.8513850000017555,
+            0.8403728999983286,
+            0.8462922000035178,
+            0.8758325000089826,
+            0.9280364000005648,
+            0.8739403000072343,
+            0.8690524999983609,
+            0.8759191999997711,
+            0.9595621999906143,
+            1.0528101999952924,
+            0.9044189999985974,
+            0.8989432999951532,
+            0.9245242999895709,
+            0.9354926000087289,
+            0.8883012000005692,
+            0.9161722999997437,
+            0.901701900002081,
+            0.9568719999952009,
+            0.8736113000049954,
+            0.8724152999930084,
+            0.8735311000054935,
+            0.9573014999914449,
+            0.8849661999993259,
+            0.8590104000031715,
+            0.8753348999889567,
+            0.8943709999875864,
+            0.9595065000030445,
+            0.9403202999965288,
+            0.9151298999931896
+          ],
+          "warmup_count": 5
+        },
+        "quality_full_pipeline": {
+          "deterministic_output": true,
+          "gpu_peak_allocated_bytes": 141174272,
+          "measured_count": 30,
+          "output_identities": [
+            "ec97c6dff3dd1bd7b3b55be545691883b26bcb2012e58e14ef0c837dba837c66"
+          ],
+          "output_shape_valid": true,
+          "p95_seconds": 4.648482239998701,
+          "published_diagnostic_byte_counts": [
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730,
+            3118730
+          ],
+          "seconds": [
+            4.762593599996762,
+            4.871140000002924,
+            3.8671878000022843,
+            4.147342399999616,
+            4.408335100000841,
+            4.340403700000024,
+            4.130958499998087,
+            4.30240600000252,
+            3.754449100000784,
+            4.100546200003009,
+            4.337951200010139,
+            4.016565199999604,
+            4.036060200000065,
+            4.383329000003869,
+            3.7511914999922737,
+            4.261473099992145,
+            3.959585300006438,
+            4.000472300002002,
+            4.292883600006462,
+            3.8903436999971746,
+            4.153620500001125,
+            3.7759529999893857,
+            4.385659199993825,
+            4.358559599990258,
+            4.3314553999953205,
+            4.091421300006914,
+            4.077039700001478,
+            4.509012800001074,
+            4.282478199995239,
+            4.364317500003381
+          ],
+          "warmup_count": 5
+        },
+        "quality_renderer": {
+          "deterministic_output": true,
+          "measured_count": 30,
+          "output_identities": [
+            [
+              "721572b1562a81f56d2de27da97ef4b1387c1ef6b216319e293fb301d367c843",
+              "2943194634476cccc7dc68bdac2c2c61d62859f01bfbb2d569f6bf149298e069"
+            ]
+          ],
+          "p95_seconds": 4.232512745002896,
+          "seconds": [
+            3.402225500001805,
+            4.006379899990861,
+            3.90759080000862,
+            4.40084200000274,
+            4.169450900008087,
+            3.7804161999956705,
+            4.2841087999986485,
+            3.3699059000064153,
+            3.9151780999964103,
+            3.7422885999985738,
+            3.1560599000076763,
+            3.964037899990217,
+            3.652334400001564,
+            3.4083424000127707,
+            3.8779491999885067,
+            3.407585900000413,
+            3.463580499999807,
+            3.601498200005153,
+            3.850422899995465,
+            3.7950395999941975,
+            3.146429899992654,
+            4.079716100008227,
+            3.4957831999927294,
+            3.416912200002116,
+            3.9017450000101235,
+            3.2606393999885768,
+            3.895734199992148,
+            3.11083590000635,
+            3.3908500999968965,
+            4.060656200002995
+          ],
+          "warmup_count": 5
+        },
+        "quality_to_fast_p95_ratio": 4.410994208181034
+      },
+      "4k": {
+        "fast_renderer": {
+          "deterministic_output": true,
+          "measured_count": 30,
+          "output_identities": [
+            [
+              "1dc3a6fc8137fb4bdd4d52e1e100d1382a57684280a1e4e0697d6916b0a3d765",
+              "f9dbd0b15653d104090140cb18fe240b2e86ccfa7149258c9ddc3db2dc8b1b50"
+            ]
+          ],
+          "p95_seconds": 3.7331541200015637,
+          "seconds": [
+            3.5431310999993,
+            3.7710556000092765,
+            3.6099203000048874,
+            3.716471299994737,
+            3.655117500005872,
+            3.4395458999933908,
+            3.4298291000013705,
+            3.563829500009888,
+            3.607280999989598,
+            3.654412300005788,
+            3.457590699996217,
+            3.4335472999955527,
+            3.5308710999961477,
+            3.7324697000003653,
+            3.507290900000953,
+            3.3378957000095397,
+            3.4264448000030825,
+            3.644381299993256,
+            3.5499925000040093,
+            3.5426854000106687,
+            3.525702099999762,
+            3.733714100002544,
+            3.605255999995279,
+            3.505468599993037,
+            3.397732700002962,
+            3.3840312999964226,
+            3.583617600001162,
+            3.428954100003466,
+            3.431731300006504,
+            3.6412377999949967
+          ],
+          "warmup_count": 5
+        },
+        "quality_full_pipeline": {
+          "deterministic_output": true,
+          "gpu_peak_allocated_bytes": 139622912,
+          "measured_count": 30,
+          "output_identities": [
+            "e44a8e0092e5d2cfadc52a182ed62c48c86cb0561eef849cbea82414e9bb1313"
+          ],
+          "output_shape_valid": true,
+          "p95_seconds": 16.410301654998328,
+          "published_diagnostic_byte_counts": [
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816,
+            8759816
+          ],
+          "seconds": [
+            16.350174499995774,
+            15.865402900002664,
+            15.368562399991788,
+            15.415675800002646,
+            16.45949660000042,
+            15.413693900001817,
+            16.037748899994767,
+            15.776083200005814,
+            16.073615600005724,
+            15.580134299991187,
+            15.810386999990442,
+            15.84382119998918,
+            15.594722800000454,
+            15.852601300008246,
+            15.732434799996554,
+            15.345400299993344,
+            15.638457299995935,
+            15.777545699995244,
+            15.793567300002906,
+            15.794559000001755,
+            15.960325399995781,
+            15.66596600000048,
+            15.568519399996148,
+            15.869770599994808,
+            17.124008600003435,
+            16.14120099999127,
+            15.679544000013266,
+            15.643787900000461,
+            16.002818399996613,
+            15.563052799989237
+          ],
+          "warmup_count": 5
+        },
+        "quality_renderer": {
+          "deterministic_output": true,
+          "measured_count": 30,
+          "output_identities": [
+            [
+              "74f4496f067e7326b9e3868503c7d1d3f5584c57da54203cb474f3b0a09db4f6",
+              "7c3f7586f2743e74c5d4bad7a9b33df37bddfd615f4b2c7b8607c31ad6c99195"
+            ]
+          ],
+          "p95_seconds": 14.81161952500115,
+          "seconds": [
+            14.077068600003258,
+            13.905254299999797,
+            14.172314200011897,
+            14.32413500000257,
+            14.598999699999695,
+            15.062025799998082,
+            13.856406999999308,
+            14.376665000003413,
+            13.803259599997546,
+            13.97510890000558,
+            14.172048699998413,
+            13.642445500008762,
+            14.360791299986886,
+            14.404569000005722,
+            14.029104500004905,
+            14.190533300003153,
+            13.730683699992369,
+            14.199490500002867,
+            14.49236760000349,
+            14.286501499998849,
+            14.509450099998503,
+            14.985581200002343,
+            13.915246700009448,
+            13.941678699993645,
+            13.923951499993564,
+            14.296810100000584,
+            14.023375300006592,
+            14.26701260000118,
+            14.29874359999667,
+            14.381534500003909
+          ],
+          "warmup_count": 5
+        },
+        "quality_to_fast_p95_ratio": 3.9675885454723594
+      }
     },
-    "quality_to_fast_p95_ratio": 4.1476946780144015,
     "status": "passed"
   },
   "benchmark_commands": [
@@ -106,29 +371,23 @@
       "argv": [
         "E:\\Code\\depth-surge-3d\\.venv\\Scripts\\python.exe",
         "E:\\Code\\depth-surge-3d\\.worktrees\\stereo-quality-edge-reconstruction\\scripts\\verify_stereo_quality_fixture.py",
-        "--fixture-root",
-        "H:\\3dtest\\1787051840_f908a5f038277cf447b8a6a9b5072311_20260818_191720",
-        "--report-json",
-        "docs\\superpowers\\reports\\2026-08-24-stereo-quality-production.json",
-        "--artifacts-dir",
-        "output\\stereo-quality-production-gate",
         "--device",
-        "auto",
+        "cuda",
+        "--cpu-affinity",
+        "0-15",
+        "--torch-intraop-threads",
+        "16",
         "--benchmark-warmups",
         "5",
         "--benchmark-measured",
         "30",
         "--temporal-radius",
-        "1",
-        "--cpu-affinity",
-        "0-15",
-        "--torch-intraop-threads",
-        "8"
+        "1"
       ],
       "cwd": "E:\\Code\\depth-surge-3d\\.worktrees\\stereo-quality-edge-reconstruction"
     }
   ],
-  "fingerprint": "d806907d6a351b9d1456a986ca0100dba00d8a5fcf7c6f4bc7853ed80de14f42",
+  "fingerprint": "6e1fe09f4179f717fe34570639117156d96281e8559489cfb2fe61ed98a81305",
   "fixture_root": "H:\\3dtest\\1787051840_f908a5f038277cf447b8a6a9b5072311_20260818_191720",
   "frames": [
     {
@@ -1221,7 +1480,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "d93cff1398c3263f63c2984682c17c62450fb405051454b8fcbfd0150b133ade",
-          "render_seconds": 1.3027170999557711,
+          "render_seconds": 0.9375236999912886,
           "right_pixel_sha256": "48fa025f3ab1a6074b0cd8443f1e66b289111af9e8b6981c747b5e87a78a9e72"
         },
         "nearest": {
@@ -2845,7 +3104,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "d74409dbabc0fd33bfaeee6d0e75f9bed7534e05548143f45ca9c3ec7ad519d2",
-          "render_seconds": 0.9770018000272103,
+          "render_seconds": 0.7018067000026349,
           "right_pixel_sha256": "cc8f82d4dbc24df79cec41012716e667b7f24f5dd87da69981c532d653e57af5"
         },
         "quality": {
@@ -3712,7 +3971,6 @@
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
                   "exemplar_evaluations": 872095,
-                  "fallback_anchor_count": 692,
                   "fallback_indexed_donor_count": 2022370,
                   "fallback_query_count": 11575,
                   "fallback_visited_nodes_max": 246,
@@ -4547,7 +4805,6 @@
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
                   "exemplar_evaluations": 153533,
-                  "fallback_anchor_count": 921,
                   "fallback_indexed_donor_count": 2021735,
                   "fallback_query_count": 11366,
                   "fallback_visited_nodes_max": 202,
@@ -4602,7 +4859,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "721572b1562a81f56d2de27da97ef4b1387c1ef6b216319e293fb301d367c843",
-          "render_seconds": 4.036367899971083,
+          "render_seconds": 3.13095500000054,
           "right_pixel_sha256": "2943194634476cccc7dc68bdac2c2c61d62859f01bfbb2d569f6bf149298e069"
         },
         "quality_without_fill": {
@@ -5469,7 +5726,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -6300,7 +6556,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -6351,7 +6606,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "800b3a95ae9178711fe3897f6c72cc939dc0b1dfc3f2db26ac40066447933762",
-          "render_seconds": 1.2286338999983855,
+          "render_seconds": 0.9633024999930058,
           "right_pixel_sha256": "5c77cd6c97d5e966f4018550f95df4e2aef598cba7db8027638ab0e3db7d4b03"
         }
       },
@@ -7454,7 +7709,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "d284d1cb039196aa6d6ef286a24037b67b203c8e58df962cc688eb3d2bd6ffa8",
-          "render_seconds": 2.384773400030099,
+          "render_seconds": 1.9540177000017138,
           "right_pixel_sha256": "97e4b2d29b70c2eef4d9e3c65937245cb40a5027d3a91461e0ad9d4740a110f1"
         },
         "nearest": {
@@ -8910,7 +9165,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "f324b8693c36bac6e16a232a7a499122673e1b98f018562d934474431e7b4e69",
-          "render_seconds": 1.4644535999977961,
+          "render_seconds": 2.182783500000369,
           "right_pixel_sha256": "b0a44bcb9e97be1fa1ba88ddc7f7505c5393d0ef9012b00d0ab985a1aa039340"
         },
         "quality": {
@@ -9721,7 +9976,6 @@
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
                   "exemplar_evaluations": 2456005,
-                  "fallback_anchor_count": 930,
                   "fallback_indexed_donor_count": 1533283,
                   "fallback_query_count": 90215,
                   "fallback_visited_nodes_max": 276,
@@ -10460,7 +10714,6 @@
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
                   "exemplar_evaluations": 5104412,
-                  "fallback_anchor_count": 1006,
                   "fallback_indexed_donor_count": 1535288,
                   "fallback_query_count": 147268,
                   "fallback_visited_nodes_max": 328,
@@ -10515,7 +10768,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "24b51bfb61e5a0a28e67f9b15277d446e50cfb194b1f99ea76d67c5a89806bcf",
-          "render_seconds": 9.180533999984618,
+          "render_seconds": 5.587021700004698,
           "right_pixel_sha256": "2d38ae19d2a048a670199eb21211cc0cfaea3a64db1822ed6d3856862e4fabc5"
         },
         "quality_without_fill": {
@@ -11326,7 +11579,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -12061,7 +12313,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -12112,7 +12363,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "9803923c0970781242e22cf9643a9b4c1295034264698ee79c9b666ad42e7f80",
-          "render_seconds": 2.2231477000168525,
+          "render_seconds": 1.8864697000099113,
           "right_pixel_sha256": "d9de0d65111b07af52fc22f43c255ddd313e4534146b77afe543a977281adf67"
         }
       },
@@ -13175,7 +13426,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "dcccbbed4c8adb047f2399eda49501c0d2dd55197b4fe6120f4226637c0f2b5d",
-          "render_seconds": 2.001043300027959,
+          "render_seconds": 1.4786166999983834,
           "right_pixel_sha256": "4f6ef6da81bf2b8689228bef2007e993f17662ff28b35d40481ea29a9918c4b1"
         },
         "nearest": {
@@ -14719,7 +14970,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "54cdc26c9a4167ba51b92eabfd8f6381b59850ea11024b5d1212baf932b13e79",
-          "render_seconds": 1.3357819999800995,
+          "render_seconds": 2.157176499997149,
           "right_pixel_sha256": "45537f24615358e598ba729b715bd429cf3ef8c574e25991fe5b6bd6109c9343"
         },
         "quality": {
@@ -15546,7 +15797,6 @@
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
                   "exemplar_evaluations": 5044703,
-                  "fallback_anchor_count": 599,
                   "fallback_indexed_donor_count": 1454901,
                   "fallback_query_count": 103954,
                   "fallback_visited_nodes_max": 275,
@@ -16361,7 +16611,6 @@
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
                   "exemplar_evaluations": 8236494,
-                  "fallback_anchor_count": 836,
                   "fallback_indexed_donor_count": 1471488,
                   "fallback_query_count": 153575,
                   "fallback_visited_nodes_max": 347,
@@ -16416,7 +16665,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "28c61352b40d7d019246f1cdeb6e2e401bea7ffaa1ddcfc0847772b81d8df146",
-          "render_seconds": 10.41857420001179,
+          "render_seconds": 6.039069399994332,
           "right_pixel_sha256": "4381b3a60e97bc15c579a2edebc9d9087cb83fd13ef8a1d59027fce2a80c41b0"
         },
         "quality_without_fill": {
@@ -17243,7 +17492,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -18054,7 +18302,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -18105,7 +18352,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "b64125374efdb5e4620c6845a672b0e024db4cd75f0c59bff65a80c031412785",
-          "render_seconds": 1.64602530002594,
+          "render_seconds": 2.0751523000071757,
           "right_pixel_sha256": "8859d6f6b922280655c2b199524b0fe8853e7051fc7bab9c158c6cf7872b5c09"
         }
       },
@@ -19228,7 +19475,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "af806fddbd6b510ecf86cb1e8b9153dd7293a00b214f8eb22c43ecf20fe47b84",
-          "render_seconds": 2.3758885000133887,
+          "render_seconds": 1.4456871000002138,
           "right_pixel_sha256": "2db7fd8f39335a7ff44991e47acd81b0ddb87b90c0230573efcf22090b7b5c68"
         },
         "nearest": {
@@ -20832,14 +21079,14 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "708597fc7e60b4c9df86bfd7e18e6323f911b816a2e95bc9c81d8dd8efef56d0",
-          "render_seconds": 2.2876679000328295,
+          "render_seconds": 1.2341309000039473,
           "right_pixel_sha256": "e076b7d2cb5f2b423e8d3cbdbd0c753fda23162888d548fdbe8ae7039dde88eb"
         },
         "quality": {
           "artifacts": {
             "left": {
               "path": "E:\\Code\\depth-surge-3d\\.worktrees\\stereo-quality-edge-reconstruction\\output\\stereo-quality-production-gate\\full\\frame_000176_quality_left.png",
-              "png_sha256": "ae49035b0a31e626870fcbc583e0c25d1f392d63ab0b3f463ea686aad6559a6f"
+              "png_sha256": "9b32fe4bdce78c6474a0c7e6ec143f15ef3a128ce0f71541edc266dc15761666"
             },
             "right": {
               "path": "E:\\Code\\depth-surge-3d\\.worktrees\\stereo-quality-edge-reconstruction\\output\\stereo-quality-production-gate\\full\\frame_000176_quality_right.png",
@@ -20851,18 +21098,18 @@
               "left": {
                 "backend_component_counts": {
                   "availability": "quality_segment_graph",
-                  "exemplar": 47,
+                  "exemplar": 44,
                   "fallback": 39624,
                   "local": 25131
                 },
                 "backend_lane_counts": {
-                  "exemplar": 77388,
-                  "fallback": 333114,
+                  "exemplar": 77103,
+                  "fallback": 333399,
                   "local": 173617
                 },
                 "backend_pixel_counts": {
-                  "exemplar": 6638,
-                  "fallback": 88143,
+                  "exemplar": 6595,
+                  "fallback": 88186,
                   "local": 57033
                 },
                 "final_unresolved_lane_count": 0,
@@ -21602,8 +21849,7 @@
                 "pixel_count": 2073600,
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
-                  "exemplar_evaluations": 4642424,
-                  "fallback_anchor_count": 1006,
+                  "exemplar_evaluations": 4631294,
                   "fallback_indexed_donor_count": 1556329,
                   "fallback_query_count": 94786,
                   "fallback_visited_nodes_max": 261,
@@ -21621,8 +21867,8 @@
                   "predicted_gap_px": 14
                 },
                 "state_pixel_counts": {
-                  "exemplar_filled": 6638,
-                  "fallback_filled": 88143,
+                  "exemplar_filled": 6595,
+                  "fallback_filled": 88186,
                   "final_unresolved": 0,
                   "local_filled": 57033,
                   "post_local_residual": 94781,
@@ -21630,8 +21876,8 @@
                   "prefill_partial": 132419
                 },
                 "state_pixel_ratios": {
-                  "exemplar_filled": 0.003201195987654321,
-                  "fallback_filled": 0.0425072337962963,
+                  "exemplar_filled": 0.0031804591049382717,
+                  "fallback_filled": 0.042527970679012345,
                   "final_unresolved": 0.0,
                   "local_filled": 0.02750434027777778,
                   "post_local_residual": 0.045708429783950615,
@@ -22450,7 +22696,6 @@
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
                   "exemplar_evaluations": 8531146,
-                  "fallback_anchor_count": 1003,
                   "fallback_indexed_donor_count": 1585415,
                   "fallback_query_count": 138749,
                   "fallback_visited_nodes_max": 379,
@@ -22504,8 +22749,8 @@
             ],
             "schema_version": 1
           },
-          "left_pixel_sha256": "cc442cabd894bb58185b8d42e44d851a2271d55e5a19027da31bab8bee677045",
-          "render_seconds": 9.696675899962429,
+          "left_pixel_sha256": "8ce6b16accb8f54c861b84b9110dc6a1ab38fce253587796be9eaee3c4ea8419",
+          "render_seconds": 6.186455899995053,
           "right_pixel_sha256": "2e28ed59198453ad92e6f8d1c0d0eecfebfd23498036d67dbcc0490162adef6d"
         },
         "quality_without_fill": {
@@ -23276,7 +23521,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -24119,7 +24363,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -24170,7 +24413,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "eedf13962089b55093494ec7f5189e6a08ac3c8b4deef6edded2aa9a0d414765",
-          "render_seconds": 2.5106874000048265,
+          "render_seconds": 1.6143750000046566,
           "right_pixel_sha256": "65191f8b04c64af3989847e829ac611045c808eb0c719495753f09a3075c9a42"
         }
       },
@@ -24198,7 +24441,7 @@
             "right": 13299
           },
           "quality_vs_fast_mae": {
-            "left": 0.8146228448275862,
+            "left": 0.8152011494252873,
             "right": 0.45210129310344827
           }
         },
@@ -24225,7 +24468,7 @@
             "right": 25296
           },
           "quality_vs_fast_mae": {
-            "left": 0.41445023148148147,
+            "left": 0.41443721064814815,
             "right": 0.4184375
           }
         },
@@ -24252,7 +24495,7 @@
             "right": 14281
           },
           "quality_vs_fast_mae": {
-            "left": 0.6246360153256705,
+            "left": 0.6250472541507024,
             "right": 0.2887126436781609
           }
         }
@@ -25216,7 +25459,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "f7e7f817bb61c4d0753a4d5c8bf73f96657dbfa225d4e1d5a24769a7b4fd00a5",
-          "render_seconds": 2.348666100006085,
+          "render_seconds": 1.446797399999923,
           "right_pixel_sha256": "ccfbadfcde927dc2c0d4f9dc09deb17d92cc5c10a71829c2ada818f102317fb7"
         },
         "nearest": {
@@ -26528,7 +26771,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "47cfd78ccee17bf59a312ddf4d623d24a6199b2db5c9d4ae65df87d2c5d77a74",
-          "render_seconds": 2.098716299980879,
+          "render_seconds": 1.2330705000058515,
           "right_pixel_sha256": "d0d17b3096b70a16fda1b1a2576c0b307d91fa4b71f541ad90346ec2c54f9708"
         },
         "quality": {
@@ -27215,7 +27458,6 @@
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
                   "exemplar_evaluations": 2484285,
-                  "fallback_anchor_count": 442,
                   "fallback_indexed_donor_count": 1424409,
                   "fallback_query_count": 106885,
                   "fallback_visited_nodes_max": 270,
@@ -27854,7 +28096,6 @@
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
                   "exemplar_evaluations": 5762508,
-                  "fallback_anchor_count": 529,
                   "fallback_indexed_donor_count": 1425718,
                   "fallback_query_count": 161086,
                   "fallback_visited_nodes_max": 214,
@@ -27909,7 +28150,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "bd36d7dbb256f214cdadd27930d3534357f4762bfb8be38a69d8c004848f0f0a",
-          "render_seconds": 9.555430500011425,
+          "render_seconds": 5.678555600010441,
           "right_pixel_sha256": "d20fef99cd28aef0dbb863adb9bfbc50f011d7b96924069da653b7cd265ed7ad"
         },
         "quality_without_fill": {
@@ -28596,7 +28837,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -29231,7 +29471,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -29282,7 +29521,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "d13c44cf33a3b709f5df03e9cb4a3550c056ca4e50ea9c9bdbd55dc3981ad8af",
-          "render_seconds": 1.8841284000081941,
+          "render_seconds": 1.8097675000026356,
           "right_pixel_sha256": "5282c55b6e90f9d46a5a25ff1df71e4f996536c79acd9d62f63d466694250b91"
         }
       },
@@ -30476,7 +30715,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "ce9b8fd6a9efbe614277b1eeea130e8931dfadf07950e99f8651e77d03d95022",
-          "render_seconds": 1.7996001000283286,
+          "render_seconds": 1.95756419999816,
           "right_pixel_sha256": "808d44f38c7c9b365e8edf5d16fc048e7404e3a19c6ea2f4e4a0517ef92c2004"
         },
         "nearest": {
@@ -32172,7 +32411,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "ee2bb6c6951fc9ddc829fd426e98ecba1475356a071c90f5ef80569006af531f",
-          "render_seconds": 2.3931953000137582,
+          "render_seconds": 1.1946120000066003,
           "right_pixel_sha256": "bf68fab7b823726ef483d9b662d7ec49426c3673ac0a818468630fad06219f0a"
         },
         "quality": {
@@ -33039,7 +33278,6 @@
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
                   "exemplar_evaluations": 2747568,
-                  "fallback_anchor_count": 1443,
                   "fallback_indexed_donor_count": 1554645,
                   "fallback_query_count": 82053,
                   "fallback_visited_nodes_max": 256,
@@ -33874,7 +34112,6 @@
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
                   "exemplar_evaluations": 6073375,
-                  "fallback_anchor_count": 1520,
                   "fallback_indexed_donor_count": 1564879,
                   "fallback_query_count": 136783,
                   "fallback_visited_nodes_max": 229,
@@ -33929,7 +34166,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "e58725896aaefc2dbc91a5405d69cb416d57eb2cde3180eca79720ec87672851",
-          "render_seconds": 8.851217599993106,
+          "render_seconds": 5.588801199992304,
           "right_pixel_sha256": "dfb26fce7478ae772034157c6b21a92245f88ddb90d74b450463455443961f63"
         },
         "quality_without_fill": {
@@ -34796,7 +35033,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -35627,7 +35863,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -35678,7 +35913,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "8c171bc9c640e5db9a00251336baff2b25746805097fa502d5cd86dc03e4b80d",
-          "render_seconds": 1.921011800004635,
+          "render_seconds": 1.48028110001178,
           "right_pixel_sha256": "39b0171b661ae6d966a487dc2b8e1d3c89c96f8d550c9aabc6b41fecae9ac9f8"
         }
       },
@@ -36937,7 +37172,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "8ed6687cfd7b5643bb85f5f8c6955940ff76c8bca2319b8fb1804177dbab26e7",
-          "render_seconds": 2.590905599994585,
+          "render_seconds": 1.4776220999920042,
           "right_pixel_sha256": "7f90ef347f91580fe516533e9858a8d3bdb8a1cc5cfc33274d75a8d045b746a9"
         },
         "nearest": {
@@ -38429,7 +38664,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "17cb40f28f769184ed7a212cd2d7f6174c1adc9f1f8e5a7b16d35fb54349df62",
-          "render_seconds": 1.1376047999947332,
+          "render_seconds": 1.0877139000076568,
           "right_pixel_sha256": "71dcaf6177be844ba07d7c06477b868322be5e5ba7c3d4a01ea3027f8d70ff23"
         },
         "quality": {
@@ -39392,7 +39627,6 @@
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
                   "exemplar_evaluations": 3804210,
-                  "fallback_anchor_count": 531,
                   "fallback_indexed_donor_count": 1639589,
                   "fallback_query_count": 94908,
                   "fallback_visited_nodes_max": 269,
@@ -40219,7 +40453,6 @@
                 "quality_budgets": {
                   "availability": "quality_repair_plan",
                   "exemplar_evaluations": 4033026,
-                  "fallback_anchor_count": 674,
                   "fallback_indexed_donor_count": 1639705,
                   "fallback_query_count": 151672,
                   "fallback_visited_nodes_max": 254,
@@ -40274,7 +40507,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "c0b338588cd596da4cf139bbe61a55079b2c82a0b1c4eece17b155f7aee05e87",
-          "render_seconds": 9.631797900015954,
+          "render_seconds": 5.7250800000038,
           "right_pixel_sha256": "9a0226f6bc920771f2301b4fcb8d89b3d648275498b1f8f613f24f254533a0e6"
         },
         "quality_without_fill": {
@@ -41237,7 +41470,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -42060,7 +42292,6 @@
                 "quality_budgets": {
                   "availability": "unavailable_quality_none_no_repair_plan",
                   "exemplar_evaluations": null,
-                  "fallback_anchor_count": null,
                   "fallback_indexed_donor_count": null,
                   "fallback_query_count": null,
                   "fallback_visited_nodes_max": null,
@@ -42111,7 +42342,7 @@
             "schema_version": 1
           },
           "left_pixel_sha256": "8c801ce2aa4fa8961c533ba381b6af41ab06db018d96779aa1ec9e5ca3aa0736",
-          "render_seconds": 1.5179041999508627,
+          "render_seconds": 1.4548994999931892,
           "right_pixel_sha256": "43b9b552752600b3b959918cd639e4d74c0b9a10b9ed7f05bcd2dd67fbc60451"
         }
       },
@@ -42147,21 +42378,39 @@
     }
   ],
   "gates": {
+    "benchmark_sample_count": true,
     "fast_byte_compatibility": true,
+    "full_pipeline_1080_determinism": true,
+    "full_pipeline_1080_timing": true,
+    "full_pipeline_4k_determinism": true,
+    "full_pipeline_4k_timing": true,
+    "gpu_allocation_with_headroom": true,
     "nearest_diagnostic_distinct": true,
     "output_contract": true,
-    "performance_and_determinism": true,
     "quality_final_unresolved_lanes_zero": true,
     "quality_without_fill_diagnostic_observed": true,
+    "renderer_1080_determinism": true,
+    "renderer_1080_ratio": true,
+    "renderer_1080_timing": true,
+    "renderer_4k_determinism": true,
+    "renderer_4k_ratio": true,
+    "renderer_4k_timing": true,
+    "source_tree_clean": true,
+    "task0_candidate_source": true,
+    "task0_capacity": true,
+    "task0_content_4k": true,
+    "task0_encoding_phases": true,
+    "task0_fallback_4k_edge25": true,
+    "task0_faults": true,
+    "task0_fixture": true,
+    "task0_geometry_4k_edge25": true,
+    "task0_native_build": true,
+    "task0_region_4k_edge25": true,
+    "task0_resource_bounds": true,
+    "task0_runtime": true,
     "temporal_windows_exported": true
   },
   "human_review": {
-    "agent_visual_notes": [
-      "Reviewed every left/right 400-percent crop for the seven pinned frames and all three-frame temporal windows.",
-      "Hair curls, feather tips, gun barrels, ribbons, and foreground silhouettes remain continuous with no black holes or cross-depth foreground donor leakage.",
-      "Residual quantized repair texture is confined to declared disocclusion bands, most visibly at the boot edge; it does not form the Fast path's soft long-range background stretch and remains bounded by the 8-pixel fill limit.",
-      "No discontinuous temporal flicker or stationary copied streak was observed across the exported adjacent-frame windows."
-    ],
     "agent_visual_review": "passed",
     "rejection_criteria": [
       "background_stretch",
@@ -42394,11 +42643,95 @@
     }
   },
   "runtime": {
-    "cpu_model": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "cpu_affinity_post": {
+      "all_threads_verified": true,
+      "effective": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "requested": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "verified_thread_count": 61,
+      "windows_thread_group_affinities": null
+    },
+    "cpu_affinity_pre": {
+      "all_threads_verified": true,
+      "effective": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "requested": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "verified_thread_count": 28,
+      "windows_thread_group_affinities": null
+    },
+    "cpu_family_model": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K",
     "cuda_available": true,
     "cuda_runtime_version": "13.0",
     "device": "cuda",
     "ffmpeg": "ffmpeg version n8.0.1-52-geef9672b02-20260203 Copyright (c) 2000-2025 the FFmpeg developers",
+    "frame_worker_count": 0,
     "gpu_driver": "620.02",
     "gpu_model": "NVIDIA GeForce RTX 4090",
     "logical_core_count": 32,
@@ -42407,28 +42740,31 @@
     "opencv_version": "4.11.0",
     "physical_core_count": 24,
     "physical_memory_bytes": 68263985152,
-    "platform": "Windows-10-10.0.26300-SP0",
-    "process_cpu_affinity": [
-      0,
-      1,
-      2,
-      3,
-      4,
-      5,
-      6,
-      7,
-      8,
-      9,
-      10,
-      11,
-      12,
-      13,
-      14,
-      15
-    ],
+    "platform": "Windows-10-10.0.26340-SP0",
     "python_version": "3.11.11",
+    "quality_native": {
+      "build_info": {
+        "algorithm": "quality-implicit-region-kd-median-of-medians-v1",
+        "kd_stack_capacity": 64,
+        "runtime_jit": false,
+        "source_sha256": "549a4ffddb3418e1c5a784630cdf2ae37f9aa27afa878a00e9b70ae860332881"
+      },
+      "byte_count": 409088,
+      "candidate_source_path": "E:\\Code\\depth-surge-3d\\.worktrees\\stereo-quality-edge-reconstruction\\native\\quality_kd_native.cpp",
+      "candidate_source_sha256": "549a4ffddb3418e1c5a784630cdf2ae37f9aa27afa878a00e9b70ae860332881",
+      "identity": {
+        "file_identity": {
+          "file_id": "39630700000014000000000000000000",
+          "volume_serial": "4a8007028006f46b"
+        },
+        "link_count": 1,
+        "platform": "windows"
+      },
+      "path": "E:\\Code\\depth-surge-3d\\.worktrees\\stereo-quality-edge-reconstruction\\_quality_kd_native.cp311-win_amd64.pyd",
+      "sha256": "1f8b71cd1d465d1fd2e10024c0ae8c7ce1c79ccaef219ff2b1ee909b36275eae"
+    },
     "torch_interop_threads": 24,
-    "torch_intraop_threads": 8,
+    "torch_intraop_threads": 16,
     "torch_version": "2.13.0+cu130"
   },
   "schema_version": 1,
@@ -42451,15 +42787,34 @@
     "stereo_strength": 1.5
   },
   "source": {
-    "commit": "af1b310205bd8b9059c55170b506d7c99a83715d",
-    "dirty": false,
-    "dirty_fingerprint": null
+    "commit": "ee53a6cb9652b2324f4d5609a8869f3eb99e31fd",
+    "dirty": true,
+    "dirty_fingerprint": "7ce85a15fe326fe37244eb4f26a4464513dae44faca6f3af531382f96ee643c7",
+    "release_tree_clean": true
   },
   "status": "machine_pass_human_review_required",
   "stereo_stage_algorithm_version": "torch-horizontal-16x-zbuffer-v3",
   "task0_report": {
+    "candidate_source_match": true,
+    "error": null,
+    "gates": {
+      "task0_capacity": true,
+      "task0_content_4k": true,
+      "task0_encoding_phases": true,
+      "task0_fallback_4k_edge25": true,
+      "task0_faults": true,
+      "task0_fixture": true,
+      "task0_geometry_4k_edge25": true,
+      "task0_region_4k_edge25": true,
+      "task0_runtime": true
+    },
+    "native_build_match": true,
     "path": "E:\\Code\\depth-surge-3d\\.worktrees\\stereo-quality-edge-reconstruction\\docs\\superpowers\\reports\\2026-08-24-stereo-quality-task0.json",
-    "sha256": "61711c878ddd2cf8e87c74810f1a969c8fe831df8cc0a2eeea9d2d18c276c372"
+    "report_fingerprint": "ce1b5b3dfc71db90be9caa40af056c97c6cb35ad741c8d9bd1dd8c93d8244677",
+    "required": true,
+    "resource_bounds": true,
+    "sha256": "0cd4920e5704a2e1af5518e539cd998860168b9117e36fc521299963ab3d83af",
+    "valid": true
   },
   "temporal_windows": [
     {
@@ -42473,7 +42828,7 @@
         {
           "canonical_sha256": "64dd37107730948a260b4996bc8d9b708ae26733e5e2e9e5c833f849c57e49c0",
           "frame_name": "frame_000088",
-          "render_seconds": 3.9959684000350535,
+          "render_seconds": 3.455442200007383,
           "source_sha256": "622778ffafc5e8bf35bcd2d8ebd386871aaa3d35986318b52a9613510bbbe0da"
         },
         {
@@ -42485,7 +42840,7 @@
         {
           "canonical_sha256": "ab6b764c6686ac74bfac73faa5519a3b8a3ecec2e0a086ffb3f423d94f96661d",
           "frame_name": "frame_000090",
-          "render_seconds": 5.1255297000170685,
+          "render_seconds": 4.088531300003524,
           "source_sha256": "900786291535b082f0b8b3cd5465a48b3501308ac2dd00137f23297a8fb5ae66"
         }
       ],
@@ -42503,7 +42858,7 @@
         {
           "canonical_sha256": "755e069fe446a19867583063762e6e59ed9ad27338aaee9a1b2d57da877c69a6",
           "frame_name": "frame_000110",
-          "render_seconds": 10.740491100004874,
+          "render_seconds": 6.659817699997802,
           "source_sha256": "690d01dfedd3389e7d74f31ea391bb4d02b3484495a130a5f5e2fb978857860e"
         },
         {
@@ -42515,7 +42870,7 @@
         {
           "canonical_sha256": "6d5e87ff8734f14526acca7806f7637ba45e82b7f0eaff5ce8b53c9ba5b70670",
           "frame_name": "frame_000112",
-          "render_seconds": 8.713752200012095,
+          "render_seconds": 5.8061097000027075,
           "source_sha256": "6ce0bf2f44e419be061020ae77af6a017e3f8f5a2ce12b1b7ca405e72b087867"
         }
       ],
@@ -42533,7 +42888,7 @@
         {
           "canonical_sha256": "bbf172fe3723bcb4c5e5879839eb003f3bc17b2cbcc89c37ede596739ef07c04",
           "frame_name": "frame_000170",
-          "render_seconds": 10.504849800025113,
+          "render_seconds": 6.275148500004434,
           "source_sha256": "978be3061d908399468ee1a8c651b621f371bb8abd989ea9b4f3673d462fe1c4"
         },
         {
@@ -42545,7 +42900,7 @@
         {
           "canonical_sha256": "e58fbde7a77ea0d8bc823f7f4911727e8d9a32f7990a491ee3e51447e4a37883",
           "frame_name": "frame_000172",
-          "render_seconds": 8.457278200017754,
+          "render_seconds": 5.681582100005471,
           "source_sha256": "80ae4f78b58ac17b1bac07782c341070bae0b8a7cbcde9f040952944bc6d5ccc"
         }
       ],
@@ -42565,7 +42920,7 @@
         {
           "canonical_sha256": "c2a2e10844572d5e18bd0a054ce188b0a369bf67e022262c98977d01fafe79ab",
           "frame_name": "frame_000175",
-          "render_seconds": 9.343982899968978,
+          "render_seconds": 6.142019500010065,
           "source_sha256": "7575d416efacbbd316a4fb3c8b4482046217e1f19ef9afe5d35561b0c7e2413f"
         },
         {
@@ -42577,7 +42932,7 @@
         {
           "canonical_sha256": "3c1be2b0530ac827f02e6576d0c9888bbad4bfe0814a65440fee96b317bd1fd4",
           "frame_name": "frame_000177",
-          "render_seconds": 9.717624299984891,
+          "render_seconds": 5.985897100006696,
           "source_sha256": "f8d2e82159adac8f16fe74e0b0679dbbd40c42df88fae5c23f510a42e4a13f65"
         }
       ],
@@ -42597,7 +42952,7 @@
         {
           "canonical_sha256": "d025dbc4b0a0c0b599877acc2ec951614e82e4d1776706be06aa5aa3431243c2",
           "frame_name": "frame_000230",
-          "render_seconds": 8.352769700053614,
+          "render_seconds": 5.3433465999987675,
           "source_sha256": "6526d269f4178ba16455a041aabd150137e60b34a07aa914f018a5a47adf5269"
         },
         {
@@ -42609,7 +42964,7 @@
         {
           "canonical_sha256": "1b9898db6ebe806b264e9cfa9fed77273907b620b0d8683b6565fac61da4e421",
           "frame_name": "frame_000232",
-          "render_seconds": 6.518585500016343,
+          "render_seconds": 5.289905999990879,
           "source_sha256": "bea01c6122f7995aa2d5fcc7f6c86f78f2fa774feede4091fe04212f4d58a02d"
         }
       ],
@@ -42627,7 +42982,7 @@
         {
           "canonical_sha256": "abd18d148edeb07b604f73c401b94b6cd47f6fb5d9ef38ddb146034d53e2897e",
           "frame_name": "frame_000300",
-          "render_seconds": 8.649176500039175,
+          "render_seconds": 5.485827500000596,
           "source_sha256": "11ad1ec64b85b735eb5b42ba6d6939bc4e1dc85cb6999558ae286c0b56a1a18d"
         },
         {
@@ -42639,7 +42994,7 @@
         {
           "canonical_sha256": "febecfe786f2d902bf8a95311cb6f4fca6a2e9bfdad9e36f58da67affeb4661c",
           "frame_name": "frame_000302",
-          "render_seconds": 8.301440000010189,
+          "render_seconds": 5.321257000003243,
           "source_sha256": "e885eaadac7039bc6503e82da6bdc3aa1e0a9d0c25357df7d8f57871b9d114ee"
         }
       ],
@@ -42655,7 +43010,7 @@
         {
           "canonical_sha256": "02387cc7102095e5b5309b9710f702b2f46b99eb869fb6532a90401875e54ec6",
           "frame_name": "frame_000400",
-          "render_seconds": 7.533813600020949,
+          "render_seconds": 5.429738100006944,
           "source_sha256": "3d89a634cfe7ebf2d40d2f5584b953532b0177074d5ad346067ec573f21f5329"
         },
         {
@@ -42667,7 +43022,7 @@
         {
           "canonical_sha256": "c8db4cd896dda3ad82971206fce19ddb2e90475184c2c6d1b7e63f97532625a0",
           "frame_name": "frame_000402",
-          "render_seconds": 8.894773699983489,
+          "render_seconds": 5.858258799999021,
           "source_sha256": "9a05506cea5e61068b9afe5e5c4b82c911ba783cb258414c568432f882cb9632"
         }
       ],
