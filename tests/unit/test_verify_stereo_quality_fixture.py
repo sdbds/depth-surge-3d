@@ -191,6 +191,23 @@ def test_cpu_affinity_parser_expands_a_canonical_processor_set() -> None:
         verifier._parse_cpu_affinity("-1")
 
 
+def test_windows_affinity_handoff_waits_and_propagates_child_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = ("python.exe", "verify.py", "--cpu-affinity", "0-15")
+    observed: list[tuple[tuple[str, ...], bool]] = []
+    monkeypatch.setattr(verifier.os, "name", "nt")
+    monkeypatch.setattr(
+        verifier.subprocess,
+        "run",
+        lambda argv, *, check: observed.append((tuple(argv), check))
+        or SimpleNamespace(returncode=7),
+    )
+
+    assert verifier._handoff_affinity_process_v1(command) == 7
+    assert observed == [(command, False)]
+
+
 def test_windows_topology_parser_counts_only_processor_core_records() -> None:
     raw = b"".join(
         (
@@ -555,9 +572,71 @@ def test_release_gate_requires_each_independent_benchmark_gate(
     )
 
     assert gates[failed_gate] is False
-    assert all(
-        value for name, value in gates.items() if name != failed_gate
+    assert all(value for name, value in gates.items() if name != failed_gate)
+
+
+def test_task0_native_build_match_includes_frozen_source_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build = {
+        "algorithm": "quality-implicit-region-kd-median-of-medians-v1",
+        "kd_stack_capacity": 64,
+        "runtime_jit": False,
+        "source_sha256": "a" * 64,
+    }
+    required_ids = sorted(
+        {
+            run_id
+            for run_ids in verifier._TASK0_RELEASE_RUN_GROUPS.values()
+            for run_id in run_ids
+        }
     )
+    runs = []
+    for index, run_id in enumerate(required_ids):
+        facts = {
+            "rss_cap_exceeded": False,
+            "arena_cap_exceeded": False,
+            "wall_cap_exceeded": False,
+        }
+        if index == 0:
+            facts["native_build"] = dict(build)
+        runs.append(
+            SimpleNamespace(
+                run_id=run_id,
+                status="passed",
+                peak_rss_bytes=1,
+                rss_cap_bytes=2,
+                facts=facts,
+            )
+        )
+    report = SimpleNamespace(
+        runs=tuple(runs),
+        source=SimpleNamespace(),
+        fingerprint="b" * 64,
+    )
+    monkeypatch.setattr(verifier.task0_reporting, "load_report", lambda _path: report)
+    monkeypatch.setattr(
+        verifier.task0_reporting,
+        "capture_source_identity",
+        lambda *_args, **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        verifier,
+        "_task0_source_matches_candidate_v1",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(verifier, "_sha256", lambda _path: "c" * 64)
+
+    evidence = verifier._task0_release_evidence(
+        {
+            "build_info": dict(build),
+            "candidate_source_sha256": build["source_sha256"],
+        },
+        required=True,
+    )
+
+    assert evidence["native_build_match"] is True
+    assert evidence["valid"] is True
 
 
 def test_full_pipeline_benchmark_publishes_production_diagnostics(

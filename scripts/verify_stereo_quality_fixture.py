@@ -304,6 +304,15 @@ def _requested_affinity_argument(argv: list[str]) -> tuple[int, ...] | None:
     return _parse_cpu_affinity(values[0])
 
 
+def _handoff_affinity_process_v1(command: tuple[str, ...]) -> int:
+    """Replace on POSIX; on Windows wait because ``execv`` loses child status."""
+
+    if os.name == "nt":
+        return int(subprocess.run(command, check=False).returncode)
+    os.execv(command[0], command)
+    raise RuntimeError("affinity process replacement unexpectedly returned")
+
+
 def _bootstrap_cpu_affinity_before_native_imports() -> None:
     requested = _requested_affinity_argument(sys.argv[1:])
     if requested is None:
@@ -315,10 +324,10 @@ def _bootstrap_cpu_affinity_before_native_imports() -> None:
         return
     _set_process_cpu_affinity(requested)
     os.environ[_AFFINITY_BOOTSTRAP_ENV] = marker
-    os.execv(
-        sys.executable,
-        (sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]),
+    exit_code = _handoff_affinity_process_v1(
+        (sys.executable, str(Path(__file__).resolve()), *sys.argv[1:])
     )
+    raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":
@@ -2096,12 +2105,22 @@ def _task0_release_evidence(
         expected_native_build = (
             {
                 key: build_info[key]
-                for key in ("algorithm", "kd_stack_capacity", "runtime_jit")
+                for key in (
+                    "algorithm",
+                    "kd_stack_capacity",
+                    "runtime_jit",
+                    "source_sha256",
+                )
             }
             if isinstance(build_info, dict)
             and all(
                 key in build_info
-                for key in ("algorithm", "kd_stack_capacity", "runtime_jit")
+                for key in (
+                    "algorithm",
+                    "kd_stack_capacity",
+                    "runtime_jit",
+                    "source_sha256",
+                )
             )
             else None
         )
