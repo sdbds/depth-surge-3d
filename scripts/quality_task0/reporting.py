@@ -17,6 +17,11 @@ from typing import Any, Literal
 
 REPORT_ALGORITHM_VERSION = "stereo-quality-task0-report-v1"
 REPORT_MAX_RAW_BYTES = 8 * 1024 * 1024
+RELEASE_EVIDENCE_RELATIVE_PATHS = (
+    "docs/superpowers/reports/2026-08-23-stereo-quality-task0.json",
+    "docs/superpowers/reports/2026-08-24-stereo-quality-task0.json",
+    "docs/superpowers/reports/2026-08-24-stereo-quality-production.json",
+)
 _HEX = re.compile(r"[0-9a-f]+")
 _RUN_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}")
 _DEVICE_NAME_CHARACTER = re.compile(r"[A-Za-z0-9_.-]")

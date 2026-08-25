@@ -385,9 +385,7 @@ _TASK0_REPORT_RELATIVE_PATH = Path(
     "docs/superpowers/reports/2026-08-24-stereo-quality-task0.json"
 )
 _RELEASE_EVIDENCE_RELATIVE_PATHS = (
-    "docs/superpowers/reports/2026-08-23-stereo-quality-task0.json",
-    _TASK0_REPORT_RELATIVE_PATH.as_posix(),
-    "docs/superpowers/reports/2026-08-24-stereo-quality-production.json",
+    task0_reporting.RELEASE_EVIDENCE_RELATIVE_PATHS
 )
 _TASK0_RELEASE_RUN_GROUPS: dict[str, tuple[str, ...]] = {
     "task0_content_4k": tuple(

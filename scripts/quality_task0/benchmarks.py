@@ -1511,7 +1511,7 @@ def run_task0_gate_suite(
     registry = build_case_registry(
         device_contexts=_default_device_contexts(), fixture_settings=fixture
     )
-    excluded_paths = {"docs/superpowers/reports/2026-08-23-stereo-quality-task0.json"}
+    excluded_paths = set(reporting.RELEASE_EVIDENCE_RELATIVE_PATHS)
     if report_path is not None:
         resolved_report = (
             (root / report_path).resolve()

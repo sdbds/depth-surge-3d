@@ -259,6 +259,39 @@ def test_cli_excludes_its_selected_report_path_from_source_identity(
     }
 
 
+def test_task0_source_identity_excludes_every_release_evidence_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts.quality_task0 import benchmarks
+
+    captured: dict[str, object] = {}
+    sentinel = object()
+    monkeypatch.setattr(benchmarks, "_default_device_contexts", lambda: ("cpu",))
+    monkeypatch.setattr(benchmarks, "build_case_registry", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        reporting,
+        "capture_source_identity",
+        lambda _root, *, excluded_relative_paths: captured.update(
+            excluded=excluded_relative_paths
+        )
+        or _source(),
+    )
+    monkeypatch.setattr(reporting, "capture_environment_identity", _environment)
+    monkeypatch.setattr(
+        benchmarks,
+        "assemble_gate_report",
+        lambda **_kwargs: sentinel,
+    )
+
+    result = benchmarks.run_task0_gate_suite((), report_path=tmp_path / "task0.json")
+
+    assert result is sentinel
+    assert set(reporting.RELEASE_EVIDENCE_RELATIVE_PATHS).issubset(
+        set(captured["excluded"])
+    )
+
+
 def test_process_rss_and_device_context_labels_are_bounded_scalars() -> None:
     rss = reporting.read_process_rss_bytes(os.getpid())
 
