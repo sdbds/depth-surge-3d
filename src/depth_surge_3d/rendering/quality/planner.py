@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from . import exemplar, fallback
+from .arena import QualityByteArena, QualityFixedArenas
 from .local_strip import (
     LocalStripPlanResult,
     QualityRepairBudgets,
@@ -17,10 +18,18 @@ from .repair_records import (
     NO_REGION,
     QUALITY_REPAIR_RECORD_CAP,
     REPAIR_RECORD_DTYPE,
+    QualityRepairBudgetError,
 )
 
 
 QUALITY_EXEMPLAR_MIN_TARGET_PIXELS = 49
+_MIB = 1024 * 1024
+_GRAPH_PARENT_OFFSET = 0
+_GRAPH_RANK_OFFSET = 16 * _MIB
+_GRAPH_MEMBERS_OFFSET = 20 * _MIB
+_GRAPH_KEYS_OFFSET = 36 * _MIB
+_GRAPH_WORKSPACE_OFFSET = 52 * _MIB
+_EXEMPLAR_MASK_PREFLIGHT_BYTES = 4 * (512 * 512 + 256 * 256 + 128 * 128)
 
 
 @dataclass(frozen=True)
@@ -87,7 +96,10 @@ def summarize_quality_repair_plan(
     records = plan.records
     backends = records["backend"]
     lane_counts = tuple(
-        sum(int(mask).bit_count() for mask in records["lane_mask"][backends == np.uint8(backend)])
+        sum(
+            int(mask).bit_count()
+            for mask in records["lane_mask"][backends == np.uint8(backend)]
+        )
         for backend in (1, 2, 3)
     )
     backend_lane_counts = (lane_counts[0], lane_counts[1], lane_counts[2])
@@ -181,7 +193,8 @@ def _union_group_pairs(
             right_mask = int(records[right]["lane_mask"])
             if relation == "same":
                 adjacent = (
-                    (((left_mask << 1) & right_mask) | ((right_mask << 1) & left_mask)) & 0xFFFF
+                    (((left_mask << 1) & right_mask) | ((right_mask << 1) & left_mask))
+                    & 0xFFFF
                 ) != 0
             elif relation == "horizontal":
                 adjacent = bool(left_mask & 0x8000) and bool(right_mask & 0x0001)
@@ -236,56 +249,123 @@ def _component_member_order(
     component_ids: np.ndarray,
     component_count: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    members, offsets = fallback.native_kd._require_native().build_component_member_order(
-        component_ids,
-        component_count,
+    members, offsets = (
+        fallback.native_kd._require_native().build_component_member_order(
+            component_ids,
+            component_count,
+        )
     )
     offsets.setflags(write=False)
     members.setflags(write=False)
     return members, offsets
 
 
+def _fixed_graph_components(
+    records: np.ndarray,
+    *,
+    render_shape: tuple[int, int],
+    arenas: QualityFixedArenas,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    height, width = render_shape
+    count = int(records.size)
+    graph_arena = arenas.graph
+    if graph_arena is None:
+        raise RuntimeError("Quality graph arena was released before planning")
+    storage = graph_arena.storage
+    parent = np.ndarray(
+        (count,), dtype=np.uint32, buffer=storage, offset=_GRAPH_PARENT_OFFSET
+    )
+    rank = np.ndarray(
+        (count,), dtype=np.uint8, buffer=storage, offset=_GRAPH_RANK_OFFSET
+    )
+    members = np.ndarray(
+        (count,), dtype=np.uint32, buffer=storage, offset=_GRAPH_MEMBERS_OFFSET
+    )
+    keys = np.ndarray(
+        (count,), dtype=np.uint32, buffer=storage, offset=_GRAPH_KEYS_OFFSET
+    )
+    workspace_count = (storage.nbytes - _GRAPH_WORKSPACE_OFFSET) // np.dtype(
+        np.int32
+    ).itemsize
+    workspace = np.ndarray(
+        (workspace_count,),
+        dtype=np.int32,
+        buffer=storage,
+        offset=_GRAPH_WORKSPACE_OFFSET,
+    )
+    raw_records = records.view(np.uint8).reshape(count, REPAIR_RECORD_DTYPE.itemsize)
+    native = fallback.native_kd._require_native()
+    try:
+        component_count = native.build_record_components_into(
+            raw_records,
+            height,
+            width,
+            parent,
+            rank,
+            members,
+            keys,
+            workspace,
+        )
+    except native.QualityBudgetError as error:
+        raise QualityRepairBudgetError("64 MiB graph arena exceeded") from error
+    component_ids = parent
+    component_ids.setflags(write=False)
+    members.setflags(write=False)
+    return component_ids, members, int(component_count)
+
+
 def _materialize_safe_donor_mask(
     records: np.ndarray,
     analysis: QualityVisibilityAnalysis,
     region_count: int,
+    arena: QualityByteArena,
 ) -> tuple[np.ndarray, np.ndarray]:
-    referenced = np.zeros(region_count + 1, dtype=np.bool_)
+    referenced = arena.allocate(region_count + 1, np.bool_, zero=True)
     for record in records:
         if int(record["backend"]) == 0:
             referenced[int(record["region_id"])] = True
     native = fallback.native_kd._require_native()
-    safe, region_has_safe_donor = native.build_safe_donor_mask(
+    safe = arena.allocate(analysis.coverage_count.shape, np.bool_)
+    region_has_safe_donor = arena.allocate(region_count + 1, np.bool_)
+    native.build_safe_donor_mask(
         analysis.coverage_count,
         analysis.pure_region_id,
         referenced,
+        safe,
+        region_has_safe_donor,
     )
     safe.setflags(write=False)
     region_has_safe_donor.setflags(write=False)
     return safe, region_has_safe_donor
 
 
-def _component_has_exemplar_candidate(
+def _component_target_pixels(
     records: np.ndarray,
-    candidate_mask: np.ndarray,
-    pure_region_id: np.ndarray,
+    record_indexes: np.ndarray,
     *,
     region_id: int,
     render_shape: tuple[int, int],
-) -> bool:
+    arena: QualityByteArena,
+) -> np.ndarray:
+    output = arena.allocate(int(record_indexes.size), np.uint32)
+    raw_records = records.view(np.uint8).reshape(
+        records.size,
+        REPAIR_RECORD_DTYPE.itemsize,
+    )
     height, width = render_shape
-    pixels = records["pixel_index"]
-    rows = pixels // np.uint32(width)
-    columns = pixels % np.uint32(width)
-    y0 = max(0, int(rows.min()) - 128)
-    y1 = min(height, int(rows.max()) + 129)
-    x0 = max(0, int(columns.min()) - 128)
-    x1 = min(width, int(columns.max()) + 129)
-    return bool(
-        np.any(
-            candidate_mask[y0:y1, x0:x1] & (pure_region_id[y0:y1, x0:x1] == np.uint32(region_id))
+    count = int(
+        fallback.native_kd._require_native().collect_exemplar_targets_into(
+            raw_records,
+            record_indexes,
+            region_id,
+            height,
+            width,
+            output,
         )
     )
+    result = output[:count]
+    result.setflags(write=False)
+    return result
 
 
 def _linear_p95(values: np.ndarray) -> float:
@@ -299,6 +379,19 @@ def _linear_p95(values: np.ndarray) -> float:
     return float(ordered[lower]) * (1.0 - fraction) + float(ordered[upper]) * fraction
 
 
+def _linear_p95_in_place(values: np.ndarray) -> float:
+    if values.size == 0:
+        return 0.0
+    values.setflags(write=True)
+    values.sort(kind="heapsort")
+    values.setflags(write=False)
+    position = 0.95 * (values.size - 1)
+    lower = int(np.floor(position))
+    upper = int(np.ceil(position))
+    fraction = position - lower
+    return float(values[lower]) * (1.0 - fraction) + float(values[upper]) * fraction
+
+
 def plan_quality_repairs(
     analysis: QualityVisibilityAnalysis,
     *,
@@ -306,9 +399,19 @@ def plan_quality_repairs(
     render_shape: tuple[int, int],
     local_limit_px: int,
     budgets: QualityRepairBudgets,
+    arenas: QualityFixedArenas | None = None,
 ) -> QualityRepairPlan:
     """Plan local, exemplar, and exact same-region fallback repair."""
 
+    if arenas is None:
+        arenas = QualityFixedArenas.allocate()
+        arenas.reset_eye()
+        arena_records = arenas.records()[: records.size]
+        arena_records[:] = records
+        records = arena_records
+    repair_arena = arenas.repair
+    if repair_arena is None:
+        raise RuntimeError("Quality repair arena was released before planning")
     skipped_before = budgets.local_budget_skipped_run_count
     local: LocalStripPlanResult = plan_local_strips(
         records,
@@ -325,9 +428,10 @@ def plan_quality_repairs(
         records[:] = local.records
         records.setflags(write=False)
     del local
-    component_ids, component_count = build_record_component_ids(
+    component_ids, member_order, component_count = _fixed_graph_components(
         records,
         render_shape=render_shape,
+        arenas=arenas,
     )
     if records.size == 0:
         return QualityRepairPlan(
@@ -352,10 +456,6 @@ def plan_quality_repairs(
             exemplar_patch_iteration_count=0,
             exemplar_donor_evaluation_count=0,
         )
-    member_order, component_offsets = _component_member_order(
-        component_ids,
-        component_count,
-    )
     region_count = _maximum_referenced_region(records)
     provisional = fallback.precompute_native_fallbacks(
         records,
@@ -364,68 +464,95 @@ def plan_quality_repairs(
         region_count=region_count,
         budgets=budgets,
         in_place=True,
+        arena=repair_arena,
     )
+    visited = provisional.visited_nodes
+    fallback_visited_nodes_total = int(np.sum(visited, dtype=np.uint64))
+    fallback_visited_nodes_max = int(visited.max(initial=np.uint32(0)))
+    fallback_visited_nodes_p95 = _linear_p95_in_place(visited)
+    fallback_indexed_donor_count = provisional.indexed_donor_count
+    fallback_index_bytes = provisional.index_bytes
+    fallback_query_count = provisional.query_count
+    fallback_anchor_count = provisional.anchor_fallback_count
+    working = provisional.records
+    del provisional, visited
+    repair_arena.reset()
     safe_donor_mask, region_has_safe_donor = _materialize_safe_donor_mask(
-        provisional.records,
+        working,
         analysis,
         region_count,
+        repair_arena,
     )
-    exemplar_candidate_mask = fallback.native_kd._require_native().build_exemplar_candidate_mask(
-        safe_donor_mask,
-        analysis.pure_region_id,
-    )
-    exemplar_candidate_mask.setflags(write=False)
-    working = provisional.records
     working.setflags(write=True)
     exemplar_processed = 0
     exemplar_unfinished = 0
     exemplar_iterations = 0
     exemplar_evaluations = 0
+    member_cursor = 0
+    component_arena_mark = repair_arena.mark()
     for component in range(component_count):
-        start = int(component_offsets[component])
-        end = int(component_offsets[component + 1])
+        repair_arena.rewind(component_arena_mark)
+        start = member_cursor
+        while (
+            member_cursor < member_order.size
+            and int(component_ids[int(member_order[member_cursor])]) == component
+        ):
+            member_cursor += 1
+        end = member_cursor
+        if start == end:
+            raise RuntimeError("fixed graph member order omitted a component")
         indexes = member_order[start:end]
-        if not any(int(working[int(index)]["backend"]) == 0 for index in indexes):
-            continue
-        component_records = np.ascontiguousarray(working[indexes])
-        region_id = int(component_records[0]["region_id"])
+        region_id = int(working[int(indexes[0])]["region_id"])
         if not bool(region_has_safe_donor[region_id]):
             continue
-        target_pixels = np.unique(component_records["pixel_index"])
-        if target_pixels.size < QUALITY_EXEMPLAR_MIN_TARGET_PIXELS:
-            continue
-        if not _component_has_exemplar_candidate(
-            component_records,
-            exemplar_candidate_mask,
-            analysis.pure_region_id,
-            region_id=region_id,
-            render_shape=render_shape,
-        ):
-            continue
-        if not fallback.native_kd._require_native().component_may_score_exemplar(
-            analysis.coverage_count,
-            analysis.pure_region_id,
-            safe_donor_mask,
-            target_pixels,
-            region_id,
-        ):
+        preflight_mark = repair_arena.mark()
+        native = fallback.native_kd._require_native()
+        try:
+            target_pixels = _component_target_pixels(
+                working,
+                indexes,
+                region_id=region_id,
+                render_shape=render_shape,
+                arena=repair_arena,
+            )
+            if target_pixels.size < QUALITY_EXEMPLAR_MIN_TARGET_PIXELS:
+                continue
+            mask_workspace = repair_arena.allocate(
+                _EXEMPLAR_MASK_PREFLIGHT_BYTES,
+                np.uint8,
+            )
+            may_score = native.component_may_score_exemplar(
+                analysis.coverage_count,
+                analysis.pure_region_id,
+                safe_donor_mask,
+                target_pixels,
+                region_id,
+                mask_workspace,
+            )
+        except native.QualityBudgetError as error:
+            raise QualityRepairBudgetError(
+                "64 MiB repair arena exceeded during exemplar preflight"
+            ) from error
+        finally:
+            repair_arena.rewind(preflight_mark)
+        if not may_score:
             continue
         repaired = exemplar.repair_component_exemplar(
-            component_records,
+            working,
             analysis,
             safe_donor_mask,
             region_id=region_id,
             render_shape=render_shape,
             budgets=budgets,
             in_place=True,
+            arena=repair_arena,
+            record_indexes=indexes,
         )
-        working[indexes] = repaired.records
         exemplar_processed += repaired.processed_target_count
         exemplar_unfinished += repaired.unfinished_target_count
         exemplar_iterations += repaired.patch_iteration_count
         exemplar_evaluations += repaired.donor_evaluation_count
     final_records = fallback.finalize_safe_fallbacks(working, in_place=True)
-    visited = provisional.visited_nodes
     return QualityRepairPlan(
         records=final_records,
         record_component_ids=component_ids,
@@ -433,14 +560,16 @@ def plan_quality_repairs(
         local_evaluated_slot_count=local_evaluated_slot_count,
         local_physical_sample_read_count=local_physical_sample_read_count,
         local_filled_run_count=local_filled_run_count,
-        local_budget_skipped_run_count=(budgets.local_budget_skipped_run_count - skipped_before),
-        fallback_indexed_donor_count=provisional.indexed_donor_count,
-        fallback_index_bytes=provisional.index_bytes,
-        fallback_query_count=provisional.query_count,
-        fallback_anchor_count=provisional.anchor_fallback_count,
-        fallback_visited_nodes_total=int(np.sum(visited, dtype=np.uint64)),
-        fallback_visited_nodes_max=int(visited.max(initial=np.uint32(0))),
-        fallback_visited_nodes_p95=_linear_p95(visited),
+        local_budget_skipped_run_count=(
+            budgets.local_budget_skipped_run_count - skipped_before
+        ),
+        fallback_indexed_donor_count=fallback_indexed_donor_count,
+        fallback_index_bytes=fallback_index_bytes,
+        fallback_query_count=fallback_query_count,
+        fallback_anchor_count=fallback_anchor_count,
+        fallback_visited_nodes_total=fallback_visited_nodes_total,
+        fallback_visited_nodes_max=fallback_visited_nodes_max,
+        fallback_visited_nodes_p95=fallback_visited_nodes_p95,
         exemplar_processed_target_count=exemplar_processed,
         exemplar_unfinished_target_count=exemplar_unfinished,
         exemplar_patch_iteration_count=exemplar_iterations,

@@ -20,6 +20,7 @@ from .forward_splat import (
 from .stereo_geometry import (
     StereoGeometryFrame,
     _resize_float32_bilinear,
+    build_metric_geometry,
     build_relative_geometry,
 )
 
@@ -662,9 +663,10 @@ class StereoRenderer:
             stereo_strength=settings.stereo_strength,
             convergence=settings.convergence,
         )
+        del frame, canonical, canonical_values
         legacy_near_score = torch.from_numpy(np.array(geometry.near_score, copy=True, order="C"))
         eye_offsets = calculate_eye_sample_offsets(legacy_near_score, settings)
-        return self._render_fast_compact_core(
+        result = self._render_fast_compact_core(
             source,
             geometry,
             eye_offsets,
@@ -673,6 +675,45 @@ class StereoRenderer:
                 occlusion_fill=settings.occlusion_fill,
             ),
         )
+        del source, geometry, legacy_near_score, eye_offsets
+        return result
+
+    def render_metric_primitives_fast_compact(
+        self,
+        frame: np.ndarray,
+        primitives,
+        settings: StereoSplatSettings,
+    ):
+        """Consume one owned metric primitive without retaining native arrays."""
+
+        metric = primitives.metric
+        source = np.asarray(frame)
+        geometry, metric_stats = build_metric_geometry(
+            metric.inverse_depth,
+            metric.valid,
+            metric.focal_x_normalized,
+            (int(source.shape[0]), int(source.shape[1])),
+            virtual_baseline_mm=float(primitives.virtual_baseline_mm),
+            convergence_distance_m=float(primitives.convergence_distance_m),
+            max_disparity_percent=float(primitives.max_disparity_percent),
+            retained_crop_width=primitives.retained_crop_width,
+        )
+        del primitives, metric
+        self._validate_geometry_inputs(source, geometry, settings)
+        source = np.ascontiguousarray(source)
+        del frame
+        eye_offsets = calculate_geometry_eye_sample_offsets(
+            geometry.total_disparity_fraction
+        )
+        result = self._render_fast_compact_core(
+            source,
+            geometry,
+            eye_offsets,
+            settings,
+            metric_stats=metric_stats,
+        )
+        del source, geometry, eye_offsets
+        return result
 
     def render_geometry_fast_compact(
         self,
@@ -909,6 +950,8 @@ class StereoRenderer:
         return result
 
     def _release_after_oom(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
         gc.collect()
         if self.device.type == "cuda":
             torch.cuda.empty_cache()

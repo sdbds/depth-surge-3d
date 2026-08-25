@@ -54,6 +54,19 @@ def test_bounded_capture_timeout_terminates_and_reaps_child() -> None:
     assert time.monotonic() - started < 3.0
 
 
+def test_bounded_capture_cancellation_terminates_and_reaps_child() -> None:
+    started = time.monotonic()
+    with pytest.raises(InterruptedError, match="cancellation"):
+        BoundedProcessCaptureV1(
+            stdout_cap=1024,
+            stderr_cap=1024,
+            timeout_seconds=30,
+            terminate_grace_seconds=0.2,
+            cancelled=lambda: True,
+        ).run([sys.executable, "-c", "import time; time.sleep(30)"])
+    assert time.monotonic() - started < 3.0
+
+
 def test_progress_runner_requires_semantic_progress_and_terminal_end() -> None:
     parser = FfmpegProgressParser()
     result = run_ffmpeg_progress_v1(
@@ -71,6 +84,21 @@ def test_progress_runner_requires_semantic_progress_and_terminal_end() -> None:
     assert result.returncode == 0
     assert result.stderr == b""
     assert parser.ended is True
+
+
+def test_progress_runner_cancellation_terminates_and_reaps_child() -> None:
+    started = time.monotonic()
+    with pytest.raises(InterruptedError, match="cancellation"):
+        run_ffmpeg_progress_v1(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            parser=FfmpegProgressParser(),
+            diagnostic_cap=1024,
+            line_cap=8192,
+            stall_seconds=30,
+            terminate_grace_seconds=0.2,
+            cancelled=lambda: True,
+        )
+    assert time.monotonic() - started < 3.0
 
 
 def test_streaming_runner_counts_stdout_without_retaining_it() -> None:
@@ -103,3 +131,17 @@ def test_streaming_runner_drains_then_rejects_diagnostics() -> None:
             stall_seconds=2.0,
             stream_buffer_bytes=512,
         )
+
+
+def test_streaming_runner_cancellation_terminates_and_reaps_child() -> None:
+    started = time.monotonic()
+    with pytest.raises(InterruptedError, match="cancellation"):
+        run_streaming_byte_count_v1(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            diagnostic_cap=1024,
+            stall_seconds=30,
+            stream_buffer_bytes=512,
+            terminate_grace_seconds=0.2,
+            cancelled=lambda: True,
+        )
+    assert time.monotonic() - started < 3.0

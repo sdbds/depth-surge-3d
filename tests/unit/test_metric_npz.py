@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import io
+import os
 from pathlib import Path
 import struct
 import zlib
@@ -13,6 +14,10 @@ import numpy as np
 import pytest
 
 from src.depth_surge_3d.io import metric_npz
+from src.depth_surge_3d.io.durable_publish import (
+    OwnedTemporaryCollisionError,
+    OwnedTemporaryIdentityError,
+)
 
 
 def _metric_values() -> tuple[np.ndarray, np.ndarray, np.float32]:
@@ -241,6 +246,30 @@ def test_owned_writer_emits_the_frozen_zip32_layout(tmp_path: Path) -> None:
     assert trace.complete_compressed_member_copies == 0
     assert trace.maximum_input_chunk_bytes <= metric_npz.METRIC_NPZ_WRITE_INPUT_CHUNK_BYTES
     assert trace.maximum_output_block_bytes <= metric_npz.METRIC_NPZ_WRITE_STREAM_BYTES
+
+
+def test_identity_audit_hashes_and_scans_headers_without_allocating_metric_arrays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "frame_000000.npz"
+    _write_owned(path)
+
+    monkeypatch.setattr(
+        metric_npz,
+        "_allocate_arrays",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("identity replay must not allocate metric arrays")
+        ),
+    )
+
+    identity = metric_npz.audit_metric_npz_identity(path, expected_shape=(2, 3))
+
+    assert identity.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert identity.byte_count == path.stat().st_size
+    assert identity.layout.archive_form == "owned-zip32-v1"
+    assert identity.member_shapes == ((2, 3), (2, 3), ())
+    assert identity.maximum_stream_bytes <= metric_npz.METRIC_NPZ_WRITE_STREAM_BYTES
     payload = path.read_bytes()
     for offset in _local_offsets(payload):
         local = struct.unpack_from("<IHHHHHIIIHH", payload, offset)
@@ -519,6 +548,58 @@ def test_owned_writer_preserves_old_bytes_before_replace_failure(
 
     assert path.read_bytes() == old
     assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("collision", ["regular", "hardlink", "symlink"])
+def test_owned_writer_preserves_an_unowned_temporary_collision(
+    tmp_path: Path,
+    collision: str,
+) -> None:
+    path = tmp_path / "frame_000000.npz"
+    temporary = path.with_name(f".{path.name}.metric-npz.tmp")
+    sentinel = tmp_path / "outside.bin"
+    sentinel.write_bytes(b"must survive")
+    if collision == "regular":
+        temporary.write_bytes(b"unowned")
+    elif collision == "hardlink":
+        os.link(sentinel, temporary)
+    else:
+        try:
+            temporary.symlink_to(sentinel)
+        except OSError as error:
+            pytest.skip(f"symlink creation unavailable: {error}")
+
+    with pytest.raises(OwnedTemporaryCollisionError, match="already exists"):
+        _write_owned(path)
+
+    assert sentinel.read_bytes() == b"must survive"
+    assert temporary.exists() or temporary.is_symlink()
+
+
+def test_owned_writer_preserves_a_post_sync_name_replacement(tmp_path: Path) -> None:
+    path = tmp_path / "frame_000000.npz"
+    temporary = path.with_name(f".{path.name}.metric-npz.tmp")
+    parked = tmp_path / "parked.tmp"
+
+    def replace_temporary(stage: str) -> None:
+        if stage == "after-sync":
+            temporary.rename(parked)
+            temporary.write_bytes(b"replacement")
+            raise RuntimeError("simulated crash")
+
+    inverse, valid, focal = _metric_values()
+    with pytest.raises(OwnedTemporaryIdentityError, match="changed"):
+        metric_npz.write_metric_npz(
+            path,
+            inverse,
+            valid,
+            focal,
+            fault=replace_temporary,
+        )
+
+    assert parked.is_file()
+    assert temporary.read_bytes() == b"replacement"
+    assert not path.exists()
 
 
 def test_size_bound_is_checked_before_opening_temporary(tmp_path: Path) -> None:

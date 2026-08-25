@@ -36,8 +36,10 @@ from depth_surge_3d.io.operations import (
 from depth_surge_3d.io.job_lock import JobWriterLock
 from depth_surge_3d.vdpp_work import cleanup_vdpp_private_work
 from depth_surge_3d.io.resume import (
+    LegacyFastAdoptionV1,
     apply_legacy_migration,
     build_resume_report,
+    recover_legacy_fast_adoption_intent_v1,
     resolve_resume_depth_model_version,
 )
 from depth_surge_3d.processing.frames.depth_storage import build_current_model_fingerprint
@@ -707,6 +709,7 @@ def main():  # noqa: C901
             output_dir = Path(args.resume).resolve()
             job_lock = JobWriterLock(output_dir).acquire()
             cleanup_vdpp_private_work(output_dir, job_lock)
+            recover_legacy_fast_adoption_intent_v1(output_dir)
             preflight = None
             execution_preflight = None
             audit_settings = processing_settings
@@ -794,6 +797,9 @@ def main():  # noqa: C901
                 if execution_preflight is None:
                     return 1
             apply_legacy_migration(resume_report, args.migrate_legacy)
+            legacy_fast_adoption = resume_report.legacy_fast_adoption
+            if not isinstance(legacy_fast_adoption, LegacyFastAdoptionV1):
+                legacy_fast_adoption = None
 
             print("Resuming processing...")
             print(f"Input: {video_path}")
@@ -820,13 +826,21 @@ def main():  # noqa: C901
                 if not video_properties:
                     print("Could not read video properties for cached resume")
                     return 1
+                processor_kwargs = {
+                    "verbose": bool(processing_settings.get("verbose", False)),
+                    "temporal_stabilizer": temporal_stabilizer,
+                    "preselected_depth_files": selected_files,
+                    "preselected_render_source": selected_source,
+                }
+                if legacy_fast_adoption is not None:
+                    processor_kwargs["legacy_fast_adoption"] = legacy_fast_adoption
                 processor = VideoProcessor(
                     None,
-                    verbose=bool(processing_settings.get("verbose", False)),
-                    temporal_stabilizer=temporal_stabilizer,
-                    preselected_depth_files=selected_files,
-                    preselected_render_source=selected_source,
+                    **processor_kwargs,
                 )
+                selected_artifact = None
+                selected_files = None
+                processor_kwargs.clear()
                 success = processor.process(
                     video_path=video_path,
                     output_dir=args.resume,
@@ -836,7 +850,14 @@ def main():  # noqa: C901
                 )
             else:
                 assert projector is not None and execution_preflight is not None
-                success = projector.execute_video(execution_preflight, job_lock=job_lock)
+                if legacy_fast_adoption is None:
+                    success = projector.execute_video(execution_preflight, job_lock=job_lock)
+                else:
+                    success = projector.execute_video(
+                        execution_preflight,
+                        job_lock=job_lock,
+                        legacy_fast_adoption=legacy_fast_adoption,
+                    )
 
             if success:
                 print("Resume processing completed successfully!")

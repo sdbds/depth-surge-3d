@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
 import hashlib
@@ -10,6 +11,7 @@ from pathlib import Path
 import stat
 from typing import Any, Literal
 
+from ...io.nofollow_io import AcquiredRoot, NoFollowPathError
 from ...utils.path_utils import parse_time_string
 from .bounded_process import (
     BoundedProcessCaptureV1,
@@ -22,6 +24,7 @@ from .encoding_provider import (
     FINAL_AUDIO_PROBE_STDERR_BYTES,
     FINAL_AUDIO_PROBE_STDOUT_BYTES,
     AudioProbeStream,
+    FfprobeJsonBudgetError,
     parse_audio_ffprobe_json,
 )
 
@@ -131,11 +134,14 @@ class SelectedAudioIdentityV1:
             f"@audio:sha256={self.source_raw_sha256}:" f"bytes={self.source_byte_count}:stream=a:0"
         )
 
-    def revalidate(self) -> None:
+    def revalidate(self, *, cancelled: Callable[[], bool] | None = None) -> None:
         if self.selection == "disabled":
             return
         assert self.selected_source_path is not None
-        actual = _hash_open_regular_file(self.selected_source_path)
+        actual = _hash_open_regular_file(
+            self.selected_source_path,
+            cancelled=cancelled,
+        )
         if (
             actual.path != self.selected_source_path
             or actual.identity != self.source_open_identity
@@ -162,44 +168,86 @@ def _checked_mul(left: int, right: int, label: str) -> int:
 def _identity_from_stat(metadata: os.stat_result) -> OpenFileIdentityV1:
     device = int(metadata.st_dev)
     inode = int(metadata.st_ino)
-    if os.name == "nt":
-        if not 0 <= device <= _U64_MAX or not 0 <= inode <= (1 << 128) - 1:
-            raise FinalAudioInputChangedError("Windows audio file identity is out of range")
-        return OpenFileIdentityV1("windows", f"{device:016x}", f"{inode:032x}")
     if device < 0 or inode < 0:
         raise FinalAudioInputChangedError("POSIX audio file identity is out of range")
     return OpenFileIdentityV1("posix", device, inode)
 
 
-def _hash_open_regular_file(path: Path) -> _HashedOpenFile:
-    supplied = Path(path)
-    before_path = supplied.lstat()
-    if stat.S_ISLNK(before_path.st_mode) or not stat.S_ISREG(before_path.st_mode):
-        raise FinalAudioInputChangedError("selected audio path is not a non-link regular file")
-    candidate = supplied.resolve(strict=True)
+def _identity_from_open_handle(handle) -> OpenFileIdentityV1:
+    if os.name != "nt":
+        return _identity_from_stat(os.fstat(handle.fileno()))
+    import msvcrt
+
+    from ...io.file_identity import windows_identity_from_handle
+
+    identity, _links, _attributes = windows_identity_from_handle(
+        int(msvcrt.get_osfhandle(handle.fileno())),
+        require_directory=False,
+    )
+    return OpenFileIdentityV1(
+        "windows",
+        identity.volume_serial,
+        identity.file_id,
+    )
+
+
+def _matches_acquired_identity(identity: OpenFileIdentityV1, acquired: object) -> bool:
+    if identity.platform == "posix":
+        return acquired == (identity.first, identity.second)
+    return (
+        getattr(acquired, "volume_serial", None) == identity.first
+        and getattr(acquired, "file_id", None) == identity.second
+    )
+
+
+def _hash_open_regular_file(
+    path: Path,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> _HashedOpenFile:
+    candidate = Path(os.path.abspath(os.fspath(path)))
     digest = hashlib.sha256()
     count = 0
-    with candidate.open("rb", buffering=0) as handle:
-        opened_before = os.fstat(handle.fileno())
-        if not stat.S_ISREG(opened_before.st_mode):
-            raise FinalAudioInputChangedError("selected audio handle is not a regular file")
-        identity = _identity_from_stat(opened_before)
-        if _identity_from_stat(before_path) != identity:
-            raise FinalAudioInputChangedError("selected audio path changed before hashing")
-        while True:
-            chunk = handle.read(FINAL_AUDIO_HASH_STREAM_BYTES)
-            if not chunk:
-                break
-            if count > _U64_MAX - len(chunk):
-                raise FinalAudioPcmOverflowError("selected audio byte count exceeds u64")
-            count += len(chunk)
-            digest.update(chunk)
-        opened_after = os.fstat(handle.fileno())
-    if _identity_from_stat(opened_after) != identity or int(opened_after.st_size) != count:
-        raise FinalAudioInputChangedError("selected audio source changed while hashing")
-    after_path = candidate.lstat()
-    if _identity_from_stat(after_path) != identity or not stat.S_ISREG(after_path.st_mode):
-        raise FinalAudioInputChangedError("selected audio path changed while hashing")
+    try:
+        with AcquiredRoot(candidate.parent) as acquired:
+            path_identity = acquired.regular_identity(candidate)
+            with acquired.open_regular(candidate) as handle:
+                opened_before = os.fstat(handle.fileno())
+                identity = _identity_from_open_handle(handle)
+                if not _matches_acquired_identity(identity, path_identity):
+                    raise FinalAudioInputChangedError(
+                        "selected audio path changed before hashing"
+                    )
+                while True:
+                    if cancelled is not None and cancelled():
+                        raise InterruptedError("final audio hashing was cancelled")
+                    chunk = handle.read(FINAL_AUDIO_HASH_STREAM_BYTES)
+                    if not chunk:
+                        break
+                    if count > _U64_MAX - len(chunk):
+                        raise FinalAudioPcmOverflowError(
+                            "selected audio byte count exceeds u64"
+                        )
+                    count += len(chunk)
+                    digest.update(chunk)
+                opened_after = os.fstat(handle.fileno())
+                if (
+                    _identity_from_open_handle(handle) != identity
+                    or int(opened_after.st_size) != count
+                    or opened_before.st_size != opened_after.st_size
+                ):
+                    raise FinalAudioInputChangedError(
+                        "selected audio source changed while hashing"
+                    )
+            after_identity = acquired.regular_identity(candidate)
+            if not _matches_acquired_identity(identity, after_identity):
+                raise FinalAudioInputChangedError(
+                    "selected audio path changed while hashing"
+                )
+    except NoFollowPathError as error:
+        raise FinalAudioInputChangedError(
+            "selected audio path is not a non-link regular file"
+        ) from error
     return _HashedOpenFile(candidate, identity, count, digest.hexdigest())
 
 
@@ -270,7 +318,10 @@ def audio_decode_command_v1(source: Path, clip_arguments: tuple[str, ...]) -> tu
 
 
 def _probe_first_audio_stream(
-    source: Path, clip_arguments: tuple[str, ...]
+    source: Path,
+    clip_arguments: tuple[str, ...],
+    *,
+    cancelled: Callable[[], bool] | None = None,
 ) -> AudioProbeStream | None:
     del clip_arguments
     try:
@@ -278,6 +329,7 @@ def _probe_first_audio_stream(
             stdout_cap=FINAL_AUDIO_PROBE_STDOUT_BYTES,
             stderr_cap=FINAL_AUDIO_PROBE_STDERR_BYTES,
             timeout_seconds=FINAL_AUDIO_PROBE_TIMEOUT_SECONDS,
+            cancelled=cancelled,
         ).run(audio_probe_command_v1(source))
     except ProcessTimeoutError as error:
         raise FinalAudioProbeTimeoutError("audio probe exceeded 30 seconds") from error
@@ -287,17 +339,27 @@ def _probe_first_audio_stream(
         raise FinalAudioProbeError("audio probe produced an error diagnostic")
     try:
         return parse_audio_ffprobe_json(result.stdout)
+    except FfprobeJsonBudgetError as error:
+        raise FinalAudioProbeBudgetError(
+            "audio probe JSON exceeded its parser-state budget"
+        ) from error
     except Exception as error:
         raise FinalAudioProbeError("audio probe JSON is invalid") from error
 
 
-def _decode_pcm_byte_count(source: Path, clip_arguments: tuple[str, ...]) -> int:
+def _decode_pcm_byte_count(
+    source: Path,
+    clip_arguments: tuple[str, ...],
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> int:
     try:
         result = run_streaming_byte_count_v1(
             audio_decode_command_v1(source, clip_arguments),
             diagnostic_cap=FINAL_AUDIO_DECODE_DIAGNOSTIC_BYTES,
             stall_seconds=FINAL_AUDIO_DECODE_STALL_SECONDS,
             stream_buffer_bytes=FINAL_AUDIO_STREAM_BYTES,
+            cancelled=cancelled,
         )
     except ProcessTimeoutError as error:
         raise FinalAudioDecodeTimeoutError("audio decode stopped making progress") from error
@@ -315,6 +377,7 @@ def prepare_selected_audio_v1(
     settings: dict[str, Any],
     frame_count: int,
     fps: str,
+    cancelled: Callable[[], bool] | None = None,
 ) -> SelectedAudioIdentityV1:
     """Freeze the one selected audio source and its exact usable sample boundary."""
 
@@ -329,9 +392,16 @@ def prepare_selected_audio_v1(
     else:
         selection = "original_video"
         selected_path = Path(original_video)
-    hashed = _hash_open_regular_file(selected_path)
+    hashed = _hash_open_regular_file(selected_path, cancelled=cancelled)
     clip_arguments = _resolve_clip_arguments(settings)
-    stream = _probe_first_audio_stream(hashed.path, clip_arguments)
+    if cancelled is None:
+        stream = _probe_first_audio_stream(hashed.path, clip_arguments)
+    else:
+        stream = _probe_first_audio_stream(
+            hashed.path,
+            clip_arguments,
+            cancelled=cancelled,
+        )
     if stream is None:
         return SelectedAudioIdentityV1(
             selection,
@@ -347,9 +417,15 @@ def prepare_selected_audio_v1(
             None,
         )
     pcm_frame_bytes = _checked_mul(4, stream.channels, "PCM frame byte count")
-    decoded = _checked_u64(
-        _decode_pcm_byte_count(hashed.path, clip_arguments), "decoded PCM byte count"
-    )
+    if cancelled is None:
+        decoded_count = _decode_pcm_byte_count(hashed.path, clip_arguments)
+    else:
+        decoded_count = _decode_pcm_byte_count(
+            hashed.path,
+            clip_arguments,
+            cancelled=cancelled,
+        )
+    decoded = _checked_u64(decoded_count, "decoded PCM byte count")
     if decoded % pcm_frame_bytes:
         raise FinalAudioDecodeError("decoded byte count does not end on a PCM frame")
     if decoded == 0:

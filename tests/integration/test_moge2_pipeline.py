@@ -9,6 +9,7 @@ import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import cv2
@@ -199,11 +200,33 @@ class _PipelineHarness:
         monkeypatch.setattr(
             VideoEncoder,
             "create_video",
-            lambda _encoder, vr_frames, output, video, settings: self._create_video(
+            lambda _encoder,
+            vr_frames,
+            output,
+            video,
+            settings,
+            *,
+            progress_tracker=None: self._create_authenticated_video(
+                _encoder,
                 vr_frames,
                 output,
                 video,
                 settings,
+            ),
+        )
+        monkeypatch.setattr(
+            VideoEncoder,
+            "retire_final_encoding_reservation",
+            self._retire_authenticated_video,
+        )
+        orchestrator_module = importlib.import_module(
+            "depth_surge_3d.processing.orchestration.pipeline_orchestrator"
+        )
+        monkeypatch.setattr(
+            orchestrator_module,
+            "audit_final_media_v1",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                final_video_authenticated=True
             ),
         )
         real_finalize = MetricGeometryStore.finalize
@@ -289,7 +312,14 @@ class _PipelineHarness:
         monkeypatch.setattr(
             encoder_module.VideoEncoder,
             "create_video",
-            lambda _encoder, vr_frames, output, video, settings: self._create_video(
+            lambda _encoder,
+            vr_frames,
+            output,
+            video,
+            settings,
+            *,
+            progress_tracker=None: self._create_authenticated_video(
+                _encoder,
                 vr_frames,
                 output,
                 video,
@@ -353,7 +383,9 @@ class _PipelineHarness:
         settings = self.settings(geometry_mode, **overrides)
         processor = VideoProcessor(estimator)
         if fail_stereo:
-            processor.stereo_generator._run_file_pipeline = self._fail_stereo
+            processor.stereo_generator.create_stereo_pairs_from_manifest = (
+                self._fail_stereo
+            )
         self._active_tracker = progress
         self._active_output_dir = output_dir
         self._stage_observations = []
@@ -431,6 +463,39 @@ class _PipelineHarness:
         )
         output.write_bytes(b"mocked media boundary\n")
         return True
+
+    def _create_authenticated_video(
+        self,
+        encoder: VideoEncoder,
+        vr_frames_dir: Path,
+        output_dir: Path,
+        video_path: str,
+        settings: dict[str, Any],
+    ) -> bool:
+        created = self._create_video(
+            vr_frames_dir,
+            output_dir,
+            video_path,
+            settings,
+        )
+        if created:
+            reservation = SimpleNamespace(
+                recover_publication_prefix=lambda: SimpleNamespace(
+                    phase="publication_authenticated"
+                ),
+                validate_authenticated_publication=lambda: None,
+            )
+            encoder._pending_final_reservation = reservation
+        return created
+
+    @staticmethod
+    def _retire_authenticated_video(
+        encoder: VideoEncoder,
+        *,
+        success: bool,
+    ) -> None:
+        del success
+        encoder._pending_final_reservation = None
 
     @staticmethod
     def _fail_stereo(*_args: object, **_kwargs: object) -> None:

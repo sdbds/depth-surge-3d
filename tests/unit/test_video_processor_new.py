@@ -58,7 +58,7 @@ class TestVideoProcessorInit:
 class TestVideoProcessorProcess:
     """Test VideoProcessor.process delegation."""
 
-    def test_process_unloads_depth_model_before_step_3(self, tmp_path):
+    def test_process_unloads_depth_model_before_step_3(self, tmp_path, monkeypatch):
         """VideoProcessor wires its estimator into the stage-boundary cleanup."""
 
         class LoadedDepthEstimator:
@@ -88,7 +88,12 @@ class TestVideoProcessorProcess:
             model_loaded_at_step_3 = estimator.loaded
             return False
 
-        processor.stereo_generator.create_stereo_pairs_from_files = observe_model_state
+        processor.stereo_generator.create_stereo_pairs_from_manifest = observe_model_state
+        monkeypatch.setattr(
+            "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+            "publish_validated_stereo_input_manifest_v1",
+            lambda **_kwargs: Mock(frame_count=1),
+        )
 
         result = processor.process(
             tmp_path / "source.mp4",

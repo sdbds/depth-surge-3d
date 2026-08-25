@@ -34,6 +34,15 @@ def read_png_header(path: Path | str) -> PngHeader | None:
     try:
         with Path(path).open("rb") as handle:
             payload = handle.read(_IHDR_SIZE)
+        return parse_png_header(payload)
+    except (OSError, struct.error):
+        return None
+
+
+def parse_png_header(payload: bytes) -> PngHeader | None:
+    """Parse a signature and IHDR captured from an already-audited file handle."""
+
+    try:
         if (
             len(payload) != _IHDR_SIZE
             or payload[:8] != _PNG_SIGNATURE
@@ -55,8 +64,29 @@ def read_png_header(path: Path | str) -> PngHeader | None:
         ):
             return None
         return PngHeader(width, height, bit_depth, color_type, channels)
-    except (OSError, struct.error):
+    except struct.error:
         return None
+
+
+def png_header_bytes_match(
+    payload: bytes,
+    *,
+    shape: Sequence[int],
+    bit_depth: int,
+) -> bool:
+    """Match an IHDR prefix captured while hashing the same regular-file handle."""
+
+    if len(shape) not in {2, 3}:
+        return False
+    header = parse_png_header(payload)
+    expected_channels = 1 if len(shape) == 2 else int(shape[2])
+    return bool(
+        header
+        and header.height == int(shape[0])
+        and header.width == int(shape[1])
+        and header.channels == expected_channels
+        and header.bit_depth == bit_depth
+    )
 
 
 def png_header_matches(

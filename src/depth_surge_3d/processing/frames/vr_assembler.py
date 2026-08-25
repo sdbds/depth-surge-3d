@@ -7,6 +7,9 @@ Assembles stereo pairs into final VR format (side-by-side or over-under).
 from __future__ import annotations
 
 import cv2
+from dataclasses import dataclass
+import os
+import re
 import traceback
 from pathlib import Path
 from typing import Any
@@ -29,6 +32,17 @@ from .stage_manifest import (
 
 
 VR_STAGE_ALGORITHM_VERSION = "vr-layout-v2"
+_CANONICAL_FRAME = re.compile(r"^frame_([0-9]{6,})\.png$")
+
+
+@dataclass(frozen=True, slots=True)
+class DirectStereoSource:
+    """Scalar parent/range hint; the encoding provider performs authority audit."""
+
+    left_parent: Path
+    right_parent: Path
+    first_index: int
+    frame_count: int
 
 
 class VRFrameAssembler:
@@ -141,6 +155,62 @@ class VRFrameAssembler:
             print("Error: VR source frame manifest is incomplete")
             return None
         return left_files, right_files
+
+    def resolve_direct_vr_source(
+        self,
+        directories: dict[str, Path],
+        settings: dict[str, Any],
+        total_frames: int,
+    ) -> DirectStereoSource | None:
+        """Return only scalar hints; no path collection is retained or authoritative."""
+
+        source_dirs = self._get_vr_assembly_source_dirs(directories, settings)
+        if source_dirs is None:
+            return None
+        left_range = self._streaming_frame_range(source_dirs[0])
+        right_range = self._streaming_frame_range(source_dirs[1])
+        if (
+            left_range is None
+            or right_range is None
+            or left_range != right_range
+            or (total_frames > 0 and left_range[1] != total_frames)
+        ):
+            print("Error: VR source frame manifest is incomplete")
+            return None
+        first_index, frame_count = left_range
+        return DirectStereoSource(
+            left_parent=source_dirs[0],
+            right_parent=source_dirs[1],
+            first_index=first_index,
+            frame_count=frame_count,
+        )
+
+    @staticmethod
+    def _streaming_frame_range(directory: Path) -> tuple[int, int] | None:
+        count = 0
+        minimum: int | None = None
+        maximum: int | None = None
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    match = _CANONICAL_FRAME.fullmatch(entry.name)
+                    if match is None:
+                        continue
+                    index = int(match.group(1))
+                    if entry.name != f"frame_{index:06d}.png" or not entry.is_file(
+                        follow_symlinks=False
+                    ):
+                        return None
+                    count += 1
+                    minimum = index if minimum is None else min(minimum, index)
+                    maximum = index if maximum is None else max(maximum, index)
+        except OSError:
+            return None
+        if count == 0 or minimum is None or maximum is None:
+            return None
+        if maximum - minimum + 1 != count:
+            return None
+        return minimum, count
 
     def _run_assembly_workers(
         self,
@@ -283,8 +353,7 @@ class VRFrameAssembler:
             left_dir = directories["left_cropped"]
             right_dir = directories["right_cropped"]
             if left_dir.exists() and right_dir.exists():
-                left_files = list(left_dir.glob("*.png"))
-                if left_files:  # Verify directory has frames
+                if next(left_dir.glob("*.png"), None) is not None:
                     return left_dir, right_dir
 
         print("Error: No cropped or upscaled frames found for VR assembly")

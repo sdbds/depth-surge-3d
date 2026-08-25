@@ -928,6 +928,27 @@ class TestLoadProcessingSettings:
 
         assert result is None
 
+    def test_schema5_settings_size_is_gated_before_bulk_read(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from src.depth_surge_3d.io.operations import load_processing_settings
+
+        settings = tmp_path / "processing-settings-v5.json"
+        with settings.open("wb") as handle:
+            handle.truncate(512 * 1024 + 1)
+        original_read_bytes = Path.read_bytes
+
+        def reject_bulk_read(path: Path) -> bytes:
+            if path == settings:
+                raise AssertionError("oversized schema-5 settings were bulk-read")
+            return original_read_bytes(path)
+
+        monkeypatch.setattr(Path, "read_bytes", reject_bulk_read)
+
+        assert load_processing_settings(settings) is None
+
 
 class TestUpdateProcessingStatus:
     """Test update_processing_status function."""

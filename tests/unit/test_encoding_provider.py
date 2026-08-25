@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 from pathlib import PurePosixPath
 import sys
@@ -185,6 +186,68 @@ def test_manifest_postpass_detects_any_image_byte_change(tmp_path: Path) -> None
         )
 
 
+def test_manifest_prepass_cancels_during_image_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(frame_count=1)
+    item = next(provider.replay())
+    assert item.frame_relative_path is not None
+    _write_png(tmp_path / item.frame_relative_path, 64, 64, 10)
+    monkeypatch.setattr(encoding_provider, "FINAL_ENCODING_IMAGE_STREAM_BYTES", 16)
+    polls = 0
+
+    def cancelled() -> bool:
+        nonlocal polls
+        polls += 1
+        return polls >= 7
+
+    with pytest.raises(InterruptedError, match="cancelled"):
+        encoding_provider.stage_encoding_input_manifest(
+            provider,
+            job_root=tmp_path,
+            sink=io.BytesIO(),
+            per_eye_size=(32, 64),
+            vr_format="side_by_side",
+            cancelled=cancelled,
+        )
+
+
+def test_manifest_resume_and_postpass_are_cancellable(tmp_path: Path) -> None:
+    provider = _provider(frame_count=1)
+    item = next(provider.replay())
+    assert item.frame_relative_path is not None
+    _write_png(tmp_path / item.frame_relative_path, 8, 4, 10)
+    staged = encoding_provider.stage_encoding_input_manifest(
+        provider,
+        job_root=tmp_path,
+        sink=io.BytesIO(),
+        per_eye_size=(4, 4),
+        vr_format="side_by_side",
+    )
+
+    with pytest.raises(InterruptedError, match="cancelled"):
+        encoding_provider.audit_encoding_input_manifest(
+            provider,
+            job_root=tmp_path,
+            expected_fingerprint=staged.fingerprint,
+            expected_raw_sha256=staged.raw_sha256,
+            expected_raw_byte_count=staged.raw_byte_count,
+            per_eye_size=(4, 4),
+            vr_format="side_by_side",
+            cancelled=lambda: True,
+        )
+    with pytest.raises(InterruptedError, match="cancelled"):
+        encoding_provider.validate_encoding_postpass(
+            provider,
+            job_root=tmp_path,
+            staged=staged,
+            per_eye_size=(4, 4),
+            vr_format="side_by_side",
+            cancelled=lambda: True,
+        )
+
+
 def test_directory_prepass_rejects_an_unmanifested_trailing_image(tmp_path: Path) -> None:
     provider = _provider(frame_count=1)
     item = next(provider.replay())
@@ -193,6 +256,57 @@ def test_directory_prepass_rejects_an_unmanifested_trailing_image(tmp_path: Path
     _write_png(tmp_path / "99_vr_frames/frame_000001.png", 8, 4, 2)
 
     with pytest.raises(encoding_provider.EncodingDirectoryError, match="count|range"):
+        encoding_provider.stage_encoding_input_manifest(
+            provider,
+            job_root=tmp_path,
+            sink=io.BytesIO(),
+            per_eye_size=(4, 4),
+            vr_format="side_by_side",
+        )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "frame_bad.png",
+        "frame_000000.PNG",
+        "FRAME_000000.png",
+        "frame_+000000.png",
+    ],
+)
+def test_directory_prepass_rejects_every_malformed_frame_domain_name(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    provider = _provider(frame_count=1)
+    item = next(provider.replay())
+    assert item.frame_relative_path is not None
+    if name.casefold() != "frame_000000.png":
+        _write_png(tmp_path / item.frame_relative_path, 8, 4, 1)
+    _write_png(tmp_path / "99_vr_frames" / name, 8, 4, 2)
+
+    with pytest.raises(encoding_provider.EncodingDirectoryError, match="noncanonical"):
+        encoding_provider.stage_encoding_input_manifest(
+            provider,
+            job_root=tmp_path,
+            sink=io.BytesIO(),
+            per_eye_size=(4, 4),
+            vr_format="side_by_side",
+        )
+
+
+def test_directory_prepass_rejects_a_linked_parent(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real_frames"
+    real_parent.mkdir()
+    _write_png(real_parent / "frame_000000.png", 8, 4, 1)
+    alias = tmp_path / "99_vr_frames"
+    try:
+        os.symlink(real_parent, alias, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this host")
+    provider = _provider(frame_count=1)
+
+    with pytest.raises(encoding_provider.EncodingDirectoryError):
         encoding_provider.stage_encoding_input_manifest(
             provider,
             job_root=tmp_path,
@@ -342,6 +456,35 @@ def test_audio_ffprobe_parser_rejects_duplicate_authority_and_unknown_roots(raw:
         encoding_provider.parse_audio_ffprobe_json(raw)
 
 
+def test_audio_ffprobe_parser_enforces_ignored_wrapper_state_caps() -> None:
+    accepted = b'{"streams":[],"programs":[' + b",".join([b"{}"] * 256) + b"]}"
+    rejected_containers = (
+        b'{"streams":[],"programs":[' + b",".join([b"{}"] * 257) + b"]}"
+    )
+    accepted_scalar = (
+        b'{"streams":[],"programs":[{"value":"' + (b"x" * 128) + b'"}]}'
+    )
+    rejected_scalar = (
+        b'{"streams":[],"programs":[{"value":"' + (b"x" * 129) + b'"}]}'
+    )
+
+    assert encoding_provider.parse_audio_ffprobe_json(accepted) is None
+    assert encoding_provider.parse_audio_ffprobe_json(accepted_scalar) is None
+    with pytest.raises(encoding_provider.FfprobeJsonError, match="container"):
+        encoding_provider.parse_audio_ffprobe_json(rejected_containers)
+    with pytest.raises(encoding_provider.FfprobeJsonError, match="scalar"):
+        encoding_provider.parse_audio_ffprobe_json(rejected_scalar)
+
+
+def test_audio_ffprobe_parser_enforces_depth_without_recursive_decoding() -> None:
+    depth_eight = b'{"streams":[],"programs":[{"v":[[[[[]]]]]}]}'
+    depth_nine = b'{"streams":[],"programs":[{"v":[[[[[[]]]]]]}]}'
+
+    assert encoding_provider.parse_audio_ffprobe_json(depth_eight) is None
+    with pytest.raises(encoding_provider.FfprobeJsonError, match="depth"):
+        encoding_provider.parse_audio_ffprobe_json(depth_nine)
+
+
 def test_final_ffprobe_parser_allows_only_empty_optional_wrappers() -> None:
     raw = json.dumps(
         {
@@ -371,6 +514,21 @@ def test_final_ffprobe_parser_allows_only_empty_optional_wrappers() -> None:
         encoding_provider.parse_final_ffprobe_json(
             raw.replace(b'"programs":[]', b'"programs":[{}]')
         )
+
+
+def test_final_ffprobe_parser_enforces_scalar_token_cap() -> None:
+    accepted = (
+        b'{"streams":[{"codec_type":"' + (b"x" * 128) + b'"}],"programs":[]}'
+    )
+    rejected = (
+        b'{"streams":[{"codec_type":"' + (b"x" * 129) + b'"}],"programs":[]}'
+    )
+
+    assert encoding_provider.parse_final_ffprobe_json(accepted)[0].fields["codec_type"] == (
+        "x" * 128
+    )
+    with pytest.raises(encoding_provider.FfprobeJsonError, match="scalar"):
+        encoding_provider.parse_final_ffprobe_json(rejected)
 
 
 def test_final_probe_contract_validates_exact_generated_video_and_audio() -> None:
@@ -449,6 +607,74 @@ def test_final_probe_contract_rejects_noncanonical_video_fields(field, value) ->
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sample_aspect_ratio", "1/1"),
+        ("display_aspect_ratio", "16/9"),
+        ("avg_frame_rate", "24000:1001"),
+    ],
+)
+def test_final_probe_contract_rejects_ratio_separator_substitution(field, value) -> None:
+    fields = {
+        "codec_type": "video",
+        "codec_name": "h264",
+        "width": 1920,
+        "height": 1080,
+        "pix_fmt": "yuv420p",
+        "sample_aspect_ratio": "1:1",
+        "display_aspect_ratio": "16:9",
+        "avg_frame_rate": "24000/1001",
+        "nb_read_frames": "101",
+    }
+    fields[field] = value
+    expectation = encoding_provider.FinalContainerExpectation(
+        width=1920,
+        height=1080,
+        fps="24000/1001",
+        frame_count=101,
+        resolved_encoder="libx264",
+        audio_expected=False,
+        audio_packet_upper_bound=0,
+    )
+
+    with pytest.raises(encoding_provider.FinalContainerValidationError):
+        encoding_provider.validate_final_probe_streams(
+            (encoding_provider.FinalProbeStream(fields),), expectation
+        )
+
+
+def test_final_probe_audio_packet_bound_has_a_distinct_error() -> None:
+    video = encoding_provider.FinalProbeStream(
+        {
+            "codec_type": "video",
+            "codec_name": "h264",
+            "width": 8,
+            "height": 4,
+            "pix_fmt": "yuv420p",
+            "sample_aspect_ratio": "1:1",
+            "display_aspect_ratio": "2:1",
+            "avg_frame_rate": "24/1",
+            "nb_read_frames": "1",
+        }
+    )
+    audio = encoding_provider.FinalProbeStream(
+        {"codec_type": "audio", "codec_name": "aac", "nb_read_frames": "4"}
+    )
+    expectation = encoding_provider.FinalContainerExpectation(
+        width=8,
+        height=4,
+        fps="24/1",
+        frame_count=1,
+        resolved_encoder="libx264",
+        audio_expected=True,
+        audio_packet_upper_bound=3,
+    )
+
+    with pytest.raises(encoding_provider.FinalContainerAudioPacketBoundError):
+        encoding_provider.validate_final_probe_streams((video, audio), expectation)
+
+
 def test_progress_parser_resets_only_on_strict_numeric_increase() -> None:
     parser = encoding_provider.FfmpegProgressParser()
 
@@ -462,6 +688,23 @@ def test_progress_parser_resets_only_on_strict_numeric_increase() -> None:
 
     with pytest.raises(encoding_provider.EncodingProgressError):
         parser.feed_line(b"frame=2\n")
+
+
+def test_final_decode_progress_ignores_total_size_for_stall_progress() -> None:
+    parser = encoding_provider.FinalDecodeProgressParser()
+
+    assert not parser.feed_line(b"total_size=1\n")
+    assert parser.feed_line(b"frame=1\n")
+    assert not parser.feed_line(b"total_size=2\n")
+    assert not parser.feed_line(b"progress=end\n")
+    parser.finish()
+
+
+def test_final_decode_progress_rejects_values_over_256_bytes() -> None:
+    parser = encoding_provider.FinalDecodeProgressParser()
+
+    with pytest.raises(encoding_provider.EncodingProgressError, match="value"):
+        parser.feed_line(b"unknown=" + b"x" * 257 + b"\n")
 
 
 def test_all_encoding_coordinator_phase_formulas_fit_the_eight_mib_budget() -> None:

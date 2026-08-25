@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import gc
 import hashlib
+import json
+import os
 from pathlib import Path
 import sys
 import threading
 import time
+import weakref
 
+import cv2
+import numpy as np
 import pytest
 
-from src.depth_surge_3d.processing.frames import stereo_control
+from src.depth_surge_3d.processing.frames import stereo_control, stereo_input_manifest
+from src.depth_surge_3d.processing.frames.metric_geometry import (
+    ClipConvergence,
+    MetricGeometryFrame,
+    MetricGeometryStore,
+)
 
 
 def _generation(frame_count: int) -> stereo_control.StereoProviderGeneration:
@@ -38,6 +49,11 @@ def _item(
         right_path=Path("right") / f"{stem}.png",
         guide_sha256=f"{index:064x}"[-64:],
         geometry_sha256=f"{index + 1:064x}"[-64:],
+        guide_byte_count=4096,
+        geometry_byte_count=2048,
+        guide_shape=(1080, 1920),
+        geometry_shape=(540, 960),
+        frame_json_bound=1024 * 1024,
     )
 
 
@@ -121,6 +137,250 @@ def test_provider_audit_is_lazy_and_freezes_one_generation() -> None:
     assert not hasattr(plan, "items")
 
 
+def _published_relative_provider(tmp_path: Path, count: int = 2):
+    guides = tmp_path / "00_original_frames"
+    geometry = tmp_path / "03_disparity_maps"
+    left = tmp_path / "04_left_frames"
+    right = tmp_path / "04_right_frames"
+    for directory in (guides, geometry, left, right):
+        directory.mkdir()
+    guide_paths: list[Path] = []
+    geometry_paths: list[Path] = []
+    for source_index in range(count):
+        frame_index = source_index + 1
+        stem = f"frame_{frame_index:06d}"
+        guide = guides / f"{stem}.png"
+        disparity = geometry / f"{stem}.png"
+        assert cv2.imwrite(
+            str(guide),
+            np.full((4, 6, 3), 20 + source_index, dtype=np.uint8),
+        )
+        assert cv2.imwrite(
+            str(disparity),
+            np.full((2, 3), 100 + source_index, dtype=np.uint16),
+        )
+        guide_paths.append(guide)
+        geometry_paths.append(disparity)
+    descriptor = stereo_input_manifest.publish_stereo_input_manifest_v1(
+        manifest_path=geometry / "stereo_input_manifest.jsonl",
+        job_root=tmp_path,
+        guide_files=iter(guide_paths),
+        geometry_files=iter(geometry_paths),
+        frame_count=count,
+        geometry_mode="relative",
+        source_metadata={
+            "fingerprint": "ab" * 32,
+            "encoding_scale": 65535.0,
+        },
+    )
+    provider = descriptor.open_provider(left_dir=left, right_dir=right)
+    return descriptor, provider, guide_paths, geometry_paths
+
+
+def test_canonical_upstream_manifest_owns_provider_identity_without_input_lists(
+    tmp_path: Path,
+) -> None:
+    descriptor, provider, guide_paths, geometry_paths = _published_relative_provider(tmp_path)
+    guide_paths.clear()
+    geometry_paths.clear()
+
+    items = list(provider.replay())
+
+    assert descriptor.raw_sha256 == hashlib.sha256(descriptor.path.read_bytes()).hexdigest()
+    assert provider.generation.input_manifest_fingerprint == descriptor.raw_sha256
+    assert [item.frame_name for item in items] == ["frame_000001", "frame_000002"]
+    assert [item.source_index for item in items] == [0, 1]
+    assert not hasattr(descriptor, "items")
+    assert not hasattr(provider, "items")
+
+    adopted = stereo_input_manifest.load_stereo_input_manifest_v1(
+        descriptor.path,
+        job_root=tmp_path,
+    )
+    assert adopted == descriptor
+
+
+def test_every_provider_replay_rehashes_actual_source_payload(tmp_path: Path) -> None:
+    descriptor, provider, guide_paths, _geometry_paths = _published_relative_provider(
+        tmp_path,
+        count=1,
+    )
+    plan = stereo_control.audit_stereo_provider(
+        provider,
+        lambda _item: stereo_control.StereoAction.REUSE,
+    )
+    assert cv2.imwrite(str(guide_paths[0]), np.full((4, 6, 3), 99, dtype=np.uint8))
+
+    with pytest.raises(stereo_control.StereoProviderChangedError, match="payload changed"):
+        stereo_control.validate_stereo_provider_replay(
+            provider,
+            plan,
+            mutation_started=False,
+        )
+
+
+def test_relative_provider_replay_streams_each_declared_payload_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _descriptor, provider, _guide_paths, _geometry_paths = _published_relative_provider(
+        tmp_path,
+        count=2,
+    )
+    original = stereo_input_manifest._stream_identity
+    calls = 0
+
+    def counted(path: Path, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(stereo_input_manifest, "_stream_identity", counted)
+
+    assert len(list(provider.replay())) == 2
+    assert calls == 4
+
+
+def test_provider_replay_uses_one_acquired_root_instance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _descriptor, provider, _guide_paths, _geometry_paths = _published_relative_provider(
+        tmp_path,
+        count=2,
+    )
+    acquired_root = stereo_input_manifest.AcquiredRoot
+    instances = 0
+
+    class CountedAcquiredRoot(acquired_root):
+        def __init__(self, root: Path) -> None:
+            nonlocal instances
+            instances += 1
+            super().__init__(root)
+
+    monkeypatch.setattr(
+        stereo_input_manifest,
+        "AcquiredRoot",
+        CountedAcquiredRoot,
+    )
+
+    assert len(list(provider.replay())) == 2
+    assert instances == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows keeps the acquired directory named")
+def test_provider_replay_keeps_one_acquired_root_for_manifest_and_payloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_root = tmp_path / "job"
+    job_root.mkdir()
+    _descriptor, provider, _guide_paths, _geometry_paths = _published_relative_provider(
+        job_root,
+        count=1,
+    )
+    displaced = tmp_path / "job-displaced"
+    original_read_line = stereo_input_manifest._read_line
+    line_count = 0
+
+    def swap_root_after_header(handle):
+        nonlocal line_count
+        raw = original_read_line(handle)
+        line_count += 1
+        if line_count == 1:
+            job_root.rename(displaced)
+            job_root.mkdir()
+        return raw
+
+    monkeypatch.setattr(stereo_input_manifest, "_read_line", swap_root_after_header)
+
+    items = list(provider.replay())
+
+    assert [item.frame_name for item in items] == ["frame_000001"]
+    assert (displaced / "00_original_frames" / "frame_000001.png").is_file()
+    assert list(job_root.iterdir()) == []
+
+
+def test_upstream_completion_publishes_validated_relative_manifest(tmp_path: Path) -> None:
+    guides = tmp_path / "00_original_frames"
+    geometry = tmp_path / "03_disparity_maps"
+    guides.mkdir()
+    geometry.mkdir()
+    guide = guides / "frame_000001.png"
+    disparity = geometry / "frame_000001.png"
+    assert cv2.imwrite(str(guide), np.full((4, 6, 3), 20, dtype=np.uint8))
+    assert cv2.imwrite(str(disparity), np.full((2, 3), 100, dtype=np.uint16))
+    metadata = {
+        "schema_version": 1,
+        "algorithm_version": "scene-percentile-v1",
+        "representation": "relative_disparity",
+        "near_value": 1.0,
+        "far_value": 0.0,
+        "encoding": "uint16_png",
+        "encoding_scale": 65535.0,
+        "num_frames": 1,
+        "frame_names": [guide.name],
+        "native_shape": [2, 3],
+        "source_raw_fingerprint": "raw",
+        "source_model_fingerprint": "model",
+        "scene_manifest_fingerprint": "scene",
+        "depth_bounds_fingerprint": "bounds",
+    }
+    from src.depth_surge_3d.processing.frames.depth_storage import canonical_json_hash
+
+    metadata["fingerprint"] = canonical_json_hash(metadata)
+    (geometry / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    descriptor = stereo_input_manifest.publish_validated_stereo_input_manifest_v1(
+        job_root=tmp_path,
+        guide_files=[guide],
+        geometry_files=[disparity],
+        geometry_mode="relative",
+    )
+
+    assert descriptor.path == geometry / "stereo_input_manifest.jsonl"
+    assert descriptor.frame_count == 1
+    assert descriptor.source_geometry_fingerprint == metadata["fingerprint"]
+
+
+def test_upstream_completion_publishes_validated_metric_manifest(tmp_path: Path) -> None:
+    guides = tmp_path / "00_original_frames"
+    geometry = tmp_path / "03_metric_geometry"
+    guides.mkdir()
+    guide = guides / "frame_000001.png"
+    assert cv2.imwrite(str(guide), np.full((4, 6, 3), 20, dtype=np.uint8))
+    store = MetricGeometryStore.open_or_create(
+        geometry,
+        frame_names=[guide.name],
+        native_shape=(2, 3),
+        source_raw_fingerprint="raw-metric",
+        source_frame_fingerprint="frames",
+        candidate_scene_fingerprint="scenes",
+        preflight_required_bytes=0,
+    )
+    store.write_frame(
+        guide.name,
+        MetricGeometryFrame(
+            np.ones((2, 3), dtype=np.float32),
+            np.ones((2, 3), dtype=np.bool_),
+            np.float32(0.5),
+        ),
+    )
+    store.finalize(ClipConvergence(np.float32(2.0), (0,), 6))
+
+    descriptor = stereo_input_manifest.publish_validated_stereo_input_manifest_v1(
+        job_root=tmp_path,
+        guide_files=[guide],
+        geometry_files=list(store.complete_files),
+        geometry_mode="metric_camera",
+    )
+
+    assert descriptor.geometry_mode == "metric"
+    assert descriptor.native_shape == (2, 3)
+    assert descriptor.resolved_auto_distance_m == pytest.approx(2.0)
+    assert descriptor.source_geometry_fingerprint == store.metadata["fingerprint"]
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -194,6 +454,43 @@ def test_replay_yields_only_the_selected_action_without_resident_sets() -> None:
     )
 
     assert [item.source_index for item in selected] == [0, 5, 10, 15]
+
+
+@pytest.mark.parametrize("failure_position", ["before_first", "middle", "after_last"])
+def test_action_replay_wraps_iterator_failures_as_post_mutation_input_change(
+    failure_position: str,
+) -> None:
+    original = _provider(3)
+    plan = stereo_control.audit_stereo_provider(
+        original,
+        lambda _item: stereo_control.StereoAction.RENDER,
+    )
+
+    def replay():
+        if failure_position == "before_first":
+            raise OSError("injected provider iteration failure")
+        for item in original.replay():
+            yield item
+            if failure_position == "middle" and item.source_index == 0:
+                raise ValueError("injected provider iteration failure")
+        if failure_position == "after_last":
+            raise stereo_control.StereoControlStateError(
+                "injected provider iteration failure"
+            )
+
+    changed = stereo_control.ReplayableStereoProvider(original.generation, replay)
+
+    with pytest.raises(
+        stereo_control.StereoStageInputChangedError,
+        match="injected provider iteration failure",
+    ):
+        list(
+            stereo_control.iter_stereo_action(
+                changed,
+                plan,
+                stereo_control.StereoAction.RENDER,
+            )
+        )
 
 
 def test_quality_capacity_is_exactly_one_and_p_zero_creates_no_control() -> None:
@@ -287,6 +584,33 @@ def test_p_zero_does_not_touch_global_stack_or_create_threads() -> None:
 
     assert group.live_thread_count == 0
     assert group.stats.thread_names == ()
+
+
+def test_p_zero_pipeline_replays_and_crosses_mutation_without_threads() -> None:
+    provider = _provider(2)
+    plan = stereo_control.audit_stereo_provider(
+        provider,
+        lambda _item: stereo_control.StereoAction.REUSE,
+    )
+    mutations: list[str] = []
+
+    stats = stereo_control.run_streaming_stereo_pipeline(
+        provider=provider,
+        plan=plan,
+        capacity=0,
+        effective_workers=0,
+        configured_workers=4,
+        decode=lambda _item: (_ for _ in ()).throw(AssertionError("decode ran")),
+        render=lambda _item: (_ for _ in ()).throw(AssertionError("render ran")),
+        write=lambda _item: (_ for _ in ()).throw(AssertionError("write ran")),
+        mutation=lambda: mutations.append("started"),
+    )
+
+    assert mutations == ["started"]
+    assert stats.configured_capacity == 0
+    assert stats.configured_workers == 4
+    assert stats.actual_thread_count == 0
+    assert stats.live_threads_after_join == 0
 
 
 def test_attestation_failure_cancels_and_joins_every_started_worker() -> None:
@@ -434,6 +758,16 @@ def test_streaming_pipeline_forces_bounded_decode_render_write_overlap(workers: 
     assert stats.maximum_live_items <= 2 * workers
     assert stats.queue_capacities == (2 * workers,) * 4
     assert stats.actual_thread_count == 1 + 2 * workers
+    assert stats.configured_workers == workers
+    assert stats.feeder_thread_count == 1
+    assert stats.decoder_thread_count == workers
+    assert stats.writer_thread_count == workers
+    assert stats.calculated_thread_bytes == (
+        stats.actual_thread_count * stereo_control.STEREO_IO_THREAD_BYTES
+    )
+    assert stats.previous_stack_bytes == stats.restored_stack_bytes
+    assert len(stats.stack_granularity_bytes) == stats.actual_thread_count
+    assert len(stats.reported_stack_reserve_bytes) == stats.actual_thread_count
     assert stats.requested_stack_bytes == 512 * 1024
     assert stats.parked_committed_delta_bytes <= (
         stats.actual_thread_count * stereo_control.STEREO_IO_THREAD_BYTES
@@ -441,6 +775,137 @@ def test_streaming_pipeline_forces_bounded_decode_render_write_overlap(workers: 
     assert stats.decode_render_overlap
     assert stats.render_write_overlap
     assert stats.work_item_copies == 0
+
+
+def test_capacity_permit_is_released_only_after_large_payload_references_are_gone() -> None:
+    provider = _provider(2)
+    plan = stereo_control.audit_stereo_provider(
+        provider,
+        lambda _item: stereo_control.StereoAction.RENDER,
+    )
+    decoded_refs: list[weakref.ReferenceType[_Payload]] = []
+    rendered_refs: list[weakref.ReferenceType[_Payload]] = []
+
+    def decode(item: stereo_control.StereoProviderItem) -> _Payload:
+        if item.source_index == 1:
+            gc.collect()
+            assert decoded_refs[0]() is None
+            assert rendered_refs[0]() is None
+        payload = _Payload(item.source_index)
+        decoded_refs.append(weakref.ref(payload))
+        return payload
+
+    def render(payload: _Payload) -> _Payload:
+        rendered = _Payload(payload.index)
+        rendered_refs.append(weakref.ref(rendered))
+        return rendered
+
+    stereo_control.run_streaming_stereo_pipeline(
+        provider=provider,
+        plan=plan,
+        capacity=1,
+        effective_workers=1,
+        decode=decode,
+        render=render,
+        write=lambda _payload: None,
+    )
+
+
+def test_feeder_acquires_capacity_before_requesting_the_next_provider_item() -> None:
+    base = _provider(2)
+    replay_number = 0
+    second_feeder_item_requested = threading.Event()
+
+    def replay():
+        nonlocal replay_number
+        replay_number += 1
+        current = replay_number
+        for item in base.replay():
+            if current == 4 and item.source_index == 1:
+                second_feeder_item_requested.set()
+            yield item
+
+    provider = stereo_control.ReplayableStereoProvider(base.generation, replay)
+    plan = stereo_control.audit_stereo_provider(
+        provider,
+        lambda _item: stereo_control.StereoAction.RENDER,
+    )
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    result: list[BaseException | None] = []
+
+    def write(_payload: object) -> None:
+        writer_entered.set()
+        assert release_writer.wait(timeout=5.0)
+
+    def run() -> None:
+        try:
+            stereo_control.run_streaming_stereo_pipeline(
+                provider=provider,
+                plan=plan,
+                capacity=1,
+                effective_workers=1,
+                decode=lambda item: item,
+                render=lambda item: item,
+                write=write,
+            )
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            result.append(error)
+        else:
+            result.append(None)
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    assert writer_entered.wait(timeout=5.0)
+    assert not second_feeder_item_requested.wait(timeout=0.2)
+    release_writer.set()
+    runner.join(timeout=5.0)
+    assert not runner.is_alive()
+    assert result == [None]
+
+
+def test_completion_acknowledgement_does_not_retain_a_finished_work_item() -> None:
+    generation = _generation(2)
+    replay_number = 0
+    first_feeder_item: list[weakref.ReferenceType[stereo_control.StereoProviderItem]] = []
+
+    def replay():
+        nonlocal replay_number
+        replay_number += 1
+        current = replay_number
+        for index in range(2):
+            if current == 4 and index == 1:
+                gc.collect()
+                assert first_feeder_item[0]() is None
+            item = _item(generation, index)
+            if current == 4 and index == 0:
+                first_feeder_item.append(weakref.ref(item))
+            yield item
+            item = None
+
+    provider = stereo_control.ReplayableStereoProvider(generation, replay)
+    plan = stereo_control.audit_stereo_provider(
+        provider,
+        lambda _item: stereo_control.StereoAction.RENDER,
+    )
+
+    stereo_control.run_streaming_stereo_pipeline(
+        provider=provider,
+        plan=plan,
+        capacity=1,
+        effective_workers=1,
+        decode=lambda item: item.source_index,
+        render=lambda item: item,
+        write=lambda _item: None,
+    )
+
+
+class _Payload:
+    __slots__ = ("data", "index", "__weakref__")
+
+    def __init__(self, index: int) -> None:
+        self.index = index
+        self.data = bytearray(1024 * 1024)
 
 
 def test_downstream_mutation_failure_cancels_workers_before_gate_release() -> None:
@@ -466,6 +931,198 @@ def test_downstream_mutation_failure_cancels_workers_before_gate_release() -> No
 
     assert touched == []
     assert stereo_control.current_process_thread_count() == baseline
+
+
+def test_parked_workers_get_a_final_provider_replay_before_mutation() -> None:
+    base = _provider(2)
+    replay_count = 0
+
+    def replay():
+        nonlocal replay_count
+        replay_count += 1
+        if replay_count == 3:
+            raise stereo_control.StereoControlStateError("changed while workers parked")
+        yield from base.replay()
+
+    provider = stereo_control.ReplayableStereoProvider(base.generation, replay)
+    plan = stereo_control.audit_stereo_provider(
+        provider,
+        lambda _item: stereo_control.StereoAction.RENDER,
+    )
+    mutations: list[str] = []
+    baseline = stereo_control.current_process_thread_count()
+
+    with pytest.raises(
+        stereo_control.StereoProviderChangedError,
+        match="changed while workers parked",
+    ):
+        stereo_control.run_streaming_stereo_pipeline(
+            provider=provider,
+            plan=plan,
+            capacity=1,
+            effective_workers=1,
+            decode=lambda item: item,
+            render=lambda item: item,
+            write=lambda _item: None,
+            mutation=lambda: mutations.append("started"),
+        )
+
+    assert mutations == []
+    assert stereo_control.current_process_thread_count() == baseline
+
+
+def test_downstream_mutation_input_change_is_typed_after_the_boundary() -> None:
+    provider = _provider(2)
+    plan = stereo_control.audit_stereo_provider(
+        provider,
+        lambda _item: stereo_control.StereoAction.RENDER,
+    )
+
+    with pytest.raises(
+        stereo_control.StereoStageInputChangedError,
+        match="injected mutation replay change",
+    ):
+        stereo_control.run_streaming_stereo_pipeline(
+            provider=provider,
+            plan=plan,
+            capacity=1,
+            effective_workers=1,
+            decode=lambda item: item,
+            render=lambda item: item,
+            write=lambda _item: None,
+            mutation=lambda: (_ for _ in ()).throw(
+                stereo_control.StereoInputIdentityMismatch(
+                    "injected mutation replay change"
+                )
+            ),
+        )
+
+
+@pytest.mark.parametrize("failure_stage", ["feeder", "decode", "write"])
+def test_streaming_pipeline_propagates_first_worker_error_without_deadlock(
+    failure_stage: str,
+) -> None:
+    base = _provider(6)
+    replay_count = 0
+
+    def replay():
+        nonlocal replay_count
+        replay_count += 1
+        if failure_stage == "feeder" and replay_count == 4:
+            raise stereo_control.StereoControlStateError("injected feeder change")
+        yield from base.replay()
+
+    provider = stereo_control.ReplayableStereoProvider(base.generation, replay)
+    plan = stereo_control.audit_stereo_provider(
+        provider,
+        lambda _item: stereo_control.StereoAction.RENDER,
+    )
+    result: list[BaseException | None] = []
+
+    def run() -> None:
+        try:
+            stereo_control.run_streaming_stereo_pipeline(
+                provider=provider,
+                plan=plan,
+                capacity=1,
+                effective_workers=1,
+                decode=lambda item: (
+                    (_ for _ in ()).throw(RuntimeError("injected decode failure"))
+                    if failure_stage == "decode" and item.source_index == 0
+                    else item
+                ),
+                render=lambda item: item,
+                write=lambda item: (
+                    (_ for _ in ()).throw(RuntimeError("injected write failure"))
+                    if failure_stage == "write" and item.source_index == 0
+                    else None
+                ),
+                mutation=lambda: None,
+            )
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            result.append(error)
+        else:
+            result.append(None)
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    runner.join(timeout=5.0)
+
+    assert not runner.is_alive(), f"{failure_stage} failure deadlocked the pipeline"
+    assert len(result) == 1
+    if failure_stage == "feeder":
+        assert isinstance(result[0], stereo_control.StereoStageInputChangedError)
+        assert "injected feeder change" in str(result[0])
+    else:
+        assert isinstance(result[0], RuntimeError)
+        assert f"injected {failure_stage} failure" in str(result[0])
+
+
+def test_late_feeder_error_after_last_render_cannot_return_success() -> None:
+    base = _provider(4)
+    replay_count = 0
+
+    def replay():
+        nonlocal replay_count
+        replay_count += 1
+        current = replay_count
+        yield from base.replay()
+        if current == 4:
+            time.sleep(0.1)
+            raise stereo_control.StereoControlStateError("late feeder corruption")
+
+    provider = stereo_control.ReplayableStereoProvider(base.generation, replay)
+    plan = stereo_control.audit_stereo_provider(
+        provider,
+        lambda item: (
+            stereo_control.StereoAction.RENDER
+            if item.source_index == 0
+            else stereo_control.StereoAction.REUSE
+        ),
+    )
+    baseline = stereo_control.current_process_thread_count()
+
+    with pytest.raises(
+        stereo_control.StereoStageInputChangedError,
+        match="late feeder corruption",
+    ):
+        stereo_control.run_streaming_stereo_pipeline(
+            provider=provider,
+            plan=plan,
+            capacity=1,
+            effective_workers=1,
+            decode=lambda item: bytearray(1024 * 1024),
+            render=lambda payload: payload,
+            write=lambda _payload: None,
+            mutation=lambda: None,
+        )
+
+    assert stereo_control.current_process_thread_count() == baseline
+
+
+def test_decoder_input_identity_mismatch_is_fatal_after_mutation() -> None:
+    provider = _provider(2)
+    plan = stereo_control.audit_stereo_provider(
+        provider,
+        lambda _item: stereo_control.StereoAction.RENDER,
+    )
+
+    with pytest.raises(
+        stereo_control.StereoStageInputChangedError,
+        match="injected input mismatch",
+    ):
+        stereo_control.run_streaming_stereo_pipeline(
+            provider=provider,
+            plan=plan,
+            capacity=1,
+            effective_workers=1,
+            decode=lambda _item: (_ for _ in ()).throw(
+                stereo_control.StereoInputIdentityMismatch("injected input mismatch")
+            ),
+            render=lambda item: item,
+            write=lambda _item: None,
+            mutation=lambda: None,
+        )
 
 
 def test_migration_replay_starts_only_after_pipeline_thread_teardown() -> None:

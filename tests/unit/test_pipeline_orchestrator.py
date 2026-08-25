@@ -1,7 +1,10 @@
 """Unit tests for pipeline orchestrator."""
 
+import gc
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
+import weakref
 
 import pytest
 
@@ -9,6 +12,7 @@ from src.depth_surge_3d.processing.orchestration.pipeline_orchestrator import (
     ProcessingOrchestrator,
 )
 from src.depth_surge_3d.io.job_lock import JobWriterLock
+from src.depth_surge_3d.io.resume import LegacyFastAdoptionV1
 
 
 class TestProcessingOrchestratorInit:
@@ -60,7 +64,9 @@ class TestProcessingOrchestratorInit:
             ([Path("frame_000001.png")], "unknown"),
         ],
     )
-    def test_preselected_files_and_producer_must_be_supplied_together(self, files, source):
+    def test_preselected_files_and_producer_must_be_supplied_together(
+        self, files, source
+    ):
         with pytest.raises(ValueError, match="preselected"):
             ProcessingOrchestrator(
                 Mock(),
@@ -116,14 +122,18 @@ class TestSetupProcessing:
     @patch(
         "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.save_processing_settings"
     )
-    @patch("src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time")
+    @patch(
+        "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time"
+    )
     def test_setup_processing(self, mock_time, mock_save_settings, mock_create_dirs):
         """Test setup processing creates directories and settings file."""
         mock_time.return_value = 1234567890
         mock_create_dirs.return_value = {"base": Path("/output/dir")}
         mock_save_settings.return_value = Path("/output/dir/settings.json")
 
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
 
         video_props = {"fps": 30, "frame_count": 100}
         settings = {"keep_intermediates": True}
@@ -143,7 +153,9 @@ class TestSetupProcessing:
 
     def test_setup_processing_omits_vr_directory_in_direct_mode(self):
         """Direct encoding does not create the unused assembled-frame directory."""
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
         with (
             patch(
                 "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.create_output_directories",
@@ -170,7 +182,9 @@ class TestSetupProcessing:
         self,
     ):
         """Explicitly disabling direct mode preserves the legacy directory setup."""
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
         with (
             patch(
                 "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.create_output_directories",
@@ -194,7 +208,9 @@ class TestSetupProcessing:
         )
 
     def test_setup_processing_creates_stabilized_directory_only_when_requested(self):
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
         with (
             patch(
                 "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.create_output_directories",
@@ -221,14 +237,18 @@ class TestSetupProcessing:
 class TestFinalizeProcessing:
     """Test _finalize_processing method."""
 
-    @patch("src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.completion_banner")
+    @patch(
+        "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.completion_banner"
+    )
     @patch(
         "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.update_processing_status"
     )
     @patch(
         "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.generate_output_filename"
     )
-    @patch("src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time")
+    @patch(
+        "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time"
+    )
     def test_finalize_processing_success(
         self, mock_time, mock_gen_filename, mock_update_status, mock_banner
     ):
@@ -237,7 +257,9 @@ class TestFinalizeProcessing:
         mock_gen_filename.return_value = "video_3D_side_by_side.mp4"
 
         video_encoder = Mock()
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), video_encoder)
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), video_encoder
+        )
         orchestrator._start_time = 1000.0  # Started 500 seconds ago
         orchestrator._settings_file = Path("/output/settings.json")
 
@@ -261,7 +283,9 @@ class TestFinalizeProcessing:
 
         # Check status was updated
         mock_update_status.assert_called_once()
-        video_encoder.retire_final_encoding_reservation.assert_called_once_with(success=True)
+        video_encoder.retire_final_encoding_reservation.assert_called_once_with(
+            success=True
+        )
 
     @patch(
         "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.update_processing_status"
@@ -269,7 +293,9 @@ class TestFinalizeProcessing:
     def test_finalize_processing_failure(self, mock_update_status):
         """Test finalize processing on failure."""
         video_encoder = Mock()
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), video_encoder)
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), video_encoder
+        )
         orchestrator._settings_file = Path("/output/settings.json")
 
         settings = {"vr_format": "side_by_side", "vr_resolution": "16x9-1080p"}
@@ -285,12 +311,16 @@ class TestFinalizeProcessing:
         mock_update_status.assert_called_once_with(
             Path("/output/settings.json"), "failed", {"error": "Video creation failed"}
         )
-        video_encoder.retire_final_encoding_reservation.assert_called_once_with(success=False)
+        video_encoder.retire_final_encoding_reservation.assert_called_once_with(
+            success=False
+        )
 
     @patch(
         "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.cleanup_intermediate_files"
     )
-    @patch("src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.completion_banner")
+    @patch(
+        "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.completion_banner"
+    )
     @patch(
         "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.update_processing_status"
     )
@@ -298,7 +328,9 @@ class TestFinalizeProcessing:
         self, _update_status, _banner, cleanup
     ):
         """Intermediates are deleted only after final video creation succeeds."""
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
         orchestrator._start_time = 0.0
         orchestrator._settings_file = Path("/output/settings.json")
 
@@ -326,7 +358,9 @@ class TestFinalizeProcessing:
     @patch(
         "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.update_processing_status"
     )
-    def test_failed_job_retains_all_committed_checkpoints(self, update_status, cleanup, tmp_path):
+    def test_failed_job_retains_all_committed_checkpoints(
+        self, update_status, cleanup, tmp_path
+    ):
         committed = {}
         for name in (
             "00_original_frames",
@@ -339,7 +373,9 @@ class TestFinalizeProcessing:
             payload = directory / "committed.bin"
             payload.write_bytes(name.encode("ascii"))
             committed[payload] = payload.read_bytes()
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
         orchestrator._settings_file = tmp_path / "job-settings.json"
 
         orchestrator._finalize_processing(
@@ -358,7 +394,9 @@ class TestFinalizeProcessing:
             {"error": "Video creation failed"},
         )
 
-    @patch("src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.completion_banner")
+    @patch(
+        "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.completion_banner"
+    )
     @patch(
         "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.update_processing_status"
     )
@@ -370,7 +408,9 @@ class TestFinalizeProcessing:
             "mean_clamped_fraction": 0.125,
             "max_clamped_fraction": 0.25,
         }
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
         orchestrator._settings_file = tmp_path / "job-settings.json"
         orchestrator._metric_clamp_summary = summary
 
@@ -393,12 +433,19 @@ class TestFinalizeProcessing:
         additional_info = update_status.call_args.args[2]
         assert additional_info["metric_clamp_summary"] == summary
 
-    def test_schema_five_cleanup_commits_authorization_and_pending_before_deletion(self, tmp_path):
+    def test_schema_five_cleanup_commits_authorization_and_pending_before_deletion(
+        self, tmp_path
+    ):
         events = []
         video_encoder = Mock()
-        reservation = object()
+        reservation = Mock()
+        reservation.recover_publication_prefix.return_value = Mock(
+            phase="publication_authenticated"
+        )
         video_encoder.pending_final_encoding_reservation = reservation
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), video_encoder)
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), video_encoder
+        )
         orchestrator._start_time = 0.0
         orchestrator._settings_file = tmp_path / "processing-settings-v5.json"
         authenticated = Mock(final_video_authenticated=True)
@@ -412,7 +459,8 @@ class TestFinalizeProcessing:
             patch(
                 "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
                 "audit_final_media_v1",
-                side_effect=lambda *_args, **_kwargs: events.append("audit") or authenticated,
+                side_effect=lambda *_args, **_kwargs: events.append("audit")
+                or authenticated,
             ),
             patch(
                 "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
@@ -443,7 +491,7 @@ class TestFinalizeProcessing:
                 return_value=1.0,
             ),
         ):
-            assert orchestrator._finalize_processing(
+            assert True is orchestrator._finalize_processing(
                 True,
                 tmp_path,
                 str(tmp_path / "source.mp4"),
@@ -456,24 +504,31 @@ class TestFinalizeProcessing:
             )
 
         assert events == [
-            "recover",
-            "audit",
             "payload_pruned",
             "pending",
             "delete",
             "terminal",
+            "recover",
+            "audit",
         ]
         assert update_status.call_args.args[2]["cleanup_status"] == "complete"
         assert commit_pruned.call_args.kwargs == {"reservation": reservation}
         assert commit_pending.call_args.kwargs == {"reservation": reservation}
-        video_encoder.retire_final_encoding_reservation.assert_called_once_with(success=True)
+        video_encoder.retire_final_encoding_reservation.assert_called_once_with(
+            success=True
+        )
 
-    def test_schema_five_cleanup_identity_failure_preserves_successful_media(self, tmp_path):
+    def test_schema_five_cleanup_identity_failure_preserves_successful_media(
+        self, tmp_path
+    ):
         from src.depth_surge_3d.rendering.quality.cleanup_transaction import (
             CleanupIdentityMismatchError,
         )
 
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        encoder = Mock()
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), encoder
+        )
         orchestrator._start_time = 0.0
         orchestrator._settings_file = tmp_path / "processing-settings-v5.json"
 
@@ -515,7 +570,7 @@ class TestFinalizeProcessing:
                 return_value=1.0,
             ),
         ):
-            assert orchestrator._finalize_processing(
+            assert not orchestrator._finalize_processing(
                 True,
                 tmp_path,
                 str(tmp_path / "source.mp4"),
@@ -527,15 +582,21 @@ class TestFinalizeProcessing:
                 3,
             )
 
-        assert update_status.call_args.args[2]["cleanup_status"] == "incomplete_identity_mismatch"
+        update_status.assert_not_called()
+        encoder.retire_final_encoding_reservation.assert_not_called()
 
 
 class TestCleanupOnlyResume:
     def test_process_returns_after_cleanup_only_resume(self, tmp_path):
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        encoder = Mock()
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), encoder
+        )
 
         with (
-            patch.object(orchestrator, "_resume_cleanup_only", return_value=True) as resume,
+            patch.object(
+                orchestrator, "_resume_cleanup_only", return_value=True
+            ) as resume,
             patch.object(orchestrator, "_setup_processing") as setup,
         ):
             result = orchestrator.process(
@@ -549,12 +610,16 @@ class TestCleanupOnlyResume:
         resume.assert_called_once_with(tmp_path)
         setup.assert_not_called()
 
-    def test_payload_pruned_resume_without_final_index_fails_without_mutation(self, tmp_path):
+    def test_payload_pruned_resume_without_final_index_fails_without_mutation(
+        self, tmp_path
+    ):
         settings_file = tmp_path / "processing-settings-v5.json"
         settings_file.write_bytes(b"settings")
         diagnostics = tmp_path / "04_stereo_diagnostics"
         diagnostics.mkdir()
-        (diagnostics / "metadata.json").write_text('{"status":"payload_pruned"}', encoding="ascii")
+        (diagnostics / "metadata.json").write_text(
+            '{"status":"payload_pruned"}', encoding="ascii"
+        )
         artifact = Mock(status="in_progress")
         artifact.to_object.return_value = {
             "metadata": {"cleanup_status": "not_requested"},
@@ -564,13 +629,24 @@ class TestCleanupOnlyResume:
             "runtime_info": {"metric_clamp_summary": None},
         }
         events = []
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
+        diagnostics_projection = Mock(status="payload_pruned")
+        diagnostics_projection.validate_state_contract.return_value = (
+            diagnostics_projection
+        )
 
         with (
             patch(
                 "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
                 "recover_processing_settings_artifact",
                 side_effect=lambda _path: events.append("recover") or artifact,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "project_diagnostics_metadata",
+                return_value=diagnostics_projection,
             ),
             patch(
                 "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
@@ -581,7 +657,8 @@ class TestCleanupOnlyResume:
             patch(
                 "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
                 "commit_cleanup_pending_status",
-                side_effect=lambda _path, **_kwargs: events.append("pending") or artifact,
+                side_effect=lambda _path, **_kwargs: events.append("pending")
+                or artifact,
             ),
             patch(
                 "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
@@ -603,8 +680,7 @@ class TestCleanupOnlyResume:
         settings_file = tmp_path / "processing-settings-v5.json"
         settings_file.write_bytes(b"settings")
         active_index = (
-            tmp_path
-            / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
+            tmp_path / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
         )
         active_index.parent.mkdir()
         active_index.write_bytes(b"index")
@@ -620,9 +696,22 @@ class TestCleanupOnlyResume:
         reservation.recover_publication_prefix.return_value = Mock(
             phase="publication_authenticated"
         )
+        capability = Mock()
         encoder = Mock()
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), encoder)
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), encoder
+        )
         events = []
+        capability.validate_authenticated_publication.side_effect = (
+            lambda: events.append("active-validate")
+        )
+
+        def retire(*, success):
+            assert success is True
+            active_index.unlink()
+            events.append("retire")
+
+        encoder.retire_final_encoding_reservation.side_effect = retire
 
         with (
             patch(
@@ -637,9 +726,19 @@ class TestCleanupOnlyResume:
             ),
             patch(
                 "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "FinalEncodingReservationCapabilityV1.from_prepared",
+                return_value=capability,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
                 "audit_final_media_v1",
-                side_effect=lambda *_args: events.append("audit")
-                or Mock(final_video_authenticated=True),
+                side_effect=lambda *_args: (
+                    (_ for _ in ()).throw(
+                        AssertionError("audit ran before index retirement")
+                    )
+                    if active_index.exists()
+                    else events.append("audit") or Mock(final_video_authenticated=True)
+                ),
             ),
             patch(
                 "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
@@ -649,12 +748,359 @@ class TestCleanupOnlyResume:
         ):
             assert orchestrator._resume_cleanup_only(tmp_path) is True
 
-        assert events == ["settings", "index", "audit", "terminal", "settings"]
-        encoder.adopt_final_encoding_reservation.assert_called_once_with(reservation)
+        assert events == [
+            "settings",
+            "settings",
+            "index",
+            "active-validate",
+            "terminal",
+            "settings",
+            "retire",
+            "settings",
+            "audit",
+        ]
+        capability.validate_authenticated_publication.assert_called_once_with()
+        encoder.adopt_final_encoding_reservation.assert_called_once_with(capability)
         encoder.retire_final_encoding_reservation.assert_called_once_with(success=True)
+
+    def test_cleanup_failure_stays_pending_and_a_later_resume_retries(self, tmp_path):
+        from src.depth_surge_3d.rendering.quality.cleanup_transaction import (
+            CleanupIdentityMismatchError,
+        )
+
+        settings_file = tmp_path / "processing-settings-v5.json"
+        settings_file.write_bytes(b"settings")
+        active_index = (
+            tmp_path / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
+        )
+        active_index.parent.mkdir()
+        active_index.write_bytes(b"index")
+        artifact = Mock(status="in_progress")
+        artifact.to_object.return_value = {
+            "metadata": {"cleanup_status": "pending"},
+            "processing_settings": {"keep_intermediates": False},
+            "video_properties": {"frame_count": 3},
+            "output_info": {"expected_final_relative_path": "result.mp4"},
+            "runtime_info": {"metric_clamp_summary": None},
+        }
+        reservation = Mock()
+        reservation.recover_publication_prefix.return_value = Mock(
+            phase="publication_authenticated"
+        )
+        capability = Mock()
+        diagnostics_projection = Mock(status="payload_pruned")
+        diagnostics_projection.validate_state_contract.return_value = (
+            diagnostics_projection
+        )
+        encoder = Mock()
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), encoder
+        )
+
+        with (
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "recover_processing_settings_artifact",
+                return_value=artifact,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "load_final_encoding_reservation_v1",
+                return_value=reservation,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "FinalEncodingReservationCapabilityV1.from_prepared",
+                return_value=capability,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "project_diagnostics_metadata",
+                return_value=diagnostics_projection,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "audit_final_media_v1",
+                return_value=Mock(final_video_authenticated=True),
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "run_authorized_cleanup",
+                side_effect=[CleanupIdentityMismatchError("changed"), 2],
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "update_processing_status",
+                return_value=True,
+            ) as update,
+        ):
+            assert orchestrator._resume_cleanup_only(tmp_path) is False
+            update.assert_not_called()
+            encoder.retire_final_encoding_reservation.assert_not_called()
+
+            assert orchestrator._resume_cleanup_only(tmp_path) is True
+
+        assert update.call_args.args[1] == "completed"
+        assert update.call_args.args[2]["cleanup_status"] == "complete"
+        encoder.retire_final_encoding_reservation.assert_called_once_with(success=True)
+
+    def test_cleanup_projection_releases_settings_and_prepared_reservation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        settings_file = tmp_path / "processing-settings-v5.json"
+        settings_file.write_bytes(b"settings")
+        active_index = (
+            tmp_path / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
+        )
+        active_index.parent.mkdir()
+        active_index.write_bytes(b"index")
+        references: dict[str, weakref.ReferenceType[object]] = {}
+
+        class Artifact:
+            status = "in_progress"
+
+            @staticmethod
+            def to_object():
+                return {
+                    "metadata": {"cleanup_status": "not_requested"},
+                    "processing_settings": {"keep_intermediates": True},
+                    "video_properties": {"frame_count": 3},
+                    "runtime_info": {"metric_clamp_summary": None},
+                }
+
+        class Prepared:
+            @staticmethod
+            def recover_publication_prefix():
+                return SimpleNamespace(phase="publication_authenticated")
+
+        capability = Mock()
+        encoder = Mock()
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), encoder
+        )
+
+        def recover(_path):
+            return Artifact()
+
+        def load(_root, settings):
+            prepared = Prepared()
+            references["settings"] = weakref.ref(settings)
+            references["reservation"] = weakref.ref(prepared)
+            return prepared
+
+        def project(_path):
+            gc.collect()
+            assert references["settings"]() is None
+            assert references["reservation"]() is None
+            projection = Mock(status="complete")
+            projection.validate_state_contract.return_value = projection
+            return projection
+
+        def retire(*, success):
+            assert success is True
+            active_index.unlink()
+
+        encoder.retire_final_encoding_reservation.side_effect = retire
+        with (
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "recover_processing_settings_artifact",
+                new=recover,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "load_final_encoding_reservation_v1",
+                new=load,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "FinalEncodingReservationCapabilityV1.from_prepared",
+                new=lambda _prepared: capability,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "project_diagnostics_metadata",
+                new=project,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "update_processing_status",
+                return_value=True,
+            ),
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "audit_final_media_v1",
+                return_value=Mock(final_video_authenticated=True),
+            ),
+        ):
+            assert orchestrator._resume_cleanup_only(tmp_path) is True
+
+        capability.validate_authenticated_publication.assert_called_once_with()
+        encoder.adopt_final_encoding_reservation.assert_called_once_with(capability)
 
 
 class TestExecutePipeline:
+    def test_upstream_path_lists_are_released_before_stereo_preflight(self, tmp_path):
+        """The bounded stereo phase cannot inherit either upstream O(N) graph."""
+
+        class TrackedPaths(list):
+            pass
+
+        references = {}
+
+        class VideoEncoder:
+            defer_final_reservation_retirement = False
+
+            @staticmethod
+            def extract_frames(*_args):
+                paths = TrackedPaths([tmp_path / "frame_000001.png"])
+                references["frames"] = weakref.ref(paths)
+                return paths
+
+        class DepthProcessor:
+            @staticmethod
+            def generate_depth_map_files(*_args):
+                paths = TrackedPaths([tmp_path / "depth_000001.png"])
+                references["geometry"] = weakref.ref(paths)
+                return paths
+
+        class StereoGenerator:
+            @staticmethod
+            def create_stereo_pairs_from_manifest(*_args):
+                gc.collect()
+                assert references["frames"]() is None
+                assert references["geometry"]() is None
+                return False
+
+        def publish_manifest(**_kwargs):
+            return SimpleNamespace(frame_count=1)
+
+        orchestrator = ProcessingOrchestrator(
+            DepthProcessor(),
+            StereoGenerator(),
+            Mock(),
+            Mock(),
+            Mock(),
+            VideoEncoder(),
+        )
+
+        with patch(
+            "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+            "publish_validated_stereo_input_manifest_v1",
+            new=publish_manifest,
+        ):
+            assert not orchestrator._execute_pipeline(
+                "source.mp4",
+                tmp_path,
+                {"base": tmp_path, "frames": tmp_path / "frames"},
+                {"fps": 30.0, "frame_count": 1},
+                {},
+            )
+
+
+def test_legacy_fast_adoption_skips_upstream_manifest_and_stereo_provider(
+    tmp_path: Path,
+) -> None:
+    adoption = LegacyFastAdoptionV1(
+        job_root=tmp_path,
+        source_settings_schema_version=4,
+        settings_fingerprint="1" * 64,
+        frame_count=2,
+        render_shape=(4, 6),
+        geometry_mode="relative",
+        occlusion_fill="background",
+        rgb_stage_fingerprint="2" * 64,
+        source_guide_fingerprint="3" * 64,
+        stage_metadata_sha256="4" * 64,
+        payload_sequence_sha256="5" * 64,
+        metric_clamp_summary_sha256=None,
+        metric_clamp_evidence_sha256=None,
+        metric_valid_pixel_count=None,
+        metric_clamped_pixel_count=None,
+        metric_affected_frame_count=None,
+        metric_mean_clamped_fraction=None,
+        metric_max_clamped_fraction=None,
+    )
+    encoder = Mock()
+    stereo = Mock()
+    orchestrator = ProcessingOrchestrator(
+        Mock(),
+        stereo,
+        Mock(),
+        Mock(),
+        Mock(),
+        encoder,
+        legacy_fast_adoption=adoption,
+    )
+    settings_file = tmp_path / "processing-settings-v5.json"
+    directories = {
+        "base": tmp_path,
+        "left_frames": tmp_path / "04_left_frames",
+        "right_frames": tmp_path / "04_right_frames",
+    }
+    lock = SimpleNamespace(is_acquired=True, output_dir=tmp_path)
+    artifact = object()
+
+    with (
+        patch(
+            "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.recover_processing_control_prefix_v1"
+        ),
+        patch(
+            "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.cleanup_vdpp_private_work"
+        ),
+        patch.object(orchestrator, "_resume_cleanup_only", return_value=None),
+        patch.object(
+            orchestrator,
+            "_setup_processing",
+            return_value=(tmp_path, directories, settings_file),
+        ),
+        patch(
+            "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.recover_processing_settings_artifact",
+            return_value=artifact,
+        ),
+        patch(
+            "src.depth_surge_3d.io.resume.revalidate_legacy_fast_adoption_v1",
+            return_value=adoption,
+        ) as revalidate,
+        patch(
+            "src.depth_surge_3d.io.resume.iter_legacy_fast_frame_names",
+            side_effect=lambda _adoption: iter(("frame_000000", "frame_000001")),
+        ),
+        patch(
+            "src.depth_surge_3d.io.resume.legacy_fast_metric_projection",
+            return_value=None,
+        ),
+        patch(
+            "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.publish_legacy_fast_unavailable"
+        ) as publish,
+        patch.object(
+            orchestrator,
+            "_execute_post_stereo_steps",
+            return_value=True,
+            create=True,
+        ) as post_stereo,
+        patch.object(orchestrator, "_execute_pipeline", return_value=False) as pipeline,
+    ):
+        assert orchestrator.process(
+            tmp_path / "source.mp4",
+            tmp_path,
+            {"fps": 30.0},
+            {"keep_intermediates": False},
+            job_lock=lock,
+        )
+
+    revalidate.assert_called_once_with(
+        adoption,
+        artifact,
+        allow_diagnostics_prefix=True,
+    )
+    publish.assert_called_once()
+    post_stereo.assert_called_once()
+    pipeline.assert_not_called()
+    encoder.extract_frames.assert_not_called()
+    stereo.create_stereo_pairs_from_manifest.assert_not_called()
+
     def test_releases_depth_model_before_starting_step_3(self, tmp_path):
         """The depth model leaves memory as soon as its pipeline stage is complete."""
 
@@ -675,7 +1121,7 @@ class TestExecutePipeline:
                 self.model = model
                 self.model_loaded_at_step_3 = None
 
-            def create_stereo_pairs_from_files(self, *_args):
+            def create_stereo_pairs_from_manifest(self, *_args):
                 self.model_loaded_at_step_3 = self.model.loaded
                 return False
 
@@ -693,13 +1139,18 @@ class TestExecutePipeline:
             release_depth_model=model.unload_model,
         )
 
-        result = orchestrator._execute_pipeline(
-            "source.mp4",
-            tmp_path,
-            {"base": tmp_path, "frames": tmp_path / "frames"},
-            {"fps": 30.0, "frame_count": 1},
-            {},
-        )
+        with patch(
+            "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+            "publish_validated_stereo_input_manifest_v1",
+            return_value=Mock(frame_count=1),
+        ):
+            result = orchestrator._execute_pipeline(
+                "source.mp4",
+                tmp_path,
+                {"base": tmp_path, "frames": tmp_path / "frames"},
+                {"fps": 30.0, "frame_count": 1},
+                {},
+            )
 
         assert result is False
         assert model.loaded is False
@@ -724,12 +1175,11 @@ class TestExecutePipeline:
         temporal.generate_files.side_effect = stabilize
         stereo = Mock()
 
-        def render(_frames, depth_files, *_args):
+        def render(_manifest, *_args):
             events.append("stereo")
-            assert depth_files == [stable]
             return False
 
-        stereo.create_stereo_pairs_from_files.side_effect = render
+        stereo.create_stereo_pairs_from_manifest.side_effect = render
         encoder = Mock()
         encoder.extract_frames.return_value = [frame]
         orchestrator = ProcessingOrchestrator(
@@ -743,15 +1193,21 @@ class TestExecutePipeline:
             temporal_stabilizer=temporal,
         )
 
-        assert not orchestrator._execute_pipeline(
-            "source.mp4",
-            tmp_path,
-            {"base": tmp_path, "frames": tmp_path / "frames"},
-            {"fps": 30.0, "frame_count": 1},
-            {"temporal_postprocessor": "vdpp"},
-        )
+        with patch(
+            "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+            "publish_validated_stereo_input_manifest_v1",
+            return_value=Mock(frame_count=1),
+        ) as publish_stereo_input:
+            assert not orchestrator._execute_pipeline(
+                "source.mp4",
+                tmp_path,
+                {"base": tmp_path, "frames": tmp_path / "frames"},
+                {"fps": 30.0, "frame_count": 1},
+                {"temporal_postprocessor": "vdpp"},
+            )
 
         assert events == ["release", "vdpp", "stereo"]
+        assert publish_stereo_input.call_args.kwargs["geometry_files"] == [stable]
 
     def test_vdpp_failure_never_starts_stereo(self, tmp_path):
         depth_processor = Mock()
@@ -810,6 +1266,7 @@ class TestExecutePipeline:
         }
         stereo_generator = Mock()
         stereo_generator.create_stereo_pairs_from_files.return_value = True
+        stereo_generator.create_stereo_pairs_from_manifest.return_value = True
         distortion_processor = Mock()
         distortion_processor.crop_frames.return_value = True
         vr_assembler = Mock()
@@ -848,15 +1305,15 @@ class TestExecutePipeline:
             video_encoder,
         ) = self._direct_encoding_dependencies(tmp_path)
         progress_tracker = Mock()
-        vr_assembler.resolve_vr_source_files.return_value = ([left], [right])
-        video_encoder.create_video_from_stereo_sequences.return_value = True
+        direct_source = Mock()
+        vr_assembler.resolve_direct_vr_source.return_value = direct_source
+        video_encoder.create_video_from_stereo_source.return_value = True
 
         with patch.object(orchestrator, "_finalize_processing"):
             assert orchestrator._execute_remaining_steps(
                 directories,
                 settings,
-                [frame],
-                [depth],
+                Mock(frame_count=1),
                 24.0,
                 "source.mp4",
                 directories["base"],
@@ -864,11 +1321,12 @@ class TestExecutePipeline:
             )
 
         vr_assembler.assemble_vr_frames.assert_not_called()
-        vr_assembler.resolve_vr_source_files.assert_called_once_with(directories, settings, 1)
+        vr_assembler.resolve_direct_vr_source.assert_called_once_with(
+            directories, settings, 1
+        )
         video_encoder.create_video.assert_not_called()
-        video_encoder.create_video_from_stereo_sequences.assert_called_once_with(
-            [left],
-            [right],
+        video_encoder.create_video_from_stereo_source.assert_called_once_with(
+            direct_source,
             directories["base"],
             "source.mp4",
             settings,
@@ -877,7 +1335,9 @@ class TestExecutePipeline:
         )
         assert "VR frames" not in capsys.readouterr().out
 
-    def test_metric_stereo_prints_exactly_one_clamp_summary_line(self, tmp_path, capsys):
+    def test_metric_stereo_prints_exactly_one_clamp_summary_line(
+        self, tmp_path, capsys
+    ):
         (
             orchestrator,
             directories,
@@ -896,26 +1356,28 @@ class TestExecutePipeline:
             "max_clamped_fraction": 0.25,
         }
         orchestrator.stereo_generator.last_metric_clamp_summary = summary
-        vr_assembler.resolve_vr_source_files.return_value = ([left], [right])
+        vr_assembler.resolve_direct_vr_source.return_value = Mock()
 
         with patch.object(orchestrator, "_finalize_processing"):
             assert orchestrator._execute_remaining_steps(
                 directories,
                 settings,
-                [frame],
-                [depth],
+                Mock(frame_count=1),
                 24.0,
                 "source.mp4",
                 directories["base"],
             )
 
         expected = (
-            "Metric disparity clamp summary: affected_frames=2, " "mean=12.5000%, max=25.0000%"
+            "Metric disparity clamp summary: affected_frames=2, "
+            "mean=12.5000%, max=25.0000%"
         )
         assert capsys.readouterr().out.count(expected) == 1
         assert orchestrator._metric_clamp_summary == summary
 
-    def test_relative_stereo_does_not_report_stale_metric_clamp_summary(self, tmp_path, capsys):
+    def test_relative_stereo_does_not_report_stale_metric_clamp_summary(
+        self, tmp_path, capsys
+    ):
         (
             orchestrator,
             directories,
@@ -932,14 +1394,13 @@ class TestExecutePipeline:
             "mean_clamped_fraction": 1.0,
             "max_clamped_fraction": 1.0,
         }
-        vr_assembler.resolve_vr_source_files.return_value = ([left], [right])
+        vr_assembler.resolve_direct_vr_source.return_value = Mock()
 
         with patch.object(orchestrator, "_finalize_processing"):
             assert orchestrator._execute_remaining_steps(
                 directories,
                 settings,
-                [frame],
-                [depth],
+                Mock(frame_count=1),
                 24.0,
                 "source.mp4",
                 directories["base"],
@@ -961,13 +1422,12 @@ class TestExecutePipeline:
             vr_assembler,
             video_encoder,
         ) = self._direct_encoding_dependencies(tmp_path)
-        vr_assembler.resolve_vr_source_files.return_value = None
+        vr_assembler.resolve_direct_vr_source.return_value = None
 
         assert not orchestrator._execute_remaining_steps(
             directories,
             settings,
-            [frame],
-            [depth],
+            Mock(frame_count=1),
             24.0,
             "source.mp4",
             directories["base"],
@@ -975,7 +1435,7 @@ class TestExecutePipeline:
 
         vr_assembler.assemble_vr_frames.assert_not_called()
         video_encoder.create_video.assert_not_called()
-        video_encoder.create_video_from_stereo_sequences.assert_not_called()
+        video_encoder.create_video_from_stereo_source.assert_not_called()
 
     def test_direct_encoding_failure_finalizes_without_cleanup(self, tmp_path):
         """A failed direct FFmpeg encode uses failure finalization and keeps intermediates."""
@@ -992,8 +1452,8 @@ class TestExecutePipeline:
         ) = self._direct_encoding_dependencies(tmp_path)
         settings["keep_intermediates"] = False
         progress_tracker = Mock()
-        vr_assembler.resolve_vr_source_files.return_value = ([left], [right])
-        video_encoder.create_video_from_stereo_sequences.return_value = False
+        vr_assembler.resolve_direct_vr_source.return_value = Mock()
+        video_encoder.create_video_from_stereo_source.return_value = False
 
         with (
             patch.object(
@@ -1008,8 +1468,7 @@ class TestExecutePipeline:
             assert not orchestrator._execute_remaining_steps(
                 directories,
                 settings,
-                [frame],
-                [depth],
+                Mock(frame_count=1),
                 24.0,
                 "source.mp4",
                 directories["base"],
@@ -1026,9 +1485,11 @@ class TestExecutePipeline:
         progress_tracker.finish.assert_called_once_with("Video processing complete")
         cleanup.assert_not_called()
 
-    def test_required_distortion_stage_fails_when_stereo_outputs_are_missing(self, tmp_path):
+    def test_required_distortion_stage_fails_when_stereo_outputs_are_missing(
+        self, tmp_path
+    ):
         stereo_generator = Mock()
-        stereo_generator.create_stereo_pairs_from_files.return_value = True
+        stereo_generator.create_stereo_pairs_from_manifest.return_value = True
         distortion_processor = Mock()
         orchestrator = ProcessingOrchestrator(
             Mock(), stereo_generator, distortion_processor, Mock(), Mock(), Mock()
@@ -1045,8 +1506,7 @@ class TestExecutePipeline:
                 "right_frames": right_dir,
             },
             {"apply_distortion": True},
-            [tmp_path / "frame_000001.png"],
-            [tmp_path / "depth_000001.png"],
+            Mock(frame_count=1),
             30.0,
             "source.mp4",
             tmp_path,
@@ -1070,10 +1530,14 @@ class TestExecutePipeline:
         geometry_files = [tmp_path / f"depth_000001{suffix}"]
         depth_processor = Mock()
         depth_processor.generate_depth_map_files.return_value = geometry_files
-        depth_processor.generate_depth_maps.side_effect = AssertionError("array depth API used")
+        depth_processor.generate_depth_maps.side_effect = AssertionError(
+            "array depth API used"
+        )
         stereo_generator = Mock()
         stereo_generator.create_stereo_pairs_from_files.return_value = True
-        stereo_generator.create_stereo_pairs.side_effect = AssertionError("array stereo API used")
+        stereo_generator.create_stereo_pairs.side_effect = AssertionError(
+            "array stereo API used"
+        )
         distortion_processor = Mock()
         distortion_processor.crop_frames.return_value = True
         vr_assembler = Mock()
@@ -1113,9 +1577,16 @@ class TestExecutePipeline:
             video_encoder,
         )
 
+        stereo_input_manifest = Mock(frame_count=1)
         with (
             patch.object(orchestrator, "_finalize_processing"),
             patch.object(orchestrator, "_print_saved_to") as saved_to,
+            patch(
+                "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
+                "publish_validated_stereo_input_manifest_v1",
+                return_value=stereo_input_manifest,
+                create=True,
+            ) as publish_stereo_input,
         ):
             result = orchestrator._execute_pipeline(
                 "source.mp4",
@@ -1127,8 +1598,20 @@ class TestExecutePipeline:
 
         assert result is True
         depth_processor.generate_depth_map_files.assert_called_once()
-        stereo_generator.create_stereo_pairs_from_files.assert_called_once()
-        video_encoder.create_video_from_stereo_sequences.assert_not_called()
+        publish_stereo_input.assert_called_once_with(
+            job_root=directories["base"],
+            guide_files=frame_files,
+            geometry_files=geometry_files,
+            geometry_mode=geometry_mode,
+        )
+        stereo_generator.create_stereo_pairs_from_manifest.assert_called_once_with(
+            stereo_input_manifest,
+            directories,
+            settings,
+            None,
+        )
+        stereo_generator.create_stereo_pairs_from_files.assert_not_called()
+        video_encoder.create_video_from_stereo_source.assert_not_called()
         saved_to.assert_any_call(directories[stage_key], saved_label)
 
 
@@ -1140,7 +1623,9 @@ class TestHandleStepError:
     )
     def test_handle_step_error(self, mock_update_status):
         """Test handle step error updates settings file."""
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
         orchestrator._settings_file = Path("/output/settings.json")
 
         result = orchestrator._handle_step_error("Test error message")
@@ -1152,7 +1637,9 @@ class TestHandleStepError:
 
     def test_handle_step_error_no_settings_file(self):
         """Test handle step error without settings file."""
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
         orchestrator._settings_file = None
 
         result = orchestrator._handle_step_error("Test error message")
@@ -1165,7 +1652,9 @@ class TestPrintMethods:
 
     def test_print_saved_to_with_directory(self, capsys):
         """Test _print_saved_to with valid directory."""
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
 
         orchestrator._print_saved_to(Path("/output/dir"), "Test prefix")
 
@@ -1174,7 +1663,9 @@ class TestPrintMethods:
 
     def test_print_saved_to_with_none(self, capsys):
         """Test _print_saved_to with None directory."""
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
 
         orchestrator._print_saved_to(None, "Test prefix")
 
@@ -1226,8 +1717,12 @@ class TestProcessMethod:
         assert model.loaded is False
         assert model.unload_count == 1
 
-    def test_process_recovers_root_control_before_vdpp_or_ordinary_audit(self, tmp_path):
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+    def test_process_recovers_root_control_before_vdpp_or_ordinary_audit(
+        self, tmp_path
+    ):
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
         order: list[str] = []
         lock = JobWriterLock(tmp_path).acquire()
         try:
@@ -1260,8 +1755,12 @@ class TestProcessMethod:
 
         assert order == ["control", "vdpp", "audit"]
 
-    def test_process_reuses_preacquired_writer_lock_without_releasing_it(self, tmp_path):
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+    def test_process_reuses_preacquired_writer_lock_without_releasing_it(
+        self, tmp_path
+    ):
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
         lock = JobWriterLock(tmp_path).acquire()
         try:
             with (
@@ -1292,7 +1791,9 @@ class TestProcessMethod:
         self,
         tmp_path,
     ):
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
         work = tmp_path / "03_disparity_stabilized/.vdpp-work"
         work.mkdir(parents=True)
         (work / "shot_0.raw.f32.mmap").write_bytes(b"stale")
@@ -1304,7 +1805,9 @@ class TestProcessMethod:
 
         try:
             with (
-                patch.object(orchestrator, "_setup_processing", side_effect=observe_setup),
+                patch.object(
+                    orchestrator, "_setup_processing", side_effect=observe_setup
+                ),
                 patch.object(orchestrator, "_execute_pipeline", return_value=True),
             ):
                 assert orchestrator.process(
@@ -1317,7 +1820,9 @@ class TestProcessMethod:
         finally:
             lock.release()
 
-    @patch("src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time")
+    @patch(
+        "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time"
+    )
     def test_process_exception_handling(self, mock_time):
         """Test process method handles exceptions."""
         mock_time.return_value = 1000.0
@@ -1347,7 +1852,9 @@ class TestProcessMethod:
             assert result is False
 
     def test_process_propagates_interrupted_error(self, tmp_path):
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), Mock())
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
+        )
 
         with (
             patch.object(
@@ -1374,11 +1881,17 @@ class TestProcessMethod:
 
         update_status.assert_not_called()
 
-    def test_process_keeps_reservation_incomplete_retryable_without_terminalizing(self, tmp_path):
-        from src.depth_surge_3d.io.reservation_protocol import ReservationIncompleteError
+    def test_process_keeps_reservation_incomplete_retryable_without_terminalizing(
+        self, tmp_path
+    ):
+        from src.depth_surge_3d.io.reservation_protocol import (
+            ReservationIncompleteError,
+        )
 
         video_encoder = Mock()
-        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), video_encoder)
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), video_encoder
+        )
         settings_file = tmp_path / "processing-settings-v5.json"
 
         with (
@@ -1390,7 +1903,9 @@ class TestProcessMethod:
             patch.object(
                 orchestrator,
                 "_execute_pipeline",
-                side_effect=ReservationIncompleteError("reservation materialization ENOSPC"),
+                side_effect=ReservationIncompleteError(
+                    "reservation materialization ENOSPC"
+                ),
             ),
             patch(
                 "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."

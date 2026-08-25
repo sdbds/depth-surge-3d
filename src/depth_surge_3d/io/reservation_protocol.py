@@ -12,9 +12,9 @@ import re
 import struct
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from io import BufferedIOBase
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Callable, Iterable, Literal
 
 from .canonical_json import CanonicalJsonError, strict_canonical_json_loads
 from .file_identity import (
@@ -28,6 +28,13 @@ from .file_identity import (
     file_identity_from_posix_fd,
     windows_identity_from_handle,
 )
+from .settings_artifact import SETTINGS_ARTIFACT_MAX_RAW_BYTES
+from .nofollow_io import (
+    AuthenticatedFixedFileV1,
+    NoFollowPathError,
+    posix_remove_verified_name,
+    scan_fixed_regular_v1,
+)
 
 if TYPE_CHECKING:
     from .settings_artifact import ProcessingSettingsArtifactV5
@@ -35,6 +42,7 @@ if TYPE_CHECKING:
 
 RESERVATION_ZERO_FILL_CHUNK_BYTES = 64 * 1024
 CONTROL_ARTIFACT_WRITE_CHUNK_BYTES = 4 * 1024
+FINAL_RESERVATION_DESCRIPTOR_RAW_BYTES = 8 * 1024
 JOB_CONTROL_RELATIVE_PATH = Path("job-control-v1.json")
 SETTINGS_ARTIFACT_RELATIVE_PATH = Path("processing-settings-v5.json")
 SETTINGS_TRANSITION_INDEX_RELATIVE_PATH = Path(
@@ -86,17 +94,50 @@ def sha256_canonical(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
-def _stream_file_sha256_count(path: Path) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    count = 0
-    with Path(path).open("rb", buffering=0) as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-            count += len(chunk)
-    return digest.hexdigest(), count
+def _scan_reservation_fixed_file_v1(
+    job_root: Path,
+    path: Path,
+    *,
+    expected_identity: ReservationFileIdentity | None = None,
+    expected_raw_sha256: str | None = None,
+    expected_byte_count: int | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> AuthenticatedFixedFileV1:
+    try:
+        return scan_fixed_regular_v1(
+            job_root,
+            path,
+            expected_identity=expected_identity,
+            expected_raw_sha256=expected_raw_sha256,
+            expected_byte_count=expected_byte_count,
+            cancelled=cancelled,
+        )
+    except InterruptedError:
+        raise
+    except (NoFollowPathError, FileNotFoundError, OSError) as error:
+        raise ReservationConflictError(
+            "reservation fixed target failed authenticated scan"
+        ) from error
+
+
+def _stream_file_sha256_count(
+    job_root: Path,
+    path: Path,
+    *,
+    expected_identity: ReservationFileIdentity | None = None,
+    expected_raw_sha256: str | None = None,
+    expected_byte_count: int | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> tuple[str, int]:
+    scanned = _scan_reservation_fixed_file_v1(
+        job_root,
+        path,
+        expected_identity=expected_identity,
+        expected_raw_sha256=expected_raw_sha256,
+        expected_byte_count=expected_byte_count,
+        cancelled=cancelled,
+    )
+    return scanned.raw_sha256, scanned.byte_count
 
 
 def _allocate(raw: int, allocation_unit: int) -> int:
@@ -179,11 +220,26 @@ def classify_payload_frame(raw: bytes, expected_payload: bytes) -> str:
     return "partial"
 
 
-def _sync_parent(path: Path) -> None:
+def _sync_parent(
+    path: Path,
+    *,
+    expected_identity: DirectoryIdentity | None = None,
+) -> None:
     if os.name == "nt":
         return
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
     try:
+        if (
+            expected_identity is not None
+            and directory_identity_from_posix_fd(descriptor) != expected_identity
+        ):
+            raise ReservationConflictError("control parent identity changed before sync")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -196,6 +252,8 @@ def _open_relative_regular_file(
     writable: bool,
     create: bool,
     exclusive: bool = False,
+    expected_parent_identity: DirectoryIdentity | None = None,
+    sync_parent_on_exit: bool = False,
 ):
     """Open one child without following it while retaining its authenticated parent."""
 
@@ -213,6 +271,13 @@ def _open_relative_regular_file(
         child_fd = -1
         try:
             parent_identity = directory_identity_from_posix_fd(parent_fd)
+            if (
+                expected_parent_identity is not None
+                and parent_identity != expected_parent_identity
+            ):
+                raise ReservationConflictError(
+                    "control parent identity changed before child open"
+                )
             child_flags = (
                 (os.O_RDWR if writable else os.O_RDONLY)
                 | getattr(os, "O_NOFOLLOW", 0)
@@ -231,6 +296,8 @@ def _open_relative_regular_file(
             with os.fdopen(child_fd, mode, buffering=0, closefd=True) as handle:
                 child_fd = -1
                 yield handle, identity, parent_identity
+            if sync_parent_on_exit:
+                os.fsync(parent_fd)
             if directory_identity_from_posix_fd(parent_fd) != parent_identity:
                 raise ReservationConflictError("control parent identity changed")
         finally:
@@ -318,6 +385,13 @@ def _open_relative_regular_file(
             require_directory=True,
         )
         parent_identity = DirectoryIdentity("windows", parent_inner)
+        if (
+            expected_parent_identity is not None
+            and parent_identity != expected_parent_identity
+        ):
+            raise ReservationConflictError(
+                "control parent identity changed before child open"
+            )
         name_buffer = ctypes.create_unicode_buffer(path.name)
         name_bytes = path.name.encode("utf-16-le")
         unicode_name = UnicodeString(
@@ -386,10 +460,49 @@ def _open_relative_regular_file(
         close_handle(wintypes.HANDLE(raw_parent))
 
 
+def create_parent_bound_placeholder_v1(
+    path: Path,
+    *,
+    expected_parent_identity: DirectoryIdentity,
+) -> ReservationFileIdentity:
+    """Create and durably bind one empty child to an authenticated parent."""
+
+    with _open_relative_regular_file(
+        Path(path),
+        writable=True,
+        create=True,
+        exclusive=True,
+        expected_parent_identity=expected_parent_identity,
+        sync_parent_on_exit=True,
+    ) as (handle, identity, _parent_identity):
+        if os.fstat(handle.fileno()).st_size != 0:
+            raise ReservationConflictError("new placeholder is not empty")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return identity
+
+
+def observe_parent_bound_regular_v1(
+    path: Path,
+    *,
+    expected_parent_identity: DirectoryIdentity,
+) -> tuple[ReservationFileIdentity, int]:
+    """Observe one regular child through the exact authenticated parent."""
+
+    with _open_relative_regular_file(
+        Path(path),
+        writable=False,
+        create=False,
+        expected_parent_identity=expected_parent_identity,
+    ) as (handle, identity, _parent_identity):
+        return identity, int(os.fstat(handle.fileno()).st_size)
+
+
 def _read_bounded_regular_file_with_identity(
     path: Path,
     *,
     max_bytes: int,
+    expected_parent_identity: DirectoryIdentity | None = None,
 ) -> tuple[bytes, ReservationFileIdentity, DirectoryIdentity]:
     if max_bytes <= 0:
         raise ValueError("bounded read limit must be positive")
@@ -398,6 +511,7 @@ def _read_bounded_regular_file_with_identity(
             path,
             writable=False,
             create=False,
+            expected_parent_identity=expected_parent_identity,
         ) as (handle, identity, parent_identity):
             assert isinstance(handle, BufferedIOBase) or hasattr(handle, "read")
             size = os.fstat(handle.fileno()).st_size
@@ -415,10 +529,16 @@ def _read_bounded_regular_file_with_identity(
         raise
 
 
-def _read_bounded_regular_file(path: Path, *, max_bytes: int) -> bytes:
+def _read_bounded_regular_file(
+    path: Path,
+    *,
+    max_bytes: int,
+    expected_parent_identity: DirectoryIdentity | None = None,
+) -> bytes:
     raw, _identity_value, _parent_identity = _read_bounded_regular_file_with_identity(
         path,
         max_bytes=max_bytes,
+        expected_parent_identity=expected_parent_identity,
     )
     return raw
 
@@ -428,12 +548,14 @@ def _write_control_temporary(
     raw: bytes,
     *,
     event: Callable[[str], None] | None,
+    expected_parent_identity: DirectoryIdentity | None = None,
 ) -> tuple[ReservationFileIdentity, DirectoryIdentity]:
     with _open_relative_regular_file(
         path,
         writable=True,
         create=True,
         exclusive=True,
+        expected_parent_identity=expected_parent_identity,
     ) as (handle, identity, parent_identity):
         handle.truncate(0)
         handle.seek(0)
@@ -453,6 +575,8 @@ def _write_control_temporary(
 def _sync_complete_control_temporary(
     path: Path,
     raw: bytes,
+    *,
+    expected_parent_identity: DirectoryIdentity | None = None,
 ) -> tuple[ReservationFileIdentity, DirectoryIdentity]:
     """Make an authenticated complete temporary durable before promotion."""
 
@@ -460,6 +584,7 @@ def _sync_complete_control_temporary(
         path,
         writable=True,
         create=False,
+        expected_parent_identity=expected_parent_identity,
     ) as (handle, identity, parent_identity):
         size = os.fstat(handle.fileno()).st_size
         if size != len(raw):
@@ -469,7 +594,11 @@ def _sync_complete_control_temporary(
             raise ReservationConflictError("complete control temporary bytes changed")
         handle.flush()
         os.fsync(handle.fileno())
-    if _read_bounded_regular_file(path, max_bytes=max(len(raw), 1)) != raw:
+    if _read_bounded_regular_file(
+        path,
+        max_bytes=max(len(raw), 1),
+        expected_parent_identity=expected_parent_identity,
+    ) != raw:
         raise ReservationConflictError("complete control temporary failed reopen validation")
     return identity, parent_identity
 
@@ -510,9 +639,17 @@ def _unlink_safe_control_temporary(
                 raise ReservationConflictError("control temporary identity changed")
             if identity.link_count != 1:
                 raise ReservationConflictError("control temporary is not single-link")
-            os.unlink(path.name, dir_fd=parent_fd)
-            if sync_parent:
-                os.fsync(parent_fd)
+            try:
+                posix_remove_verified_name(
+                    parent_fd,
+                    path.name,
+                    child_fd,
+                    directory=False,
+                )
+            except NoFollowPathError as error:
+                raise ReservationConflictError(
+                    "control temporary changed during authenticated deletion"
+                ) from error
             if directory_identity_from_posix_fd(parent_fd) != parent_identity:
                 raise ReservationConflictError("control temporary parent changed")
         finally:
@@ -566,18 +703,58 @@ def _unlink_safe_control_temporary(
             raise ReservationConflictError("control temporary parent changed")
 
 
-def _write_json_file(path: Path, payload: dict, *, event: Callable[[str], None] | None) -> None:
+def _unlink_exact_control_artifact(
+    path: Path,
+    expected_raw: bytes,
+    *,
+    expected_parent_identity: DirectoryIdentity | None = None,
+) -> None:
+    if not (path.exists() or path.is_symlink()):
+        return
+    raw, identity, parent_identity = _read_bounded_regular_file_with_identity(
+        path,
+        max_bytes=max(len(expected_raw), 1),
+        expected_parent_identity=expected_parent_identity,
+    )
+    if raw != expected_raw:
+        raise ReservationConflictError(f"control artifact changed before retirement: {path}")
+    _unlink_safe_control_temporary(
+        path,
+        expected_identity=identity,
+        expected_parent_identity=parent_identity,
+    )
+
+
+def _write_json_file(
+    path: Path,
+    payload: dict,
+    *,
+    event: Callable[[str], None] | None,
+    expected_parent_identity: DirectoryIdentity | None = None,
+) -> None:
     raw = canonical_json_bytes(payload)
     temporary = path.with_name(f".{path.name}.create-new.tmp")
     path.parent.mkdir(parents=True, exist_ok=True)
+    observed_parent_identity = _directory_identity(path.parent)
+    if (
+        expected_parent_identity is not None
+        and observed_parent_identity != expected_parent_identity
+    ):
+        raise ReservationConflictError("control parent identity changed before publication")
+    parent_authority = expected_parent_identity or observed_parent_identity
     if path.exists() or path.is_symlink():
-        if _read_bounded_regular_file(path, max_bytes=max(len(raw), 1)) != raw:
+        if _read_bounded_regular_file(
+            path,
+            max_bytes=max(len(raw), 1),
+            expected_parent_identity=parent_authority,
+        ) != raw:
             raise ReservationConflictError(f"authoritative control artifact differs: {path}")
         if temporary.exists() or temporary.is_symlink():
             _temporary_raw, temporary_identity, parent_identity = (
                 _read_bounded_regular_file_with_identity(
                     temporary,
                     max_bytes=max(len(raw), 1),
+                    expected_parent_identity=parent_authority,
                 )
             )
             _unlink_safe_control_temporary(
@@ -587,11 +764,19 @@ def _write_json_file(path: Path, payload: dict, *, event: Callable[[str], None] 
             )
         return
     if temporary.exists() or temporary.is_symlink():
-        if _read_bounded_regular_file(temporary, max_bytes=max(len(raw), 1)) != raw:
+        if _read_bounded_regular_file(
+            temporary,
+            max_bytes=max(len(raw), 1),
+            expected_parent_identity=parent_authority,
+        ) != raw:
             raise ReservationIncompleteError(
                 f"control temporary is an incomplete durable prefix: {temporary}"
             )
-        source_identity, parent_identity = _sync_complete_control_temporary(temporary, raw)
+        source_identity, parent_identity = _sync_complete_control_temporary(
+            temporary,
+            raw,
+            expected_parent_identity=parent_authority,
+        )
         same_parent_replace_v1(
             temporary,
             path,
@@ -600,7 +785,11 @@ def _write_json_file(path: Path, payload: dict, *, event: Callable[[str], None] 
             expected_parent_identity=parent_identity,
             replace_existing=False,
         )
-        if _read_bounded_regular_file(path, max_bytes=max(len(raw), 1)) != raw:
+        if _read_bounded_regular_file(
+            path,
+            max_bytes=max(len(raw), 1),
+            expected_parent_identity=parent_authority,
+        ) != raw:
             raise ReservationConflictError(
                 f"published control artifact failed reopen: {path}"
             )
@@ -611,8 +800,13 @@ def _write_json_file(path: Path, payload: dict, *, event: Callable[[str], None] 
         temporary,
         raw,
         event=event,
+        expected_parent_identity=parent_authority,
     )
-    if _read_bounded_regular_file(temporary, max_bytes=max(len(raw), 1)) != raw:
+    if _read_bounded_regular_file(
+        temporary,
+        max_bytes=max(len(raw), 1),
+        expected_parent_identity=parent_authority,
+    ) != raw:
         raise ReservationConflictError("control temporary failed reopen validation")
     same_parent_replace_v1(
         temporary,
@@ -622,7 +816,11 @@ def _write_json_file(path: Path, payload: dict, *, event: Callable[[str], None] 
         expected_parent_identity=parent_identity,
         replace_existing=False,
     )
-    if _read_bounded_regular_file(path, max_bytes=max(len(raw), 1)) != raw:
+    if _read_bounded_regular_file(
+        path,
+        max_bytes=max(len(raw), 1),
+        expected_parent_identity=parent_authority,
+    ) != raw:
         raise ReservationConflictError(f"published control artifact failed reopen: {path}")
     if event is not None:
         event("index:published")
@@ -634,6 +832,7 @@ def publish_index_owned_descriptor_v1(
     *,
     validate_authority: Callable[[], None],
     event: Callable[[str], None] | None = None,
+    expected_parent_identity: DirectoryIdentity | None = None,
 ) -> None:
     """Publish one descriptor, repairing only an authenticated partial temp."""
 
@@ -641,16 +840,32 @@ def publish_index_owned_descriptor_v1(
         raise TypeError("index-owned descriptor validation must be callable")
     path = Path(path)
     raw = canonical_json_bytes(payload)
+    if len(raw) > FINAL_RESERVATION_DESCRIPTOR_RAW_BYTES:
+        raise ReservationConflictError(
+            "indexed reservation descriptor exceeds its frozen raw-byte bound"
+        )
     temporary = path.with_name(f".{path.name}.create-new.tmp")
     path.parent.mkdir(parents=True, exist_ok=True)
+    observed_parent_identity = _directory_identity(path.parent)
+    if (
+        expected_parent_identity is not None
+        and observed_parent_identity != expected_parent_identity
+    ):
+        raise ReservationConflictError("descriptor parent identity changed before publication")
+    parent_authority = expected_parent_identity or observed_parent_identity
     if path.exists() or path.is_symlink():
-        if _read_bounded_regular_file(path, max_bytes=max(len(raw), 1)) != raw:
+        if _read_bounded_regular_file(
+            path,
+            max_bytes=max(len(raw), 1),
+            expected_parent_identity=parent_authority,
+        ) != raw:
             raise ReservationConflictError(f"authoritative descriptor differs: {path}")
         if temporary.exists() or temporary.is_symlink():
             temporary_raw, temporary_identity, parent_identity = (
                 _read_bounded_regular_file_with_identity(
                     temporary,
                     max_bytes=max(len(raw), 1),
+                    expected_parent_identity=parent_authority,
                 )
             )
             if temporary_raw != raw:
@@ -669,6 +884,7 @@ def publish_index_owned_descriptor_v1(
             temporary,
             writable=True,
             create=False,
+            expected_parent_identity=parent_authority,
         ) as (handle, source_identity, parent_identity):
             size = os.fstat(handle.fileno()).st_size
             if size > len(raw):
@@ -699,7 +915,11 @@ def publish_index_owned_descriptor_v1(
             os.fsync(handle.fileno())
             if os.fstat(handle.fileno()).st_size != len(raw):
                 raise ReservationConflictError("indexed descriptor temporary EOF changed")
-        if _read_bounded_regular_file(temporary, max_bytes=max(len(raw), 1)) != raw:
+        if _read_bounded_regular_file(
+            temporary,
+            max_bytes=max(len(raw), 1),
+            expected_parent_identity=parent_authority,
+        ) != raw:
             raise ReservationConflictError(
                 "indexed descriptor temporary failed reopen validation"
             )
@@ -709,6 +929,7 @@ def publish_index_owned_descriptor_v1(
             temporary,
             raw,
             event=event,
+            expected_parent_identity=parent_authority,
         )
 
     same_parent_replace_v1(
@@ -719,7 +940,11 @@ def publish_index_owned_descriptor_v1(
         expected_parent_identity=parent_identity,
         replace_existing=False,
     )
-    if _read_bounded_regular_file(path, max_bytes=max(len(raw), 1)) != raw:
+    if _read_bounded_regular_file(
+        path,
+        max_bytes=max(len(raw), 1),
+        expected_parent_identity=parent_authority,
+    ) != raw:
         raise ReservationConflictError("published indexed descriptor failed reopen")
 
 
@@ -728,9 +953,15 @@ def publish_write_ahead_intent(
     payload: dict,
     *,
     event: Callable[[str], None] | None = None,
+    expected_parent_identity: DirectoryIdentity | None = None,
 ) -> None:
     try:
-        _write_json_file(Path(path), payload, event=event)
+        _write_json_file(
+            Path(path),
+            payload,
+            event=event,
+            expected_parent_identity=expected_parent_identity,
+        )
     except OSError as error:
         if error.errno == errno.ENOSPC or getattr(error, "winerror", None) == 112:
             raise ReservationIncompleteError(f"namespace reservation incomplete: {path}") from error
@@ -744,17 +975,29 @@ def recover_control_artifact_pair_v1(
     parser: Callable[[bytes], object],
     prepublish_validate: Callable[[object], None] | None = None,
     preunlink_validate: Callable[[], None] | None = None,
+    expected_parent_identity: DirectoryIdentity | None = None,
 ) -> object | None:
     """Recover one deterministic create-new final/temporary pair without caller state."""
 
     path = Path(path)
     temporary = path.with_name(f".{path.name}.create-new.tmp")
+    observed_parent_identity = _directory_identity(path.parent)
+    if (
+        expected_parent_identity is not None
+        and observed_parent_identity != expected_parent_identity
+    ):
+        raise ReservationConflictError("control parent identity changed before recovery")
+    parent_authority = expected_parent_identity or observed_parent_identity
     final_present = path.exists() or path.is_symlink()
     temporary_present = temporary.exists() or temporary.is_symlink()
     if not final_present and not temporary_present:
         return None
     if final_present:
-        raw = _read_bounded_regular_file(path, max_bytes=max_bytes)
+        raw = _read_bounded_regular_file(
+            path,
+            max_bytes=max_bytes,
+            expected_parent_identity=parent_authority,
+        )
         try:
             result = parser(raw)
         except Exception as error:
@@ -766,6 +1009,7 @@ def recover_control_artifact_pair_v1(
                 _read_bounded_regular_file_with_identity(
                     temporary,
                     max_bytes=max_bytes,
+                    expected_parent_identity=parent_authority,
                 )
             )
             _unlink_safe_control_temporary(
@@ -773,16 +1017,23 @@ def recover_control_artifact_pair_v1(
                 expected_identity=temporary_identity,
                 expected_parent_identity=parent_identity,
             )
-            _sync_parent(temporary.parent)
+            _sync_parent(temporary.parent, expected_identity=parent_authority)
         return result
-    raw = _read_bounded_regular_file(temporary, max_bytes=max_bytes)
+    raw = _read_bounded_regular_file(
+        temporary,
+        max_bytes=max_bytes,
+        expected_parent_identity=parent_authority,
+    )
     try:
         result = parser(raw)
     except Exception:
         if preunlink_validate is not None:
             preunlink_validate()
-        _unlink_safe_control_temporary(temporary)
-        _sync_parent(temporary.parent)
+        _unlink_safe_control_temporary(
+            temporary,
+            expected_parent_identity=parent_authority,
+        )
+        _sync_parent(temporary.parent, expected_identity=parent_authority)
         return None
     if prepublish_validate is not None:
         try:
@@ -793,7 +1044,11 @@ def recover_control_artifact_pair_v1(
             raise ReservationConflictError(
                 f"control temporary prepublication validation failed: {temporary}"
             ) from error
-    source_identity, parent_identity = _sync_complete_control_temporary(temporary, raw)
+    source_identity, parent_identity = _sync_complete_control_temporary(
+        temporary,
+        raw,
+        expected_parent_identity=parent_authority,
+    )
     same_parent_replace_v1(
         temporary,
         path,
@@ -802,7 +1057,11 @@ def recover_control_artifact_pair_v1(
         expected_parent_identity=parent_identity,
         replace_existing=False,
     )
-    reopened = _read_bounded_regular_file(path, max_bytes=max_bytes)
+    reopened = _read_bounded_regular_file(
+        path,
+        max_bytes=max_bytes,
+        expected_parent_identity=parent_authority,
+    )
     try:
         reparsed = parser(reopened)
     except Exception as error:
@@ -957,6 +1216,7 @@ def windows_same_parent_rename_v1(  # noqa: C901
     expected_target_identity: ReservationFileIdentity | None,
     expected_parent_identity: DirectoryIdentity,
     replace_existing: bool,
+    after_namespace_replace: Callable[[], None] | None = None,
 ) -> str:
     """Perform the frozen handle-relative Windows rename and classify disk state."""
 
@@ -1270,6 +1530,8 @@ def windows_same_parent_rename_v1(  # noqa: C901
             raise win_error(saved_error)
         if classification != "committed":
             raise WindowsRenameProtocolError("Windows rename did not reach committed state")
+        if after_namespace_replace is not None:
+            after_namespace_replace()
         return classification
     finally:
         if source_handle not in {-1, invalid_handle}:
@@ -1285,6 +1547,7 @@ def same_parent_replace_v1(
     expected_target_identity: ReservationFileIdentity | None,
     expected_parent_identity: DirectoryIdentity,
     replace_existing: bool,
+    after_namespace_replace: Callable[[], None] | None = None,
 ) -> None:
     """Use the frozen platform replacement primitive for an authenticated pair."""
 
@@ -1296,8 +1559,30 @@ def same_parent_replace_v1(
             expected_target_identity=expected_target_identity,
             expected_parent_identity=expected_parent_identity,
             replace_existing=replace_existing,
+            after_namespace_replace=after_namespace_replace,
         )
         return
+    _same_parent_replace_posix_v1(
+        source_path,
+        target_path,
+        expected_source_identity=expected_source_identity,
+        expected_target_identity=expected_target_identity,
+        expected_parent_identity=expected_parent_identity,
+        replace_existing=replace_existing,
+        after_namespace_replace=after_namespace_replace,
+    )
+
+
+def _same_parent_replace_posix_v1(
+    source_path: Path,
+    target_path: Path,
+    *,
+    expected_source_identity: ReservationFileIdentity,
+    expected_target_identity: ReservationFileIdentity | None,
+    expected_parent_identity: DirectoryIdentity,
+    replace_existing: bool,
+    after_namespace_replace: Callable[[], None] | None = None,
+) -> None:
     source = Path(source_path)
     target = Path(target_path)
     if source.parent != target.parent:
@@ -1365,6 +1650,8 @@ def same_parent_replace_v1(
                 if code in {errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTTY}:
                     raise ReservationCapabilityError("renameat2 no-replace is unsupported")
                 raise OSError(code, os.strerror(code))
+        if after_namespace_replace is not None:
+            after_namespace_replace()
         os.fsync(parent_fd)
         if directory_identity_from_posix_fd(parent_fd) != expected_parent_identity:
             raise ReservationConflictError("rename parent identity changed after sync")
@@ -1895,7 +2182,7 @@ def _default_counter(path: Path, allocation_unit: int) -> int:
     return _allocate(path.stat().st_size, allocation_unit)
 
 
-def _windows_standard_info(path: Path) -> tuple[int, int]:
+def _windows_standard_info(path_or_handle) -> tuple[int, int]:
     import ctypes
     import msvcrt
     from ctypes import wintypes
@@ -1918,7 +2205,12 @@ def _windows_standard_info(path: Path) -> tuple[int, int]:
         wintypes.DWORD,
     ]
     get_info.restype = wintypes.BOOL
-    with Path(path).open("rb", buffering=0) as handle:
+    opened = (
+        nullcontext(path_or_handle)
+        if hasattr(path_or_handle, "fileno")
+        else Path(path_or_handle).open("rb", buffering=0)
+    )
+    with opened as handle:
         native = wintypes.HANDLE(msvcrt.get_osfhandle(handle.fileno()))
         info = FileStandardInfo()
         if not get_info(native, 1, ctypes.byref(info), ctypes.sizeof(info)):
@@ -1929,7 +2221,7 @@ def _windows_standard_info(path: Path) -> tuple[int, int]:
     return int(info.EndOfFile), int(info.AllocationSize)
 
 
-def _windows_allocated_ranges(path: Path, logical: int) -> tuple[tuple[int, int], ...]:
+def _windows_allocated_ranges(path_or_handle, logical: int) -> tuple[tuple[int, int], ...]:
     import ctypes
     import msvcrt
     from ctypes import wintypes
@@ -1958,7 +2250,12 @@ def _windows_allocated_ranges(path: Path, logical: int) -> tuple[tuple[int, int]
     device_io.restype = wintypes.BOOL
     ranges: list[tuple[int, int]] = []
     start = 0
-    with Path(path).open("rb", buffering=0) as handle:
+    opened = (
+        nullcontext(path_or_handle)
+        if hasattr(path_or_handle, "fileno")
+        else Path(path_or_handle).open("rb", buffering=0)
+    )
+    with opened as handle:
         native = wintypes.HANDLE(msvcrt.get_osfhandle(handle.fileno()))
         while start < logical:
             query = FileAllocatedRangeBuffer(start, logical - start)
@@ -2002,7 +2299,7 @@ def _windows_allocated_ranges(path: Path, logical: int) -> tuple[tuple[int, int]
     return tuple(ranges)
 
 
-def _linux_fiemap_ranges(path: Path, logical: int) -> tuple[tuple[int, int], ...]:
+def _linux_fiemap_ranges(path_or_handle, logical: int) -> tuple[tuple[int, int], ...]:
     import fcntl
 
     fiemap_ioctl = 0xC020660B
@@ -2015,7 +2312,12 @@ def _linux_fiemap_ranges(path: Path, logical: int) -> tuple[tuple[int, int], ...
     extent_size = 56
     ranges: list[tuple[int, int]] = []
     start = 0
-    with Path(path).open("rb", buffering=0) as handle:
+    opened = (
+        nullcontext(path_or_handle)
+        if hasattr(path_or_handle, "fileno")
+        else Path(path_or_handle).open("rb", buffering=0)
+    )
+    with opened as handle:
         while start < logical:
             buffer = bytearray(header_size + extent_capacity * extent_size)
             struct.pack_into(
@@ -2089,16 +2391,24 @@ def _normalize_allocation_ranges(
     return tuple(normalized)
 
 
+def _platform_allocation_counter_source(path_or_handle) -> int:
+    if os.name == "nt":
+        _, allocated = _windows_standard_info(path_or_handle)
+        return allocated
+    if sys.platform.startswith("linux"):
+        metadata = (
+            os.fstat(path_or_handle.fileno())
+            if hasattr(path_or_handle, "fileno")
+            else Path(path_or_handle).stat(follow_symlinks=False)
+        )
+        return int(metadata.st_blocks) * 512
+    raise ReservationCapabilityError("allocation evidence is unsupported on this platform")
+
+
 def platform_allocation_counter(path: Path) -> int:
     """Return the platform's physical allocation counter for release proofs."""
 
-    path = Path(path)
-    if os.name == "nt":
-        _, allocated = _windows_standard_info(path)
-        return allocated
-    if sys.platform.startswith("linux"):
-        return int(path.stat(follow_symlinks=False).st_blocks) * 512
-    raise ReservationCapabilityError("allocation evidence is unsupported on this platform")
+    return _platform_allocation_counter_source(Path(path))
 
 
 def platform_allocation_adapter(
@@ -2107,20 +2417,37 @@ def platform_allocation_adapter(
 ) -> ReservationAllocationEvidence:
     """Prove complete physical allocation using the frozen platform adapter."""
 
-    path = Path(path)
+    return _platform_allocation_adapter_source(Path(path), logical)
+
+
+def _platform_allocation_adapter_source(
+    path_or_handle,
+    logical: int,
+) -> ReservationAllocationEvidence:
     if type(logical) is not int or logical <= 0:
         raise ValueError("logical allocation length must be a positive integer")
     if os.name == "nt":
-        eof, allocated = _windows_standard_info(path)
+        eof, allocated = _windows_standard_info(path_or_handle)
         if eof != logical:
             raise ReservationIncompleteError("Windows EOF differs from logical reservation")
-        ranges = _normalize_allocation_ranges(_windows_allocated_ranges(path, logical), logical)
+        ranges = _normalize_allocation_ranges(
+            _windows_allocated_ranges(path_or_handle, logical),
+            logical,
+        )
         platform = "windows-allocated-ranges-v1"
     elif sys.platform.startswith("linux"):
-        if path.stat(follow_symlinks=False).st_size != logical:
+        metadata = (
+            os.fstat(path_or_handle.fileno())
+            if hasattr(path_or_handle, "fileno")
+            else Path(path_or_handle).stat(follow_symlinks=False)
+        )
+        if metadata.st_size != logical:
             raise ReservationIncompleteError("Linux EOF differs from logical reservation")
-        ranges = _normalize_allocation_ranges(_linux_fiemap_ranges(path, logical), logical)
-        allocated = platform_allocation_counter(path)
+        ranges = _normalize_allocation_ranges(
+            _linux_fiemap_ranges(path_or_handle, logical),
+            logical,
+        )
+        allocated = _platform_allocation_counter_source(path_or_handle)
         platform = "linux-fiemap-v1"
     else:
         raise ReservationCapabilityError("allocation evidence is unsupported on this platform")
@@ -2196,6 +2523,121 @@ class ReservedArtifactTransaction:
     def target_path(self) -> Path:
         return self.job_root / self.descriptor.target_relative_path
 
+    @contextmanager
+    def open_authenticated_source(
+        self,
+        *,
+        writable: bool = False,
+        missing_ok: bool = False,
+    ):
+        """Open the exact indexed source inode without following its name."""
+
+        try:
+            with _open_relative_regular_file(
+                self.source_path,
+                writable=writable,
+                create=False,
+                expected_parent_identity=self.descriptor.target_parent_identity,
+            ) as (handle, identity, _parent_identity):
+                if identity != self.descriptor.filesystem_identity:
+                    raise ReservationConflictError("reservation source identity changed")
+                yield handle
+        except FileNotFoundError:
+            if missing_ok:
+                yield None
+                return
+            raise ReservationConflictError("reservation source is absent") from None
+        except ReservationConflictError:
+            raise
+        except (
+            NoFollowPathError,
+            OSError,
+            PersistentIdentityCapabilityError,
+            PersistentIdentitySchemaError,
+        ) as error:
+            raise ReservationConflictError(
+                "reservation source cannot be opened without following links"
+            ) from error
+
+    @contextmanager
+    def open_authenticated_target(
+        self,
+        *,
+        expected_identity: ReservationFileIdentity | None,
+        missing_ok: bool = False,
+    ):
+        """Open one target through the indexed parent and optional exact identity."""
+
+        try:
+            with _open_relative_regular_file(
+                self.target_path,
+                writable=False,
+                create=False,
+                expected_parent_identity=self.descriptor.target_parent_identity,
+            ) as (handle, identity, _parent_identity):
+                if expected_identity is not None and identity != expected_identity:
+                    label = (
+                        "reservation preflight target"
+                        if self.descriptor.publication_method == "replace_existing"
+                        else "reservation target"
+                    )
+                    raise ReservationConflictError(f"{label} identity changed")
+                yield handle, identity
+        except FileNotFoundError:
+            if missing_ok:
+                yield None
+                return
+            raise ReservationConflictError("reservation target is absent") from None
+        except ReservationConflictError:
+            raise
+        except (
+            NoFollowPathError,
+            OSError,
+            PersistentIdentityCapabilityError,
+            PersistentIdentitySchemaError,
+        ) as error:
+            raise ReservationConflictError(
+                "reservation target cannot be opened without following links"
+            ) from error
+
+    @staticmethod
+    def _read_open_payload(handle, *, byte_count: int) -> bytes:
+        handle.seek(0)
+        raw = handle.read(byte_count + 1)
+        if len(raw) != byte_count:
+            raise ReservationConflictError("reservation payload length changed")
+        return raw
+
+    def _allocation_evidence_for_open_source(
+        self,
+        handle,
+        logical: int,
+    ) -> ReservationAllocationEvidence:
+        if self.allocation_adapter is platform_allocation_adapter:
+            return _platform_allocation_adapter_source(handle, logical)
+        return self.allocation_adapter(self.source_path, logical)
+
+    def _allocation_counter_for_open_source(self, handle) -> int:
+        if self.allocation_counter is platform_allocation_counter:
+            return _platform_allocation_counter_source(handle)
+        return self.allocation_counter(self.source_path)
+
+    def reset_authenticated_source_to_zero_full(self) -> None:
+        """Reset only the exact indexed source handle to its full zero state."""
+
+        zero_chunk = b"\x00" * RESERVATION_ZERO_FILL_CHUNK_BYTES
+        with self.open_authenticated_source(writable=True) as handle:
+            handle.seek(0)
+            remaining = self.descriptor.logical_byte_count
+            while remaining:
+                chunk = zero_chunk[: min(len(zero_chunk), remaining)]
+                if handle.write(chunk) != len(chunk):
+                    raise OSError("short authenticated reservation reset")
+                remaining -= len(chunk)
+            handle.truncate(self.descriptor.logical_byte_count)
+            handle.flush()
+            os.fsync(handle.fileno())
+
     @classmethod
     def create(  # noqa: C901
         cls,
@@ -2214,13 +2656,24 @@ class ReservedArtifactTransaction:
         event: Callable[[str], None] | None = None,
         descriptor_publisher: Callable[..., None] = publish_index_owned_descriptor_v1,
         materialize_missing: bool = True,
+        cancelled: Callable[[], bool] | None = None,
     ) -> ReservedArtifactTransaction:
+        def check_cancelled() -> None:
+            if cancelled is not None and cancelled():
+                raise InterruptedError("reservation extent materialization was cancelled")
+
         started = time.monotonic_ns()
+        check_cancelled()
         job_root = Path(job_root)
         index_path = job_root / index_relative_path
         if not index_path.is_file():
             raise ReservationConflictError("reservation extent has no durable write-ahead index")
-        index_raw = _read_bounded_regular_file(index_path, max_bytes=1024 * 1024)
+        index_raw, _index_identity, index_parent_identity = (
+            _read_bounded_regular_file_with_identity(
+                index_path,
+                max_bytes=1024 * 1024,
+            )
+        )
         try:
             index_value = strict_canonical_json_loads(index_raw, max_bytes=1024 * 1024)
         except CanonicalJsonError as error:
@@ -2291,6 +2744,8 @@ class ReservedArtifactTransaction:
             indexed_entry["target_parent_identity"]
         ) != target_parent_identity:
             raise ReservationConflictError("indexed reservation target parent changed")
+        if event is not None:
+            event("parent:authenticated")
         target_exists = target_path.exists() or target_path.is_symlink()
         publication_method: PublicationMethod = (
             indexed_entry["publication_method"]
@@ -2305,8 +2760,19 @@ class ReservedArtifactTransaction:
         if publication_method == "replace_existing":
             if not target_exists:
                 raise ReservationConflictError("declared existing reservation target is absent")
-            old_target_identity = _identity(target_path)
-            old_target_sha256, old_target_byte_count = _stream_file_sha256_count(target_path)
+            old_target_scan = _scan_reservation_fixed_file_v1(
+                job_root,
+                target_path,
+                cancelled=cancelled,
+            )
+            if not isinstance(old_target_scan.identity, ReservationFileIdentity):
+                raise ReservationConflictError(
+                    "existing reservation target identity type changed"
+                )
+            old_target_identity = old_target_scan.identity
+            old_target_sha256 = old_target_scan.raw_sha256
+            old_target_byte_count = old_target_scan.byte_count
+            del old_target_scan
             if strict_index:
                 expected_identity = indexed_entry["existing_target_identity_at_preflight"]
                 expected_count = indexed_entry["existing_target_byte_count_at_preflight"]
@@ -2320,16 +2786,30 @@ class ReservedArtifactTransaction:
                     raise ReservationConflictError("indexed existing target changed before readiness")
             placeholder_identity = None
         elif publication_method == "replace_placeholder" and target_exists:
-            if target_path.stat(follow_symlinks=False).st_size != 0:
-                raise ReservationConflictError("declared reservation placeholder is nonempty")
-            placeholder_identity = _identity(target_path)
+            with _open_relative_regular_file(
+                target_path,
+                writable=False,
+                create=False,
+                expected_parent_identity=target_parent_identity,
+            ) as (placeholder, placeholder_identity, _parent_identity):
+                if os.fstat(placeholder.fileno()).st_size != 0:
+                    raise ReservationConflictError(
+                        "declared reservation placeholder is nonempty"
+                    )
         elif publication_method == "replace_placeholder":
             if not materialize_missing:
                 raise ReservationIncompleteError(
                     "reservation placeholder is absent during read-only readiness validation"
                 )
             try:
-                with target_path.open("xb") as placeholder:
+                with _open_relative_regular_file(
+                    target_path,
+                    writable=True,
+                    create=True,
+                    exclusive=True,
+                    expected_parent_identity=target_parent_identity,
+                    sync_parent_on_exit=True,
+                ) as (placeholder, placeholder_identity, _parent_identity):
                     placeholder.flush()
                     os.fsync(placeholder.fileno())
             except OSError as error:
@@ -2338,8 +2818,6 @@ class ReservedArtifactTransaction:
                         "placeholder creation is incomplete"
                     ) from error
                 raise
-            _sync_parent(target_path.parent)
-            placeholder_identity = _identity(target_path)
             if event is not None:
                 event("placeholder:created")
         else:
@@ -2348,70 +2826,113 @@ class ReservedArtifactTransaction:
         source_name = f".depth-surge-r-{generation}-{reservation_kind}-{reservation_id}.reserved"
         source_path = target_path.parent / source_name
         metrics = ReservationMetrics()
-        try:
-            if source_path.exists() or source_path.is_symlink():
-                if source_path.is_symlink() or not source_path.is_file():
-                    raise ReservationConflictError("reservation source is unsafe")
-                current_size = source_path.stat().st_size
-                if current_size > logical:
-                    raise ReservationConflictError("reservation source exceeds logical length")
-                with source_path.open("rb", buffering=0) as existing:
-                    while True:
-                        chunk = existing.read(RESERVATION_ZERO_FILL_CHUNK_BYTES)
-                        if not chunk:
-                            break
-                        if any(chunk):
-                            raise ReservationConflictError(
-                                "descriptorless reservation source is not all zero"
-                            )
-                open_mode = "r+b"
-            else:
-                current_size = 0
-                open_mode = "x+b"
+
+        def prepare_source(
+            handle,
+            *,
+            current_size: int,
+        ) -> None:
+            if current_size > logical:
+                raise ReservationConflictError(
+                    "reservation source exceeds logical length"
+                )
+            handle.seek(0)
+            while True:
+                check_cancelled()
+                chunk = handle.read(RESERVATION_ZERO_FILL_CHUNK_BYTES)
+                if not chunk:
+                    break
+                if any(chunk):
+                    raise ReservationConflictError(
+                        "descriptorless reservation source is not all zero"
+                    )
             if not materialize_missing:
                 if current_size != logical:
                     raise ReservationIncompleteError(
                         "reservation source is not ready during read-only validation"
                     )
             else:
-                with source_path.open(open_mode) as handle:
-                    handle.seek(current_size)
-                    if event is not None:
-                        event("extent:created")
-                    remaining = logical - current_size
-                    zero_chunk = b"\x00" * RESERVATION_ZERO_FILL_CHUNK_BYTES
-                    while remaining:
-                        chunk = zero_chunk[: min(remaining, len(zero_chunk))]
-                        written = handle.write(chunk)
-                        if written != len(chunk):
-                            raise OSError("short reservation zero fill")
-                        metrics.reservation_write_bytes += written
-                        remaining -= written
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                    metrics.reservation_fsync_count += 1
+                handle.seek(current_size)
+                if event is not None:
+                    event("extent:created")
+                remaining = logical - current_size
+                zero_chunk = b"\x00" * RESERVATION_ZERO_FILL_CHUNK_BYTES
+                while remaining:
+                    check_cancelled()
+                    chunk = zero_chunk[: min(remaining, len(zero_chunk))]
+                    written = handle.write(chunk)
+                    if written != len(chunk):
+                        raise OSError("short reservation zero fill")
+                    metrics.reservation_write_bytes += written
+                    remaining -= written
+                handle.flush()
+                os.fsync(handle.fileno())
+                metrics.reservation_fsync_count += 1
+            if os.fstat(handle.fileno()).st_size != logical:
+                raise ReservationIncompleteError(
+                    "reservation extent is not a full zero frame"
+                )
+            handle.seek(0)
+            while True:
+                check_cancelled()
+                chunk = handle.read(RESERVATION_ZERO_FILL_CHUNK_BYTES)
+                if not chunk:
+                    break
+                if any(chunk):
+                    raise ReservationIncompleteError(
+                        "reservation extent is not a full zero frame"
+                    )
+
+        try:
+            try:
+                with _open_relative_regular_file(
+                    source_path,
+                    writable=True,
+                    create=False,
+                    expected_parent_identity=target_parent_identity,
+                ) as (handle, source_identity, _parent_identity):
+                    prepare_source(
+                        handle,
+                        current_size=os.fstat(handle.fileno()).st_size,
+                    )
+            except FileNotFoundError:
+                if not materialize_missing:
+                    raise ReservationIncompleteError(
+                        "reservation source is absent during read-only validation"
+                    ) from None
+                with _open_relative_regular_file(
+                    source_path,
+                    writable=True,
+                    create=True,
+                    exclusive=True,
+                    expected_parent_identity=target_parent_identity,
+                    sync_parent_on_exit=True,
+                ) as (handle, source_identity, _parent_identity):
+                    prepare_source(handle, current_size=0)
         except OSError as error:
             if error.errno == errno.ENOSPC or getattr(error, "winerror", None) == 112:
                 raise ReservationIncompleteError("reservation extent fill is incomplete") from error
             raise
-        zero_ready = source_path.stat().st_size == logical
-        if zero_ready:
-            with source_path.open("rb", buffering=0) as handle:
-                while True:
-                    chunk = handle.read(RESERVATION_ZERO_FILL_CHUNK_BYTES)
-                    if not chunk:
-                        break
-                    if any(chunk):
-                        zero_ready = False
-                        break
-        if not zero_ready:
-            raise ReservationIncompleteError("reservation extent is not a full zero frame")
+        check_cancelled()
         evidence = allocation_adapter(source_path, logical)
+        check_cancelled()
         if evidence.logical_coverage_byte_count != logical:
             raise ReservationIncompleteError("reservation allocation coverage is incomplete")
         if event is not None:
             event("extent:ready")
-        source_identity = _identity(source_path)
+        with _open_relative_regular_file(
+            source_path,
+            writable=False,
+            create=False,
+            expected_parent_identity=target_parent_identity,
+        ) as (source, current_source_identity, _parent_identity):
+            if (
+                current_source_identity != source_identity
+                or os.fstat(source.fileno()).st_size != logical
+            ):
+                raise ReservationConflictError(
+                    "reservation source changed during allocation proof"
+                )
         publication_generation = (
             indexed_entry["descriptor_publication_generation"]
             if strict_index
@@ -2557,48 +3078,68 @@ class ReservedArtifactTransaction:
             marker_payload_sha256=marker_sha256,
         )
         descriptor_path = job_root / descriptor_relative
+        descriptor_parent_authority = (
+            index_parent_identity
+            if Path(index_relative_path).parent == descriptor_relative.parent
+            else None
+        )
 
         def validate_descriptor_authority() -> None:
-            if _read_bounded_regular_file(index_path, max_bytes=1024 * 1024) != index_raw:
+            if _read_bounded_regular_file(
+                index_path,
+                max_bytes=1024 * 1024,
+                expected_parent_identity=index_parent_identity,
+            ) != index_raw:
                 raise ReservationConflictError(
                     "reservation index changed before descriptor publication"
                 )
-            if (
-                not source_path.is_file()
-                or source_path.is_symlink()
-                or _identity(source_path) != source_identity
-                or source_path.stat(follow_symlinks=False).st_size != logical
-            ):
-                raise ReservationConflictError(
-                    "reservation source changed before descriptor publication"
-                )
-            if publication_method == "replace_placeholder":
+            with _open_relative_regular_file(
+                source_path,
+                writable=False,
+                create=False,
+                expected_parent_identity=target_parent_identity,
+            ) as (source, opened_source_identity, _parent_identity):
                 if (
-                    placeholder_identity is None
-                    or not target_path.is_file()
-                    or target_path.is_symlink()
-                    or _identity(target_path) != placeholder_identity
-                    or target_path.stat(follow_symlinks=False).st_size != 0
+                    opened_source_identity != source_identity
+                    or os.fstat(source.fileno()).st_size != logical
                 ):
                     raise ReservationConflictError(
-                        "reservation placeholder changed before descriptor publication"
+                        "reservation source changed before descriptor publication"
                     )
+            if publication_method == "replace_placeholder":
+                with _open_relative_regular_file(
+                    target_path,
+                    writable=False,
+                    create=False,
+                    expected_parent_identity=target_parent_identity,
+                ) as (placeholder, opened_placeholder_identity, _parent_identity):
+                    if (
+                        placeholder_identity is None
+                        or opened_placeholder_identity != placeholder_identity
+                        or os.fstat(placeholder.fileno()).st_size != 0
+                    ):
+                        raise ReservationConflictError(
+                            "reservation placeholder changed before descriptor publication"
+                        )
             else:
-                current_hash, current_count = _stream_file_sha256_count(target_path)
-                if (
-                    old_target_identity is None
-                    or _identity(target_path) != old_target_identity
-                    or current_count != old_target_byte_count
-                    or current_hash != old_target_sha256
-                ):
+                if old_target_identity is None:
                     raise ReservationConflictError(
                         "existing reservation target changed before descriptor publication"
                     )
+                _stream_file_sha256_count(
+                    job_root,
+                    target_path,
+                    expected_identity=old_target_identity,
+                    expected_raw_sha256=old_target_sha256,
+                    expected_byte_count=old_target_byte_count,
+                    cancelled=cancelled,
+                )
 
         descriptor_publisher(
             descriptor_path,
             descriptor.to_object(),
             validate_authority=validate_descriptor_authority,
+            expected_parent_identity=descriptor_parent_authority,
         )
         if event is not None:
             event("descriptor:published")
@@ -2642,50 +3183,80 @@ class ReservedArtifactTransaction:
 
     def _validate_placeholder(self) -> None:
         if self.descriptor.publication_method == "replace_placeholder":
-            if (
-                self.descriptor.placeholder_identity is None
-                or not self.target_path.exists()
-                or self.target_path.stat().st_size != 0
-                or _identity(self.target_path) != self.descriptor.placeholder_identity
-            ):
-                raise ReservationConflictError("reserved target placeholder changed")
+            expected = self.descriptor.placeholder_identity
+            if expected is None:
+                raise ReservationConflictError("reserved target placeholder is unbound")
+            with self.open_authenticated_target(expected_identity=expected) as opened:
+                assert opened is not None
+                handle, _identity_value = opened
+                if os.fstat(handle.fileno()).st_size != 0:
+                    raise ReservationConflictError(
+                        "reserved target placeholder changed"
+                    )
 
     def validate_physical_phase(self, expected_payload: bytes) -> str:
-        source_exists = self.source_path.exists()
-        target_exists = self.target_path.exists()
-        if source_exists:
-            if _identity(self.source_path) != self.descriptor.filesystem_identity:
-                raise ReservationConflictError("reservation source identity changed")
-            size = self.source_path.stat().st_size
-            if not target_exists:
-                if (
-                    os.name == "nt"
-                    and size == len(expected_payload)
-                    and self.source_path.read_bytes() == expected_payload
-                ):
-                    return "replacement-gap"
-                raise ReservationConflictError(
-                    "missing replacement target has no complete-short intent"
+        with self.open_authenticated_source(missing_ok=True) as source:
+            if source is not None:
+                size = int(os.fstat(source.fileno()).st_size)
+                expected_target = (
+                    self.descriptor.placeholder_identity
+                    if self.descriptor.publication_method == "replace_placeholder"
+                    else self.descriptor.existing_target_identity_at_preflight
                 )
-            self._validate_placeholder()
-            if size == self.descriptor.logical_byte_count:
-                evidence = self.allocation_adapter(self.source_path, size)
-                if evidence != self.descriptor.allocation_evidence_at_readiness:
-                    raise ReservationEvidenceConflictError("full-source readiness evidence changed")
-                return "full-source"
-            if size == len(expected_payload) and self.source_path.read_bytes() == expected_payload:
-                return "short-source"
-            raise ReservationConflictError("reservation source length/content is invalid")
-        if target_exists:
-            if (
-                _identity(self.target_path) == self.descriptor.filesystem_identity
-                and self.target_path.stat().st_size == len(expected_payload)
-                and self.target_path.read_bytes() == expected_payload
-            ):
-                return "committed-target"
-            raise ReservationConflictError(
-                "reservation target does not contain the committed extent"
-            )
+                with self.open_authenticated_target(
+                    expected_identity=expected_target,
+                    missing_ok=True,
+                ) as target:
+                    target_exists = target is not None
+                if not target_exists:
+                    if (
+                        os.name == "nt"
+                        and size == len(expected_payload)
+                        and self._read_open_payload(source, byte_count=size)
+                        == expected_payload
+                    ):
+                        return "replacement-gap"
+                    raise ReservationConflictError(
+                        "missing replacement target has no complete-short intent"
+                    )
+                self._validate_placeholder()
+                if (
+                    size == self.descriptor.logical_byte_count
+                ):
+                    evidence = self._allocation_evidence_for_open_source(
+                        source,
+                        size,
+                    )
+                    if evidence != self.descriptor.allocation_evidence_at_readiness:
+                        raise ReservationEvidenceConflictError(
+                            "full-source readiness evidence changed"
+                        )
+                    return "full-source"
+                if (
+                    size == len(expected_payload)
+                    and self._read_open_payload(source, byte_count=size)
+                    == expected_payload
+                ):
+                    return "short-source"
+                raise ReservationConflictError(
+                    "reservation source length/content is invalid"
+                )
+        with self.open_authenticated_target(
+            expected_identity=self.descriptor.filesystem_identity,
+            missing_ok=True,
+        ) as target:
+            if target is not None:
+                handle, _identity_value = target
+                size = int(os.fstat(handle.fileno()).st_size)
+                if (
+                    size == len(expected_payload)
+                    and self._read_open_payload(handle, byte_count=size)
+                    == expected_payload
+                ):
+                    return "committed-target"
+                raise ReservationConflictError(
+                    "reservation target does not contain the committed extent"
+                )
         raise ReservationConflictError("reserved extent exists at neither authorized location")
 
     def stage_complete_full(self, payload: bytes) -> None:
@@ -2693,50 +3264,75 @@ class ReservedArtifactTransaction:
             raise ValueError("reservation payload is outside its canonical raw bound")
         if self.validate_physical_phase(payload) != "full-source":
             raise ReservationConflictError("reservation source is not full")
-        with self.source_path.open("r+b") as handle:
+        with self.open_authenticated_source(writable=True) as handle:
+            assert handle is not None
+            if os.fstat(handle.fileno()).st_size != self.descriptor.logical_byte_count:
+                raise ReservationConflictError("reservation source length changed")
             handle.seek(0)
             if handle.write(payload) != len(payload):
                 raise OSError("short reservation payload write")
             handle.flush()
             os.fsync(handle.fileno())
-        evidence = self.allocation_adapter(self.source_path, self.descriptor.logical_byte_count)
-        if evidence != self.descriptor.allocation_evidence_at_readiness:
-            raise ReservationEvidenceConflictError("complete-full readiness evidence changed")
-        if classify_payload_frame(self.source_path.read_bytes(), payload) != "complete-full":
-            raise ReservationConflictError("reservation source is not exact complete-full")
+            evidence = self._allocation_evidence_for_open_source(
+                handle,
+                self.descriptor.logical_byte_count,
+            )
+            if evidence != self.descriptor.allocation_evidence_at_readiness:
+                raise ReservationEvidenceConflictError(
+                    "complete-full readiness evidence changed"
+                )
+            raw = self._read_open_payload(
+                handle,
+                byte_count=self.descriptor.logical_byte_count,
+            )
+            if classify_payload_frame(raw, payload) != "complete-full":
+                raise ReservationConflictError(
+                    "reservation source is not exact complete-full"
+                )
 
     def truncate_to_payload(self, payload: bytes) -> None:
-        if classify_payload_frame(self.source_path.read_bytes(), payload) != "complete-full":
-            raise ReservationConflictError("only complete-full may enter truncate")
-        with self.source_path.open("r+b") as handle:
+        with self.open_authenticated_source(writable=True) as handle:
+            assert handle is not None
+            raw = self._read_open_payload(
+                handle,
+                byte_count=int(os.fstat(handle.fileno()).st_size),
+            )
+            if classify_payload_frame(raw, payload) != "complete-full":
+                raise ReservationConflictError("only complete-full may enter truncate")
             handle.truncate(len(payload))
 
     def _short_release_recovery(self, payload: bytes) -> None:
         if self.validate_physical_phase(payload) != "short-source":
             raise ReservationConflictError("short release recovery requires complete-short")
-        with self.source_path.open("r+b") as handle:
+        with self.open_authenticated_source(writable=True) as handle:
+            assert handle is not None
             handle.flush()
             os.fsync(handle.fileno())
-        if self.source_path.read_bytes() != payload:
-            raise ReservationConflictError("short source changed after file sync")
+            if self._read_open_payload(handle, byte_count=len(payload)) != payload:
+                raise ReservationConflictError("short source changed after file sync")
         threshold = (
             self.descriptor.allocation_evidence_at_readiness.allocated_byte_count
             - self.descriptor.allocation_unit
         )
         if self.allocation_counter(self.source_path) <= threshold:
             return
-        with self.source_path.open("r+b") as handle:
+        with self.open_authenticated_source(writable=True) as handle:
+            assert handle is not None
             handle.truncate(len(payload))
             handle.flush()
             os.fsync(handle.fileno())
-        if self.source_path.read_bytes() != payload:
-            raise ReservationConflictError("short source changed after retry truncate")
+            if self._read_open_payload(handle, byte_count=len(payload)) != payload:
+                raise ReservationConflictError(
+                    "short source changed after retry truncate"
+                )
         if self.allocation_counter(self.source_path) > threshold:
-            raise ReservationIncompleteError("short-source allocation release remains unproved")
+            raise ReservationIncompleteError(
+                "short-source allocation release remains unproved"
+            )
 
-    def _stream_prefix_and_zero_tail(
+    def _stream_open_prefix_and_zero_tail(
         self,
-        path: Path,
+        handle,
         *,
         prefix_byte_count: int,
         expected_sha256: str,
@@ -2753,23 +3349,123 @@ class ReservedArtifactTransaction:
             raise ValueError("streamed reservation identity is invalid")
         digest = hashlib.sha256()
         remaining = prefix_byte_count
-        with path.open("rb", buffering=0) as handle:
-            while remaining:
-                chunk = handle.read(min(1024 * 1024, remaining))
-                if not chunk:
-                    raise ReservationConflictError("streamed reservation prefix ended early")
-                digest.update(chunk)
-                remaining -= len(chunk)
-            tail_remaining = expected_total_byte_count - prefix_byte_count
-            while tail_remaining:
-                chunk = handle.read(min(1024 * 1024, tail_remaining))
-                if not chunk or any(chunk):
-                    raise ReservationConflictError("streamed reservation tail is not all zero")
-                tail_remaining -= len(chunk)
-            if handle.read(1):
-                raise ReservationConflictError("streamed reservation has trailing bytes")
+        handle.seek(0)
+        while remaining:
+            chunk = handle.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise ReservationConflictError("streamed reservation prefix ended early")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        tail_remaining = expected_total_byte_count - prefix_byte_count
+        while tail_remaining:
+            chunk = handle.read(min(1024 * 1024, tail_remaining))
+            if not chunk or any(chunk):
+                raise ReservationConflictError("streamed reservation tail is not all zero")
+            tail_remaining -= len(chunk)
+        if handle.read(1):
+            raise ReservationConflictError("streamed reservation has trailing bytes")
         if digest.hexdigest() != expected_sha256:
             raise ReservationConflictError("streamed reservation prefix hash differs")
+
+    def stage_complete_full_streamed(
+        self,
+        *,
+        chunks: Callable[[], Iterable[bytes]],
+        prefix_byte_count: int,
+        prefix_sha256: str,
+    ) -> None:
+        """Write one replayable canonical prefix while retaining the reserved zero tail."""
+
+        if (
+            not callable(chunks)
+            or type(prefix_byte_count) is not int
+            or not 0 < prefix_byte_count <= self.descriptor.payload_raw_max
+            or not isinstance(prefix_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", prefix_sha256, flags=re.ASCII) is None
+        ):
+            raise ValueError("streamed reservation identity is invalid")
+        with self.open_authenticated_source(writable=True) as handle:
+            assert handle is not None
+            if os.fstat(handle.fileno()).st_size != self.descriptor.logical_byte_count:
+                raise ReservationConflictError("streamed reservation source is not full")
+            self._validate_placeholder()
+            evidence = self._allocation_evidence_for_open_source(
+                handle,
+                self.descriptor.logical_byte_count,
+            )
+            if evidence != self.descriptor.allocation_evidence_at_readiness:
+                raise ReservationEvidenceConflictError(
+                    "full-source readiness evidence changed"
+                )
+
+            digest = hashlib.sha256()
+            count = 0
+            reached_zero_tail = False
+            handle.seek(0)
+            for chunk in chunks():
+                if not isinstance(chunk, bytes) or not chunk or b"\x00" in chunk:
+                    raise ValueError("streamed reservation chunks must be nonempty NUL-free bytes")
+                current = handle.read(len(chunk))
+                if len(current) != len(chunk):
+                    raise ReservationConflictError("streamed reservation source ended early")
+                for current_byte, expected_byte in zip(current, chunk, strict=True):
+                    if reached_zero_tail:
+                        if current_byte != 0:
+                            raise ReservationConflictError(
+                                "streamed reservation source is not a canonical prefix"
+                            )
+                    elif current_byte == 0:
+                        reached_zero_tail = True
+                    elif current_byte != expected_byte:
+                        raise ReservationConflictError(
+                            "streamed reservation source has foreign semantic intent"
+                        )
+                digest.update(chunk)
+                count += len(chunk)
+            remaining = self.descriptor.logical_byte_count - count
+            while remaining:
+                current = handle.read(
+                    min(RESERVATION_ZERO_FILL_CHUNK_BYTES, remaining)
+                )
+                if not current or any(current):
+                    raise ReservationConflictError("streamed reservation tail is not all zero")
+                remaining -= len(current)
+            if handle.read(1):
+                raise ReservationConflictError("streamed reservation source has trailing bytes")
+            if count != prefix_byte_count or digest.hexdigest() != prefix_sha256:
+                raise ReservationConflictError(
+                    "streamed reservation replay identity differs"
+                )
+
+            digest = hashlib.sha256()
+            count = 0
+            handle.seek(0)
+            for chunk in chunks():
+                if not isinstance(chunk, bytes) or not chunk or b"\x00" in chunk:
+                    raise ValueError("streamed reservation chunks must be nonempty NUL-free bytes")
+                if handle.write(chunk) != len(chunk):
+                    raise OSError("short streamed reservation payload write")
+                digest.update(chunk)
+                count += len(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+            if count != prefix_byte_count or digest.hexdigest() != prefix_sha256:
+                raise ReservationConflictError(
+                    "streamed reservation changed while writing"
+                )
+            if self._allocation_evidence_for_open_source(
+                handle,
+                self.descriptor.logical_byte_count,
+            ) != self.descriptor.allocation_evidence_at_readiness:
+                raise ReservationEvidenceConflictError(
+                    "complete-full readiness evidence changed"
+                )
+            self._stream_open_prefix_and_zero_tail(
+                handle,
+                prefix_byte_count=prefix_byte_count,
+                expected_sha256=prefix_sha256,
+                expected_total_byte_count=self.descriptor.logical_byte_count,
+            )
 
     def validate_streamed_physical_phase(
         self,
@@ -2779,58 +3475,77 @@ class ReservedArtifactTransaction:
     ) -> str:
         """Validate a large canonical prefix without materializing it in memory."""
 
-        source_exists = self.source_path.exists()
-        target_exists = self.target_path.exists()
-        if source_exists:
-            if _identity(self.source_path) != self.descriptor.filesystem_identity:
-                raise ReservationConflictError("reservation source identity changed")
-            size = self.source_path.stat().st_size
-            if not target_exists:
-                if os.name != "nt" or size != prefix_byte_count:
-                    raise ReservationConflictError(
-                        "missing streamed replacement target has no complete-short intent"
+        with self.open_authenticated_source(missing_ok=True) as source:
+            if source is not None:
+                size = int(os.fstat(source.fileno()).st_size)
+                expected_target = (
+                    self.descriptor.placeholder_identity
+                    if self.descriptor.publication_method == "replace_placeholder"
+                    else self.descriptor.existing_target_identity_at_preflight
+                )
+                with self.open_authenticated_target(
+                    expected_identity=expected_target,
+                    missing_ok=True,
+                ) as target:
+                    target_exists = target is not None
+                if not target_exists:
+                    if os.name != "nt" or size != prefix_byte_count:
+                        raise ReservationConflictError(
+                            "missing streamed replacement target has no complete-short intent"
+                        )
+                    self._stream_open_prefix_and_zero_tail(
+                        source,
+                        prefix_byte_count=prefix_byte_count,
+                        expected_sha256=prefix_sha256,
+                        expected_total_byte_count=size,
                     )
-                self._stream_prefix_and_zero_tail(
-                    self.source_path,
+                    return "replacement-gap"
+                self._validate_placeholder()
+                if size == self.descriptor.logical_byte_count:
+                    evidence = self._allocation_evidence_for_open_source(
+                        source,
+                        size,
+                    )
+                    if evidence != self.descriptor.allocation_evidence_at_readiness:
+                        raise ReservationEvidenceConflictError(
+                            "full-source readiness evidence changed"
+                        )
+                    self._stream_open_prefix_and_zero_tail(
+                        source,
+                        prefix_byte_count=prefix_byte_count,
+                        expected_sha256=prefix_sha256,
+                        expected_total_byte_count=size,
+                    )
+                    return "full-source"
+                if size == prefix_byte_count:
+                    self._stream_open_prefix_and_zero_tail(
+                        source,
+                        prefix_byte_count=prefix_byte_count,
+                        expected_sha256=prefix_sha256,
+                        expected_total_byte_count=size,
+                    )
+                    return "short-source"
+                raise ReservationConflictError(
+                    "streamed reservation source length is invalid"
+                )
+        with self.open_authenticated_target(
+            expected_identity=self.descriptor.filesystem_identity,
+            missing_ok=True,
+        ) as target:
+            if target is not None:
+                handle, _identity_value = target
+                size = int(os.fstat(handle.fileno()).st_size)
+                if size != prefix_byte_count:
+                    raise ReservationConflictError(
+                        "streamed reservation target identity differs"
+                    )
+                self._stream_open_prefix_and_zero_tail(
+                    handle,
                     prefix_byte_count=prefix_byte_count,
                     expected_sha256=prefix_sha256,
-                    expected_total_byte_count=size,
+                    expected_total_byte_count=prefix_byte_count,
                 )
-                return "replacement-gap"
-            self._validate_placeholder()
-            if size == self.descriptor.logical_byte_count:
-                evidence = self.allocation_adapter(self.source_path, size)
-                if evidence != self.descriptor.allocation_evidence_at_readiness:
-                    raise ReservationEvidenceConflictError("full-source readiness evidence changed")
-                self._stream_prefix_and_zero_tail(
-                    self.source_path,
-                    prefix_byte_count=prefix_byte_count,
-                    expected_sha256=prefix_sha256,
-                    expected_total_byte_count=size,
-                )
-                return "full-source"
-            if size == prefix_byte_count:
-                self._stream_prefix_and_zero_tail(
-                    self.source_path,
-                    prefix_byte_count=prefix_byte_count,
-                    expected_sha256=prefix_sha256,
-                    expected_total_byte_count=size,
-                )
-                return "short-source"
-            raise ReservationConflictError("streamed reservation source length is invalid")
-        if target_exists:
-            if (
-                _identity(self.target_path) != self.descriptor.filesystem_identity
-                or self.target_path.stat().st_size != prefix_byte_count
-            ):
-                raise ReservationConflictError("streamed reservation target identity differs")
-            self._stream_prefix_and_zero_tail(
-                self.target_path,
-                prefix_byte_count=prefix_byte_count,
-                expected_sha256=prefix_sha256,
-                expected_total_byte_count=prefix_byte_count,
-            )
-            return "committed-target"
+                return "committed-target"
         raise ReservationConflictError("streamed extent exists at neither authorized location")
 
     def _short_release_recovery_streamed(
@@ -2847,30 +3562,48 @@ class ReservedArtifactTransaction:
             != "short-source"
         ):
             raise ReservationConflictError("streamed release recovery requires short source")
-        with self.source_path.open("r+b") as handle:
+        with self.open_authenticated_source(writable=True) as handle:
+            assert handle is not None
             handle.flush()
             os.fsync(handle.fileno())
+            self._stream_open_prefix_and_zero_tail(
+                handle,
+                prefix_byte_count=prefix_byte_count,
+                expected_sha256=prefix_sha256,
+                expected_total_byte_count=prefix_byte_count,
+            )
         threshold = (
             self.descriptor.allocation_evidence_at_readiness.allocated_byte_count
             - self.descriptor.allocation_unit
         )
         if self.allocation_counter(self.source_path) <= threshold:
             return
-        with self.source_path.open("r+b") as handle:
+        with self.open_authenticated_source(writable=True) as handle:
+            assert handle is not None
             handle.truncate(prefix_byte_count)
             handle.flush()
             os.fsync(handle.fileno())
-        self.validate_streamed_physical_phase(
-            prefix_byte_count=prefix_byte_count,
-            prefix_sha256=prefix_sha256,
-        )
+            self._stream_open_prefix_and_zero_tail(
+                handle,
+                prefix_byte_count=prefix_byte_count,
+                expected_sha256=prefix_sha256,
+                expected_total_byte_count=prefix_byte_count,
+            )
         if self.allocation_counter(self.source_path) > threshold:
-            raise ReservationIncompleteError("streamed short-source release remains unproved")
+            raise ReservationIncompleteError(
+                "streamed short-source release remains unproved"
+            )
 
     def _rename_and_sync(self, *, replacement_gap: bool = False) -> None:
         if replacement_gap:
-            if self.target_path.exists() or self.target_path.is_symlink():
-                raise ReservationConflictError("replacement-gap target reappeared")
+            with self.open_authenticated_target(
+                expected_identity=None,
+                missing_ok=True,
+            ) as target:
+                if target is not None:
+                    raise ReservationConflictError(
+                        "replacement-gap target reappeared"
+                    )
             expected_target = None
         else:
             self._validate_placeholder()
@@ -2878,17 +3611,23 @@ class ReservedArtifactTransaction:
             if self.descriptor.publication_method == "replace_existing":
                 expected_target = self.descriptor.existing_target_identity_at_preflight
                 if expected_target is not None:
-                    digest, count = _stream_file_sha256_count(self.target_path)
-                    if (
-                        _identity(self.target_path) != expected_target
-                        or count != self.descriptor.existing_target_byte_count_at_preflight
-                        or digest != self.descriptor.existing_target_raw_sha256_at_preflight
-                    ):
-                        raise ReservationConflictError(
-                            "reservation existing target changed before replacement"
-                        )
+                    _stream_file_sha256_count(
+                        self.job_root,
+                        self.target_path,
+                        expected_identity=expected_target,
+                        expected_raw_sha256=(
+                            self.descriptor.existing_target_raw_sha256_at_preflight
+                        ),
+                        expected_byte_count=(
+                            self.descriptor.existing_target_byte_count_at_preflight
+                        ),
+                    )
                 else:
-                    expected_target = _identity(self.target_path)
+                    with self.open_authenticated_target(
+                        expected_identity=None,
+                    ) as target:
+                        assert target is not None
+                        _handle, expected_target = target
         same_parent_replace_v1(
             self.source_path,
             self.target_path,
@@ -2899,8 +3638,10 @@ class ReservedArtifactTransaction:
         )
 
     def _retire_descriptor(self) -> None:
-        self.descriptor_path.unlink(missing_ok=True)
-        _sync_parent(self.descriptor_path.parent)
+        _unlink_exact_control_artifact(
+            self.descriptor_path,
+            canonical_json_bytes(self.descriptor.to_object()),
+        )
 
     def consume(self, payload: bytes, *, crash_at: str | None = None) -> str:
         self.stage_complete_full(payload)
@@ -2909,7 +3650,8 @@ class ReservedArtifactTransaction:
         self.truncate_to_payload(payload)
         if crash_at == "after-truncate":
             raise InjectedReservationCrash(crash_at)
-        with self.source_path.open("r+b") as handle:
+        with self.open_authenticated_source(writable=True) as handle:
+            assert handle is not None
             handle.flush()
             os.fsync(handle.fileno())
         if crash_at == "after-truncate-sync":
@@ -2926,7 +3668,13 @@ class ReservedArtifactTransaction:
     def recover(self, payload: bytes) -> str:
         phase = self.validate_physical_phase(payload)
         if phase == "full-source":
-            state = classify_payload_frame(self.source_path.read_bytes(), payload)
+            with self.open_authenticated_source() as handle:
+                assert handle is not None
+                raw = self._read_open_payload(
+                    handle,
+                    byte_count=int(os.fstat(handle.fileno()).st_size),
+                )
+            state = classify_payload_frame(raw, payload)
             if state != "complete-full":
                 raise ReservationConflictError("recovery full source has no semantic intent")
             self.truncate_to_payload(payload)
@@ -2958,11 +3706,13 @@ class ReservedArtifactTransaction:
         )
         if phase != "full-source":
             raise ReservationConflictError("streamed consumption requires complete-full source")
-        with self.source_path.open("r+b") as handle:
+        with self.open_authenticated_source(writable=True) as handle:
+            assert handle is not None
             handle.truncate(prefix_byte_count)
         if crash_at == "after-truncate":
             raise InjectedReservationCrash(crash_at)
-        with self.source_path.open("r+b") as handle:
+        with self.open_authenticated_source(writable=True) as handle:
+            assert handle is not None
             handle.flush()
             os.fsync(handle.fileno())
         if crash_at == "after-truncate-sync":
@@ -2996,7 +3746,8 @@ class ReservedArtifactTransaction:
             prefix_sha256=prefix_sha256,
         )
         if phase == "full-source":
-            with self.source_path.open("r+b") as handle:
+            with self.open_authenticated_source(writable=True) as handle:
+                assert handle is not None
                 handle.truncate(prefix_byte_count)
             phase = "short-source"
         if phase == "short-source":
@@ -3344,7 +4095,11 @@ def publish_job_control(job_root: Path, control: JobControlV1) -> None:
     job_root = Path(job_root)
     if _directory_identity(job_root) != control.job_root_identity:
         raise ReservationConflictError("job control belongs to a different job root")
-    publish_write_ahead_intent(job_root / JOB_CONTROL_RELATIVE_PATH, control.to_object())
+    publish_write_ahead_intent(
+        job_root / JOB_CONTROL_RELATIVE_PATH,
+        control.to_object(),
+        expected_parent_identity=control.job_root_identity,
+    )
 
 
 _FINAL_ENCODING_RESERVED_PAYLOAD_PARENTS_V1 = (
@@ -4207,7 +4962,10 @@ class SettingsArtifactTransactionV1:
             return "gap"
         if not fixed_path.is_file():
             raise ReservationConflictError("fixed settings target is unsafe")
-        raw = fixed_path.read_bytes()
+        raw = _read_bounded_regular_file(
+            fixed_path,
+            max_bytes=SETTINGS_ARTIFACT_MAX_RAW_BYTES,
+        )
         target_raw = target.encode()
         if raw == target_raw:
             return "target"
@@ -4284,7 +5042,10 @@ class SettingsArtifactTransactionV1:
         fixed_path = job_root / SETTINGS_ARTIFACT_RELATIVE_PATH
         if not fixed_path.is_file() or fixed_path.is_symlink():
             raise ReservationConflictError("fixed settings target is missing or unsafe")
-        if fixed_path.read_bytes() != current.encode():
+        if _read_bounded_regular_file(
+            fixed_path,
+            max_bytes=SETTINGS_ARTIFACT_MAX_RAW_BYTES,
+        ) != current.encode():
             raise ReservationConflictError("current settings bytes changed before transaction")
         attempt_restart = (
             current.status in {"completed", "failed"} and target.status == "in_progress"
@@ -4300,7 +5061,11 @@ class SettingsArtifactTransactionV1:
             replacement_terminal_entry=terminal_entry,
         )
         index_path = job_root / SETTINGS_TRANSITION_INDEX_RELATIVE_PATH
-        publish_write_ahead_intent(index_path, intent.to_object())
+        publish_write_ahead_intent(
+            index_path,
+            intent.to_object(),
+            expected_parent_identity=_directory_identity(index_path.parent),
+        )
         transaction = cls._load_or_create_primary(
             job_root=job_root,
             intent=intent,
@@ -4322,11 +5087,14 @@ class SettingsArtifactTransactionV1:
         )
 
     @staticmethod
-    def _retire_index(index_path: Path) -> None:
-        index_path.unlink(missing_ok=True)
+    def _retire_index(
+        index_path: Path,
+        intent: SettingsTransitionIntentV1,
+    ) -> None:
+        raw = canonical_json_bytes(intent.to_object())
+        _unlink_exact_control_artifact(index_path, raw)
         temporary = index_path.with_name(f".{index_path.name}.create-new.tmp")
-        temporary.unlink(missing_ok=True)
-        _sync_parent(index_path.parent)
+        _unlink_exact_control_artifact(temporary, raw)
 
     def commit(self, *, crash_at: str | None = None) -> ProcessingSettingsArtifactV5:
         from .settings_artifact import ProcessingSettingsArtifactV5
@@ -4365,7 +5133,10 @@ class SettingsArtifactTransactionV1:
         self._consume_or_recover(self.transaction, target.encode(), crash_at=nested_crash)
         if crash_at == "after-target-commit":
             raise InjectedReservationCrash(crash_at)
-        if fixed_path.read_bytes() != target.encode():
+        if _read_bounded_regular_file(
+            fixed_path,
+            max_bytes=SETTINGS_ARTIFACT_MAX_RAW_BYTES,
+        ) != target.encode():
             raise ReservationConflictError("settings target changed after commit")
         if replacement_terminal is not None:
             self._load_or_create_replacement_terminal(
@@ -4375,7 +5146,7 @@ class SettingsArtifactTransactionV1:
                 allocation_adapter=self.transaction.allocation_adapter,
                 allocation_counter=self.transaction.allocation_counter,
             )
-        self._retire_index(self.index_path)
+        self._retire_index(self.index_path, self.intent)
         return target
 
     @classmethod
@@ -4532,7 +5303,10 @@ class SettingsArtifactTransactionV1:
                 allocation_counter=allocation_counter,
             )
             cls._consume_or_recover(transaction, target.encode())
-        if fixed_path.read_bytes() != target.encode():
+        if _read_bounded_regular_file(
+            fixed_path,
+            max_bytes=SETTINGS_ARTIFACT_MAX_RAW_BYTES,
+        ) != target.encode():
             raise ReservationConflictError("settings transition did not commit its exact target")
         cls._load_or_create_replacement_terminal(
             job_root=job_root,
@@ -4541,7 +5315,7 @@ class SettingsArtifactTransactionV1:
             allocation_adapter=allocation_adapter,
             allocation_counter=allocation_counter,
         )
-        cls._retire_index(index_path)
+        cls._retire_index(index_path, intent)
         return target
 
 
@@ -4728,8 +5502,10 @@ def bootstrap_settings_job_v1(  # noqa: C901
         if classify_payload_frame(terminal.source_path.read_bytes(), artifact.encode()) != "zero":
             raise ReservationConflictError("terminal settings extent is not a zero frame")
     else:
-        terminal.source_path.unlink()
-        _sync_parent(terminal.source_path.parent)
+        _unlink_safe_control_temporary(
+            terminal.source_path,
+            expected_identity=terminal.descriptor.filesystem_identity,
+        )
         terminal._retire_descriptor()
     return control
 
@@ -4829,7 +5605,10 @@ def commit_terminal_settings_v1(
     job_root = Path(job_root)
     control = load_job_control(job_root)
     fixed_path = resolve_fixed_settings_path(job_root, control)
-    if fixed_path.read_bytes() != current.encode():
+    if _read_bounded_regular_file(
+        fixed_path,
+        max_bytes=SETTINGS_ARTIFACT_MAX_RAW_BYTES,
+    ) != current.encode():
         raise ReservationConflictError("terminal transition current settings changed")
     if not _terminal_settings_delta_is_legal(current, target):
         raise ReservationConflictError("terminal settings delta is not the unique legal revision")
@@ -4951,7 +5730,12 @@ def recover_settings_job_v1(  # noqa: C901
     current: ProcessingSettingsArtifactV5 | None = None
     if fixed_path.is_file() and fixed_path.stat().st_size:
         try:
-            current = ProcessingSettingsArtifactV5.parse(fixed_path.read_bytes())
+            current = ProcessingSettingsArtifactV5.parse(
+                _read_bounded_regular_file(
+                    fixed_path,
+                    max_bytes=SETTINGS_ARTIFACT_MAX_RAW_BYTES,
+                )
+            )
         except Exception as error:
             raise ReservationConflictError("fixed settings target is malformed") from error
     initial_entry, terminal_entry = control.bootstrap_extent_entries
@@ -5021,7 +5805,12 @@ def recover_settings_job_v1(  # noqa: C901
             allocation_counter=allocation_counter,
         )
     else:
-        current = ProcessingSettingsArtifactV5.parse(fixed_path.read_bytes())
+        current = ProcessingSettingsArtifactV5.parse(
+            _read_bounded_regular_file(
+                fixed_path,
+                max_bytes=SETTINGS_ARTIFACT_MAX_RAW_BYTES,
+            )
+        )
     current_value = current.to_object()
     if (
         current_value["metadata"]["job_id"] != control.job_id

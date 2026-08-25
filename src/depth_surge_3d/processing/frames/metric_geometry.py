@@ -14,6 +14,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from ...io.durable_publish import OwnedSiblingTemporary
 from ...core.depth_contract import canonical_json_hash
 from ...inference.depth.types import DepthRepresentation
 from .depth_storage import RawDepthStore
@@ -417,16 +418,22 @@ def _atomic_write_json(path: Path, payload: dict[str, Any], *, required_bytes: i
         failing_path=path,
     )
     temporary = path.with_name(f"{path.name}.tmp")
+    raw = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+    owned: OwnedSiblingTemporary | None = None
     try:
-        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        temporary.replace(path)
+        owned = OwnedSiblingTemporary.create(path, temporary=temporary)
+        if owned.handle.write(raw) != len(raw):
+            raise OSError("short metric geometry metadata write")
+        owned.sync()
+        owned.replace()
     except OSError as error:
         if not _is_disk_full(error):
             raise
         free_bytes = _current_free_bytes(path.parent)
         raise MetricGeometryDiskFullError(required_bytes, free_bytes, path) from error
     finally:
-        temporary.unlink(missing_ok=True)
+        if owned is not None:
+            owned.cleanup()
 
 
 def _atomic_save_npz(path: Path, frame: MetricGeometryFrame, *, required_bytes: int) -> None:
@@ -644,8 +651,13 @@ class MetricGeometryStore:
     ) -> "MetricGeometryStore":
         if _is_regular_file(metadata_path):
             raise ValueError("Metric geometry metadata is malformed")
-        for temporary in directory.glob("*.tmp"):
-            temporary.unlink(missing_ok=True)
+        unexpected_temporaries = tuple(
+            temporary
+            for temporary in directory.glob("*.tmp")
+            if temporary.name != f"{metadata_path.name}.tmp"
+        )
+        if unexpected_temporaries:
+            raise ValueError("Metric geometry contains an unowned temporary")
         if any(directory.glob("*.npz")):
             raise ValueError("Metric geometry payloads exist without metadata")
         metadata = {
@@ -846,6 +858,7 @@ class MetricGeometryStore:
             audit = metric_npz.audit_metric_npz(
                 path,
                 expected_shape=tuple(self.metadata["native_shape"]),
+                job_root=self.directory,
             )
         except FileNotFoundError as error:
             raise ValueError(f"Metric geometry payload is missing: {path}") from error
@@ -862,11 +875,10 @@ class MetricGeometryStore:
         )
 
     def validate_payloads(self, *, cleanup_temporaries: bool = True) -> int:
-        """Validate exact payloads, optionally cleaning interrupted writes."""
+        """Validate exact payloads without inferring ownership from a temp suffix."""
 
-        if cleanup_temporaries:
-            for temporary in self.directory.glob("*.tmp"):
-                temporary.unlink(missing_ok=True)
+        if cleanup_temporaries and next(self.directory.glob("*.tmp"), None) is not None:
+            raise ValueError("Metric geometry contains an unowned temporary")
         frame_names = self.metadata["frame_names"]
         expected_names = {f"{Path(name).stem}.npz" for name in frame_names}
         actual_names = {path.name for path in self.directory.glob("*.npz")}

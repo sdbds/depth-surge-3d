@@ -8,7 +8,10 @@ import numpy as np
 import cv2
 from unittest.mock import Mock, patch
 
-from src.depth_surge_3d.processing.frames.vr_assembler import VRFrameAssembler
+from src.depth_surge_3d.processing.frames.vr_assembler import (
+    DirectStereoSource,
+    VRFrameAssembler,
+)
 
 
 def _write_source_pair(left_dir, right_dir, index):
@@ -99,6 +102,33 @@ class TestResolveVRSourceFiles:
             )
             is None
         )
+
+    def test_direct_sequences_are_constant_space_canonical_views(self, tmp_path):
+        left = tmp_path / "left_cropped"
+        right = tmp_path / "right_cropped"
+        left.mkdir()
+        right.mkdir()
+        _write_source_pair(left, right, 7)
+        _write_source_pair(left, right, 8)
+
+        result = VRFrameAssembler().resolve_direct_vr_source(
+            {"left_cropped": left, "right_cropped": right},
+            {"upscale_model": "none"},
+            total_frames=2,
+        )
+
+        assert result == DirectStereoSource(left, right, 7, 2)
+
+    def test_direct_sequence_object_size_is_independent_of_frame_count(self, tmp_path):
+        source = DirectStereoSource(
+            tmp_path / "left",
+            tmp_path / "right",
+            1,
+            4_194_304,
+        )
+
+        assert source.frame_count == 4_194_304
+        assert not hasattr(source, "__iter__")
 
 
 class TestVRFrameAssemblerInit:

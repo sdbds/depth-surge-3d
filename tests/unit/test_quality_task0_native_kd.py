@@ -26,11 +26,12 @@ def test_native_extension_is_prebuilt_and_reports_frozen_contract() -> None:
     native_build_info = _api("native_build_info")
 
     assert native_available(), native_load_error()
-    assert native_build_info() == {
-        "algorithm": "quality-implicit-region-kd-median-of-medians-v1",
-        "kd_stack_capacity": 64,
-        "runtime_jit": False,
-    }
+    build_info = native_build_info()
+    assert build_info["algorithm"] == "quality-implicit-region-kd-median-of-medians-v1"
+    assert build_info["kd_stack_capacity"] == 64
+    assert build_info["runtime_jit"] is False
+    assert len(build_info["source_sha256"]) == 64
+    int(build_info["source_sha256"], 16)
     source = inspect.getsource(native_kd)
     assert "cpp_extension.load(" not in source
     assert "load_inline(" not in source

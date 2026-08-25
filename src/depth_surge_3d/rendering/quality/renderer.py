@@ -21,6 +21,12 @@ from ..stereo_renderer import (
     _downsample_subpixel_band,
 )
 from . import native_kd
+from .arena import (
+    QUALITY_GRAPH_ARENA_BYTES,
+    QUALITY_RECORD_ARENA_BYTES,
+    QUALITY_REPAIR_ARENA_BYTES,
+    QualityFixedArenas,
+)
 from .geometry import (
     QualityGeometryResult,
     build_geometry_eye_offsets_into,
@@ -50,10 +56,11 @@ from .visibility import QualitySplatBand, quality_splat_band
 
 QUALITY_HOST_BUDGET_BYTES = 512 * 1024 * 1024
 QUALITY_RUNTIME_OVERHEAD_BYTES = 16 * 1024 * 1024
-QUALITY_RECORD_ARENA_BYTES = 64 * 1024 * 1024
-QUALITY_GRAPH_ARENA_BYTES = 64 * 1024 * 1024
-QUALITY_REPAIR_ARENA_BYTES = 64 * 1024 * 1024
 QUALITY_SPLAT_BYTES_PER_PIXEL = 1536
+QUALITY_SCATTER_WORKSPACE_BYTES = 12 * 1024 * 1024
+QUALITY_SCATTER_CHUNK_PIXELS = QUALITY_SCATTER_WORKSPACE_BYTES // (
+    HORIZONTAL_SUBPIXELS * 4
+)
 
 
 def _calculate_quality_band_height(
@@ -75,7 +82,7 @@ def _quality_public_memory_preflight(
     native_shape: tuple[int, int],
     occlusion_fill: Literal["none", "background"],
     materialize_public_masks: bool,
-) -> None:
+) -> dict[str, int]:
     height, width = render_shape
     native_height, native_width = native_shape
     if min(height, width, native_height, native_width) <= 0:
@@ -110,7 +117,9 @@ def _quality_public_memory_preflight(
             + QUALITY_REPAIR_ARENA_BYTES
             + runtime
         )
-        pass_b = 42 * output_pixels + histogram_bytes + QUALITY_RECORD_ARENA_BYTES + runtime
+        pass_b = (
+            42 * output_pixels + histogram_bytes + QUALITY_RECORD_ARENA_BYTES + runtime
+        )
         phases["quality-planning"] = planning
         phases["quality-pass-b"] = pass_b
         if materialize_public_masks:
@@ -128,6 +137,7 @@ def _quality_public_memory_preflight(
             required,
             QUALITY_HOST_BUDGET_BYTES,
         )
+    return phases
 
 
 @dataclass(frozen=True)
@@ -224,7 +234,9 @@ def _write_analysis_band(
     )
     safe_winners = np.where(valid, winners, np.uint32(0))
     winner_regions = source_regions.reshape(-1)[safe_winners]
-    winner_regions = np.where(valid, winner_regions, NO_REGION).astype(np.uint32, copy=False)
+    winner_regions = np.where(valid, winner_regions, NO_REGION).astype(
+        np.uint32, copy=False
+    )
     lane_valid = valid.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
     lane_regions = winner_regions.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
     coverage = np.sum(lane_valid, axis=2, dtype=np.uint16).astype(np.uint8)
@@ -276,24 +288,33 @@ def _write_analysis_band_native(
     source_regions: np.ndarray,
     start_row: int,
     end_row: int,
+    record_output: np.ndarray,
 ) -> RepairRecordBuildResult:
     winner_sources_i32 = np.ascontiguousarray(
         band.winner_source_index.to(dtype=torch.int32).detach().cpu().numpy()
     )
     winner_sources = winner_sources_i32.view(np.uint32)
     native = native_kd._require_native()
-    raw_records, statistics = native.analyze_splat_band(
-        winner_sources,
-        source_bgr,
-        source_near_score,
-        source_regions,
-        analysis.coverage_count[start_row:end_row],
-        analysis.pure_region_id[start_row:end_row],
-        analysis.pure_bgr[0][start_row:end_row],
-        analysis.pure_bgr[1][start_row:end_row],
-        analysis.pure_bgr[2][start_row:end_row],
+    raw_output = record_output.view(np.uint8).reshape(
+        record_output.size,
+        REPAIR_RECORD_DTYPE.itemsize,
     )
-    records = raw_records.reshape(-1).view(REPAIR_RECORD_DTYPE)
+    try:
+        record_count, statistics = native.analyze_splat_band(
+            winner_sources,
+            source_bgr,
+            source_near_score,
+            source_regions,
+            analysis.coverage_count[start_row:end_row],
+            analysis.pure_region_id[start_row:end_row],
+            analysis.pure_bgr[0][start_row:end_row],
+            analysis.pure_bgr[1][start_row:end_row],
+            analysis.pure_bgr[2][start_row:end_row],
+            raw_output,
+        )
+    except native.QualityBudgetError as error:
+        raise QualityRepairBudgetError("64 MiB repair record arena exceeded") from error
+    records = record_output[: int(record_count)]
     records.setflags(write=False)
     return RepairRecordBuildResult(
         records=records,
@@ -309,6 +330,7 @@ def _analyze_eye_once(
     source: np.ndarray,
     geometry: QualityGeometryResult,
     offsets: np.ndarray,
+    arenas: QualityFixedArenas,
     band_height: int,
 ) -> _EyeAnalysisResult:
     height = int(source.shape[0])
@@ -326,7 +348,7 @@ def _analyze_eye_once(
         pure_bgr,
         anchor_fallbacks_seeded=True,
     )
-    record_arena = np.zeros(QUALITY_REPAIR_RECORD_CAP, dtype=REPAIR_RECORD_DTYPE)
+    record_arena = arenas.records()
     record_count = 0
     for start_row in range(0, height, band_height):
         end_row = min(height, start_row + band_height)
@@ -339,14 +361,15 @@ def _analyze_eye_once(
             geometry.final_region_map,
             start_row,
             end_row,
+            record_arena[record_count:],
         )
         if built.records.size:
             next_count = record_count + int(built.records.size)
             if next_count > QUALITY_REPAIR_RECORD_CAP:
                 raise QualityRepairBudgetError("64 MiB repair record arena exceeded")
-            destination = record_arena[record_count:next_count]
-            destination[:] = built.records
-            destination["pixel_index"] += np.uint32(start_row * width)
+            built.records.setflags(write=True)
+            built.records["pixel_index"] += np.uint32(start_row * width)
+            built.records.setflags(write=False)
             record_count = next_count
         del band, built
     records = record_arena[:record_count]
@@ -505,20 +528,64 @@ def _scatter_repair_records(
     records: np.ndarray,
     *,
     width: int,
+    host_colours: np.ndarray | None,
+    host_mask: np.ndarray | None,
 ) -> int:
     if records.size == 0:
         return 0
-    raw_records = records.view(np.uint8).reshape(records.size, REPAIR_RECORD_DTYPE.itemsize)
-    indexes, colours = native_kd._require_native().expand_repair_scatter(
-        raw_records,
-        int(colour.shape[0]),
-        width,
+    raw_records = records.view(np.uint8).reshape(
+        records.size, REPAIR_RECORD_DTYPE.itemsize
     )
-    lane_count = int(indexes.size)
-    device_indexes = torch.from_numpy(indexes).to(colour.device)
-    device_colours = torch.from_numpy(colours).to(colour.device)
-    colour.reshape(-1, 3).index_copy_(0, device_indexes, device_colours)
-    return lane_count
+    native = native_kd._require_native()
+    if colour.device.type == "cpu":
+        if host_colours is not None or host_mask is not None:
+            raise AssertionError(
+                "CPU compact scatter received a host staging workspace"
+            )
+        output = colour.detach().numpy().reshape(-1, 3)
+        return int(native.scatter_repair_records_float_into(raw_records, 0, output))
+    if host_colours is None or host_mask is None:
+        raise AssertionError("CUDA compact scatter has no bounded host workspace")
+    total_pixels = int(colour.shape[0]) * width
+    flat_colour = colour.reshape(-1, 3)
+    record_pixels = records["pixel_index"]
+    scattered = 0
+    for pixel_start in range(0, total_pixels, QUALITY_SCATTER_CHUNK_PIXELS):
+        pixel_end = min(total_pixels, pixel_start + QUALITY_SCATTER_CHUNK_PIXELS)
+        record_start = int(
+            np.searchsorted(record_pixels, np.uint32(pixel_start), side="left")
+        )
+        record_end = int(
+            np.searchsorted(record_pixels, np.uint32(pixel_end), side="left")
+        )
+        if record_start == record_end:
+            continue
+        lane_capacity = (pixel_end - pixel_start) * HORIZONTAL_SUBPIXELS
+        colour_staging = host_colours[:lane_capacity]
+        mask_staging = host_mask[:lane_capacity]
+        chunk_raw = raw_records[record_start:record_end]
+        scattered += int(
+            native.materialize_repair_scatter_u8_into(
+                chunk_raw,
+                pixel_start,
+                colour_staging,
+                mask_staging,
+            )
+        )
+        device_colours = torch.from_numpy(colour_staging).to(
+            device=colour.device,
+            dtype=colour.dtype,
+        )
+        device_mask = torch.from_numpy(mask_staging).to(
+            device=colour.device,
+            dtype=torch.bool,
+        )
+        target = flat_colour[
+            pixel_start * HORIZONTAL_SUBPIXELS : pixel_end * HORIZONTAL_SUBPIXELS
+        ]
+        target.copy_(torch.where(device_mask[:, None], device_colours, target))
+        del device_colours, device_mask, target
+    return scattered
 
 
 def _replay_background_eye_once(
@@ -534,6 +601,17 @@ def _replay_background_eye_once(
     output = np.empty_like(source)
     scattered = 0
     planned = sum(int(value).bit_count() for value in records["lane_mask"])
+    if renderer.device.type == "cpu":
+        host_colours = None
+        host_mask = None
+    else:
+        staging_pixels = min(
+            band_height * width,
+            QUALITY_SCATTER_CHUNK_PIXELS,
+        )
+        staging_lanes = staging_pixels * HORIZONTAL_SUBPIXELS
+        host_colours = np.empty((staging_lanes, 3), dtype=np.uint8)
+        host_mask = np.empty(staging_lanes, dtype=np.bool_)
     for start_row in range(0, height, band_height):
         end_row = min(height, start_row + band_height)
         band = _quality_splat(renderer, source, geometry, offsets, start_row, end_row)
@@ -548,12 +626,16 @@ def _replay_background_eye_once(
                 band.splat.colour,
                 band_records,
                 width=width,
+                host_colours=host_colours,
+                host_mask=host_mask,
             )
         downsampled = _downsample_subpixel_band(band.splat.colour)
         output[start_row:end_row] = _convert_image_band(downsampled, source.dtype)
         del band, valid, downsampled
     if scattered != planned:
-        raise RuntimeError("Quality Pass B scatter total does not match the repair plan")
+        raise RuntimeError(
+            "Quality Pass B scatter total does not match the repair plan"
+        )
     return output
 
 
@@ -566,7 +648,9 @@ def _render_background_eye(
     controls_limit_px: int,
     budgets: QualityRepairBudgets,
     band_state: _FrameBandState,
+    arenas: QualityFixedArenas,
 ) -> _CompactEyeResult:
+    arenas.reset_eye()
     analyzed = _retry_after_oom(
         renderer,
         band_state,
@@ -575,6 +659,7 @@ def _render_background_eye(
         source=source,
         geometry=geometry,
         offsets=offsets,
+        arenas=arenas,
     )
     safe_limit = max(1, math.floor(controls_limit_px * source.shape[0] / 1080.0 + 0.5))
     local_limit = min(safe_limit, geometry.predicted_gap_px)
@@ -584,6 +669,7 @@ def _render_background_eye(
         render_shape=(int(source.shape[0]), int(source.shape[1])),
         local_limit_px=local_limit,
         budgets=budgets,
+        arenas=arenas,
     )
     coverage = analyzed.analysis.coverage_count
     repair_bits = _background_repair_bits(
@@ -596,6 +682,7 @@ def _render_background_eye(
     records = plan.records
     del plan
     del analyzed
+    arenas.release_planning_scratch()
     image = _retry_after_oom(
         renderer,
         band_state,
@@ -684,6 +771,11 @@ def _render_metric_quality_eyes(
         current_height=initial_height,
     )
     budgets = QualityRepairBudgets()
+    arenas = (
+        QualityFixedArenas.allocate()
+        if controls.occlusion_fill == "background"
+        else None
+    )
     eyes: list[_CompactEyeResult] = []
     for eye in ("left", "right"):
         offsets = _build_metric_eye_offsets(geometry, eye)
@@ -698,6 +790,7 @@ def _render_metric_quality_eyes(
                 offsets=offsets,
             )
         else:
+            assert arenas is not None
             result = _render_background_eye(
                 renderer=renderer,
                 source=source,
@@ -706,6 +799,7 @@ def _render_metric_quality_eyes(
                 controls_limit_px=controls.occlusion_fill_max_px,
                 budgets=budgets,
                 band_state=band_state,
+                arenas=arenas,
             )
         eyes.append(result)
         del offsets
@@ -723,11 +817,20 @@ def render_relative_quality_compact(
 
     if not isinstance(renderer, StereoRenderer):
         raise TypeError("renderer must be StereoRenderer")
-    if not isinstance(settings, StereoRenderSettings) or settings.stereo_render_mode != "quality":
-        raise ValueError("Quality rendering requires StereoRenderSettings in quality mode")
+    if (
+        not isinstance(settings, StereoRenderSettings)
+        or settings.stereo_render_mode != "quality"
+    ):
+        raise ValueError(
+            "Quality rendering requires StereoRenderSettings in quality mode"
+        )
     frame_values = np.asarray(frame)
     canonical_input = np.asarray(canonical)
-    if frame_values.ndim != 3 or frame_values.shape[2] != 3 or canonical_input.ndim != 2:
+    if (
+        frame_values.ndim != 3
+        or frame_values.shape[2] != 3
+        or canonical_input.ndim != 2
+    ):
         raise TypeError("Quality rendering requires BGR frames and a 2D canonical map")
     _quality_public_memory_preflight(
         render_shape=(int(frame_values.shape[0]), int(frame_values.shape[1])),
@@ -748,6 +851,8 @@ def render_relative_quality_compact(
         stereo_strength=settings.stereo_strength,
         convergence=settings.convergence,
     )
+    indexed_sample_count = int(canonical_values.size)
+    del canonical, canonical_input, canonical_values, frame, frame_values
     initial_height = _calculate_quality_band_height(
         width,
         height,
@@ -759,6 +864,11 @@ def render_relative_quality_compact(
         current_height=initial_height,
     )
     budgets = QualityRepairBudgets()
+    arenas = (
+        QualityFixedArenas.allocate()
+        if settings.occlusion_fill == "background"
+        else None
+    )
     eyes: list[_CompactEyeResult] = []
     for eye in ("left", "right"):
         offsets = _build_eye_offsets(geometry, settings, eye)
@@ -773,6 +883,7 @@ def render_relative_quality_compact(
                 offsets=offsets,
             )
         else:
+            assert arenas is not None
             result = _render_background_eye(
                 renderer=renderer,
                 source=source,
@@ -781,6 +892,7 @@ def render_relative_quality_compact(
                 controls_limit_px=settings.occlusion_fill_max_px,
                 budgets=budgets,
                 band_state=band_state,
+                arenas=arenas,
             )
         eyes.append(result)
         del offsets
@@ -793,7 +905,9 @@ def render_relative_quality_compact(
     quality_limits = (
         {
             eye: {
-                "max_neighbour_abs_q_jump_px": float(geometry.max_neighbour_abs_q_jump_px),
+                "max_neighbour_abs_q_jump_px": float(
+                    geometry.max_neighbour_abs_q_jump_px
+                ),
                 "predicted_gap_px": int(geometry.predicted_gap_px),
                 "local_limit_px": int(local_limit),
             }
@@ -802,7 +916,7 @@ def render_relative_quality_compact(
         if settings.occlusion_fill == "background"
         else None
     )
-    return CompactStereoRenderResult(
+    result = CompactStereoRenderResult(
         left_image=left.image,
         right_image=right.image,
         left_coverage_count=left.coverage_count,
@@ -812,7 +926,7 @@ def render_relative_quality_compact(
         left_plan=left.plan,
         right_plan=right.plan,
         geometry_nearest={
-            "indexed_sample_count": int(canonical_values.size),
+            "indexed_sample_count": indexed_sample_count,
             "query_count": int(geometry.geometry_query_count),
             "visited_nodes_total": int(geometry.geometry_visited_nodes_total),
             "visited_nodes_max": int(geometry.geometry_visited_nodes_max),
@@ -821,6 +935,8 @@ def render_relative_quality_compact(
         left_hole_runs=left.hole_runs,
         right_hole_runs=right.hole_runs,
     )
+    del source, geometry, eyes, left, right
+    return result
 
 
 def render_metric_primitives_compact(
@@ -869,6 +985,8 @@ def render_metric_primitives_compact(
         max_disparity_percent=float(primitives.max_disparity_percent),
         retained_crop_width=primitives.retained_crop_width,
     )
+    indexed_sample_count = int(metric.inverse_depth.size)
+    del frame, frame_values, primitives, metric
     left, right = _render_metric_quality_eyes(
         renderer=renderer,
         source=source,
@@ -876,8 +994,23 @@ def render_metric_primitives_compact(
         controls=controls,
     )
     if geometry.metric_stats is None:
-        raise RuntimeError("Metric Quality geometry did not produce projection statistics")
-    return CompactStereoRenderResult(
+        raise RuntimeError(
+            "Metric Quality geometry did not produce projection statistics"
+        )
+    metric_stats = geometry.metric_stats
+    geometry_nearest = {
+        "indexed_sample_count": indexed_sample_count,
+        "query_count": int(geometry.geometry_query_count),
+        "visited_nodes_total": int(geometry.geometry_visited_nodes_total),
+        "visited_nodes_max": int(geometry.geometry_visited_nodes_max),
+    }
+    quality_limits = _quality_limits(
+        geometry,
+        height=height,
+        occlusion_fill=controls.occlusion_fill,
+        occlusion_fill_max_px=controls.occlusion_fill_max_px,
+    )
+    result = CompactStereoRenderResult(
         left_image=left.image,
         right_image=right.image,
         left_coverage_count=left.coverage_count,
@@ -886,22 +1019,14 @@ def render_metric_primitives_compact(
         right_repair_bits=right.repair_bits,
         left_plan=left.plan,
         right_plan=right.plan,
-        metric_stats=geometry.metric_stats,
-        geometry_nearest={
-            "indexed_sample_count": int(metric.inverse_depth.size),
-            "query_count": int(geometry.geometry_query_count),
-            "visited_nodes_total": int(geometry.geometry_visited_nodes_total),
-            "visited_nodes_max": int(geometry.geometry_visited_nodes_max),
-        },
-        quality_limits=_quality_limits(
-            geometry,
-            height=height,
-            occlusion_fill=controls.occlusion_fill,
-            occlusion_fill_max_px=controls.occlusion_fill_max_px,
-        ),
+        metric_stats=metric_stats,
+        geometry_nearest=geometry_nearest,
+        quality_limits=quality_limits,
         left_hole_runs=left.hole_runs,
         right_hole_runs=right.hole_runs,
     )
+    del source, geometry, left, right
+    return result
 
 
 def render_relative_quality_public(

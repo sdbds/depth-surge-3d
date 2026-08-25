@@ -2,6 +2,7 @@
 
 import errno
 import json
+import os
 from pathlib import Path
 import shutil
 import zipfile
@@ -16,6 +17,11 @@ from src.depth_surge_3d.inference.depth.types import (
     PinholeCameraBatch,
 )
 from src.depth_surge_3d.io import metric_npz
+from src.depth_surge_3d.io.durable_publish import (
+    OwnedSiblingTemporary,
+    OwnedTemporaryCollisionError,
+    OwnedTemporaryIdentityError,
+)
 from src.depth_surge_3d.processing.frames import metric_geometry
 from src.depth_surge_3d.processing.frames.depth_storage import RawDepthStore
 from src.depth_surge_3d.processing.frames.metric_geometry import (
@@ -70,6 +76,21 @@ def _disk_full_failure(kind: str) -> OSError:
     failure = OSError("windows disk full")
     failure.winerror = 112  # type: ignore[attr-defined]
     return failure
+
+
+def _fail_owned_replace_for(
+    monkeypatch: pytest.MonkeyPatch,
+    target: Path,
+    failure: BaseException,
+) -> None:
+    original_replace = OwnedSiblingTemporary.replace
+
+    def fail_target(self: OwnedSiblingTemporary, **kwargs) -> None:
+        if self.target == target:
+            raise failure
+        original_replace(self, **kwargs)
+
+    monkeypatch.setattr(OwnedSiblingTemporary, "replace", fail_target)
 
 
 def _raw_store_for_depths(directory: Path, depths: np.ndarray) -> RawDepthStore:
@@ -466,6 +487,23 @@ def test_metric_payload_has_exact_ordered_npz_members(tmp_path: Path) -> None:
         ]
 
 
+def test_metric_store_payload_audit_is_rooted_at_the_acquired_store_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    complete_metric_store: MetricGeometryStore,
+) -> None:
+    real_audit = metric_npz.audit_metric_npz
+    acquired_roots: list[Path | None] = []
+
+    def audit(*args, **kwargs):
+        acquired_roots.append(kwargs.get("job_root"))
+        return real_audit(*args, **kwargs)
+
+    monkeypatch.setattr(metric_npz, "audit_metric_npz", audit)
+
+    assert complete_metric_store.validate_payloads(cleanup_temporaries=False) == 1
+    assert acquired_roots == [complete_metric_store.directory]
+
+
 @pytest.mark.parametrize(
     ("arrays", "message"),
     [
@@ -666,14 +704,69 @@ def test_complete_store_identity_excludes_later_preflight_estimate(
     assert reopened.metadata_path.read_bytes() == before
 
 
-def test_interrupted_temporary_is_removed_without_touching_commits(
+def test_unowned_temporary_is_preserved_and_blocks_resume(
     partial_metric_store: MetricGeometryStore,
 ) -> None:
     temporary = partial_metric_store.directory / "frame_000002.npz.tmp"
     temporary.write_bytes(b"incomplete")
-    assert partial_metric_store.validate_payloads() == 1
+
+    with pytest.raises(ValueError, match="unowned temporary"):
+        partial_metric_store.validate_payloads()
+
     assert partial_metric_store.path_for(FRAME_NAMES[0]).is_file()
-    assert not temporary.exists()
+    assert temporary.read_bytes() == b"incomplete"
+
+
+@pytest.mark.parametrize("collision", ["regular", "hardlink", "symlink"])
+def test_metric_metadata_preserves_an_unowned_temporary_collision(
+    tmp_path: Path,
+    collision: str,
+) -> None:
+    directory = tmp_path / "metric"
+    directory.mkdir()
+    temporary = directory / "metadata.json.tmp"
+    sentinel = tmp_path / "outside.bin"
+    sentinel.write_bytes(b"must survive")
+    if collision == "regular":
+        temporary.write_bytes(b"unowned")
+    elif collision == "hardlink":
+        os.link(sentinel, temporary)
+    else:
+        try:
+            temporary.symlink_to(sentinel)
+        except OSError as error:
+            pytest.skip(f"symlink creation unavailable: {error}")
+
+    with pytest.raises(OwnedTemporaryCollisionError, match="already exists"):
+        _create_metric_store(directory)
+
+    assert sentinel.read_bytes() == b"must survive"
+    assert temporary.exists() or temporary.is_symlink()
+
+
+def test_metric_metadata_preserves_a_pre_replace_name_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = tmp_path / "metric"
+    parked = directory / "parked.tmp"
+    original_replace = OwnedSiblingTemporary.replace
+
+    def replace_after_swap(self: OwnedSiblingTemporary, **kwargs) -> None:
+        if self.target.name == "metadata.json":
+            self.close()
+            self.path.rename(parked)
+            self.path.write_bytes(b"replacement")
+        original_replace(self, **kwargs)
+
+    monkeypatch.setattr(OwnedSiblingTemporary, "replace", replace_after_swap)
+
+    with pytest.raises(OwnedTemporaryIdentityError, match="changed"):
+        _create_metric_store(directory)
+
+    assert parked.is_file()
+    assert (directory / "metadata.json.tmp").read_bytes() == b"replacement"
+    assert not (directory / "metadata.json").exists()
 
 
 def test_complete_files_are_always_returned_in_source_order(tmp_path: Path) -> None:
@@ -716,12 +809,11 @@ def test_initial_metadata_creation_normalizes_disk_full(
     directory.mkdir()
     failure = _disk_full_failure(error_kind)
 
-    def fail_replace(_path: Path, destination: Path) -> Path:
-        if Path(destination) == directory / "metadata.json":
-            raise failure
-        raise AssertionError(f"Unexpected replace destination: {destination}")
-
-    monkeypatch.setattr(Path, "replace", fail_replace)
+    _fail_owned_replace_for(
+        monkeypatch,
+        directory / "metadata.json",
+        failure,
+    )
     with pytest.raises(MetricGeometryDiskFullError) as raised:
         _create_metric_store(directory, preflight_required_bytes=654)
     assert raised.value.required_bytes == 654
@@ -749,10 +841,11 @@ def test_initial_creation_preserves_every_other_oserror(
     else:
         directory.mkdir()
 
-        def fail_replace(_path: Path, _destination: Path) -> Path:
-            raise failure
-
-        monkeypatch.setattr(Path, "replace", fail_replace)
+        _fail_owned_replace_for(
+            monkeypatch,
+            directory / "metadata.json",
+            failure,
+        )
 
     with pytest.raises(OSError) as raised:
         _create_metric_store(directory, preflight_required_bytes=777)
@@ -767,14 +860,11 @@ def test_enospc_removes_only_current_temp_and_keeps_committed_frames(
 ) -> None:
     committed = partial_metric_store.path_for(FRAME_NAMES[0])
     failing = partial_metric_store.path_for(FRAME_NAMES[1])
-    real_replace = metric_npz.os.replace
-
-    def fail_second_replace(path: Path, destination: Path) -> None:
-        if Path(destination) == failing:
-            raise OSError(errno.ENOSPC, "disk full")
-        real_replace(path, destination)
-
-    monkeypatch.setattr(metric_npz.os, "replace", fail_second_replace)
+    _fail_owned_replace_for(
+        monkeypatch,
+        failing,
+        OSError(errno.ENOSPC, "disk full"),
+    )
     with pytest.raises(MetricGeometryDiskFullError) as raised:
         partial_metric_store.write_frame(FRAME_NAMES[1], VALID_FRAME)
     assert committed.is_file()
@@ -793,11 +883,6 @@ def test_disk_full_samples_free_space_before_current_temp_cleanup(
     usage = shutil.disk_usage(partial_metric_store.directory)
     observed_temp_sizes: list[int] = []
 
-    def fail_replace(_path: Path, destination: Path) -> None:
-        if Path(destination) == failing:
-            raise OSError(errno.ENOSPC, "disk full")
-        raise AssertionError(f"Unexpected replace destination: {destination}")
-
     def free_depends_on_temp(_path: Path):
         temp_size = sum(
             path.stat().st_size for path in partial_metric_store.directory.glob("*.tmp")
@@ -806,7 +891,11 @@ def test_disk_full_samples_free_space_before_current_temp_cleanup(
         free = 11 if temp_size > 0 else 99
         return type(usage)(usage.total, usage.used, free)
 
-    monkeypatch.setattr(metric_npz.os, "replace", fail_replace)
+    _fail_owned_replace_for(
+        monkeypatch,
+        failing,
+        OSError(errno.ENOSPC, "disk full"),
+    )
     monkeypatch.setattr(metric_geometry.shutil, "disk_usage", free_depends_on_temp)
     with pytest.raises(MetricGeometryDiskFullError) as raised:
         partial_metric_store.write_frame(FRAME_NAMES[1], VALID_FRAME)
@@ -821,15 +910,8 @@ def test_finalize_disk_full_keeps_writing_metadata_and_all_payloads(
 ) -> None:
     store = _create_metric_store(tmp_path / "finalize", frame_names=[FRAME_NAMES[0]])
     payload = store.write_frame(FRAME_NAMES[0], VALID_FRAME)
-    real_replace = Path.replace
     failure = _disk_full_failure(error_kind)
-
-    def fail_metadata_replace(path: Path, destination: Path) -> Path:
-        if Path(destination) == store.metadata_path:
-            raise failure
-        return real_replace(path, destination)
-
-    monkeypatch.setattr(Path, "replace", fail_metadata_replace)
+    _fail_owned_replace_for(monkeypatch, store.metadata_path, failure)
     with pytest.raises(MetricGeometryDiskFullError) as raised:
         store.finalize(ClipConvergence(np.float32(2.0), (0,), 1))
     persisted = json.loads(store.metadata_path.read_text(encoding="utf-8"))
@@ -849,10 +931,7 @@ def test_preflight_update_disk_full_reports_the_persisted_current_estimate(
     store = _create_metric_store(directory, preflight_required_bytes=100)
     failure = _disk_full_failure(error_kind)
 
-    def fail_replace(_path: Path, _destination: Path) -> None:
-        raise failure
-
-    monkeypatch.setattr(Path, "replace", fail_replace)
+    _fail_owned_replace_for(monkeypatch, store.metadata_path, failure)
     with pytest.raises(MetricGeometryDiskFullError) as raised:
         _create_metric_store(directory, preflight_required_bytes=200)
     persisted = json.loads(store.metadata_path.read_text(encoding="utf-8"))
@@ -868,10 +947,11 @@ def test_windows_error_disk_full_112_uses_same_restartable_error(
     failure = OSError("windows disk full")
     failure.winerror = 112  # type: ignore[attr-defined]
 
-    def fail_replace(_path: Path, _destination: Path) -> None:
-        raise failure
-
-    monkeypatch.setattr(metric_npz.os, "replace", fail_replace)
+    _fail_owned_replace_for(
+        monkeypatch,
+        partial_metric_store.path_for(FRAME_NAMES[1]),
+        failure,
+    )
     with pytest.raises(MetricGeometryDiskFullError) as raised:
         partial_metric_store.write_frame(FRAME_NAMES[1], VALID_FRAME)
     assert raised.value.failing_path == partial_metric_store.path_for(FRAME_NAMES[1])
@@ -885,10 +965,11 @@ def test_non_disk_full_oserror_is_reraised_unchanged(
 ) -> None:
     failure = OSError(errno.EACCES, "denied")
 
-    def fail_replace(_path: Path, _destination: Path) -> None:
-        raise failure
-
-    monkeypatch.setattr(metric_npz.os, "replace", fail_replace)
+    _fail_owned_replace_for(
+        monkeypatch,
+        partial_metric_store.path_for(FRAME_NAMES[1]),
+        failure,
+    )
     with pytest.raises(OSError) as raised:
         partial_metric_store.write_frame(FRAME_NAMES[1], VALID_FRAME)
     assert raised.value is failure

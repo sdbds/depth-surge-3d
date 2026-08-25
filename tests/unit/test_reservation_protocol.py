@@ -178,6 +178,38 @@ def _create_transaction(
     )
 
 
+def test_reservation_create_propagates_cancellation_from_fixed_target_scan(
+    tmp_path: Path,
+) -> None:
+    intent_path = tmp_path / ".depth-surge-reservations-v1/final-index.json"
+    reservation_protocol.publish_write_ahead_intent(
+        intent_path,
+        {"algorithm_version": "test-final-index-v1", "generation": "ab" * 16},
+    )
+    target = tmp_path / "encoding_input_manifest.json"
+    target.write_bytes(b"old-generation")
+
+    with pytest.raises(InterruptedError, match="cancelled"):
+        reservation_protocol.ReservedArtifactTransaction.create(
+            job_root=tmp_path,
+            index_relative_path=Path(
+                ".depth-surge-reservations-v1/final-index.json"
+            ),
+            target_relative_path=Path("encoding_input_manifest.json"),
+            reservation_kind="encoding_input_manifest",
+            payload_raw_max=4217,
+            allocation_unit=4096,
+            allocation_adapter=_adapter,
+            generation="cd" * 16,
+            reservation_id="ef" * 16,
+            expected_publication_method="replace_existing",
+            cancelled=lambda: True,
+        )
+
+    assert target.read_bytes() == b"old-generation"
+    assert not any(tmp_path.glob("*.reserved"))
+
+
 def test_control_publication_preserves_a_preplaced_hardlink_temporary(tmp_path: Path) -> None:
     outside = tmp_path / "outside.bin"
     outside.write_bytes(b"do-not-truncate")
@@ -241,6 +273,118 @@ def test_control_publication_syncs_a_complete_temporary_before_promotion(
 
     assert events.index("file-sync") < events.index("rename")
     assert final.read_bytes() == raw
+
+
+def test_control_publication_rejects_parent_replacement_after_temporary_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = tmp_path / ".depth-surge-reservations-v1"
+    parked = tmp_path / "reservation-namespace-original"
+    namespace.mkdir()
+    final = namespace / "final-index.json"
+    temporary = namespace / ".final-index.json.create-new.tmp"
+    victim_payload = b"do-not-overwrite"
+    swapped = False
+
+    original_write = reservation_protocol._write_control_temporary
+
+    def write_then_swap(
+        path: Path,
+        raw: bytes,
+        *,
+        event,
+        expected_parent_identity=None,
+    ) -> tuple[object, object]:
+        nonlocal swapped
+        result = original_write(
+            path,
+            raw,
+            event=event,
+            expected_parent_identity=expected_parent_identity,
+        )
+        swapped = True
+        namespace.rename(parked)
+        namespace.mkdir()
+        temporary.write_bytes(victim_payload)
+        return result
+
+    monkeypatch.setattr(
+        reservation_protocol,
+        "_write_control_temporary",
+        write_then_swap,
+    )
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="parent identity changed",
+    ):
+        reservation_protocol.publish_write_ahead_intent(
+            final,
+            {"algorithm_version": "test-control-v1"},
+        )
+
+    assert swapped
+    assert temporary.read_bytes() == victim_payload
+    assert not final.exists()
+    assert (parked / temporary.name).is_file()
+
+
+def test_posix_replace_fault_boundary_is_between_rename_and_parent_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Path("parent/source.tmp")
+    target = Path("parent/target.json")
+    source_identity = object()
+    target_identity = object()
+    parent_identity = object()
+    identities = iter((target_identity, source_identity))
+    descriptors = iter((41, 42))
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        reservation_protocol.os,
+        "open",
+        lambda *_args, **_kwargs: next(descriptors),
+    )
+    monkeypatch.setattr(reservation_protocol.os, "close", lambda _fd: None)
+    monkeypatch.setattr(
+        reservation_protocol.os,
+        "replace",
+        lambda *_args, **_kwargs: events.append("rename"),
+    )
+    monkeypatch.setattr(
+        reservation_protocol.os,
+        "fsync",
+        lambda _fd: events.append("parent-sync"),
+    )
+    monkeypatch.setattr(
+        reservation_protocol,
+        "directory_identity_from_posix_fd",
+        lambda _fd: parent_identity,
+    )
+    monkeypatch.setattr(
+        reservation_protocol,
+        "file_identity_from_posix_fd",
+        lambda _fd: source_identity,
+    )
+    monkeypatch.setattr(
+        reservation_protocol,
+        "_identity",
+        lambda _path: next(identities),
+    )
+
+    reservation_protocol._same_parent_replace_posix_v1(
+        source,
+        target,
+        expected_source_identity=source_identity,
+        expected_target_identity=target_identity,
+        expected_parent_identity=parent_identity,
+        replace_existing=True,
+        after_namespace_replace=lambda: events.append("fault-boundary"),
+    )
+
+    assert events == ["rename", "fault-boundary", "parent-sync"]
 
 
 def test_control_recovery_syncs_a_complete_temporary_before_promotion(
@@ -336,7 +480,13 @@ def test_index_owned_extent_descriptor_rewrites_a_partial_temporary(
     temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
     original = reservation_protocol._write_control_temporary
 
-    def interrupt_descriptor(path: Path, raw: bytes, *, event):
+    def interrupt_descriptor(
+        path: Path,
+        raw: bytes,
+        *,
+        event,
+        expected_parent_identity=None,
+    ):
         if path == temporary:
             with path.open("xb", buffering=0) as handle:
                 prefix = raw[: max(1, min(37, len(raw) - 1))]
@@ -344,7 +494,12 @@ def test_index_owned_extent_descriptor_rewrites_a_partial_temporary(
                 handle.flush()
                 os.fsync(handle.fileno())
             raise OSError("injected descriptor short write")
-        return original(path, raw, event=event)
+        return original(
+            path,
+            raw,
+            event=event,
+            expected_parent_identity=expected_parent_identity,
+        )
 
     monkeypatch.setattr(
         reservation_protocol,
@@ -414,9 +569,9 @@ def test_index_owned_descriptor_rejects_temporary_swap_before_unlink(
     original_read = reservation_protocol._read_bounded_regular_file_with_identity
     swapped = False
 
-    def read_then_swap(path: Path, *, max_bytes: int):
+    def read_then_swap(path: Path, *, max_bytes: int, **kwargs):
         nonlocal swapped
-        result = original_read(path, max_bytes=max_bytes)
+        result = original_read(path, max_bytes=max_bytes, **kwargs)
         if Path(path) == temporary and not swapped:
             swapped = True
             temporary.unlink()
@@ -458,9 +613,9 @@ def test_control_recovery_rejects_temporary_swap_before_unlink(
     original_read = reservation_protocol._read_bounded_regular_file_with_identity
     swapped = False
 
-    def read_then_swap(path: Path, *, max_bytes: int):
+    def read_then_swap(path: Path, *, max_bytes: int, **kwargs):
         nonlocal swapped
-        result = original_read(path, max_bytes=max_bytes)
+        result = original_read(path, max_bytes=max_bytes, **kwargs)
         if Path(path) == temporary and not swapped:
             swapped = True
             temporary.unlink()
@@ -552,6 +707,30 @@ def test_streamed_prefix_consumption_never_requires_a_payload_bytes_object(tmp_p
     assert not transaction.descriptor_path.exists()
 
 
+def test_streamed_prefix_can_be_staged_from_bounded_chunks(tmp_path: Path) -> None:
+    payload_parts = (b'{"large":"', b"x" * 3000, b'"}')
+    payload_size = sum(len(part) for part in payload_parts)
+    payload_sha256 = hashlib.sha256(b"".join(payload_parts)).hexdigest()
+
+    def allocated(path: Path) -> int:
+        size = path.stat().st_size
+        return ((size + 4095) // 4096) * 4096
+
+    transaction = _create_transaction(tmp_path, counter=allocated)
+    transaction.stage_complete_full_streamed(
+        chunks=lambda: iter(payload_parts),
+        prefix_byte_count=payload_size,
+        prefix_sha256=payload_sha256,
+    )
+    transaction.consume_streamed_prefix(
+        prefix_byte_count=payload_size,
+        prefix_sha256=payload_sha256,
+    )
+
+    assert transaction.target_path.stat().st_size == payload_size
+    assert hashlib.sha256(transaction.target_path.read_bytes()).hexdigest() == payload_sha256
+
+
 def test_write_ahead_index_is_durable_before_placeholder_extent_and_descriptor(
     tmp_path: Path,
 ) -> None:
@@ -580,6 +759,93 @@ def test_write_ahead_index_is_durable_before_placeholder_extent_and_descriptor(
     assert events.index("extent:ready") < events.index("descriptor:published")
     assert transaction.metrics.reservation_write_bytes == transaction.descriptor.logical_byte_count
     assert transaction.metrics.reservation_fsync_count == 1
+
+
+def test_extent_materialization_never_writes_through_a_swapped_target_parent(
+    tmp_path: Path,
+) -> None:
+    index = tmp_path / ".depth-surge-reservations-v1/final-index.json"
+    reservation_protocol.publish_write_ahead_intent(
+        index,
+        {"algorithm_version": "test-final-index-v1", "generation": "ab" * 16},
+    )
+    target_parent = tmp_path / "target"
+    original_parent = tmp_path / "target-original"
+    target_parent.mkdir()
+    victim_payload = b"foreign target bytes"
+    swapped = False
+
+    def swap_after_parent_authentication(stage: str) -> None:
+        nonlocal swapped
+        if stage != "parent:authenticated" or swapped:
+            return
+        swapped = True
+        target_parent.rename(original_parent)
+        target_parent.mkdir()
+        (target_parent / "manifest.json").write_bytes(victim_payload)
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="parent identity changed",
+    ):
+        reservation_protocol.ReservedArtifactTransaction.create(
+            job_root=tmp_path,
+            index_relative_path=index.relative_to(tmp_path),
+            target_relative_path=Path("target/manifest.json"),
+            reservation_kind="encoding_input_manifest",
+            payload_raw_max=100,
+            allocation_unit=4096,
+            allocation_adapter=_adapter,
+            generation="cd" * 16,
+            reservation_id="ef" * 16,
+            expected_publication_method="replace_placeholder",
+            event=swap_after_parent_authentication,
+        )
+
+    assert swapped is True
+    assert (target_parent / "manifest.json").read_bytes() == victim_payload
+    assert list(original_parent.iterdir()) == []
+    assert not any(path.name.endswith(".reserved") for path in target_parent.iterdir())
+
+
+def test_later_extent_write_never_uses_a_replaced_target_parent(
+    tmp_path: Path,
+) -> None:
+    intent_path = tmp_path / ".depth-surge-reservations-v1/final-index.json"
+    reservation_protocol.publish_write_ahead_intent(
+        intent_path,
+        {"algorithm_version": "test-final-index-v1", "generation": "ab" * 16},
+    )
+    target_parent = tmp_path / "manifests"
+    parked_parent = tmp_path / "manifests-original"
+    target_parent.mkdir()
+    transaction = reservation_protocol.ReservedArtifactTransaction.create(
+        job_root=tmp_path,
+        index_relative_path=Path(".depth-surge-reservations-v1/final-index.json"),
+        target_relative_path=Path("manifests/encoding_input_manifest.json"),
+        reservation_kind="encoding_input_manifest",
+        payload_raw_max=4217,
+        allocation_unit=4096,
+        allocation_adapter=_adapter,
+        generation="cd" * 16,
+        reservation_id="ef" * 16,
+    )
+    original_zero_bytes = transaction.source_path.read_bytes()
+    source_name = transaction.source_path.name
+
+    target_parent.rename(parked_parent)
+    target_parent.mkdir()
+    victim = target_parent / source_name
+    victim.write_bytes(b"do-not-overwrite")
+
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError,
+        match="parent identity changed",
+    ):
+        transaction.stage_complete_full(b'{"schema_version":1}')
+
+    assert victim.read_bytes() == b"do-not-overwrite"
+    assert (parked_parent / source_name).read_bytes() == original_zero_bytes
 
 
 def test_truncate_fsync_crash_recovers_short_source_without_readiness_adapter(

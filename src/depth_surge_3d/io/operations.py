@@ -55,10 +55,12 @@ from .reservation_protocol import (
     platform_allocation_adapter,
     platform_allocation_counter,
     recover_settings_job_v1,
+    _read_bounded_regular_file,
     _assert_job_control_candidate_has_no_downstream,
 )
 from .settings_artifact import (
     ProcessingSettingsArtifactV5,
+    SETTINGS_ARTIFACT_MAX_RAW_BYTES,
     create_processing_settings_artifact_v5,
 )
 
@@ -71,12 +73,19 @@ def parse_sample_aspect_ratio(value: object) -> tuple[int, int]:
     if value is None or value == "N/A":
         return 1, 1
     if not isinstance(value, str):
-        raise ValueError("sample_aspect_ratio must be an unsigned numerator:denominator")
+        raise ValueError(
+            "sample_aspect_ratio must be an unsigned numerator:denominator"
+        )
     match = _SAR_PATTERN.fullmatch(value)
     if match is None:
-        raise ValueError("sample_aspect_ratio must be an unsigned numerator:denominator")
+        raise ValueError(
+            "sample_aspect_ratio must be an unsigned numerator:denominator"
+        )
     numerator, denominator = (int(part) for part in match.groups())
-    if not 1 <= numerator <= _SAR_COMPONENT_MAX or not 1 <= denominator <= _SAR_COMPONENT_MAX:
+    if (
+        not 1 <= numerator <= _SAR_COMPONENT_MAX
+        or not 1 <= denominator <= _SAR_COMPONENT_MAX
+    ):
         raise ValueError("sample_aspect_ratio components must be in 1..2147483647")
     divisor = math.gcd(numerator, denominator)
     return numerator // divisor, denominator // divisor
@@ -181,7 +190,11 @@ def get_video_properties(video_path: str) -> dict[str, Any]:
             ),
             None,
         )
-        sar_value = video_stream.get("sample_aspect_ratio") if video_stream is not None else None
+        sar_value = (
+            video_stream.get("sample_aspect_ratio")
+            if video_stream is not None
+            else None
+        )
         numerator, denominator = parse_sample_aspect_ratio(sar_value)
         properties.update(
             {
@@ -395,7 +408,9 @@ def _cleanup_directory(directory: Path, keep_patterns: list[str]) -> int:
     return removed_count
 
 
-def cleanup_intermediate_files(base_path: Path, keep_patterns: list[str] | None = None) -> int:
+def cleanup_intermediate_files(
+    base_path: Path, keep_patterns: list[str] | None = None
+) -> int:
     """
     Clean up intermediate files, optionally keeping certain patterns.
 
@@ -435,7 +450,9 @@ def verify_ffmpeg_installation() -> bool:
         Executes ffmpeg subprocess
     """
     try:
-        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            ["ffmpeg", "-version"], capture_output=True, text=True, timeout=10
+        )
         return result.returncode == 0
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         return False
@@ -577,7 +594,9 @@ def _save_processing_settings_v5(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     source_path = Path(source_video_path)
-    source_fingerprint = file_sample_fingerprint(source_path) if source_path.is_file() else None
+    source_fingerprint = (
+        file_sample_fingerprint(source_path) if source_path.is_file() else None
+    )
     artifact = create_processing_settings_artifact_v5(
         batch_name=batch_name,
         source_video=str(source_video_path),
@@ -623,7 +642,10 @@ def load_processing_settings(settings_file: Path) -> dict[str, Any] | None:
 
         if settings_file.name == SETTINGS_ARTIFACT_RELATIVE_PATH.name:
             settings_data = ProcessingSettingsArtifactV5.parse(
-                settings_file.read_bytes()
+                _read_bounded_regular_file(
+                    settings_file,
+                    max_bytes=SETTINGS_ARTIFACT_MAX_RAW_BYTES,
+                )
             ).to_object()
         else:
             with open(settings_file, "r", encoding="utf-8") as f:
@@ -671,15 +693,17 @@ def update_processing_status(
         settings_data["metadata"]["last_updated_timestamp"] = time.time()
 
         if status == "completed":
-            settings_data["metadata"]["completed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            settings_data["metadata"]["completed_at"] = time.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
             settings_data["metadata"]["completed_timestamp"] = time.time()
 
             # Calculate processing duration
             if "created_timestamp" in settings_data["metadata"]:
                 duration = time.time() - settings_data["metadata"]["created_timestamp"]
                 settings_data["metadata"]["processing_duration_seconds"] = duration
-                settings_data["metadata"]["processing_duration_formatted"] = format_time_duration(
-                    duration
+                settings_data["metadata"]["processing_duration_formatted"] = (
+                    format_time_duration(duration)
                 )
 
         # Add any additional info
@@ -717,7 +741,9 @@ def _bounded_metric_summary(value: object) -> dict[str, Any] | None:
         "affected_frame_count": int(value["affected_frame_count"]),
         "mean_clamped_fraction": float(value["mean_clamped_fraction"]),
         "max_clamped_fraction": float(value["max_clamped_fraction"]),
-        "compatibility_summary_sha256": hashlib.sha256(canonical_json_bytes(value)).hexdigest(),
+        "compatibility_summary_sha256": hashlib.sha256(
+            canonical_json_bytes(value)
+        ).hexdigest(),
     }
 
 
@@ -738,9 +764,7 @@ def commit_final_media_producer_marker(
     final_index = job_root / (
         ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
     )
-    final_index_temporary = final_index.with_name(
-        f".{final_index.name}.create-new.tmp"
-    )
+    final_index_temporary = final_index.with_name(f".{final_index.name}.create-new.tmp")
     if any(
         path.exists() or path.is_symlink()
         for path in (final_index, final_index_temporary)
@@ -751,7 +775,9 @@ def commit_final_media_producer_marker(
 
         reservation = load_final_encoding_reservation_v1(job_root, current)
         if reservation.index.publication_generation != generation:
-            raise ReservationConflictError("producer marker generation differs from active index")
+            raise ReservationConflictError(
+                "producer marker generation differs from active index"
+            )
         return reservation.commit_producer_settings()
     target = current.with_producer_marker(
         generation=generation,
@@ -786,7 +812,9 @@ def commit_cleanup_pending_status(
     current = recover_processing_control_prefix_v1(job_root)
     if current is None:
         raise ReservationConflictError("cleanup pending has no schema-5 job")
-    active_index = job_root / ".depth-surge-reservations-v1" / "final-encoding-reservation-v1.json"
+    active_index = (
+        job_root / ".depth-surge-reservations-v1" / "final-encoding-reservation-v1.json"
+    )
     active_index_temporary = active_index.with_name(
         f".{active_index.name}.create-new.tmp"
     )
@@ -803,9 +831,17 @@ def commit_cleanup_pending_status(
     )
 
     active_reservation = load_final_encoding_reservation_v1(job_root, current)
+    reservation_fingerprint = None
+    if reservation is not None:
+        reservation_fingerprint = getattr(reservation, "index_fingerprint", None)
+        if reservation_fingerprint is None:
+            reservation_fingerprint = getattr(
+                getattr(reservation, "index", None),
+                "fingerprint",
+                None,
+            )
     if reservation is not None and (
-        getattr(getattr(reservation, "index", None), "fingerprint", None)
-        != active_reservation.index.fingerprint
+        reservation_fingerprint != active_reservation.index.fingerprint
     ):
         raise ReservationConflictError("cleanup reservation is no longer authoritative")
     return active_reservation.commit_cleanup_pending_settings()
@@ -833,9 +869,7 @@ def recover_processing_control_prefix_v1(
 
     root = Path(job_root)
     job_control = root / JOB_CONTROL_RELATIVE_PATH
-    job_control_temporary = job_control.with_name(
-        f".{job_control.name}.create-new.tmp"
-    )
+    job_control_temporary = job_control.with_name(f".{job_control.name}.create-new.tmp")
     has_locator = any(
         path.exists() or path.is_symlink()
         for path in (job_control, job_control_temporary)
@@ -871,9 +905,7 @@ def recover_processing_control_prefix_v1(
     )
 
     final_index = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
-    final_index_temporary = final_index.with_name(
-        f".{final_index.name}.create-new.tmp"
-    )
+    final_index_temporary = final_index.with_name(f".{final_index.name}.create-new.tmp")
     settings_active = any(
         path.exists() or path.is_symlink()
         for path in (settings_index, settings_index_temporary)
@@ -964,16 +996,16 @@ def prepare_processing_settings_artifact(
     final_index = settings_file.parent / (
         ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
     )
-    final_index_temporary = final_index.with_name(
-        f".{final_index.name}.create-new.tmp"
-    )
+    final_index_temporary = final_index.with_name(f".{final_index.name}.create-new.tmp")
     final_active = any(
         path.exists() or path.is_symlink()
         for path in (final_index, final_index_temporary)
     )
     value = current.to_object()
     source_path = Path(source_video_path)
-    source_fingerprint = file_sample_fingerprint(source_path) if source_path.is_file() else None
+    source_fingerprint = (
+        file_sample_fingerprint(source_path) if source_path.is_file() else None
+    )
     metadata = value["metadata"]
     if (
         metadata["source_video"] != str(source_video_path)
@@ -1029,7 +1061,9 @@ def _update_processing_status_v5(
             settings = current.to_object()["processing_settings"]
             cleanup_status = info.get("cleanup_status")
             if cleanup_status is None:
-                cleanup_status = "not_requested" if settings["keep_intermediates"] else "complete"
+                cleanup_status = (
+                    "not_requested" if settings["keep_intermediates"] else "complete"
+                )
             if cleanup_status not in {
                 "not_requested",
                 "complete",
@@ -1053,21 +1087,29 @@ def _update_processing_status_v5(
                     current.to_object()["video_properties"]["frame_count"],
                 ),
                 cleanup_status=completed_cleanup_status,
-                metric_clamp_summary=_bounded_metric_summary(info.get("metric_clamp_summary")),
+                metric_clamp_summary=_bounded_metric_summary(
+                    info.get("metric_clamp_summary")
+                ),
             )
         elif status == "failed":
             message = info.get("error") or info.get("terminal_diagnostic_message")
             if message is not None:
-                message = str(message).encode("utf-8")[:1024].decode("utf-8", errors="ignore")
+                message = (
+                    str(message).encode("utf-8")[:1024].decode("utf-8", errors="ignore")
+                )
             target = current.failed(
                 terminal_at=now,
-                diagnostic_code=str(info.get("terminal_diagnostic_code", "PROCESSING_FAILED")),
+                diagnostic_code=str(
+                    info.get("terminal_diagnostic_code", "PROCESSING_FAILED")
+                ),
                 diagnostic_message=message,
             )
         elif status == "in_progress" and current.status == "in_progress":
             return True
         else:
-            raise ValueError(f"unsupported schema-5 processing status transition: {status}")
+            raise ValueError(
+                f"unsupported schema-5 processing status transition: {status}"
+            )
         commit_terminal_settings_v1(
             job_root=job_root,
             current=current,
@@ -1238,7 +1280,9 @@ def analyze_processing_progress(  # noqa: C901
             progress["frames_processed"] = progress["vr_frames_created"]
             progress["can_resume_from_intermediates"] = True
         elif "disparity_maps" in progress["intermediate_stages"]:
-            depth_frames = progress["intermediate_stages"]["disparity_maps"]["frames_found"]
+            depth_frames = progress["intermediate_stages"]["disparity_maps"][
+                "frames_found"
+            ]
             if depth_frames > 0:
                 progress["frames_processed"] = depth_frames
                 progress["can_resume_from_intermediates"] = True

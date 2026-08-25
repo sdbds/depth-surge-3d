@@ -6,16 +6,16 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 from pathlib import PurePosixPath
 import re
 import secrets
-import stat
 import struct
-from typing import BinaryIO, Iterator, Literal, Protocol
+from typing import BinaryIO, Callable, Iterator, Literal, Protocol
 import unicodedata
 import zlib
+
+from ...io.nofollow_io import AcquiredRoot, NoFollowPathError
 
 
 ENCODING_CONTROL_FRAME_CAP = 4_194_304
@@ -88,6 +88,12 @@ _DEVICE_NAMES = frozenset(
 )
 
 EncodingMode = Literal["direct_stereo", "assembled_vr"]
+CancellationPredicate = Callable[[], bool]
+
+
+def _raise_if_cancelled(cancelled: CancellationPredicate | None) -> None:
+    if cancelled is not None and cancelled():
+        raise InterruptedError("final encoding input audit was cancelled")
 
 
 class EncodingProviderError(RuntimeError):
@@ -114,12 +120,20 @@ class FfprobeJsonError(ValueError):
     """A bounded FFprobe JSON payload is outside its closed grammar."""
 
 
+class FfprobeJsonBudgetError(FfprobeJsonError):
+    """A fixed FFprobe JSON parser-state or token budget was exceeded."""
+
+
 class EncodingProgressError(ValueError):
     """The FFmpeg progress stream is malformed or incomplete."""
 
 
 class FinalContainerValidationError(ValueError):
     """The generated container does not match its exact encoding contract."""
+
+
+class FinalContainerAudioPacketBoundError(FinalContainerValidationError):
+    """The generated AAC stream exceeds its preflight packet-count bound."""
 
 
 class EncodingDirectoryError(EncodingProviderError):
@@ -326,9 +340,13 @@ class EncodingProviderAudit:
     frame_count: int
 
 
-def _validated_items(provider: EncodingSequenceProvider) -> Iterator[EncodingSequenceItem]:
+def _validated_items(
+    provider: EncodingSequenceProvider,
+    cancelled: CancellationPredicate | None = None,
+) -> Iterator[EncodingSequenceItem]:
     expected_source = 0
     for item in provider.replay():
+        _raise_if_cancelled(cancelled)
         if item.source_index != expected_source:
             raise EncodingProviderError("encoding source index is noncontiguous")
         expected_frame = provider.first_index + expected_source
@@ -347,9 +365,12 @@ def _validated_items(provider: EncodingSequenceProvider) -> Iterator[EncodingSeq
         raise EncodingProviderError("encoding replay count changed")
 
 
-def _item_stream_hash(provider: EncodingSequenceProvider) -> str:
+def _item_stream_hash(
+    provider: EncodingSequenceProvider,
+    cancelled: CancellationPredicate | None = None,
+) -> str:
     digest = hashlib.sha256()
-    for item in _validated_items(provider):
+    for item in _validated_items(provider, cancelled):
         digest.update(
             canonical_json_bytes(
                 {
@@ -377,12 +398,17 @@ def _item_stream_hash(provider: EncodingSequenceProvider) -> str:
     return digest.hexdigest()
 
 
-def audit_encoding_provider(provider: EncodingSequenceProvider) -> EncodingProviderAudit:
+def audit_encoding_provider(
+    provider: EncodingSequenceProvider,
+    *,
+    cancelled: CancellationPredicate | None = None,
+) -> EncodingProviderAudit:
+    _raise_if_cancelled(cancelled)
     provider.validated()
     return EncodingProviderAudit(
         provider.audit_generation_id,
         provider.generation_fingerprint,
-        _item_stream_hash(provider),
+        _item_stream_hash(provider, cancelled),
         provider.frame_count,
     )
 
@@ -392,10 +418,13 @@ def validate_encoding_provider(
     evidence: EncodingProviderAudit,
     *,
     launch_started: bool,
+    cancelled: CancellationPredicate | None = None,
 ) -> None:
     error_type = FinalEncodingInputChangedError if launch_started else EncodingProviderChangedError
     try:
-        current = audit_encoding_provider(provider)
+        current = audit_encoding_provider(provider, cancelled=cancelled)
+    except InterruptedError:
+        raise
     except (EncodingProviderError, TypeError, ValueError) as error:
         raise error_type(str(error)) from error
     if current != evidence:
@@ -457,22 +486,6 @@ def _write_exact(sink: _ByteSink, payload: bytes) -> None:
         raise OSError("encoding manifest sink returned a short write")
 
 
-def _open_regular(path: Path) -> BinaryIO:
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise EncodingDirectoryError(f"encoding image is not a regular file: {path}")
-        attributes = getattr(metadata, "st_file_attributes", 0)
-        if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
-            raise EncodingDirectoryError(f"encoding image is a reparse point: {path}")
-        return os.fdopen(descriptor, "rb", closefd=True)
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-
 def _parse_png_header(raw: bytes, path: Path) -> EncodingPngHeader:
     if len(raw) != 33 or raw[:8] != b"\x89PNG\r\n\x1a\n":
         raise EncodingDirectoryError(f"encoding image has an invalid PNG signature: {path}")
@@ -499,24 +512,29 @@ def _parse_png_header(raw: bytes, path: Path) -> EncodingPngHeader:
 
 
 def _image_identity(
-    job_root: Path,
+    acquired: AcquiredRoot,
     relative_path: PurePosixPath,
     trace: EncodingManifestTrace,
+    cancelled: CancellationPredicate | None = None,
 ) -> tuple[dict[str, object], EncodingPngHeader]:
-    path = job_root.joinpath(*relative_path.parts)
+    path = acquired.root.joinpath(*relative_path.parts)
     digest = hashlib.sha256()
     byte_count = 0
-    with _open_regular(path) as handle:
-        header_raw = handle.read(33)
-        header = _parse_png_header(header_raw, path)
-        handle.seek(0)
-        while True:
-            chunk = handle.read(FINAL_ENCODING_IMAGE_STREAM_BYTES)
-            if not chunk:
-                break
-            trace.maximum_stream_bytes = max(trace.maximum_stream_bytes, len(chunk))
-            digest.update(chunk)
-            byte_count += len(chunk)
+    try:
+        with acquired.open_regular(path) as handle:
+            header_raw = handle.read(33)
+            header = _parse_png_header(header_raw, path)
+            handle.seek(0)
+            while True:
+                _raise_if_cancelled(cancelled)
+                chunk = handle.read(FINAL_ENCODING_IMAGE_STREAM_BYTES)
+                if not chunk:
+                    break
+                trace.maximum_stream_bytes = max(trace.maximum_stream_bytes, len(chunk))
+                digest.update(chunk)
+                byte_count += len(chunk)
+    except NoFollowPathError as error:
+        raise EncodingDirectoryError(str(error)) from error
     trace.maximum_live_identities = max(trace.maximum_live_identities, 1)
     return (
         {
@@ -538,22 +556,23 @@ _FRAME_FILE = re.compile(r"^frame_([0-9]+)\.png$")
 
 
 def _validate_selected_directory(
-    job_root: Path,
+    acquired: AcquiredRoot,
     parent: PurePosixPath,
     provider: EncodingSequenceProvider,
+    cancelled: CancellationPredicate | None = None,
 ) -> None:
-    directory = job_root.joinpath(*parent.parts)
+    directory = acquired.root.joinpath(*parent.parts)
     try:
-        metadata = directory.lstat()
-    except FileNotFoundError as error:
-        raise EncodingDirectoryError(f"encoding parent is missing: {directory}") from error
-    if not stat.S_ISDIR(metadata.st_mode) or directory.is_symlink():
-        raise EncodingDirectoryError(f"encoding parent is not a contained directory: {directory}")
-    count = 0
-    with os.scandir(directory) as entries:
-        for entry in entries:
+        count = 0
+        for entry in acquired.iter_directory(directory):
+            _raise_if_cancelled(cancelled)
             match = _FRAME_FILE.fullmatch(entry.name)
             if match is None:
+                folded = entry.name.casefold()
+                if folded.startswith("frame_") and folded.endswith(".png"):
+                    raise EncodingDirectoryError(
+                        "encoding directory contains a noncanonical frame name"
+                    )
                 continue
             index = int(match.group(1))
             if entry.name != f"{_canonical_frame_stem(index)}.png":
@@ -564,9 +583,11 @@ def _validate_selected_directory(
                 raise EncodingDirectoryError(
                     "encoding directory frame is outside the declared range"
                 )
-            if not entry.is_file(follow_symlinks=False) or entry.is_symlink():
+            if not entry.is_regular:
                 raise EncodingDirectoryError("encoding directory frame is not an ordinary file")
             count += 1
+    except NoFollowPathError as error:
+        raise EncodingDirectoryError(str(error)) from error
     if count != provider.frame_count:
         raise EncodingDirectoryError(
             f"encoding directory frame count {count} does not equal {provider.frame_count}"
@@ -586,14 +607,15 @@ def _write_identity_array(
     sink: _ByteSink,
     self_digest: hashlib._Hash,
     provider: EncodingSequenceProvider,
-    job_root: Path,
+    acquired: AcquiredRoot,
     field: str,
     trace: EncodingManifestTrace,
     shape_state: _ManifestShapeState,
+    cancelled: CancellationPredicate | None = None,
 ) -> None:
     _write_exact(sink, b"[")
     self_digest.update(b"[")
-    for source_index, item in enumerate(_validated_items(provider)):
+    for source_index, item in enumerate(_validated_items(provider, cancelled)):
         relative = {
             "left": item.left_relative_path,
             "right": item.right_relative_path,
@@ -601,7 +623,12 @@ def _write_identity_array(
         }[field]
         if relative is None:
             raise EncodingProviderError(f"encoding manifest {field} path is unexpectedly null")
-        identity, header = _image_identity(job_root, relative, trace)
+        identity, header = _image_identity(
+            acquired,
+            relative,
+            trace,
+            cancelled,
+        )
         shape = (header.width, header.height)
         previous = getattr(shape_state, "frame" if field == "frames" else field)
         if previous is None:
@@ -626,13 +653,15 @@ def _write_identity_array(
 def _write_manifest_stream(  # noqa: C901
     *,
     provider: EncodingSequenceProvider,
-    job_root: Path,
+    acquired: AcquiredRoot,
     sink: _ByteSink,
     fingerprint_value: str,
     per_eye_size: tuple[int, int],
     vr_format: Literal["side_by_side", "over_under"],
     trace: EncodingManifestTrace,
+    cancelled: CancellationPredicate | None = None,
 ) -> tuple[str, tuple[tuple[int, int], ...], bool]:
+    _raise_if_cancelled(cancelled)
     if not _HEX_64.fullmatch(fingerprint_value):
         raise ValueError("encoding manifest fingerprint placeholder is invalid")
     self_digest = hashlib.sha256()
@@ -648,7 +677,7 @@ def _write_manifest_stream(  # noqa: C901
     segment = b',"frame_names":['
     _write_exact(sink, segment)
     self_digest.update(segment)
-    for source_index, item in enumerate(_validated_items(provider)):
+    for source_index, item in enumerate(_validated_items(provider, cancelled)):
         if source_index:
             _write_exact(sink, b",")
             self_digest.update(b",")
@@ -668,10 +697,11 @@ def _write_manifest_stream(  # noqa: C901
                 sink=sink,
                 self_digest=self_digest,
                 provider=provider,
-                job_root=job_root,
+                acquired=acquired,
                 field=field,
                 trace=trace,
                 shape_state=shape_state,
+                cancelled=cancelled,
             )
         else:
             _write_exact(sink, b"null")
@@ -689,10 +719,11 @@ def _write_manifest_stream(  # noqa: C901
             sink=sink,
             self_digest=self_digest,
             provider=provider,
-            job_root=job_root,
+            acquired=acquired,
             field="right",
             trace=trace,
             shape_state=shape_state,
+            cancelled=cancelled,
         )
     else:
         _write_exact(sink, b"null")
@@ -727,22 +758,25 @@ def stage_encoding_input_manifest(
     sink: BinaryIO,
     per_eye_size: tuple[int, int],
     vr_format: Literal["side_by_side", "over_under"],
+    cancelled: CancellationPredicate | None = None,
 ) -> StagedEncodingInputManifest:
-    provider_audit = audit_encoding_provider(provider)
-    for parent in _selected_parents(provider):
-        _validate_selected_directory(Path(job_root), parent, provider)
-    trace = EncodingManifestTrace()
-    start = sink.tell()
-    placeholder = "0" * 64
-    fingerprint, headers, scale_required = _write_manifest_stream(
-        provider=provider,
-        job_root=Path(job_root),
-        sink=sink,
-        fingerprint_value=placeholder,
-        per_eye_size=per_eye_size,
-        vr_format=vr_format,
-        trace=trace,
-    )
+    provider_audit = audit_encoding_provider(provider, cancelled=cancelled)
+    with AcquiredRoot(Path(job_root)) as acquired:
+        for parent in _selected_parents(provider):
+            _validate_selected_directory(acquired, parent, provider, cancelled)
+        trace = EncodingManifestTrace()
+        start = sink.tell()
+        placeholder = "0" * 64
+        fingerprint, headers, scale_required = _write_manifest_stream(
+            provider=provider,
+            acquired=acquired,
+            sink=sink,
+            fingerprint_value=placeholder,
+            per_eye_size=per_eye_size,
+            vr_format=vr_format,
+            trace=trace,
+            cancelled=cancelled,
+        )
     end = sink.tell()
     fingerprint_offset = start + len(
         b'{"algorithm_version":"encoding-input-sequence-v2","fingerprint":"'
@@ -753,6 +787,7 @@ def stage_encoding_input_manifest(
     raw_digest = hashlib.sha256()
     remaining = end - start
     while remaining:
+        _raise_if_cancelled(cancelled)
         chunk = sink.read(min(FINAL_ENCODING_JSON_STREAM_BYTES, remaining))
         if not chunk:
             raise OSError("encoding manifest sink ended before its written extent")
@@ -778,21 +813,31 @@ def validate_encoding_postpass(
     staged: StagedEncodingInputManifest,
     per_eye_size: tuple[int, int],
     vr_format: Literal["side_by_side", "over_under"],
+    cancelled: CancellationPredicate | None = None,
 ) -> None:
     try:
-        validate_encoding_provider(provider, staged.provider_audit, launch_started=True)
-        for parent in _selected_parents(provider):
-            _validate_selected_directory(Path(job_root), parent, provider)
-        sink = _DigestSink()
-        fingerprint, headers, scale_required = _write_manifest_stream(
-            provider=provider,
-            job_root=Path(job_root),
-            sink=sink,
-            fingerprint_value=staged.fingerprint,
-            per_eye_size=per_eye_size,
-            vr_format=vr_format,
-            trace=EncodingManifestTrace(),
+        validate_encoding_provider(
+            provider,
+            staged.provider_audit,
+            launch_started=True,
+            cancelled=cancelled,
         )
+        with AcquiredRoot(Path(job_root)) as acquired:
+            for parent in _selected_parents(provider):
+                _validate_selected_directory(acquired, parent, provider, cancelled)
+            sink = _DigestSink()
+            fingerprint, headers, scale_required = _write_manifest_stream(
+                provider=provider,
+                acquired=acquired,
+                sink=sink,
+                fingerprint_value=staged.fingerprint,
+                per_eye_size=per_eye_size,
+                vr_format=vr_format,
+                trace=EncodingManifestTrace(),
+                cancelled=cancelled,
+            )
+    except InterruptedError:
+        raise
     except (EncodingProviderError, EncodingDirectoryError, OSError, ValueError) as error:
         if isinstance(error, FinalEncodingInputChangedError):
             raise
@@ -816,23 +861,26 @@ def audit_encoding_input_manifest(
     expected_raw_byte_count: int,
     per_eye_size: tuple[int, int],
     vr_format: Literal["side_by_side", "over_under"],
+    cancelled: CancellationPredicate | None = None,
 ) -> StagedEncodingInputManifest:
     """Rebuild only streaming identity needed to adopt a durable manifest on resume."""
 
-    provider_audit = audit_encoding_provider(provider)
-    for parent in _selected_parents(provider):
-        _validate_selected_directory(Path(job_root), parent, provider)
-    trace = EncodingManifestTrace()
-    sink = _DigestSink()
-    fingerprint, headers, scale_required = _write_manifest_stream(
-        provider=provider,
-        job_root=Path(job_root),
-        sink=sink,
-        fingerprint_value=expected_fingerprint,
-        per_eye_size=per_eye_size,
-        vr_format=vr_format,
-        trace=trace,
-    )
+    provider_audit = audit_encoding_provider(provider, cancelled=cancelled)
+    with AcquiredRoot(Path(job_root)) as acquired:
+        for parent in _selected_parents(provider):
+            _validate_selected_directory(acquired, parent, provider, cancelled)
+        trace = EncodingManifestTrace()
+        sink = _DigestSink()
+        fingerprint, headers, scale_required = _write_manifest_stream(
+            provider=provider,
+            acquired=acquired,
+            sink=sink,
+            fingerprint_value=expected_fingerprint,
+            per_eye_size=per_eye_size,
+            vr_format=vr_format,
+            trace=trace,
+            cancelled=cancelled,
+        )
     if (
         fingerprint != expected_fingerprint
         or sink.digest.hexdigest() != expected_raw_sha256
@@ -988,46 +1036,194 @@ def job_output_name_v1(
     raise FinalMediaTargetMetadataError("zero-prefix fallback is not portable")
 
 
-class _Pairs(list[tuple[str, object]]):
-    pass
+_JSON_NUMBER = re.compile(rb"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 
 
-def _load_pairs(raw: bytes, *, cap: int, max_depth: int) -> _Pairs:  # noqa: C901
-    if len(raw) > cap:
-        raise FfprobeJsonError("FFprobe JSON exceeds its raw byte cap")
-    if b"\x00" in raw:
-        raise FfprobeJsonError("FFprobe JSON contains NUL")
-    try:
-        text = raw.decode("utf-8", errors="strict")
-        value = json.loads(text, object_pairs_hook=_Pairs)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise FfprobeJsonError("FFprobe JSON is malformed") from error
-    if not isinstance(value, _Pairs):
-        raise FfprobeJsonError("FFprobe JSON root must be an object")
+class _BoundedFfprobeJsonCursor:
+    """Byte cursor for the two fixed FFprobe schemas; never builds a JSON tree."""
 
-    def depth(item: object, current: int) -> None:
-        if current > max_depth:
-            raise FfprobeJsonError("FFprobe JSON nesting depth exceeds the cap")
-        if isinstance(item, _Pairs):
-            for key, child in item:
-                if not isinstance(key, str):
-                    raise FfprobeJsonError("FFprobe JSON object key is invalid")
-                depth(child, current + 1)
-        elif isinstance(item, list):
-            for child in item:
-                depth(child, current + 1)
+    def __init__(self, raw: bytes, *, raw_cap: int, max_depth: int) -> None:
+        if len(raw) > raw_cap:
+            raise FfprobeJsonBudgetError("FFprobe JSON exceeds its raw byte cap")
+        if b"\x00" in raw:
+            raise FfprobeJsonError("FFprobe JSON contains NUL")
+        self.raw = raw
+        self.offset = 0
+        self.max_depth = max_depth
+        self.ignored_container_starts = 0
 
-    depth(value, 1)
-    return value
+    def _space(self) -> None:
+        raw = self.raw
+        offset = self.offset
+        while offset < len(raw) and raw[offset] in b" \t\r\n":
+            offset += 1
+        self.offset = offset
+
+    def peek(self) -> int | None:
+        self._space()
+        if self.offset == len(self.raw):
+            return None
+        return self.raw[self.offset]
+
+    def take(self, byte: int, label: str = "FFprobe JSON") -> None:
+        self._space()
+        if self.offset == len(self.raw) or self.raw[self.offset] != byte:
+            raise FfprobeJsonError(f"{label} is malformed")
+        self.offset += 1
+
+    def finish(self) -> None:
+        self._space()
+        if self.offset != len(self.raw):
+            raise FfprobeJsonError("FFprobe JSON has trailing data")
+
+    def enter_known_container(self, byte: int, *, depth: int, label: str) -> None:
+        if depth > self.max_depth:
+            raise FfprobeJsonBudgetError("FFprobe JSON nesting depth exceeds the cap")
+        self.take(byte, label)
+
+    def string(self, *, maximum_bytes: int, label: str) -> str:
+        self._space()
+        start = self.offset
+        if start == len(self.raw) or self.raw[start] != ord('"'):
+            raise FfprobeJsonError(f"{label} must be a JSON string")
+        offset = start + 1
+        escaped = False
+        while offset < len(self.raw):
+            byte = self.raw[offset]
+            if byte < 0x20:
+                raise FfprobeJsonError(f"{label} contains an invalid control byte")
+            if escaped:
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == ord('"'):
+                token = self.raw[start : offset + 1]
+                if len(token) - 2 > maximum_bytes:
+                    raise FfprobeJsonBudgetError(
+                        f"{label} scalar token exceeds its byte cap"
+                    )
+                try:
+                    value = json.loads(token)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise FfprobeJsonError(f"{label} is malformed") from error
+                if not isinstance(value, str):
+                    raise FfprobeJsonError(f"{label} must be a JSON string")
+                try:
+                    encoded_length = len(value.encode("utf-8", errors="strict"))
+                except UnicodeEncodeError as error:
+                    raise FfprobeJsonError(f"{label} contains invalid Unicode") from error
+                if encoded_length > maximum_bytes:
+                    raise FfprobeJsonBudgetError(
+                        f"{label} scalar token exceeds its byte cap"
+                    )
+                self.offset = offset + 1
+                return value
+            offset += 1
+        raise FfprobeJsonError(f"{label} is unterminated")
+
+    def scalar(self, *, maximum_bytes: int, label: str) -> object:
+        self._space()
+        if self.offset == len(self.raw):
+            raise FfprobeJsonError(f"{label} is missing")
+        if self.raw[self.offset] == ord('"'):
+            return self.string(maximum_bytes=maximum_bytes, label=label)
+        start = self.offset
+        while self.offset < len(self.raw) and self.raw[self.offset] not in b" \t\r\n,]}":
+            self.offset += 1
+        token = self.raw[start : self.offset]
+        if not token or len(token) > maximum_bytes:
+            raise FfprobeJsonBudgetError(f"{label} scalar token exceeds its byte cap")
+        if token == b"true":
+            return True
+        if token == b"false":
+            return False
+        if token == b"null":
+            return None
+        if _JSON_NUMBER.fullmatch(token) is None:
+            raise FfprobeJsonError(f"{label} is malformed")
+        try:
+            return json.loads(token)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise FfprobeJsonError(f"{label} is malformed") from error
+
+    def skip_ignored_value(self, *, depth: int) -> None:  # noqa: C901
+        """Consume one ignored JSON value with fixed depth/container/scalar caps."""
+
+        # A frame is [kind, state, depth]. Parent state advances before a child
+        # starts, so closing a child never needs recursion or a Python value.
+        frames: list[list[object]] = []
+
+        def start_value(value_depth: int) -> None:
+            self._space()
+            byte = self.peek()
+            if byte not in {ord("{"), ord("[")}:
+                self.scalar(maximum_bytes=128, label="ignored FFprobe JSON")
+                return
+            if value_depth > self.max_depth:
+                raise FfprobeJsonBudgetError(
+                    "FFprobe JSON nesting depth exceeds the cap"
+                )
+            self.ignored_container_starts += 1
+            if self.ignored_container_starts > 256:
+                raise FfprobeJsonBudgetError(
+                    "ignored FFprobe JSON container count exceeds the cap"
+                )
+            self.offset += 1
+            frames.append(
+                ["object" if byte == ord("{") else "array", "first", value_depth]
+            )
+
+        start_value(depth)
+        while frames:
+            kind, state, container_depth = frames[-1]
+            self._space()
+            byte = self.peek()
+            if kind == "object":
+                if state == "first":
+                    if byte == ord("}"):
+                        self.offset += 1
+                        frames.pop()
+                        continue
+                    self.string(maximum_bytes=128, label="ignored FFprobe JSON key")
+                    self.take(ord(":"), "ignored FFprobe JSON object")
+                    frames[-1][1] = "after_value"
+                    start_value(int(container_depth) + 1)
+                    continue
+                if byte == ord("}"):
+                    self.offset += 1
+                    frames.pop()
+                    continue
+                self.take(ord(","), "ignored FFprobe JSON object")
+                self.string(maximum_bytes=128, label="ignored FFprobe JSON key")
+                self.take(ord(":"), "ignored FFprobe JSON object")
+                start_value(int(container_depth) + 1)
+                continue
+            if state == "first":
+                if byte == ord("]"):
+                    self.offset += 1
+                    frames.pop()
+                    continue
+                frames[-1][1] = "after_value"
+                start_value(int(container_depth) + 1)
+                continue
+            if byte == ord("]"):
+                self.offset += 1
+                frames.pop()
+                continue
+            self.take(ord(","), "ignored FFprobe JSON array")
+            start_value(int(container_depth) + 1)
 
 
-def _unique_pairs(value: _Pairs, label: str) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, item in value:
-        if key in result:
-            raise FfprobeJsonError(f"duplicate authoritative {label} key: {key}")
-        result[key] = item
-    return result
+def _next_member(cursor: _BoundedFfprobeJsonCursor, *, first: bool, label: str) -> bool:
+    """Position an object/array parser at its next member; return false at close."""
+
+    closing = ord("}") if label.endswith("object") else ord("]")
+    if cursor.peek() == closing:
+        cursor.offset += 1
+        return False
+    if not first:
+        cursor.take(ord(","), label)
+    return True
 
 
 @dataclass(frozen=True)
@@ -1038,24 +1234,81 @@ class AudioProbeStream:
 
 
 def parse_audio_ffprobe_json(raw: bytes) -> AudioProbeStream | None:  # noqa: C901
-    root = _unique_pairs(
-        _load_pairs(raw, cap=FINAL_AUDIO_PROBE_STDOUT_BYTES, max_depth=8),
-        "root",
+    cursor = _BoundedFfprobeJsonCursor(
+        raw,
+        raw_cap=FINAL_AUDIO_PROBE_STDOUT_BYTES,
+        max_depth=8,
     )
-    if set(root).difference({"streams", "programs", "stream_groups"}) or "streams" not in root:
+    cursor.enter_known_container(ord("{"), depth=1, label="audio FFprobe root")
+    root_keys: set[str] = set()
+    stream: dict[str, object] | None = None
+    first_root = True
+    while cursor.peek() != ord("}"):
+        if not first_root:
+            cursor.take(ord(","), "audio FFprobe root object")
+        first_root = False
+        key = cursor.string(maximum_bytes=128, label="audio FFprobe root key")
+        if key not in {"streams", "programs", "stream_groups"}:
+            raise FfprobeJsonError("audio FFprobe root keys are invalid")
+        if key in root_keys:
+            raise FfprobeJsonError(f"duplicate authoritative root key: {key}")
+        root_keys.add(key)
+        cursor.take(ord(":"), "audio FFprobe root object")
+        if key == "streams":
+            cursor.enter_known_container(
+                ord("["), depth=2, label="audio FFprobe streams array"
+            )
+            if cursor.peek() != ord("]"):
+                cursor.enter_known_container(
+                    ord("{"), depth=3, label="audio FFprobe stream object"
+                )
+                fields: dict[str, object] = {}
+                first_field = True
+                while cursor.peek() != ord("}"):
+                    if not first_field:
+                        cursor.take(ord(","), "audio FFprobe stream object")
+                    first_field = False
+                    field = cursor.string(
+                        maximum_bytes=128,
+                        label="audio FFprobe stream key",
+                    )
+                    if field not in {"codec_type", "sample_rate", "channels"}:
+                        raise FfprobeJsonError("audio FFprobe stream keys are invalid")
+                    if field in fields:
+                        raise FfprobeJsonError(
+                            f"duplicate authoritative stream key: {field}"
+                        )
+                    cursor.take(ord(":"), "audio FFprobe stream object")
+                    fields[field] = cursor.scalar(
+                        maximum_bytes=32,
+                        label=f"audio FFprobe {field}",
+                    )
+                cursor.take(ord("}"), "audio FFprobe stream object")
+                stream = fields
+                if cursor.peek() != ord("]"):
+                    raise FfprobeJsonError(
+                        "audio FFprobe streams must contain zero or one object"
+                    )
+            cursor.take(ord("]"), "audio FFprobe streams array")
+        else:
+            cursor.enter_known_container(
+                ord("["), depth=2, label=f"audio FFprobe {key} wrapper"
+            )
+            first_item = True
+            while cursor.peek() != ord("]"):
+                if not first_item:
+                    cursor.take(ord(","), f"audio FFprobe {key} wrapper")
+                first_item = False
+                if cursor.peek() != ord("{"):
+                    raise FfprobeJsonError(f"audio FFprobe {key} wrapper is invalid")
+                cursor.skip_ignored_value(depth=3)
+            cursor.take(ord("]"), f"audio FFprobe {key} wrapper")
+    cursor.take(ord("}"), "audio FFprobe root object")
+    cursor.finish()
+    if "streams" not in root_keys:
         raise FfprobeJsonError("audio FFprobe root keys are invalid")
-    for wrapper in ("programs", "stream_groups"):
-        value = root.get(wrapper, [])
-        if not isinstance(value, list) or any(not isinstance(item, _Pairs) for item in value):
-            raise FfprobeJsonError(f"audio FFprobe {wrapper} wrapper is invalid")
-    streams = root["streams"]
-    if not isinstance(streams, list) or len(streams) > 1:
-        raise FfprobeJsonError("audio FFprobe streams must contain zero or one object")
-    if not streams:
+    if stream is None:
         return None
-    if not isinstance(streams[0], _Pairs):
-        raise FfprobeJsonError("audio FFprobe stream must be an object")
-    stream = _unique_pairs(streams[0], "stream")
     if set(stream) != {"codec_type", "sample_rate", "channels"}:
         raise FfprobeJsonError("audio FFprobe stream keys are invalid")
     codec_type = stream["codec_type"]
@@ -1100,7 +1353,7 @@ class FinalContainerExpectation:
             or self.height <= 0
         ):
             raise FinalContainerValidationError("final dimensions must be positive integers")
-        _canonical_ratio(self.fps, "final frame rate")
+        _canonical_slash_ratio(self.fps, "final frame rate")
         if type(self.frame_count) is not int or self.frame_count <= 0:
             raise FinalContainerValidationError("final frame count must be positive")
         if self.resolved_encoder not in {"libx264", "libx265", "hevc_nvenc"}:
@@ -1132,24 +1385,74 @@ _FINAL_STREAM_KEYS = frozenset(
 
 
 def parse_final_ffprobe_json(raw: bytes) -> tuple[FinalProbeStream, ...]:
-    root = _unique_pairs(_load_pairs(raw, cap=FINAL_PROBE_STDOUT_BYTES, max_depth=4), "root")
-    if set(root).difference({"streams", "programs", "stream_groups"}) or "streams" not in root:
-        raise FfprobeJsonError("final FFprobe root keys are invalid")
-    for wrapper in ("programs", "stream_groups"):
-        value = root.get(wrapper, [])
-        if not isinstance(value, list) or value:
-            raise FfprobeJsonError(f"final FFprobe {wrapper} wrapper must be empty")
-    streams = root["streams"]
-    if not isinstance(streams, list) or not 1 <= len(streams) <= 2:
-        raise FfprobeJsonError("final FFprobe must contain one or two streams")
+    cursor = _BoundedFfprobeJsonCursor(
+        raw,
+        raw_cap=FINAL_PROBE_STDOUT_BYTES,
+        max_depth=4,
+    )
+    cursor.enter_known_container(ord("{"), depth=1, label="final FFprobe root")
+    root_keys: set[str] = set()
     result: list[FinalProbeStream] = []
-    for value in streams:
-        if not isinstance(value, _Pairs):
-            raise FfprobeJsonError("final FFprobe stream must be an object")
-        fields = _unique_pairs(value, "stream")
-        if set(fields).difference(_FINAL_STREAM_KEYS):
-            raise FfprobeJsonError("final FFprobe stream key is outside the allowlist")
-        result.append(FinalProbeStream(fields))
+    first_root = True
+    while cursor.peek() != ord("}"):
+        if not first_root:
+            cursor.take(ord(","), "final FFprobe root object")
+        first_root = False
+        key = cursor.string(maximum_bytes=128, label="final FFprobe root key")
+        if key not in {"streams", "programs", "stream_groups"}:
+            raise FfprobeJsonError("final FFprobe root keys are invalid")
+        if key in root_keys:
+            raise FfprobeJsonError(f"duplicate authoritative root key: {key}")
+        root_keys.add(key)
+        cursor.take(ord(":"), "final FFprobe root object")
+        if key != "streams":
+            cursor.enter_known_container(
+                ord("["), depth=2, label=f"final FFprobe {key} wrapper"
+            )
+            if cursor.peek() != ord("]"):
+                raise FfprobeJsonError(f"final FFprobe {key} wrapper must be empty")
+            cursor.take(ord("]"), f"final FFprobe {key} wrapper")
+            continue
+        cursor.enter_known_container(ord("["), depth=2, label="final FFprobe streams")
+        first_stream = True
+        while cursor.peek() != ord("]"):
+            if not first_stream:
+                cursor.take(ord(","), "final FFprobe streams array")
+            first_stream = False
+            if len(result) == 2:
+                raise FfprobeJsonError("final FFprobe must contain one or two streams")
+            cursor.enter_known_container(
+                ord("{"), depth=3, label="final FFprobe stream object"
+            )
+            fields: dict[str, object] = {}
+            first_field = True
+            while cursor.peek() != ord("}"):
+                if not first_field:
+                    cursor.take(ord(","), "final FFprobe stream object")
+                first_field = False
+                field = cursor.string(maximum_bytes=128, label="final FFprobe stream key")
+                if field not in _FINAL_STREAM_KEYS:
+                    raise FfprobeJsonError(
+                        "final FFprobe stream key is outside the allowlist"
+                    )
+                if field in fields:
+                    raise FfprobeJsonError(
+                        f"duplicate authoritative stream key: {field}"
+                    )
+                cursor.take(ord(":"), "final FFprobe stream object")
+                fields[field] = cursor.scalar(
+                    maximum_bytes=128,
+                    label=f"final FFprobe {field}",
+                )
+            cursor.take(ord("}"), "final FFprobe stream object")
+            result.append(FinalProbeStream(fields))
+        cursor.take(ord("]"), "final FFprobe streams array")
+    cursor.take(ord("}"), "final FFprobe root object")
+    cursor.finish()
+    if "streams" not in root_keys:
+        raise FfprobeJsonError("final FFprobe root keys are invalid")
+    if not 1 <= len(result) <= 2:
+        raise FfprobeJsonError("final FFprobe must contain one or two streams")
     return tuple(result)
 
 
@@ -1163,12 +1466,19 @@ def _canonical_decimal(value: object, label: str, *, positive: bool) -> int:
     return number
 
 
-def _canonical_ratio(value: object, label: str) -> tuple[int, int]:
+def _canonical_ratio(
+    value: object,
+    label: str,
+    *,
+    separator: Literal[":", "/"],
+) -> tuple[int, int]:
     if not isinstance(value, str):
         raise FinalContainerValidationError(f"{label} is not a string ratio")
-    match = re.fullmatch(r"([1-9][0-9]*):([1-9][0-9]*)", value)
-    if match is None:
-        match = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", value)
+    escaped_separator = re.escape(separator)
+    match = re.fullmatch(
+        rf"([1-9][0-9]*){escaped_separator}([1-9][0-9]*)",
+        value,
+    )
     if match is None:
         raise FinalContainerValidationError(f"{label} is not a positive ratio")
     numerator, denominator = int(match.group(1)), int(match.group(2))
@@ -1177,6 +1487,14 @@ def _canonical_ratio(value: object, label: str) -> tuple[int, int]:
     if math.gcd(numerator, denominator) != 1:
         raise FinalContainerValidationError(f"{label} is not reduced")
     return numerator, denominator
+
+
+def _canonical_colon_ratio(value: object, label: str) -> tuple[int, int]:
+    return _canonical_ratio(value, label, separator=":")
+
+
+def _canonical_slash_ratio(value: object, label: str) -> tuple[int, int]:
+    return _canonical_ratio(value, label, separator="/")
 
 
 def validate_final_probe_streams(  # noqa: C901
@@ -1223,14 +1541,20 @@ def validate_final_probe_streams(  # noqa: C901
         raise FinalContainerValidationError("final video dimensions differ")
     if video["pix_fmt"] != "yuv420p":
         raise FinalContainerValidationError("final video pixel format differs")
-    if _canonical_ratio(video["sample_aspect_ratio"], "sample aspect ratio") != (1, 1):
+    if _canonical_colon_ratio(video["sample_aspect_ratio"], "sample aspect ratio") != (
+        1,
+        1,
+    ):
         raise FinalContainerValidationError("final video sample aspect ratio differs")
     divisor = math.gcd(expectation.width, expectation.height)
     expected_display = (expectation.width // divisor, expectation.height // divisor)
-    if _canonical_ratio(video["display_aspect_ratio"], "display aspect ratio") != expected_display:
+    if (
+        _canonical_colon_ratio(video["display_aspect_ratio"], "display aspect ratio")
+        != expected_display
+    ):
         raise FinalContainerValidationError("final video display aspect ratio differs")
-    expected_fps = _canonical_ratio(expectation.fps, "expected frame rate")
-    if _canonical_ratio(video["avg_frame_rate"], "average frame rate") != expected_fps:
+    expected_fps = _canonical_slash_ratio(expectation.fps, "expected frame rate")
+    if _canonical_slash_ratio(video["avg_frame_rate"], "average frame rate") != expected_fps:
         raise FinalContainerValidationError("final video frame rate differs")
     if (
         _canonical_decimal(video["nb_read_frames"], "video frame count", positive=True)
@@ -1249,7 +1573,9 @@ def validate_final_probe_streams(  # noqa: C901
             audio["nb_read_frames"], "audio packet count", positive=True
         )
         if packet_count > expectation.audio_packet_upper_bound:
-            raise FinalContainerValidationError("final audio packet bound was exceeded")
+            raise FinalContainerAudioPacketBoundError(
+                "final audio packet bound was exceeded"
+            )
     elif audio_streams:
         raise FinalContainerValidationError("final container has unexpected audio")
 
@@ -1301,6 +1627,55 @@ class FfmpegProgressParser:
     def finish(self) -> None:
         if not self.ended:
             raise EncodingProgressError("progress stream has no terminal progress=end")
+
+
+class FinalDecodeProgressParser(FfmpegProgressParser):
+    """Final-decode progress whose stall clock advances only on decoded media."""
+
+    _VALUE_CAP = 256
+
+    def __init__(self) -> None:
+        self.maximums = {key: -1 for key in ("frame", "out_time_us", "out_time_ms")}
+        self.ended = False
+
+    def feed_line(self, raw_line: bytes) -> bool:
+        if self.ended:
+            raise EncodingProgressError("progress bytes follow progress=end")
+        if len(raw_line) > FINAL_ENCODING_LINE_BYTES:
+            raise EncodingProgressError("progress line exceeds its cap")
+        if raw_line.endswith(b"\r\n"):
+            line = raw_line[:-2]
+        elif raw_line.endswith(b"\n"):
+            line = raw_line[:-1]
+        else:
+            raise EncodingProgressError("progress line has no terminator")
+        if b"=" not in line:
+            raise EncodingProgressError("progress line has no key separator")
+        key, value = line.split(b"=", 1)
+        if len(value) > self._VALUE_CAP:
+            raise EncodingProgressError("progress value exceeds its cap")
+        if not _PROGRESS_KEY.fullmatch(key) or any(
+            byte < 0x20 or byte > 0x7E for byte in value
+        ):
+            raise EncodingProgressError("progress line syntax is invalid")
+        decoded_key = key.decode("ascii")
+        if decoded_key in self.maximums:
+            if not _CANONICAL_U64.fullmatch(value):
+                raise EncodingProgressError("progress numeric value is noncanonical")
+            number = int(value)
+            if number > 0xFFFFFFFFFFFFFFFF:
+                raise EncodingProgressError("progress numeric value exceeds u64")
+            increased = number > self.maximums[decoded_key]
+            self.maximums[decoded_key] = max(self.maximums[decoded_key], number)
+            return increased
+        if decoded_key == "progress":
+            if value == b"continue":
+                return False
+            if value == b"end":
+                self.ended = True
+                return False
+            raise EncodingProgressError("progress control value is invalid")
+        return False
 
 
 def encoding_control_phase_peaks() -> dict[str, int]:

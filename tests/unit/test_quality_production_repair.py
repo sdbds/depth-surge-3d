@@ -389,6 +389,10 @@ def test_production_exemplar_reuses_one_native_sobel_pair_per_level(monkeypatch)
                 donor_gradient_y,
             )
 
+        @staticmethod
+        def copy_exemplar_patch_into(*args):
+            return native.copy_exemplar_patch_into(*args)
+
     monkeypatch.setattr(native_kd, "_require_native", lambda: RecordingNative())
     height = width = 33
     coverage = np.full((height, width), 16, dtype=np.uint8)

@@ -1,9 +1,13 @@
 """Unit tests for final video encoding."""
 
+import gc
+import inspect
 import io
 import json
 import subprocess
+import weakref
 from pathlib import Path
+from pathlib import PurePosixPath
 from unittest.mock import MagicMock, Mock, patch
 
 import cv2
@@ -15,6 +19,7 @@ from src.depth_surge_3d.processing.video.final_audio import (
     OpenFileIdentityV1,
     SelectedAudioIdentityV1,
 )
+from src.depth_surge_3d.processing.video.bounded_process import BoundedProcessResult
 from src.depth_surge_3d.processing.video.video_encoder import VideoEncoder
 from src.depth_surge_3d.processing.frames.source_frame_manifest import (
     write_source_frame_manifest,
@@ -224,7 +229,11 @@ def test_direct_command_omits_scale_for_exact_size_and_uses_hstack(tmp_path):
     assert command.count("-framerate") == 2
     assert command.count("24000/1001") == 2
     assert command.count("-start_number") == 2
-    starts = [command[index + 1] for index, value in enumerate(command) if value == "-start_number"]
+    starts = [
+        command[index + 1]
+        for index, value in enumerate(command)
+        if value == "-start_number"
+    ]
     assert starts == ["1", "1"]
     assert command[command.index("-frames:v") + 1] == "2"
     assert command[command.index("-map") + 1] == "[vr]"
@@ -284,9 +293,9 @@ def test_direct_command_maps_audio_from_third_input(tmp_path):
         "aac",
         "-shortest",
     ]
-    assert max(index for index, value in enumerate(command) if value == "-i") < command.index(
-        "-filter_complex"
-    )
+    assert max(
+        index for index, value in enumerate(command) if value == "-i"
+    ) < command.index("-filter_complex")
 
 
 def test_schema5_direct_command_uses_preflighted_audio_without_shortest(tmp_path):
@@ -417,6 +426,31 @@ def test_direct_command_reuses_nvenc_arguments_unchanged(tmp_path):
     ]
 
 
+def test_nvenc_capability_probe_is_bounded_and_cancellable() -> None:
+    def cancelled() -> bool:
+        return False
+    with patch(
+        "src.depth_surge_3d.processing.video.video_encoder.BoundedProcessCaptureV1"
+    ) as capture:
+        capture.return_value.run.return_value = BoundedProcessResult(
+            b" V..... hevc_nvenc NVIDIA NVENC hevc encoder\n",
+            b"",
+            0,
+        )
+
+        assert VideoEncoder()._check_nvenc_available(cancelled=cancelled)
+
+    capture.assert_called_once_with(
+        stdout_cap=1024 * 1024,
+        stderr_cap=64 * 1024,
+        timeout_seconds=10.0,
+        cancelled=cancelled,
+    )
+    capture.return_value.run.assert_called_once_with(
+        ("ffmpeg", "-hide_banner", "-encoders")
+    )
+
+
 def test_direct_runner_merges_stderr_tracks_frames_and_waits():
     process = _FakeProcess("frame=1\nnoise\nframe=2\n")
     tracker = Mock()
@@ -425,12 +459,16 @@ def test_direct_runner_merges_stderr_tracks_frames_and_waits():
         "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
         return_value=process,
     ) as popen:
-        returncode, diagnostics = VideoEncoder()._run_ffmpeg_with_progress(["ffmpeg"], 2, tracker)
+        returncode, diagnostics = VideoEncoder()._run_ffmpeg_with_progress(
+            ["ffmpeg"], 2, tracker
+        )
 
     assert returncode == 0
     assert diagnostics == ("noise",)
     assert process.waited is True
-    assert [call.kwargs["frame_num"] for call in tracker.update_progress.call_args_list] == [1, 2]
+    assert [
+        call.kwargs["frame_num"] for call in tracker.update_progress.call_args_list
+    ] == [1, 2]
     assert popen.call_args.kwargs == {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
@@ -448,7 +486,9 @@ def test_direct_runner_retains_only_last_fifty_diagnostic_lines():
         "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
         return_value=process,
     ):
-        returncode, diagnostics = VideoEncoder()._run_ffmpeg_with_progress(["ffmpeg"], 1, None)
+        returncode, diagnostics = VideoEncoder()._run_ffmpeg_with_progress(
+            ["ffmpeg"], 1, None
+        )
 
     assert returncode == 1
     assert len(diagnostics) == 50
@@ -465,7 +505,9 @@ def test_direct_runner_ignores_tracker_errors_and_uses_wait_returncode():
         "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen",
         return_value=process,
     ):
-        returncode, diagnostics = VideoEncoder()._run_ffmpeg_with_progress(["ffmpeg"], 4, tracker)
+        returncode, diagnostics = VideoEncoder()._run_ffmpeg_with_progress(
+            ["ffmpeg"], 4, tracker
+        )
 
     assert returncode == 7
     assert diagnostics == ()
@@ -567,7 +609,9 @@ def test_direct_create_video_atomically_replaces_final_output(tmp_path):
     assert right[0].read_bytes() == right_before
 
 
-def test_direct_create_video_failure_preserves_old_final_and_removes_temp(tmp_path, capsys):
+def test_direct_create_video_failure_preserves_old_final_and_removes_temp(
+    tmp_path, capsys
+):
     left = _write_eye_sequence(tmp_path / "left", [1])
     right = _write_eye_sequence(tmp_path / "right", [1])
     settings = _direct_settings()
@@ -682,7 +726,9 @@ def test_direct_create_video_validates_before_launch_and_cleans_stale_temp(tmp_p
             "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
             return_value=True,
         ),
-        patch("src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen") as popen,
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen"
+        ) as popen,
     ):
         assert not VideoEncoder().create_video_from_stereo_sequences(
             [],
@@ -718,7 +764,9 @@ def test_direct_create_video_preflight_failure_cleans_only_exact_stale_temp(tmp_
             "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
             return_value=False,
         ),
-        patch("src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen") as popen,
+        patch(
+            "src.depth_surge_3d.processing.video.video_encoder.subprocess.Popen"
+        ) as popen,
     ):
         assert not VideoEncoder().create_video_from_stereo_sequences(
             left,
@@ -771,7 +819,9 @@ def test_direct_create_video_cleans_temp_after_launch_exception(tmp_path):
 
 
 @pytest.mark.parametrize("output_state", ["missing", "empty"])
-def test_direct_create_video_reports_output_validation_failure(tmp_path, capsys, output_state):
+def test_direct_create_video_reports_output_validation_failure(
+    tmp_path, capsys, output_state
+):
     left = _write_eye_sequence(tmp_path / "left", [1])
     right = _write_eye_sequence(tmp_path / "right", [1])
     settings = _direct_settings()
@@ -1025,7 +1075,9 @@ def test_extract_frames_reuses_complete_existing_sequence(tmp_path):
     source_video.write_bytes(b"source-video")
     write_source_frame_manifest(expected, source_video)
 
-    with patch("src.depth_surge_3d.processing.video.video_encoder.subprocess.run") as run:
+    with patch(
+        "src.depth_surge_3d.processing.video.video_encoder.subprocess.run"
+    ) as run:
         result = VideoEncoder().extract_frames(
             str(source_video),
             {"base": tmp_path, "frames": frames_dir},
@@ -1053,7 +1105,9 @@ def test_extract_frames_tolerates_small_vfr_metadata_count_drift(tmp_path):
     source_video.write_bytes(b"source-video")
     write_source_frame_manifest(expected, source_video)
 
-    with patch("src.depth_surge_3d.processing.video.video_encoder.subprocess.run") as run:
+    with patch(
+        "src.depth_surge_3d.processing.video.video_encoder.subprocess.run"
+    ) as run:
         result = VideoEncoder().extract_frames(
             str(source_video),
             {"base": tmp_path, "frames": frames_dir, "disparity_maps": depth_dir},
@@ -1073,7 +1127,9 @@ def test_metric_geometry_npz_counts_as_downstream_progress(tmp_path: Path) -> No
     assert VideoEncoder._has_downstream_progress({"metric_geometry": metric_dir})
 
 
-def test_extract_frames_reextracts_approximate_count_without_downstream_progress(tmp_path):
+def test_extract_frames_reextracts_approximate_count_without_downstream_progress(
+    tmp_path,
+):
     """A near-complete frame count alone cannot prove that extraction finished."""
     frames_dir = tmp_path / "frames"
     frames_dir.mkdir()
@@ -1100,7 +1156,9 @@ def test_extract_frames_reextracts_approximate_count_without_downstream_progress
     assert not any(path.exists() for path in stale_frames)
 
 
-def test_extract_frames_does_not_reuse_empty_sequence_with_stale_downstream_files(tmp_path):
+def test_extract_frames_does_not_reuse_empty_sequence_with_stale_downstream_files(
+    tmp_path,
+):
     """Downstream leftovers cannot turn an empty extraction directory into a cache hit."""
     frames_dir = tmp_path / "frames"
     depth_dir = tmp_path / "depth"
@@ -1124,11 +1182,12 @@ def test_extract_frames_does_not_reuse_empty_sequence_with_stale_downstream_file
     assert result == []
 
 
-def test_schema5_assembled_encode_publishes_bound_video_and_manifests(tmp_path, monkeypatch):
+def test_schema5_assembled_encode_publishes_bound_video_and_manifests(
+    tmp_path, monkeypatch
+):
     from src.depth_surge_3d.core.settings import validate_settings
     from src.depth_surge_3d.io.operations import save_processing_settings
     from src.depth_surge_3d.io.settings_artifact import ProcessingSettingsArtifactV5
-    from src.depth_surge_3d.processing.video.final_publication import audit_final_media_v1
 
     source = tmp_path / "source.mp4"
     source.write_bytes(b"source")
@@ -1141,6 +1200,7 @@ def test_schema5_assembled_encode_publishes_bound_video_and_manifests(tmp_path, 
         {
             "preserve_audio": False,
             "video_encoder": "libx264",
+            "target_fps": "original",
             "vr_resolution": "custom:4x4",
             "per_eye_width": 4,
             "per_eye_height": 4,
@@ -1185,7 +1245,15 @@ def test_schema5_assembled_encode_publishes_bound_video_and_manifests(tmp_path, 
             AssertionError("schema-5 encoding used unbounded subprocess.run")
         ),
     )
-    monkeypatch.setattr(VideoEncoder, "_run_schema5_ffmpeg_with_progress", fake_bounded_run)
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.get_video_info_ffprobe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("schema-5 assembled encoding reprobed source FPS")
+        ),
+    )
+    monkeypatch.setattr(
+        VideoEncoder, "_run_schema5_ffmpeg_with_progress", fake_bounded_run
+    )
     monkeypatch.setattr(VideoEncoder, "_validate_final_container", lambda *_args: True)
     monkeypatch.setattr(
         io,
@@ -1201,9 +1269,14 @@ def test_schema5_assembled_encode_publishes_bound_video_and_manifests(tmp_path, 
     assert (job / expected).read_bytes() == b"validated-mp4"
     assert (job / "encoding_input_manifest.json").is_file()
     assert (job / "final_video_manifest.json").is_file()
-    assert audit_final_media_v1(job, artifact).final_video_authenticated is True
-    assert (job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json").is_file()
+    encoder.pending_final_encoding_reservation.validate_authenticated_publication(
+        container_validator=lambda _path: True
+    )
+    assert (
+        job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
+    ).is_file()
     assert launches[0][launches[0].index("-start_number") + 1] == "1"
+    assert launches[0][launches[0].index("-framerate") + 1] == "24/1"
     assert launches[0][launches[0].index("-vf") + 1] == "setsar=1"
 
     resumed = VideoEncoder()
@@ -1221,7 +1294,694 @@ def test_schema5_assembled_encode_publishes_bound_video_and_manifests(tmp_path, 
         {"frames_processed": 1},
     )
     resumed.retire_final_encoding_reservation(success=True)
-    assert not (job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json").exists()
+    assert not (
+        job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
+    ).exists()
+
+
+def test_schema5_provider_count_must_equal_durable_settings_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.processing.video.encoding_provider import (
+        EncodingSequenceProvider,
+    )
+
+    job = tmp_path / "job"
+    job.mkdir()
+    provider = EncodingSequenceProvider.freeze(
+        mode="assembled_vr",
+        frame_count=1,
+        first_index=0,
+        frames_parent=PurePosixPath("99_vr_frames"),
+    )
+    artifact = Mock()
+    artifact.to_object.return_value = {
+        "metadata": {"final_media_publication_generation": None},
+        "video_properties": {"frame_count": 2},
+    }
+    reserve = Mock(side_effect=AssertionError("reservation crossed frame-count gate"))
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "prepare_final_encoding_reservation_v1",
+        reserve,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "recover_processing_control_prefix_v1",
+        lambda _root: artifact,
+    )
+
+    with pytest.raises(ValueError, match="frame count"):
+        VideoEncoder()._prepare_schema5_publication_context(
+            provider=provider,
+            output_dir=job,
+            settings=_direct_settings(),
+        )
+
+    reserve.assert_not_called()
+
+
+def test_schema5_prelaunch_staged_manifest_mismatch_discards_and_rebuilds_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.processing.video.encoding_provider import (
+        EncodingSequenceProvider,
+        FinalEncodingInputChangedError,
+    )
+
+    job = tmp_path / "job"
+    job.mkdir()
+    active_index = (
+        job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
+    )
+    active_index.parent.mkdir()
+    active_index.write_bytes(b"active")
+    provider = EncodingSequenceProvider.freeze(
+        mode="assembled_vr",
+        frame_count=1,
+        first_index=0,
+        frames_parent=PurePosixPath("99_vr_frames"),
+    )
+    artifact = Mock()
+    artifact.to_object.return_value = {
+        "metadata": {"final_media_publication_generation": None},
+        "video_properties": {"frame_count": 1, "fps": 24.0},
+        "processing_settings": {"target_fps": None, "source_fps": 24.0},
+        "output_info": {"expected_final_relative_path": "result.mp4"},
+    }
+    old = Mock()
+    old.job_root = job
+    old.index.fingerprint = "11" * 32
+    old.index.publication_generation = "44" * 16
+    old.index.sibling_video_temporary_relative_path = ".old.tmp.mp4"
+    old.index.final_video_relative_path = "result.mp4"
+    old.recover_publication_prefix.return_value = Mock(phase="ready_pre_video")
+    old.input_publication_source.return_value = Mock(
+        fingerprint="a" * 64,
+        raw_sha256="b" * 64,
+        raw_byte_count=10,
+    )
+    old.discard_prelaunch_invocation.side_effect = lambda: active_index.unlink()
+    fresh = Mock(sibling_path=job / ".fresh.tmp.mp4", job_root=job)
+    fresh.index.fingerprint = "22" * 32
+    fresh.index.sibling_video_temporary_relative_path = ".fresh.tmp.mp4"
+    fresh.index.final_video_relative_path = "result.mp4"
+    staged = Mock(fingerprint="c" * 64)
+    source = Mock()
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "load_final_encoding_reservation_v1",
+        lambda *_args, **_kwargs: old,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "recover_processing_control_prefix_v1",
+        lambda _root: artifact,
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "_recover_encoding_manifest_source",
+        lambda *_args, **_kwargs: old.input_publication_source.return_value,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "FinalEncodingReservationCapabilityV1.discard_prelaunch_invocation",
+        lambda _capability: old.discard_prelaunch_invocation(),
+    )
+
+    def stage_after_rebuild(*_args, **_kwargs):
+        preparation_frames = sum(
+            frame.function == "_prepare_schema5_publication_context"
+            for frame in inspect.stack()
+        )
+        assert preparation_frames == 1
+        return staged, source
+
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "audit_encoding_input_manifest",
+        Mock(side_effect=FinalEncodingInputChangedError("staged input differs")),
+    )
+    prepare = Mock(return_value=fresh)
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "prepare_final_encoding_reservation_v1",
+        prepare,
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "_stage_encoding_manifest_file",
+        stage_after_rebuild,
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "_encoding_manifest_extent_authority",
+        staticmethod(lambda _reservation: Mock()),
+    )
+
+    context = VideoEncoder()._prepare_schema5_publication_context(
+        provider=provider,
+        output_dir=job,
+        settings=_direct_settings(),
+    )
+
+    old.discard_prelaunch_invocation.assert_called_once_with()
+    prepare.assert_called_once()
+    assert context.reservation.index_fingerprint == "22" * 32
+    assert context.staged_manifest is staged
+
+
+def test_schema5_manifest_stage_releases_settings_and_prepared_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.processing.video.encoding_provider import (
+        EncodingSequenceProvider,
+    )
+
+    job = tmp_path / "job"
+    job.mkdir()
+    provider = EncodingSequenceProvider.freeze(
+        mode="assembled_vr",
+        frame_count=1,
+        first_index=0,
+        frames_parent=PurePosixPath("99_vr_frames"),
+    )
+    references: dict[str, weakref.ReferenceType[object]] = {}
+
+    class Artifact:
+        def to_object(self):
+            return {
+                "metadata": {"final_media_publication_generation": None},
+                "video_properties": {"frame_count": 1, "fps": 24.0},
+                "processing_settings": {"target_fps": None, "source_fps": 24.0},
+                "output_info": {"expected_final_relative_path": "result.mp4"},
+            }
+
+    class Descriptor:
+        payload_raw_max = 4096
+        logical_byte_count = 8192
+
+    class Transaction:
+        descriptor = Descriptor()
+        source_path = job / "manifest.reserved"
+
+    class Index:
+        fingerprint = "11" * 32
+        sibling_video_temporary_relative_path = ".fresh.tmp.mp4"
+        final_video_relative_path = "result.mp4"
+
+    class Reservation:
+        job_root = job
+        index = Index()
+        input_manifest_transaction = Transaction()
+
+    def recover(_root):
+        return Artifact()
+
+    def prepare(*_args, settings, **_kwargs):
+        reservation = Reservation()
+        references["settings"] = weakref.ref(settings)
+        references["reservation"] = weakref.ref(reservation)
+        return reservation
+
+    staged = Mock(fingerprint="a" * 64)
+    source = Mock()
+
+    def stage(*_args, **_kwargs):
+        gc.collect()
+        assert references["settings"]() is None
+        assert references["reservation"]() is None
+        return staged, source
+
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "recover_processing_control_prefix_v1",
+        recover,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "prepare_final_encoding_reservation_v1",
+        prepare,
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "_encoding_manifest_extent_authority",
+        staticmethod(lambda _reservation: Mock()),
+    )
+    monkeypatch.setattr(VideoEncoder, "_stage_encoding_manifest_file", stage)
+
+    context = VideoEncoder()._prepare_schema5_publication_context(
+        provider=provider,
+        output_dir=job,
+        settings=_direct_settings(),
+    )
+
+    assert context.staged_manifest is staged
+
+
+def _manifest_extent_authority_fixture(
+    job: Path,
+    source: Path,
+):
+    from src.depth_surge_3d.io.file_identity import (
+        capture_directory_identity,
+        capture_file_identity,
+    )
+    from src.depth_surge_3d.processing.video.video_encoder import (
+        _EncodingManifestExtentAuthority,
+    )
+
+    return _EncodingManifestExtentAuthority(
+        job_root=job,
+        job_root_identity=capture_directory_identity(job),
+        source_path=source,
+        source_parent_identity=capture_directory_identity(source.parent),
+        source_identity=capture_file_identity(source),
+        payload_raw_max=4096,
+        logical_byte_count=8192,
+        indexed_source=True,
+    )
+
+
+def test_indexed_manifest_recovery_rejects_source_symlink_before_read(
+    tmp_path: Path,
+) -> None:
+    from src.depth_surge_3d.io.reservation_protocol import ReservationConflictError
+
+    job = tmp_path / "job"
+    job.mkdir()
+    source = job / "manifest.reserved"
+    source.write_bytes(b"original")
+    authority = _manifest_extent_authority_fixture(job, source)
+    victim = job / "victim.bin"
+    victim.write_bytes(b"victim-must-not-be-read")
+    source.unlink()
+    try:
+        source.symlink_to(victim)
+    except OSError as error:
+        pytest.skip(f"symlink creation is unavailable: {error}")
+
+    with pytest.raises(ReservationConflictError, match="without following"):
+        VideoEncoder._recover_encoding_manifest_source(
+            authority,
+            expected_frame_count=1,
+        )
+
+    assert victim.read_bytes() == b"victim-must-not-be-read"
+
+
+def test_indexed_manifest_staging_rejects_ordinary_source_replacement_before_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.io.reservation_protocol import ReservationConflictError
+
+    job = tmp_path / "job"
+    job.mkdir()
+    source = job / "manifest.reserved"
+    source.write_bytes(b"original")
+    authority = _manifest_extent_authority_fixture(job, source)
+    source.unlink()
+    source.write_bytes(b"replacement-must-not-be-written")
+    stage = Mock()
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "stage_encoding_input_manifest",
+        stage,
+    )
+
+    with pytest.raises(ReservationConflictError, match="identity changed"):
+        VideoEncoder()._stage_encoding_manifest_file(
+            provider=Mock(frame_count=1),
+            output_dir=job,
+            settings=_direct_settings(),
+            reservation=Mock(),
+            authority=authority,
+        )
+
+    stage.assert_not_called()
+    assert source.read_bytes() == b"replacement-must-not-be-written"
+
+
+def test_schema5_manifest_audit_releases_settings_and_prepared_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.processing.video.encoding_provider import (
+        EncodingSequenceProvider,
+    )
+
+    job = tmp_path / "job"
+    job.mkdir()
+    active_index = (
+        job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
+    )
+    active_index.parent.mkdir()
+    active_index.write_bytes(b"active")
+    provider = EncodingSequenceProvider.freeze(
+        mode="assembled_vr",
+        frame_count=1,
+        first_index=0,
+        frames_parent=PurePosixPath("99_vr_frames"),
+    )
+    references: dict[str, weakref.ReferenceType[object]] = {}
+
+    class Artifact:
+        def to_object(self):
+            return {
+                "metadata": {"final_media_publication_generation": "44" * 16},
+                "video_properties": {"frame_count": 1, "fps": 24.0},
+                "processing_settings": {"target_fps": None, "source_fps": 24.0},
+                "output_info": {"expected_final_relative_path": "result.mp4"},
+            }
+
+    class Index:
+        fingerprint = "11" * 32
+        publication_generation = "44" * 16
+        sibling_video_temporary_relative_path = ".old.tmp.mp4"
+        final_video_relative_path = "result.mp4"
+
+    class Reservation:
+        job_root = job
+        index = Index()
+        input_manifest_transaction = None
+        sibling_path = job / ".old.tmp.mp4"
+
+        @staticmethod
+        def recover_publication_prefix():
+            return Mock(phase="ready_pre_video")
+
+        @staticmethod
+        def reset_incomplete_manifest_sources():
+            return None
+
+    def recover(_root):
+        return Artifact()
+
+    def load(_root, settings):
+        reservation = Reservation()
+        references["settings"] = weakref.ref(settings)
+        references["reservation"] = weakref.ref(reservation)
+        return reservation
+
+    source = Mock(
+        fingerprint="a" * 64,
+        raw_sha256="b" * 64,
+        raw_byte_count=10,
+    )
+    staged = Mock()
+
+    def audit(*_args, **_kwargs):
+        gc.collect()
+        assert references["settings"]() is None
+        assert references["reservation"]() is None
+        return staged
+
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "recover_processing_control_prefix_v1",
+        recover,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "load_final_encoding_reservation_v1",
+        load,
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "_recover_encoding_manifest_source",
+        lambda *_args, **_kwargs: source,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "audit_encoding_input_manifest",
+        audit,
+    )
+
+    context = VideoEncoder()._prepare_schema5_publication_context(
+        provider=provider,
+        output_dir=job,
+        settings=_direct_settings(),
+    )
+
+    assert context.staged_manifest is staged
+
+
+def test_schema5_assembled_launch_uses_provider_path_and_one_final_launch_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.processing.video.encoding_provider import (
+        EncodingSequenceProvider,
+    )
+
+    job = tmp_path / "job"
+    job.mkdir()
+    caller_path = tmp_path / "caller_alias"
+    sibling = job / ".depth-surge-final-v4-fixture.tmp.mp4"
+    provider = EncodingSequenceProvider.freeze(
+        mode="assembled_vr",
+        frame_count=1,
+        first_index=7,
+        frames_parent=PurePosixPath("99_vr_frames"),
+    )
+    staged = Mock(provider_audit=Mock())
+    events: list[str] = []
+    reservation = Mock()
+    reservation.commit_producer_settings.side_effect = lambda: (
+        events.append("commit") or Mock()
+    )
+    context = Mock(
+        already_authenticated=False,
+        reservation=reservation,
+        staged_manifest=staged,
+        manifest_source=Mock(),
+        sibling_path=sibling,
+        expected_relative_path="result.mp4",
+        provider=provider,
+        settings=Mock(),
+    )
+    selected_audio = Mock(audio_end_sample=None)
+    selected_audio.input_arguments.return_value = []
+    selected_audio.output_arguments.return_value = []
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "recover_processing_control_prefix_v1",
+        lambda _root: Mock(),
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "_prepare_schema5_assembled_context",
+        lambda *_args, **_kwargs: context,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.prepare_selected_audio_v1",
+        lambda **_kwargs: events.append("audio") or selected_audio,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.validate_encoding_provider",
+        lambda *_args, **_kwargs: events.append("validate"),
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.audit_encoding_input_manifest",
+        lambda *_args, **_kwargs: events.append("content") or staged,
+    )
+    launches: list[list[str]] = []
+
+    def fail_launch(self, command, total_frames, progress_tracker=None):
+        events.append("launch")
+        launches.append(command)
+        return 1, ()
+
+    monkeypatch.setattr(VideoEncoder, "_run_schema5_ffmpeg_with_progress", fail_launch)
+
+    assert not VideoEncoder().create_video(
+        caller_path,
+        job,
+        str(tmp_path / "source.mp4"),
+        {
+            "preserve_audio": False,
+            "video_encoder": "libx264",
+            "vr_format": "side_by_side",
+            "vr_resolution": "custom",
+            "per_eye_width": 4,
+            "per_eye_height": 4,
+        },
+    )
+
+    assert events == ["audio", "commit", "validate", "content", "launch"]
+    input_index = launches[0].index("-i") + 1
+    assert launches[0][input_index] == str(job / "99_vr_frames" / "frame_%06d.png")
+
+
+def test_schema5_direct_launch_commits_producer_after_all_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.processing.frames.vr_assembler import DirectStereoSource
+
+    job = tmp_path / "job"
+    left = job / "left"
+    right = job / "right"
+    left.mkdir(parents=True)
+    right.mkdir()
+    sibling = job / ".depth-surge-final-v4-fixture.tmp.mp4"
+    events: list[str] = []
+    reservation = Mock()
+    reservation.commit_producer_settings.side_effect = lambda: (
+        events.append("commit") or Mock()
+    )
+    staged = Mock(provider_audit=Mock(), first_headers=((6, 4), (6, 4)))
+    context = Mock(
+        already_authenticated=False,
+        reservation=reservation,
+        staged_manifest=staged,
+        manifest_source=Mock(),
+        sibling_path=sibling,
+        expected_relative_path="result.mp4",
+        settings=Mock(),
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "recover_processing_control_prefix_v1",
+        lambda _root: Mock(),
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "_prepare_schema5_direct_provider_context",
+        lambda *_args, **_kwargs: context,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.prepare_selected_audio_v1",
+        lambda **_kwargs: events.append("audio") or Mock(),
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "_build_schema5_direct_provider_command",
+        lambda *_args, **_kwargs: events.append("command") or ["ffmpeg", str(sibling)],
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.validate_encoding_provider",
+        lambda *_args, **_kwargs: events.append("validate"),
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.audit_encoding_input_manifest",
+        lambda *_args, **_kwargs: events.append("content") or staged,
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "_run_schema5_ffmpeg_with_progress",
+        lambda *_args, **_kwargs: events.append("launch") or (1, ()),
+    )
+
+    assert not VideoEncoder().create_video_from_stereo_source(
+        DirectStereoSource(left, right, 1, 1),
+        job,
+        str(tmp_path / "source.mp4"),
+        _direct_settings(),
+        total_frames=1,
+    )
+
+    assert events == ["audio", "command", "commit", "validate", "content", "launch"]
+
+
+def test_schema5_launch_boundary_rehashes_images_after_producer_commit(
+    tmp_path: Path,
+) -> None:
+    from src.depth_surge_3d.processing.video.encoding_provider import (
+        EncodingProviderChangedError,
+        EncodingSequenceProvider,
+        stage_encoding_input_manifest,
+    )
+
+    job = tmp_path / "job"
+    frames = job / "99_vr_frames"
+    frames.mkdir(parents=True)
+    frame = frames / "frame_000000.png"
+    assert cv2.imwrite(str(frame), np.zeros((4, 8, 3), np.uint8))
+    provider = EncodingSequenceProvider.freeze(
+        mode="assembled_vr",
+        frame_count=1,
+        first_index=0,
+        frames_parent=PurePosixPath("99_vr_frames"),
+    )
+    staged = stage_encoding_input_manifest(
+        provider,
+        job_root=job,
+        sink=io.BytesIO(),
+        per_eye_size=(4, 4),
+        vr_format="side_by_side",
+    )
+    reservation = Mock()
+
+    def commit_then_change():
+        assert cv2.imwrite(str(frame), np.ones((4, 8, 3), np.uint8))
+        return Mock()
+
+    reservation.commit_producer_settings.side_effect = commit_then_change
+    context = Mock(
+        provider=provider,
+        staged_manifest=staged,
+        reservation=reservation,
+    )
+
+    with pytest.raises(EncodingProviderChangedError, match="changed"):
+        VideoEncoder._commit_schema5_launch_boundary(
+            context,
+            job_root=job,
+            settings={
+                "per_eye_width": 4,
+                "per_eye_height": 4,
+                "vr_format": "side_by_side",
+            },
+        )
+
+    reservation.discard_prelaunch_invocation.assert_called_once_with()
+
+
+def test_schema5_rejects_the_eager_sequence_api_before_path_list_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "processing-settings-v5.json").write_bytes(b"schema-5-marker")
+    encoder = VideoEncoder()
+    validate = Mock(
+        side_effect=AssertionError("schema-5 entered eager Path-list validation")
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "recover_processing_control_prefix_v1",
+        lambda _root: Mock(),
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+        lambda: True,
+    )
+    monkeypatch.setattr(encoder, "_validate_direct_stereo_sequence", validate)
+
+    assert not encoder.create_video_from_stereo_sequences(
+        [job / "left" / "frame_000001.png"],
+        [job / "right" / "frame_000001.png"],
+        job,
+        str(tmp_path / "source.mp4"),
+        _direct_settings(),
+        total_frames=1,
+    )
+
+    validate.assert_not_called()
 
 
 def test_schema5_failed_encode_keeps_reservation_available_for_terminal_retirement(
@@ -1353,7 +2113,9 @@ def test_schema5_manifest_staging_failure_keeps_new_reservation_for_terminal_ret
     monkeypatch.setattr(
         VideoEncoder,
         "_stage_encoding_manifest_file",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("forced staging failure")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("forced staging failure")
+        ),
     )
 
     encoder = VideoEncoder(defer_final_reservation_retirement=True)
@@ -1405,11 +2167,13 @@ def test_schema5_incomplete_reservation_stays_retryable_instead_of_becoming_fail
         )
 
 
-def test_schema5_direct_encode_uses_provider_and_same_publication_contract(tmp_path, monkeypatch):
+def test_schema5_direct_encode_uses_provider_and_same_publication_contract(
+    tmp_path, monkeypatch
+):
     from src.depth_surge_3d.core.settings import validate_settings
     from src.depth_surge_3d.io.operations import save_processing_settings
     from src.depth_surge_3d.io.settings_artifact import ProcessingSettingsArtifactV5
-    from src.depth_surge_3d.processing.video.final_publication import audit_final_media_v1
+    from src.depth_surge_3d.processing.frames.vr_assembler import DirectStereoSource
 
     source = tmp_path / "source.mp4"
     source.write_bytes(b"source")
@@ -1428,6 +2192,7 @@ def test_schema5_direct_encode_uses_provider_and_same_publication_contract(tmp_p
             "preserve_audio": False,
             "direct_vr_encode": True,
             "video_encoder": "libx264",
+            "target_fps": "original",
             "vr_resolution": "custom:4x4",
             "per_eye_width": 4,
             "per_eye_height": 4,
@@ -1463,13 +2228,14 @@ def test_schema5_direct_encode_uses_provider_and_same_publication_contract(tmp_p
         "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
         lambda: True,
     )
-    monkeypatch.setattr(VideoEncoder, "_run_schema5_ffmpeg_with_progress", fake_progress)
+    monkeypatch.setattr(
+        VideoEncoder, "_run_schema5_ffmpeg_with_progress", fake_progress
+    )
     monkeypatch.setattr(VideoEncoder, "_validate_final_container", lambda *_args: True)
 
     encoder = VideoEncoder()
-    assert encoder.create_video_from_stereo_sequences(
-        [left],
-        [right],
+    assert encoder.create_video_from_stereo_source(
+        DirectStereoSource(left_dir, right_dir, 1, 1),
         job,
         str(source),
         settings,
@@ -1478,9 +2244,209 @@ def test_schema5_direct_encode_uses_provider_and_same_publication_contract(tmp_p
     artifact = ProcessingSettingsArtifactV5.parse(settings_file.read_bytes())
     expected = artifact.to_object()["output_info"]["expected_final_relative_path"]
     assert (job / expected).read_bytes() == b"validated-direct-mp4"
-    assert audit_final_media_v1(job, artifact).final_video_authenticated is True
     assert encoder.pending_final_encoding_reservation is not None
-    assert (job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json").is_file()
+    encoder.pending_final_encoding_reservation.validate_authenticated_publication(
+        container_validator=lambda _path: True
+    )
+    assert (
+        job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
+    ).is_file()
+
+
+def test_schema5_direct_provider_revalidates_immediately_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.processing.frames.vr_assembler import DirectStereoSource
+
+    job = tmp_path / "job"
+    left = job / "left"
+    right = job / "right"
+    left.mkdir(parents=True)
+    right.mkdir()
+    sibling = job / ".depth-surge-final-v4-fixture.tmp.mp4"
+    reservation = Mock()
+    staged = Mock(provider_audit=Mock())
+    context = Mock(
+        already_authenticated=False,
+        reservation=reservation,
+        staged_manifest=staged,
+        manifest_source=Mock(),
+        sibling_path=sibling,
+    )
+    encoder = VideoEncoder()
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "recover_processing_control_prefix_v1",
+        lambda _root: Mock(),
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.get_video_info_ffprobe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("schema-5 direct encoding reprobed source FPS")
+        ),
+    )
+    monkeypatch.setattr(
+        encoder,
+        "_prepare_schema5_direct_provider_context",
+        lambda **_kwargs: context,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.prepare_selected_audio_v1",
+        lambda **_kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        encoder,
+        "_build_schema5_direct_provider_command",
+        lambda *_args: ["ffmpeg", str(sibling)],
+    )
+    validate = Mock(side_effect=RuntimeError("provider replay changed"))
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.validate_encoding_provider",
+        validate,
+    )
+    launch = Mock(side_effect=AssertionError("FFmpeg launch crossed provider gate"))
+    monkeypatch.setattr(encoder, "_run_schema5_ffmpeg_with_progress", launch)
+
+    assert not encoder.create_video_from_stereo_source(
+        DirectStereoSource(left, right, 1, 1),
+        job,
+        str(tmp_path / "source.mp4"),
+        _direct_settings(),
+        total_frames=1,
+    )
+
+    validate.assert_called_once()
+    assert validate.call_args.kwargs == {
+        "launch_started": False,
+        "cancelled": None,
+    }
+    launch.assert_not_called()
+    reservation.discard_nonsemantic_sibling.assert_called_once_with()
+
+
+def test_schema5_direct_provider_preserves_unowned_sibling_occupant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.processing.frames.vr_assembler import DirectStereoSource
+
+    job = tmp_path / "job"
+    left = job / "left"
+    right = job / "right"
+    left.mkdir(parents=True)
+    right.mkdir()
+    sibling = job / ".depth-surge-final-v4-fixture.tmp.mp4"
+    sibling.write_bytes(b"unowned-occupant")
+    reservation = Mock()
+    context = Mock(
+        already_authenticated=False,
+        reservation=reservation,
+        staged_manifest=Mock(provider_audit=Mock()),
+        manifest_source=Mock(),
+        sibling_path=sibling,
+    )
+    encoder = VideoEncoder()
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "recover_processing_control_prefix_v1",
+        lambda _root: Mock(),
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        encoder,
+        "_prepare_schema5_direct_provider_context",
+        lambda **_kwargs: context,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.prepare_selected_audio_v1",
+        lambda **_kwargs: Mock(),
+    )
+    launch = Mock(side_effect=AssertionError("FFmpeg launched with sibling collision"))
+    monkeypatch.setattr(encoder, "_run_schema5_ffmpeg_with_progress", launch)
+
+    assert not encoder.create_video_from_stereo_source(
+        DirectStereoSource(left, right, 1, 1),
+        job,
+        str(tmp_path / "source.mp4"),
+        _direct_settings(),
+        total_frames=1,
+    )
+
+    assert sibling.read_bytes() == b"unowned-occupant"
+    launch.assert_not_called()
+
+
+def test_direct_source_recovers_schema5_before_any_legacy_path_materialization(
+    tmp_path,
+    monkeypatch,
+):
+    from src.depth_surge_3d.processing.frames.vr_assembler import DirectStereoSource
+
+    job = tmp_path / "job"
+    left = job / "left"
+    right = job / "right"
+    left.mkdir(parents=True)
+    right.mkdir()
+    encoder = VideoEncoder()
+    context = Mock(already_authenticated=True, reservation=Mock())
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "recover_processing_control_prefix_v1",
+        lambda _root: Mock(),
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        encoder,
+        "_prepare_schema5_direct_provider_context",
+        lambda **_kwargs: context,
+    )
+    monkeypatch.setattr(
+        encoder,
+        "create_video_from_stereo_sequences",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("schema-5 recovery entered the legacy Path-list API")
+        ),
+    )
+
+    assert encoder.create_video_from_stereo_source(
+        DirectStereoSource(left, right, 1, 4_194_304),
+        job,
+        str(tmp_path / "source.mp4"),
+        {},
+        total_frames=4_194_304,
+    )
+
+
+def test_maximum_encoding_manifest_bound_is_a_disk_extent_not_a_resident_cap() -> None:
+    from pathlib import PurePosixPath
+
+    from src.depth_surge_3d.processing.video.encoding_provider import (
+        EncodingSequenceProvider,
+    )
+
+    provider = EncodingSequenceProvider.freeze(
+        mode="direct_stereo",
+        frame_count=4_194_304,
+        first_index=1,
+        left_parent=PurePosixPath("07_left_upscaled"),
+        right_parent=PurePosixPath("07_right_upscaled"),
+    )
+
+    raw_bound = VideoEncoder._encoding_manifest_raw_bound(provider)
+
+    assert raw_bound > 512 * 1024 * 1024
+    assert raw_bound < 1 << 64
 
 
 @pytest.mark.parametrize(
@@ -1500,7 +2466,6 @@ def test_schema5_post_boundary_restart_reencodes_without_rewriting_input_manifes
     from src.depth_surge_3d.processing.video.final_publication import (
         FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
         FinalPublicationTransactionV4,
-        audit_final_media_v1,
     )
 
     source = tmp_path / "source.mp4"
@@ -1551,7 +2516,9 @@ def test_schema5_post_boundary_restart_reencodes_without_rewriting_input_manifes
         "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
         lambda: True,
     )
-    monkeypatch.setattr(VideoEncoder, "_run_schema5_ffmpeg_with_progress", fake_bounded_run)
+    monkeypatch.setattr(
+        VideoEncoder, "_run_schema5_ffmpeg_with_progress", fake_bounded_run
+    )
     monkeypatch.setattr(VideoEncoder, "_validate_final_container", lambda *_args: True)
     original_publish = FinalPublicationTransactionV4.publish
 
@@ -1570,13 +2537,18 @@ def test_schema5_post_boundary_restart_reencodes_without_rewriting_input_manifes
     assert (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).is_file()
 
     monkeypatch.setattr(FinalPublicationTransactionV4, "publish", original_publish)
-    assert VideoEncoder().create_video(frames, job, str(source), settings)
+    resumed_encoder = VideoEncoder()
+    assert resumed_encoder.create_video(frames, job, str(source), settings)
 
     artifact = ProcessingSettingsArtifactV5.parse(settings_file.read_bytes())
+    assert artifact.status == "in_progress"
     assert launches == expected_launches
     if committed_input is not None:
         assert (job / "encoding_input_manifest.json").read_bytes() == committed_input
-    assert audit_final_media_v1(job, artifact).final_video_authenticated is True
+    assert resumed_encoder.pending_final_encoding_reservation is not None
+    resumed_encoder.pending_final_encoding_reservation.validate_authenticated_publication(
+        container_validator=lambda _path: True
+    )
     assert (job / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).is_file()
 
 

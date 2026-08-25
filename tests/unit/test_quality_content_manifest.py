@@ -12,6 +12,12 @@ import pytest
 
 from src.depth_surge_3d.io import content_manifest as content_reader
 from src.depth_surge_3d.io import metric_npz
+from src.depth_surge_3d.processing.frames.stereo_input_manifest import (
+    publish_stereo_input_manifest_v1,
+)
+from src.depth_surge_3d.rendering.quality.diagnostic_transaction import (
+    project_quality_input_manifest,
+)
 
 
 def _payload(path: Path, scale: float = 1.0) -> None:
@@ -57,6 +63,116 @@ def test_relative_quality_input_manifest_hashes_complete_png_content(
         allow_nan=False,
     ).encode("ascii")
     assert result.raw_sha256 == hashlib.sha256(result.raw).hexdigest()
+
+    geometry_identity = {
+        "geometry_mode": "relative",
+        "relative_encoding_scale_float32_bits": result.payload[
+            "relative_encoding_scale_float32_bits"
+        ],
+        "geometry": result.payload["geometry"],
+    }
+    def canonical(value):
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    assert result.payload["native_geometry_fingerprint"] == hashlib.sha256(
+        canonical(geometry_identity)
+    ).hexdigest()
+    assert result.payload["native_geometry_fingerprint"] != hashlib.sha256(
+        canonical({**geometry_identity, "geometry_mode": "metric"})
+    ).hexdigest()
+    assert result.payload["native_geometry_fingerprint"] != hashlib.sha256(
+        canonical(
+            {
+                **geometry_identity,
+                "relative_encoding_scale_float32_bits": "3f800000",
+            }
+        )
+    ).hexdigest()
+
+
+def test_quality_manifest_streams_directly_from_durable_upstream_records(tmp_path: Path) -> None:
+    guide_dir = tmp_path / "00_original_frames"
+    geometry_dir = tmp_path / "03_depth_canonical"
+    guide_dir.mkdir()
+    geometry_dir.mkdir()
+    guide = guide_dir / "frame_000001.png"
+    geometry = geometry_dir / "frame_000001.png"
+    assert cv2.imwrite(str(guide), np.full((3, 5, 3), 17, dtype=np.uint8))
+    assert cv2.imwrite(str(geometry), np.full((2, 4), 32768, dtype=np.uint16))
+    upstream = publish_stereo_input_manifest_v1(
+        manifest_path=geometry_dir / "stereo_input_manifest.jsonl",
+        job_root=tmp_path,
+        guide_files=[guide],
+        geometry_files=[geometry],
+        frame_count=1,
+        geometry_mode="relative",
+        source_metadata={"fingerprint": "ab" * 32, "encoding_scale": 65535.0},
+    )
+
+    result = content_reader.build_streamed_quality_input_manifest(upstream)
+    output = tmp_path / "04_stereo_diagnostics" / "quality_input_manifest.json"
+    result.publish(output)
+    projection = project_quality_input_manifest(output)
+    payload = json.loads(output.read_text(encoding="ascii"))
+    legacy = content_reader.build_quality_input_manifest(
+        job_root=tmp_path,
+        frame_files=[guide],
+        geometry_files=[geometry],
+        geometry_mode="relative",
+        relative_encoding_scale=np.float32(65535.0),
+        metric_native_shape=None,
+    )
+
+    assert payload["frame_names"] == ["frame_000001"]
+    assert payload["guides"][0]["sha256"] == hashlib.sha256(guide.read_bytes()).hexdigest()
+    assert payload["geometry"][0]["sha256"] == hashlib.sha256(
+        geometry.read_bytes()
+    ).hexdigest()
+    assert result.raw_sha256 == hashlib.sha256(output.read_bytes()).hexdigest()
+    assert output.read_bytes() == legacy.raw
+    assert not hasattr(result, "payload")
+    assert projection.raw_sha256 == result.raw_sha256
+    assert tuple(projection.iter_frame_names()) == ("frame_000001",)
+
+
+def test_quality_projection_rejects_the_first_frame_over_control_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    guide_dir = tmp_path / "00_original_frames"
+    geometry_dir = tmp_path / "03_depth_canonical"
+    guide_dir.mkdir()
+    geometry_dir.mkdir()
+    guides = []
+    geometry = []
+    for index in range(2):
+        guide = guide_dir / f"frame_{index:06d}.png"
+        depth = geometry_dir / f"frame_{index:06d}.png"
+        assert cv2.imwrite(str(guide), np.full((3, 5, 3), 17, dtype=np.uint8))
+        assert cv2.imwrite(str(depth), np.full((2, 4), 32768, dtype=np.uint16))
+        guides.append(guide)
+        geometry.append(depth)
+    result = content_reader.build_quality_input_manifest(
+        job_root=tmp_path,
+        frame_files=guides,
+        geometry_files=geometry,
+        geometry_mode="relative",
+        relative_encoding_scale=np.float32(65535.0),
+        metric_native_shape=None,
+    )
+    path = tmp_path / "quality_input_manifest.json"
+    path.write_bytes(result.raw)
+    monkeypatch.setattr(diagnostic_transaction, "STEREO_CONTROL_FRAME_CAP", 1)
+
+    with pytest.raises(diagnostic_transaction.StereoControlBudgetError, match="control cap"):
+        diagnostic_transaction.project_quality_input_manifest(path)
 
 
 def test_metric_quality_input_manifest_uses_closed_npz_identity(tmp_path: Path) -> None:

@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
-import os
 from pathlib import Path
 import struct
 from typing import Any, Iterable, Iterator, Literal, Sequence
@@ -14,6 +13,12 @@ import numpy as np
 
 from ..core.resource_errors import QualityHostBudgetError
 from . import metric_npz
+from .durable_publish import OwnedSiblingTemporary
+from .nofollow_io import AcquiredRoot, open_regular_beneath
+from .streamed_canonical_json import (
+    StreamedCanonicalObject,
+    build_streamed_canonical_object_arrays,
+)
 
 
 QUALITY_CONTENT_STREAM_BYTES = metric_npz.METRIC_NPZ_WRITE_STREAM_BYTES
@@ -125,6 +130,7 @@ def audit_metric_payload(
     *,
     expected_shape: tuple[int, int],
     allocator=_default_allocator,
+    job_root: Path | None = None,
 ) -> OwnedMetricAuditFrame:
     """Audit one regular payload without ``zipfile``, ``np.load``, or a copy constructor."""
 
@@ -135,6 +141,7 @@ def audit_metric_payload(
             path,
             expected_shape=expected_shape,
             allocator=allocator,
+            job_root=job_root,
         )
     except metric_npz.MetricNpzAllocationError as error:
         raise QualityHostBudgetError(
@@ -208,6 +215,112 @@ class QualityInputManifestResult:
     raw_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class StreamedQualityInputManifest:
+    """Scalar identity plus a replayable canonical Quality content manifest."""
+
+    document: StreamedCanonicalObject
+    source_guide_fingerprint: str
+    native_geometry_fingerprint: str
+
+    @property
+    def raw_sha256(self) -> str:
+        return self.document.raw_sha256
+
+    @property
+    def raw_byte_count(self) -> int:
+        return self.document.raw_byte_count
+
+    @property
+    def fingerprint(self) -> str:
+        assert self.document.fingerprint is not None
+        return self.document.fingerprint
+
+    def publish(self, path: Path) -> None:
+        self.document.publish(path)
+
+    def matches(self, path: Path, *, acquired: AcquiredRoot | None = None) -> bool:
+        return self.document.matches(path, acquired=acquired)
+
+
+def build_streamed_quality_input_manifest(
+    manifest: Any,
+    *,
+    validate_payloads: bool = True,
+) -> StreamedQualityInputManifest:
+    """Freeze declared identities, optionally after the bounded semantic audit."""
+
+    from ..processing.frames.stereo_input_manifest import StereoInputManifestV1
+
+    if not isinstance(manifest, StereoInputManifestV1):
+        raise TypeError("Quality content requires a stereo input manifest descriptor")
+
+    if not isinstance(validate_payloads, bool):
+        raise TypeError("validate_payloads must be boolean")
+    if validate_payloads:
+        audited_count = 0
+        for record in manifest.replay_records():
+            if record.source_index != audited_count:
+                raise ValueError("Quality input manifest source order changed")
+            audited_count += 1
+        if audited_count != manifest.frame_count:
+            raise ValueError("Quality input manifest ended before its declared count")
+
+    def frame_names():
+        for record in manifest.replay_declared_records():
+            yield record.frame_name
+
+    def guides():
+        for record in manifest.replay_declared_records():
+            yield record.guide_identity
+
+    def geometry():
+        for record in manifest.replay_declared_records():
+            yield record.geometry_identity
+
+    def array_fingerprint(replay: Any) -> str:
+        digest = hashlib.sha256()
+        digest.update(b"[")
+        for index, identity in enumerate(replay()):
+            if index:
+                digest.update(b",")
+            digest.update(_canonical_json_bytes(identity))
+        digest.update(b"]")
+        return digest.hexdigest()
+
+    source_guide_fingerprint = array_fingerprint(guides)
+
+    scale_bits = manifest.relative_encoding_scale_float32_bits
+    native_geometry_fingerprint = build_streamed_canonical_object_arrays(
+        static_fields={
+            "geometry_mode": manifest.geometry_mode,
+            "relative_encoding_scale_float32_bits": scale_bits,
+        },
+        array_items={"geometry": geometry},
+    ).raw_sha256
+    document = build_streamed_canonical_object_arrays(
+        static_fields={
+            "algorithm_version": "quality-input-content-v4",
+            "geometry_mode": manifest.geometry_mode,
+            "native_geometry_fingerprint": native_geometry_fingerprint,
+            "relative_encoding_scale_float32_bits": scale_bits,
+            "schema_version": 1,
+            "source_guide_fingerprint": source_guide_fingerprint,
+        },
+        array_items={
+            "frame_names": frame_names,
+            "geometry": geometry,
+            "guides": guides,
+        },
+        fingerprint_key="fingerprint",
+    )
+    return StreamedQualityInputManifest(
+        document=document,
+        source_guide_fingerprint=source_guide_fingerprint,
+        native_geometry_fingerprint=native_geometry_fingerprint,
+    )
+
+
 def _canonical_json_bytes(value: object) -> bytes:
     return json.dumps(
         value,
@@ -230,16 +343,12 @@ def _contained_relative_path(root: Path, path: Path) -> str:
     return relative.as_posix()
 
 
-def _hash_regular_file(path: Path) -> tuple[str, int, bytes]:
-    if path.is_symlink():
-        raise ValueError(f"Quality input cannot be a symlink: {path}")
+def _hash_regular_file(root: Path, path: Path) -> tuple[str, int, bytes]:
     digest = hashlib.sha256()
     header = bytearray()
     total = 0
     workspace = bytearray(_CONTENT_READ_BYTES)
-    with path.open("rb", buffering=0) as handle:
-        if not os.path.isfile(path):
-            raise ValueError(f"Quality input must be a regular file: {path}")
+    with open_regular_beneath(root, path) as handle:
         view = memoryview(workspace)
         while True:
             count = handle.readinto(workspace)
@@ -282,7 +391,7 @@ def _png_identity(
     expected_bit_depth: int,
     expected_color_type: int,
 ) -> dict[str, Any]:
-    sha256, byte_count, raw_header = _hash_regular_file(path)
+    sha256, byte_count, raw_header = _hash_regular_file(root, path)
     header = _png_header(raw_header)
     if header["bit_depth"] != expected_bit_depth or header["color_type"] != expected_color_type:
         raise ValueError(f"Quality input PNG format is invalid: {path}")
@@ -355,6 +464,7 @@ def build_quality_input_manifest(  # noqa: C901
             with audit_metric_payload(
                 geometry_path,
                 expected_shape=metric_native_shape,
+                job_root=root,
             ) as audited:
                 metric_identity = audited.identity()
                 if geometry_path.name != f"{frame_name}.npz":
@@ -392,7 +502,15 @@ def build_quality_input_manifest(  # noqa: C901
             raise ValueError("Metric Quality inputs cannot carry relative encoding scale")
         scale_bits = None
     source_guide_fingerprint = hashlib.sha256(_canonical_json_bytes(guides)).hexdigest()
-    native_geometry_fingerprint = hashlib.sha256(_canonical_json_bytes(geometry)).hexdigest()
+    native_geometry_fingerprint = hashlib.sha256(
+        _canonical_json_bytes(
+            {
+                "geometry_mode": geometry_mode,
+                "relative_encoding_scale_float32_bits": scale_bits,
+                "geometry": geometry,
+            }
+        )
+    ).hexdigest()
     payload: dict[str, Any] = {
         "schema_version": 1,
         "algorithm_version": "quality-input-content-v4",
@@ -423,21 +541,11 @@ def publish_quality_input_manifest(
         raise TypeError("result must be QualityInputManifestResult")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
+    owned = OwnedSiblingTemporary.create(path)
     try:
-        with temporary.open("xb") as handle:
-            handle.write(result.raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        if os.name != "nt":
-            descriptor = os.open(
-                path.parent,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-            )
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
+        if owned.handle.write(result.raw) != len(result.raw):
+            raise OSError("short Quality input manifest write")
+        owned.sync()
+        owned.replace()
     finally:
-        temporary.unlink(missing_ok=True)
+        owned.cleanup()

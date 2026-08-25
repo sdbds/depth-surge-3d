@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+import os
 import secrets
 import shutil
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Callable, Iterable, Iterator, Literal, cast
 
 from ..core.settings import (
     parse_saved_processing_settings,
@@ -58,9 +61,16 @@ from .reservation_protocol import (
     platform_allocation_adapter,
     platform_allocation_counter,
     recover_settings_job_v1,
+    publish_write_ahead_intent,
+    recover_control_artifact_pair_v1,
+    _read_bounded_regular_file,
+    _unlink_exact_control_artifact,
 )
+from .canonical_json import canonical_json_bytes, strict_canonical_json_loads
+from .nofollow_io import AcquiredRoot, NoFollowPathError
 from .settings_artifact import (
     ProcessingSettingsArtifactV5,
+    SETTINGS_ARTIFACT_MAX_RAW_BYTES,
     migrate_processing_settings_artifact_v5,
 )
 from ..processing.frames.metric_geometry import MetricGeometryStore
@@ -73,7 +83,11 @@ from ..processing.frames.source_frame_manifest import (
     source_frame_manifest_mismatch_reason,
 )
 from ..processing.frames.stage_manifest import FRAME_STAGE_SCHEMA_VERSION
-from ..utils.imaging.png_header import png_header_matches, read_png_header
+from ..utils.imaging.png_header import (
+    png_header_bytes_match,
+    png_header_matches,
+    read_png_header,
+)
 from ..processing.frames.stereo_generator import (
     METRIC_PROJECTION_ALGORITHM_VERSION,
     STEREO_STAGE_ALGORITHM_VERSION,
@@ -84,11 +98,18 @@ from ..utils.imaging.image_processing import (
     CENTER_CROP_ALGORITHM_VERSION,
     calculate_center_crop_dimensions,
 )
+from ..rendering.stereo_geometry import MetricProjectionStats
 from ..utils.path_utils import calculate_frame_range
 
 
 Disposition = Literal["preserve", "resume", "invalidate", "missing"]
 MigrationMode = Literal["archive", "delete"]
+
+LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH = Path(
+    ".depth-surge-legacy-fast-adoption-v1.json"
+)
+LEGACY_FAST_ADOPTION_INTENT_MAX_RAW_BYTES = 4096
+_HEX64 = frozenset("0123456789abcdef")
 
 _STEREO_SETTING_KEYS = ("stereo_strength", "convergence", "occlusion_fill")
 _DISTORTION_SETTING_KEYS = (
@@ -134,6 +155,220 @@ class ResumeStage:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class LegacyFastAdoptionV1:
+    """Read-only proof for adopting one intact pre-schema-5 Fast RGB stage."""
+
+    job_root: Path
+    source_settings_schema_version: int
+    settings_fingerprint: str
+    frame_count: int
+    render_shape: tuple[int, int]
+    geometry_mode: Literal["relative", "metric"]
+    occlusion_fill: Literal["none", "background"]
+    rgb_stage_fingerprint: str
+    source_guide_fingerprint: str
+    stage_metadata_sha256: str
+    payload_sequence_sha256: str
+    metric_clamp_summary_sha256: str | None
+    metric_clamp_evidence_sha256: str | None
+    metric_valid_pixel_count: int | None
+    metric_clamped_pixel_count: int | None
+    metric_affected_frame_count: int | None
+    metric_mean_clamped_fraction: float | None
+    metric_max_clamped_fraction: float | None
+
+
+_LEGACY_FAST_ADOPTION_INTENT_KEYS = frozenset(
+    {
+        "frame_count",
+        "geometry_mode",
+        "metric_affected_frame_count",
+        "metric_clamp_evidence_sha256",
+        "metric_clamp_summary_sha256",
+        "metric_clamped_pixel_count",
+        "metric_max_clamped_fraction",
+        "metric_mean_clamped_fraction",
+        "metric_valid_pixel_count",
+        "occlusion_fill",
+        "payload_sequence_sha256",
+        "render_shape",
+        "rgb_stage_fingerprint",
+        "schema_version",
+        "settings_fingerprint",
+        "source_guide_fingerprint",
+        "source_settings_schema_version",
+        "stage_metadata_sha256",
+    }
+)
+
+
+def _legacy_fast_adoption_payload(adoption: LegacyFastAdoptionV1) -> dict[str, Any]:
+    return {
+        "frame_count": adoption.frame_count,
+        "geometry_mode": adoption.geometry_mode,
+        "metric_affected_frame_count": adoption.metric_affected_frame_count,
+        "metric_clamp_evidence_sha256": adoption.metric_clamp_evidence_sha256,
+        "metric_clamp_summary_sha256": adoption.metric_clamp_summary_sha256,
+        "metric_clamped_pixel_count": adoption.metric_clamped_pixel_count,
+        "metric_max_clamped_fraction": adoption.metric_max_clamped_fraction,
+        "metric_mean_clamped_fraction": adoption.metric_mean_clamped_fraction,
+        "metric_valid_pixel_count": adoption.metric_valid_pixel_count,
+        "occlusion_fill": adoption.occlusion_fill,
+        "payload_sequence_sha256": adoption.payload_sequence_sha256,
+        "render_shape": [adoption.render_shape[0], adoption.render_shape[1]],
+        "rgb_stage_fingerprint": adoption.rgb_stage_fingerprint,
+        "schema_version": 1,
+        "settings_fingerprint": adoption.settings_fingerprint,
+        "source_guide_fingerprint": adoption.source_guide_fingerprint,
+        "source_settings_schema_version": adoption.source_settings_schema_version,
+        "stage_metadata_sha256": adoption.stage_metadata_sha256,
+    }
+
+
+def _parse_legacy_fast_adoption_intent(
+    raw: bytes,
+    job_root: Path,
+) -> LegacyFastAdoptionV1:
+    value = strict_canonical_json_loads(
+        raw,
+        max_bytes=LEGACY_FAST_ADOPTION_INTENT_MAX_RAW_BYTES,
+    )
+    if not isinstance(value, dict) or set(value) != _LEGACY_FAST_ADOPTION_INTENT_KEYS:
+        raise ValueError("legacy Fast adoption intent has the wrong schema")
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        raise ValueError("legacy Fast adoption intent schema version is invalid")
+    source_version = value["source_settings_schema_version"]
+    frame_count = value["frame_count"]
+    shape = value["render_shape"]
+    if type(source_version) is not int or not 1 <= source_version <= 4:
+        raise ValueError("legacy Fast adoption source schema is invalid")
+    if type(frame_count) is not int or frame_count <= 0:
+        raise ValueError("legacy Fast adoption frame count is invalid")
+    if (
+        not isinstance(shape, list)
+        or len(shape) != 2
+        or any(type(item) is not int or item <= 0 for item in shape)
+    ):
+        raise ValueError("legacy Fast adoption render shape is invalid")
+    geometry = value["geometry_mode"]
+    occlusion = value["occlusion_fill"]
+    if geometry not in {"relative", "metric"} or occlusion not in {
+        "none",
+        "background",
+    }:
+        raise ValueError("legacy Fast adoption mode is invalid")
+    for key in (
+        "settings_fingerprint",
+        "rgb_stage_fingerprint",
+        "source_guide_fingerprint",
+        "stage_metadata_sha256",
+        "payload_sequence_sha256",
+    ):
+        field = value[key]
+        if not isinstance(field, str) or len(field) != 64 or set(field) - _HEX64:
+            raise ValueError(f"legacy Fast adoption {key} is invalid")
+    metric_keys = (
+        "metric_clamp_summary_sha256",
+        "metric_clamp_evidence_sha256",
+        "metric_valid_pixel_count",
+        "metric_clamped_pixel_count",
+        "metric_affected_frame_count",
+        "metric_mean_clamped_fraction",
+        "metric_max_clamped_fraction",
+    )
+    if geometry == "relative":
+        if any(value[key] is not None for key in metric_keys):
+            raise ValueError("relative legacy Fast intent carries metric evidence")
+    else:
+        for key in metric_keys[:2]:
+            field = value[key]
+            if not isinstance(field, str) or len(field) != 64 or set(field) - _HEX64:
+                raise ValueError(f"legacy Fast adoption {key} is invalid")
+        for key in metric_keys[2:5]:
+            field = value[key]
+            if type(field) is not int or field < 0:
+                raise ValueError(f"legacy Fast adoption {key} is invalid")
+        for key in metric_keys[5:]:
+            field = value[key]
+            if type(field) is not float or not math.isfinite(field) or not 0.0 <= field <= 1.0:
+                raise ValueError(f"legacy Fast adoption {key} is invalid")
+        if value["metric_clamped_pixel_count"] > value["metric_valid_pixel_count"]:
+            raise ValueError("legacy Fast adoption clamp counts are inconsistent")
+        if value["metric_affected_frame_count"] > frame_count:
+            raise ValueError("legacy Fast adoption affected-frame count is inconsistent")
+    return LegacyFastAdoptionV1(
+        job_root=job_root.resolve(),
+        source_settings_schema_version=source_version,
+        settings_fingerprint=value["settings_fingerprint"],
+        frame_count=frame_count,
+        render_shape=(shape[0], shape[1]),
+        geometry_mode=cast(Literal["relative", "metric"], geometry),
+        occlusion_fill=cast(Literal["none", "background"], occlusion),
+        rgb_stage_fingerprint=value["rgb_stage_fingerprint"],
+        source_guide_fingerprint=value["source_guide_fingerprint"],
+        stage_metadata_sha256=value["stage_metadata_sha256"],
+        payload_sequence_sha256=value["payload_sequence_sha256"],
+        metric_clamp_summary_sha256=value["metric_clamp_summary_sha256"],
+        metric_clamp_evidence_sha256=value["metric_clamp_evidence_sha256"],
+        metric_valid_pixel_count=value["metric_valid_pixel_count"],
+        metric_clamped_pixel_count=value["metric_clamped_pixel_count"],
+        metric_affected_frame_count=value["metric_affected_frame_count"],
+        metric_mean_clamped_fraction=value["metric_mean_clamped_fraction"],
+        metric_max_clamped_fraction=value["metric_max_clamped_fraction"],
+    )
+
+
+def publish_legacy_fast_adoption_intent_v1(adoption: LegacyFastAdoptionV1) -> None:
+    """Durably publish the bounded authority for aggregate-only legacy adoption."""
+
+    publish_write_ahead_intent(
+        adoption.job_root / LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH,
+        _legacy_fast_adoption_payload(adoption),
+    )
+
+
+def recover_legacy_fast_adoption_intent_v1(
+    job_root: Path | str,
+) -> LegacyFastAdoptionV1 | None:
+    """Recover the deterministic intent pair before diagnostics mutation."""
+
+    root = Path(job_root).resolve()
+    result = recover_control_artifact_pair_v1(
+        root / LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH,
+        max_bytes=LEGACY_FAST_ADOPTION_INTENT_MAX_RAW_BYTES,
+        parser=lambda raw: _parse_legacy_fast_adoption_intent(raw, root),
+    )
+    return cast(LegacyFastAdoptionV1 | None, result)
+
+
+def load_legacy_fast_adoption_intent_v1(
+    job_root: Path | str,
+) -> LegacyFastAdoptionV1 | None:
+    """Read the final intent without repairing or mutating its namespace."""
+
+    root = Path(job_root).resolve()
+    path = root / LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH
+    if not (path.exists() or path.is_symlink()):
+        return None
+    return _parse_legacy_fast_adoption_intent(
+        _read_bounded_regular_file(
+            path,
+            max_bytes=LEGACY_FAST_ADOPTION_INTENT_MAX_RAW_BYTES,
+        ),
+        root,
+    )
+
+
+def retire_legacy_fast_adoption_intent_v1(adoption: LegacyFastAdoptionV1) -> None:
+    """Retire only the exact authority that enabled a complete publication."""
+
+    _unlink_exact_control_artifact(
+        adoption.job_root / LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH,
+        canonical_json_bytes(_legacy_fast_adoption_payload(adoption)),
+    )
+
+
 @dataclass(frozen=True)
 class ResumeReport:
     """Read-only resume decision plus the data required for migration."""
@@ -145,6 +380,10 @@ class ResumeReport:
     original_settings_data: dict[str, Any] | None
     migrated_settings: dict[str, Any]
     settings_backup_required: bool
+    legacy_fast_adoption: LegacyFastAdoptionV1 | None = None
+    final_media_audit: object | None = None
+    historical_diagnostics_valid: bool | None = None
+    stereo_payload_reusable: bool | None = None
 
     def stage(self, name: str) -> ResumeStage:
         for stage in self.stages:
@@ -182,6 +421,7 @@ class ResumeReport:
             "removed_settings": list(self.removed_settings),
             "preserved_stages": list(self.preserved_stage_names),
             "invalidated_stages": list(self.invalidated_stage_names),
+            "legacy_fast_adoptable": self.legacy_fast_adoption is not None,
         }
 
 
@@ -1405,6 +1645,663 @@ def _stereo_payload_state(
     return None, None
 
 
+def _hash_regular_file_into(
+    digest: Any,
+    acquired: AcquiredRoot,
+    path: Path,
+    *,
+    png_shape: tuple[int, int, int] | None = None,
+) -> str:
+    file_digest = hashlib.sha256()
+    byte_count = 0
+    try:
+        with acquired.open_regular(path) as handle:
+            if png_shape is not None:
+                header = handle.read(33)
+                if not png_header_bytes_match(header, shape=png_shape, bit_depth=8):
+                    raise ValueError(f"legacy Fast RGB payload is invalid: {path.name}")
+                handle.seek(0)
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                file_digest.update(chunk)
+                byte_count += len(chunk)
+    except NoFollowPathError as error:
+        raise ValueError(f"legacy Fast payload is not a regular file: {path}") from error
+    relative = path.name.encode("utf-8")
+    digest.update(len(relative).to_bytes(8, "big"))
+    digest.update(relative)
+    digest.update(byte_count.to_bytes(8, "big"))
+    digest.update(file_digest.digest())
+    return file_digest.hexdigest()
+
+
+def _legacy_fast_rgb_payload_fingerprint(
+    acquired: AcquiredRoot,
+    paths: tuple[Path, Path],
+    frame_names: Callable[[], Iterable[str]],
+    frame_count: int,
+    render_shape: tuple[int, int],
+) -> str:
+    digest = hashlib.sha256(b"legacy-fast-rgb-payload-sequence-v1\0")
+    for eye, directory in zip((b"left", b"right"), paths, strict=True):
+        try:
+            actual_count = sum(
+                1 for entry in acquired.iter_directory(directory) if entry.name.endswith(".png")
+            )
+        except NoFollowPathError as error:
+            raise ValueError("legacy Fast RGB directory is not a regular directory") from error
+        if actual_count != frame_count:
+            raise ValueError("legacy Fast RGB payload set differs from its frame sequence")
+        digest.update(eye)
+        replayed_count = 0
+        for frame_name in frame_names():
+            if replayed_count >= frame_count:
+                raise ValueError("legacy Fast frame-name replay exceeds its count")
+            path = directory / f"{frame_name}.png"
+            _hash_regular_file_into(
+                digest,
+                acquired,
+                path,
+                png_shape=(*render_shape, 3),
+            )
+            replayed_count += 1
+        if replayed_count != frame_count:
+            raise ValueError("legacy Fast frame-name replay ended early")
+    return digest.hexdigest()
+
+
+def _streaming_file_sha256(acquired: AcquiredRoot, path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with acquired.open_regular(path) as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    return digest.hexdigest()
+                digest.update(chunk)
+    except NoFollowPathError as error:
+        raise ValueError(f"legacy evidence is not a regular file: {path}") from error
+
+
+def _iter_bounded_legacy_lines(
+    handle: Any,
+    *,
+    maximum_line_bytes: int = 64 * 1024,
+) -> Iterator[bytes]:
+    pending = bytearray()
+    while True:
+        chunk = handle.read(64 * 1024)
+        if not chunk:
+            if pending:
+                yield bytes(pending)
+            return
+        start = 0
+        while True:
+            newline = chunk.find(b"\n", start)
+            if newline < 0:
+                pending.extend(chunk[start:])
+                if len(pending) > maximum_line_bytes:
+                    raise ValueError("legacy JSON line exceeds 64 KiB")
+                break
+            pending.extend(chunk[start : newline + 1])
+            if len(pending) > maximum_line_bytes:
+                raise ValueError("legacy JSON line exceeds 64 KiB")
+            yield bytes(pending)
+            pending.clear()
+            start = newline + 1
+
+
+def _iter_pretty_top_level_array(
+    acquired: AcquiredRoot,
+    path: Path,
+    key: str,
+) -> Iterator[Any]:
+    marker = f'  "{key}": ['.encode("ascii")
+    found = False
+    try:
+        handle_context = acquired.open_regular(path)
+    except NoFollowPathError as error:
+        raise ValueError("legacy JSON evidence is not a regular file") from error
+    with handle_context as handle:
+        for raw_line in _iter_bounded_legacy_lines(handle):
+            line = raw_line.rstrip(b"\r\n")
+            if not found:
+                if line == marker:
+                    found = True
+                continue
+            if line in {b"  ],", b"  ]"}:
+                return
+            if not line.startswith(b"    "):
+                raise ValueError(f"legacy JSON array {key} is malformed")
+            token = line.strip()
+            if token.endswith(b","):
+                token = token[:-1]
+            try:
+                yield json.loads(token.decode("ascii"))
+            except (UnicodeError, json.JSONDecodeError) as error:
+                raise ValueError(f"legacy JSON array {key} is malformed") from error
+    if not found:
+        raise ValueError(f"legacy JSON array {key} is missing")
+    raise ValueError(f"legacy JSON array {key} is unterminated")
+
+
+def _iter_legacy_stage_frame_names_from_path(
+    acquired: AcquiredRoot,
+    metadata_path: Path,
+    frame_count: int,
+) -> Iterator[str]:
+    count = 0
+    for value in _iter_pretty_top_level_array(acquired, metadata_path, "frame_names"):
+        if (
+            count >= frame_count
+            or not isinstance(value, str)
+            or not value.endswith(".png")
+            or Path(value).name != value
+        ):
+            raise ValueError("legacy Fast frame name is invalid")
+        count += 1
+        yield Path(value).stem
+    if count != frame_count:
+        raise ValueError("legacy Fast frame-name count changed")
+
+
+def iter_legacy_fast_frame_names(adoption: LegacyFastAdoptionV1) -> Iterator[str]:
+    """Replay legacy Fast stems without retaining the metadata array."""
+
+    with AcquiredRoot(adoption.job_root) as acquired:
+        yield from _iter_legacy_stage_frame_names_from_path(
+            acquired,
+            adoption.job_root / "04_left_frames" / "metadata.json",
+            adoption.frame_count,
+        )
+
+
+def _read_legacy_metric_stat(
+    acquired: AcquiredRoot,
+    path: Path,
+    frame_name: str,
+) -> MetricProjectionStats:
+    try:
+        with acquired.open_regular(path) as handle:
+            raw = handle.read(64 * 1024 + 1)
+    except NoFollowPathError as error:
+        raise ValueError("legacy metric clamp sidecar is unsafe") from error
+    if len(raw) > 64 * 1024:
+        raise ValueError("legacy metric clamp sidecar exceeds 64 KiB")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("legacy metric clamp sidecar is invalid") from error
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "frame_name",
+        "valid_pixel_count",
+        "clamped_pixel_count",
+        "clamped_fraction",
+    }:
+        raise ValueError("legacy metric clamp sidecar has the wrong schema")
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+        raise ValueError("legacy metric clamp sidecar schema version is invalid")
+    if payload["frame_name"] != frame_name:
+        raise ValueError("legacy metric clamp sidecar frame identity changed")
+    return MetricProjectionStats(
+        payload["valid_pixel_count"],
+        payload["clamped_pixel_count"],
+        payload["clamped_fraction"],
+    )
+
+
+def _iter_legacy_metric_fractions_from_paths(
+    acquired: AcquiredRoot,
+    left_dir: Path,
+    frame_names: Callable[[], Iterable[str]],
+) -> Iterator[float]:
+    for frame_name in frame_names():
+        yield _read_legacy_metric_stat(
+            acquired,
+            left_dir / "clamp_stats" / f"{frame_name}.json",
+            frame_name,
+        ).clamped_fraction
+
+
+def iter_legacy_metric_clamped_fractions(
+    adoption: LegacyFastAdoptionV1,
+) -> Iterator[float]:
+    """Replay validated legacy metric fractions in source order."""
+
+    if adoption.geometry_mode != "metric":
+        raise ValueError("relative legacy Fast adoption has no clamp fractions")
+    with AcquiredRoot(adoption.job_root) as acquired:
+        yield from _iter_legacy_metric_fractions_from_paths(
+            acquired,
+            adoption.job_root / "04_left_frames",
+            lambda: _iter_legacy_stage_frame_names_from_path(
+                acquired,
+                adoption.job_root / "04_left_frames" / "metadata.json",
+                adoption.frame_count,
+            ),
+        )
+
+
+def legacy_fast_metric_projection(
+    adoption: LegacyFastAdoptionV1,
+) -> dict[str, Any] | None:
+    """Build the replayable aggregate required by the legacy diagnostics marker."""
+
+    if adoption.geometry_mode == "relative":
+        return None
+    from .streamed_canonical_json import ReplayableJsonArray
+
+    valid = adoption.metric_valid_pixel_count
+    clamped = adoption.metric_clamped_pixel_count
+    affected = adoption.metric_affected_frame_count
+    mean = adoption.metric_mean_clamped_fraction
+    maximum = adoption.metric_max_clamped_fraction
+    if (
+        type(valid) is not int
+        or type(clamped) is not int
+        or type(affected) is not int
+        or type(mean) is not float
+        or type(maximum) is not float
+    ):
+        raise ValueError("legacy metric adoption omits clamp evidence")
+    return {
+        "valid_pixel_count": valid,
+        "clamped_pixel_count": clamped,
+        "clamped_fraction": float(clamped) / float(valid) if valid else 0.0,
+        "clamped_fractions": ReplayableJsonArray(
+            lambda: iter_legacy_metric_clamped_fractions(adoption)
+        ),
+        "affected_frame_count": affected,
+        "mean_clamped_fraction": mean,
+        "max_clamped_fraction": maximum,
+    }
+
+
+def _legacy_fast_diagnostics_complete(adoption: LegacyFastAdoptionV1) -> bool:
+    from ..rendering.quality.diagnostic_transaction import (
+        StreamingDiagnosticsStageContext,
+        legacy_fast_unavailable_aggregates_match,
+    )
+
+    context = StreamingDiagnosticsStageContext(
+        job_root=adoption.job_root,
+        frame_count=adoption.frame_count,
+        frame_names=lambda: iter_legacy_fast_frame_names(adoption),
+        render_shape=adoption.render_shape,
+        render_mode="fast",
+        geometry_mode=adoption.geometry_mode,
+        occlusion_fill=adoption.occlusion_fill,
+        mask_payloads_enabled=False,
+        rgb_stage_fingerprint=adoption.rgb_stage_fingerprint,
+        source_guide_fingerprint=adoption.source_guide_fingerprint,
+        native_geometry_fingerprint=None,
+        quality_input_manifest_sha256=None,
+        left_rgb_parent=adoption.job_root / "04_left_frames",
+        right_rgb_parent=adoption.job_root / "04_right_frames",
+    )
+    return legacy_fast_unavailable_aggregates_match(
+        context,
+        metric_projection=legacy_fast_metric_projection(adoption),
+        metric_clamp_summary_sha256=adoption.metric_clamp_summary_sha256,
+    )
+
+
+def _legacy_summary_scalars(acquired: AcquiredRoot, path: Path) -> dict[str, Any]:
+    expected_keys = {
+        "affected_frame_count",
+        "clamped_fractions",
+        "frame_names",
+        "max_clamped_fraction",
+        "mean_clamped_fraction",
+        "schema_version",
+    }
+    keys: set[str] = set()
+    scalars: dict[str, Any] = {}
+    try:
+        handle_context = acquired.open_regular(path)
+    except NoFollowPathError as error:
+        raise ValueError("legacy metric clamp summary is unsafe") from error
+    with handle_context as handle:
+        for raw_line in _iter_bounded_legacy_lines(handle):
+            line = raw_line.rstrip(b"\r\n")
+            if not line.startswith(b'  "'):
+                continue
+            separator = line.find(b'": ')
+            if separator < 0:
+                raise ValueError("legacy metric clamp summary is malformed")
+            key = line[3:separator].decode("ascii")
+            if key in keys:
+                raise ValueError("legacy metric clamp summary repeats a key")
+            keys.add(key)
+            token = line[separator + 3 :]
+            if token == b"[":
+                continue
+            if token.endswith(b","):
+                token = token[:-1]
+            try:
+                scalars[key] = json.loads(token.decode("ascii"))
+            except (UnicodeError, json.JSONDecodeError) as error:
+                raise ValueError("legacy metric clamp summary is malformed") from error
+    if keys != expected_keys:
+        raise ValueError("legacy metric clamp summary has the wrong schema")
+    return scalars
+
+
+def _legacy_metric_clamp_evidence(
+    acquired: AcquiredRoot,
+    left_dir: Path,
+    frame_names: Callable[[], Iterable[str]],
+    frame_count: int,
+) -> tuple[str, str, int, int, int, float, float]:
+    stat_dir = left_dir / "clamp_stats"
+    try:
+        actual_count = sum(
+            1 for entry in acquired.iter_directory(stat_dir) if entry.name.endswith(".json")
+        )
+    except NoFollowPathError as error:
+        raise ValueError("legacy metric clamp sidecar directory is invalid") from error
+    if actual_count != frame_count:
+        raise ValueError("legacy metric clamp sidecar set is incomplete")
+
+    evidence_digest = hashlib.sha256(b"legacy-metric-clamp-evidence-v1\0")
+    valid_total = 0
+    clamped_total = 0
+    affected = 0
+    fraction_sum = 0.0
+    maximum = 0.0
+    count = 0
+    for frame_name in frame_names():
+        if count >= frame_count:
+            raise ValueError("legacy metric clamp replay exceeds its frame count")
+        path = stat_dir / f"{frame_name}.json"
+        stats = _read_legacy_metric_stat(acquired, path, frame_name)
+        _hash_regular_file_into(evidence_digest, acquired, path)
+        valid_total += stats.valid_pixel_count
+        clamped_total += stats.clamped_pixel_count
+        affected += int(stats.clamped_fraction > 0.0)
+        fraction_sum += stats.clamped_fraction
+        maximum = max(maximum, stats.clamped_fraction)
+        count += 1
+    if count != frame_count:
+        raise ValueError("legacy metric clamp replay ended early")
+    mean = fraction_sum / frame_count
+
+    summary_path = left_dir / "clamp_summary.json"
+    summary_sha256 = _streaming_file_sha256(acquired, summary_path)
+    _hash_regular_file_into(evidence_digest, acquired, summary_path)
+    scalars = _legacy_summary_scalars(acquired, summary_path)
+    if (
+        type(scalars.get("schema_version")) is not int
+        or scalars["schema_version"] != 1
+        or type(scalars.get("affected_frame_count")) is not int
+        or scalars["affected_frame_count"] != affected
+        or type(scalars.get("mean_clamped_fraction")) is not float
+        or not math.isfinite(scalars["mean_clamped_fraction"])
+        or scalars["mean_clamped_fraction"] != mean
+        or type(scalars.get("max_clamped_fraction")) is not float
+        or not math.isfinite(scalars["max_clamped_fraction"])
+        or scalars["max_clamped_fraction"] != maximum
+    ):
+        raise ValueError("legacy metric clamp summary scalar values changed")
+    summary_names = _iter_pretty_top_level_array(acquired, summary_path, "frame_names")
+    if any(
+        summary_name != frame_name
+        for summary_name, frame_name in zip(summary_names, frame_names(), strict=True)
+    ):
+        raise ValueError("legacy metric clamp summary frame order changed")
+    summary_fractions = _iter_pretty_top_level_array(
+        acquired,
+        summary_path,
+        "clamped_fractions",
+    )
+    expected_fractions = _iter_legacy_metric_fractions_from_paths(
+        acquired,
+        left_dir,
+        frame_names,
+    )
+    for actual, expected in zip(summary_fractions, expected_fractions, strict=True):
+        if type(actual) is not float or actual != expected:
+            raise ValueError("legacy metric clamp summary fractions changed")
+    return (
+        summary_sha256,
+        evidence_digest.hexdigest(),
+        valid_total,
+        clamped_total,
+        affected,
+        mean,
+        maximum,
+    )
+
+
+def _build_legacy_fast_adoption(
+    output_dir: Path,
+    frame_files: list[Path],
+    current_settings: dict[str, Any],
+    metadata: dict[str, Any],
+    render_shape: tuple[int, int],
+    geometry_mode: str,
+    *,
+    source_settings_schema_version: int,
+) -> LegacyFastAdoptionV1:
+    with AcquiredRoot(output_dir) as acquired:
+        return _build_legacy_fast_adoption_from_acquired_root(
+            acquired,
+            output_dir,
+            frame_files,
+            current_settings,
+            metadata,
+            render_shape,
+            geometry_mode,
+            source_settings_schema_version=source_settings_schema_version,
+        )
+
+
+def _build_legacy_fast_adoption_from_acquired_root(
+    acquired: AcquiredRoot,
+    output_dir: Path,
+    frame_files: list[Path],
+    current_settings: dict[str, Any],
+    metadata: dict[str, Any],
+    render_shape: tuple[int, int],
+    geometry_mode: str,
+    *,
+    source_settings_schema_version: int,
+) -> LegacyFastAdoptionV1:
+    left_dir = output_dir / "04_left_frames"
+    right_dir = output_dir / "04_right_frames"
+    metadata_path = left_dir / "metadata.json"
+    metadata_max = 64 * 1024 + len(frame_files) * 256
+    try:
+        with acquired.open_regular(metadata_path) as handle:
+            metadata_raw = handle.read(metadata_max + 1)
+    except NoFollowPathError as error:
+        raise ValueError("legacy Fast RGB metadata is unsafe") from error
+    if len(metadata_raw) > metadata_max:
+        raise ValueError("legacy Fast RGB metadata exceeds its bound")
+    writer_text = json.dumps(metadata, indent=2, sort_keys=True)
+    if os.linesep != "\n":
+        writer_text = writer_text.replace("\n", os.linesep)
+    if metadata_raw != writer_text.encode("utf-8"):
+        raise ValueError("legacy Fast RGB metadata bytes are not from the v3 writer")
+    frame_count = len(frame_files)
+
+    def replay_frame_names() -> Iterator[str]:
+        for frame in frame_files:
+            yield frame.stem
+
+    payload_fingerprint = _legacy_fast_rgb_payload_fingerprint(
+        acquired,
+        (left_dir, right_dir),
+        replay_frame_names,
+        frame_count,
+        render_shape,
+    )
+    normalized_geometry = cast(
+        Literal["relative", "metric"],
+        "metric" if geometry_mode == "metric_camera" else "relative",
+    )
+    clamp_sha256 = None
+    clamp_evidence_sha256 = None
+    metric_valid = None
+    metric_clamped = None
+    metric_affected = None
+    metric_mean = None
+    metric_maximum = None
+    if normalized_geometry == "metric":
+        (
+            clamp_sha256,
+            clamp_evidence_sha256,
+            metric_valid,
+            metric_clamped,
+            metric_affected,
+            metric_mean,
+            metric_maximum,
+        ) = _legacy_metric_clamp_evidence(
+            acquired,
+            left_dir,
+            replay_frame_names,
+            frame_count,
+        )
+    source_provenance = metadata.get(
+        "source_canonical_fingerprint",
+        metadata.get("source_metric_fingerprint"),
+    )
+    if not isinstance(source_provenance, str) or len(source_provenance) != 64:
+        raise ValueError("legacy Fast source provenance is invalid")
+    return LegacyFastAdoptionV1(
+        job_root=output_dir.resolve(),
+        source_settings_schema_version=source_settings_schema_version,
+        settings_fingerprint=canonical_json_hash(current_settings),
+        frame_count=frame_count,
+        render_shape=render_shape,
+        geometry_mode=normalized_geometry,
+        occlusion_fill=cast(
+            Literal["none", "background"],
+            current_settings.get("occlusion_fill", "background"),
+        ),
+        rgb_stage_fingerprint=str(metadata["fingerprint"]),
+        source_guide_fingerprint=source_provenance,
+        stage_metadata_sha256=hashlib.sha256(metadata_raw).hexdigest(),
+        payload_sequence_sha256=payload_fingerprint,
+        metric_clamp_summary_sha256=clamp_sha256,
+        metric_clamp_evidence_sha256=clamp_evidence_sha256,
+        metric_valid_pixel_count=metric_valid,
+        metric_clamped_pixel_count=metric_clamped,
+        metric_affected_frame_count=metric_affected,
+        metric_mean_clamped_fraction=metric_mean,
+        metric_max_clamped_fraction=metric_maximum,
+    )
+
+
+def revalidate_legacy_fast_adoption_v1(
+    adoption: LegacyFastAdoptionV1,
+    settings_artifact: ProcessingSettingsArtifactV5,
+    *,
+    allow_diagnostics_prefix: bool = False,
+) -> LegacyFastAdoptionV1:
+    """Replay every frozen legacy fact immediately before diagnostics publication."""
+
+    if not isinstance(adoption, LegacyFastAdoptionV1):
+        raise TypeError("legacy Fast adoption proof has the wrong type")
+    if not isinstance(settings_artifact, ProcessingSettingsArtifactV5):
+        raise TypeError("legacy Fast adoption requires a schema-5 settings artifact")
+    root = Path(os.path.abspath(os.fspath(adoption.job_root)))
+    if root != adoption.job_root:
+        raise ValueError("legacy Fast adoption job root changed")
+    try:
+        with AcquiredRoot(root) as acquired:
+            return _revalidate_legacy_fast_adoption_from_acquired_root(
+                acquired,
+                adoption,
+                settings_artifact,
+                allow_diagnostics_prefix=allow_diagnostics_prefix,
+            )
+    except NoFollowPathError as error:
+        raise ValueError("legacy Fast adoption contains an unsafe path") from error
+
+
+def _revalidate_legacy_fast_adoption_from_acquired_root(
+    acquired: AcquiredRoot,
+    adoption: LegacyFastAdoptionV1,
+    settings_artifact: ProcessingSettingsArtifactV5,
+    *,
+    allow_diagnostics_prefix: bool,
+) -> LegacyFastAdoptionV1:
+    root = adoption.job_root
+    settings_value = settings_artifact.to_object()
+    metadata_fields = settings_value["metadata"]
+    source_version = metadata_fields["source_settings_schema_version"]
+    settings = settings_value["processing_settings"]
+    if (
+        source_version != adoption.source_settings_schema_version
+        or not 1 <= source_version <= 4
+        or canonical_json_hash(settings) != adoption.settings_fingerprint
+        or settings.get("stereo_render_mode") != "fast"
+        or settings.get("keep_intermediates") is not False
+        or (
+            not allow_diagnostics_prefix
+            and not acquired.directory_absent(root / "04_stereo_diagnostics")
+        )
+    ):
+        raise ValueError("legacy Fast adoption settings or diagnostics state changed")
+
+    metadata_path = root / "04_left_frames" / "metadata.json"
+    if _streaming_file_sha256(acquired, metadata_path) != adoption.stage_metadata_sha256:
+        raise ValueError("legacy Fast RGB metadata changed")
+    payload_fingerprint = _legacy_fast_rgb_payload_fingerprint(
+        acquired,
+        (root / "04_left_frames", root / "04_right_frames"),
+        lambda: _iter_legacy_stage_frame_names_from_path(
+            acquired,
+            metadata_path,
+            adoption.frame_count,
+        ),
+        adoption.frame_count,
+        adoption.render_shape,
+    )
+    if payload_fingerprint != adoption.payload_sequence_sha256:
+        raise ValueError("legacy Fast RGB payload sequence changed")
+    if adoption.geometry_mode == "metric":
+        replayed_metric = _legacy_metric_clamp_evidence(
+            acquired,
+            root / "04_left_frames",
+            lambda: _iter_legacy_stage_frame_names_from_path(
+                acquired,
+                metadata_path,
+                adoption.frame_count,
+            ),
+            adoption.frame_count,
+        )
+        expected_metric = (
+            adoption.metric_clamp_summary_sha256,
+            adoption.metric_clamp_evidence_sha256,
+            adoption.metric_valid_pixel_count,
+            adoption.metric_clamped_pixel_count,
+            adoption.metric_affected_frame_count,
+            adoption.metric_mean_clamped_fraction,
+            adoption.metric_max_clamped_fraction,
+        )
+        if replayed_metric != expected_metric:
+            raise ValueError("legacy metric clamp evidence changed")
+    elif any(
+        value is not None
+        for value in (
+            adoption.metric_clamp_summary_sha256,
+            adoption.metric_clamp_evidence_sha256,
+            adoption.metric_valid_pixel_count,
+            adoption.metric_clamped_pixel_count,
+            adoption.metric_affected_frame_count,
+            adoption.metric_mean_clamped_fraction,
+            adoption.metric_max_clamped_fraction,
+        )
+    ):
+        raise ValueError("relative legacy Fast adoption carries metric evidence")
+    return adoption
+
+
 def _validate_stereo_stage(
     output_dir: Path,
     frame_files: list[Path],
@@ -1414,19 +2311,21 @@ def _validate_stereo_stage(
     geometry_mode: str,
     *,
     current_settings_schema: bool,
+    source_settings_schema_version: int,
     geometry_reusable: bool,
-) -> ResumeStage:
+) -> tuple[ResumeStage, LegacyFastAdoptionV1 | None]:
     paths = (output_dir / "04_left_frames", output_dir / "04_right_frames")
     if not any(_has_payload(path) for path in paths):
-        return _stage("stereo", paths, "missing", "stereo output is absent")
+        return _stage("stereo", paths, "missing", "stereo output is absent"), None
     if not geometry_reusable or geometry_metadata is None:
-        return _stage("stereo", paths, "invalidate", "selected geometry stage is invalid")
-    if not current_settings_schema:
-        return _stage("stereo", paths, "invalidate", "legacy renderer schema")
+        return (
+            _stage("stereo", paths, "invalidate", "selected geometry stage is invalid"),
+            None,
+        )
 
     metadata = _read_json(paths[0] / "metadata.json")
     if metadata is None:
-        return _stage("stereo", paths, "invalidate", "stereo metadata is missing")
+        return _stage("stereo", paths, "invalidate", "stereo metadata is missing"), None
     if not _stereo_metadata_matches(
         metadata,
         geometry_metadata,
@@ -1435,14 +2334,96 @@ def _validate_stereo_stage(
         video_properties,
         geometry_mode,
     ):
-        return _stage("stereo", paths, "invalidate", "stereo stage fingerprint mismatch")
+        return (
+            _stage("stereo", paths, "invalidate", "stereo stage fingerprint mismatch"),
+            None,
+        )
     render_shape = _positive_shape(metadata, "render_shape")
     if render_shape is None:
-        return _stage("stereo", paths, "invalidate", "stereo render shape is invalid")
+        return _stage("stereo", paths, "invalidate", "stereo render shape is invalid"), None
     disposition, reason = _stereo_payload_state(paths, frame_files, render_shape)
     if disposition is not None and reason is not None:
-        return _stage("stereo", paths, disposition, reason)
-    return _stage("stereo", paths, "preserve", "stereo stage fingerprint matches")
+        if source_settings_schema_version <= 4:
+            return (
+                _stage(
+                    "stereo",
+                    paths,
+                    "invalidate",
+                    "legacy Fast RGB stage is not whole-stage complete",
+                ),
+                None,
+            )
+        return _stage("stereo", paths, disposition, reason), None
+    if source_settings_schema_version <= 4:
+        intent = load_legacy_fast_adoption_intent_v1(output_dir)
+        diagnostics_present = (output_dir / "04_stereo_diagnostics").exists()
+        eligible = (
+            1 <= source_settings_schema_version <= 4
+            and current_settings.get("stereo_render_mode") == "fast"
+            and current_settings.get("keep_intermediates") is False
+        )
+        if not eligible:
+            return _stage("stereo", paths, "invalidate", "legacy renderer schema"), None
+        try:
+            adoption = _build_legacy_fast_adoption(
+                output_dir,
+                frame_files,
+                current_settings,
+                metadata,
+                render_shape,
+                geometry_mode,
+                source_settings_schema_version=source_settings_schema_version,
+            )
+        except (OSError, TypeError, ValueError):
+            return (
+                _stage(
+                    "stereo",
+                    paths,
+                    "invalidate",
+                    "legacy Fast whole-stage validation failed",
+                ),
+                None,
+            )
+        if intent is not None and intent != adoption:
+            return (
+                _stage(
+                    "stereo",
+                    paths,
+                    "invalidate",
+                    "legacy Fast adoption intent differs from the RGB stage",
+                ),
+                None,
+            )
+        if diagnostics_present and intent is None:
+            if not _legacy_fast_diagnostics_complete(adoption):
+                return (
+                    _stage(
+                        "stereo",
+                        paths,
+                        "invalidate",
+                        "legacy Fast diagnostics completion is invalid",
+                    ),
+                    None,
+                )
+            return (
+                _stage(
+                    "stereo",
+                    paths,
+                    "preserve",
+                    "legacy Fast aggregate-only diagnostics are complete",
+                ),
+                adoption,
+            )
+        return (
+            _stage(
+                "stereo",
+                paths,
+                "preserve",
+                "legacy Fast v3 whole stage is adoptable",
+            ),
+            adoption,
+        )
+    return _stage("stereo", paths, "preserve", "stereo stage fingerprint matches"), None
 
 
 def _build_generated_stages(
@@ -1455,9 +2436,10 @@ def _build_generated_stages(
     geometry_mode: str,
     *,
     current_settings_schema: bool,
+    source_settings_schema_version: int,
     geometry_reusable: bool,
-) -> list[ResumeStage]:
-    stereo = _validate_stereo_stage(
+) -> tuple[list[ResumeStage], LegacyFastAdoptionV1 | None]:
+    stereo, legacy_fast_adoption = _validate_stereo_stage(
         output_dir,
         frame_files,
         current_settings,
@@ -1465,6 +2447,7 @@ def _build_generated_stages(
         video_properties,
         geometry_mode,
         current_settings_schema=current_settings_schema,
+        source_settings_schema_version=source_settings_schema_version,
         geometry_reusable=geometry_reusable,
     )
     distortion = _validate_generated_stage(
@@ -1500,7 +2483,7 @@ def _build_generated_stages(
         changed_setting=_settings_changed(saved_settings, current_settings, _VR_SETTING_KEYS),
         reusable_reason="VR assembly settings match",
     )
-    return [stereo, distortion, crop, upscale, vr]
+    return [stereo, distortion, crop, upscale, vr], legacy_fast_adoption
 
 
 def build_resume_report(  # noqa: C901
@@ -1515,12 +2498,17 @@ def build_resume_report(  # noqa: C901
 
     root = Path(output_dir).resolve()
     selected_settings_file = _resolve_settings_file(root, settings_file)
+    settings_artifact: ProcessingSettingsArtifactV5 | None = None
     if selected_settings_file is None:
         settings_data = None
     elif selected_settings_file.name == SETTINGS_ARTIFACT_RELATIVE_PATH.name:
-        settings_data = ProcessingSettingsArtifactV5.parse(
-            selected_settings_file.read_bytes()
-        ).to_object()
+        settings_artifact = ProcessingSettingsArtifactV5.parse(
+            _read_bounded_regular_file(
+                selected_settings_file,
+                max_bytes=SETTINGS_ARTIFACT_MAX_RAW_BYTES,
+            )
+        )
+        settings_data = settings_artifact.to_object()
     else:
         settings_data = _read_json(selected_settings_file)
     raw_saved = (settings_data or {}).get("processing_settings", {})
@@ -1536,6 +2524,15 @@ def build_resume_report(  # noqa: C901
         raw_saved,
         saved_version=saved_version,
     )
+    source_settings_schema_version = saved_result.source_version
+    if (
+        saved_result.source_version == 5
+        and isinstance(settings_metadata, dict)
+        and type(settings_metadata.get("source_settings_schema_version")) is int
+    ):
+        source_settings_schema_version = settings_metadata[
+            "source_settings_schema_version"
+        ]
     removed = saved_result.removed_settings
     saved_settings = saved_result.settings
     migrated_settings = validate_settings(current_settings, source="explicit")
@@ -1661,22 +2658,50 @@ def build_resume_report(  # noqa: C901
     video_properties = (report_settings_data or {}).get("video_properties", {})
     if not isinstance(video_properties, dict):
         video_properties = {}
-    stages.extend(
-        _build_generated_stages(
-            root,
-            frame_files,
-            saved_settings,
-            migrated_settings,
-            render_metadata,
-            video_properties,
-            geometry_mode,
-            current_settings_schema=settings_schema_current,
-            geometry_reusable=render_reusable,
-        )
+    generated_stages, legacy_fast_adoption = _build_generated_stages(
+        root,
+        frame_files,
+        saved_settings,
+        migrated_settings,
+        render_metadata,
+        video_properties,
+        geometry_mode,
+        current_settings_schema=settings_schema_current,
+        source_settings_schema_version=source_settings_schema_version,
+        geometry_reusable=render_reusable,
     )
+    stages.extend(generated_stages)
     backup_required = selected_settings_file is not None and (
         bool(removed) or not settings_schema_current
     )
+    final_media_audit: object | None = None
+    historical_diagnostics_valid: bool | None = None
+    stereo_payload_reusable: bool | None = None
+    if (
+        settings_artifact is not None
+        and settings_data is not None
+        and settings_data["metadata"]["processing_status"] == "completed"
+    ):
+        from ..processing.video.final_publication import audit_final_media_v1
+        from ..rendering.quality.cleanup_transaction import (
+            audit_payload_pruned_historical_diagnostics_v1,
+        )
+        from ..rendering.quality.diagnostic_transaction import (
+            project_diagnostics_metadata,
+        )
+
+        final_media_audit = audit_final_media_v1(root, settings_artifact)
+        try:
+            diagnostics = project_diagnostics_metadata(
+                root / "04_stereo_diagnostics" / "metadata.json"
+            ).validate_state_contract()
+        except (OSError, ValueError, NoFollowPathError):
+            diagnostics = None
+        if diagnostics is not None and diagnostics.status == "payload_pruned":
+            historical_diagnostics_valid = (
+                audit_payload_pruned_historical_diagnostics_v1(root)
+            )
+            stereo_payload_reusable = False
     return ResumeReport(
         output_dir=root,
         stages=tuple(stages),
@@ -1685,6 +2710,10 @@ def build_resume_report(  # noqa: C901
         original_settings_data=settings_data,
         migrated_settings=migrated_settings,
         settings_backup_required=backup_required,
+        legacy_fast_adoption=legacy_fast_adoption,
+        final_media_audit=final_media_audit,
+        historical_diagnostics_valid=historical_diagnostics_valid,
+        stereo_payload_reusable=stereo_payload_reusable,
     )
 
 
@@ -1799,14 +2828,23 @@ def apply_legacy_migration(report: ResumeReport, mode: MigrationMode) -> None:
         else None
     )
     moved: list[tuple[Path, Path]] = []
+    existing_intent = recover_legacy_fast_adoption_intent_v1(report.output_dir)
+    if existing_intent is not None and existing_intent != report.legacy_fast_adoption:
+        raise ValueError("legacy Fast adoption intent differs from the resume report")
+    published_new_intent = False
     try:
         _migrate_settings(report)
+        if report.legacy_fast_adoption is not None and existing_intent is None:
+            publish_legacy_fast_adoption_intent_v1(report.legacy_fast_adoption)
+            published_new_intent = True
         for source in report.migration_paths:
             destination = destinations[source]
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(source), str(destination))
             moved.append((source, destination))
     except Exception:
+        if published_new_intent and report.legacy_fast_adoption is not None:
+            retire_legacy_fast_adoption_intent_v1(report.legacy_fast_adoption)
         _rollback_migration(report, moved, original_settings)
         _remove_empty_migration_directories(report.output_dir)
         raise

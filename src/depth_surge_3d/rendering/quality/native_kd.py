@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import importlib
+import os
+from pathlib import Path
 from types import ModuleType
 
 import numpy as np
@@ -17,6 +20,8 @@ from .implicit_kd import (
     _validate_inputs,
     _validate_nonnegative_integer,
 )
+from ...io.file_identity import capture_file_identity
+from ...io.nofollow_io import AcquiredRoot
 
 
 _NATIVE: ModuleType | None
@@ -48,6 +53,37 @@ def native_build_info() -> dict[str, object]:
 
     native = _require_native()
     return dict(native.build_info())
+
+
+def native_binary_evidence() -> dict[str, object]:
+    """Hash the exact no-follow extension file imported by this process."""
+
+    native = _require_native()
+    raw_path = getattr(native, "__file__", None)
+    if not isinstance(raw_path, str) or not raw_path:
+        raise RuntimeError("native extension did not expose its binary path")
+    path = Path(os.path.abspath(raw_path))
+    before = capture_file_identity(path)
+    digest = hashlib.sha256()
+    byte_count = 0
+    with AcquiredRoot(path.parent) as acquired:
+        with acquired.open_regular(path) as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                byte_count += len(chunk)
+    after = capture_file_identity(path)
+    if after != before:
+        raise RuntimeError("native extension identity changed while hashing")
+    return {
+        "path": str(path),
+        "identity": before.to_object(),
+        "sha256": digest.hexdigest(),
+        "byte_count": byte_count,
+        "build_info": native_build_info(),
+    }
 
 
 def build_native_implicit_region_kd(

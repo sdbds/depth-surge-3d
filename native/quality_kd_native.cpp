@@ -1,6 +1,8 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 
+#include "quality_kd_build_identity.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -22,6 +24,11 @@ constexpr std::uint64_t kUint32Max = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint64_t kRepairRecordCap = (64ULL * 1024ULL * 1024ULL) / 16ULL;
 constexpr std::uint8_t kDividerAddMarker = 0x40;
 constexpr std::uint32_t kPackedCoordinateLimit = 0xffff;
+
+class QualityNativeBudgetError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class U32Divider {
 public:
@@ -1271,7 +1278,7 @@ void visit_repair_runs_with_accessors(
                 ++statistics->repair_run_count;
                 statistics->record_count += end / 16 - start / 16 + 1;
                 if (statistics->record_count > kRepairRecordCap) {
-                    throw std::runtime_error("64 MiB repair record arena exceeded");
+                    throw QualityNativeBudgetError("64 MiB repair record arena exceeded");
                 }
                 callback(row, start, end, region, far_side);
             };
@@ -1637,7 +1644,8 @@ py::tuple analyze_splat_band(
     py::array& pure_region_id,
     py::array& blue,
     py::array& green,
-    py::array& red
+    py::array& red,
+    py::object record_output_object
 ) {
     validate_array(
         winner_source_index,
@@ -1804,13 +1812,29 @@ py::tuple analyze_splat_band(
                std::uint8_t) {}
         );
     }
-    py::array_t<std::uint8_t> records(
-        {
+    const bool caller_owned_output = !record_output_object.is_none();
+    py::array records;
+    if (caller_owned_output) {
+        records = py::cast<py::array>(record_output_object);
+        if (
+            !records.dtype().is(py::dtype::of<std::uint8_t>()) ||
+            records.ndim() != 2 || records.shape(1) != 16 ||
+            (records.flags() & py::array::c_style) == 0 || !records.writeable()
+        ) {
+            throw py::type_error(
+                "record_output must be a writable C-contiguous uint8 [capacity,16] array"
+            );
+        }
+        if (static_cast<std::uint64_t>(records.shape(0)) < statistics.record_count) {
+            throw QualityNativeBudgetError("64 MiB repair record arena exceeded");
+        }
+    } else {
+        records = py::array_t<std::uint8_t>({
             static_cast<py::ssize_t>(statistics.record_count),
             static_cast<py::ssize_t>(16),
-        }
-    );
-    auto* record_values = records.mutable_data();
+        });
+    }
+    auto* record_values = static_cast<std::uint8_t*>(records.mutable_data());
     std::fill(record_values, record_values + statistics.record_count * 16, 0);
     std::uint64_t cursor = 0;
     {
@@ -1856,6 +1880,9 @@ py::tuple analyze_splat_band(
     result_statistics["prefill_run_count"] = statistics.prefill_run_count;
     result_statistics["repair_run_count"] = statistics.repair_run_count;
     result_statistics["invalid_lane_count"] = statistics.invalid_lane_count;
+    if (caller_owned_output) {
+        return py::make_tuple(statistics.record_count, std::move(result_statistics));
+    }
     return py::make_tuple(std::move(records), std::move(result_statistics));
 }
 
@@ -2077,10 +2104,169 @@ py::tuple build_safe_donor_index(
     return py::make_tuple(std::move(members), std::move(offsets));
 }
 
+py::tuple build_safe_donor_index_into(
+    const py::array& coverage_count,
+    const py::array& pure_region_id,
+    const py::array& referenced_regions,
+    bool include_full_pure_for_empty_regions,
+    py::array members_output,
+    py::array offsets_output,
+    py::array use_full_output
+) {
+    validate_array(coverage_count, py::dtype::of<std::uint8_t>(), "coverage_count");
+    validate_array(pure_region_id, py::dtype::of<std::uint32_t>(), "pure_region_id");
+    validate_vector(referenced_regions, py::dtype::of<bool>(), "referenced_regions");
+    auto require_vector = [](py::array& value, const py::dtype& dtype, const char* name) {
+        if (
+            !value.dtype().is(dtype) || value.ndim() != 1 ||
+            (value.flags() & py::array::c_style) == 0 || !value.writeable()
+        ) {
+            throw py::type_error(std::string(name) + " must be a writable contiguous vector");
+        }
+    };
+    require_vector(members_output, py::dtype::of<std::uint32_t>(), "members_output");
+    require_vector(offsets_output, py::dtype::of<std::uint32_t>(), "offsets_output");
+    require_vector(use_full_output, py::dtype::of<bool>(), "use_full_output");
+    if (
+        pure_region_id.shape(0) != coverage_count.shape(0) ||
+        pure_region_id.shape(1) != coverage_count.shape(1) ||
+        referenced_regions.shape(0) < 2
+    ) {
+        throw py::value_error("safe-donor index inputs are inconsistent");
+    }
+    const std::uint64_t sample_count64 =
+        static_cast<std::uint64_t>(coverage_count.shape(0)) * coverage_count.shape(1);
+    const std::uint64_t region_count64 = referenced_regions.shape(0) - 1;
+    if (sample_count64 + 1 > kUint32Max || region_count64 + 1 > kUint32Max) {
+        throw py::value_error("safe-donor index shape must fit uint32");
+    }
+    const auto height = static_cast<std::uint32_t>(coverage_count.shape(0));
+    const auto width = static_cast<std::uint32_t>(coverage_count.shape(1));
+    const auto sample_count = static_cast<std::uint32_t>(sample_count64);
+    const auto region_count = static_cast<std::uint32_t>(region_count64);
+    if (
+        offsets_output.shape(0) < static_cast<py::ssize_t>(region_count) + 1 ||
+        use_full_output.shape(0) < static_cast<py::ssize_t>(region_count) + 1
+    ) {
+        throw std::runtime_error("safe-donor region descriptors exceed repair arena");
+    }
+    const auto* coverage = static_cast<const std::uint8_t*>(coverage_count.data());
+    const auto* regions = static_cast<const std::uint32_t*>(pure_region_id.data());
+    const auto* referenced = static_cast<const std::uint8_t*>(referenced_regions.data());
+    auto* members = static_cast<std::uint32_t*>(members_output.mutable_data());
+    auto* offsets = static_cast<std::uint32_t*>(offsets_output.mutable_data());
+    auto* use_full = static_cast<std::uint8_t*>(use_full_output.mutable_data());
+    std::fill(offsets, offsets + region_count + 1, 0);
+    std::fill(use_full, use_full + region_count + 1, 0);
+    const auto radius = static_cast<std::uint32_t>(std::max(
+        1.0,
+        std::floor(static_cast<double>(height) / 1080.0 + 0.5)
+    ));
+    std::uint32_t donor_count = 0;
+    {
+        py::gil_scoped_release release;
+        for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
+            const std::uint32_t region = regions[pixel];
+            if (
+                region == 0 || region > region_count || referenced[region] == 0 ||
+                coverage[pixel] != 16 || !is_safe_donor_pixel(
+                    coverage, regions, height, width, pixel, region, radius
+                )
+            ) {
+                continue;
+            }
+            ++offsets[region - 1];
+            ++donor_count;
+        }
+        if (include_full_pure_for_empty_regions) {
+            for (std::uint32_t region = 1; region <= region_count; ++region) {
+                if (referenced[region] != 0 && offsets[region - 1] == 0) {
+                    use_full[region] = 1;
+                }
+            }
+            for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
+                const std::uint32_t region = regions[pixel];
+                if (
+                    region == 0 || region > region_count || use_full[region] == 0 ||
+                    coverage[pixel] != 16
+                ) {
+                    continue;
+                }
+                ++offsets[region - 1];
+                ++donor_count;
+            }
+        }
+        const std::uint64_t index_bytes =
+            static_cast<std::uint64_t>(donor_count) * sizeof(std::uint32_t) +
+            static_cast<std::uint64_t>(region_count + 1) * sizeof(std::uint32_t) +
+            static_cast<std::uint64_t>(region_count + 1);
+        if (
+            index_bytes > 48ULL * 1024ULL * 1024ULL ||
+            members_output.shape(0) < donor_count
+        ) {
+            throw std::runtime_error("safe-donor index exceeds its 48 MiB partition");
+        }
+        std::uint32_t running = 0;
+        for (std::uint32_t region_index = 0; region_index < region_count; ++region_index) {
+            running += offsets[region_index];
+            offsets[region_index] = running;
+        }
+        offsets[region_count] = donor_count;
+        const bool packed_coordinates =
+            height <= kPackedCoordinateLimit && width <= kPackedCoordinateLimit;
+        for (std::uint32_t cursor = sample_count; cursor > 0; --cursor) {
+            const std::uint32_t pixel = cursor - 1;
+            const std::uint32_t region = regions[pixel];
+            if (
+                region == 0 || region > region_count || referenced[region] == 0 ||
+                coverage[pixel] != 16
+            ) {
+                continue;
+            }
+            if (
+                use_full[region] == 0 && !is_safe_donor_pixel(
+                    coverage, regions, height, width, pixel, region, radius
+                )
+            ) {
+                continue;
+            }
+            const std::uint32_t destination = --offsets[region - 1];
+            if (packed_coordinates) {
+                const std::uint32_t row = pixel / width;
+                members[destination] = (row << 16) | (pixel - row * width);
+            } else {
+                members[destination] = pixel;
+            }
+        }
+        for (std::uint32_t region_index = 0; region_index < region_count; ++region_index) {
+            partition_region_tree(
+                members,
+                offsets[region_index],
+                offsets[region_index + 1],
+                height,
+                width,
+                packed_coordinates
+            );
+        }
+        if (packed_coordinates) {
+            for (std::uint32_t cursor = 0; cursor < donor_count; ++cursor) {
+                const std::uint32_t packed = members[cursor];
+                members[cursor] = (packed >> 16) * width + (packed & kPackedCoordinateLimit);
+            }
+        }
+    }
+    const std::uint64_t reported_index_bytes =
+        static_cast<std::uint64_t>(donor_count) * sizeof(std::uint32_t) +
+        static_cast<std::uint64_t>(region_count + 1) * sizeof(std::uint32_t);
+    return py::make_tuple(donor_count, reported_index_bytes);
+}
+
 py::tuple build_safe_donor_mask(
     const py::array& coverage_count,
     const py::array& pure_region_id,
-    const py::array& referenced_regions
+    const py::array& referenced_regions,
+    py::object safe_output_object,
+    py::object region_output_object
 ) {
     validate_array(
         coverage_count,
@@ -2128,10 +2314,37 @@ py::tuple build_safe_donor_mask(
         1.0,
         std::floor(static_cast<double>(height) / 1080.0 + 0.5)
     ));
-    py::array_t<bool> safe({coverage_count.shape(0), coverage_count.shape(1)});
-    py::array_t<bool> region_has_safe_donor(referenced_regions.shape(0));
-    auto* safe_values = safe.mutable_data();
-    auto* region_values = region_has_safe_donor.mutable_data();
+    if (safe_output_object.is_none() != region_output_object.is_none()) {
+        throw py::value_error("safe donor outputs must be supplied together");
+    }
+    py::array safe;
+    py::array region_has_safe_donor;
+    if (safe_output_object.is_none()) {
+        safe = py::array_t<bool>({coverage_count.shape(0), coverage_count.shape(1)});
+        region_has_safe_donor = py::array_t<bool>(referenced_regions.shape(0));
+    } else {
+        safe = py::cast<py::array>(safe_output_object);
+        region_has_safe_donor = py::cast<py::array>(region_output_object);
+        if (
+            !safe.dtype().is(py::dtype::of<bool>()) || safe.ndim() != 2 ||
+            safe.shape(0) != coverage_count.shape(0) ||
+            safe.shape(1) != coverage_count.shape(1) ||
+            (safe.flags() & py::array::c_style) == 0 || !safe.writeable()
+        ) {
+            throw py::type_error("safe_output must be a writable matching bool raster");
+        }
+        if (
+            !region_has_safe_donor.dtype().is(py::dtype::of<bool>()) ||
+            region_has_safe_donor.ndim() != 1 ||
+            region_has_safe_donor.shape(0) < referenced_regions.shape(0) ||
+            (region_has_safe_donor.flags() & py::array::c_style) == 0 ||
+            !region_has_safe_donor.writeable()
+        ) {
+            throw py::type_error("region_output must cover every referenced region");
+        }
+    }
+    auto* safe_values = static_cast<bool*>(safe.mutable_data());
+    auto* region_values = static_cast<bool*>(region_has_safe_donor.mutable_data());
     {
         py::gil_scoped_release release;
         std::fill(safe_values, safe_values + sample_count, false);
@@ -2181,7 +2394,8 @@ py::tuple query_fallback_records(
     const py::array& red,
     std::uint64_t radius_px,
     py::array budget_state,
-    bool allow_seeded_missing
+    bool allow_seeded_missing,
+    py::object visits_output_object
 ) {
     validate_index_arrays(members, offsets, height, width);
     if (
@@ -2223,8 +2437,23 @@ py::tuple query_fallback_records(
         );
     }
 
-    py::array_t<std::uint32_t> visits(query_count);
-    auto* visit_values = visits.mutable_data();
+    const bool caller_owned_visits = !visits_output_object.is_none();
+    py::array visits;
+    if (caller_owned_visits) {
+        visits = py::cast<py::array>(visits_output_object);
+        if (
+            !visits.dtype().is(py::dtype::of<std::uint32_t>()) || visits.ndim() != 1 ||
+            (visits.flags() & py::array::c_style) == 0 || !visits.writeable() ||
+            visits.shape(0) < query_count
+        ) {
+            throw py::type_error(
+                "visits_output must be a writable uint32 vector covering every query"
+            );
+        }
+    } else {
+        visits = py::array_t<std::uint32_t>(query_count);
+    }
+    auto* visit_values = static_cast<std::uint32_t*>(visits.mutable_data());
     auto* record_values =
         static_cast<std::uint8_t*>(raw_records.mutable_data());
     const auto* member_values =
@@ -2283,6 +2512,9 @@ py::tuple query_fallback_records(
             record[12] = red_values[best.sample_index];
             ++query;
         }
+    }
+    if (caller_owned_visits) {
+        return py::make_tuple(query_count, seeded_missing);
     }
     return py::make_tuple(std::move(visits), seeded_missing);
 }
@@ -2456,7 +2688,11 @@ std::pair<std::int32_t, std::int32_t> exemplar_sobel(
     return {gx, gy};
 }
 
-py::tuple build_exemplar_sobel_planes(const py::array& working_bgr) {
+py::tuple build_exemplar_sobel_planes(
+    const py::array& working_bgr,
+    py::object gradient_x_object,
+    py::object gradient_y_object
+) {
     if (
         !working_bgr.dtype().is(py::dtype::of<std::uint8_t>()) ||
         working_bgr.ndim() != 3 ||
@@ -2470,10 +2706,32 @@ py::tuple build_exemplar_sobel_planes(const py::array& working_bgr) {
     const std::int64_t height = working_bgr.shape(0);
     const std::int64_t width = working_bgr.shape(1);
     const auto* working = static_cast<const std::uint8_t*>(working_bgr.data());
-    py::array_t<std::int16_t> gradient_x({height, width});
-    py::array_t<std::int16_t> gradient_y({height, width});
-    auto* output_x = gradient_x.mutable_data();
-    auto* output_y = gradient_y.mutable_data();
+    if (gradient_x_object.is_none() != gradient_y_object.is_none()) {
+        throw py::value_error("exemplar gradient outputs must be supplied together");
+    }
+    py::array gradient_x;
+    py::array gradient_y;
+    if (gradient_x_object.is_none()) {
+        gradient_x = py::array_t<std::int16_t>({height, width});
+        gradient_y = py::array_t<std::int16_t>({height, width});
+    } else {
+        gradient_x = py::cast<py::array>(gradient_x_object);
+        gradient_y = py::cast<py::array>(gradient_y_object);
+        for (py::array* output : {&gradient_x, &gradient_y}) {
+            if (
+                !output->dtype().is(py::dtype::of<std::int16_t>()) ||
+                output->ndim() != 2 || output->shape(0) != height ||
+                output->shape(1) != width ||
+                (output->flags() & py::array::c_style) == 0 || !output->writeable()
+            ) {
+                throw py::type_error(
+                    "exemplar gradient outputs must be writable matching int16 rasters"
+                );
+            }
+        }
+    }
+    auto* output_x = static_cast<std::int16_t*>(gradient_x.mutable_data());
+    auto* output_y = static_cast<std::int16_t*>(gradient_y.mutable_data());
     {
         py::gil_scoped_release release;
         for (std::int64_t row = 0; row < height; ++row) {
@@ -2771,6 +3029,758 @@ inline bool is_contiguous_u16_mask(std::uint16_t value) {
         value >> least_u16_bit(value)
     );
     return (shifted & static_cast<std::uint16_t>(shifted + 1U)) == 0;
+}
+
+std::uint64_t collect_exemplar_targets_into_native(
+    const py::array& raw_records,
+    const py::array& record_indexes,
+    std::uint32_t region,
+    std::uint32_t frame_height,
+    std::uint32_t frame_width,
+    py::array target_pixels,
+    const py::object& target_colours_object
+) {
+    if (
+        !raw_records.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        raw_records.ndim() != 2 || raw_records.shape(1) != 16 ||
+        (raw_records.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error("raw_records must be a C-contiguous uint8 [n,16] array");
+    }
+    validate_vector(record_indexes, py::dtype::of<std::uint32_t>(), "record_indexes");
+    if (
+        !target_pixels.dtype().is(py::dtype::of<std::uint32_t>()) ||
+        target_pixels.ndim() != 1 ||
+        (target_pixels.flags() & py::array::c_style) == 0 ||
+        !target_pixels.writeable() ||
+        target_pixels.shape(0) < record_indexes.shape(0)
+    ) {
+        throw py::type_error(
+            "target_pixels must be a writable uint32 vector with record capacity"
+        );
+    }
+    if (frame_height == 0 || frame_width == 0 || region == 0 || region == kUint32Max) {
+        throw py::value_error("exemplar target identity is invalid");
+    }
+    const std::uint64_t pixel_count =
+        static_cast<std::uint64_t>(frame_height) * frame_width;
+    if (pixel_count > kUint32Max) {
+        throw py::value_error("exemplar frame exceeds uint32 pixels");
+    }
+    py::array target_colours;
+    std::uint8_t* colour_values = nullptr;
+    if (!target_colours_object.is_none()) {
+        target_colours = py::cast<py::array>(target_colours_object);
+        if (
+            !target_colours.dtype().is(py::dtype::of<std::uint8_t>()) ||
+            target_colours.ndim() != 2 || target_colours.shape(1) != 3 ||
+            target_colours.shape(0) < record_indexes.shape(0) ||
+            (target_colours.flags() & py::array::c_style) == 0 ||
+            !target_colours.writeable()
+        ) {
+            throw py::type_error(
+                "target_colours must be a writable uint8 [record_capacity,3] array"
+            );
+        }
+        colour_values = static_cast<std::uint8_t*>(target_colours.mutable_data());
+    }
+    const auto* records = static_cast<const std::uint8_t*>(raw_records.data());
+    const auto* indexes = static_cast<const std::uint32_t*>(record_indexes.data());
+    auto* pixels = static_cast<std::uint32_t*>(target_pixels.mutable_data());
+    std::uint64_t target_count = 0;
+    bool have_previous = false;
+    std::uint32_t previous_pixel = 0;
+    {
+        py::gil_scoped_release release;
+        for (py::ssize_t ordinal = 0; ordinal < record_indexes.shape(0); ++ordinal) {
+            const std::uint32_t record_index = indexes[ordinal];
+            if (record_index >= static_cast<std::uint64_t>(raw_records.shape(0))) {
+                throw std::runtime_error("exemplar record index lies outside its arena");
+            }
+            const std::uint8_t* record = records + 16ULL * record_index;
+            const std::uint32_t pixel = load_u32_le(record);
+            if (pixel >= pixel_count) {
+                throw std::runtime_error("exemplar target pixel lies outside the frame");
+            }
+            if (have_previous && pixel < previous_pixel) {
+                throw std::runtime_error("exemplar component records are not row-major");
+            }
+            previous_pixel = pixel;
+            have_previous = true;
+            if (record[13] != 0) {
+                continue;
+            }
+            if (load_u32_le(record + 6) != region) {
+                throw std::runtime_error("exemplar component crosses a region");
+            }
+            if (target_count != 0 && pixels[target_count - 1] == pixel) {
+                if (
+                    colour_values != nullptr &&
+                    (
+                        colour_values[3 * (target_count - 1)] != record[10] ||
+                        colour_values[3 * (target_count - 1) + 1] != record[11] ||
+                        colour_values[3 * (target_count - 1) + 2] != record[12]
+                    )
+                ) {
+                    throw std::runtime_error(
+                        "records for one exemplar target disagree on colour"
+                    );
+                }
+                continue;
+            }
+            pixels[target_count] = pixel;
+            if (colour_values != nullptr) {
+                colour_values[3 * target_count] = record[10];
+                colour_values[3 * target_count + 1] = record[11];
+                colour_values[3 * target_count + 2] = record[12];
+            }
+            ++target_count;
+        }
+    }
+    return target_count;
+}
+
+std::uint64_t prepare_exemplar_full_level_into_native(
+    const py::array& coverage_count,
+    const py::array& pure_region_id,
+    const py::array& blue,
+    const py::array& green,
+    const py::array& red,
+    const py::array& safe_donor_mask,
+    const py::array& target_pixels,
+    const py::array& target_colours,
+    const py::array& completed,
+    const py::array& completed_colours,
+    std::uint32_t region,
+    std::uint32_t y0,
+    std::uint32_t x0,
+    std::uint32_t interior_y0,
+    std::uint32_t interior_y1,
+    std::uint32_t interior_x0,
+    std::uint32_t interior_x1,
+    py::array working,
+    py::array donor,
+    py::array target,
+    py::array processed,
+    py::array barrier
+) {
+    validate_array(coverage_count, py::dtype::of<std::uint8_t>(), "coverage_count");
+    validate_array(pure_region_id, py::dtype::of<std::uint32_t>(), "pure_region_id");
+    validate_array(blue, py::dtype::of<std::uint8_t>(), "blue");
+    validate_array(green, py::dtype::of<std::uint8_t>(), "green");
+    validate_array(red, py::dtype::of<std::uint8_t>(), "red");
+    validate_array(safe_donor_mask, py::dtype::of<bool>(), "safe_donor_mask");
+    validate_vector(target_pixels, py::dtype::of<std::uint32_t>(), "target_pixels");
+    validate_array(target_colours, py::dtype::of<std::uint8_t>(), "target_colours");
+    validate_vector(completed, py::dtype::of<bool>(), "completed");
+    validate_array(completed_colours, py::dtype::of<std::uint8_t>(), "completed_colours");
+    const py::ssize_t frame_height = coverage_count.shape(0);
+    const py::ssize_t frame_width = coverage_count.shape(1);
+    if (
+        frame_height <= 0 || frame_width <= 0 ||
+        static_cast<std::uint64_t>(frame_height) > kUint32Max ||
+        static_cast<std::uint64_t>(frame_width) > kUint32Max ||
+        static_cast<std::uint64_t>(frame_height) *
+            static_cast<std::uint64_t>(frame_width) > kUint32Max
+    ) {
+        throw py::value_error("exemplar source shape must fit uint32 pixels");
+    }
+    const auto frame_height_u32 = static_cast<std::uint32_t>(frame_height);
+    const auto frame_width_u32 = static_cast<std::uint32_t>(frame_width);
+    for (const py::array* raster : {
+        &pure_region_id, &blue, &green, &red, &safe_donor_mask
+    }) {
+        if (raster->shape(0) != frame_height || raster->shape(1) != frame_width) {
+            throw py::value_error("exemplar source rasters must match");
+        }
+    }
+    const py::ssize_t target_count = target_pixels.shape(0);
+    if (
+        target_colours.ndim() != 2 || target_colours.shape(0) != target_count ||
+        target_colours.shape(1) != 3 || completed.shape(0) != target_count ||
+        completed_colours.ndim() != 2 ||
+        completed_colours.shape(0) != target_count ||
+        completed_colours.shape(1) != 3
+    ) {
+        throw py::value_error("exemplar target arrays must match");
+    }
+    if (
+        !working.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        working.ndim() != 3 || working.shape(2) != 3 ||
+        (working.flags() & py::array::c_style) == 0 || !working.writeable()
+    ) {
+        throw py::type_error("working must be a writable uint8 [h,w,3] array");
+    }
+    const py::ssize_t local_height = working.shape(0);
+    const py::ssize_t local_width = working.shape(1);
+    if (
+        local_height <= 0 || local_width <= 0 ||
+        static_cast<std::uint64_t>(local_height) > kUint32Max ||
+        static_cast<std::uint64_t>(local_width) > kUint32Max
+    ) {
+        throw py::value_error("exemplar working shape must fit uint32 bounds");
+    }
+    for (py::array* mask : {&donor, &target, &processed, &barrier}) {
+        if (
+            !mask->dtype().is(py::dtype::of<bool>()) || mask->ndim() != 2 ||
+            mask->shape(0) != local_height || mask->shape(1) != local_width ||
+            (mask->flags() & py::array::c_style) == 0 || !mask->writeable()
+        ) {
+            throw py::type_error("exemplar outputs must be writable matching bool rasters");
+        }
+    }
+    const auto local_width_u64 = static_cast<std::uint64_t>(local_width);
+    const std::uint64_t y1_64 =
+        static_cast<std::uint64_t>(y0) + static_cast<std::uint64_t>(local_height);
+    const std::uint64_t x1_64 =
+        static_cast<std::uint64_t>(x0) + local_width_u64;
+    if (
+        y1_64 > frame_height_u32 || x1_64 > frame_width_u32 ||
+        !(y0 <= interior_y0 && interior_y0 < interior_y1 && interior_y1 <= y1_64) ||
+        !(x0 <= interior_x0 && interior_x0 < interior_x1 && interior_x1 <= x1_64) ||
+        region == 0 || region == kUint32Max
+    ) {
+        throw py::value_error("exemplar working bounds are invalid");
+    }
+    const auto y1 = static_cast<std::uint32_t>(y1_64);
+    const auto x1 = static_cast<std::uint32_t>(x1_64);
+    const auto* coverage = static_cast<const std::uint8_t*>(coverage_count.data());
+    const auto* regions = static_cast<const std::uint32_t*>(pure_region_id.data());
+    const auto* blue_values = static_cast<const std::uint8_t*>(blue.data());
+    const auto* green_values = static_cast<const std::uint8_t*>(green.data());
+    const auto* red_values = static_cast<const std::uint8_t*>(red.data());
+    const auto* safe = static_cast<const bool*>(safe_donor_mask.data());
+    const auto* pixels = static_cast<const std::uint32_t*>(target_pixels.data());
+    const auto* colours = static_cast<const std::uint8_t*>(target_colours.data());
+    const auto* completed_values = static_cast<const bool*>(completed.data());
+    const auto* completed_colour_values = static_cast<const std::uint8_t*>(
+        completed_colours.data()
+    );
+    auto* working_values = static_cast<std::uint8_t*>(working.mutable_data());
+    auto* donor_values = static_cast<bool*>(donor.mutable_data());
+    auto* target_values = static_cast<bool*>(target.mutable_data());
+    auto* processed_values = static_cast<bool*>(processed.mutable_data());
+    auto* barrier_values = static_cast<bool*>(barrier.mutable_data());
+    std::uint64_t owned_count = 0;
+    {
+        py::gil_scoped_release release;
+        for (std::uint32_t row = y0; row < y1; ++row) {
+            for (std::uint32_t column = x0; column < x1; ++column) {
+                const std::uint64_t source =
+                    static_cast<std::uint64_t>(row) * frame_width_u32 + column;
+                const std::uint64_t local =
+                    static_cast<std::uint64_t>(row - y0) * local_width_u64 + column - x0;
+                const bool same = coverage[source] > 0 && regions[source] == region;
+                donor_values[local] = same && safe[source];
+                target_values[local] = false;
+                processed_values[local] = same;
+                barrier_values[local] = !same;
+                working_values[3 * local] = same ? blue_values[source] : 0;
+                working_values[3 * local + 1] = same ? green_values[source] : 0;
+                working_values[3 * local + 2] = same ? red_values[source] : 0;
+            }
+        }
+        const std::uint64_t frame_pixels =
+            static_cast<std::uint64_t>(frame_height_u32) * frame_width_u32;
+        for (py::ssize_t index = 0; index < target_count; ++index) {
+            const std::uint32_t pixel = pixels[index];
+            if (pixel >= frame_pixels) {
+                throw std::runtime_error("exemplar target lies outside the frame");
+            }
+            const std::uint32_t row = pixel / frame_width_u32;
+            const std::uint32_t column = pixel % frame_width_u32;
+            if (row < y0 || row >= y1 || column < x0 || column >= x1) {
+                continue;
+            }
+            const std::uint64_t local =
+                static_cast<std::uint64_t>(row - y0) * local_width_u64 + column - x0;
+            donor_values[local] = false;
+            if (
+                row >= interior_y0 && row < interior_y1 &&
+                column >= interior_x0 && column < interior_x1
+            ) {
+                target_values[local] = true;
+                processed_values[local] = false;
+                barrier_values[local] = false;
+                working_values[3 * local] = colours[3 * index];
+                working_values[3 * local + 1] = colours[3 * index + 1];
+                working_values[3 * local + 2] = colours[3 * index + 2];
+                ++owned_count;
+            } else if (completed_values[index]) {
+                processed_values[local] = true;
+                barrier_values[local] = false;
+                working_values[3 * local] = completed_colour_values[3 * index];
+                working_values[3 * local + 1] = completed_colour_values[3 * index + 1];
+                working_values[3 * local + 2] = completed_colour_values[3 * index + 2];
+            } else {
+                processed_values[local] = false;
+                barrier_values[local] = true;
+                working_values[3 * local] = 0;
+                working_values[3 * local + 1] = 0;
+                working_values[3 * local + 2] = 0;
+            }
+        }
+    }
+    return owned_count;
+}
+
+void downsample_exemplar_level_into_native(
+    const py::array& child_working,
+    const py::array& child_donor,
+    const py::array& child_target,
+    const py::array& child_processed,
+    const py::array& child_barrier,
+    py::array parent_working,
+    py::array parent_donor,
+    py::array parent_target,
+    py::array parent_processed,
+    py::array parent_barrier
+) {
+    if (
+        !child_working.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        child_working.ndim() != 3 || child_working.shape(2) != 3 ||
+        (child_working.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error("child_working must be C-contiguous uint8 [h,w,3]");
+    }
+    const py::ssize_t child_height = child_working.shape(0);
+    const py::ssize_t child_width = child_working.shape(1);
+    for (const py::array* mask : {
+        &child_donor, &child_target, &child_processed, &child_barrier
+    }) {
+        if (
+            !mask->dtype().is(py::dtype::of<bool>()) || mask->ndim() != 2 ||
+            mask->shape(0) != child_height || mask->shape(1) != child_width ||
+            (mask->flags() & py::array::c_style) == 0
+        ) {
+            throw py::type_error("child exemplar masks must match");
+        }
+    }
+    const py::ssize_t parent_height = (child_height + 1) / 2;
+    const py::ssize_t parent_width = (child_width + 1) / 2;
+    if (
+        !parent_working.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        parent_working.ndim() != 3 || parent_working.shape(0) != parent_height ||
+        parent_working.shape(1) != parent_width || parent_working.shape(2) != 3 ||
+        (parent_working.flags() & py::array::c_style) == 0 ||
+        !parent_working.writeable()
+    ) {
+        throw py::type_error("parent_working must be a writable matching uint8 raster");
+    }
+    for (py::array* mask : {
+        &parent_donor, &parent_target, &parent_processed, &parent_barrier
+    }) {
+        if (
+            !mask->dtype().is(py::dtype::of<bool>()) || mask->ndim() != 2 ||
+            mask->shape(0) != parent_height || mask->shape(1) != parent_width ||
+            (mask->flags() & py::array::c_style) == 0 || !mask->writeable()
+        ) {
+            throw py::type_error("parent exemplar masks must be writable and matching");
+        }
+    }
+    const auto* child_colours = static_cast<const std::uint8_t*>(child_working.data());
+    const auto* child_donor_values = static_cast<const bool*>(child_donor.data());
+    const auto* child_target_values = static_cast<const bool*>(child_target.data());
+    const auto* child_processed_values = static_cast<const bool*>(child_processed.data());
+    const auto* child_barrier_values = static_cast<const bool*>(child_barrier.data());
+    auto* colours = static_cast<std::uint8_t*>(parent_working.mutable_data());
+    auto* donor = static_cast<bool*>(parent_donor.mutable_data());
+    auto* target = static_cast<bool*>(parent_target.mutable_data());
+    auto* processed = static_cast<bool*>(parent_processed.mutable_data());
+    auto* barrier = static_cast<bool*>(parent_barrier.mutable_data());
+    {
+        py::gil_scoped_release release;
+        for (py::ssize_t row = 0; row < parent_height; ++row) {
+            for (py::ssize_t column = 0; column < parent_width; ++column) {
+                std::array<std::uint32_t, 3> sums{};
+                std::uint32_t count = 0;
+                bool donor_value = true;
+                bool target_value = false;
+                bool processed_value = true;
+                bool barrier_value = false;
+                for (py::ssize_t delta_row = 0; delta_row < 2; ++delta_row) {
+                    const py::ssize_t child_row = 2 * row + delta_row;
+                    if (child_row >= child_height) {
+                        continue;
+                    }
+                    for (py::ssize_t delta_column = 0; delta_column < 2; ++delta_column) {
+                        const py::ssize_t child_column = 2 * column + delta_column;
+                        if (child_column >= child_width) {
+                            continue;
+                        }
+                        const std::uint64_t child =
+                            static_cast<std::uint64_t>(child_row) * child_width + child_column;
+                        ++count;
+                        for (std::size_t channel = 0; channel < 3; ++channel) {
+                            sums[channel] += child_colours[3 * child + channel];
+                        }
+                        donor_value = donor_value && child_donor_values[child];
+                        target_value = target_value || child_target_values[child];
+                        processed_value = processed_value && child_processed_values[child];
+                        barrier_value = barrier_value || child_barrier_values[child];
+                    }
+                }
+                const std::uint64_t parent =
+                    static_cast<std::uint64_t>(row) * parent_width + column;
+                barrier[parent] = barrier_value;
+                target[parent] = !barrier_value && target_value;
+                donor[parent] = !barrier_value && donor_value;
+                processed[parent] = !target_value && !barrier_value && processed_value;
+                for (std::size_t channel = 0; channel < 3; ++channel) {
+                    if (barrier_value) {
+                        colours[3 * parent + channel] = 0;
+                        continue;
+                    }
+                    std::uint32_t quotient = sums[channel] / count;
+                    const std::uint32_t remainder = sums[channel] % count;
+                    if (
+                        2 * remainder > count ||
+                        (2 * remainder == count && (quotient & 1U) != 0)
+                    ) {
+                        ++quotient;
+                    }
+                    colours[3 * parent + channel] = static_cast<std::uint8_t>(quotient);
+                }
+            }
+        }
+    }
+}
+
+std::uint64_t enumerate_exemplar_donor_centres_into_native(
+    const py::array& donor_mask,
+    py::array integral,
+    py::array centres
+) {
+    validate_array(donor_mask, py::dtype::of<bool>(), "donor_mask");
+    const py::ssize_t height = donor_mask.shape(0);
+    const py::ssize_t width = donor_mask.shape(1);
+    if (
+        !integral.dtype().is(py::dtype::of<std::uint32_t>()) ||
+        integral.ndim() != 2 || integral.shape(0) != height + 1 ||
+        integral.shape(1) != width + 1 ||
+        (integral.flags() & py::array::c_style) == 0 || !integral.writeable()
+    ) {
+        throw py::type_error("integral must be a writable uint32 [h+1,w+1] raster");
+    }
+    const std::uint64_t capacity =
+        height >= 9 && width >= 9
+        ? static_cast<std::uint64_t>(height - 8) * (width - 8)
+        : 0;
+    if (
+        !centres.dtype().is(py::dtype::of<std::uint32_t>()) ||
+        centres.ndim() != 2 || centres.shape(1) != 2 ||
+        static_cast<std::uint64_t>(centres.shape(0)) < capacity ||
+        (centres.flags() & py::array::c_style) == 0 || !centres.writeable()
+    ) {
+        throw py::type_error("centres must be a writable uint32 [capacity,2] array");
+    }
+    const auto* donor = static_cast<const bool*>(donor_mask.data());
+    auto* sums = static_cast<std::uint32_t*>(integral.mutable_data());
+    auto* output = static_cast<std::uint32_t*>(centres.mutable_data());
+    std::uint64_t count = 0;
+    {
+        py::gil_scoped_release release;
+        std::fill(sums, sums + static_cast<std::uint64_t>(height + 1) * (width + 1), 0);
+        for (py::ssize_t row = 1; row <= height; ++row) {
+            std::uint32_t row_sum = 0;
+            for (py::ssize_t column = 1; column <= width; ++column) {
+                row_sum += donor[(row - 1) * width + column - 1] ? 1U : 0U;
+                sums[row * (width + 1) + column] =
+                    sums[(row - 1) * (width + 1) + column] + row_sum;
+            }
+        }
+        for (py::ssize_t row = 4; row + 4 < height; ++row) {
+            const py::ssize_t top = row - 4;
+            const py::ssize_t bottom = row + 5;
+            for (py::ssize_t column = 4; column + 4 < width; ++column) {
+                const py::ssize_t left = column - 4;
+                const py::ssize_t right = column + 5;
+                const std::uint32_t total =
+                    sums[bottom * (width + 1) + right] -
+                    sums[top * (width + 1) + right] -
+                    sums[bottom * (width + 1) + left] +
+                    sums[top * (width + 1) + left];
+                if (total == 81) {
+                    output[2 * count] = static_cast<std::uint32_t>(row);
+                    output[2 * count + 1] = static_cast<std::uint32_t>(column);
+                    ++count;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+void subsample_exemplar_indexes_into_native(
+    std::uint64_t candidate_count,
+    std::uint64_t selected_count,
+    py::array output
+) {
+    if (
+        !output.dtype().is(py::dtype::of<std::uint32_t>()) || output.ndim() != 1 ||
+        (output.flags() & py::array::c_style) == 0 || !output.writeable() ||
+        static_cast<std::uint64_t>(output.shape(0)) < selected_count
+    ) {
+        throw py::type_error("selected output must be a writable uint32 vector");
+    }
+    if (selected_count > candidate_count || candidate_count > kUint32Max) {
+        throw py::value_error("exemplar candidate counts are invalid");
+    }
+    auto* values = static_cast<std::uint32_t*>(output.mutable_data());
+    py::gil_scoped_release release;
+    for (std::uint64_t ordinal = 0; ordinal < selected_count; ++ordinal) {
+        values[ordinal] = static_cast<std::uint32_t>(
+            (ordinal * candidate_count) / selected_count
+        );
+    }
+}
+
+void replicate_exemplar_targets_into_native(
+    const py::array& coarse_working,
+    const py::array& coarse_target,
+    const py::array& coarse_barrier,
+    py::array fine_working,
+    const py::array& fine_target
+) {
+    if (
+        !coarse_working.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        coarse_working.ndim() != 3 || coarse_working.shape(2) != 3 ||
+        (coarse_working.flags() & py::array::c_style) == 0 ||
+        !fine_working.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        fine_working.ndim() != 3 || fine_working.shape(2) != 3 ||
+        (fine_working.flags() & py::array::c_style) == 0 || !fine_working.writeable()
+    ) {
+        throw py::type_error("exemplar working rasters are invalid");
+    }
+    validate_array(coarse_target, py::dtype::of<bool>(), "coarse_target");
+    validate_array(coarse_barrier, py::dtype::of<bool>(), "coarse_barrier");
+    validate_array(fine_target, py::dtype::of<bool>(), "fine_target");
+    const py::ssize_t coarse_height = coarse_working.shape(0);
+    const py::ssize_t coarse_width = coarse_working.shape(1);
+    const py::ssize_t fine_height = fine_working.shape(0);
+    const py::ssize_t fine_width = fine_working.shape(1);
+    if (
+        coarse_target.shape(0) != coarse_height || coarse_target.shape(1) != coarse_width ||
+        coarse_barrier.shape(0) != coarse_height || coarse_barrier.shape(1) != coarse_width ||
+        fine_target.shape(0) != fine_height || fine_target.shape(1) != fine_width ||
+        coarse_height != (fine_height + 1) / 2 ||
+        coarse_width != (fine_width + 1) / 2
+    ) {
+        throw py::value_error("exemplar pyramid levels do not align");
+    }
+    const auto* coarse_colours = static_cast<const std::uint8_t*>(coarse_working.data());
+    const auto* coarse_targets = static_cast<const bool*>(coarse_target.data());
+    const auto* coarse_barriers = static_cast<const bool*>(coarse_barrier.data());
+    auto* fine_colours = static_cast<std::uint8_t*>(fine_working.mutable_data());
+    const auto* fine_targets = static_cast<const bool*>(fine_target.data());
+    py::gil_scoped_release release;
+    for (py::ssize_t row = 0; row < fine_height; ++row) {
+        for (py::ssize_t column = 0; column < fine_width; ++column) {
+            const std::uint64_t fine = static_cast<std::uint64_t>(row) * fine_width + column;
+            if (!fine_targets[fine]) {
+                continue;
+            }
+            const std::uint64_t coarse =
+                static_cast<std::uint64_t>(row / 2) * coarse_width + column / 2;
+            if (coarse_targets[coarse] && !coarse_barriers[coarse]) {
+                fine_colours[3 * fine] = coarse_colours[3 * coarse];
+                fine_colours[3 * fine + 1] = coarse_colours[3 * coarse + 1];
+                fine_colours[3 * fine + 2] = coarse_colours[3 * coarse + 2];
+            }
+        }
+    }
+}
+
+void copy_exemplar_patch_into_native(
+    py::array working,
+    const py::array& target,
+    py::array processed,
+    std::uint32_t target_row,
+    std::uint32_t target_column,
+    std::uint32_t donor_row,
+    std::uint32_t donor_column
+) {
+    if (
+        !working.dtype().is(py::dtype::of<std::uint8_t>()) || working.ndim() != 3 ||
+        working.shape(2) != 3 || (working.flags() & py::array::c_style) == 0 ||
+        !working.writeable()
+    ) {
+        throw py::type_error("working must be a writable uint8 exemplar raster");
+    }
+    validate_array(target, py::dtype::of<bool>(), "target");
+    if (
+        !processed.dtype().is(py::dtype::of<bool>()) || processed.ndim() != 2 ||
+        (processed.flags() & py::array::c_style) == 0 || !processed.writeable()
+    ) {
+        throw py::type_error("processed must be a writable bool exemplar raster");
+    }
+    const std::uint32_t height = static_cast<std::uint32_t>(working.shape(0));
+    const std::uint32_t width = static_cast<std::uint32_t>(working.shape(1));
+    if (
+        target.shape(0) != height || target.shape(1) != width ||
+        processed.shape(0) != height || processed.shape(1) != width ||
+        target_row < 3 || target_row + 3 >= height || target_column < 3 ||
+        target_column + 3 >= width || donor_row < 3 || donor_row + 3 >= height ||
+        donor_column < 3 || donor_column + 3 >= width
+    ) {
+        throw py::value_error("exemplar copy patch lies outside its level");
+    }
+    auto* colours = static_cast<std::uint8_t*>(working.mutable_data());
+    const auto* targets = static_cast<const bool*>(target.data());
+    auto* processed_values = static_cast<bool*>(processed.mutable_data());
+    py::gil_scoped_release release;
+    for (std::int32_t delta_row = -3; delta_row <= 3; ++delta_row) {
+        for (std::int32_t delta_column = -3; delta_column <= 3; ++delta_column) {
+            const std::uint64_t destination =
+                static_cast<std::uint64_t>(target_row + delta_row) * width +
+                target_column + delta_column;
+            if (!targets[destination] || processed_values[destination]) {
+                continue;
+            }
+            const std::uint64_t source =
+                static_cast<std::uint64_t>(donor_row + delta_row) * width +
+                donor_column + delta_column;
+            colours[3 * destination] = colours[3 * source];
+            colours[3 * destination + 1] = colours[3 * source + 1];
+            colours[3 * destination + 2] = colours[3 * source + 2];
+            processed_values[destination] = true;
+        }
+    }
+}
+
+std::uint64_t record_exemplar_completions_into_native(
+    const py::array& full_working,
+    const py::array& full_target,
+    const py::array& full_processed,
+    const py::array& target_pixels,
+    std::uint32_t frame_width,
+    std::uint32_t y0,
+    std::uint32_t x0,
+    py::array completed,
+    py::array completed_colours
+) {
+    if (
+        !full_working.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        full_working.ndim() != 3 || full_working.shape(2) != 3 ||
+        (full_working.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error("full_working must be a C-contiguous uint8 raster");
+    }
+    validate_array(full_target, py::dtype::of<bool>(), "full_target");
+    validate_array(full_processed, py::dtype::of<bool>(), "full_processed");
+    validate_vector(target_pixels, py::dtype::of<std::uint32_t>(), "target_pixels");
+    if (
+        !completed.dtype().is(py::dtype::of<bool>()) || completed.ndim() != 1 ||
+        (completed.flags() & py::array::c_style) == 0 || !completed.writeable() ||
+        !completed_colours.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        completed_colours.ndim() != 2 || completed_colours.shape(1) != 3 ||
+        (completed_colours.flags() & py::array::c_style) == 0 ||
+        !completed_colours.writeable() ||
+        completed.shape(0) != target_pixels.shape(0) ||
+        completed_colours.shape(0) != target_pixels.shape(0)
+    ) {
+        throw py::type_error("completion outputs must match target_pixels");
+    }
+    const std::uint32_t local_height = static_cast<std::uint32_t>(full_working.shape(0));
+    const std::uint32_t local_width = static_cast<std::uint32_t>(full_working.shape(1));
+    if (
+        full_target.shape(0) != local_height || full_target.shape(1) != local_width ||
+        full_processed.shape(0) != local_height ||
+        full_processed.shape(1) != local_width || frame_width == 0
+    ) {
+        throw py::value_error("completion level masks do not match");
+    }
+    const auto* colours = static_cast<const std::uint8_t*>(full_working.data());
+    const auto* targets = static_cast<const bool*>(full_target.data());
+    const auto* processed = static_cast<const bool*>(full_processed.data());
+    const auto* pixels = static_cast<const std::uint32_t*>(target_pixels.data());
+    auto* completed_values = static_cast<bool*>(completed.mutable_data());
+    auto* output_colours = static_cast<std::uint8_t*>(completed_colours.mutable_data());
+    std::uint64_t count = 0;
+    py::gil_scoped_release release;
+    for (py::ssize_t index = 0; index < target_pixels.shape(0); ++index) {
+        const std::uint32_t row = pixels[index] / frame_width;
+        const std::uint32_t column = pixels[index] % frame_width;
+        if (
+            row < y0 || row >= static_cast<std::uint64_t>(y0) + local_height ||
+            column < x0 || column >= static_cast<std::uint64_t>(x0) + local_width
+        ) {
+            continue;
+        }
+        const std::uint64_t local =
+            static_cast<std::uint64_t>(row - y0) * local_width + column - x0;
+        if (targets[local] && processed[local]) {
+            if (!completed_values[index]) {
+                ++count;
+            }
+            completed_values[index] = true;
+            output_colours[3 * index] = colours[3 * local];
+            output_colours[3 * index + 1] = colours[3 * local + 1];
+            output_colours[3 * index + 2] = colours[3 * local + 2];
+        }
+    }
+    return count;
+}
+
+std::uint64_t commit_exemplar_records_into_native(
+    py::array raw_records,
+    const py::array& record_indexes,
+    const py::array& target_pixels,
+    const py::array& completed,
+    const py::array& completed_colours
+) {
+    if (
+        !raw_records.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        raw_records.ndim() != 2 || raw_records.shape(1) != 16 ||
+        (raw_records.flags() & py::array::c_style) == 0 || !raw_records.writeable()
+    ) {
+        throw py::type_error("raw_records must be writable C-contiguous uint8 [n,16]");
+    }
+    validate_vector(record_indexes, py::dtype::of<std::uint32_t>(), "record_indexes");
+    validate_vector(target_pixels, py::dtype::of<std::uint32_t>(), "target_pixels");
+    validate_vector(completed, py::dtype::of<bool>(), "completed");
+    validate_array(completed_colours, py::dtype::of<std::uint8_t>(), "completed_colours");
+    if (
+        completed.shape(0) != target_pixels.shape(0) ||
+        completed_colours.ndim() != 2 ||
+        completed_colours.shape(0) != target_pixels.shape(0) ||
+        completed_colours.shape(1) != 3
+    ) {
+        throw py::value_error("completed exemplar arrays must match target pixels");
+    }
+    auto* records = static_cast<std::uint8_t*>(raw_records.mutable_data());
+    const auto* indexes = static_cast<const std::uint32_t*>(record_indexes.data());
+    const auto* pixels = static_cast<const std::uint32_t*>(target_pixels.data());
+    const auto* completed_values = static_cast<const bool*>(completed.data());
+    const auto* colours = static_cast<const std::uint8_t*>(completed_colours.data());
+    const std::uint32_t target_count = static_cast<std::uint32_t>(target_pixels.shape(0));
+    std::uint64_t committed = 0;
+    py::gil_scoped_release release;
+    for (py::ssize_t ordinal = 0; ordinal < record_indexes.shape(0); ++ordinal) {
+        const std::uint32_t record_index = indexes[ordinal];
+        if (record_index >= static_cast<std::uint64_t>(raw_records.shape(0))) {
+            throw std::runtime_error("exemplar commit index lies outside record arena");
+        }
+        std::uint8_t* record = records + 16ULL * record_index;
+        if (record[13] != 0) {
+            continue;
+        }
+        const std::uint32_t pixel = load_u32_le(record);
+        const auto* found = std::lower_bound(pixels, pixels + target_count, pixel);
+        if (found == pixels + target_count || *found != pixel) {
+            throw std::runtime_error("exemplar record has no target identity");
+        }
+        const std::uint64_t target_index = found - pixels;
+        if (!completed_values[target_index]) {
+            continue;
+        }
+        record[10] = colours[3 * target_index];
+        record[11] = colours[3 * target_index + 1];
+        record[12] = colours[3 * target_index + 2];
+        record[13] = 2;
+        ++committed;
+    }
+    return committed;
 }
 
 std::uint64_t validate_repair_record_coverage_native(
@@ -3269,6 +4279,316 @@ py::tuple build_record_component_ids_native(
     return py::make_tuple(std::move(component_ids), component_count);
 }
 
+inline std::uint32_t fixed_component_find(
+    std::uint32_t* parent,
+    std::uint32_t index
+) {
+    std::uint32_t root = index;
+    while (parent[root] != root) {
+        root = parent[root];
+    }
+    while (parent[index] != index) {
+        const std::uint32_t next = parent[index];
+        parent[index] = root;
+        index = next;
+    }
+    return root;
+}
+
+inline void fixed_component_union(
+    std::uint32_t* parent,
+    std::uint8_t* rank,
+    std::uint32_t* keys,
+    std::uint32_t left,
+    std::uint32_t right
+) {
+    std::uint32_t left_root = fixed_component_find(parent, left);
+    std::uint32_t right_root = fixed_component_find(parent, right);
+    if (left_root == right_root) {
+        return;
+    }
+    if (
+        rank[left_root] < rank[right_root] ||
+        (rank[left_root] == rank[right_root] && keys[right_root] < keys[left_root])
+    ) {
+        std::swap(left_root, right_root);
+    }
+    parent[right_root] = left_root;
+    keys[left_root] = std::min(keys[left_root], keys[right_root]);
+    if (rank[left_root] == rank[right_root]) {
+        if (rank[left_root] == std::numeric_limits<std::uint8_t>::max()) {
+            throw std::runtime_error("repair component union rank overflow");
+        }
+        ++rank[left_root];
+    }
+}
+
+void fixed_union_component_groups(
+    const std::uint8_t* records,
+    std::uint32_t* parent,
+    std::uint8_t* rank,
+    std::uint32_t* keys,
+    std::uint32_t left_start,
+    std::uint32_t left_end,
+    std::uint32_t right_start,
+    std::uint32_t right_end,
+    ComponentRelation relation
+) {
+    for (std::uint32_t left = left_start; left < left_end; ++left) {
+        const std::uint8_t* left_record = records + 16ULL * left;
+        const std::uint32_t left_region = load_u32_le(left_record + 6);
+        const std::uint16_t left_mask = load_u16_le(left_record + 4);
+        for (std::uint32_t right = right_start; right < right_end; ++right) {
+            const std::uint8_t* right_record = records + 16ULL * right;
+            if (left_region != load_u32_le(right_record + 6)) {
+                continue;
+            }
+            const std::uint16_t right_mask = load_u16_le(right_record + 4);
+            bool adjacent = false;
+            if (relation == ComponentRelation::Same) {
+                adjacent = (
+                    ((static_cast<std::uint32_t>(left_mask) << 1U) & right_mask) |
+                    ((static_cast<std::uint32_t>(right_mask) << 1U) & left_mask)
+                ) != 0;
+            } else if (relation == ComponentRelation::Horizontal) {
+                adjacent = (left_mask & 0x8000U) != 0 && (right_mask & 0x0001U) != 0;
+            } else {
+                adjacent = (left_mask & right_mask) != 0;
+            }
+            if (adjacent) {
+                fixed_component_union(parent, rank, keys, left, right);
+            }
+        }
+    }
+}
+
+inline bool component_member_less(
+    std::uint32_t left,
+    std::uint32_t right,
+    const std::uint32_t* keys
+) {
+    return keys[left] < keys[right] || (keys[left] == keys[right] && left < right);
+}
+
+void sift_component_member_heap(
+    std::uint32_t* members,
+    std::uint32_t start,
+    std::uint32_t end,
+    const std::uint32_t* keys
+) {
+    std::uint32_t root = start;
+    while (true) {
+        const std::uint64_t child64 = 2ULL * root + 1;
+        if (child64 >= end) {
+            return;
+        }
+        std::uint32_t child = static_cast<std::uint32_t>(child64);
+        if (
+            child + 1 < end &&
+            component_member_less(members[child], members[child + 1], keys)
+        ) {
+            ++child;
+        }
+        if (!component_member_less(members[root], members[child], keys)) {
+            return;
+        }
+        std::swap(members[root], members[child]);
+        root = child;
+    }
+}
+
+std::uint32_t build_record_components_into_native(
+    const py::array& raw_records,
+    std::uint32_t height,
+    std::uint32_t width,
+    py::array parent_array,
+    py::array rank_array,
+    py::array member_array,
+    py::array key_array,
+    py::array row_workspace
+) {
+    if (
+        !raw_records.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        raw_records.ndim() != 2 || raw_records.shape(1) != 16 ||
+        (raw_records.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error("raw_records must be a C-contiguous uint8 [n,16] array");
+    }
+    auto require_output = [](py::array& value, const py::dtype& dtype, const char* name) {
+        if (
+            !value.dtype().is(dtype) || value.ndim() != 1 ||
+            (value.flags() & py::array::c_style) == 0 || !value.writeable()
+        ) {
+            throw py::type_error(std::string(name) + " must be a writable contiguous vector");
+        }
+    };
+    require_output(parent_array, py::dtype::of<std::uint32_t>(), "parent_output");
+    require_output(rank_array, py::dtype::of<std::uint8_t>(), "rank_output");
+    require_output(member_array, py::dtype::of<std::uint32_t>(), "member_output");
+    require_output(key_array, py::dtype::of<std::uint32_t>(), "key_output");
+    require_output(row_workspace, py::dtype::of<std::int32_t>(), "row_workspace");
+    if (height == 0 || width == 0) {
+        throw py::value_error("render shape must be positive");
+    }
+    const std::uint64_t count64 = static_cast<std::uint64_t>(raw_records.shape(0));
+    if (count64 > kRepairRecordCap) {
+        throw py::value_error("repair record count exceeds the fixed arena");
+    }
+    if (
+        static_cast<std::uint64_t>(parent_array.shape(0)) < count64 ||
+        static_cast<std::uint64_t>(rank_array.shape(0)) < count64 ||
+        static_cast<std::uint64_t>(member_array.shape(0)) < count64 ||
+        static_cast<std::uint64_t>(key_array.shape(0)) < count64 ||
+        static_cast<std::uint64_t>(row_workspace.shape(0)) < 4ULL * width
+    ) {
+        throw QualityNativeBudgetError("64 MiB graph arena partition exceeded");
+    }
+    const std::uint64_t pixel_count = static_cast<std::uint64_t>(height) * width;
+    if (pixel_count * 16ULL > kUint32Max) {
+        throw py::value_error("render shape must fit uint32 fine indexes");
+    }
+    const std::uint32_t count = static_cast<std::uint32_t>(count64);
+    if (count == 0) {
+        return 0;
+    }
+    const auto* records = static_cast<const std::uint8_t*>(raw_records.data());
+    auto* parent = static_cast<std::uint32_t*>(parent_array.mutable_data());
+    auto* rank = static_cast<std::uint8_t*>(rank_array.mutable_data());
+    auto* members = static_cast<std::uint32_t*>(member_array.mutable_data());
+    auto* keys = static_cast<std::uint32_t*>(key_array.mutable_data());
+    auto* rows = static_cast<std::int32_t*>(row_workspace.mutable_data());
+    auto* previous_starts = rows;
+    auto* previous_ends = rows + width;
+    auto* current_starts = rows + 2ULL * width;
+    auto* current_ends = rows + 3ULL * width;
+    std::fill(previous_starts, previous_starts + 2ULL * width, -1);
+    std::fill(rank, rank + count, 0);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        parent[index] = index;
+        members[index] = index;
+    }
+    std::uint32_t cursor = 0;
+    std::uint32_t previous_pixel = 0;
+    std::uint32_t previous_first_bit = 0;
+    std::uint32_t previous_region = 0;
+    std::uint8_t previous_far_side = 0;
+    bool has_previous_key = false;
+    {
+        py::gil_scoped_release release;
+        for (std::uint32_t row = 0; row < height; ++row) {
+            std::fill(current_starts, current_starts + width, -1);
+            std::fill(current_ends, current_ends + width, -1);
+            const std::uint64_t row_start_pixel = static_cast<std::uint64_t>(row) * width;
+            const std::uint64_t row_end_pixel = row_start_pixel + width;
+            while (cursor < count) {
+                const std::uint32_t pixel = load_u32_le(records + 16ULL * cursor);
+                if (pixel >= row_end_pixel) {
+                    break;
+                }
+                if (pixel < row_start_pixel || pixel >= pixel_count) {
+                    throw std::runtime_error("records are not ordered by output pixel");
+                }
+                const std::uint32_t column = pixel - static_cast<std::uint32_t>(row_start_pixel);
+                const std::uint32_t start = cursor;
+                while (cursor < count && load_u32_le(records + 16ULL * cursor) == pixel) {
+                    const std::uint8_t* record = records + 16ULL * cursor;
+                    const std::uint16_t mask = load_u16_le(record + 4);
+                    const std::uint32_t region = load_u32_le(record + 6);
+                    const std::uint8_t far_side = record[14];
+                    if (
+                        !is_contiguous_u16_mask(mask) || region == 0 || region == kUint32Max ||
+                        far_side > 1 || record[15] != 0
+                    ) {
+                        throw std::runtime_error("repair record identity is invalid");
+                    }
+                    const std::uint32_t first_bit = least_u16_bit(mask);
+                    const bool out_of_order = has_previous_key && (
+                        pixel < previous_pixel ||
+                        (pixel == previous_pixel && first_bit < previous_first_bit) ||
+                        (
+                            pixel == previous_pixel && first_bit == previous_first_bit &&
+                            region < previous_region
+                        ) ||
+                        (
+                            pixel == previous_pixel && first_bit == previous_first_bit &&
+                            region == previous_region && far_side < previous_far_side
+                        )
+                    );
+                    if (out_of_order) {
+                        throw std::runtime_error("records are not canonically ordered");
+                    }
+                    has_previous_key = true;
+                    previous_pixel = pixel;
+                    previous_first_bit = first_bit;
+                    previous_region = region;
+                    previous_far_side = far_side;
+                    keys[cursor] = static_cast<std::uint32_t>(
+                        row_start_pixel * 16ULL + 16ULL * column + first_bit
+                    );
+                    ++cursor;
+                }
+                const std::uint32_t end = cursor;
+                current_starts[column] = static_cast<std::int32_t>(start);
+                current_ends[column] = static_cast<std::int32_t>(end);
+                fixed_union_component_groups(
+                    records, parent, rank, keys, start, end, start, end,
+                    ComponentRelation::Same
+                );
+                if (column > 0 && current_starts[column - 1] >= 0) {
+                    fixed_union_component_groups(
+                        records, parent, rank, keys,
+                        static_cast<std::uint32_t>(current_starts[column - 1]),
+                        static_cast<std::uint32_t>(current_ends[column - 1]),
+                        start, end, ComponentRelation::Horizontal
+                    );
+                }
+                if (previous_starts[column] >= 0) {
+                    fixed_union_component_groups(
+                        records, parent, rank, keys,
+                        static_cast<std::uint32_t>(previous_starts[column]),
+                        static_cast<std::uint32_t>(previous_ends[column]),
+                        start, end, ComponentRelation::Vertical
+                    );
+                }
+            }
+            std::swap(previous_starts, current_starts);
+            std::swap(previous_ends, current_ends);
+        }
+        if (cursor != count) {
+            throw std::runtime_error("record pixel lies outside render_shape");
+        }
+        for (std::uint32_t index = 0; index < count; ++index) {
+            const std::uint32_t root = fixed_component_find(parent, index);
+            parent[index] = root;
+            keys[index] = keys[root];
+        }
+        for (std::int64_t start = static_cast<std::int64_t>(count) / 2 - 1; start >= 0; --start) {
+            sift_component_member_heap(
+                members,
+                static_cast<std::uint32_t>(start),
+                count,
+                keys
+            );
+        }
+        for (std::uint32_t end = count; end > 1; --end) {
+            std::swap(members[0], members[end - 1]);
+            sift_component_member_heap(members, 0, end - 1, keys);
+        }
+        std::uint32_t component_count = 0;
+        std::uint32_t previous_key = kUint32Max;
+        for (std::uint32_t position = 0; position < count; ++position) {
+            const std::uint32_t index = members[position];
+            const std::uint32_t key = keys[index];
+            if (position == 0 || key != previous_key) {
+                previous_key = key;
+                ++component_count;
+            }
+            parent[index] = component_count - 1;
+        }
+        return component_count;
+    }
+}
+
 py::tuple build_component_member_order_native(
     const py::array& component_ids,
     std::uint32_t component_count
@@ -3388,6 +4708,147 @@ py::tuple expand_repair_scatter_native(
         }
     }
     return py::make_tuple(std::move(indexes), std::move(colours));
+}
+
+std::uint64_t scatter_repair_records_float_into_native(
+    const py::array& raw_records,
+    std::uint32_t pixel_offset,
+    py::array output
+) {
+    if (
+        !raw_records.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        raw_records.ndim() != 2 || raw_records.shape(1) != 16 ||
+        (raw_records.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error("raw_records must be a C-contiguous uint8 [n,16] array");
+    }
+    if (
+        !output.dtype().is(py::dtype::of<float>()) || output.ndim() != 2 ||
+        output.shape(1) != 3 || (output.flags() & py::array::c_style) == 0 ||
+        !output.writeable() || output.shape(0) % 16 != 0
+    ) {
+        throw py::type_error(
+            "output must be a writable C-contiguous float32 [pixel_count*16,3] array"
+        );
+    }
+    const std::uint64_t pixel_count =
+        static_cast<std::uint64_t>(output.shape(0)) / 16ULL;
+    const std::uint64_t pixel_end = static_cast<std::uint64_t>(pixel_offset) + pixel_count;
+    if (pixel_end > static_cast<std::uint64_t>(kUint32Max) + 1ULL) {
+        throw py::value_error("repair scatter pixel window exceeds uint32");
+    }
+    const auto* records = static_cast<const std::uint8_t*>(raw_records.data());
+    auto* output_values = static_cast<float*>(output.mutable_data());
+    std::uint64_t lane_count = 0;
+    {
+        py::gil_scoped_release release;
+        for (py::ssize_t index = 0; index < raw_records.shape(0); ++index) {
+            const std::uint8_t* record = records + 16 * index;
+            const std::uint32_t pixel = load_u32_le(record);
+            const std::uint16_t mask = load_u16_le(record + 4);
+            if (pixel < pixel_offset || pixel >= pixel_end) {
+                throw std::runtime_error("repair scatter record lies outside its pixel window");
+            }
+            if (!is_contiguous_u16_mask(mask)) {
+                throw py::value_error("repair scatter mask must be nonzero and contiguous");
+            }
+            if (record[13] < 1 || record[13] > 3) {
+                throw py::value_error("repair scatter backend must be final");
+            }
+            const std::uint64_t local_pixel = pixel - pixel_offset;
+            for (std::uint32_t lane = 0; lane < 16; ++lane) {
+                if ((mask & (1U << lane)) == 0) {
+                    continue;
+                }
+                const std::uint64_t destination = 3ULL * (16ULL * local_pixel + lane);
+                output_values[destination] = static_cast<float>(record[10]);
+                output_values[destination + 1] = static_cast<float>(record[11]);
+                output_values[destination + 2] = static_cast<float>(record[12]);
+                ++lane_count;
+            }
+        }
+    }
+    return lane_count;
+}
+
+std::uint64_t materialize_repair_scatter_u8_into_native(
+    const py::array& raw_records,
+    std::uint32_t pixel_offset,
+    py::array colour_output,
+    py::array mask_output
+) {
+    if (
+        !raw_records.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        raw_records.ndim() != 2 || raw_records.shape(1) != 16 ||
+        (raw_records.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error("raw_records must be a C-contiguous uint8 [n,16] array");
+    }
+    if (
+        !colour_output.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        colour_output.ndim() != 2 || colour_output.shape(1) != 3 ||
+        (colour_output.flags() & py::array::c_style) == 0 ||
+        !colour_output.writeable()
+    ) {
+        throw py::type_error(
+            "colour_output must be a writable C-contiguous uint8 [lane_count,3] array"
+        );
+    }
+    if (
+        !mask_output.dtype().is(py::dtype::of<bool>()) || mask_output.ndim() != 1 ||
+        (mask_output.flags() & py::array::c_style) == 0 ||
+        !mask_output.writeable() || mask_output.shape(0) != colour_output.shape(0) ||
+        mask_output.shape(0) % 16 != 0
+    ) {
+        throw py::type_error(
+            "mask_output must be a matching writable C-contiguous bool vector"
+        );
+    }
+    const std::uint64_t pixel_count =
+        static_cast<std::uint64_t>(mask_output.shape(0)) / 16ULL;
+    const std::uint64_t pixel_end = static_cast<std::uint64_t>(pixel_offset) + pixel_count;
+    if (pixel_end > static_cast<std::uint64_t>(kUint32Max) + 1ULL) {
+        throw py::value_error("repair scatter pixel window exceeds uint32");
+    }
+    auto* colours = static_cast<std::uint8_t*>(colour_output.mutable_data());
+    auto* masks = static_cast<bool*>(mask_output.mutable_data());
+    std::fill(colours, colours + 3ULL * mask_output.shape(0), 0);
+    std::fill(masks, masks + mask_output.shape(0), false);
+    const auto* records = static_cast<const std::uint8_t*>(raw_records.data());
+    std::uint64_t lane_count = 0;
+    {
+        py::gil_scoped_release release;
+        for (py::ssize_t index = 0; index < raw_records.shape(0); ++index) {
+            const std::uint8_t* record = records + 16 * index;
+            const std::uint32_t pixel = load_u32_le(record);
+            const std::uint16_t mask = load_u16_le(record + 4);
+            if (pixel < pixel_offset || pixel >= pixel_end) {
+                throw std::runtime_error("repair scatter record lies outside its pixel window");
+            }
+            if (!is_contiguous_u16_mask(mask)) {
+                throw py::value_error("repair scatter mask must be nonzero and contiguous");
+            }
+            if (record[13] < 1 || record[13] > 3) {
+                throw py::value_error("repair scatter backend must be final");
+            }
+            const std::uint64_t local_pixel = pixel - pixel_offset;
+            for (std::uint32_t lane = 0; lane < 16; ++lane) {
+                if ((mask & (1U << lane)) == 0) {
+                    continue;
+                }
+                const std::uint64_t destination = 16ULL * local_pixel + lane;
+                if (masks[destination]) {
+                    throw std::runtime_error("repair scatter records overlap");
+                }
+                masks[destination] = true;
+                colours[3ULL * destination] = record[10];
+                colours[3ULL * destination + 1] = record[11];
+                colours[3ULL * destination + 2] = record[12];
+                ++lane_count;
+            }
+        }
+    }
+    return lane_count;
 }
 
 inline std::uint64_t checked_local_add(std::uint64_t left, std::uint64_t right) {
@@ -3522,6 +4983,357 @@ std::uint64_t local_context_score(
         ));
     }
     return 2 * bgr_l1 + difference_l1;
+}
+
+void plan_one_local_run_in_place(
+    std::uint8_t* output_records,
+    std::uint64_t record_count,
+    const NativeRepairRun& run,
+    const std::uint8_t* coverage,
+    const std::uint32_t* regions,
+    const std::array<const std::uint8_t*, 3>& colours,
+    std::int64_t height,
+    std::int64_t width,
+    std::uint32_t local_limit_px,
+    std::uint32_t search_limit,
+    std::uint32_t safe_radius,
+    std::uint64_t slot_remaining,
+    std::uint64_t sample_remaining,
+    LocalStatistics& statistics
+) {
+    if (
+        run.record_start >= run.record_end || run.record_end > record_count ||
+        run.row >= height || run.start_fine > run.end_fine || run.far_side > 1
+    ) {
+        throw py::value_error("local-strip run is malformed");
+    }
+    const std::uint64_t lane_count =
+        static_cast<std::uint64_t>(run.end_fine) - run.start_fine + 1;
+    if (lane_count > 16ULL * local_limit_px) {
+        return;
+    }
+    const std::uint32_t first_pixel = run.start_fine / 16;
+    const std::uint32_t last_pixel = run.end_fine / 16;
+    const std::uint32_t donor_count = last_pixel - first_pixel + 1;
+    if (run.record_end - run.record_start != donor_count) {
+        throw py::value_error("local-strip run/record cardinality differs");
+    }
+    const std::uint64_t slot_charge = checked_local_mul(5, search_limit);
+    const std::uint64_t support = checked_local_mul(
+        2ULL * safe_radius + 1,
+        2ULL * safe_radius + 1
+    );
+    const std::uint64_t per_slot = checked_local_add(
+        3,
+        checked_local_mul(donor_count, support)
+    );
+    const std::uint64_t sample_charge = checked_local_add(
+        3,
+        checked_local_mul(slot_charge, per_slot)
+    );
+    if (
+        slot_charge > slot_remaining - statistics.slot_consumed ||
+        sample_charge > sample_remaining - statistics.sample_consumed
+    ) {
+        statistics.budget_skipped_runs = checked_local_add(
+            statistics.budget_skipped_runs,
+            1
+        );
+        return;
+    }
+    statistics.slot_consumed = checked_local_add(statistics.slot_consumed, slot_charge);
+    statistics.sample_consumed = checked_local_add(statistics.sample_consumed, sample_charge);
+    statistics.evaluated_slots = checked_local_add(statistics.evaluated_slots, slot_charge);
+    const std::int64_t direction = run.far_side == 0 ? -1 : 1;
+    const std::int64_t anchor_fine = run.far_side == 0
+        ? static_cast<std::int64_t>(run.start_fine) - 1
+        : static_cast<std::int64_t>(run.end_fine) + 1;
+    const std::int64_t boundary_column = anchor_fine >= 0
+        ? anchor_fine / 16
+        : -((-anchor_fine + 15) / 16);
+    const std::array<std::int64_t, 3> actual_columns{
+        boundary_column + 2 * direction,
+        boundary_column + direction,
+        boundary_column,
+    };
+    LocalContext actual{};
+    if (!read_local_context(
+        coverage,
+        regions,
+        colours,
+        height,
+        width,
+        run.row,
+        actual_columns,
+        run.region,
+        statistics,
+        actual
+    )) {
+        return;
+    }
+    constexpr std::array<std::int64_t, 5> row_deltas{0, -1, 1, -2, 2};
+    bool best_found = false;
+    std::uint64_t best_score = 0;
+    std::uint64_t best_ordinal = 0;
+    std::int64_t best_row = 0;
+    std::int64_t best_start = 0;
+    for (std::uint32_t offset = 1; offset <= search_limit; ++offset) {
+        for (std::size_t row_index = 0; row_index < row_deltas.size(); ++row_index) {
+            const std::uint64_t ordinal = (offset - 1ULL) * 5 + row_index;
+            const std::int64_t candidate_row =
+                static_cast<std::int64_t>(run.row) + row_deltas[row_index];
+            const std::int64_t candidate_start =
+                boundary_column + direction * static_cast<std::int64_t>(offset);
+            const std::array<std::int64_t, 3> candidate_columns{
+                candidate_start + 3 * direction,
+                candidate_start + 2 * direction,
+                candidate_start + direction,
+            };
+            bool legal = candidate_row >= 0 && candidate_row < height;
+            for (const std::int64_t column : candidate_columns) {
+                legal = legal && column >= 0 && column < width;
+            }
+            for (std::uint32_t donor_index = 0; donor_index < donor_count; ++donor_index) {
+                const std::int64_t column =
+                    candidate_start - static_cast<std::int64_t>(donor_index) * direction;
+                legal = legal && column >= 0 && column < width;
+                legal = legal && (column - boundary_column) * direction > 0;
+            }
+            if (!legal) {
+                continue;
+            }
+            LocalContext candidate{};
+            if (!read_local_context(
+                coverage,
+                regions,
+                colours,
+                height,
+                width,
+                candidate_row,
+                candidate_columns,
+                run.region,
+                statistics,
+                candidate
+            )) {
+                continue;
+            }
+            bool safe = true;
+            for (std::uint32_t donor_index = 0; donor_index < donor_count; ++donor_index) {
+                const std::int64_t donor_column =
+                    candidate_start - static_cast<std::int64_t>(donor_index) * direction;
+                if (!local_donor_is_safe(
+                    coverage,
+                    regions,
+                    height,
+                    width,
+                    candidate_row,
+                    donor_column,
+                    run.region,
+                    safe_radius,
+                    statistics
+                )) {
+                    safe = false;
+                    break;
+                }
+            }
+            if (!safe) {
+                statistics.unsafe_donor_slots = checked_local_add(
+                    statistics.unsafe_donor_slots,
+                    1
+                );
+                continue;
+            }
+            statistics.eligible_slots = checked_local_add(statistics.eligible_slots, 1);
+            const std::uint64_t score = local_context_score(actual, candidate);
+            if (
+                !best_found || score < best_score ||
+                (score == best_score && ordinal < best_ordinal)
+            ) {
+                best_found = true;
+                best_score = score;
+                best_ordinal = ordinal;
+                best_row = candidate_row;
+                best_start = candidate_start;
+            }
+        }
+    }
+    if (!best_found) {
+        return;
+    }
+    for (std::uint32_t donor_index = 0; donor_index < donor_count; ++donor_index) {
+        const std::uint32_t record_index = run.far_side == 1
+            ? run.record_end - 1 - donor_index
+            : run.record_start + donor_index;
+        std::uint8_t* record = output_records + 16ULL * record_index;
+        const std::int64_t donor_column =
+            best_start - static_cast<std::int64_t>(donor_index) * direction;
+        const auto sample = static_cast<std::uint64_t>(best_row * width + donor_column);
+        record[10] = colours[0][sample];
+        record[11] = colours[1][sample];
+        record[12] = colours[2][sample];
+        record[13] = 1;
+    }
+    statistics.filled_runs = checked_local_add(statistics.filled_runs, 1);
+}
+
+py::dict local_statistics_object(const LocalStatistics& statistics) {
+    py::dict result;
+    result["evaluated_slots"] = statistics.evaluated_slots;
+    result["physical_sample_reads"] = statistics.physical_sample_reads;
+    result["filled_runs"] = statistics.filled_runs;
+    result["eligible_slots"] = statistics.eligible_slots;
+    result["unsafe_donor_slots"] = statistics.unsafe_donor_slots;
+    result["slot_consumed"] = statistics.slot_consumed;
+    result["sample_consumed"] = statistics.sample_consumed;
+    result["budget_skipped_runs"] = statistics.budget_skipped_runs;
+    return result;
+}
+
+py::dict plan_local_strips_in_place_native(
+    py::array raw_records,
+    const py::array& coverage_count,
+    const py::array& pure_region_id,
+    const py::array& blue,
+    const py::array& green,
+    const py::array& red,
+    std::uint32_t local_limit_px,
+    std::uint32_t search_limit,
+    std::uint32_t safe_radius,
+    std::uint64_t slot_remaining,
+    std::uint64_t sample_remaining
+) {
+    if (
+        !raw_records.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        raw_records.ndim() != 2 || raw_records.shape(1) != 16 ||
+        (raw_records.flags() & py::array::c_style) == 0 || !raw_records.writeable()
+    ) {
+        throw py::type_error(
+            "raw_records must be a writable C-contiguous uint8 [n,16] array"
+        );
+    }
+    validate_array(coverage_count, py::dtype::of<std::uint8_t>(), "coverage_count");
+    validate_array(pure_region_id, py::dtype::of<std::uint32_t>(), "pure_region_id");
+    validate_array(blue, py::dtype::of<std::uint8_t>(), "blue");
+    validate_array(green, py::dtype::of<std::uint8_t>(), "green");
+    validate_array(red, py::dtype::of<std::uint8_t>(), "red");
+    const std::int64_t height = coverage_count.shape(0);
+    const std::int64_t width = coverage_count.shape(1);
+    for (const py::array* plane : {&pure_region_id, &blue, &green, &red}) {
+        if (plane->shape(0) != height || plane->shape(1) != width) {
+            throw py::value_error("local-strip rasters must have one shape");
+        }
+    }
+    if (local_limit_px == 0 || search_limit == 0 || safe_radius == 0) {
+        throw py::value_error("local-strip limits must be positive");
+    }
+    const std::uint64_t record_count = static_cast<std::uint64_t>(raw_records.shape(0));
+    if (record_count > kRepairRecordCap) {
+        throw py::value_error("repair record count exceeds the fixed arena");
+    }
+    auto* records = static_cast<std::uint8_t*>(raw_records.mutable_data());
+    const auto* coverage = static_cast<const std::uint8_t*>(coverage_count.data());
+    const auto* regions = static_cast<const std::uint32_t*>(pure_region_id.data());
+    const std::array<const std::uint8_t*, 3> colours{
+        static_cast<const std::uint8_t*>(blue.data()),
+        static_cast<const std::uint8_t*>(green.data()),
+        static_cast<const std::uint8_t*>(red.data()),
+    };
+    LocalStatistics statistics;
+    NativeRepairRun active{};
+    bool has_active = false;
+    bool has_previous_key = false;
+    std::uint32_t previous_pixel = 0;
+    std::uint32_t previous_first_bit = 0;
+    std::uint32_t previous_region = 0;
+    std::uint8_t previous_far_side = 0;
+    for (std::uint32_t index = 0; index < record_count; ++index) {
+        const std::uint8_t* record = records + 16ULL * index;
+        const std::uint32_t pixel = load_u32_le(record);
+        const std::uint16_t mask = load_u16_le(record + 4);
+        const std::uint32_t region = load_u32_le(record + 6);
+        const std::uint8_t far_side = record[14];
+        if (pixel >= static_cast<std::uint64_t>(height) * width) {
+            throw std::runtime_error("record pixel lies outside render_shape");
+        }
+        if (!is_contiguous_u16_mask(mask)) {
+            throw std::runtime_error("record lane mask must be nonzero and contiguous");
+        }
+        if (region == 0 || region == kUint32Max || far_side > 1 || record[15] != 0) {
+            throw std::runtime_error("record region/side identity is invalid");
+        }
+        const std::uint32_t first_bit = least_u16_bit(mask);
+        const bool out_of_order = has_previous_key && (
+            pixel < previous_pixel ||
+            (pixel == previous_pixel && first_bit < previous_first_bit) ||
+            (
+                pixel == previous_pixel && first_bit == previous_first_bit &&
+                region < previous_region
+            ) ||
+            (
+                pixel == previous_pixel && first_bit == previous_first_bit &&
+                region == previous_region && far_side < previous_far_side
+            )
+        );
+        if (out_of_order) {
+            throw std::runtime_error("records are not canonically ordered");
+        }
+        has_previous_key = true;
+        previous_pixel = pixel;
+        previous_first_bit = first_bit;
+        previous_region = region;
+        previous_far_side = far_side;
+        const std::uint32_t row = pixel / static_cast<std::uint32_t>(width);
+        const std::uint32_t column = pixel % static_cast<std::uint32_t>(width);
+        const std::uint32_t start_fine = 16U * column + first_bit;
+        const std::uint32_t end_fine = 16U * column + greatest_u16_bit(mask);
+        if (
+            has_active && active.row == row && active.end_fine + 1U == start_fine &&
+            active.region == region && active.far_side == far_side
+        ) {
+            active.record_end = index + 1;
+            active.end_fine = end_fine;
+            continue;
+        }
+        if (has_active) {
+            plan_one_local_run_in_place(
+                records,
+                record_count,
+                active,
+                coverage,
+                regions,
+                colours,
+                height,
+                width,
+                local_limit_px,
+                search_limit,
+                safe_radius,
+                slot_remaining,
+                sample_remaining,
+                statistics
+            );
+        }
+        active = NativeRepairRun{index, index + 1, row, start_fine, end_fine, region, far_side};
+        has_active = true;
+    }
+    if (has_active) {
+        plan_one_local_run_in_place(
+            records,
+            record_count,
+            active,
+            coverage,
+            regions,
+            colours,
+            height,
+            width,
+            local_limit_px,
+            search_limit,
+            safe_radius,
+            slot_remaining,
+            sample_remaining,
+            statistics
+        );
+    }
+    return local_statistics_object(statistics);
 }
 
 py::tuple plan_local_strips_native(
@@ -4432,7 +6244,9 @@ py::tuple collect_one_sided_queries_native(
 
 py::array build_exemplar_candidate_mask_native(
     const py::array& safe_donor_mask,
-    const py::array& pure_region_id
+    const py::array& pure_region_id,
+    py::object output_object,
+    py::object workspace_object
 ) {
     validate_array(safe_donor_mask, py::dtype::of<bool>(), "safe_donor_mask");
     validate_array(pure_region_id, py::dtype::of<std::uint32_t>(), "pure_region_id");
@@ -4442,20 +6256,61 @@ py::array build_exemplar_candidate_mask_native(
     ) {
         throw py::value_error("exemplar candidate rasters must match");
     }
-    const auto height = static_cast<std::uint32_t>(safe_donor_mask.shape(0));
-    const auto width = static_cast<std::uint32_t>(safe_donor_mask.shape(1));
+    const py::ssize_t height_value = safe_donor_mask.shape(0);
+    const py::ssize_t width_value = safe_donor_mask.shape(1);
+    if (
+        height_value <= 0 || width_value <= 0 ||
+        static_cast<std::uint64_t>(height_value) > kUint32Max ||
+        static_cast<std::uint64_t>(width_value) > kUint32Max
+    ) {
+        throw py::value_error("exemplar candidate shape must fit uint32 bounds");
+    }
+    const auto height = static_cast<std::uint32_t>(height_value);
+    const auto width = static_cast<std::uint32_t>(width_value);
     const auto* safe = static_cast<const std::uint8_t*>(safe_donor_mask.data());
     const auto* regions = static_cast<const std::uint32_t*>(pure_region_id.data());
-    py::array_t<bool> output({height, width});
-    auto* result = output.mutable_data();
+    if (output_object.is_none() != workspace_object.is_none()) {
+        throw py::value_error("candidate output and workspace must be supplied together");
+    }
+    py::array output;
+    py::array workspace;
+    if (output_object.is_none()) {
+        output = py::array_t<bool>({height, width});
+        workspace = py::array_t<std::uint32_t>(2ULL * width);
+    } else {
+        output = py::cast<py::array>(output_object);
+        workspace = py::cast<py::array>(workspace_object);
+        if (
+            !output.dtype().is(py::dtype::of<bool>()) || output.ndim() != 2 ||
+            output.shape(0) != height || output.shape(1) != width ||
+            (output.flags() & py::array::c_style) == 0 || !output.writeable()
+        ) {
+            throw py::type_error("candidate output must be a writable matching bool raster");
+        }
+        if (
+            !workspace.dtype().is(py::dtype::of<std::uint32_t>()) ||
+            workspace.ndim() != 1 ||
+            static_cast<std::uint64_t>(workspace.shape(0)) < 2ULL * width ||
+            (workspace.flags() & py::array::c_style) == 0 || !workspace.writeable()
+        ) {
+            throw py::type_error("candidate workspace must contain two uint32 image rows");
+        }
+    }
+    auto* result = static_cast<bool*>(output.mutable_data());
     std::fill(result, result + static_cast<std::uint64_t>(height) * width, false);
     if (height < 9 || width < 9) {
         return output;
     }
     {
         py::gil_scoped_release release;
-        std::vector<std::uint32_t> vertical_run(width, 0);
-        std::vector<std::uint32_t> vertical_region(width, kUint32Max);
+        auto* vertical_run = static_cast<std::uint32_t*>(workspace.mutable_data());
+        auto* vertical_region = vertical_run + width;
+        std::fill(vertical_run, vertical_run + width, 0);
+        std::fill(
+            vertical_region,
+            vertical_region + width,
+            static_cast<std::uint32_t>(kUint32Max)
+        );
         for (std::uint32_t row = 0; row < height; ++row) {
             std::uint32_t horizontal_run = 0;
             std::uint32_t horizontal_region = kUint32Max;
@@ -4577,16 +6432,16 @@ py::object select_exemplar_frontier_native(
     return py::make_tuple(best_row, best_column, best_count);
 }
 
-struct ExemplarMaskLevel {
+struct ExemplarMaskLevelView {
     std::uint32_t height;
     std::uint32_t width;
-    std::vector<std::uint8_t> donor;
-    std::vector<std::uint8_t> target;
-    std::vector<std::uint8_t> processed;
-    std::vector<std::uint8_t> barrier;
+    std::uint8_t* donor;
+    std::uint8_t* target;
+    std::uint8_t* processed;
+    std::uint8_t* barrier;
 };
 
-bool exemplar_level_has_candidate(const ExemplarMaskLevel& level) {
+bool exemplar_level_has_candidate(const ExemplarMaskLevelView& level) {
     if (level.height < 9 || level.width < 9) {
         return false;
     }
@@ -4615,7 +6470,7 @@ bool exemplar_level_has_candidate(const ExemplarMaskLevel& level) {
     return false;
 }
 
-bool exemplar_level_has_frontier(const ExemplarMaskLevel& level) {
+bool exemplar_level_has_frontier(const ExemplarMaskLevelView& level) {
     if (level.height < 7 || level.width < 7) {
         return false;
     }
@@ -4678,15 +6533,10 @@ bool exemplar_level_has_frontier(const ExemplarMaskLevel& level) {
     return false;
 }
 
-ExemplarMaskLevel downsample_exemplar_masks(const ExemplarMaskLevel& child) {
-    ExemplarMaskLevel parent;
-    parent.height = (child.height + 1) / 2;
-    parent.width = (child.width + 1) / 2;
-    const std::uint64_t count = static_cast<std::uint64_t>(parent.height) * parent.width;
-    parent.donor.assign(count, 0);
-    parent.target.assign(count, 0);
-    parent.processed.assign(count, 0);
-    parent.barrier.assign(count, 0);
+void downsample_exemplar_masks(
+    const ExemplarMaskLevelView& child,
+    ExemplarMaskLevelView& parent
+) {
     for (std::uint32_t row = 0; row < parent.height; ++row) {
         for (std::uint32_t column = 0; column < parent.width; ++column) {
             bool donor = true;
@@ -4718,7 +6568,6 @@ ExemplarMaskLevel downsample_exemplar_masks(const ExemplarMaskLevel& child) {
             parent.processed[pixel] = !target && !barrier && processed;
         }
     }
-    return parent;
 }
 
 bool component_may_score_exemplar_native(
@@ -4726,12 +6575,20 @@ bool component_may_score_exemplar_native(
     const py::array& pure_region_id,
     const py::array& safe_donor_mask,
     const py::array& target_pixels,
-    std::uint32_t region
+    std::uint32_t region,
+    py::array workspace
 ) {
     validate_array(coverage_count, py::dtype::of<std::uint8_t>(), "coverage_count");
     validate_array(pure_region_id, py::dtype::of<std::uint32_t>(), "pure_region_id");
     validate_array(safe_donor_mask, py::dtype::of<bool>(), "safe_donor_mask");
     validate_vector(target_pixels, py::dtype::of<std::uint32_t>(), "target_pixels");
+    if (
+        !workspace.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        workspace.ndim() != 1 || (workspace.flags() & py::array::c_style) == 0 ||
+        !workspace.writeable()
+    ) {
+        throw py::type_error("exemplar mask workspace must be a writable uint8 vector");
+    }
     if (
         pure_region_id.shape(0) != coverage_count.shape(0) ||
         pure_region_id.shape(1) != coverage_count.shape(1) ||
@@ -4774,14 +6631,52 @@ bool component_may_score_exemplar_native(
         width,
         static_cast<std::uint64_t>(max_column) + 65
     ));
-    ExemplarMaskLevel level;
-    level.height = y1 - y0;
-    level.width = x1 - x0;
-    const std::uint64_t local_count = static_cast<std::uint64_t>(level.height) * level.width;
-    level.donor.assign(local_count, 0);
-    level.target.assign(local_count, 0);
-    level.processed.assign(local_count, 0);
-    level.barrier.assign(local_count, 0);
+    std::array<std::pair<std::uint32_t, std::uint32_t>, 3> shapes{};
+    shapes[0] = {y1 - y0, x1 - x0};
+    std::size_t level_count = 1;
+    while (level_count < shapes.size()) {
+        const auto [current_height, current_width] = shapes[level_count - 1];
+        const std::uint32_t next_height = (current_height + 1) / 2;
+        const std::uint32_t next_width = (current_width + 1) / 2;
+        if (std::min(next_height, next_width) < 32) {
+            break;
+        }
+        shapes[level_count] = {next_height, next_width};
+        ++level_count;
+    }
+    std::uint64_t required_bytes = 0;
+    for (std::size_t index = 0; index < level_count; ++index) {
+        required_bytes += 4ULL * shapes[index].first * shapes[index].second;
+    }
+    if (required_bytes > static_cast<std::uint64_t>(workspace.shape(0))) {
+        throw QualityNativeBudgetError("exemplar mask workspace exceeded");
+    }
+    auto* workspace_values = static_cast<std::uint8_t*>(workspace.mutable_data());
+    std::array<ExemplarMaskLevelView, 3> levels{};
+    std::uint64_t workspace_cursor = 0;
+    for (std::size_t index = 0; index < level_count; ++index) {
+        const auto [level_height, level_width] = shapes[index];
+        const std::uint64_t count =
+            static_cast<std::uint64_t>(level_height) * level_width;
+        auto& level = levels[index];
+        level.height = level_height;
+        level.width = level_width;
+        level.donor = workspace_values + workspace_cursor;
+        workspace_cursor += count;
+        level.target = workspace_values + workspace_cursor;
+        workspace_cursor += count;
+        level.processed = workspace_values + workspace_cursor;
+        workspace_cursor += count;
+        level.barrier = workspace_values + workspace_cursor;
+        workspace_cursor += count;
+    }
+    auto& level = levels[0];
+    const std::uint64_t local_count =
+        static_cast<std::uint64_t>(level.height) * level.width;
+    std::fill(level.donor, level.donor + local_count, 0);
+    std::fill(level.target, level.target + local_count, 0);
+    std::fill(level.processed, level.processed + local_count, 0);
+    std::fill(level.barrier, level.barrier + local_count, 0);
     const auto* coverage = static_cast<const std::uint8_t*>(coverage_count.data());
     const auto* regions = static_cast<const std::uint32_t*>(pure_region_id.data());
     const auto* safe = static_cast<const std::uint8_t*>(safe_donor_mask.data());
@@ -4806,18 +6701,8 @@ bool component_may_score_exemplar_native(
             level.processed[local] = 0;
             level.barrier[local] = 0;
         }
-        std::array<ExemplarMaskLevel, 3> levels;
-        levels[0] = std::move(level);
-        std::size_t level_count = 1;
-        while (level_count < levels.size()) {
-            const auto& current = levels[level_count - 1];
-            const std::uint32_t next_height = (current.height + 1) / 2;
-            const std::uint32_t next_width = (current.width + 1) / 2;
-            if (std::min(next_height, next_width) < 32) {
-                break;
-            }
-            levels[level_count] = downsample_exemplar_masks(current);
-            ++level_count;
+        for (std::size_t index = 1; index < level_count; ++index) {
+            downsample_exemplar_masks(levels[index - 1], levels[index]);
         }
         for (std::size_t index = 0; index < level_count; ++index) {
             if (
@@ -4836,6 +6721,7 @@ py::dict build_info() {
     result["algorithm"] = "quality-implicit-region-kd-median-of-medians-v1";
     result["kd_stack_capacity"] = kStackCapacity;
     result["runtime_jit"] = false;
+    result["source_sha256"] = QUALITY_KD_SOURCE_SHA256;
     return result;
 }
 
@@ -4843,6 +6729,7 @@ py::dict build_info() {
 
 PYBIND11_MODULE(_quality_kd_native, module) {
     module.doc() = "Prebuilt deterministic implicit region k-d Task 0 extension";
+    py::register_exception<QualityNativeBudgetError>(module, "QualityBudgetError");
     module.def(
         "build_index",
         &build_index,
@@ -4902,7 +6789,8 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("pure_region_id"),
         py::arg("blue"),
         py::arg("green"),
-        py::arg("red")
+        py::arg("red"),
+        py::arg("record_output") = py::none()
     );
     module.def(
         "build_safe_donor_index",
@@ -4913,11 +6801,24 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("include_full_pure_for_empty_regions") = false
     );
     module.def(
+        "build_safe_donor_index_into",
+        &build_safe_donor_index_into,
+        py::arg("coverage_count"),
+        py::arg("pure_region_id"),
+        py::arg("referenced_regions"),
+        py::arg("include_full_pure_for_empty_regions"),
+        py::arg("members_output"),
+        py::arg("offsets_output"),
+        py::arg("use_full_output")
+    );
+    module.def(
         "build_safe_donor_mask",
         &build_safe_donor_mask,
         py::arg("coverage_count"),
         py::arg("pure_region_id"),
-        py::arg("referenced_regions")
+        py::arg("referenced_regions"),
+        py::arg("safe_output") = py::none(),
+        py::arg("region_output") = py::none()
     );
     module.def(
         "query_fallback_records",
@@ -4932,12 +6833,122 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("red"),
         py::arg("radius_px"),
         py::arg("budget_state"),
-        py::arg("allow_seeded_missing") = false
+        py::arg("allow_seeded_missing") = false,
+        py::arg("visits_output") = py::none()
     );
     module.def(
         "build_exemplar_sobel_planes",
         &build_exemplar_sobel_planes,
-        py::arg("working_bgr")
+        py::arg("working_bgr"),
+        py::arg("gradient_x") = py::none(),
+        py::arg("gradient_y") = py::none()
+    );
+    module.def(
+        "collect_exemplar_targets_into",
+        &collect_exemplar_targets_into_native,
+        py::arg("raw_records"),
+        py::arg("record_indexes"),
+        py::arg("region_id"),
+        py::arg("frame_height"),
+        py::arg("frame_width"),
+        py::arg("target_pixels"),
+        py::arg("target_colours") = py::none()
+    );
+    module.def(
+        "prepare_exemplar_full_level_into",
+        &prepare_exemplar_full_level_into_native,
+        py::arg("coverage_count"),
+        py::arg("pure_region_id"),
+        py::arg("blue"),
+        py::arg("green"),
+        py::arg("red"),
+        py::arg("safe_donor_mask"),
+        py::arg("target_pixels"),
+        py::arg("target_colours"),
+        py::arg("completed"),
+        py::arg("completed_colours"),
+        py::arg("region_id"),
+        py::arg("y0"),
+        py::arg("x0"),
+        py::arg("interior_y0"),
+        py::arg("interior_y1"),
+        py::arg("interior_x0"),
+        py::arg("interior_x1"),
+        py::arg("working"),
+        py::arg("donor"),
+        py::arg("target"),
+        py::arg("processed"),
+        py::arg("barrier")
+    );
+    module.def(
+        "downsample_exemplar_level_into",
+        &downsample_exemplar_level_into_native,
+        py::arg("child_working"),
+        py::arg("child_donor"),
+        py::arg("child_target"),
+        py::arg("child_processed"),
+        py::arg("child_barrier"),
+        py::arg("parent_working"),
+        py::arg("parent_donor"),
+        py::arg("parent_target"),
+        py::arg("parent_processed"),
+        py::arg("parent_barrier")
+    );
+    module.def(
+        "enumerate_exemplar_donor_centres_into",
+        &enumerate_exemplar_donor_centres_into_native,
+        py::arg("donor_mask"),
+        py::arg("integral"),
+        py::arg("centres")
+    );
+    module.def(
+        "subsample_exemplar_indexes_into",
+        &subsample_exemplar_indexes_into_native,
+        py::arg("candidate_count"),
+        py::arg("selected_count"),
+        py::arg("output")
+    );
+    module.def(
+        "replicate_exemplar_targets_into",
+        &replicate_exemplar_targets_into_native,
+        py::arg("coarse_working"),
+        py::arg("coarse_target"),
+        py::arg("coarse_barrier"),
+        py::arg("fine_working"),
+        py::arg("fine_target")
+    );
+    module.def(
+        "copy_exemplar_patch_into",
+        &copy_exemplar_patch_into_native,
+        py::arg("working"),
+        py::arg("target"),
+        py::arg("processed"),
+        py::arg("target_row"),
+        py::arg("target_column"),
+        py::arg("donor_row"),
+        py::arg("donor_column")
+    );
+    module.def(
+        "record_exemplar_completions_into",
+        &record_exemplar_completions_into_native,
+        py::arg("full_working"),
+        py::arg("full_target"),
+        py::arg("full_processed"),
+        py::arg("target_pixels"),
+        py::arg("frame_width"),
+        py::arg("y0"),
+        py::arg("x0"),
+        py::arg("completed"),
+        py::arg("completed_colours")
+    );
+    module.def(
+        "commit_exemplar_records_into",
+        &commit_exemplar_records_into_native,
+        py::arg("raw_records"),
+        py::arg("record_indexes"),
+        py::arg("target_pixels"),
+        py::arg("completed"),
+        py::arg("completed_colours")
     );
     module.def(
         "validate_repair_record_coverage",
@@ -4960,6 +6971,18 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("width")
     );
     module.def(
+        "build_record_components_into",
+        &build_record_components_into_native,
+        py::arg("raw_records"),
+        py::arg("height"),
+        py::arg("width"),
+        py::arg("parent_output"),
+        py::arg("rank_output"),
+        py::arg("member_output"),
+        py::arg("key_output"),
+        py::arg("row_workspace")
+    );
+    module.def(
         "build_component_member_order",
         &build_component_member_order_native,
         py::arg("component_ids"),
@@ -4973,6 +6996,21 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("width")
     );
     module.def(
+        "scatter_repair_records_float_into",
+        &scatter_repair_records_float_into_native,
+        py::arg("raw_records"),
+        py::arg("pixel_offset"),
+        py::arg("output")
+    );
+    module.def(
+        "materialize_repair_scatter_u8_into",
+        &materialize_repair_scatter_u8_into_native,
+        py::arg("raw_records"),
+        py::arg("pixel_offset"),
+        py::arg("colour_output"),
+        py::arg("mask_output")
+    );
+    module.def(
         "select_exemplar_donor",
         &select_exemplar_donor,
         py::arg("working_bgr"),
@@ -4984,6 +7022,21 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("selected_indexes"),
         py::arg("donor_gradient_x") = py::none(),
         py::arg("donor_gradient_y") = py::none()
+    );
+    module.def(
+        "plan_local_strips_in_place",
+        &plan_local_strips_in_place_native,
+        py::arg("raw_records"),
+        py::arg("coverage_count"),
+        py::arg("pure_region_id"),
+        py::arg("blue"),
+        py::arg("green"),
+        py::arg("red"),
+        py::arg("local_limit_px"),
+        py::arg("search_limit"),
+        py::arg("safe_radius"),
+        py::arg("slot_remaining"),
+        py::arg("sample_remaining")
     );
     module.def(
         "plan_local_strips",
@@ -5044,7 +7097,9 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         "build_exemplar_candidate_mask",
         &build_exemplar_candidate_mask_native,
         py::arg("safe_donor_mask"),
-        py::arg("pure_region_id")
+        py::arg("pure_region_id"),
+        py::arg("output") = py::none(),
+        py::arg("workspace") = py::none()
     );
     module.def(
         "select_exemplar_frontier",
@@ -5060,7 +7115,8 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("pure_region_id"),
         py::arg("safe_donor_mask"),
         py::arg("target_pixels"),
-        py::arg("region_id")
+        py::arg("region_id"),
+        py::arg("workspace")
     );
     module.def("build_info", &build_info);
 }

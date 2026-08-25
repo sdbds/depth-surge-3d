@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from . import local_strip, native_kd
+from .arena import QualityByteArena
 from .local_strip import QualityRepairBudgets, QualityVisibilityAnalysis
 from .repair_records import REPAIR_RECORD_DTYPE
 
@@ -163,7 +164,9 @@ def downsample_exemplar_level(level: ExemplarLevel) -> ExemplarLevel:
     quotients = totals // divisors
     remainders = totals % divisors
     doubled = remainders * np.uint16(2)
-    rounded = quotients + ((doubled > divisors) | ((doubled == divisors) & ((quotients & 1) != 0)))
+    rounded = quotients + (
+        (doubled > divisors) | ((doubled == divisors) & ((quotients & 1) != 0))
+    )
     working = np.ascontiguousarray(rounded.astype(np.uint8))
     working[barrier] = np.uint8(0)
     target &= ~barrier
@@ -184,6 +187,46 @@ def build_exemplar_pyramid(full_level: ExemplarLevel) -> tuple[ExemplarLevel, ..
         if min(next_shape) < _MIN_COARSE_SIDE:
             break
         levels.append(downsample_exemplar_level(levels[-1]))
+    return tuple(levels)
+
+
+def _downsample_exemplar_level_fixed(
+    level: ExemplarLevel,
+    arena: QualityByteArena,
+) -> ExemplarLevel:
+    child_height, child_width = level.target_mask.shape
+    parent_shape = ((child_height + 1) // 2, (child_width + 1) // 2)
+    working = arena.allocate((*parent_shape, 3), np.uint8)
+    donor = arena.allocate(parent_shape, np.bool_)
+    target = arena.allocate(parent_shape, np.bool_)
+    processed = arena.allocate(parent_shape, np.bool_)
+    barrier = arena.allocate(parent_shape, np.bool_)
+    native_kd._require_native().downsample_exemplar_level_into(
+        level.working_bgr,
+        level.donor_mask,
+        level.target_mask,
+        level.processed_mask,
+        level.barrier_mask,
+        working,
+        donor,
+        target,
+        processed,
+        barrier,
+    )
+    return ExemplarLevel(working, donor, target, processed, barrier)
+
+
+def _build_exemplar_pyramid_fixed(
+    full_level: ExemplarLevel,
+    arena: QualityByteArena,
+) -> tuple[ExemplarLevel, ...]:
+    levels = [full_level]
+    while len(levels) < 3:
+        current_height, current_width = levels[-1].target_mask.shape
+        next_shape = ((current_height + 1) // 2, (current_width + 1) // 2)
+        if min(next_shape) < _MIN_COARSE_SIDE:
+            break
+        levels.append(_downsample_exemplar_level_fixed(levels[-1], arena))
     return tuple(levels)
 
 
@@ -229,9 +272,35 @@ def enumerate_donor_centres(donor_mask: np.ndarray) -> np.ndarray:
     )
     rows, columns = np.nonzero(counts == support * support)
     centres = np.empty((rows.size, 2), dtype=np.uint32)
-    centres[:, 0] = rows.astype(np.uint32, copy=False) + np.uint32(_DONOR_SUPPORT_RADIUS)
-    centres[:, 1] = columns.astype(np.uint32, copy=False) + np.uint32(_DONOR_SUPPORT_RADIUS)
+    centres[:, 0] = rows.astype(np.uint32, copy=False) + np.uint32(
+        _DONOR_SUPPORT_RADIUS
+    )
+    centres[:, 1] = columns.astype(np.uint32, copy=False) + np.uint32(
+        _DONOR_SUPPORT_RADIUS
+    )
     return centres
+
+
+def _enumerate_donor_centres_fixed(
+    donor_mask: np.ndarray,
+    arena: QualityByteArena,
+) -> np.ndarray:
+    height, width = donor_mask.shape
+    if height < 9 or width < 9:
+        return arena.allocate((0, 2), np.uint32)
+    integral = arena.allocate((height + 1, width + 1), np.uint32)
+    capacity = (height - 8) * (width - 8)
+    centres = arena.allocate((capacity, 2), np.uint32)
+    count = int(
+        native_kd._require_native().enumerate_exemplar_donor_centres_into(
+            donor_mask,
+            integral,
+            centres,
+        )
+    )
+    result = centres[:count]
+    result.setflags(write=False)
+    return result
 
 
 def reflect_101_index(index: int, length: int) -> int:
@@ -317,6 +386,8 @@ def repair_component_exemplar(
     render_shape: tuple[int, int],
     budgets: QualityRepairBudgets,
     in_place: bool = False,
+    arena: QualityByteArena | None = None,
+    record_indexes: np.ndarray | None = None,
 ) -> ExemplarRepairResult:
     """Run the exact bounded exemplar state machine for one component."""
 
@@ -327,17 +398,39 @@ def repair_component_exemplar(
         region_id,
         render_shape,
         budgets,
+        record_indexes,
     )
+    if record_indexes is not None and arena is None:
+        raise ValueError("record_indexes require the fixed-arena exemplar path")
     if in_place:
         output = records
         output.setflags(write=True)
     else:
         output = np.array(records, copy=True, order="C")
-    residual_indexes = np.flatnonzero(output["backend"] == np.uint8(0))
-    if residual_indexes.size == 0:
-        output.setflags(write=False)
-        return ExemplarRepairResult(output, 0, 0, 0, 0)
-    work = _prepare_component_work(output, residual_indexes, region, width)
+    if arena is None:
+        residual_indexes = np.flatnonzero(output["backend"] == np.uint8(0))
+        if residual_indexes.size == 0:
+            output.setflags(write=False)
+            return ExemplarRepairResult(output, 0, 0, 0, 0)
+        work = _prepare_component_work(output, residual_indexes, region, width)
+        selected_record_indexes = None
+    else:
+        selected_record_indexes = record_indexes
+        if selected_record_indexes is None:
+            selected_record_indexes = arena.allocate(int(output.size), np.uint32)
+            for index in range(output.size):
+                selected_record_indexes[index] = np.uint32(index)
+        work = _prepare_component_work_fixed(
+            output,
+            selected_record_indexes,
+            region,
+            height,
+            width,
+            arena,
+        )
+        if work is None:
+            output.setflags(write=False)
+            return ExemplarRepairResult(output, 0, 0, 0, 0)
     _run_component_cores(
         work,
         analysis,
@@ -345,12 +438,14 @@ def repair_component_exemplar(
         region,
         render_shape,
         budgets,
+        arena=arena,
     )
     _commit_completed_records(
         output,
         work.target_pixels,
         work.completed,
         work.completed_colours,
+        record_indexes=selected_record_indexes,
     )
     output.setflags(write=False)
     processed_count = int(np.count_nonzero(work.completed))
@@ -393,6 +488,57 @@ def _prepare_component_work(
     )
 
 
+def _prepare_component_work_fixed(
+    output: np.ndarray,
+    record_indexes: np.ndarray,
+    region: int,
+    height: int,
+    width: int,
+    arena: QualityByteArena,
+) -> _ComponentWork | None:
+    target_capacity = int(record_indexes.size)
+    target_pixels_storage = arena.allocate(target_capacity, np.uint32)
+    target_colours_storage = arena.allocate((target_capacity, 3), np.uint8)
+    raw_records = output.view(np.uint8).reshape(output.size, REPAIR_RECORD_DTYPE.itemsize)
+    target_count = int(
+        native_kd._require_native().collect_exemplar_targets_into(
+            raw_records,
+            record_indexes,
+            region,
+            height,
+            width,
+            target_pixels_storage,
+            target_colours_storage,
+        )
+    )
+    if target_count == 0:
+        return None
+    target_pixels = target_pixels_storage[:target_count]
+    target_colours = target_colours_storage[:target_count]
+    target_rows = arena.allocate(target_count, np.uint32)
+    target_columns = arena.allocate(target_count, np.uint32)
+    np.floor_divide(target_pixels, np.uint32(width), out=target_rows)
+    np.remainder(target_pixels, np.uint32(width), out=target_columns)
+    completed = arena.allocate(target_count, np.bool_, zero=True)
+    completed_colours = arena.allocate((target_count, 3), np.uint8)
+    completed_colours[:] = target_colours
+    component_bbox = (
+        int(target_rows.min()),
+        int(target_rows.max()) + 1,
+        int(target_columns.min()),
+        int(target_columns.max()) + 1,
+    )
+    return _ComponentWork(
+        target_pixels=target_pixels,
+        target_rows=target_rows,
+        target_columns=target_columns,
+        target_colours=target_colours,
+        completed=completed,
+        completed_colours=completed_colours,
+        component_bbox=component_bbox,
+    )
+
+
 def _run_component_cores(
     work: _ComponentWork,
     analysis: QualityVisibilityAnalysis,
@@ -400,12 +546,53 @@ def _run_component_cores(
     region: int,
     render_shape: tuple[int, int],
     budgets: QualityRepairBudgets,
+    *,
+    arena: QualityByteArena | None = None,
 ) -> None:
-    cores = partition_exemplar_cores(work.component_bbox, frame_shape=render_shape)
-    for core in cores:
-        if not _component_budget_available(work, budgets):
-            break
-        _repair_core(work, core, analysis, safe_donor_mask, region, budgets)
+    if arena is None:
+        cores = partition_exemplar_cores(work.component_bbox, frame_shape=render_shape)
+        for core in cores:
+            if not _component_budget_available(work, budgets):
+                break
+            _repair_core(work, core, analysis, safe_donor_mask, region, budgets)
+        return
+    height, width = render_shape
+    y0, y1, x0, x1 = work.component_bbox
+    read_bbox = (
+        max(0, y0 - _COMPONENT_READ_MARGIN),
+        min(height, y1 + _COMPONENT_READ_MARGIN),
+        max(0, x0 - _COMPONENT_READ_MARGIN),
+        min(width, x1 + _COMPONENT_READ_MARGIN),
+    )
+    read_y0, read_y1, read_x0, read_x1 = read_bbox
+    core_mark = arena.mark()
+    for origin_y in range(y0, y1, _CORE_INTERIOR_SIZE):
+        interior_y1 = min(origin_y + _CORE_INTERIOR_SIZE, y1)
+        for origin_x in range(x0, x1, _CORE_INTERIOR_SIZE):
+            if not _component_budget_available(work, budgets):
+                return
+            arena.rewind(core_mark)
+            interior_x1 = min(origin_x + _CORE_INTERIOR_SIZE, x1)
+            core = ExemplarCore(
+                origin=(origin_y, origin_x),
+                interior_bbox=(origin_y, interior_y1, origin_x, interior_x1),
+                working_bbox=(
+                    max(read_y0, origin_y - _CORE_HALO_SIZE),
+                    min(read_y1, interior_y1 + _CORE_HALO_SIZE),
+                    max(read_x0, origin_x - _CORE_HALO_SIZE),
+                    min(read_x1, interior_x1 + _CORE_HALO_SIZE),
+                ),
+                read_bbox=read_bbox,
+            )
+            _repair_core(
+                work,
+                core,
+                analysis,
+                safe_donor_mask,
+                region,
+                budgets,
+                arena=arena,
+            )
 
 
 def _repair_core(
@@ -415,46 +602,86 @@ def _repair_core(
     safe_donor_mask: np.ndarray,
     region: int,
     budgets: QualityRepairBudgets,
+    *,
+    arena: QualityByteArena | None = None,
 ) -> None:
-    full_level, local_target_indexes = _build_full_level(
-        core,
-        analysis,
-        safe_donor_mask,
-        work.target_pixels,
-        work.target_rows,
-        work.target_columns,
-        work.target_colours,
-        work.completed,
-        work.completed_colours,
-        region,
-    )
+    if arena is None:
+        full_level, local_target_indexes = _build_full_level(
+            core,
+            analysis,
+            safe_donor_mask,
+            work.target_pixels,
+            work.target_rows,
+            work.target_columns,
+            work.target_colours,
+            work.completed,
+            work.completed_colours,
+            region,
+        )
+    else:
+        full_level = _build_full_level_fixed(
+            core,
+            analysis,
+            safe_donor_mask,
+            work,
+            region,
+            arena,
+        )
+        local_target_indexes = None
     if not np.any(full_level.target_mask):
         return
-    levels = build_exemplar_pyramid(full_level)
+    levels = (
+        build_exemplar_pyramid(full_level)
+        if arena is None
+        else _build_exemplar_pyramid_fixed(full_level, arena)
+    )
     core_evaluations = 0
     for level_index in range(len(levels) - 1, -1, -1):
         if level_index < len(levels) - 1:
-            _replicate_coarse_targets(levels[level_index + 1], levels[level_index])
-        iteration_count, evaluation_count = _repair_level(
-            levels[level_index],
-            budgets,
-            core_evaluations=core_evaluations,
-            component_evaluations=work.evaluation_count,
-        )
+            if arena is None:
+                _replicate_coarse_targets(
+                    levels[level_index + 1],
+                    levels[level_index],
+                )
+            else:
+                _replicate_coarse_targets_fixed(
+                    levels[level_index + 1],
+                    levels[level_index],
+                )
+        scratch_mark = None if arena is None else arena.mark()
+        try:
+            iteration_count, evaluation_count = _repair_level(
+                levels[level_index],
+                budgets,
+                core_evaluations=core_evaluations,
+                component_evaluations=work.evaluation_count,
+                arena=arena,
+            )
+        finally:
+            if scratch_mark is not None:
+                arena.rewind(scratch_mark)
         core_evaluations += evaluation_count
         work.evaluation_count += evaluation_count
         work.patch_iteration_count += iteration_count
         if not _core_budget_available(core_evaluations, work, budgets):
             break
-    _record_full_level_completions(
-        levels[0],
-        local_target_indexes,
-        work.target_rows,
-        work.target_columns,
-        work.completed,
-        work.completed_colours,
-        core.working_bbox,
-    )
+    if local_target_indexes is None:
+        _record_full_level_completions_fixed(
+            levels[0],
+            work,
+            core.working_bbox,
+            int(analysis.coverage_count.shape[1]),
+        )
+    else:
+        _record_full_level_completions(
+            levels[0],
+            local_target_indexes,
+            work.target_rows,
+            work.target_columns,
+            work.completed,
+            work.completed_colours,
+            core.working_bbox,
+        )
 
 
 def _component_budget_available(
@@ -463,7 +690,8 @@ def _component_budget_available(
 ) -> bool:
     return (
         work.evaluation_count < budgets.exemplar_component_evaluation_cap
-        and budgets.exemplar_eye_evaluations_consumed < budgets.exemplar_eye_evaluation_cap
+        and budgets.exemplar_eye_evaluations_consumed
+        < budgets.exemplar_eye_evaluation_cap
     )
 
 
@@ -472,8 +700,9 @@ def _core_budget_available(
     work: _ComponentWork,
     budgets: QualityRepairBudgets,
 ) -> bool:
-    return core_evaluations < budgets.exemplar_core_evaluation_cap and _component_budget_available(
-        work, budgets
+    return (
+        core_evaluations < budgets.exemplar_core_evaluation_cap
+        and _component_budget_available(work, budgets)
     )
 
 
@@ -483,6 +712,7 @@ def _repair_level(
     *,
     core_evaluations: int,
     component_evaluations: int,
+    arena: QualityByteArena | None = None,
 ) -> tuple[int, int]:
     iterations = 0
     evaluations = 0
@@ -496,16 +726,31 @@ def _repair_level(
         <= 0
     ):
         return iterations, evaluations
-    candidates = enumerate_donor_centres(level.donor_mask)
+    candidates = (
+        enumerate_donor_centres(level.donor_mask)
+        if arena is None
+        else _enumerate_donor_centres_fixed(level.donor_mask, arena)
+    )
     if candidates.size == 0:
         return iterations, evaluations
     native = native_kd._require_native()
-    donor_gradient_x, donor_gradient_y = native.build_exemplar_sobel_planes(level.working_bgr)
+    if arena is None:
+        donor_gradient_x, donor_gradient_y = native.build_exemplar_sobel_planes(
+            level.working_bgr
+        )
+        selected_storage = None
+    else:
+        donor_gradient_x = arena.allocate(level.target_mask.shape, np.int16)
+        donor_gradient_y = arena.allocate(level.target_mask.shape, np.int16)
+        native.build_exemplar_sobel_planes(
+            level.working_bgr,
+            donor_gradient_x,
+            donor_gradient_y,
+        )
+        selected_storage = arena.allocate(int(candidates.shape[0]), np.uint32)
     donor_gradient_x.setflags(write=False)
     donor_gradient_y.setflags(write=False)
     while iterations < _PATCH_ITERATION_CAP:
-        if np.all(level.processed_mask[level.target_mask]):
-            break
         remaining = _remaining_evaluations(
             budgets,
             core_evaluations,
@@ -517,10 +762,19 @@ def _repair_level(
         frontier = select_frontier_target(level)
         if frontier is None:
             break
-        selected = subsample_candidate_indexes(
-            candidate_count=int(candidates.shape[0]),
-            evaluation_limit=remaining,
-        )
+        if selected_storage is None:
+            selected = subsample_candidate_indexes(
+                candidate_count=int(candidates.shape[0]),
+                evaluation_limit=remaining,
+            )
+        else:
+            selected_count = min(int(candidates.shape[0]), remaining)
+            native.subsample_exemplar_indexes_into(
+                int(candidates.shape[0]),
+                selected_count,
+                selected_storage,
+            )
+            selected = selected_storage[:selected_count]
         if selected.size == 0:
             break
         target_row, target_column, _ = frontier
@@ -552,7 +806,9 @@ def _remaining_evaluations(
 ) -> int:
     return min(
         budgets.exemplar_core_evaluation_cap - core_evaluations - level_evaluations,
-        budgets.exemplar_component_evaluation_cap - component_evaluations - level_evaluations,
+        budgets.exemplar_component_evaluation_cap
+        - component_evaluations
+        - level_evaluations,
         budgets.exemplar_eye_evaluation_cap - budgets.exemplar_eye_evaluations_consumed,
     )
 
@@ -677,17 +933,15 @@ def _copy_patch(
     donor_row: int,
     donor_column: int,
 ) -> None:
-    for delta_row in range(-_PATCH_RADIUS, _PATCH_RADIUS + 1):
-        for delta_column in range(-_PATCH_RADIUS, _PATCH_RADIUS + 1):
-            row = target_row + delta_row
-            column = target_column + delta_column
-            if not level.target_mask[row, column] or level.processed_mask[row, column]:
-                continue
-            level.working_bgr[row, column] = level.working_bgr[
-                donor_row + delta_row,
-                donor_column + delta_column,
-            ]
-            level.processed_mask[row, column] = True
+    native_kd._require_native().copy_exemplar_patch_into(
+        level.working_bgr,
+        level.target_mask,
+        level.processed_mask,
+        target_row,
+        target_column,
+        donor_row,
+        donor_column,
+    )
 
 
 def _build_full_level(
@@ -721,7 +975,10 @@ def _build_full_level(
     barrier = ~same_proxy
 
     in_working = (
-        (target_rows >= y0) & (target_rows < y1) & (target_columns >= x0) & (target_columns < x1)
+        (target_rows >= y0)
+        & (target_rows < y1)
+        & (target_columns >= x0)
+        & (target_columns < x1)
     )
     local_indexes = np.flatnonzero(in_working)
     for target_index in local_indexes:
@@ -756,6 +1013,49 @@ def _build_full_level(
     return level, local_indexes
 
 
+def _build_full_level_fixed(
+    core: ExemplarCore,
+    analysis: QualityVisibilityAnalysis,
+    safe_donor_mask: np.ndarray,
+    work: _ComponentWork,
+    region: int,
+    arena: QualityByteArena,
+) -> ExemplarLevel:
+    y0, y1, x0, x1 = core.working_bbox
+    interior_y0, interior_y1, interior_x0, interior_x1 = core.interior_bbox
+    shape = (y1 - y0, x1 - x0)
+    working = arena.allocate((*shape, 3), np.uint8)
+    processed = arena.allocate(shape, np.bool_)
+    donor = arena.allocate(shape, np.bool_)
+    target = arena.allocate(shape, np.bool_)
+    barrier = arena.allocate(shape, np.bool_)
+    native_kd._require_native().prepare_exemplar_full_level_into(
+        analysis.coverage_count,
+        analysis.pure_region_id,
+        analysis.pure_bgr[0],
+        analysis.pure_bgr[1],
+        analysis.pure_bgr[2],
+        safe_donor_mask,
+        work.target_pixels,
+        work.target_colours,
+        work.completed,
+        work.completed_colours,
+        region,
+        y0,
+        x0,
+        interior_y0,
+        interior_y1,
+        interior_x0,
+        interior_x1,
+        working,
+        donor,
+        target,
+        processed,
+        barrier,
+    )
+    return ExemplarLevel(working, donor, target, processed, barrier)
+
+
 def _record_full_level_completions(
     full_level: ExemplarLevel,
     local_target_indexes: np.ndarray,
@@ -778,6 +1078,26 @@ def _record_full_level_completions(
             completed_colours[index] = full_level.working_bgr[local_row, local_column]
 
 
+def _record_full_level_completions_fixed(
+    full_level: ExemplarLevel,
+    work: _ComponentWork,
+    working_bbox: tuple[int, int, int, int],
+    frame_width: int,
+) -> None:
+    y0, _, x0, _ = working_bbox
+    native_kd._require_native().record_exemplar_completions_into(
+        full_level.working_bgr,
+        full_level.target_mask,
+        full_level.processed_mask,
+        work.target_pixels,
+        frame_width,
+        y0,
+        x0,
+        work.completed,
+        work.completed_colours,
+    )
+
+
 def _replicate_coarse_targets(coarse: ExemplarLevel, fine: ExemplarLevel) -> None:
     height, width = fine.target_mask.shape
     for row in range(height):
@@ -796,16 +1116,46 @@ def _replicate_coarse_targets(coarse: ExemplarLevel, fine: ExemplarLevel) -> Non
                 ]
 
 
+def _replicate_coarse_targets_fixed(
+    coarse: ExemplarLevel,
+    fine: ExemplarLevel,
+) -> None:
+    native_kd._require_native().replicate_exemplar_targets_into(
+        coarse.working_bgr,
+        coarse.target_mask,
+        coarse.barrier_mask,
+        fine.working_bgr,
+        fine.target_mask,
+    )
+
+
 def _commit_completed_records(
     output: np.ndarray,
     target_pixels: np.ndarray,
     completed: np.ndarray,
     completed_colours: np.ndarray,
+    *,
+    record_indexes: np.ndarray | None = None,
 ) -> None:
+    if record_indexes is not None:
+        raw_records = output.view(np.uint8).reshape(
+            output.size,
+            REPAIR_RECORD_DTYPE.itemsize,
+        )
+        native_kd._require_native().commit_exemplar_records_into(
+            raw_records,
+            record_indexes,
+            target_pixels,
+            completed,
+            completed_colours,
+        )
+        return
     for record in output:
         if int(record["backend"]) != 0:
             continue
-        target_index = int(np.searchsorted(target_pixels, np.uint32(record["pixel_index"])))
+        target_index = int(
+            np.searchsorted(target_pixels, np.uint32(record["pixel_index"]))
+        )
         if target_index < target_pixels.size and completed[target_index]:
             record["fill_bgr"] = completed_colours[target_index]
             record["backend"] = np.uint8(2)
@@ -825,7 +1175,9 @@ def _collect_component_targets(
         matching = residual[residual["pixel_index"] == pixel]
         target_colours[target_index] = matching[0]["fill_bgr"]
         if np.any(matching["fill_bgr"] != target_colours[target_index]):
-            raise ValueError("records for one target pixel disagree on provisional colour")
+            raise ValueError(
+                "records for one target pixel disagree on provisional colour"
+            )
     return np.ascontiguousarray(target_pixels), target_colours
 
 
@@ -836,6 +1188,7 @@ def _validate_repair_inputs(
     region_id: int,
     render_shape: tuple[int, int],
     budgets: QualityRepairBudgets,
+    record_indexes: np.ndarray | None,
 ) -> tuple[int, int, int]:
     height, width = _validate_shape(render_shape)
     if (
@@ -860,10 +1213,18 @@ def _validate_repair_inputs(
     region = _require_integer("region_id", region_id)
     if not 0 < region < _NO_REGION:
         raise ValueError("region_id must be a positive canonical region")
-    for record in records:
-        pixel = int(record["pixel_index"])
-        if not 0 <= pixel < height * width:
-            raise ValueError("record pixel lies outside render_shape")
+    if record_indexes is None:
+        for record in records:
+            pixel = int(record["pixel_index"])
+            if not 0 <= pixel < height * width:
+                raise ValueError("record pixel lies outside render_shape")
+    elif (
+        not isinstance(record_indexes, np.ndarray)
+        or record_indexes.dtype != np.uint32
+        or record_indexes.ndim != 1
+        or not record_indexes.flags.c_contiguous
+    ):
+        raise TypeError("record_indexes must be a C-contiguous uint32 vector")
     return height, width, region
 
 
@@ -942,7 +1303,9 @@ def _validate_center(name: str, center: tuple[int, int]) -> tuple[int, int]:
     if (
         not isinstance(center, tuple)
         or len(center) != 2
-        or any(isinstance(value, bool) or not isinstance(value, int) for value in center)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) for value in center
+        )
     ):
         raise TypeError(f"{name} must be an integer (row, column) tuple")
     return center

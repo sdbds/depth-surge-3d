@@ -10,6 +10,9 @@ import cv2
 import numpy as np
 import pytest
 
+from src.depth_surge_3d.io import resume as resume_module
+from src.depth_surge_3d.io.nofollow_io import AcquiredRoot
+
 from src.depth_surge_3d.core.file_identity import (
     FILE_IDENTITY_ALGORITHM_VERSION,
     file_sample_fingerprint,
@@ -647,6 +650,36 @@ def _legacy_job(tmp_path: Path):
     return settings_file, legacy_depth
 
 
+def _schema4_fast_job(output_dir: Path, **settings_overrides):
+    frame_files, source_fingerprint = _write_frames(output_dir)
+    requested = {
+        "keep_intermediates": False,
+        "stereo_render_mode": "fast",
+        **settings_overrides,
+    }
+    settings = _current_settings(**requested)
+    settings_file = _write_settings(output_dir, settings)
+    settings_payload = json.loads(settings_file.read_text(encoding="utf-8"))
+    settings_payload["metadata"]["settings_schema_version"] = 4
+    settings_payload["processing_settings"].pop("stereo_render_mode", None)
+    settings_payload["processing_settings"].pop("occlusion_fill_max_px", None)
+    settings_file.write_text(json.dumps(settings_payload), encoding="utf-8")
+    _manifest, _bounds, canonical = _write_current_depth_pipeline(
+        output_dir,
+        frame_files,
+        source_fingerprint,
+        settings=settings,
+    )
+    _write_current_stereo_pipeline(output_dir, frame_files, canonical)
+    metadata_path = output_dir / "04_left_frames" / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return frame_files, settings
+
+
 def test_report_preserves_original_frames_and_lists_legacy_stages(tmp_path):
     from src.depth_surge_3d.io.resume import build_resume_report
 
@@ -664,6 +697,245 @@ def test_report_preserves_original_frames_and_lists_legacy_stages(tmp_path):
         "focal_length",
         "hole_fill_quality",
     }
+
+
+def test_schema4_intact_fast_stage_without_masks_is_adoptable(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, source_fingerprint = _write_frames(tmp_path)
+    settings = _current_settings(
+        keep_intermediates=False,
+        stereo_render_mode="fast",
+        per_eye_width=6,
+        per_eye_height=4,
+        vr_output_width=12,
+        vr_output_height=4,
+        source_width=6,
+        source_height=4,
+    )
+    settings_file = _write_settings(tmp_path, settings)
+    settings_payload = json.loads(settings_file.read_text(encoding="utf-8"))
+    settings_payload["metadata"]["settings_schema_version"] = 4
+    settings_payload["processing_settings"].pop("stereo_render_mode", None)
+    settings_payload["processing_settings"].pop("occlusion_fill_max_px", None)
+    settings_file.write_text(json.dumps(settings_payload), encoding="utf-8")
+    _manifest, _bounds, canonical = _write_current_depth_pipeline(
+        tmp_path,
+        frame_files,
+        source_fingerprint,
+        settings=settings,
+    )
+    _write_current_stereo_pipeline(tmp_path, frame_files, canonical)
+    stereo_metadata_path = tmp_path / "04_left_frames" / "metadata.json"
+    stereo_metadata = json.loads(stereo_metadata_path.read_text(encoding="utf-8"))
+    stereo_metadata_path.write_text(
+        json.dumps(stereo_metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("stereo").disposition == "preserve"
+    assert report.legacy_fast_adoption is not None
+    assert report.legacy_fast_adoption.frame_count == len(frame_files)
+    assert not {
+        tmp_path / "04_left_frames",
+        tmp_path / "04_right_frames",
+    } & set(report.migration_paths)
+
+
+@pytest.mark.parametrize(
+    "settings_override",
+    [
+        {"keep_intermediates": True},
+        {"stereo_render_mode": "quality"},
+    ],
+)
+def test_legacy_fast_adoption_requires_fast_without_masks(
+    tmp_path,
+    settings_override,
+):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _frames, settings = _schema4_fast_job(tmp_path, **settings_override)
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("stereo").disposition == "invalidate"
+    assert report.legacy_fast_adoption is None
+
+
+def test_legacy_fast_adoption_rejects_one_corrupt_rgb_payload(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    frame_files, settings = _schema4_fast_job(tmp_path)
+    (tmp_path / "04_left_frames" / frame_files[0].name).write_bytes(b"not a PNG")
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("stereo").disposition == "invalidate"
+    assert report.legacy_fast_adoption is None
+
+
+def test_legacy_fast_adoption_rejects_linked_rgb_parent(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _frame_files, settings = _schema4_fast_job(tmp_path)
+    right = tmp_path / "04_right_frames"
+    moved = tmp_path / "04_right_frames.real"
+    right.rename(moved)
+    try:
+        try:
+            right.symlink_to(moved, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"directory symlink creation is unavailable: {error}")
+        report = build_resume_report(tmp_path, settings)
+        assert report.stage("stereo").disposition == "invalidate"
+        assert report.legacy_fast_adoption is None
+    finally:
+        if right.is_symlink():
+            right.unlink()
+        if moved.exists() and not right.exists():
+            moved.rename(right)
+
+
+def test_legacy_pretty_array_reader_rejects_a_line_over_64_kib(tmp_path):
+    path = tmp_path / "legacy.json"
+    path.write_bytes(b'{\n  "frame_names": [\n    "' + b"a" * (64 * 1024) + b'"\n  ]\n}')
+
+    with AcquiredRoot(tmp_path) as acquired:
+        with pytest.raises(ValueError, match="exceeds 64 KiB"):
+            list(
+                resume_module._iter_pretty_top_level_array(
+                    acquired,
+                    path,
+                    "frame_names",
+                )
+            )
+
+
+def test_legacy_metric_fast_adoption_requires_old_clamp_evidence(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _frame_files, original_settings = _metric_job(tmp_path)
+    settings = {
+        **original_settings,
+        "keep_intermediates": False,
+        "stereo_render_mode": "fast",
+    }
+    settings_path = tmp_path / "job-settings.json"
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    payload["metadata"]["settings_schema_version"] = 4
+    payload["processing_settings"]["keep_intermediates"] = False
+    payload["processing_settings"].pop("stereo_render_mode", None)
+    payload["processing_settings"].pop("occlusion_fill_max_px", None)
+    settings_path.write_text(json.dumps(payload), encoding="utf-8")
+    metadata_path = tmp_path / "04_left_frames" / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    report = build_resume_report(tmp_path, settings)
+
+    assert report.stage("stereo").disposition == "invalidate"
+    assert report.legacy_fast_adoption is None
+
+
+def test_legacy_fast_intent_recovers_schema5_diagnostics_prefix(tmp_path):
+    from src.depth_surge_3d.io.resume import (
+        LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH,
+        apply_legacy_migration,
+        build_resume_report,
+        iter_legacy_fast_frame_names,
+        recover_legacy_fast_adoption_intent_v1,
+    )
+    from src.depth_surge_3d.rendering.quality.diagnostic_transaction import (
+        StreamingDiagnosticsStageContext,
+        publish_legacy_fast_unavailable,
+    )
+
+    frame_files, source_fingerprint = _write_frames(tmp_path)
+    settings = _current_settings(
+        keep_intermediates=False,
+        stereo_render_mode="fast",
+        per_eye_width=6,
+        per_eye_height=4,
+        vr_output_width=12,
+        vr_output_height=4,
+        source_width=6,
+        source_height=4,
+    )
+    settings_file = _write_settings(tmp_path, settings)
+    settings_payload = json.loads(settings_file.read_text(encoding="utf-8"))
+    settings_payload["metadata"]["settings_schema_version"] = 4
+    settings_payload["processing_settings"].pop("stereo_render_mode", None)
+    settings_payload["processing_settings"].pop("occlusion_fill_max_px", None)
+    settings_file.write_text(json.dumps(settings_payload), encoding="utf-8")
+    _manifest, _bounds, canonical = _write_current_depth_pipeline(
+        tmp_path,
+        frame_files,
+        source_fingerprint,
+        settings=settings,
+    )
+    _write_current_stereo_pipeline(tmp_path, frame_files, canonical)
+    stereo_metadata_path = tmp_path / "04_left_frames" / "metadata.json"
+    stereo_metadata = json.loads(stereo_metadata_path.read_text(encoding="utf-8"))
+    stereo_metadata_path.write_text(
+        json.dumps(stereo_metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    initial = build_resume_report(tmp_path, settings)
+    assert initial.legacy_fast_adoption is not None
+
+    apply_legacy_migration(initial, "archive")
+
+    intent_path = tmp_path / LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH
+    assert intent_path.is_file()
+    recovered_intent = recover_legacy_fast_adoption_intent_v1(tmp_path)
+    assert recovered_intent == initial.legacy_fast_adoption
+    (tmp_path / "04_stereo_diagnostics").mkdir()
+
+    resumed = build_resume_report(
+        tmp_path,
+        settings,
+        settings_file=tmp_path / "processing-settings-v5.json",
+    )
+
+    assert resumed.stage("stereo").disposition == "preserve"
+    assert resumed.legacy_fast_adoption == recovered_intent
+
+    assert recovered_intent is not None
+    context = StreamingDiagnosticsStageContext(
+        job_root=tmp_path,
+        frame_count=recovered_intent.frame_count,
+        frame_names=lambda: iter_legacy_fast_frame_names(recovered_intent),
+        render_shape=recovered_intent.render_shape,
+        render_mode="fast",
+        geometry_mode="relative",
+        occlusion_fill=recovered_intent.occlusion_fill,
+        mask_payloads_enabled=False,
+        rgb_stage_fingerprint=recovered_intent.rgb_stage_fingerprint,
+        source_guide_fingerprint=recovered_intent.source_guide_fingerprint,
+        native_geometry_fingerprint=None,
+        quality_input_manifest_sha256=None,
+    )
+    publish_legacy_fast_unavailable(context, recovered_intent)
+
+    completed = build_resume_report(
+        tmp_path,
+        settings,
+        settings_file=tmp_path / "processing-settings-v5.json",
+    )
+
+    assert completed.stage("stereo").disposition == "preserve"
+    assert completed.legacy_fast_adoption == recovered_intent
+
+    apply_legacy_migration(completed, "archive")
+    assert recover_legacy_fast_adoption_intent_v1(tmp_path) == recovered_intent
+    publish_legacy_fast_unavailable(context, recovered_intent)
+    assert not (tmp_path / LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH).exists()
 
 
 def test_resume_rejects_future_schema_before_any_mutation(tmp_path):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sys
@@ -33,10 +34,18 @@ def build_native_extension(
 ) -> Path:
     """Compile to the repository root; importing never invokes this function."""
 
+    build_temp.mkdir(parents=True, exist_ok=True)
+    source_sha256 = hashlib.sha256(SOURCE.read_bytes()).hexdigest()
+    identity_header = build_temp / "quality_kd_build_identity.h"
+    identity_header.write_text(
+        "#pragma once\n"
+        f'#define QUALITY_KD_SOURCE_SHA256 "{source_sha256}"\n',
+        encoding="ascii",
+    )
     extension = Extension(
         "_quality_kd_native",
         sources=[str(SOURCE)],
-        include_dirs=[np.get_include(), *include_paths()],
+        include_dirs=[str(build_temp), np.get_include(), *include_paths()],
         language="c++",
         extra_compile_args=_compile_arguments(),
     )

@@ -492,6 +492,27 @@ def test_web_complete_stabilized_resume_skips_cuda_and_base_model(tmp_path):
     )
     report = MagicMock()
     report.migrated_settings = settings
+    adoption = web_app.LegacyFastAdoptionV1(
+        job_root=output_dir,
+        source_settings_schema_version=4,
+        settings_fingerprint="1" * 64,
+        frame_count=1,
+        render_shape=(48, 64),
+        geometry_mode="relative",
+        occlusion_fill="background",
+        rgb_stage_fingerprint="2" * 64,
+        source_guide_fingerprint="3" * 64,
+        stage_metadata_sha256="4" * 64,
+        payload_sequence_sha256="5" * 64,
+        metric_clamp_summary_sha256=None,
+        metric_clamp_evidence_sha256=None,
+        metric_valid_pixel_count=None,
+        metric_clamped_pixel_count=None,
+        metric_affected_frame_count=None,
+        metric_mean_clamped_fraction=None,
+        metric_max_clamped_fraction=None,
+    )
+    report.legacy_fast_adoption = adoption
     processor = MagicMock()
     lock_states = []
 
@@ -551,6 +572,7 @@ def test_web_complete_stabilized_resume_skips_cuda_and_base_model(tmp_path):
     create_projector.assert_not_called()
     processor_class.assert_called_once()
     assert processor_class.call_args.args[0] is None
+    assert processor_class.call_args.kwargs["legacy_fast_adoption"] is adoption
     assert lock_states == [True]
 
 

@@ -97,6 +97,7 @@ from socketio.exceptions import (  # type: ignore[import-untyped]  # noqa: E402
 
 from depth_surge_3d.processing import VideoProcessor  # noqa: E402
 from depth_surge_3d.io.resume import (  # noqa: E402
+    LegacyFastAdoptionV1,
     apply_legacy_migration,
     build_resume_report,
     resolve_resume_depth_model_version,
@@ -687,6 +688,11 @@ class ProgressCallback:
         self.step_progress = 0
         self.step_total = 0
 
+    def is_cancelled(self) -> bool:
+        """Return the shared user-stop state without emitting progress."""
+
+        return bool(current_processing.get("stop_requested", False))
+
     def send_preview_frame(
         self,
         frame_path: Path,
@@ -1219,10 +1225,14 @@ def process_video_async(  # noqa: C901
                     settings_file=resume_context.get("settings_file"),
                 )
 
+        legacy_fast_adoption: LegacyFastAdoptionV1 | None = None
         if resume_context is not None:
             assert resume_report is not None
             migration_mode = resume_context.get("migration_mode", "archive")
             apply_legacy_migration(resume_report, migration_mode)
+            candidate_adoption = resume_report.legacy_fast_adoption
+            if isinstance(candidate_adoption, LegacyFastAdoptionV1):
+                legacy_fast_adoption = candidate_adoption
             resolved_temporal = settings.get("temporal_postprocessor", "off")
             settings = dict(resume_report.migrated_settings)
             settings.setdefault("temporal_postprocessor", resolved_temporal)
@@ -1267,21 +1277,30 @@ def process_video_async(  # noqa: C901
                 effective_device=device,
                 models_dir=Path("models"),
             )
+        processor_kwargs: dict[str, Any] = {
+            "temporal_stabilizer": temporal_stabilizer,
+        }
+        if legacy_fast_adoption is not None:
+            processor_kwargs["legacy_fast_adoption"] = legacy_fast_adoption
         if selected_artifact is not None:
             selected_files, selected_source = selected_artifact
             processor = VideoProcessor(
                 None,
-                temporal_stabilizer=temporal_stabilizer,
                 preselected_depth_files=selected_files,
                 preselected_render_source=selected_source,
+                **processor_kwargs,
             )
+            selected_artifact = None
+            selected_files = None
+            processor_kwargs.clear()
         else:
             assert projector is not None
             processor = VideoProcessor(
                 projector.depth_estimator,
                 release_depth_model=projector.unload_model,
-                temporal_stabilizer=temporal_stabilizer,
+                **processor_kwargs,
             )
+            processor_kwargs.clear()
 
         # Calculate resolution settings that VideoProcessor expects
         from depth_surge_3d.utils.domain.resolution import (

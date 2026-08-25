@@ -87,8 +87,9 @@ def test_production_native_module_uses_frozen_prebuilt_algorithm() -> None:
     native = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
 
     assert native.native_available()
-    assert native.native_build_info() == {
-        "algorithm": "quality-implicit-region-kd-median-of-medians-v1",
-        "kd_stack_capacity": 64,
-        "runtime_jit": False,
-    }
+    build_info = native.native_build_info()
+    assert build_info["algorithm"] == "quality-implicit-region-kd-median-of-medians-v1"
+    assert build_info["kd_stack_capacity"] == 64
+    assert build_info["runtime_jit"] is False
+    assert len(build_info["source_sha256"]) == 64
+    int(build_info["source_sha256"], 16)

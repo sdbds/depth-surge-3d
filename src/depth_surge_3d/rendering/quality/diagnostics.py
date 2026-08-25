@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from typing import Any, Iterable
+from numbers import Integral
+from typing import Any, Callable, Iterable
 
 import numpy as np
+
+from ...io.streamed_canonical_json import ReplayableJsonArray
 
 from ..forward_splat import HORIZONTAL_SUBPIXELS
 from .planner import QualityRepairPlan, QualityRepairPlanSummary
@@ -27,10 +30,87 @@ _STATE_BITS = {
     "fallback_filled": 0x20,
     "final_unresolved": 0x40,
 }
+_U64_MAX = 2**64 - 1
+
+
+class DiagnosticsCardinalityError(ValueError):
+    """A persisted diagnostics integer exceeded the frozen uint64 domain."""
+
+    def __init__(self, field: str, operands: tuple[object, ...]) -> None:
+        self.field = field
+        self.operands = operands
+        super().__init__(f"diagnostics uint64 overflow for {field}: {operands!r}")
+
+
+def _u64_operand(field: str, value: object) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+        raise DiagnosticsCardinalityError(field, (value,))
+    normalized = int(value)
+    if normalized < 0 or normalized > _U64_MAX:
+        raise DiagnosticsCardinalityError(field, (value,))
+    return normalized
+
+
+def checked_u64_add(field: str, *operands: object) -> int:
+    """Add nonnegative integer operands without entering Python-bigint output."""
+
+    total = 0
+    normalized: list[int] = []
+    for operand in operands:
+        value = _u64_operand(field, operand)
+        normalized.append(value)
+        if value > _U64_MAX - total:
+            raise DiagnosticsCardinalityError(field, tuple(normalized))
+        total += value
+    return total
+
+
+def checked_u64_mul(field: str, *operands: object) -> int:
+    """Multiply nonnegative integer operands in frozen left-to-right order."""
+
+    total = 1
+    normalized: list[int] = []
+    for operand in operands:
+        value = _u64_operand(field, operand)
+        normalized.append(value)
+        if value and total > _U64_MAX // value:
+            raise DiagnosticsCardinalityError(field, tuple(normalized))
+        total *= value
+    return total
+
+
+def validate_diagnostics_cardinality_dimensions(
+    *,
+    frame_count: object,
+    height: object,
+    width: object,
+) -> int:
+    """Prove the fixed diagnostics dimensions and their root counter bounds."""
+
+    count = _u64_operand("frame_count", frame_count)
+    normalized_height = _u64_operand("render_shape.height", height)
+    normalized_width = _u64_operand("render_shape.width", width)
+    if count == 0 or normalized_height == 0 or normalized_width == 0:
+        raise DiagnosticsCardinalityError(
+            "diagnostics_dimensions",
+            (count, normalized_height, normalized_width),
+        )
+    pixels = checked_u64_mul(
+        "render_shape.pixel_count",
+        normalized_height,
+        normalized_width,
+    )
+    lane_count = checked_u64_mul("frame_lane_count", 16, pixels)
+    checked_u64_mul("root_pixel_count", count, pixels)
+    checked_u64_mul("root_lane_count", count, lane_count)
+    return pixels
 
 
 def _histogram_total(histogram: np.ndarray) -> int:
-    return int(np.sum(histogram, dtype=np.uint64))
+    total = 0
+    for count in histogram:
+        total = checked_u64_add("histogram_total", total, int(count))
+    return total
 
 
 def _histogram_max(histogram: np.ndarray) -> int:
@@ -95,13 +175,39 @@ def _prefill_run_histograms(
             continue
         if active_row >= 0:
             length = active_end - active_start + 1
-            lane_histogram[length] += np.uint64(1)
-            span_histogram[active_end // 16 - active_start // 16 + 1] += np.uint64(1)
+            lane_histogram[length] = np.uint64(
+                checked_u64_add(
+                    "lane_count_histogram",
+                    int(lane_histogram[length]),
+                    1,
+                )
+            )
+            span_index = active_end // 16 - active_start // 16 + 1
+            span_histogram[span_index] = np.uint64(
+                checked_u64_add(
+                    "touched_pixel_span_histogram",
+                    int(span_histogram[span_index]),
+                    1,
+                )
+            )
         active_row, active_start, active_end = row, start, end
     if active_row >= 0:
         length = active_end - active_start + 1
-        lane_histogram[length] += np.uint64(1)
-        span_histogram[active_end // 16 - active_start // 16 + 1] += np.uint64(1)
+        lane_histogram[length] = np.uint64(
+            checked_u64_add(
+                "lane_count_histogram",
+                int(lane_histogram[length]),
+                1,
+            )
+        )
+        span_index = active_end // 16 - active_start // 16 + 1
+        span_histogram[span_index] = np.uint64(
+            checked_u64_add(
+                "touched_pixel_span_histogram",
+                int(span_histogram[span_index]),
+                1,
+            )
+        )
     return lane_histogram, span_histogram
 
 
@@ -212,7 +318,6 @@ def _eye_stats(
             "exemplar_evaluations": None,
             "fallback_indexed_donor_count": None,
             "fallback_query_count": None,
-            "fallback_anchor_count": None,
             "fallback_visited_nodes_total": None,
             "fallback_visited_nodes_max": None,
             "fallback_visited_nodes_p95": None,
@@ -235,7 +340,6 @@ def _eye_stats(
             "exemplar_evaluations": int(plan.exemplar_donor_evaluation_count),
             "fallback_indexed_donor_count": int(plan.fallback_indexed_donor_count),
             "fallback_query_count": int(plan.fallback_query_count),
-            "fallback_anchor_count": int(plan.fallback_anchor_count),
             "fallback_visited_nodes_total": int(plan.fallback_visited_nodes_total),
             "fallback_visited_nodes_max": int(plan.fallback_visited_nodes_max),
             "fallback_visited_nodes_p95": float(plan.fallback_visited_nodes_p95),
@@ -283,6 +387,12 @@ def build_quality_frame_stats(
     render_mode: str = "quality",
 ) -> dict[str, Any]:
     """Build the closed frame statistics object from compact state."""
+
+    validate_diagnostics_cardinality_dimensions(
+        frame_count=1,
+        height=int(compact.left_image.shape[0]),
+        width=int(compact.left_image.shape[1]),
+    )
 
     if geometry_mode not in {"relative", "metric"}:
         raise ValueError("diagnostic geometry_mode must be relative or metric")
@@ -346,28 +456,32 @@ def _merge_histogram_pairs(
     merged = np.zeros(maximum + 1, dtype=np.uint64)
     for eye in eyes:
         pairs = eye["hole_runs"][field]
-        if isinstance(pairs, DenseHistogramPairs):
-            merged[: pairs.bins.size] += pairs.bins
-            continue
-        for value, count in pairs:
-            merged[int(value)] += np.uint64(count)
+        source = enumerate(pairs.bins) if isinstance(pairs, DenseHistogramPairs) else pairs
+        for value, count in source:
+            index = int(value)
+            merged[index] = np.uint64(
+                checked_u64_add(field, int(merged[index]), int(count))
+            )
     return merged
 
 
 def _add_histogram_pairs(
     target: np.ndarray,
-    pairs: DenseHistogramPairs | list[list[int]],
+    pairs: DenseHistogramPairs | Iterable[tuple[int, int]] | list[list[int]],
 ) -> None:
     if isinstance(pairs, DenseHistogramPairs):
         if pairs.bins.shape != target.shape:
             raise ValueError("dense histogram width changed between frames")
-        target += pairs.bins
-        return
-    for bucket, count in pairs:
+        source = enumerate(pairs.bins)
+    else:
+        source = pairs
+    for bucket, count in source:
         index = int(bucket)
         if index < 0 or index >= target.size:
             raise ValueError("histogram bucket is outside the render width")
-        target[index] += np.uint64(count)
+        target[index] = np.uint64(
+            checked_u64_add("diagnostic_histogram_bin", int(target[index]), int(count))
+        )
 
 
 def _sum_named_counts(
@@ -375,13 +489,21 @@ def _sum_named_counts(
     field: str,
     names: tuple[str, ...],
 ) -> dict[str, int]:
-    return {name: sum(int(value[field][name]) for value in values) for name in names}
+    result: dict[str, int] = {}
+    for name in names:
+        total = 0
+        for value in values:
+            total = checked_u64_add(f"{field}.{name}", total, value[field][name])
+        result[name] = total
+    return result
 
 
 def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, Any]:
     state_names = tuple(_STATE_BITS)
     backend_names = ("local", "exemplar", "fallback")
-    pixel_count = sum(int(eye["pixel_count"]) for eye in eyes)
+    pixel_count = 0
+    for eye in eyes:
+        pixel_count = checked_u64_add("eye.pixel_count", pixel_count, eye["pixel_count"])
     state_counts = _sum_named_counts(eyes, "state_pixel_counts", state_names)
     lane_histogram = _merge_histogram_pairs(eyes, "lane_count_histogram")
     span_histogram = _merge_histogram_pairs(eyes, "touched_pixel_span_histogram")
@@ -442,7 +564,6 @@ def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, An
             "exemplar_evaluations": None,
             "fallback_indexed_donor_count": None,
             "fallback_query_count": None,
-            "fallback_anchor_count": None,
             "fallback_visited_nodes_total": None,
             "fallback_visited_nodes_max": None,
             "fallback_visited_nodes_frame_p95_max": None,
@@ -450,23 +571,38 @@ def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, An
     elif all(value["availability"] == "quality_repair_plan" for value in budgets):
         budget_totals = {
             "availability": "quality_repair_plan",
-            "segment_record_count": sum(int(value["segment_record_count"]) for value in budgets),
+            "segment_record_count": checked_u64_add(
+                "quality_budget_totals.segment_record_count",
+                *(value["segment_record_count"] for value in budgets),
+            ),
             "segment_table_bytes_max": max(int(value["segment_table_bytes"]) for value in budgets),
-            "local_slot_charge": sum(int(value["local_slot_charge"]) for value in budgets),
-            "local_neighborhood_sample_charge": sum(
-                int(value["local_neighborhood_sample_charge"]) for value in budgets
+            "local_slot_charge": checked_u64_add(
+                "quality_budget_totals.local_slot_charge",
+                *(value["local_slot_charge"] for value in budgets),
             ),
-            "local_budget_skipped_run_count": sum(
-                int(value["local_budget_skipped_run_count"]) for value in budgets
+            "local_neighborhood_sample_charge": checked_u64_add(
+                "quality_budget_totals.local_neighborhood_sample_charge",
+                *(value["local_neighborhood_sample_charge"] for value in budgets),
             ),
-            "exemplar_evaluations": sum(int(value["exemplar_evaluations"]) for value in budgets),
-            "fallback_indexed_donor_count": sum(
-                int(value["fallback_indexed_donor_count"]) for value in budgets
+            "local_budget_skipped_run_count": checked_u64_add(
+                "quality_budget_totals.local_budget_skipped_run_count",
+                *(value["local_budget_skipped_run_count"] for value in budgets),
             ),
-            "fallback_query_count": sum(int(value["fallback_query_count"]) for value in budgets),
-            "fallback_anchor_count": sum(int(value["fallback_anchor_count"]) for value in budgets),
-            "fallback_visited_nodes_total": sum(
-                int(value["fallback_visited_nodes_total"]) for value in budgets
+            "exemplar_evaluations": checked_u64_add(
+                "quality_budget_totals.exemplar_evaluations",
+                *(value["exemplar_evaluations"] for value in budgets),
+            ),
+            "fallback_indexed_donor_count": checked_u64_add(
+                "quality_budget_totals.fallback_indexed_donor_count",
+                *(value["fallback_indexed_donor_count"] for value in budgets),
+            ),
+            "fallback_query_count": checked_u64_add(
+                "quality_budget_totals.fallback_query_count",
+                *(value["fallback_query_count"] for value in budgets),
+            ),
+            "fallback_visited_nodes_total": checked_u64_add(
+                "quality_budget_totals.fallback_visited_nodes_total",
+                *(value["fallback_visited_nodes_total"] for value in budgets),
             ),
             "fallback_visited_nodes_max": max(
                 int(value["fallback_visited_nodes_max"]) for value in budgets
@@ -498,7 +634,10 @@ def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, An
         "backend_lane_counts": _sum_named_counts(eyes, "backend_lane_counts", backend_names),
         "backend_pixel_counts": _sum_named_counts(eyes, "backend_pixel_counts", backend_names),
         "backend_component_counts": component_counts,
-        "final_unresolved_lane_count": sum(int(eye["final_unresolved_lane_count"]) for eye in eyes),
+        "final_unresolved_lane_count": checked_u64_add(
+            "eye.final_unresolved_lane_count",
+            *(eye["final_unresolved_lane_count"] for eye in eyes),
+        ),
         "quality_limit_ranges": limit_ranges,
         "quality_budget_totals": budget_totals,
     }
@@ -507,7 +646,10 @@ def _aggregate_eye(eyes: list[dict[str, Any]], render_mode: str) -> dict[str, An
 def build_diagnostics_summary(  # noqa: C901
     frame_stats: Iterable[dict[str, Any]],
     *,
-    frame_names: tuple[str, ...],
+    frame_names: tuple[str, ...] | None = None,
+    frame_name_replay: Callable[[], Iterable[str]] | None = None,
+    frame_count: int | None = None,
+    clamped_fraction_replay: Callable[[], Iterable[float]] | None = None,
     render_shape: tuple[int, int],
     render_mode: str,
     geometry_mode: str,
@@ -516,6 +658,29 @@ def build_diagnostics_summary(  # noqa: C901
     frames_jsonl_sha256: str,
 ) -> dict[str, Any]:
     """Aggregate validated source-ordered frame statistics."""
+
+    if frame_name_replay is None:
+        if not frame_names:
+            raise ValueError("diagnostics frame names must be nonempty")
+        expected_frame_count = len(frame_names)
+        def replay_frame_names() -> Iterable[str]:
+            return iter(frame_names)
+
+        frame_name_replay = replay_frame_names
+        summary_frame_names: object = list(frame_names)
+    else:
+        if frame_names is not None:
+            raise ValueError("diagnostics frame names require exactly one replay source")
+        if isinstance(frame_count, bool) or not isinstance(frame_count, int) or frame_count <= 0:
+            raise ValueError("streamed diagnostics frame count must be positive")
+        expected_frame_count = frame_count
+        summary_frame_names = ReplayableJsonArray(frame_name_replay)
+    validate_diagnostics_cardinality_dimensions(
+        frame_count=expected_frame_count,
+        height=render_shape[0],
+        width=render_shape[1],
+    )
+    expected_names = iter(frame_name_replay())
 
     state_names = tuple(_STATE_BITS)
     backend_names = ("local", "exemplar", "fallback")
@@ -544,7 +709,12 @@ def build_diagnostics_summary(  # noqa: C901
     eye_accumulators = {name: eye_accumulator() for name in ("left", "right")}
     valid_count = 0
     clamped_count = 0
-    clamped_fractions: list[float] = []
+    clamped_fractions: list[float] | None = (
+        [] if clamped_fraction_replay is None else None
+    )
+    clamped_fraction_sum = 0.0
+    clamped_fraction_max = 0.0
+    affected_frame_count = 0
     nearest = {
         "indexed_sample_count": 0,
         "query_count": 0,
@@ -553,16 +723,28 @@ def build_diagnostics_summary(  # noqa: C901
     }
     frame_count = 0
 
-    for index, value in enumerate(frame_stats):
-        if index >= len(frame_names) or value["frame_name"] != frame_names[index]:
+    for value in frame_stats:
+        try:
+            expected_frame_name = next(expected_names)
+        except StopIteration as error:
+            raise ValueError("frame statistics exceed the source sequence") from error
+        if value["frame_name"] != expected_frame_name:
             raise ValueError("frame statistics are not in exact source order")
-        frame_count += 1
+        frame_count = checked_u64_add("frame_count", frame_count, 1)
         for eye_name in ("left", "right"):
             eye = value["eyes"][eye_name]
             accumulator = eye_accumulators[eye_name]
-            accumulator["pixel_count"] += int(eye["pixel_count"])
+            accumulator["pixel_count"] = checked_u64_add(
+                f"{eye_name}.pixel_count",
+                accumulator["pixel_count"],
+                eye["pixel_count"],
+            )
             for name in state_names:
-                accumulator["state_counts"][name] += int(eye["state_pixel_counts"][name])
+                accumulator["state_counts"][name] = checked_u64_add(
+                    f"{eye_name}.state_pixel_counts.{name}",
+                    accumulator["state_counts"][name],
+                    eye["state_pixel_counts"][name],
+                )
             for histogram_name, target_name in (
                 ("lane_count_histogram", "lane_histogram"),
                 ("touched_pixel_span_histogram", "span_histogram"),
@@ -572,8 +754,16 @@ def build_diagnostics_summary(  # noqa: C901
                     eye["hole_runs"][histogram_name],
                 )
             for name in backend_names:
-                accumulator["backend_lane_counts"][name] += int(eye["backend_lane_counts"][name])
-                accumulator["backend_pixel_counts"][name] += int(eye["backend_pixel_counts"][name])
+                accumulator["backend_lane_counts"][name] = checked_u64_add(
+                    f"{eye_name}.backend_lane_counts.{name}",
+                    accumulator["backend_lane_counts"][name],
+                    eye["backend_lane_counts"][name],
+                )
+                accumulator["backend_pixel_counts"][name] = checked_u64_add(
+                    f"{eye_name}.backend_pixel_counts.{name}",
+                    accumulator["backend_pixel_counts"][name],
+                    eye["backend_pixel_counts"][name],
+                )
             components = eye["backend_component_counts"]
             availability = components["availability"]
             previous_availability = accumulator["component_availability"]
@@ -582,8 +772,16 @@ def build_diagnostics_summary(  # noqa: C901
             accumulator["component_availability"] = availability
             if availability == "quality_segment_graph":
                 for name in backend_names:
-                    accumulator["component_counts"][name] += int(components[name])
-            accumulator["final_unresolved_lane_count"] += int(eye["final_unresolved_lane_count"])
+                    accumulator["component_counts"][name] = checked_u64_add(
+                        f"{eye_name}.backend_component_counts.{name}",
+                        accumulator["component_counts"][name],
+                        components[name],
+                    )
+            accumulator["final_unresolved_lane_count"] = checked_u64_add(
+                f"{eye_name}.final_unresolved_lane_count",
+                accumulator["final_unresolved_lane_count"],
+                eye["final_unresolved_lane_count"],
+            )
 
             limits = eye["quality_limits"]
             limit_mode = "none" if limits is None else "value"
@@ -621,10 +819,13 @@ def build_diagnostics_summary(  # noqa: C901
                         "exemplar_evaluations",
                         "fallback_indexed_donor_count",
                         "fallback_query_count",
-                        "fallback_anchor_count",
                         "fallback_visited_nodes_total",
                     ):
-                        accumulator["budget_sums"][field] += int(budgets[field])
+                        accumulator["budget_sums"][field] = checked_u64_add(
+                            f"{eye_name}.quality_budgets.{field}",
+                            accumulator["budget_sums"][field],
+                            budgets[field],
+                        )
                     for field in (
                         "segment_table_bytes",
                         "fallback_visited_nodes_max",
@@ -640,9 +841,26 @@ def build_diagnostics_summary(  # noqa: C901
         if geometry_mode == "metric":
             if projection is None:
                 raise ValueError("metric diagnostics require projection statistics")
-            valid_count += int(projection["valid_pixel_count"])
-            clamped_count += int(projection["clamped_pixel_count"])
-            clamped_fractions.append(float(projection["clamped_fraction"]))
+            valid_count = checked_u64_add(
+                "metric_projection.valid_pixel_count",
+                valid_count,
+                projection["valid_pixel_count"],
+            )
+            clamped_count = checked_u64_add(
+                "metric_projection.clamped_pixel_count",
+                clamped_count,
+                projection["clamped_pixel_count"],
+            )
+            fraction = float(projection["clamped_fraction"])
+            if clamped_fractions is not None:
+                clamped_fractions.append(fraction)
+            clamped_fraction_sum += fraction
+            clamped_fraction_max = max(clamped_fraction_max, fraction)
+            affected_frame_count = checked_u64_add(
+                "metric_projection.affected_frame_count",
+                affected_frame_count,
+                int(fraction > 0.0),
+            )
         elif projection is not None:
             raise ValueError("relative diagnostics cannot contain metric statistics")
 
@@ -651,13 +869,24 @@ def build_diagnostics_summary(  # noqa: C901
             if nearest_value is None:
                 raise ValueError("Quality diagnostics require geometry-nearest statistics")
             for field in ("indexed_sample_count", "query_count", "visited_nodes_total"):
-                nearest[field] += int(nearest_value[field])
+                nearest[field] = checked_u64_add(
+                    f"geometry_nearest.{field}",
+                    nearest[field],
+                    nearest_value[field],
+                )
             nearest["visited_nodes_max"] = max(
                 nearest["visited_nodes_max"],
                 int(nearest_value["visited_nodes_max"]),
             )
+        del value
 
-    if frame_count != len(frame_names):
+    try:
+        next(expected_names)
+    except StopIteration:
+        pass
+    else:
+        raise ValueError("frame statistics ended before the source sequence")
+    if frame_count != expected_frame_count:
         raise ValueError("frame statistics ended before the source sequence")
 
     eyes: dict[str, Any] = {}
@@ -691,7 +920,6 @@ def build_diagnostics_summary(  # noqa: C901
                 "exemplar_evaluations": None,
                 "fallback_indexed_donor_count": None,
                 "fallback_query_count": None,
-                "fallback_anchor_count": None,
                 "fallback_visited_nodes_total": None,
                 "fallback_visited_nodes_max": None,
                 "fallback_visited_nodes_frame_p95_max": None,
@@ -741,18 +969,24 @@ def build_diagnostics_summary(  # noqa: C901
         }
 
     if geometry_mode == "metric":
+        streamed_fractions: object
+        if clamped_fractions is None:
+            assert clamped_fraction_replay is not None
+            streamed_fractions = ReplayableJsonArray(clamped_fraction_replay)
+        else:
+            streamed_fractions = clamped_fractions
         metric_projection = {
             "valid_pixel_count": valid_count,
             "clamped_pixel_count": clamped_count,
             "clamped_fraction": (float(clamped_count) / float(valid_count) if valid_count else 0.0),
-            "clamped_fractions": clamped_fractions,
-            "affected_frame_count": sum(value > 0.0 for value in clamped_fractions),
+            "clamped_fractions": streamed_fractions,
+            "affected_frame_count": affected_frame_count,
             "mean_clamped_fraction": (
-                sum(clamped_fractions, 0.0) / float(len(clamped_fractions))
-                if clamped_fractions
+                clamped_fraction_sum / float(expected_frame_count)
+                if expected_frame_count
                 else 0.0
             ),
-            "max_clamped_fraction": max(clamped_fractions, default=0.0),
+            "max_clamped_fraction": clamped_fraction_max,
         }
     else:
         metric_projection = None
@@ -761,8 +995,8 @@ def build_diagnostics_summary(  # noqa: C901
         "schema_version": 1,
         "algorithm_version": "stereo-coverage-sidecar-v1",
         "availability": "available",
-        "frame_names": list(frame_names),
-        "frame_count": len(frame_names),
+        "frame_names": summary_frame_names,
+        "frame_count": expected_frame_count,
         "render_shape": [int(render_shape[0]), int(render_shape[1])],
         "render_mode": render_mode,
         "geometry_mode": geometry_mode,

@@ -15,6 +15,9 @@ import zlib
 
 import numpy as np
 
+from .durable_publish import OwnedSiblingTemporary
+from .nofollow_io import AcquiredRoot, open_regular_beneath
+
 
 METRIC_NPZ_WRITE_INPUT_CHUNK_BYTES = 512 * 1024
 METRIC_NPZ_WRITE_STREAM_BYTES = 1024 * 1024
@@ -118,6 +121,17 @@ class MetricNpzAudit:
     maximum_stream_bytes: int
     stream_workspace_peak_bytes: int
     value_scratch_peak_bytes: int
+
+
+@dataclass(frozen=True)
+class MetricNpzIdentityAudit:
+    """Raw identity plus strict container/header facts without array ownership."""
+
+    layout: MetricNpzLayout
+    member_shapes: tuple[tuple[int, ...], ...]
+    sha256: str
+    byte_count: int
+    maximum_stream_bytes: int
 
 
 @dataclass
@@ -268,7 +282,20 @@ def _read_exact(handle: BinaryIO, byte_count: int, path: Path, label: str) -> by
     return payload
 
 
-def _regular_open(path: Path) -> BinaryIO:
+def _regular_open(
+    path: Path,
+    *,
+    job_root: Path | None = None,
+    acquired: AcquiredRoot | None = None,
+) -> BinaryIO:
+    if acquired is not None:
+        if job_root is not None and acquired.root != Path(
+            os.path.abspath(os.fspath(job_root))
+        ):
+            raise MetricNpzFormatError("metric NPZ acquired the wrong job root")
+        return acquired.open_regular(path)
+    if job_root is not None:
+        return open_regular_beneath(job_root, path)
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -752,11 +779,133 @@ def _validate_metric_values(path: Path, ownership: _InflateOwnership) -> int:
     return scratch_peak
 
 
+def _inflate_member_header(
+    handle: BinaryIO,
+    path: Path,
+    member: MetricNpzMember,
+) -> tuple[_NpyHeader, int]:
+    """Inflate only one bounded NPY header from a checked member extent."""
+
+    handle.seek(member.data_offset)
+    decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+    compressed_remaining = member.compressed_size
+    pending = b""
+    header = bytearray()
+    header_total: int | None = None
+    maximum_stream_bytes = 0
+    try:
+        while header_total is None or len(header) < header_total:
+            if not pending:
+                if compressed_remaining == 0:
+                    raise _format_error(path, f"{member.name} NPY header is incomplete")
+                read_size = min(
+                    METRIC_NPZ_AUDIT_COMPRESSED_CHUNK_BYTES,
+                    compressed_remaining,
+                )
+                pending = _read_exact(
+                    handle,
+                    read_size,
+                    path,
+                    f"{member.name} compressed header extent",
+                )
+                compressed_remaining -= read_size
+                maximum_stream_bytes = max(maximum_stream_bytes, len(pending))
+            target = 10 if header_total is None else header_total
+            before = len(pending)
+            output = decoder.decompress(pending, max(1, target - len(header)))
+            pending = decoder.unconsumed_tail
+            maximum_stream_bytes = max(maximum_stream_bytes, len(output), len(pending))
+            header.extend(output)
+            if header_total is None and len(header) == 10:
+                if header[:8] != b"\x93NUMPY\x01\x00":
+                    raise _format_error(path, f"{member.name} NPY descriptor/version is invalid")
+                header_length = struct.unpack_from("<H", header, 8)[0]
+                if header_length > 256:
+                    raise _format_error(path, f"{member.name} NPY header length is invalid")
+                header_total = 10 + header_length
+            if decoder.eof and (header_total is None or len(header) < header_total):
+                raise _format_error(path, f"{member.name} NPY header is incomplete")
+            if not output and pending and len(pending) == before:
+                raise _format_error(path, f"{member.name} DEFLATE decoder made no progress")
+    except zlib.error as error:
+        raise _format_error(path, f"{member.name} DEFLATE header is invalid") from error
+    parsed = _parse_npy_header(path, member.name, bytes(header))
+    if member.uncompressed_size != len(parsed.header_bytes) + parsed.data_bytes:
+        raise _format_error(path, f"{member.name} declared uncompressed size is invalid")
+    return parsed, maximum_stream_bytes
+
+
+def audit_metric_npz_identity(
+    path: Path,
+    *,
+    expected_shape: tuple[int, int] | None = None,
+    job_root: Path | None = None,
+    acquired: AcquiredRoot | None = None,
+) -> MetricNpzIdentityAudit:
+    """Hash and header-scan one metric archive without inflating its value arrays."""
+
+    path = Path(path)
+    if expected_shape is not None:
+        expected_shape = _validate_shape(expected_shape)
+    digest = hashlib.sha256()
+    byte_count = 0
+    maximum_stream_bytes = 0
+    workspace = bytearray(METRIC_NPZ_WRITE_STREAM_BYTES)
+    view = memoryview(workspace)
+    with _regular_open(path, job_root=job_root, acquired=acquired) as handle:
+        before = os.fstat(handle.fileno())
+        while True:
+            count = handle.readinto(workspace)
+            if not count:
+                break
+            digest.update(view[:count])
+            byte_count += count
+            maximum_stream_bytes = max(maximum_stream_bytes, count)
+        handle.seek(0)
+        layout = parse_metric_npz_layout(handle, path)
+        parsed_headers: list[_NpyHeader] = []
+        for member in layout.members:
+            parsed, header_stream_bytes = _inflate_member_header(handle, path, member)
+            parsed_headers.append(parsed)
+            maximum_stream_bytes = max(maximum_stream_bytes, header_stream_bytes)
+        after = os.fstat(handle.fileno())
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise _format_error(path, "file identity changed during audit")
+    member_shapes = tuple(parsed.shape for parsed in parsed_headers)
+    if member_shapes[0] != member_shapes[1]:
+        raise _format_error(path, "metric NPY member shapes differ")
+    if expected_shape is not None and member_shapes[0] != expected_shape:
+        raise _format_error(path, "inverse_depth.npy NPY shape mismatch")
+    if member_shapes[2] != ():
+        raise _format_error(path, "focal_x_normalized.npy shape mismatch")
+    return MetricNpzIdentityAudit(
+        layout=layout,
+        member_shapes=member_shapes,
+        sha256=digest.hexdigest(),
+        byte_count=byte_count,
+        maximum_stream_bytes=maximum_stream_bytes,
+    )
+
+
 def audit_metric_npz(
     path: Path,
     *,
     expected_shape: tuple[int, int] | None = None,
     allocator: _Allocator = np.empty,
+    job_root: Path | None = None,
+    acquired: AcquiredRoot | None = None,
 ) -> MetricNpzAudit:
     """Hash, parse, directly inflate, and semantically validate one payload."""
 
@@ -766,7 +915,7 @@ def audit_metric_npz(
     digest = hashlib.sha256()
     byte_count = 0
     maximum_stream_bytes = 0
-    with _regular_open(path) as handle:
+    with _regular_open(path, job_root=job_root, acquired=acquired) as handle:
         while True:
             chunk = handle.read(METRIC_NPZ_WRITE_STREAM_BYTES)
             if not chunk:
@@ -989,17 +1138,6 @@ def _write_directory(handle: BinaryIO, records: list[_WriteRecord]) -> None:
         raise MetricNpzSizeError("metric NPZ archive length exceeds ZIP32")
 
 
-def _sync_parent(path: Path) -> None:
-    if os.name == "nt":
-        return
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(path, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def write_metric_npz(
     path: Path,
     inverse: np.ndarray,
@@ -1020,57 +1158,56 @@ def write_metric_npz(
     temporary = path.with_name(f".{path.name}.metric-npz.tmp")
     trace = MetricNpzWriteTrace(logical_bound_bytes=logical_bound)
     records: list[_WriteRecord] = []
-    replaced = False
+    owned = OwnedSiblingTemporary.create(path, temporary=temporary)
     try:
         _call_fault(fault, "disk-full")
-        with temporary.open("w+b") as handle:
-            inverse_header = _npy_header(_MEMBER_NAMES[0], shape)
-            valid_header = _npy_header(_MEMBER_NAMES[1], shape)
-            focal_header = _npy_header(_MEMBER_NAMES[2], ())
-            records.append(
-                _write_member(
-                    handle=handle,
-                    name=_MEMBER_NAMES[0],
-                    header=inverse_header,
-                    data=memoryview(cast(Any, inverse)).cast("B"),
-                    trace=trace,
-                    fault=fault,
-                )
+        handle = owned.handle
+        inverse_header = _npy_header(_MEMBER_NAMES[0], shape)
+        valid_header = _npy_header(_MEMBER_NAMES[1], shape)
+        focal_header = _npy_header(_MEMBER_NAMES[2], ())
+        records.append(
+            _write_member(
+                handle=handle,
+                name=_MEMBER_NAMES[0],
+                header=inverse_header,
+                data=memoryview(cast(Any, inverse)).cast("B"),
+                trace=trace,
+                fault=fault,
             )
-            records.append(
-                _write_member(
-                    handle=handle,
-                    name=_MEMBER_NAMES[1],
-                    header=valid_header,
-                    data=memoryview(cast(Any, valid)).cast("B"),
-                    trace=trace,
-                    fault=fault,
-                )
+        )
+        records.append(
+            _write_member(
+                handle=handle,
+                name=_MEMBER_NAMES[1],
+                header=valid_header,
+                data=memoryview(cast(Any, valid)).cast("B"),
+                trace=trace,
+                fault=fault,
             )
-            focal_bytes = struct.pack("<f", float(focal_x_normalized))
-            records.append(
-                _write_member(
-                    handle=handle,
-                    name=_MEMBER_NAMES[2],
-                    header=focal_header,
-                    data=memoryview(focal_bytes),
-                    trace=trace,
-                    fault=fault,
-                )
+        )
+        focal_bytes = struct.pack("<f", float(focal_x_normalized))
+        records.append(
+            _write_member(
+                handle=handle,
+                name=_MEMBER_NAMES[2],
+                header=focal_header,
+                data=memoryview(focal_bytes),
+                trace=trace,
+                fault=fault,
             )
-            _write_directory(handle, records)
-            trace.archive_bytes = handle.tell()
-            if trace.archive_bytes > trace.logical_bound_bytes:
-                raise MetricNpzWriteError("metric NPZ archive exceeded its preflight bound")
-            _call_fault(fault, "sync")
-            handle.flush()
-            os.fsync(handle.fileno())
+        )
+        _write_directory(handle, records)
+        trace.archive_bytes = handle.tell()
+        if trace.archive_bytes > trace.logical_bound_bytes:
+            raise MetricNpzWriteError("metric NPZ archive exceeded its preflight bound")
+        _call_fault(fault, "sync")
+        owned.sync()
+        _call_fault(fault, "after-sync")
         _call_fault(fault, "replace")
-        os.replace(temporary, path)
-        replaced = True
+        owned.replace(
+            after_replace=lambda: _call_fault(fault, "parent-sync"),
+        )
         trace.replaced = True
-        _call_fault(fault, "parent-sync")
-        _sync_parent(path.parent)
         return trace
     except OSError as error:
         if error.errno == errno.ENOSPC or getattr(error, "winerror", None) == 112:
@@ -1079,5 +1216,4 @@ def write_metric_npz(
             ) from error
         raise
     finally:
-        if not replaced:
-            temporary.unlink(missing_ok=True)
+        owned.cleanup()

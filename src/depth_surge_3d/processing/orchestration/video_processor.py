@@ -11,7 +11,7 @@ processor modules for improved maintainability and testability.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from ...io.job_lock import JobWriterLock
 from ..frames.depth_processor import DepthMapProcessor
@@ -21,6 +21,9 @@ from ..frames.frame_upscaler import FrameUpscalerProcessor
 from ..frames.vr_assembler import VRFrameAssembler
 from ..video.video_encoder import VideoEncoder
 from .pipeline_orchestrator import ProcessingOrchestrator
+
+if TYPE_CHECKING:
+    from ...io.resume import LegacyFastAdoptionV1
 
 
 class VideoProcessor:
@@ -48,6 +51,7 @@ class VideoProcessor:
         temporal_stabilizer: Any | None = None,
         preselected_depth_files: list[Path] | None = None,
         preselected_render_source: str | None = None,
+        legacy_fast_adoption: LegacyFastAdoptionV1 | None = None,
     ):
         """
         Initialize video processor with specialized modules.
@@ -88,6 +92,7 @@ class VideoProcessor:
             temporal_stabilizer=temporal_stabilizer,
             preselected_depth_files=preselected_depth_files,
             preselected_render_source=preselected_render_source,
+            legacy_fast_adoption=legacy_fast_adoption,
         )
 
     def process(

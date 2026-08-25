@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from src.depth_surge_3d.processing.video import final_audio
+from src.depth_surge_3d.processing.video.bounded_process import BoundedProcessResult
 from src.depth_surge_3d.processing.video.encoding_provider import AudioProbeStream
 
 
@@ -193,6 +195,28 @@ def test_postpass_rejects_changed_selected_source(tmp_path: Path) -> None:
         selected.revalidate()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows FileIdInfo contract")
+def test_windows_audio_identity_comes_from_the_open_file_handle(tmp_path: Path) -> None:
+    import msvcrt
+
+    from src.depth_surge_3d.io.file_identity import windows_identity_from_handle
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    hashed = final_audio._hash_open_regular_file(source)
+    with source.open("rb", buffering=0) as handle:
+        identity, _links, _attributes = windows_identity_from_handle(
+            int(msvcrt.get_osfhandle(handle.fileno())),
+            require_directory=False,
+        )
+
+    assert hashed.identity == final_audio.OpenFileIdentityV1(
+        "windows",
+        identity.volume_serial,
+        identity.file_id,
+    )
+
+
 def test_audio_probe_and_decode_commands_are_closed(tmp_path: Path) -> None:
     source = tmp_path / "source.mp4"
     source.write_bytes(b"source")
@@ -232,3 +256,14 @@ def test_audio_probe_and_decode_commands_are_closed(tmp_path: Path) -> None:
         "s32le",
         "pipe:1",
     )
+
+
+def test_audio_probe_parser_state_overflow_maps_to_budget_error(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    overlong = b'{"streams":[],"programs":[{"value":"' + b"x" * 129 + b'"}]}'
+    with patch.object(final_audio, "BoundedProcessCaptureV1") as capture:
+        capture.return_value.run.return_value = BoundedProcessResult(overlong, b"", 0)
+
+        with pytest.raises(final_audio.FinalAudioProbeBudgetError, match="parser-state"):
+            final_audio._probe_first_audio_stream(source, ())

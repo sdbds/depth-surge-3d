@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import weakref
 
 import numpy as np
 import pytest
@@ -94,7 +95,9 @@ def test_quality_background_finishes_every_lane_and_public_holes_are_clear() -> 
 
 def test_quality_compact_result_releases_dense_eye_plans_before_return() -> None:
     quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
-    diagnostics = importlib.import_module("src.depth_surge_3d.rendering.quality.diagnostics")
+    diagnostics = importlib.import_module(
+        "src.depth_surge_3d.rendering.quality.diagnostics"
+    )
     frame = np.arange(7 * 33 * 3, dtype=np.uint8).reshape(7, 33, 3)
     canonical = np.tile(
         np.concatenate(
@@ -123,7 +126,9 @@ def test_quality_compact_result_releases_dense_eye_plans_before_return() -> None
         geometry_mode="relative",
         occlusion_fill="background",
     )
-    assert stats["eyes"]["left"]["quality_budgets"]["availability"] == ("quality_repair_plan")
+    assert stats["eyes"]["left"]["quality_budgets"]["availability"] == (
+        "quality_repair_plan"
+    )
 
 
 def test_quality_public_budget_rejects_before_materializing_broadcast_input(
@@ -241,7 +246,9 @@ def test_quality_second_oom_releases_device_state_and_reports_both_heights(
         attempted_heights.append(band_height)
         raise torch.cuda.OutOfMemoryError("injected")
 
-    monkeypatch.setattr(quality, "_release_after_oom", lambda owner: releases.append(owner))
+    monkeypatch.setattr(
+        quality, "_release_after_oom", lambda owner: releases.append(owner)
+    )
     source = np.zeros((8, 11, 3), dtype=np.uint8)
 
     with pytest.raises(RuntimeError, match="attempted band heights 8 and 4"):
@@ -254,6 +261,26 @@ def test_quality_second_oom_releases_device_state_and_reports_both_heights(
 
     assert attempted_heights == [8, 4]
     assert len(releases) == 2
+
+
+def test_cuda_oom_release_synchronizes_before_collecting_and_clearing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    renderer = StereoRenderer(device="cpu")
+    renderer.device = torch.device("cuda")
+    events: list[str] = []
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda _device: events.append("sync")
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty"))
+    monkeypatch.setattr(
+        "src.depth_surge_3d.rendering.stereo_renderer.gc.collect",
+        lambda: events.append("collect"),
+    )
+
+    renderer._release_after_oom()
+
+    assert events == ["sync", "collect", "empty"]
 
 
 def test_quality_none_retains_dense_uint64_hole_histograms() -> None:
@@ -315,6 +342,92 @@ def test_quality_background_transfers_the_pass_a_b_plane_to_repair_bits(
     assert result.right_repair_bits.base is None
 
 
+def test_quality_pass_b_releases_graph_and_repair_backing_before_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arena_module = importlib.import_module("src.depth_surge_3d.rendering.quality.arena")
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    real_reset_eye = arena_module.QualityFixedArenas.reset_eye
+    real_replay = quality._replay_background_eye_once
+    planning_storage: list[
+        tuple[weakref.ReferenceType[np.ndarray], weakref.ReferenceType[np.ndarray]]
+    ] = []
+    replay_count = 0
+
+    def capture_planning_storage(arenas) -> None:
+        real_reset_eye(arenas)
+        assert arenas.graph is not None
+        assert arenas.repair is not None
+        planning_storage.append(
+            (weakref.ref(arenas.graph.storage), weakref.ref(arenas.repair.storage))
+        )
+
+    def replay_after_release(**kwargs):
+        nonlocal replay_count
+        graph_ref, repair_ref = planning_storage[replay_count]
+        replay_count += 1
+        assert graph_ref() is None
+        assert repair_ref() is None
+        return real_replay(**kwargs)
+
+    monkeypatch.setattr(
+        arena_module.QualityFixedArenas,
+        "reset_eye",
+        capture_planning_storage,
+    )
+    monkeypatch.setattr(quality, "_replay_background_eye_once", replay_after_release)
+    frame = np.full((5, 7, 3), 80, dtype=np.uint8)
+    canonical = np.linspace(0.0, 1.0, 15, dtype=np.float32).reshape(3, 5)
+
+    result = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(occlusion_fill="background"),
+    )
+
+    assert result.left_image.shape == frame.shape
+    assert replay_count == 2
+
+
+def test_quality_pass_b_never_expands_compact_records_to_host_lane_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_kd = importlib.import_module(
+        "src.depth_surge_3d.rendering.quality.native_kd"
+    )
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    native = native_kd._require_native()
+    monkeypatch.setattr(
+        native,
+        "expand_repair_scatter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Pass B expanded compact records into per-lane host arrays")
+        ),
+    )
+    generator = np.random.default_rng(29)
+    frame = generator.integers(0, 256, size=(9, 48, 3), dtype=np.uint8)
+    canonical = np.tile(
+        np.concatenate(
+            [
+                np.full(12, 0.15, dtype=np.float32),
+                np.full(12, 0.9, dtype=np.float32),
+                np.full(24, 0.2, dtype=np.float32),
+            ]
+        ),
+        (9, 1),
+    )
+
+    result = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(stereo_strength=5.0, convergence=0.45),
+    )
+
+    assert np.any(result.left_repair_bits & np.uint8(0x3C))
+
+
 def test_quality_controls_reject_boolean_limit() -> None:
     types = importlib.import_module("src.depth_surge_3d.rendering.quality.types")
 
@@ -324,10 +437,21 @@ def test_quality_controls_reject_boolean_limit() -> None:
 
 def test_native_analysis_band_matches_the_existing_scalar_boundary() -> None:
     quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
-    forward_splat = importlib.import_module("src.depth_surge_3d.rendering.forward_splat")
-    local_strip = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
-    native_repair = importlib.import_module("src.depth_surge_3d.rendering.quality.native_repair")
-    visibility = importlib.import_module("src.depth_surge_3d.rendering.quality.visibility")
+    forward_splat = importlib.import_module(
+        "src.depth_surge_3d.rendering.forward_splat"
+    )
+    local_strip = importlib.import_module(
+        "src.depth_surge_3d.rendering.quality.local_strip"
+    )
+    native_repair = importlib.import_module(
+        "src.depth_surge_3d.rendering.quality.native_repair"
+    )
+    repair_records = importlib.import_module(
+        "src.depth_surge_3d.rendering.quality.repair_records"
+    )
+    visibility = importlib.import_module(
+        "src.depth_surge_3d.rendering.quality.visibility"
+    )
     height, width = 2, 3
     fine_width = width * 16
     valid = np.ones((height, fine_width), dtype=np.bool_)
@@ -391,6 +515,10 @@ def test_native_analysis_band_matches_the_existing_scalar_boundary() -> None:
     ).records
 
     actual_analysis = empty_analysis()
+    record_output = np.empty(
+        height * fine_width,
+        dtype=repair_records.REPAIR_RECORD_DTYPE,
+    )
     actual_records = quality._write_analysis_band_native(
         actual_analysis,
         band,
@@ -399,10 +527,15 @@ def test_native_analysis_band_matches_the_existing_scalar_boundary() -> None:
         source_regions,
         0,
         height,
+        record_output,
     ).records
 
-    assert np.array_equal(actual_analysis.coverage_count, expected_analysis.coverage_count)
-    assert np.array_equal(actual_analysis.pure_region_id, expected_analysis.pure_region_id)
+    assert np.array_equal(
+        actual_analysis.coverage_count, expected_analysis.coverage_count
+    )
+    assert np.array_equal(
+        actual_analysis.pure_region_id, expected_analysis.pure_region_id
+    )
     for actual, expected in zip(
         actual_analysis.pure_bgr,
         expected_analysis.pure_bgr,

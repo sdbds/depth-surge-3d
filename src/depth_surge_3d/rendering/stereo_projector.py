@@ -14,7 +14,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, Mapping, cast
+from typing import TYPE_CHECKING, Any, Literal, Mapping, cast
 
 from ..inference.depth.backend_registry import (
     EstimatorRequest,
@@ -44,6 +44,9 @@ from ..processing.frames.depth_normalizer import canonicalize_single_scene
 from ..processing.frames.temporal_stabilizer import TemporalDepthStabilizer
 from ..core.settings import validate_settings
 from .stereo_renderer import StereoRenderer, StereoRenderSettings
+
+if TYPE_CHECKING:
+    from ..io.resume import LegacyFastAdoptionV1
 
 
 def _freeze_snapshot(value: Any) -> Any:
@@ -184,6 +187,7 @@ class StereoProjector:
         preflight: VideoRunPreflight,
         *,
         job_lock: JobWriterLock | None = None,
+        legacy_fast_adoption: LegacyFastAdoptionV1 | None = None,
     ) -> bool:
         """Execute one owned preflight without accepting competing settings."""
         owns_job_lock = False
@@ -208,7 +212,10 @@ class StereoProjector:
             if not self._prepare_output_directory(output_dir):
                 return False
 
-            processor = self._create_video_processor(settings)
+            processor = self._create_video_processor(
+                settings,
+                legacy_fast_adoption=legacy_fast_adoption,
+            )
 
             # Process the video
             return processor.process(
@@ -226,11 +233,18 @@ class StereoProjector:
             if owns_job_lock and job_lock is not None:
                 job_lock.release()
 
-    def _create_video_processor(self, settings: dict[str, Any]) -> VideoProcessor:
+    def _create_video_processor(
+        self,
+        settings: dict[str, Any],
+        *,
+        legacy_fast_adoption: LegacyFastAdoptionV1 | None = None,
+    ) -> VideoProcessor:
         kwargs: dict[str, Any] = {
             "verbose": settings.get("verbose", False),
             "release_depth_model": self.unload_model,
         }
+        if legacy_fast_adoption is not None:
+            kwargs["legacy_fast_adoption"] = legacy_fast_adoption
         if settings.get("temporal_postprocessor") == "vdpp":
             effective_device = str(getattr(self.depth_estimator, "device", self.device))
             kwargs["temporal_stabilizer"] = TemporalDepthStabilizer(

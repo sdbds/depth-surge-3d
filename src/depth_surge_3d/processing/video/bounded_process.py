@@ -111,6 +111,7 @@ class BoundedProcessCaptureV1:
         stderr_cap: int,
         timeout_seconds: float,
         terminate_grace_seconds: float = 5.0,
+        cancelled: Callable[[], bool] | None = None,
     ) -> None:
         if stdout_cap < 0 or stderr_cap < 0:
             raise ValueError("process stream caps must be nonnegative")
@@ -120,6 +121,7 @@ class BoundedProcessCaptureV1:
         self.stderr_cap = stderr_cap
         self.timeout_seconds = timeout_seconds
         self.terminate_grace_seconds = terminate_grace_seconds
+        self.cancelled = cancelled
 
     def run(self, arguments: Sequence[str]) -> BoundedProcessResult:  # noqa: C901
         if not arguments:
@@ -153,9 +155,13 @@ class BoundedProcessCaptureV1:
             thread.start()
         deadline = time.monotonic() + self.timeout_seconds
         timed_out = False
+        was_cancelled = False
         try:
             while process.poll() is None:
                 if stdout.overflow or stderr.overflow or stdout.error or stderr.error:
+                    break
+                if self.cancelled is not None and self.cancelled():
+                    was_cancelled = True
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -177,6 +183,8 @@ class BoundedProcessCaptureV1:
             process.stderr.close()
         if any(thread.is_alive() for thread in threads):
             raise ProcessPipeError("child pipe drain did not terminate")
+        if was_cancelled:
+            raise InterruptedError("bounded child stopped by cancellation request")
         if timed_out:
             raise ProcessTimeoutError("bounded child exceeded its wall deadline")
         for state in (stdout, stderr):
@@ -280,6 +288,7 @@ def run_ffmpeg_progress_v1(  # noqa: C901
     line_cap: int,
     stall_seconds: float,
     terminate_grace_seconds: float = 5.0,
+    cancelled: Callable[[], bool] | None = None,
 ) -> ProgressProcessResult:
     """Drain FFmpeg progress and diagnostics without cumulative stdout storage."""
 
@@ -317,9 +326,13 @@ def run_ffmpeg_progress_v1(  # noqa: C901
     for thread in threads:
         thread.start()
     timed_out = False
+    was_cancelled = False
     try:
         while process.poll() is None:
             if progress.error or diagnostics.error or diagnostics.overflow:
+                break
+            if cancelled is not None and cancelled():
+                was_cancelled = True
                 break
             remaining = stall_seconds - (time.monotonic() - progress.last_semantic_progress)
             if remaining <= 0:
@@ -338,6 +351,8 @@ def run_ffmpeg_progress_v1(  # noqa: C901
         process.stderr.close()
     if any(thread.is_alive() for thread in threads):
         raise ProcessPipeError("progress pipe drain did not terminate")
+    if was_cancelled:
+        raise InterruptedError("progress child stopped by cancellation request")
     if timed_out:
         raise ProcessTimeoutError("FFmpeg made no semantic progress before its deadline")
     if progress.error is not None:

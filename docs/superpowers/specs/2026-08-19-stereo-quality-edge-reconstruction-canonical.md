@@ -5407,6 +5407,28 @@ Enumeration, identity checks, child opens, and unlink/remove operations are all
 handle-relative to the verified root; cleanup never switches back to recursive
 path-string APIs after authorization.
 
+On Linux, deletion of each acquired name first uses
+`renameat2(RENAME_NOREPLACE)` to move that name into the reserved
+`.depth-surge-quarantine-v1-*` namespace, fsyncs the parent, reopens the
+quarantine name without following links, and requires the same device, inode,
+and type before `unlinkat`/`rmdir` plus another parent fsync. Descendant
+quarantine names may be random because an interrupted recursive traversal sees
+and removes them on retry. Marker and prune-root quarantine names are derived
+deterministically from the committed prune entry so recovery can find them when
+the public marker or root name is already absent. A public-name replacement
+created before or after the quarantine rename is never selected as the object
+to remove, and its appearance makes cleanup incomplete.
+
+This application is a cooperative single-writer transaction, not a privilege
+boundary. Its POSIX concurrency model excludes another process running with the
+same directory-write authority which actively monitors and swaps names inside
+the private quarantine namespace between the final identity check and the
+pathname deletion syscall. Linux provides no general unlink-by-file-descriptor
+operation with which a normal user process could close that last adversarial
+window. Deployments requiring protection from a hostile same-credential writer
+must isolate directory permissions or perform deletion in a separately trusted
+helper; this specification does not claim that stronger guarantee.
+
 A marker placeholder or fully written marker absent from committed
 `prune_entries` is inert transaction state and never authorizes tree deletion.
 Its reserved name is excluded from ordinary payload listings. Only its matching
@@ -5528,13 +5550,15 @@ The non-semantic settings/runtime completion record persists one
 `incomplete_identity_mismatch`, or `incomplete_error`. It is not part of RGB,
 diagnostics, encoding-input, or final-video identity. A restart which cannot
 reproduce the persisted object/volume identity or the current invocation's
-no-crossing proof leaves the final video and
-both final manifests successful, sets
-`cleanup_status="incomplete_identity_mismatch"`, performs no render or encode,
-and leaves the residual path for an explicit later cleanup or manual action.
-Other cleanup failures use `incomplete_error`. Only successful absence/removal
-of every persisted entry sets `complete`; none of these incomplete values may
-demote `payload_pruned` or reopen frame processing.
+no-crossing proof leaves the final video and both final manifests successful,
+keeps the job `in_progress` with durable `cleanup_status="pending"`, performs no
+render or encode, and leaves the residual path for a later cleanup-only retry or
+manual action. `incomplete_identity_mismatch` and `incomplete_error` are
+classification values for an explicit future abandon/manual-resolution
+transition; automatic finalization does not commit either value. Only successful
+absence/removal of every persisted entry sets `complete`, and
+`processing_status="completed"` requires cleanup `complete` or `not_requested`.
+No cleanup failure may demote `payload_pruned` or reopen frame processing.
 `keep_intermediates=true` commits `not_requested`; the `payload_pruned` commit
 and any resumed cleanup first persist `pending`; each terminal result above is
 then atomically persisted without changing final-video success.
@@ -6581,6 +6605,12 @@ quality_rgb_metadata_raw = max_json_bytes(
     N,
     every frame name and concrete projection/repair-policy string,
 )  # Quality only; zero for Fast
+fast_rgb_metadata_raw = max_json_bytes(
+    LegacyFastRgbMetadataSchema1,
+    N,
+    every complete `.png` filename and concrete legacy render/device field,
+)  # Fast only; zero for Quality
+rgb_metadata_raw = max(quality_rgb_metadata_raw, fast_rgb_metadata_raw)
 jsonl_raw       = sum(stats_raw[i] + 1 for i in source order)
 J_frame         = max({0}, {stats_raw[i] + manifest_raw[i] for all i})
 J_root          = max(stage_metadata_raw, summary_raw,
@@ -6635,7 +6665,7 @@ pending_json  = sum(alloc(stats_raw[i]) for i in P_set)
 root_final = alloc(stage_metadata_raw) + alloc(jsonl_raw) + alloc(summary_raw)
            + (alloc(clamp_raw) when metric else 0)
            + (alloc(quality_input_manifest_raw) when Quality else 0)
-           + (alloc(quality_rgb_metadata_raw) when Quality else 0)
+           + alloc(rgb_metadata_raw)
 root_atomic_reserve = 2 * root_final
 
 frame_atomic[i] = 2*rgb_bound + M*4*mask_bound
@@ -6644,7 +6674,7 @@ manifest_atomic[i] = alloc(manifest_raw[i])                     # i in R_set
 one_transaction_overlap = max({0}, all frame_atomic, all manifest_atomic)
 
 pending_file_count = P*(4 + 4*M) + R
-root_file_count = 3 + (1 when metric else 0) + (2 when Quality else 0)
+root_file_count = 4 + (1 when metric else 0) + (1 when Quality else 0)
 atomic_file_count = max((4 + 4*M) if P>0 else 0, 1 if R>0 else 0)
 filesystem_slack = A * (pending_file_count + root_file_count
                         + atomic_file_count)
@@ -6928,57 +6958,32 @@ reclaim credit is never used to promise video completion.
 
 The 1.25 factor matches metric geometry. Allocation rounding and explicit
 filesystem slack are both intentionally retained. Root reserve is doubled
-because existing aggregates and replacement temporaries coexist. Existing valid
-files consume disk and are not treated as free. Bytes from an entirely
-incompatible stage may count as `reclaimable_bytes` only after a read-only audit
-has enumerated exact files authorized for deletion; valid per-frame payloads
-being atomically replaced are never counted as reclaimable.
-
-`reclaimable_bytes` means uniquely releasable physical allocation, never the sum
-of logical path sizes. Compute a separate ledger for every target volume and
-never transfer reclaim credit between volumes. The audit runs under the acquired
-job writer lock and uses `lstat` or non-following handle opens:
-
-- on Linux/POSIX, allocation identity is the invocation-local tuple
-  `(InvocationMountIdentityV1,stx_dev_major,stx_dev_minor,stx_ino)` and allocated
-  bytes are `st_blocks * 512`; it is never serialized or substituted for the
-  persisted UUID/file-handle identity;
-- on Windows, allocation identity is the exact shared
-  `WindowsFileIdentityV1` `(16-hex volume_serial,32-hex file_id)` and bytes are
-  the filesystem allocation size from the opened handle, not `st_size`;
-- each allocation identity contributes at most once, and only when its reported
-  hard-link count equals the number of directory entries with that identity in
-  the authorized deletion set after a complete job-tree audit;
-- a link count larger than the authorized count, an identity reachable from a
-  retained path, an external/unknown link, or failure to obtain stable identity,
-  link-count, or allocation-size data contributes zero;
-- symlinks and Windows reparse points are never followed. Only their own link
-  object allocation may count, under the same reliable-identity rule;
-- filesystems with clone/reflink, deduplication, compression, or other shared
-  extents contribute zero unless the platform exposes a reliable unique-release
-  allocation value for that identity.
-
-Immediately before the first stage mutation, re-open and revalidate every
-credited identity, allocation size, link count, and authorized path. Any change
-invalidates the entire audit and reruns preflight; it never merely subtracts a
-delta. Directories themselves receive zero reclaim credit. These rules make the
-existing crop-stage `os.link` optimization conservative rather than double
-counting its stage paths.
+because existing aggregates and replacement temporaries coexist. Existing files
+consume disk and are never treated as free. Stage-04 production sets
+`reclaimable_bytes = 0` on every platform, including for an entirely incompatible
+stage, deterministic transaction residue, and files whose reported hard-link
+count is one. A unique directory entry does not prove immediate block release:
+an external open file description can retain an unlinked ext4 inode, and a
+Windows handle opened with delete sharing can likewise retain allocation. The
+job writer lock cannot exclude either case. It also cannot bind a credited
+pathname against an uncooperative rename-and-replace race between preflight and
+unlink. Consequently neither logical size nor allocation metadata is admissible
+as a capacity guarantee. Existing stage payloads may still be removed after the
+no-reclaim admission succeeds, but their eventual release is only surplus space.
 
 Define the no-reclaim first-mutation requirement:
 
 ```text
 first_mutation_reserve = alloc(stage_metadata_raw) + A
+                       + alloc(rgb_metadata_raw) + A
                        + (alloc(quality_input_manifest_raw) + A
                           when Quality manifest publication is planned else 0)
-                       + (alloc(quality_rgb_metadata_raw) + A
-                          when Quality RGB metadata publication is planned else 0)
 ```
 
-Preflight requires both `current_free >= first_mutation_reserve` for the Quality
-content-manifest, RGB-metadata, and building-metadata transactions (or just the
-latter for Fast) and
-`current_free + reclaimable_bytes >= required_bytes` for the complete plan.
+Preflight requires both `current_free >= first_mutation_reserve` for the
+selected mode's RGB-metadata and building-metadata transactions plus the Quality
+content manifest when applicable, and `current_free >= required_bytes` for the
+complete plan. The reported audited reclaimable byte count is always zero.
 Both inequalities are evaluated independently on every volume containing a
 planned temporary or final payload.
 
@@ -6991,10 +6996,10 @@ checked-u64 diagnostics cardinality preflight
 compute the applicable Quality content-audit host bound
 perform the full initial Quality content audit when applicable
 freeze one provider generation for the selected Fast or Quality inputs
-derive lifecycle transition, packed action vector, P, R, and exact reclaimable paths
+derive lifecycle transition, packed action vector, P, and R
 compute JSON/image bounds and every remaining Fast/Quality host phase bound
-disk preflight using current_free + reclaimable_bytes
-revalidate every credited physical allocation; restart audit on any change
+disk preflight with no reclaim credit
+rebuild and compare the complete disk plan; restart audit on any change
 create and attest parked workers when P > 0
 replay and validate the complete frozen provider generation one final time
 then and only then:
@@ -7002,7 +7007,7 @@ then and only then:
     invalidate downstream when P > 0
     delete audited incompatible payload/clamp sidecars
     publish Quality input content manifest when planned
-    publish Quality StereoRgbMetadataV2 when planned
+    publish the selected mode's RGB metadata (Quality V2 or legacy Fast schema 1)
     write building metadata
     release the work gate and render P items
     teardown and join the pipeline, then synchronously migrate R manifests

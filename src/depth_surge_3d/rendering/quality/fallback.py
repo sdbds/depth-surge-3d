@@ -8,6 +8,7 @@ import math
 import numpy as np
 
 from . import local_strip, native_kd
+from .arena import QUALITY_REPAIR_ARENA_BYTES, QualityByteArena
 from .implicit_kd import (
     ImplicitRegionKdIndex,
     QualityRepairFallbackQueryBudgetError,
@@ -75,6 +76,7 @@ def precompute_native_fallbacks(
     region_count: int,
     budgets: QualityRepairBudgets,
     in_place: bool = False,
+    arena: QualityByteArena | None = None,
 ) -> FallbackPrecomputeResult:
     """Store one provisional colour for every still-unplanned record."""
 
@@ -85,35 +87,93 @@ def precompute_native_fallbacks(
         region_count,
         budgets,
     )
+    if arena is None:
+        arena = QualityByteArena(
+            np.empty(QUALITY_REPAIR_ARENA_BYTES, dtype=np.uint8),
+            "Quality repair",
+        )
+    arena.reset()
     if in_place:
         output = records
         output.setflags(write=True)
     else:
         output = np.array(records, copy=True, order="C")
+    index_partition = arena.allocate(
+        QUALITY_REPAIR_FALLBACK_INDEX_BYTES,
+        np.uint8,
+    )
+    visits_storage = arena.allocate(
+        QUALITY_REPAIR_FALLBACK_VISITS_BYTES // np.dtype(np.uint32).itemsize,
+        np.uint32,
+    )
     query_count = int(np.count_nonzero(output["backend"] == np.uint8(0)))
     if query_count == 0:
         output.setflags(write=False)
-        visits = np.empty(0, dtype=np.uint32)
+        visits = visits_storage[:0]
         visits.setflags(write=False)
         return FallbackPrecomputeResult(output, visits, 0, 0, 0, 0, 0)
-    referenced = np.zeros(count + 1, dtype=np.bool_)
+    offsets_bytes = (count + 1) * np.dtype(np.uint32).itemsize
+    use_full_bytes = count + 1
+    referenced_bytes = count + 1
+    member_offset = (offsets_bytes + use_full_bytes + referenced_bytes + 63) // 64 * 64
+    if member_offset > QUALITY_REPAIR_FALLBACK_INDEX_BYTES:
+        raise QualityRepairFallbackQueryBudgetError(
+            "safe-donor descriptors exceed their 48 MiB partition"
+        )
+    offsets = np.ndarray(
+        (count + 1,),
+        dtype=np.uint32,
+        buffer=index_partition,
+        offset=0,
+    )
+    use_full = np.ndarray(
+        (count + 1,),
+        dtype=np.bool_,
+        buffer=index_partition,
+        offset=offsets_bytes,
+    )
+    referenced = np.ndarray(
+        (count + 1,),
+        dtype=np.bool_,
+        buffer=index_partition,
+        offset=offsets_bytes + use_full_bytes,
+    )
+    referenced.fill(False)
     for record in output:
         if int(record["backend"]) == 0:
             referenced[int(record["region_id"])] = True
 
     native = native_kd._require_native()
-    members, offsets = native.build_safe_donor_index(
+    member_capacity = (QUALITY_REPAIR_FALLBACK_INDEX_BYTES - member_offset) // np.dtype(
+        np.uint32
+    ).itemsize
+    member_storage = np.ndarray(
+        (member_capacity,),
+        dtype=np.uint32,
+        buffer=index_partition,
+        offset=member_offset,
+    )
+    donor_count, index_bytes = native.build_safe_donor_index_into(
         analysis.coverage_count,
         analysis.pure_region_id,
         referenced,
         True,
+        member_storage,
+        offsets,
+        use_full,
     )
+    members = member_storage[: int(donor_count)]
     members.setflags(write=False)
     offsets.setflags(write=False)
     index = ImplicitRegionKdIndex(height, width, count, members, offsets)
     if index.index_bytes > QUALITY_REPAIR_FALLBACK_INDEX_BYTES:
-        raise QualityRepairFallbackQueryBudgetError("safe-donor index exceeds its 48 MiB partition")
-    if query_count * np.dtype(np.uint32).itemsize > QUALITY_REPAIR_FALLBACK_VISITS_BYTES:
+        raise QualityRepairFallbackQueryBudgetError(
+            "safe-donor index exceeds its 48 MiB partition"
+        )
+    if (
+        query_count * np.dtype(np.uint32).itemsize
+        > QUALITY_REPAIR_FALLBACK_VISITS_BYTES
+    ):
         raise QualityRepairFallbackQueryBudgetError(
             "fallback visit counts exceed their 16 MiB partition"
         )
@@ -128,7 +188,7 @@ def precompute_native_fallbacks(
     raw_records = output.view(np.uint8).reshape(output.size, 16)
     fallback_limit = max(1, math.floor((256 * height) / 1080.0 + 0.5))
     try:
-        visits, anchor_fallback_count = native.query_fallback_records(
+        query_count_written, anchor_fallback_count = native.query_fallback_records(
             index.member_index,
             index.region_offsets,
             height,
@@ -140,6 +200,7 @@ def precompute_native_fallbacks(
             fallback_limit,
             budget_state,
             analysis.anchor_fallbacks_seeded,
+            visits_storage,
         )
     except RuntimeError as error:
         message = str(error)
@@ -152,20 +213,25 @@ def precompute_native_fallbacks(
         raise
     finally:
         budgets.repair_fallback_visits_consumed = int(budget_state[0])
+    if int(query_count_written) != query_count:
+        raise RuntimeError("fallback query count changed during fixed-arena execution")
+    visits = visits_storage[:query_count]
     output.setflags(write=False)
     visits.setflags(write=False)
     return FallbackPrecomputeResult(
         records=output,
         visited_nodes=visits,
         indexed_donor_count=index.indexed_sample_count,
-        index_bytes=index.index_bytes,
+        index_bytes=int(index_bytes),
         query_count=query_count,
         retained_safe_donor_mask_bytes=0,
         anchor_fallback_count=int(anchor_fallback_count),
     )
 
 
-def finalize_safe_fallbacks(records: np.ndarray, *, in_place: bool = False) -> np.ndarray:
+def finalize_safe_fallbacks(
+    records: np.ndarray, *, in_place: bool = False
+) -> np.ndarray:
     """Commit every residual provisional colour as backend 3."""
 
     if (
@@ -227,7 +293,10 @@ def _validate_render_shape(render_shape: tuple[int, int]) -> tuple[int, int]:
     if (
         not isinstance(render_shape, tuple)
         or len(render_shape) != 2
-        or any(isinstance(value, bool) or not isinstance(value, int) for value in render_shape)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in render_shape
+        )
     ):
         raise TypeError("render_shape must be an integer (height, width) tuple")
     height, width = render_shape

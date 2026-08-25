@@ -16,25 +16,28 @@ import sys
 import threading
 from typing import Callable, Iterable, Iterator, Protocol, cast
 
+from ...io.stereo_contract import (
+    STEREO_CONTROL_FRAME_CAP,
+    StereoControlBudgetError,
+    StereoControlError,
+)
 
-STEREO_CONTROL_FRAME_CAP = 4_194_304
 STEREO_CONTROL_ACTION_BYTES = 1 * 1024 * 1024
 STEREO_CONTROL_OVERHEAD = 4 * 1024 * 1024
 STEREO_HOST_BUDGET = 512 * 1024 * 1024
 STEREO_IO_THREAD_BYTES = 2 * 1024 * 1024
 STEREO_REQUESTED_STACK_BYTES = 512 * 1024
+STEREO_CONTROL_MANIFEST_STREAM_BYTES = 1024 * 1024
+STEREO_CONTROL_JSON_STATE_BYTES = 256 * 1024
+STEREO_CONTROL_DIAGNOSTICS_STATE_BYTES = 512 * 1024
+STEREO_CONTROL_PROGRESS_STATE_BYTES = 128 * 1024
+STEREO_CONTROL_PROVIDER_STATE_BYTES = 256 * 1024
+STEREO_CONTROL_ALLOCATOR_SLACK_BYTES = 512 * 1024
 
 _HEX_32 = re.compile(r"^[0-9a-f]{32}$")
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
+_CANONICAL_FRAME_STEM = re.compile(r"^frame_(?:[0-9]{6}|[1-9][0-9]{6,})$")
 _STEREO_THREAD_CREATION_LOCK = threading.Lock()
-
-
-class StereoControlError(RuntimeError):
-    """Base error for the bounded replayable control plane."""
-
-
-class StereoControlBudgetError(StereoControlError):
-    """The frame or resident control-plane bound cannot be met."""
 
 
 class StereoControlStateError(StereoControlError):
@@ -47,6 +50,10 @@ class StereoProviderChangedError(StereoControlError):
 
 class StereoStageInputChangedError(StereoControlError):
     """A post-mutation replay changed and cannot restart in the current call."""
+
+
+class StereoInputIdentityMismatch(StereoControlError):
+    """Decoded source bytes no longer match the frozen provider identity."""
 
 
 class StereoThreadBudgetError(StereoControlError):
@@ -166,6 +173,27 @@ class StereoProviderItem:
     right_path: Path
     guide_sha256: str
     geometry_sha256: str
+    guide_byte_count: int
+    geometry_byte_count: int
+    guide_shape: tuple[int, int]
+    geometry_shape: tuple[int, int]
+    frame_json_bound: int
+
+    @property
+    def index(self) -> int:
+        return self.source_index
+
+    @property
+    def frame_path(self) -> Path:
+        return self.guide_path
+
+    @property
+    def depth_path(self) -> Path:
+        return self.geometry_path
+
+    @property
+    def stat_path(self) -> None:
+        return None
 
 
 class _ReplayFactory(Protocol):
@@ -200,16 +228,69 @@ class StereoControlAuditPlan:
     render_count: int
     migrate_count: int
     item_stream_sha256: str
+    maximum_native_pixels: int
+    maximum_compressed_payload_bytes: int
+    maximum_source_native_pixels: int
+    maximum_source_compressed_payload_bytes: int
+    maximum_frame_json_bound: int
+    frame_name_json_array_bytes: int
+    maximum_fast_relative_item_bytes: int
+    maximum_fast_metric_item_bytes: int
+    control_residency: "StereoControlResidencyEvidence"
 
     @property
     def persistent_control_bytes(self) -> int:
-        return (
-            sys.getsizeof(self)
-            + sys.getsizeof(self.generation)
-            + sys.getsizeof(self.actions)
-            + sys.getsizeof(self.actions.storage)
-            + sys.getsizeof(self.item_stream_sha256)
+        return self.control_residency.total_bytes
+
+
+@dataclass(frozen=True)
+class StereoControlResidencyEvidence:
+    action_bytes: int
+    manifest_stream_bytes: int
+    json_state_bytes: int
+    diagnostics_state_bytes: int
+    progress_state_bytes: int
+    provider_state_bytes: int
+    allocator_slack_bytes: int
+    scalar_object_bytes: int
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(
+            (
+                self.action_bytes,
+                self.manifest_stream_bytes,
+                self.json_state_bytes,
+                self.diagnostics_state_bytes,
+                self.progress_state_bytes,
+                self.provider_state_bytes,
+                self.allocator_slack_bytes,
+                self.scalar_object_bytes,
+            )
         )
+
+
+def _control_residency_evidence(
+    generation: StereoProviderGeneration,
+    actions: PackedStereoActions,
+    item_stream_sha256: str,
+) -> StereoControlResidencyEvidence:
+    scalar_bytes = (
+        sys.getsizeof(generation)
+        + sys.getsizeof(actions)
+        + sys.getsizeof(item_stream_sha256)
+        + 64 * 1024
+    )
+    return StereoControlResidencyEvidence(
+        action_bytes=sys.getsizeof(actions.storage),
+        manifest_stream_bytes=STEREO_CONTROL_MANIFEST_STREAM_BYTES,
+        json_state_bytes=STEREO_CONTROL_JSON_STATE_BYTES,
+        diagnostics_state_bytes=STEREO_CONTROL_DIAGNOSTICS_STATE_BYTES,
+        progress_state_bytes=STEREO_CONTROL_PROGRESS_STATE_BYTES,
+        provider_state_bytes=STEREO_CONTROL_PROVIDER_STATE_BYTES,
+        allocator_slack_bytes=STEREO_CONTROL_ALLOCATOR_SLACK_BYTES,
+        scalar_object_bytes=scalar_bytes,
+    )
 
 
 def canonical_frame_stem(index: int) -> str:
@@ -238,11 +319,27 @@ def _validate_provider_item(
         raise StereoControlStateError("provider input manifest fingerprint changed")
     if item.source_index != expected_index:
         raise StereoControlStateError("provider source index is noncontiguous")
-    stem = canonical_frame_stem(expected_index)
-    if item.frame_name != stem:
+    stem = item.frame_name
+    if not _CANONICAL_FRAME_STEM.fullmatch(stem):
         raise StereoControlStateError("provider frame name is noncanonical")
     if not _HEX_64.fullmatch(item.guide_sha256) or not _HEX_64.fullmatch(item.geometry_sha256):
         raise StereoControlStateError("provider content hash is noncanonical")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in (
+            item.guide_byte_count,
+            item.geometry_byte_count,
+            item.frame_json_bound,
+        )
+    ):
+        raise StereoControlStateError("provider byte bounds are invalid")
+    for shape in (item.guide_shape, item.geometry_shape):
+        if (
+            not isinstance(shape, tuple)
+            or len(shape) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in shape)
+        ):
+            raise StereoControlStateError("provider image shape is invalid")
     expected_guide = f"{stem}.png"
     if item.guide_path.name != expected_guide:
         raise StereoControlStateError("provider guide path does not match the canonical stem")
@@ -266,6 +363,17 @@ def _update_item_digest(digest: hashlib._Hash, item: StereoProviderItem) -> None
         item.geometry_sha256,
     ):
         _update_length_prefixed(digest, value)
+    digest.update(
+        struct.pack(
+            "<QQQQQ",
+            item.guide_byte_count,
+            item.geometry_byte_count,
+            item.guide_shape[0],
+            item.guide_shape[1],
+            item.frame_json_bound,
+        )
+    )
+    digest.update(struct.pack("<QQ", item.geometry_shape[0], item.geometry_shape[1]))
 
 
 def audit_stereo_provider(
@@ -279,6 +387,14 @@ def audit_stereo_provider(
     digest = hashlib.sha256()
     render_count = 0
     migrate_count = 0
+    maximum_native_pixels = 0
+    maximum_compressed_payload_bytes = 0
+    maximum_source_native_pixels = 0
+    maximum_source_compressed_payload_bytes = 0
+    maximum_frame_json_bound = 0
+    frame_name_json_array_bytes = 2
+    maximum_fast_relative_item_bytes = 0
+    maximum_fast_metric_item_bytes = 0
     expected_index = 0
     for item in provider.replay():
         if expected_index >= generation.frame_count:
@@ -292,15 +408,61 @@ def audit_stereo_provider(
         actions.set(expected_index, action)
         render_count += int(action is StereoAction.RENDER)
         migrate_count += int(action is StereoAction.MIGRATE)
+        maximum_frame_json_bound = max(maximum_frame_json_bound, item.frame_json_bound)
+        source_native_pixels = item.geometry_shape[0] * item.geometry_shape[1]
+        source_compressed_bytes = item.guide_byte_count + item.geometry_byte_count
+        maximum_source_native_pixels = max(
+            maximum_source_native_pixels,
+            source_native_pixels,
+        )
+        maximum_source_compressed_payload_bytes = max(
+            maximum_source_compressed_payload_bytes,
+            source_compressed_bytes,
+        )
+        frame_name_json_array_bytes += len(item.frame_name) + 2 + int(expected_index > 0)
+        if action is StereoAction.RENDER:
+            output_pixels = item.guide_shape[0] * item.guide_shape[1]
+            native_pixels = item.geometry_shape[0] * item.geometry_shape[1]
+            compressed = item.guide_byte_count + item.geometry_byte_count
+            maximum_native_pixels = max(maximum_native_pixels, native_pixels)
+            maximum_compressed_payload_bytes = max(
+                maximum_compressed_payload_bytes,
+                compressed,
+            )
+            maximum_fast_relative_item_bytes = max(
+                maximum_fast_relative_item_bytes,
+                3 * output_pixels + 2 * native_pixels + compressed,
+                7 * output_pixels + 6 * native_pixels,
+                25 * output_pixels,
+                23 * output_pixels + item.frame_json_bound,
+            )
+            maximum_fast_metric_item_bytes = max(
+                maximum_fast_metric_item_bytes,
+                3 * output_pixels + 5 * native_pixels + compressed,
+                11 * output_pixels + 9 * native_pixels,
+                25 * output_pixels,
+                23 * output_pixels + item.frame_json_bound,
+            )
         expected_index += 1
     if expected_index != generation.frame_count:
         raise StereoControlStateError("provider replay ended before its frozen frame count")
+    item_stream_sha256 = digest.hexdigest()
+    residency = _control_residency_evidence(generation, actions, item_stream_sha256)
     plan = StereoControlAuditPlan(
         generation=generation,
         actions=actions,
         render_count=render_count,
         migrate_count=migrate_count,
-        item_stream_sha256=digest.hexdigest(),
+        item_stream_sha256=item_stream_sha256,
+        maximum_native_pixels=maximum_native_pixels,
+        maximum_compressed_payload_bytes=maximum_compressed_payload_bytes,
+        maximum_source_native_pixels=maximum_source_native_pixels,
+        maximum_source_compressed_payload_bytes=maximum_source_compressed_payload_bytes,
+        maximum_frame_json_bound=maximum_frame_json_bound,
+        frame_name_json_array_bytes=frame_name_json_array_bytes,
+        maximum_fast_relative_item_bytes=maximum_fast_relative_item_bytes,
+        maximum_fast_metric_item_bytes=maximum_fast_metric_item_bytes,
+        control_residency=residency,
     )
     if plan.persistent_control_bytes > STEREO_CONTROL_OVERHEAD:
         raise StereoControlBudgetError("persistent stereo control plane exceeds four MiB")
@@ -345,10 +507,61 @@ def validate_stereo_provider_replay(
         _raise_provider_changed("provider item identity changed", mutation_started)
 
 
+def validate_stereo_action_replay(
+    provider: ReplayableStereoProvider,
+    plan: StereoControlAuditPlan,
+    classify: Callable[[StereoProviderItem], StereoAction],
+) -> None:
+    """Reclassify retained outputs without allocating a second action vector."""
+
+    if provider.generation != plan.generation:
+        raise StereoProviderChangedError("provider generation changed")
+    digest = hashlib.sha256()
+    expected_index = 0
+    render_count = 0
+    migrate_count = 0
+    try:
+        replay = provider.replay()
+        for item in replay:
+            if expected_index >= plan.generation.frame_count:
+                raise StereoControlStateError(
+                    "provider replay exceeds its frozen frame count"
+                )
+            _validate_provider_item(item, plan.generation, expected_index)
+            _update_item_digest(digest, item)
+            try:
+                action = StereoAction(classify(item))
+            except (TypeError, ValueError) as error:
+                raise StereoControlStateError(
+                    "classifier returned an unknown stereo action"
+                ) from error
+            if action is not plan.actions.get(expected_index):
+                raise StereoProviderChangedError(
+                    "stereo retained-output action changed before mutation"
+                )
+            render_count += int(action is StereoAction.RENDER)
+            migrate_count += int(action is StereoAction.MIGRATE)
+            expected_index += 1
+    except StereoProviderChangedError:
+        raise
+    except (StereoControlError, OSError, TypeError, ValueError) as error:
+        raise StereoProviderChangedError(str(error)) from error
+    if expected_index != plan.generation.frame_count:
+        raise StereoProviderChangedError(
+            "provider replay ended before its frozen frame count"
+        )
+    if digest.hexdigest() != plan.item_stream_sha256:
+        raise StereoProviderChangedError("provider item identity changed")
+    if render_count != plan.render_count or migrate_count != plan.migrate_count:
+        raise StereoProviderChangedError("stereo retained-output action counts changed")
+
+
 def iter_stereo_action(
     provider: ReplayableStereoProvider,
     plan: StereoControlAuditPlan,
     selected_action: StereoAction,
+    *,
+    mutation_started: bool = True,
 ) -> Iterator[StereoProviderItem]:
     """Replay lazily and yield only one action without constructing a resident set."""
 
@@ -356,25 +569,42 @@ def iter_stereo_action(
     if selected_action is StereoAction.INVALID:
         raise StereoControlStateError("invalid action cannot be selected")
     if provider.generation != plan.generation:
-        raise StereoStageInputChangedError("provider generation changed")
+        _raise_provider_changed("provider generation changed", mutation_started)
     digest = hashlib.sha256()
     expected_index = 0
-    for item in provider.replay():
+    try:
+        replay = provider.replay()
+    except (StereoControlError, OSError, TypeError, ValueError) as error:
+        _raise_provider_changed(str(error), mutation_started)
+    while True:
+        try:
+            item = next(replay)
+        except StopIteration:
+            break
+        except (StereoControlError, OSError, TypeError, ValueError) as error:
+            _raise_provider_changed(str(error), mutation_started)
         if expected_index >= plan.generation.frame_count:
-            raise StereoStageInputChangedError("provider replay exceeds its frozen frame count")
+            _raise_provider_changed(
+                "provider replay exceeds its frozen frame count",
+                mutation_started,
+            )
         try:
             _validate_provider_item(item, plan.generation, expected_index)
             action = plan.actions.get(expected_index)
         except StereoControlError as error:
-            raise StereoStageInputChangedError(str(error)) from error
+            _raise_provider_changed(str(error), mutation_started)
         _update_item_digest(digest, item)
         expected_index += 1
         if action is selected_action:
             yield item
+            del item
     if expected_index != plan.generation.frame_count:
-        raise StereoStageInputChangedError("provider replay ended before its frozen frame count")
+        _raise_provider_changed(
+            "provider replay ended before its frozen frame count",
+            mutation_started,
+        )
     if digest.hexdigest() != plan.item_stream_sha256:
-        raise StereoStageInputChangedError("provider item identity changed")
+        _raise_provider_changed("provider item identity changed", mutation_started)
 
 
 @dataclass(frozen=True)
@@ -490,7 +720,7 @@ class _WindowsReservedThread:
     ) -> None:
         self.name = name
         self.ident: int | None = None
-        self._target = target
+        self._target: Callable[..., None] | None = target
         self._args = args
         self._handle: int | None = None
         self._callback: object | None = None
@@ -505,7 +735,10 @@ class _WindowsReservedThread:
         @callback_type
         def entry(_argument: int) -> int:
             try:
-                self._target(*self._args)
+                target = self._target
+                if target is None:
+                    raise RuntimeError("reserved thread target was released before start")
+                target(*self._args)
             except BaseException as error:
                 self.error = error
             return 0
@@ -573,6 +806,8 @@ class _WindowsReservedThread:
             raise OSError(ctypes.get_last_error(), "CloseHandle failed")
         self._closed = True
         self._callback = None
+        self._target = None
+        self._args = ()
 
 
 def _new_stereo_thread(
@@ -796,6 +1031,15 @@ class StreamingStereoPipelineStats:
     work_item_copies: int
     parked_committed_delta_bytes: int
     live_threads_after_join: int
+    configured_workers: int = 0
+    feeder_thread_count: int = 0
+    decoder_thread_count: int = 0
+    writer_thread_count: int = 0
+    calculated_thread_bytes: int = 0
+    previous_stack_bytes: int = 0
+    restored_stack_bytes: int = 0
+    stack_granularity_bytes: tuple[int, ...] = ()
+    reported_stack_reserve_bytes: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -844,6 +1088,7 @@ class _StreamingTrace:
 
 
 _PIPELINE_SENTINEL = object()
+_PIPELINE_COMPLETION = object()
 
 
 def run_streaming_stereo_pipeline(  # noqa: C901
@@ -856,37 +1101,59 @@ def run_streaming_stereo_pipeline(  # noqa: C901
     render: Callable[[object], object],
     write: Callable[[object], object],
     mutation: Callable[[], None] | None = None,
+    pre_mutation: Callable[[], None] | None = None,
+    configured_workers: int | None = None,
 ) -> StreamingStereoPipelineStats:
     """Drive a capacity-bounded synthetic pipeline without a resident work-item list."""
 
     if plan.render_count == 0:
         if capacity != 0 or effective_workers != 0:
             raise ValueError("P=0 requires zero pipeline capacity and workers")
+        if configured_workers is None:
+            configured_workers = 0
+        if configured_workers < 0 or configured_workers > 16:
+            raise ValueError("configured workers must be between zero and sixteen")
+        validate_stereo_provider_replay(provider, plan, mutation_started=False)
+        if pre_mutation is not None:
+            pre_mutation()
+        if mutation is not None:
+            try:
+                mutation()
+            except StereoInputIdentityMismatch as error:
+                _raise_provider_changed(str(error), mutation_started=True)
         return StreamingStereoPipelineStats(
-            0,
-            0,
-            0,
-            (0, 0, 0, 0),
-            0,
-            0,
-            0,
-            0,
-            0,
-            False,
-            False,
-            False,
-            0,
-            0,
-            0,
+            configured_capacity=0,
+            effective_workers=0,
+            actual_thread_count=0,
+            queue_capacities=(0, 0, 0, 0),
+            requested_stack_bytes=0,
+            decoded=0,
+            rendered=0,
+            written=0,
+            maximum_live_items=0,
+            decode_render_overlap=False,
+            render_write_overlap=False,
+            decoder_writer_overlap=False,
+            work_item_copies=0,
+            parked_committed_delta_bytes=0,
+            live_threads_after_join=0,
+            configured_workers=configured_workers,
         )
     if capacity <= 0 or effective_workers <= 0:
         raise ValueError("nonzero render work requires positive capacity and workers")
+    if configured_workers is None:
+        configured_workers = effective_workers
+    if configured_workers < effective_workers or configured_workers > 16:
+        raise ValueError("configured workers must contain the effective worker count")
     validate_stereo_provider_replay(provider, plan, mutation_started=False)
     before_committed = current_process_committed_bytes()
     queues = StereoPipelineQueues(capacity)
     permits = threading.BoundedSemaphore(capacity)
     trace = _StreamingTrace()
     pipeline_cancel = threading.Event()
+    feeder_complete = threading.Event()
+    worker_errors: queue.Queue[tuple[str, BaseException]] = queue.Queue(maxsize=1)
+    mutation_started = False
 
     def validate_handoff(item: StereoProviderItem) -> None:
         _validate_provider_item(item, plan.generation, item.source_index)
@@ -900,25 +1167,94 @@ def run_streaming_stereo_pipeline(  # noqa: C901
             return True
         return False
 
-    def get_or_cancel(target: queue.Queue[object]) -> object:
-        while not pipeline_cancel.is_set():
+    def record_worker_error(role: str, error: BaseException) -> None:
+        try:
+            worker_errors.put_nowait((role, error))
+        except queue.Full:
+            pass
+        pipeline_cancel.set()
+
+    def raise_worker_error() -> None:
+        try:
+            role, error = worker_errors.get_nowait()
+        except queue.Empty:
+            raise StereoControlStateError("stereo pipeline cancelled without an error")
+        worker_errors.task_done()
+        if isinstance(error, StereoInputIdentityMismatch):
+            _raise_provider_changed(str(error), mutation_started)
+        if role == "feeder" and isinstance(
+            error,
+            (StereoControlError, OSError, TypeError, ValueError),
+        ):
+            _raise_provider_changed(str(error), mutation_started)
+        raise error
+
+    def coordinator_get(target: queue.Queue[object]) -> object:
+        while True:
+            if pipeline_cancel.is_set():
+                raise_worker_error()
             try:
                 return target.get(timeout=0.05)
             except queue.Empty:
                 continue
-        return _PIPELINE_SENTINEL
 
-    def worker(role: str, _worker_index: int) -> None:
+    def release_item() -> None:
+        trace.item_finished()
+        permits.release()
+
+    def drain_owned_queues() -> None:
+        for target, owns in (
+            (queues.decode_requests, lambda value: value is not _PIPELINE_SENTINEL),
+            (
+                queues.decoded_frames,
+                lambda value: isinstance(value, tuple)
+                and len(value) == 2
+                and isinstance(value[0], StereoProviderItem),
+            ),
+            (
+                queues.write_requests,
+                lambda value: value is not _PIPELINE_SENTINEL
+                and isinstance(value, tuple)
+                and len(value) == 2
+                and isinstance(value[0], StereoProviderItem),
+            ),
+            (queues.write_completions, lambda _value: False),
+        ):
+            while True:
+                try:
+                    message = target.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if owns(message):
+                        release_item()
+                finally:
+                    target.task_done()
+                    message = None
+
+    def worker_body(role: str) -> None:
         if role == "feeder":
             try:
-                for item in iter_stereo_action(provider, plan, StereoAction.RENDER):
+                actions = iter(iter_stereo_action(provider, plan, StereoAction.RENDER))
+                while True:
                     while not pipeline_cancel.is_set() and not permits.acquire(timeout=0.05):
                         pass
                     if pipeline_cancel.is_set():
                         return
+                    try:
+                        item = next(actions)
+                    except StopIteration:
+                        permits.release()
+                        feeder_complete.set()
+                        break
+                    except BaseException:
+                        permits.release()
+                        raise
                     trace.item_started()
                     if not put_or_cancel(queues.decode_requests, item):
+                        release_item()
                         return
+                    item = None
             finally:
                 for _ in range(effective_workers):
                     if not put_or_cancel(queues.decode_requests, _PIPELINE_SENTINEL):
@@ -926,9 +1262,16 @@ def run_streaming_stereo_pipeline(  # noqa: C901
             return
         if role == "decoder":
             while True:
-                queued_item = get_or_cancel(queues.decode_requests)
-                if pipeline_cancel.is_set() and queued_item is _PIPELINE_SENTINEL:
-                    return
+                try:
+                    queued_item = queues.decode_requests.get(timeout=0.05)
+                except queue.Empty:
+                    if pipeline_cancel.is_set():
+                        return
+                    continue
+                transferred = False
+                owns_item = queued_item is not _PIPELINE_SENTINEL
+                decode_item: StereoProviderItem | None = None
+                payload: object | None = None
                 try:
                     if queued_item is _PIPELINE_SENTINEL:
                         return
@@ -941,15 +1284,30 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                         payload = decode(decode_item)
                     finally:
                         trace.end("decode")
-                    if not put_or_cancel(queues.decoded_frames, (decode_item, payload)):
+                    transferred = put_or_cancel(
+                        queues.decoded_frames,
+                        (decode_item, payload),
+                    )
+                    if not transferred:
                         return
                 finally:
                     queues.decode_requests.task_done()
+                    queued_item = None
+                    decode_item = None
+                    payload = None
+                    if owns_item and not transferred:
+                        release_item()
         if role == "writer":
             while True:
-                message = get_or_cancel(queues.write_requests)
-                if pipeline_cancel.is_set() and message is _PIPELINE_SENTINEL:
-                    return
+                try:
+                    message = queues.write_requests.get(timeout=0.05)
+                except queue.Empty:
+                    if pipeline_cancel.is_set():
+                        return
+                    continue
+                owns_item = message is not _PIPELINE_SENTINEL
+                write_item: StereoProviderItem | None = None
+                payload: object | None = None
                 try:
                     if message is _PIPELINE_SENTINEL:
                         return
@@ -964,12 +1322,21 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                         write(payload)
                     finally:
                         trace.end("write")
-                    if not put_or_cancel(queues.write_completions, write_item):
+                    if not put_or_cancel(queues.write_completions, _PIPELINE_COMPLETION):
                         return
-                    trace.item_finished()
-                    permits.release()
                 finally:
                     queues.write_requests.task_done()
+                    message = None
+                    write_item = None
+                    payload = None
+                    if owns_item:
+                        release_item()
+
+    def worker(role: str, _worker_index: int) -> None:
+        try:
+            worker_body(role)
+        except BaseException as error:
+            record_worker_error(role, error)
 
     group = create_parked_stereo_workers(
         pending_render_count=plan.render_count,
@@ -981,11 +1348,23 @@ def run_streaming_stereo_pipeline(  # noqa: C901
     rendered = 0
     completions = 0
     try:
+        validate_stereo_provider_replay(
+            provider,
+            plan,
+            mutation_started=False,
+        )
+        if pre_mutation is not None:
+            pre_mutation()
         if mutation is not None:
+            mutation_started = True
             mutation()
         group.release()
         while rendered < plan.render_count:
-            decoded_message = queues.decoded_frames.get(timeout=10.0)
+            decoded_message = coordinator_get(queues.decoded_frames)
+            handed_to_writer = False
+            render_item: StereoProviderItem | None = None
+            payload: object | None = None
+            rendered_payload: object | None = None
             try:
                 if not isinstance(decoded_message, tuple) or len(decoded_message) != 2:
                     raise StereoControlStateError("renderer received a malformed message")
@@ -999,7 +1378,12 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                     rendered_payload = render(payload)
                 finally:
                     trace.end("render")
-                queues.write_requests.put((render_item, rendered_payload))
+                handed_to_writer = put_or_cancel(
+                    queues.write_requests,
+                    (render_item, rendered_payload),
+                )
+                if not handed_to_writer:
+                    raise_worker_error()
                 rendered += 1
                 while True:
                     try:
@@ -1011,18 +1395,57 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                         completions += 1
             finally:
                 queues.decoded_frames.task_done()
+                decoded_message = None
+                render_item = None
+                payload = None
+                rendered_payload = None
+                if not handed_to_writer:
+                    release_item()
         for _ in range(effective_workers):
-            queues.write_requests.put(_PIPELINE_SENTINEL)
+            if not put_or_cancel(queues.write_requests, _PIPELINE_SENTINEL):
+                raise_worker_error()
         while completions < plan.render_count:
-            queues.write_completions.get(timeout=10.0)
+            coordinator_get(queues.write_completions)
             queues.write_completions.task_done()
             completions += 1
         group.join()
         live_threads_after_join = group.live_thread_count
-    except BaseException:
+        if pipeline_cancel.is_set() or not worker_errors.empty():
+            raise_worker_error()
+        if not feeder_complete.is_set():
+            raise StereoControlStateError(
+                "stereo feeder ended without completing its authoritative replay"
+            )
+    except BaseException as error:
         pipeline_cancel.set()
         group.cancel_and_join()
-        raise
+        worker_failure: tuple[str, BaseException] | None = None
+        try:
+            worker_failure = worker_errors.get_nowait()
+            worker_errors.task_done()
+        except queue.Empty:
+            pass
+        drain_owned_queues()
+        while True:
+            try:
+                worker_errors.get_nowait()
+            except queue.Empty:
+                break
+            worker_errors.task_done()
+        if worker_failure is not None:
+            role, worker_error = worker_failure
+            worker_failure = None
+            if isinstance(worker_error, StereoInputIdentityMismatch):
+                _raise_provider_changed(str(worker_error), mutation_started)
+            if role == "feeder" and isinstance(
+                worker_error,
+                (StereoControlError, OSError, TypeError, ValueError),
+            ):
+                _raise_provider_changed(str(worker_error), mutation_started)
+            raise worker_error
+        if isinstance(error, StereoInputIdentityMismatch):
+            _raise_provider_changed(str(error), mutation_started)
+        raise error
     return StreamingStereoPipelineStats(
         configured_capacity=capacity,
         effective_workers=effective_workers,
@@ -1039,6 +1462,19 @@ def run_streaming_stereo_pipeline(  # noqa: C901
         work_item_copies=0,
         parked_committed_delta_bytes=parked_committed_delta,
         live_threads_after_join=live_threads_after_join,
+        configured_workers=configured_workers,
+        feeder_thread_count=1,
+        decoder_thread_count=effective_workers,
+        writer_thread_count=effective_workers,
+        calculated_thread_bytes=actual_threads * STEREO_IO_THREAD_BYTES,
+        previous_stack_bytes=group.stats.previous_stack_bytes,
+        restored_stack_bytes=group.stats.restored_stack_bytes,
+        stack_granularity_bytes=tuple(
+            evidence.granularity_bytes for evidence in group.stats.stack_evidence
+        ),
+        reported_stack_reserve_bytes=tuple(
+            evidence.reserve_bytes for evidence in group.stats.stack_evidence
+        ),
     )
 
 
