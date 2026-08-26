@@ -448,7 +448,7 @@ def resolve_stereo_render_mode(
     is_resume: bool,
     renderer_device_type: object,
 ) -> StereoRenderMode:
-    """Resolve omission without changing the library-level Fast default."""
+    """Resolve omission while keeping the library-level Fast default separate."""
 
     if override is not None:
         return _choice(
@@ -458,5 +458,5 @@ def resolve_stereo_render_mode(
         return _choice(
             "stereo_render_mode", persisted, {"fast", "quality"}
         )  # type: ignore[return-value]
-    del renderer_device_type
-    return "fast"
+    device_type = str(renderer_device_type).split(":", 1)[0].lower()
+    return "quality" if device_type == "cuda" else "fast"

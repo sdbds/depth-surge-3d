@@ -20,14 +20,22 @@ def test_web_quality_controls_are_visible_and_submitted(web_app) -> None:
     assert 'id="occlusionFillMaxPx"' in html
     assert 'min="1" max="32"' in html
     assert 'id="stereoQualityCpuWarning"' in html
-    assert "stereo_render_mode: document.getElementById('stereoRenderMode').value" in html
+    assert "stereo_render_mode: document.getElementById('stereoRenderMode').value" not in html
+    assert (
+        "settings.stereo_render_mode = document.getElementById('stereoRenderMode').value"
+        in html
+    )
+    assert "if (stereoRenderModeExplicit) {\n                settings.stereo_render_mode" in html
     assert "occlusion_fill_max_px: parseInt(" in html
     assert "let stereoRenderModeExplicit = false;" in html
-    assert "document.getElementById('stereoRenderMode').value = 'fast'" in html
+    assert "const cudaDefault = requestedDevice === 'cuda'" in html
+    assert "systemCudaAvailable === true" in html
+    assert "document.getElementById('stereoRenderMode').value =" in html
+    assert "cudaDefault ? 'quality' : 'fast';" in html
     assert "stereoRenderModeExplicit = true;" in html
 
 
-@pytest.mark.parametrize(("device", "expected"), [("cuda", "fast"), ("cpu", "fast")])
+@pytest.mark.parametrize(("device", "expected"), [("cuda", "quality"), ("cpu", "fast")])
 def test_web_omitted_mode_resolves_from_effective_device(
     web_app, monkeypatch: pytest.MonkeyPatch, device: str, expected: str
 ) -> None:

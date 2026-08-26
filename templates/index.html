@@ -2166,7 +2166,11 @@
 
         function applyStereoRenderModeDefault() {
             if (stereoRenderModeExplicit) return;
-            document.getElementById('stereoRenderMode').value = 'fast';
+            const requestedDevice = document.getElementById('device').value;
+            const cudaDefault = requestedDevice === 'cuda'
+                || (requestedDevice === 'auto' && systemCudaAvailable === true);
+            document.getElementById('stereoRenderMode').value =
+                cudaDefault ? 'quality' : 'fast';
         }
 
         function updateStereoQualityControls() {
@@ -2292,7 +2296,6 @@
                 stereo_strength: parseFloat(document.getElementById('stereoStrength').value),
                 convergence: parseFloat(document.getElementById('convergence').value),
                 occlusion_fill: document.getElementById('occlusionFill').value,
-                stereo_render_mode: document.getElementById('stereoRenderMode').value,
                 occlusion_fill_max_px: parseInt(document.getElementById('occlusionFillMaxPx').value),
                 stereo_geometry_mode: document.getElementById('stereoGeometryMode').value,
                 virtual_baseline_mm: parseFloat(document.getElementById('virtualBaselineMm').value),
@@ -2327,6 +2330,9 @@
                 enable_live_preview: document.getElementById('enableLivePreview').checked,
                 preview_update_interval: parseFloat(document.getElementById('previewUpdateInterval').value)
             };
+            if (stereoRenderModeExplicit) {
+                settings.stereo_render_mode = document.getElementById('stereoRenderMode').value;
+            }
             
             fetch('/process', {
                 method: 'POST',
