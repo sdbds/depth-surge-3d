@@ -30,6 +30,7 @@ PyYAML>=6.0
 # Note: xformers is optional - provides performance optimization for DA3
 # Uncomment the line below if you want to install xformers (may fail on some systems):
 # xformers>=0.0.26
+addict>=2.4.0
 git+https://github.com/ByteDance-Seed/Depth-Anything-3.git
 
 # AI Upscaling: Real-ESRGAN with standalone RRDB network (no extra dependencies)

@@ -47,6 +47,7 @@ dependencies = [
     "imageio>=2.30.0",
     "imageio-ffmpeg>=0.4.7",
     "decord>=0.6.0",
+    "addict>=2.4.0",
     "depth-anything-3",
 ]
 

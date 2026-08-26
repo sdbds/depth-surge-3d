@@ -744,6 +744,7 @@ version = "0.9.1"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
+    { name = "addict" },
     { name = "decord" },
     { name = "depth-anything-3" },
     { name = "diffusers" },
@@ -790,6 +791,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=0.34.0" },
+    { name = "addict", specifier = ">=2.4.0" },
     { name = "decord", specifier = ">=0.6.0" },
     { name = "depth-anything-3", git = "https://github.com/ByteDance-Seed/Depth-Anything-3" },
     { name = "diffusers", specifier = ">=0.35.1" },

@@ -2235,8 +2235,8 @@ class VideoEncoder:
             str(duration),  # Duration limit (more efficient than select filter)
             "-pix_fmt",
             "rgb24",
-            "-vsync",
-            "0",  # Pass through original timestamps
+            "-fps_mode",
+            "passthrough",  # Pass through original timestamps
             str(frames_dir / "frame_%06d.png"),
         ]
 
@@ -2256,8 +2256,8 @@ class VideoEncoder:
                     str(duration),  # Duration limit
                     "-pix_fmt",
                     "rgb24",
-                    "-vsync",
-                    "0",
+                    "-fps_mode",
+                    "passthrough",
                     "-threads",
                     "0",  # Auto-detect optimal thread count
                     str(frames_dir / "frame_%06d.png"),

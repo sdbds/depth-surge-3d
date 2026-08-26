@@ -967,6 +967,41 @@ def test_extract_frames_cuda_command_allows_ffmpeg_to_negotiate_10_bit_frames(tm
     assert "nv12" not in cuda_command
 
 
+def test_extract_frames_uses_passthrough_fps_mode_for_cuda_and_cpu_fallback(tmp_path):
+    """Both extraction paths must use FFmpeg's supported per-output FPS mode."""
+    source_video = tmp_path / "source.mkv"
+    source_video.write_bytes(b"source-video")
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    commands = []
+
+    def extract(command, **_kwargs):
+        commands.append(command)
+        if len(commands) == 1:
+            return MagicMock(returncode=1)
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        assert cv2.imwrite(str(frames_dir / "frame_000001.png"), frame)
+        return MagicMock(returncode=0)
+
+    with patch(
+        "src.depth_surge_3d.processing.video.video_encoder.subprocess.run",
+        side_effect=extract,
+    ):
+        frame_files = VideoEncoder().extract_frames(
+            str(source_video),
+            {"base": tmp_path, "frames": frames_dir},
+            {"frame_count": 1, "fps": 30.0},
+            {"start_time": None, "end_time": None},
+        )
+
+    assert len(frame_files) == 1
+    assert len(commands) == 2
+    for command in commands:
+        assert "-fps_mode" in command
+        assert command[command.index("-fps_mode") + 1] == "passthrough"
+        assert "-vsync" not in command
+
+
 def test_create_video_preserves_fractional_source_fps_when_target_is_original(tmp_path):
     """Original FPS must use the source stream rate instead of the 30 FPS fallback."""
     encoder = VideoEncoder()
