@@ -13,6 +13,9 @@ def solve_native_geodesic_regions(
     band_mask: np.ndarray,
     seed_region_map: np.ndarray,
     region_rank_bits: np.ndarray,
+    *,
+    movement_base_cost: int = 256,
+    movement_edge_scale: int = 8,
 ) -> region_solver.GeodesicSolveResult:
     """Assign a full render band using the build-time native indexed heap."""
 
@@ -22,6 +25,14 @@ def solve_native_geodesic_regions(
         seed_region_map,
         region_rank_bits,
     )
+    base_cost = region_solver._validate_positive_dimension(
+        "movement_base_cost",
+        movement_base_cost,
+    )
+    edge_scale = region_solver._validate_positive_dimension(
+        "movement_edge_scale",
+        movement_edge_scale,
+    )
     native = native_kd._require_native()
     try:
         owner, distance, position, statistics = native.solve_geodesic_regions(
@@ -29,6 +40,8 @@ def solve_native_geodesic_regions(
             band_mask,
             seed_region_map,
             region_rank_bits,
+            base_cost,
+            edge_scale,
         )
     except RuntimeError as error:
         if "quality region queue" in str(error):

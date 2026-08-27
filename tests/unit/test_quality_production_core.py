@@ -93,3 +93,114 @@ def test_production_native_module_uses_frozen_prebuilt_algorithm() -> None:
     assert build_info["runtime_jit"] is False
     assert len(build_info["source_sha256"]) == 64
     int(build_info["source_sha256"], 16)
+
+
+def test_stable_region_support_rejects_low_area_transition_slivers() -> None:
+    production = importlib.import_module("src.depth_surge_3d.rendering.quality.geometry")
+    regions = np.ones((8, 10), dtype=np.uint32)
+    regions[1:3, 1:3] = np.uint32(2)  # area 4, span 2: transient
+    regions[4, 1:5] = np.uint32(3)  # area 4, span 4: transition sliver
+    regions[5:7, 6:9] = np.uint32(4)  # area 6: stable surface
+
+    stable = production._select_stable_region_support(
+        regions,
+        area_threshold=5,
+    )
+    included = production._stable_interior_support(regions, stable[regions])
+
+    assert stable.tolist() == [False, True, False, False, True]
+    assert not included[np.isin(regions, (2, 3))].any()
+    for region in (1, 4):
+        assert included[regions == np.uint32(region)].any()
+
+
+def test_foreground_matte_expands_only_a_large_nearer_surface_jump() -> None:
+    production = importlib.import_module("src.depth_surge_3d.rendering.quality.geometry")
+    near_score = np.array([[0.1, 0.2, 0.8, 0.9, 0.91]], dtype=np.float32)
+    total = np.array([[-0.4, -0.3, 0.3, 0.4, 0.41]], dtype=np.float64)
+    source_valid = np.ones((1, 5), dtype=np.bool_)
+    regions = np.array([[1, 1, 2, 2, 3]], dtype=np.uint32)
+    displacement = np.array([[0.0, 0.0, 4.0, 4.0, 4.1]], dtype=np.float64)
+
+    expanded = production._expand_foreground_matte_one_pixel(
+        near_score,
+        total,
+        source_valid,
+        regions,
+        displacement,
+        metric_valid=None,
+    )
+
+    assert expanded.tolist() == [[False, True, False, False, False]]
+    np.testing.assert_array_equal(
+        near_score,
+        np.array([[0.1, 0.8, 0.8, 0.9, 0.91]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        total,
+        np.array([[-0.4, 0.3, 0.3, 0.4, 0.41]], dtype=np.float64),
+    )
+    np.testing.assert_array_equal(regions, np.array([[1, 2, 2, 2, 3]], dtype=np.uint32))
+
+
+def test_stable_surface_snaps_jagged_transition_to_persistent_depth_labels() -> None:
+    production = importlib.import_module("src.depth_surge_3d.rendering.quality.geometry")
+    native_height, native_width = 48, 64
+    render_shape = (96, 128)
+    canonical = np.zeros((native_height, native_width), dtype=np.float32)
+    canonical[:, native_width // 2 :] = np.float32(1.0)
+    for row in range(native_height):
+        canonical[row, native_width // 2 - 1 + row % 2] = np.float32(0.5)
+    guide = np.zeros((*render_shape, 3), dtype=np.uint8)
+    guide[:, render_shape[1] // 2 :] = np.uint8(255)
+
+    result = production.build_relative_quality_geometry(
+        guide,
+        canonical,
+        render_shape=render_shape,
+        stereo_strength=5.0,
+        convergence=0.5,
+    )
+
+    assert set(np.unique(result.near_score).tolist()) <= {0.0, 1.0}
+    assert result.geometry_query_count == result.edge_band_pixel_count
+
+
+def test_stable_surface_breaks_a_transitively_connected_depth_ramp() -> None:
+    production = importlib.import_module("src.depth_surge_3d.rendering.quality.geometry")
+    region_solver = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
+    native_height, native_width = 8, 64
+    render_shape = (16, 1920)
+    canonical = np.zeros((native_height, native_width), dtype=np.float32)
+    ramp = np.linspace(0.0, 1.0, 17, dtype=np.float32)
+    canonical[:, 24:41] = ramp
+    canonical[:, 41:] = np.float32(1.0)
+    guide = np.zeros((*render_shape, 3), dtype=np.uint8)
+    guide_edge = 1104
+    guide[:, guide_edge:] = np.uint8(255)
+
+    raw_regions = region_solver.build_low_resolution_regions(
+        production._relative_displacement(
+            canonical,
+            render_shape[1],
+            np.float64(1.2),
+            np.float64(0.5),
+        ),
+        np.ones(canonical.shape, dtype=np.bool_),
+        canonical,
+    )
+    assert set(np.unique(raw_regions.region_map).tolist()) == {1}
+
+    result = production.build_relative_quality_geometry(
+        guide,
+        canonical,
+        render_shape=render_shape,
+        stereo_strength=1.2,
+        convergence=0.5,
+    )
+
+    assert set(np.unique(result.near_score).tolist()) <= {0.0, 1.0}
+    assert result.geometry_query_count > 0
+    transitions = np.flatnonzero(np.diff(result.near_score[render_shape[0] // 2]))
+    assert transitions.size == 1
+    assert abs(int(transitions[0]) + 1 - guide_edge) <= 2

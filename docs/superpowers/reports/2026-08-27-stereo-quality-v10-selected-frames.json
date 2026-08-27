@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "algorithm_version": "torch-horizontal-16x-rgb-geodesic-repair-v10",
+  "measurement_scope": "two-eye-core-render-without-durable-diagnostics",
+  "device": "NVIDIA GeForce RTX 4090",
+  "render_shape": [
+    1080,
+    1920
+  ],
+  "settings": {
+    "geometry_mode": "relative",
+    "stereo_strength": 1.2,
+    "convergence": 0.5,
+    "occlusion_fill": "background",
+    "occlusion_fill_max_px": 8
+  },
+  "frames": [
+    {
+      "frame": 89,
+      "seconds": 3.623530499986373,
+      "left_missing_pixels": 16101,
+      "right_missing_pixels": 16301,
+      "left_unresolved_pixels": 0,
+      "right_unresolved_pixels": 0
+    },
+    {
+      "frame": 111,
+      "seconds": 4.2064952999935485,
+      "left_missing_pixels": 94551,
+      "right_missing_pixels": 94141,
+      "left_unresolved_pixels": 0,
+      "right_unresolved_pixels": 0
+    },
+    {
+      "frame": 171,
+      "seconds": 3.937727900018217,
+      "left_missing_pixels": 122429,
+      "right_missing_pixels": 118180,
+      "left_unresolved_pixels": 0,
+      "right_unresolved_pixels": 0
+    },
+    {
+      "frame": 176,
+      "seconds": 4.582250500010559,
+      "left_missing_pixels": 106610,
+      "right_missing_pixels": 100782,
+      "left_unresolved_pixels": 0,
+      "right_unresolved_pixels": 0
+    },
+    {
+      "frame": 231,
+      "seconds": 3.930855699989479,
+      "left_missing_pixels": 118421,
+      "right_missing_pixels": 117267,
+      "left_unresolved_pixels": 0,
+      "right_unresolved_pixels": 0
+    },
+    {
+      "frame": 301,
+      "seconds": 3.790112799993949,
+      "left_missing_pixels": 95097,
+      "right_missing_pixels": 93440,
+      "left_unresolved_pixels": 0,
+      "right_unresolved_pixels": 0
+    },
+    {
+      "frame": 401,
+      "seconds": 2.5624156999983825,
+      "left_missing_pixels": 96789,
+      "right_missing_pixels": 97054,
+      "left_unresolved_pixels": 0,
+      "right_unresolved_pixels": 0
+    }
+  ],
+  "min_seconds": 2.5624156999983825,
+  "max_seconds": 4.582250500010559,
+  "median_seconds": 3.930855699989479,
+  "machine_gate_seconds": 5.0,
+  "machine_gate_passed": true,
+  "human_review": "performed-during-development",
+  "user_approval": "not-asserted-by-machine"
+}

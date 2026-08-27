@@ -18,6 +18,12 @@ from ..stereo_geometry import (
 
 
 QUALITY_GEOMETRY_NEAREST_VISIT_CAP = 268_435_456
+_STABLE_REGION_REFERENCE_PIXELS = 1080 * 608
+_STABLE_REGION_REFERENCE_AREA = 16
+_STABLE_SAMPLE_MAX_NEIGHBOUR_JUMP_PX = np.float64(0.25)
+_FOREGROUND_MATTE_MIN_DISPLACEMENT_JUMP_PX = np.float64(0.25)
+_EDGE_LOCKED_MOVEMENT_BASE_COST = 4
+_EDGE_LOCKED_MOVEMENT_EDGE_SCALE = 8
 _UINT32_MAX = int(np.iinfo(np.uint32).max)
 _INT32_MIN = int(np.iinfo(np.int32).min)
 _INT32_MAX = int(np.iinfo(np.int32).max)
@@ -92,6 +98,8 @@ class _MetricBaseline:
 class _RegionState:
     source_region_map: np.ndarray
     final_region_map: np.ndarray
+    edge_band: np.ndarray
+    stable_sample_include: np.ndarray
     region_count: int
     radius: int
     edge_band_pixel_count: int
@@ -152,6 +160,342 @@ class _LifetimeRecorder:
                 live_bytes=self._live_bytes,
             )
         )
+
+
+def _stable_region_area_threshold(shape: tuple[int, int]) -> int:
+    sample_count = int(shape[0]) * int(shape[1])
+    if sample_count < 1024:
+        return 1
+    return max(
+        2,
+        int(
+            math.floor(
+                _STABLE_REGION_REFERENCE_AREA * sample_count / _STABLE_REGION_REFERENCE_PIXELS + 0.5
+            )
+        ),
+    )
+
+
+def _require_positive_integer(name: str, value: object) -> int:
+    result = _require_nonnegative_integer(name, value)
+    if result == 0:
+        raise ValueError(f"{name} must be positive")
+    return result
+
+
+def _select_stable_region_support(
+    region_map: np.ndarray,
+    *,
+    area_threshold: int,
+) -> np.ndarray:
+    region_solver._validate_region_map(region_map)
+    minimum_area = _require_positive_integer("area_threshold", area_threshold)
+    region_count = int(region_map.max(initial=np.uint32(0)))
+    labels = region_map.reshape(-1).astype(np.intp, copy=False)
+    counts = np.bincount(labels, minlength=region_count + 1)
+    stable = np.ascontiguousarray(
+        counts >= minimum_area,
+        dtype=np.bool_,
+    )
+    stable[0] = False
+    if not bool(np.any(stable[1:])):
+        stable[1:] = counts[1:] > 0
+    return stable
+
+
+def _stable_interior_support(
+    region_map: np.ndarray,
+    eligible_samples: np.ndarray,
+) -> np.ndarray:
+    region_solver._validate_region_map(region_map)
+    region_count = int(region_map.max(initial=np.uint32(0)))
+    if (
+        not isinstance(eligible_samples, np.ndarray)
+        or eligible_samples.dtype != np.bool_
+        or eligible_samples.shape != region_map.shape
+        or not eligible_samples.flags.c_contiguous
+    ):
+        raise TypeError("eligible_samples must be a matching C-contiguous bool raster")
+    included = np.array(eligible_samples, copy=True, order="C")
+    if region_map.shape[0] > 1:
+        included[1:] &= region_map[1:] == region_map[:-1]
+        included[:-1] &= region_map[:-1] == region_map[1:]
+    if region_map.shape[1] > 1:
+        included[:, 1:] &= region_map[:, 1:] == region_map[:, :-1]
+        included[:, :-1] &= region_map[:, :-1] == region_map[:, 1:]
+    interior_counts = np.bincount(
+        region_map[included].astype(np.intp, copy=False),
+        minlength=region_count + 1,
+    )
+    eligible_counts = np.bincount(
+        region_map[eligible_samples].astype(np.intp, copy=False),
+        minlength=region_count + 1,
+    )
+    fallback_regions = (eligible_counts > 0) & (interior_counts == 0)
+    if bool(np.any(fallback_regions)):
+        included |= eligible_samples & fallback_regions[region_map]
+    return included
+
+
+def _select_stable_sample_support(
+    region_map: np.ndarray,
+    stable_regions: np.ndarray,
+    one_eye_displacement_px: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    region_solver._validate_region_map(region_map)
+    region_count = int(region_map.max(initial=np.uint32(0)))
+    if (
+        not isinstance(stable_regions, np.ndarray)
+        or stable_regions.dtype != np.bool_
+        or stable_regions.shape != (region_count + 1,)
+    ):
+        raise TypeError("stable_regions must be a bool lookup for every region")
+    if (
+        not isinstance(one_eye_displacement_px, np.ndarray)
+        or one_eye_displacement_px.dtype != np.float64
+        or one_eye_displacement_px.shape != region_map.shape
+        or not one_eye_displacement_px.flags.c_contiguous
+    ):
+        raise TypeError("one_eye_displacement_px must be a matching C-contiguous float64 raster")
+    if not np.isfinite(one_eye_displacement_px).all():
+        raise ValueError("one_eye_displacement_px must contain only finite values")
+
+    eligible = np.ascontiguousarray(stable_regions[region_map], dtype=np.bool_)
+    if region_map.shape[0] > 1:
+        high_jump = (
+            np.abs(one_eye_displacement_px[1:] - one_eye_displacement_px[:-1])
+            >= _STABLE_SAMPLE_MAX_NEIGHBOUR_JUMP_PX
+        )
+        eligible[1:][high_jump] = False
+        eligible[:-1][high_jump] = False
+    if region_map.shape[1] > 1:
+        high_jump = (
+            np.abs(one_eye_displacement_px[:, 1:] - one_eye_displacement_px[:, :-1])
+            >= _STABLE_SAMPLE_MAX_NEIGHBOUR_JUMP_PX
+        )
+        eligible[:, 1:][high_jump] = False
+        eligible[:, :-1][high_jump] = False
+
+    eligible_counts = np.bincount(
+        region_map[eligible].astype(np.intp, copy=False),
+        minlength=region_count + 1,
+    )
+    supported_regions = np.array(stable_regions, copy=True, order="C")
+    supported_regions &= eligible_counts > 0
+    supported_regions[0] = False
+    if not bool(np.any(supported_regions[1:])):
+        return (
+            np.array(stable_regions, copy=True, order="C"),
+            np.ascontiguousarray(stable_regions[region_map], dtype=np.bool_),
+        )
+    eligible &= supported_regions[region_map]
+    return supported_regions, eligible
+
+
+def _build_stable_surface_regions(
+    region_map: np.ndarray,
+    stable_samples: np.ndarray,
+    near_score: np.ndarray,
+) -> tuple[region_solver.LowResolutionRegionResult, np.ndarray]:
+    region_solver._validate_region_map(region_map)
+    if (
+        not isinstance(stable_samples, np.ndarray)
+        or stable_samples.dtype != np.bool_
+        or stable_samples.shape != region_map.shape
+        or not stable_samples.flags.c_contiguous
+    ):
+        raise TypeError("stable_samples must be a matching C-contiguous bool raster")
+    _validate_native_primitive("near_score", near_score)
+    if near_score.shape != region_map.shape:
+        raise ValueError("near_score must match the source region map")
+
+    synthetic_displacement = np.ascontiguousarray(region_map.astype(np.float64) * np.float64(2.0))
+    surfaces = region_solver.build_low_resolution_regions(
+        synthetic_displacement,
+        stable_samples,
+        near_score,
+    )
+    surface_count = int(surfaces.region_rank_bits.size) - 1
+    stable_counts = np.bincount(
+        surfaces.region_map[stable_samples].astype(np.intp, copy=False),
+        minlength=surface_count + 1,
+    )
+    stable_surfaces = np.ascontiguousarray(stable_counts > 0, dtype=np.bool_)
+    stable_surfaces[0] = False
+    if not bool(np.any(stable_surfaces[1:])):
+        raise RuntimeError("stable surface partition has no eligible component")
+    return surfaces, stable_surfaces
+
+
+def _validate_matching_writeable_raster(
+    name: str,
+    values: object,
+    *,
+    dtype: np.dtype,
+    shape: tuple[int, int],
+) -> np.ndarray:
+    if (
+        not isinstance(values, np.ndarray)
+        or values.dtype != dtype
+        or values.shape != shape
+        or not values.flags.c_contiguous
+    ):
+        raise TypeError(f"{name} must be a matching C-contiguous {dtype} raster")
+    if not values.flags.writeable:
+        raise ValueError(f"{name} must be writeable")
+    return values
+
+
+def _shifted_neighbour_slices(
+    shape: tuple[int, int],
+    delta_row: int,
+    delta_column: int,
+) -> tuple[tuple[slice, slice], tuple[slice, slice]]:
+    height, width = shape
+    destination_rows = (
+        slice(-delta_row, height)
+        if delta_row < 0
+        else slice(0, height - delta_row) if delta_row > 0 else slice(None)
+    )
+    source_rows = (
+        slice(0, height + delta_row)
+        if delta_row < 0
+        else slice(delta_row, height) if delta_row > 0 else slice(None)
+    )
+    destination_columns = (
+        slice(-delta_column, width)
+        if delta_column < 0
+        else slice(0, width - delta_column) if delta_column > 0 else slice(None)
+    )
+    source_columns = (
+        slice(0, width + delta_column)
+        if delta_column < 0
+        else slice(delta_column, width) if delta_column > 0 else slice(None)
+    )
+    return (
+        (destination_rows, destination_columns),
+        (source_rows, source_columns),
+    )
+
+
+def _expand_foreground_matte_one_pixel(  # noqa: C901 - validates and mutates one contract.
+    near_score: np.ndarray,
+    total_disparity_fraction: np.ndarray,
+    source_valid: np.ndarray,
+    final_region_map: np.ndarray,
+    one_eye_displacement_px: np.ndarray,
+    *,
+    metric_valid: np.ndarray | None,
+) -> np.ndarray:
+    """Move the outer antialiasing pixel with the nearer stable surface."""
+
+    _validate_native_primitive("near_score", near_score)
+    shape = near_score.shape
+    if not near_score.flags.writeable:
+        raise ValueError("near_score must be writeable")
+    _validate_matching_writeable_raster(
+        "total_disparity_fraction",
+        total_disparity_fraction,
+        dtype=np.dtype(np.float64),
+        shape=shape,
+    )
+    _validate_matching_writeable_raster(
+        "source_valid",
+        source_valid,
+        dtype=np.dtype(np.bool_),
+        shape=shape,
+    )
+    _validate_source_regions(final_region_map, shape)
+    if not final_region_map.flags.writeable:
+        raise ValueError("final_region_map must be writeable")
+    _validate_matching_writeable_raster(
+        "one_eye_displacement_px",
+        one_eye_displacement_px,
+        dtype=np.dtype(np.float64),
+        shape=shape,
+    )
+    if (
+        not np.isfinite(total_disparity_fraction).all()
+        or not np.isfinite(one_eye_displacement_px).all()
+    ):
+        raise ValueError("foreground matte geometry must contain only finite values")
+    if metric_valid is not None:
+        _validate_matching_writeable_raster(
+            "metric_valid",
+            metric_valid,
+            dtype=np.dtype(np.bool_),
+            shape=shape,
+        )
+
+    eligible = np.array(source_valid, copy=True, order="C")
+    if metric_valid is not None:
+        eligible &= metric_valid
+    best_near = np.array(near_score, copy=True, order="C")
+    winner = np.zeros(shape, dtype=np.uint8)
+    directions = (
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+    )
+
+    for code, (delta_row, delta_column) in enumerate(directions, start=1):
+        destination, source = _shifted_neighbour_slices(
+            shape,
+            delta_row,
+            delta_column,
+        )
+        better = (
+            eligible[source]
+            & (final_region_map[source] != final_region_map[destination])
+            & (near_score[source] > best_near[destination])
+        )
+        best_near[destination][better] = near_score[source][better]
+        winner[destination][better] = np.uint8(code)
+
+    expanded = np.zeros(shape, dtype=np.bool_)
+    for code, (delta_row, delta_column) in enumerate(directions, start=1):
+        destination, source = _shifted_neighbour_slices(
+            shape,
+            delta_row,
+            delta_column,
+        )
+        selected = winner[destination] == np.uint8(code)
+        selected &= (
+            np.abs(one_eye_displacement_px[source] - one_eye_displacement_px[destination])
+            >= _FOREGROUND_MATTE_MIN_DISPLACEMENT_JUMP_PX
+        )
+        expanded[destination][selected] = True
+
+    if bool(np.any(expanded)):
+        for values in (
+            near_score,
+            total_disparity_fraction,
+            source_valid,
+            final_region_map,
+            metric_valid,
+        ):
+            if values is None:
+                continue
+            original = np.array(values, copy=True, order="C")
+            for code, (delta_row, delta_column) in enumerate(directions, start=1):
+                destination, source = _shifted_neighbour_slices(
+                    shape,
+                    delta_row,
+                    delta_column,
+                )
+                selected = expanded[destination] & (winner[destination] == np.uint8(code))
+                np.copyto(values[destination], original[source], where=selected)
+    return np.ascontiguousarray(expanded)
+
+
+def _cross_dilate_mask(mask: np.ndarray) -> np.ndarray:
+    output = np.array(mask, copy=True, order="C")
+    output[1:] |= mask[:-1]
+    output[:-1] |= mask[1:]
+    output[:, 1:] |= mask[:, :-1]
+    output[:, :-1] |= mask[:, 1:]
+    return output
 
 
 def one_sided_resample_scalar(
@@ -344,12 +688,15 @@ def build_relative_quality_geometry(
     regions = _solve_final_regions(
         guide_bgr,
         low_regions,
+        low_displacement,
+        canonical,
         destination_shape,
         recorder,
     )
     index = native_kd.build_native_implicit_region_kd(
         regions.source_region_map,
         region_count=regions.region_count,
+        include=regions.stable_sample_include,
     )
     recorder.allocate(6, "retained_zero_index", index.index_bytes)
     recorder.checkpoint(7, "final_geodesic_region_selection")
@@ -369,18 +716,31 @@ def build_relative_quality_geometry(
     _update_relative_total_inside_band(
         total,
         near_score,
-        regions.source_region_map,
-        regions.radius,
+        regions.edge_band,
         strength,
         convergence64,
     )
-    recorder.checkpoint(10, "derived_geometry_complete")
     displacement = _relative_displacement(
         near_score,
         destination_shape[1],
         strength,
         convergence64,
     )
+    _expand_foreground_matte_one_pixel(
+        near_score,
+        total,
+        source_valid,
+        regions.final_region_map,
+        displacement,
+        metric_valid=None,
+    )
+    displacement = _relative_displacement(
+        near_score,
+        destination_shape[1],
+        strength,
+        convergence64,
+    )
+    recorder.checkpoint(10, "derived_geometry_complete")
     result = _freeze_quality_result(
         near_score=near_score,
         total=total,
@@ -478,12 +838,15 @@ def build_metric_quality_geometry(
     regions = _solve_final_regions(
         guide_bgr,
         low_regions,
+        low_displacement,
+        low_near,
         destination_shape,
         recorder,
     )
     index = native_kd.build_native_implicit_region_kd(
         regions.source_region_map,
         region_count=regions.region_count,
+        include=regions.stable_sample_include,
     )
     recorder.allocate(6, "retained_zero_index", index.index_bytes)
     recorder.checkpoint(7, "final_geodesic_region_selection")
@@ -509,6 +872,19 @@ def build_metric_quality_geometry(
         disparity_percent,
         crop_width,
     )
+    displacement = _geometry_displacement(
+        baseline.total_disparity_fraction,
+        destination_shape[1],
+    )
+    source_valid = np.ones(destination_shape, dtype=np.bool_)
+    _expand_foreground_matte_one_pixel(
+        baseline.near_score,
+        baseline.total_disparity_fraction,
+        source_valid,
+        regions.final_region_map,
+        displacement,
+        metric_valid=baseline.resized_valid,
+    )
     baseline.stats = _recount_metric_stats(
         baseline.near_score,
         baseline.resized_valid,
@@ -518,15 +894,15 @@ def build_metric_quality_geometry(
         disparity_percent,
         crop_width,
     )
-    recorder.checkpoint(10, "derived_geometry_complete")
     displacement = _geometry_displacement(
         baseline.total_disparity_fraction,
         destination_shape[1],
     )
+    recorder.checkpoint(10, "derived_geometry_complete")
     return _freeze_quality_result(
         near_score=baseline.near_score,
         total=baseline.total_disparity_fraction,
-        source_valid=np.ones(destination_shape, dtype=np.bool_),
+        source_valid=source_valid,
         region_state=regions,
         metric_valid=baseline.resized_valid,
         metric_stats=baseline.stats,
@@ -539,11 +915,30 @@ def build_metric_quality_geometry(
 def _solve_final_regions(
     guide_bgr: np.ndarray,
     low_regions: region_solver.LowResolutionRegionResult,
+    low_displacement: np.ndarray,
+    low_near_score: np.ndarray,
     render_shape: tuple[int, int],
     recorder: _LifetimeRecorder,
 ) -> _RegionState:
-    source_region_map = low_regions.region_map
-    region_count = int(low_regions.region_rank_bits.size) - 1
+    initial_region_map = low_regions.region_map
+    area_threshold = _stable_region_area_threshold(initial_region_map.shape)
+    stable_regions = _select_stable_region_support(
+        initial_region_map,
+        area_threshold=area_threshold,
+    )
+    stable_regions, stable_samples = _select_stable_sample_support(
+        initial_region_map,
+        stable_regions,
+        low_displacement,
+    )
+    surface_regions, stable_surfaces = _build_stable_surface_regions(
+        initial_region_map,
+        stable_samples,
+        low_near_score,
+    )
+    source_region_map = surface_regions.region_map
+    region_count = int(surface_regions.region_rank_bits.size) - 1
+    stable_sample_include = _stable_interior_support(source_region_map, stable_samples)
     initial = region_solver.nearest_label_upsample(
         source_region_map,
         render_height=render_shape[0],
@@ -555,33 +950,75 @@ def _solve_final_regions(
         render_height=render_shape[0],
         render_width=render_shape[1],
     )
-    edge_band = region_solver.build_four_connected_edge_band(initial, radius=radius)
+    stable_source_map = np.array(source_region_map, copy=True, order="C")
+    stable_source_map[~stable_samples] = np.uint32(0)
+    surface_map = region_solver.nearest_label_upsample(
+        stable_source_map,
+        render_height=render_shape[0],
+        render_width=render_shape[1],
+    )
+    stable_initial = np.ascontiguousarray(surface_map != np.uint32(0))
+    edge_band = np.array(
+        region_solver.build_four_connected_edge_band(surface_map, radius=radius),
+        copy=True,
+        order="C",
+    )
+    uncertainty = ~stable_initial
+    for _ in range(radius):
+        uncertainty = _cross_dilate_mask(uncertainty)
+    edge_band |= uncertainty
+    edge_band.setflags(write=False)
     seeds = region_solver.build_sparse_region_seeds(initial, edge_band, radius=radius)
-    morphology_bytes = initial.nbytes + edge_band.nbytes + seeds.nbytes
+    seeds = np.array(seeds, copy=True, order="C")
+    seeds[~stable_initial] = np.uint32(0)
+    seeds[~stable_surfaces[seeds]] = np.uint32(0)
+    seeds.setflags(write=False)
+    morphology_bytes = (
+        initial.nbytes
+        + stable_initial.nbytes
+        + stable_source_map.nbytes
+        + surface_map.nbytes
+        + edge_band.nbytes
+        + seeds.nbytes
+        + stable_sample_include.nbytes
+    )
     recorder.allocate(3, "morphology_scratch", morphology_bytes)
     recorder.checkpoint(3, "nearest_label_map_complete")
     geodesic = native_region_solver.solve_native_geodesic_regions(
         guide_bgr,
         edge_band,
         seeds,
-        low_regions.region_rank_bits,
+        surface_regions.region_rank_bits,
+        movement_base_cost=_EDGE_LOCKED_MOVEMENT_BASE_COST,
+        movement_edge_scale=_EDGE_LOCKED_MOVEMENT_EDGE_SCALE,
     )
     solver_bytes = (
         geodesic.distance.nbytes + geodesic.heap_position.nbytes + geodesic.heap_pixel_bytes
     )
     recorder.allocate(4, "geodesic_solver_scratch", solver_bytes)
     recorder.checkpoint(4, "final_geodesic_region_map_complete")
-    final_region_map = geodesic.region_map
+    final_region_map = np.array(geodesic.region_map, copy=True, order="C")
     recorder.allocate(4, "final_region_map", final_region_map.nbytes)
     edge_count = int(np.count_nonzero(edge_band))
     final_hash = _array_sha256(final_region_map)
-    del initial, edge_band, seeds, geodesic, low_regions
+    del (
+        initial,
+        stable_initial,
+        stable_source_map,
+        surface_map,
+        seeds,
+        geodesic,
+        low_regions,
+        surface_regions,
+    )
     recorder.release(5, "geodesic_solver_scratch")
     recorder.release(5, "morphology_scratch")
     recorder.checkpoint(5, "region_scratch_released")
     return _RegionState(
         source_region_map=source_region_map,
         final_region_map=final_region_map,
+        edge_band=edge_band,
+        stable_sample_include=stable_sample_include,
         region_count=region_count,
         radius=radius,
         edge_band_pixel_count=edge_count,
@@ -609,19 +1046,14 @@ def _resample_primitives_in_place(
     query_regions = np.empty(query_capacity, dtype=np.uint32)
     query_y = np.empty(query_capacity, dtype=np.float64)
     query_x = np.empty(query_capacity, dtype=np.float64)
-    query_count, observed_edge_count = _collect_one_sided_queries(
-        source_primitives,
-        output_primitives,
+    query_count = _collect_stable_surface_queries(
         regions,
         query_pixels,
         query_regions,
         query_y,
         query_x,
     )
-    if observed_edge_count != regions.edge_band_pixel_count:
-        raise RuntimeError("streamed edge classifier disagrees with the solver band")
-
-    visits = _resolve_retained_zero_queries(
+    visits = _resolve_stable_surface_queries(
         source_primitives,
         output_primitives,
         render_shape,
@@ -640,6 +1072,66 @@ def _resample_primitives_in_place(
         visited_nodes_max=int(visits.max()) if visits.size else 0,
         index_bytes=index.index_bytes,
     )
+
+
+def _collect_stable_surface_queries(
+    regions: _RegionState,
+    query_pixels: np.ndarray,
+    query_regions: np.ndarray,
+    query_y: np.ndarray,
+    query_x: np.ndarray,
+) -> int:
+    pixels = np.flatnonzero(regions.edge_band).astype(np.uint32, copy=False)
+    query_count = int(pixels.size)
+    if query_count != regions.edge_band_pixel_count:
+        raise RuntimeError("stable edge-band cardinality changed before primitive snapping")
+    query_pixels[:query_count] = pixels
+    query_regions[:query_count] = regions.final_region_map.reshape(-1)[pixels]
+    render_height, render_width = regions.final_region_map.shape
+    source_height, source_width = regions.source_region_map.shape
+    rows = pixels // np.uint32(render_width)
+    columns = pixels - rows * np.uint32(render_width)
+    query_y[:query_count] = rows
+    query_y[:query_count] += np.float64(0.5)
+    query_y[:query_count] *= np.float64(source_height)
+    query_y[:query_count] /= np.float64(render_height)
+    query_y[:query_count] -= np.float64(0.5)
+    query_x[:query_count] = columns
+    query_x[:query_count] += np.float64(0.5)
+    query_x[:query_count] *= np.float64(source_width)
+    query_x[:query_count] /= np.float64(render_width)
+    query_x[:query_count] -= np.float64(0.5)
+    return query_count
+
+
+def _resolve_stable_surface_queries(
+    source_primitives: tuple[np.ndarray, ...],
+    output_primitives: tuple[np.ndarray, ...],
+    render_shape: tuple[int, int],
+    index: ImplicitRegionKdIndex,
+    budget: VisitBudget,
+    query_pixels: np.ndarray,
+    query_regions: np.ndarray,
+    query_y: np.ndarray,
+    query_x: np.ndarray,
+    query_count: int,
+) -> np.ndarray:
+    if query_count == 0:
+        return np.empty(0, dtype=np.uint32)
+    result = native_kd.query_native_geometry_batch(
+        index,
+        np.ascontiguousarray(query_regions[:query_count]),
+        np.ascontiguousarray(query_y[:query_count]),
+        np.ascontiguousarray(query_x[:query_count]),
+        budget=budget,
+    )
+    if not np.all(result.found):
+        raise RuntimeError("selected stable surface has no indexed native member")
+    pixels = query_pixels[:query_count]
+    samples = result.sample_index
+    for source, output in zip(source_primitives, output_primitives, strict=True):
+        output.reshape(-1)[pixels] = source.reshape(-1)[samples]
+    return result.visited_nodes
 
 
 def _collect_one_sided_queries(
@@ -921,13 +1413,11 @@ def _derive_relative_total(
 def _update_relative_total_inside_band(
     total: np.ndarray,
     near_score: np.ndarray,
-    source_regions: np.ndarray,
-    radius: int,
+    edge_band: np.ndarray,
     strength: np.float64,
     convergence: np.float64,
 ) -> None:
-    render_shape = (int(near_score.shape[0]), int(near_score.shape[1]))
-    for row, edge_row in _iter_streamed_edge_rows(source_regions, render_shape, radius):
+    for row, edge_row in enumerate(edge_band):
         if not np.any(edge_row):
             continue
         values = near_score[row, edge_row].astype(np.float64)
@@ -1056,11 +1546,7 @@ def _update_metric_derived_inside_band(
     retained_fraction = np.float64(crop_width) / np.float64(width)
     baseline_m = np.float64(baseline_mm / np.float64(1000.0))
     limit = np.float64(disparity_percent / np.float64(100.0))
-    for row, edge_row in _iter_streamed_edge_rows(
-        regions.source_region_map,
-        (int(baseline.near_score.shape[0]), int(baseline.near_score.shape[1])),
-        regions.radius,
-    ):
+    for row, edge_row in enumerate(regions.edge_band):
         columns = np.flatnonzero(edge_row)
         for column_value in columns:
             column = int(column_value)

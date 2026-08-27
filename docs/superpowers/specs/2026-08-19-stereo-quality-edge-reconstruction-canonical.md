@@ -237,6 +237,7 @@ defects.
 | Pre-publication videos had no non-destructive audit state | Add an unauthenticated legacy-final-media disposition which preserves historical video, forbids manifest synthesis and pruning, and reencodes only explicitly from retained inputs. |
 | One local `safe_donor` charge hid a neighbourhood scan | Charge a conservative full Chebyshev support for every donor predicate without allocating a dense mask, and advance Quality RGB identity to v8. |
 | Microscopic source regions had no strict 3x3 donor and made otherwise valid anime frames fail | Advance Quality RGB identity to v9; retain strict donors for local/exemplar, add a same-region full-pure fallback tier only when the region has zero strict donors, and finally retain the selected boundary anchor with an explicit counter when no indexed donor is in range. Components smaller than one 7x7 patch bypass exemplar because they contain no patch-scale texture to synthesize. |
+| Transition-depth tearing, antialias matte residue, and the v9 second-splat planner remained visible and slow | Apply the normative v10 amendment in `2026-08-27-stereo-quality-stable-surface-repair-design.md`: stable-component geometry, one-pixel foreground matte expansion, one-splat background proxy repair, native streaming hole histograms, and explicit NVENC CQ18 publication. |
 | Canonical U64 frame indexes exceeded the unspecified image2 domain | Fix the supported image2 maximum to signed-int max, use checked last-index arithmetic, and require boundary integration fixtures. |
 | Legacy final-media classification and states were not closed | Persist the pre-migration source settings schema, define `FinalMediaAuditDispositionV1` and its complete artifact-presence matrix, add `not_present`, and remove the redundant `final_video_valid` field. |
 | Metric NPZ acceptance delegated syntax to NumPy/ZIP readers | Define `MetricNpzPayloadContractV1`, exact owned plus CPython-dependent historical archive forms, strict ZIP/NPY grammar, a project-owned schema-5 writer, and malformed plus supported-runtime fixture gates. |
@@ -2567,7 +2568,7 @@ The stereo RGB and diagnostics algorithm identities are:
 
 ```text
 Fast RGB schema/algorithm: 1 / torch-horizontal-16x-zbuffer-v3
-Quality RGB schema/algorithm: 2 / torch-horizontal-16x-rgb-geodesic-repair-v9
+Quality RGB schema/algorithm: 2 / torch-horizontal-16x-rgb-geodesic-repair-v10
 Diagnostics schema/algorithm: 1 / stereo-coverage-sidecar-v1
 ```
 
@@ -2614,7 +2615,7 @@ metadata copy. `StereoRgbMetadataV2` has exactly:
 
 ```text
 schema_version:                 2
-algorithm_version:              "torch-horizontal-16x-rgb-geodesic-repair-v9"
+algorithm_version:              "torch-horizontal-16x-rgb-geodesic-repair-v10"
 geometry_mode:                  "relative" | "metric"
 frame_names:                    list[string]
 render_shape:                   [H, W]
@@ -3820,6 +3821,11 @@ none visibility pass; duplicate records, retained counter increments, partially
 retained RGB, or retained partial none diagnostics are errors.
 
 ## Bounded Repair Planner
+
+> **Historical v9 contract:** v10 retains this section only to validate old
+> artifacts. New rendering follows the single-splat proxy and diagnostics
+> amendment in `2026-08-27-stereo-quality-stable-surface-repair-design.md` and
+> does not execute these planner budgets.
 
 The following semantic work budgets are shared by the complete frame, across
 the left eye first and then the right eye in that fixed order:
@@ -7922,7 +7928,9 @@ Task 0 also includes the million-one-lane-run local fixture and degenerate
 repair k-d fixture. It verifies exact whole-run local charges/skips, shared
 left-then-right frame budgets, fatal fallback-node overflow without a current-
 best result, full-neighbourhood sample reservation with no dense local helper,
-and algorithm-v9 diagnostics. It separately traces the ten-step
+and historical algorithm-v9 diagnostics. The v10 amendment separately proves
+the stable-surface, matte-expansion, one-splat proxy, and native streaming
+histogram paths. It also traces the ten-step
 geometry order and proves `quality_region_peak` ends before
 `quality_geometry_build_with_nearest_index_peak` begins.
 

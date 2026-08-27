@@ -55,6 +55,9 @@ from src.depth_surge_3d.rendering.quality.types import (
 
 def test_stereo_algorithm_version_identifies_production_sixteen_sample_zbuffer() -> None:
     assert stereo_generator.STEREO_STAGE_ALGORITHM_VERSION == "torch-horizontal-16x-zbuffer-v3"
+    assert stereo_generator.QUALITY_STEREO_ALGORITHM_VERSION == (
+        "torch-horizontal-16x-rgb-geodesic-repair-v10"
+    )
 
 
 def _write_canonical_metadata(
@@ -1026,7 +1029,9 @@ def test_quality_file_pipeline_uses_one_slot_and_publishes_compact_diagnostics(
         (directories["left_frames"] / "metadata.json").read_text(encoding="ascii")
     )
     assert rgb_metadata["schema_version"] == 2
-    assert rgb_metadata["algorithm_version"] == ("torch-horizontal-16x-rgb-geodesic-repair-v9")
+    assert rgb_metadata["algorithm_version"] == (
+        "torch-horizontal-16x-rgb-geodesic-repair-v10"
+    )
     diagnostics_metadata = json.loads(
         (tmp_path / "04_stereo_diagnostics" / "metadata.json").read_text(encoding="ascii")
     )

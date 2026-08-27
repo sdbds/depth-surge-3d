@@ -119,6 +119,7 @@ from .stereo_disk import (
 
 STEREO_STAGE_SCHEMA_VERSION = 1
 STEREO_STAGE_ALGORITHM_VERSION = "torch-horizontal-16x-zbuffer-v3"
+QUALITY_STEREO_ALGORITHM_VERSION = "torch-horizontal-16x-rgb-geodesic-repair-v10"
 METRIC_PROJECTION_ALGORITHM_VERSION = "crop-aware-metric-pinhole-v2"
 METRIC_CLAMP_STATS_SCHEMA_VERSION = 1
 METRIC_STEREO_COMPLETION_ERROR = "metric stereo requires completed clip-global convergence metadata"
@@ -1465,7 +1466,7 @@ class StereoPairGenerator:
                 }
             document = build_streamed_canonical_object(
                 static_fields={
-                    "algorithm_version": "torch-horizontal-16x-rgb-geodesic-repair-v9",
+                    "algorithm_version": QUALITY_STEREO_ALGORITHM_VERSION,
                     "encoding": "uint8_png",
                     "geometry_mode": geometry_mode,
                     "native_geometry_fingerprint": (
@@ -2760,7 +2761,7 @@ class StereoPairGenerator:
             }
         metadata: dict[str, Any] = {
             "schema_version": 2,
-            "algorithm_version": "torch-horizontal-16x-rgb-geodesic-repair-v9",
+            "algorithm_version": QUALITY_STEREO_ALGORITHM_VERSION,
             "geometry_mode": geometry_mode,
             "frame_names": list(content_payload["frame_names"]),
             "render_shape": [int(render_shape[0]), int(render_shape[1])],

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import weakref
 
 import numpy as np
 import pytest
@@ -93,11 +92,168 @@ def test_quality_background_finishes_every_lane_and_public_holes_are_clear() -> 
     assert result.right_image.dtype == frame.dtype
 
 
+def test_missing_lane_background_proxy_preserves_valid_pixel_contribution() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    source = np.zeros((9, 9, 3), dtype=np.uint8)
+    source[:, :, 1] = np.uint8(100)
+    pre_repair = source.copy()
+    coverage = np.full((9, 9), 16, dtype=np.uint8)
+    coverage[4, 4] = np.uint8(8)
+    pre_repair[4, 4] = np.asarray([50, 0, 0], dtype=np.uint8)
+    coverage[4, 5] = np.uint8(0)
+    pre_repair[4, 5] = np.uint8(0)
+
+    repaired = quality._composite_background_proxy(
+        pre_repair,
+        coverage,
+        source,
+        radius_px=3,
+        far_side="right",
+        foreground_exclusion_px=3,
+    )
+
+    np.testing.assert_array_equal(repaired[coverage == 16], pre_repair[coverage == 16])
+    np.testing.assert_array_equal(repaired[4, 4], np.asarray([50, 50, 0], dtype=np.uint8))
+    np.testing.assert_allclose(
+        repaired[4, 5],
+        np.asarray([0, 100, 0], dtype=np.uint8),
+        atol=2,
+    )
+
+
+def test_background_proxy_excludes_the_foreground_side_from_inpaint_donors() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    source = np.zeros((9, 15, 3), dtype=np.uint8)
+    source[:, :, 1] = np.uint8(100)
+    pre_repair = source.copy()
+    pre_repair[:, 4] = np.asarray([0, 0, 200], dtype=np.uint8)
+    pre_repair[:, 5:10] = np.uint8(0)
+    coverage = np.full((9, 15), 16, dtype=np.uint8)
+    coverage[:, 5:10] = np.uint8(0)
+
+    repaired = quality._composite_background_proxy(
+        pre_repair,
+        coverage,
+        source,
+        radius_px=3,
+        far_side="right",
+        foreground_exclusion_px=4,
+    )
+
+    assert int(repaired[:, 5:10, 2].max()) <= 5
+    assert int(repaired[:, 5:10, 1].min()) >= 95
+
+
+def test_background_proxy_mask_only_expands_low_coverage_holes() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    coverage = np.full((7, 15), 16, dtype=np.uint8)
+    coverage[3, 7] = np.uint8(0)
+    coverage[1, 13] = np.uint8(15)
+    coverage[5, 13] = np.uint8(8)
+
+    mask = quality._build_background_proxy_mask(
+        coverage,
+        far_side="right",
+        foreground_exclusion_px=4,
+    )
+
+    assert not mask[1, 13]
+    assert not mask[0, 13]
+    assert not mask[2, 13]
+    assert mask[3, 3:10].all()
+    assert mask[2, 3:10].all()
+    assert mask[4, 3:10].all()
+    assert not mask[3, 2]
+    assert not mask[3, 10]
+    assert mask[5, 13]
+
+
+def test_hole_run_histograms_are_row_bounded_and_exact() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    lane_valid = np.ones((2, 2, 16), dtype=np.bool_)
+    missing = lane_valid.reshape(2, -1)
+    missing[0, [0, 1, 15, 16, 17, 31]] = False
+    missing[1, [0, 31]] = False
+    lane_histogram = np.zeros(16 * (2 + 1), dtype=np.uint64)
+    span_histogram = np.zeros(2 + 1, dtype=np.uint64)
+
+    quality._accumulate_hole_run_histograms(
+        lane_valid,
+        lane_histogram,
+        span_histogram,
+    )
+
+    assert lane_histogram[1] == 3
+    assert lane_histogram[2] == 1
+    assert lane_histogram[3] == 1
+    assert int(lane_histogram.sum()) == 5
+    assert span_histogram.tolist() == [0, 4, 1]
+
+
+def test_quality_background_avoids_legacy_global_planner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    frame = np.full((9, 48, 3), 100, dtype=np.uint8)
+    canonical = np.tile(
+        np.concatenate(
+            [
+                np.full(12, 0.15, dtype=np.float32),
+                np.full(12, 0.9, dtype=np.float32),
+                np.full(24, 0.2, dtype=np.float32),
+            ]
+        ),
+        (9, 1),
+    )
+    real_splat = quality._quality_splat
+    splat_count = 0
+
+    def count_splat(*args, **kwargs):
+        nonlocal splat_count
+        splat_count += 1
+        return real_splat(*args, **kwargs)
+
+    monkeypatch.setattr(quality, "_quality_splat", count_splat)
+    monkeypatch.setattr(
+        quality.QualityFixedArenas,
+        "allocate",
+        lambda: (_ for _ in ()).throw(AssertionError("allocated legacy repair arenas")),
+    )
+    monkeypatch.setattr(
+        quality,
+        "plan_quality_repairs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("entered legacy global repair planner")
+        ),
+    )
+    monkeypatch.setattr(
+        quality,
+        "_replay_background_eye_once",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("replayed a second splat")),
+    )
+
+    result = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(stereo_strength=5.0, convergence=0.45),
+    )
+
+    assert splat_count == 2
+    for coverage, bits, plan in (
+        (result.left_coverage_count, result.left_repair_bits, result.left_plan),
+        (result.right_coverage_count, result.right_repair_bits, result.right_plan),
+    ):
+        assert plan is not None
+        missing_lanes = int(np.sum(16 - coverage, dtype=np.uint64))
+        assert plan.backend_lane_counts == (0, 0, missing_lanes)
+        assert plan.fallback_indexed_donor_count == 0
+        assert not np.any(bits & np.uint8(0x40))
+
+
 def test_quality_compact_result_releases_dense_eye_plans_before_return() -> None:
     quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
-    diagnostics = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.diagnostics"
-    )
+    diagnostics = importlib.import_module("src.depth_surge_3d.rendering.quality.diagnostics")
     frame = np.arange(7 * 33 * 3, dtype=np.uint8).reshape(7, 33, 3)
     canonical = np.tile(
         np.concatenate(
@@ -126,9 +282,7 @@ def test_quality_compact_result_releases_dense_eye_plans_before_return() -> None
         geometry_mode="relative",
         occlusion_fill="background",
     )
-    assert stats["eyes"]["left"]["quality_budgets"]["availability"] == (
-        "quality_repair_plan"
-    )
+    assert stats["eyes"]["left"]["quality_budgets"]["availability"] == ("quality_repair_plan")
 
 
 def test_quality_public_budget_rejects_before_materializing_broadcast_input(
@@ -153,6 +307,34 @@ def test_quality_public_budget_rejects_before_materializing_broadcast_input(
             canonical=canonical,
             settings=_quality_settings(),
         )
+
+
+def test_quality_background_preflight_models_the_one_pass_proxy() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    render_shape = (10, 20)
+    native_shape = (5, 10)
+    pixels = 200
+    native_pixels = 50
+    histogram_bytes = 272 * (render_shape[1] + 1)
+
+    phases = quality._quality_public_memory_preflight(
+        render_shape=render_shape,
+        native_shape=native_shape,
+        occlusion_fill="background",
+        materialize_public_masks=False,
+    )
+
+    assert "quality-planning" not in phases
+    assert "quality-pass-b" not in phases
+    assert phases["quality-geometry-matte"] == (
+        68 * pixels + 18 * native_pixels + quality.QUALITY_RUNTIME_OVERHEAD_BYTES
+    )
+    assert phases["quality-background-visibility"] == (
+        40 * pixels + 9 * native_pixels + histogram_bytes + quality.QUALITY_RUNTIME_OVERHEAD_BYTES
+    )
+    assert phases["quality-background-proxy"] == (
+        100 * pixels + 9 * native_pixels + histogram_bytes + quality.QUALITY_RUNTIME_OVERHEAD_BYTES
+    )
 
 
 def test_quality_band_height_does_not_change_rgb_or_compact_masks() -> None:
@@ -246,9 +428,7 @@ def test_quality_second_oom_releases_device_state_and_reports_both_heights(
         attempted_heights.append(band_height)
         raise torch.cuda.OutOfMemoryError("injected")
 
-    monkeypatch.setattr(
-        quality, "_release_after_oom", lambda owner: releases.append(owner)
-    )
+    monkeypatch.setattr(quality, "_release_after_oom", lambda owner: releases.append(owner))
     source = np.zeros((8, 11, 3), dtype=np.uint8)
 
     with pytest.raises(RuntimeError, match="attempted band heights 8 and 4"):
@@ -269,9 +449,7 @@ def test_cuda_oom_release_synchronizes_before_collecting_and_clearing(
     renderer = StereoRenderer(device="cpu")
     renderer.device = torch.device("cuda")
     events: list[str] = []
-    monkeypatch.setattr(
-        torch.cuda, "synchronize", lambda _device: events.append("sync")
-    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: events.append("sync"))
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty"))
     monkeypatch.setattr(
         "src.depth_surge_3d.rendering.stereo_renderer.gc.collect",
@@ -307,33 +485,10 @@ def test_quality_none_retains_dense_uint64_hole_histograms() -> None:
         assert hole_runs.touched_pixel_span_histogram.shape == (17 + 1,)
 
 
-def test_quality_background_transfers_the_pass_a_b_plane_to_repair_bits(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_quality_background_marks_only_missing_coverage_as_proxy_repaired() -> None:
     quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
     frame = np.full((3, 17, 3), 80, dtype=np.uint8)
     canonical = np.tile(np.linspace(0.0, 1.0, 17, dtype=np.float32), (3, 1))
-    pass_a_b_planes: list[np.ndarray] = []
-    original_analyze = quality._analyze_eye_once
-    original_bits = quality._background_repair_bits
-
-    def capture_analysis(*args, **kwargs):
-        analyzed = original_analyze(*args, **kwargs)
-        pass_a_b_planes.append(analyzed.analysis.pure_bgr[0])
-        return analyzed
-
-    def capture_transfer(coverage, records, *, out, backend_lane_counts_out=None):
-        expected = pass_a_b_planes.pop(0)
-        assert out is expected
-        return original_bits(
-            coverage,
-            records,
-            out=out,
-            backend_lane_counts_out=backend_lane_counts_out,
-        )
-
-    monkeypatch.setattr(quality, "_analyze_eye_once", capture_analysis)
-    monkeypatch.setattr(quality, "_background_repair_bits", capture_transfer)
 
     result = quality.render_relative_quality_compact(
         renderer=StereoRenderer(device="cpu"),
@@ -342,17 +497,20 @@ def test_quality_background_transfers_the_pass_a_b_plane_to_repair_bits(
         settings=_quality_settings(stereo_strength=5.0, convergence=0.0),
     )
 
-    assert not pass_a_b_planes
-    assert result.left_repair_bits.base is None
-    assert result.right_repair_bits.base is None
+    for coverage, bits in (
+        (result.left_coverage_count, result.left_repair_bits),
+        (result.right_coverage_count, result.right_repair_bits),
+    ):
+        missing = coverage < np.uint8(16)
+        assert np.all((bits[missing] & np.uint8(0x28)) == np.uint8(0x28))
+        assert not np.any(bits[missing] & np.uint8(0x40))
+        assert not bits[~missing].any()
 
 
 def test_quality_renderer_uses_the_frame_level_value_validation_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    forward_splat = importlib.import_module(
-        "src.depth_surge_3d.rendering.forward_splat"
-    )
+    forward_splat = importlib.import_module("src.depth_surge_3d.rendering.forward_splat")
     quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
     monkeypatch.setattr(
         forward_splat,
@@ -375,12 +533,8 @@ def test_quality_renderer_uses_the_frame_level_value_validation_boundary(
 
 
 def test_native_background_diagnostics_match_canonical_record_semantics() -> None:
-    native_kd = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.native_kd"
-    )
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
     native = native_kd._require_native()
     records = np.zeros(3, dtype=repair_records.REPAIR_RECORD_DTYPE)
     records["pixel_index"] = (1, 1, 2)
@@ -415,60 +569,10 @@ def test_native_background_diagnostics_match_canonical_record_semantics() -> Non
     assert int(span_histogram[1]) == 2
 
 
-def test_quality_pass_b_releases_graph_and_repair_backing_before_replay(
+def test_quality_background_proxy_never_expands_compact_records_to_host_lane_indexes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    arena_module = importlib.import_module("src.depth_surge_3d.rendering.quality.arena")
-    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
-    real_reset_eye = arena_module.QualityFixedArenas.reset_eye
-    real_replay = quality._replay_background_eye_once
-    planning_storage: list[
-        tuple[weakref.ReferenceType[np.ndarray], weakref.ReferenceType[np.ndarray]]
-    ] = []
-    replay_count = 0
-
-    def capture_planning_storage(arenas) -> None:
-        real_reset_eye(arenas)
-        assert arenas.graph is not None
-        assert arenas.repair is not None
-        planning_storage.append(
-            (weakref.ref(arenas.graph.storage), weakref.ref(arenas.repair.storage))
-        )
-
-    def replay_after_release(**kwargs):
-        nonlocal replay_count
-        graph_ref, repair_ref = planning_storage[replay_count]
-        replay_count += 1
-        assert graph_ref() is None
-        assert repair_ref() is None
-        return real_replay(**kwargs)
-
-    monkeypatch.setattr(
-        arena_module.QualityFixedArenas,
-        "reset_eye",
-        capture_planning_storage,
-    )
-    monkeypatch.setattr(quality, "_replay_background_eye_once", replay_after_release)
-    frame = np.full((5, 7, 3), 80, dtype=np.uint8)
-    canonical = np.linspace(0.0, 1.0, 15, dtype=np.float32).reshape(3, 5)
-
-    result = quality.render_relative_quality_compact(
-        renderer=StereoRenderer(device="cpu"),
-        frame=frame,
-        canonical=canonical,
-        settings=_quality_settings(occlusion_fill="background"),
-    )
-
-    assert result.left_image.shape == frame.shape
-    assert replay_count == 2
-
-
-def test_quality_pass_b_never_expands_compact_records_to_host_lane_indexes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    native_kd = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.native_kd"
-    )
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
     quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
     native = native_kd._require_native()
     monkeypatch.setattr(
@@ -510,21 +614,11 @@ def test_quality_controls_reject_boolean_limit() -> None:
 
 def test_native_analysis_band_matches_the_existing_scalar_boundary() -> None:
     quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
-    forward_splat = importlib.import_module(
-        "src.depth_surge_3d.rendering.forward_splat"
-    )
-    local_strip = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.local_strip"
-    )
-    native_repair = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.native_repair"
-    )
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
-    visibility = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.visibility"
-    )
+    forward_splat = importlib.import_module("src.depth_surge_3d.rendering.forward_splat")
+    local_strip = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    native_repair = importlib.import_module("src.depth_surge_3d.rendering.quality.native_repair")
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
+    visibility = importlib.import_module("src.depth_surge_3d.rendering.quality.visibility")
     height, width = 2, 3
     fine_width = width * 16
     valid = np.ones((height, fine_width), dtype=np.bool_)
@@ -603,12 +697,8 @@ def test_native_analysis_band_matches_the_existing_scalar_boundary() -> None:
         record_output,
     ).records
 
-    assert np.array_equal(
-        actual_analysis.coverage_count, expected_analysis.coverage_count
-    )
-    assert np.array_equal(
-        actual_analysis.pure_region_id, expected_analysis.pure_region_id
-    )
+    assert np.array_equal(actual_analysis.coverage_count, expected_analysis.coverage_count)
+    assert np.array_equal(actual_analysis.pure_region_id, expected_analysis.pure_region_id)
     for actual, expected in zip(
         actual_analysis.pure_bgr,
         expected_analysis.pure_bgr,

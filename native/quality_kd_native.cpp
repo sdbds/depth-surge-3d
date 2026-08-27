@@ -976,7 +976,9 @@ private:
 std::uint64_t bgr_movement_cost(
     const std::uint8_t* guide,
     std::uint32_t left_pixel,
-    std::uint32_t right_pixel
+    std::uint32_t right_pixel,
+    std::uint32_t base_cost,
+    std::uint32_t edge_scale
 ) {
     const std::size_t left_offset = static_cast<std::size_t>(left_pixel) * 3;
     const std::size_t right_offset = static_cast<std::size_t>(right_pixel) * 3;
@@ -990,7 +992,8 @@ std::uint64_t bgr_movement_cost(
         );
         maximum = std::max(maximum, magnitude);
     }
-    return 256 + 8 * maximum;
+    return static_cast<std::uint64_t>(base_cost) +
+        static_cast<std::uint64_t>(edge_scale) * maximum;
 }
 
 bool region_candidate_is_better(
@@ -1059,8 +1062,13 @@ py::tuple solve_geodesic_regions(
     const py::array& guide,
     const py::array& band_mask,
     const py::array& seed_region_map,
-    const py::array& region_rank_bits
+    const py::array& region_rank_bits,
+    std::uint32_t movement_base_cost,
+    std::uint32_t movement_edge_scale
 ) {
+    if (movement_base_cost == 0 || movement_edge_scale == 0) {
+        throw py::value_error("region movement costs must be positive");
+    }
     if (
         !guide.dtype().is(py::dtype::of<std::uint8_t>()) ||
         guide.ndim() != 3 ||
@@ -1167,7 +1175,13 @@ py::tuple solve_geodesic_regions(
                 }
                 relax_region_pixel(
                     pixel,
-                    bgr_movement_cost(guide_values, neighbour, pixel),
+                    bgr_movement_cost(
+                        guide_values,
+                        neighbour,
+                        pixel,
+                        movement_base_cost,
+                        movement_edge_scale
+                    ),
                     region,
                     distance_values,
                     owner_values,
@@ -1185,7 +1199,13 @@ py::tuple solve_geodesic_regions(
                     return;
                 }
                 const std::uint64_t movement =
-                    bgr_movement_cost(guide_values, pixel, neighbour);
+                    bgr_movement_cost(
+                        guide_values,
+                        pixel,
+                        neighbour,
+                        movement_base_cost,
+                        movement_edge_scale
+                    );
                 if (
                     source_distance >
                     std::numeric_limits<std::uint64_t>::max() - movement
@@ -5124,6 +5144,91 @@ std::uint64_t build_hole_run_histograms_into_native(
     return planned_lane_count;
 }
 
+std::uint64_t accumulate_lane_hole_run_histograms_into_native(
+    const py::array& lane_valid,
+    py::array lane_histogram,
+    py::array span_histogram
+) {
+    if (
+        !lane_valid.dtype().is(py::dtype::of<bool>()) ||
+        lane_valid.ndim() != 3 || lane_valid.shape(2) != 16 ||
+        (lane_valid.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error(
+            "lane_valid must be a C-contiguous bool [rows,width,16] array"
+        );
+    }
+    const std::uint64_t width = static_cast<std::uint64_t>(lane_valid.shape(1));
+    if (width == 0) {
+        throw py::value_error("lane validity width must be positive");
+    }
+    const std::uint64_t expected_lane_bins = 16ULL * (width + 1ULL);
+    const std::uint64_t expected_span_bins = width + 1ULL;
+    if (
+        !lane_histogram.dtype().is(py::dtype::of<std::uint64_t>()) ||
+        lane_histogram.ndim() != 1 ||
+        (lane_histogram.flags() & py::array::c_style) == 0 ||
+        !lane_histogram.writeable() ||
+        static_cast<std::uint64_t>(lane_histogram.shape(0)) != expected_lane_bins
+    ) {
+        throw py::type_error(
+            "lane_histogram must be a writable uint64 vector with 16*(width+1) bins"
+        );
+    }
+    if (
+        !span_histogram.dtype().is(py::dtype::of<std::uint64_t>()) ||
+        span_histogram.ndim() != 1 ||
+        (span_histogram.flags() & py::array::c_style) == 0 ||
+        !span_histogram.writeable() ||
+        static_cast<std::uint64_t>(span_histogram.shape(0)) != expected_span_bins
+    ) {
+        throw py::type_error(
+            "span_histogram must be a writable uint64 vector with width+1 bins"
+        );
+    }
+    const auto* valid = static_cast<const std::uint8_t*>(lane_valid.data());
+    auto* lane_bins = static_cast<std::uint64_t*>(lane_histogram.mutable_data());
+    auto* span_bins = static_cast<std::uint64_t*>(span_histogram.mutable_data());
+    const std::uint64_t lanes_per_row = width * 16ULL;
+    std::uint64_t run_count = 0;
+    {
+        py::gil_scoped_release release;
+        for (py::ssize_t row = 0; row < lane_valid.shape(0); ++row) {
+            const auto* row_valid = valid + static_cast<std::uint64_t>(row) * lanes_per_row;
+            bool active = false;
+            std::uint64_t start = 0;
+            for (std::uint64_t lane = 0; lane <= lanes_per_row; ++lane) {
+                const bool missing = lane < lanes_per_row && row_valid[lane] == 0;
+                if (missing && !active) {
+                    active = true;
+                    start = lane;
+                    continue;
+                }
+                if (missing || !active) {
+                    continue;
+                }
+                const std::uint64_t lane_length = lane - start;
+                const std::uint64_t pixel_span =
+                    (lane - 1ULL) / 16ULL - start / 16ULL + 1ULL;
+                if (lane_bins[lane_length] == std::numeric_limits<std::uint64_t>::max()) {
+                    throw std::overflow_error("hole-run lane histogram exceeds uint64");
+                }
+                if (span_bins[pixel_span] == std::numeric_limits<std::uint64_t>::max()) {
+                    throw std::overflow_error("hole-run span histogram exceeds uint64");
+                }
+                if (run_count == std::numeric_limits<std::uint64_t>::max()) {
+                    throw std::overflow_error("hole-run count exceeds uint64");
+                }
+                ++lane_bins[lane_length];
+                ++span_bins[pixel_span];
+                ++run_count;
+                active = false;
+            }
+        }
+    }
+    return run_count;
+}
+
 std::uint64_t scatter_repair_records_float_into_native(
     const py::array& raw_records,
     std::uint32_t pixel_offset,
@@ -7182,7 +7287,9 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("guide"),
         py::arg("band_mask"),
         py::arg("seed_region_map"),
-        py::arg("region_rank_bits")
+        py::arg("region_rank_bits"),
+        py::arg("movement_base_cost") = 256,
+        py::arg("movement_edge_scale") = 8
     );
     module.def(
         "build_repair_records",
@@ -7439,6 +7546,13 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         &build_hole_run_histograms_into_native,
         py::arg("raw_records"),
         py::arg("width"),
+        py::arg("lane_histogram"),
+        py::arg("span_histogram")
+    );
+    module.def(
+        "accumulate_lane_hole_run_histograms_into",
+        &accumulate_lane_hole_run_histograms_into_native,
+        py::arg("lane_valid"),
         py::arg("lane_histogram"),
         py::arg("span_histogram")
     );
