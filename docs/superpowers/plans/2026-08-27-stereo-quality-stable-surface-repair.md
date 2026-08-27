@@ -36,12 +36,14 @@ the Quality renderer's cost.
 - [x] Run the focused Quality, diagnostics, resume, CLI, Web, and encoder suite:
   527 tests passed.
 
-## Remaining Integration
+## Integration Result
 
 - [x] Run the complete repository test suite: 2956 passed and 17 skipped; the
   sole failure is the unchanged environment-only packaged CLI lookup, which
   also fails on `main` because `depth-surge-3d` is not installed on `PATH`.
 - [x] Run compile, focused lint, and diff checks.
-- [ ] Commit the isolated branch.
-- [ ] Integrate into dirty `main` without staging or overwriting unrelated user
-  changes.
+- [x] Commit the isolated implementation as `81c65e4` and `59cf6b5`.
+- [x] Integrate it on `main` as `d480d9f` and `943936b` without staging or
+  overwriting unrelated user changes.
+- [x] Rebuild the native extension on `main` and pass the combined focused
+  suite: 529 tests passed.

@@ -1,6 +1,6 @@
 # Stereo Quality Stable-Surface Repair Design
 
-**Status:** implemented; awaiting integration
+**Status:** implemented and integrated on `main`
 
 **Supersedes:** the Quality geometry-edge and background-repair behavior in
 `2026-08-19-stereo-quality-edge-reconstruction-canonical.md`. Fast mode,
