@@ -399,7 +399,7 @@ def test_direct_command_omits_audio_arguments_when_disabled(tmp_path):
     assert "-shortest" not in command
 
 
-def test_direct_command_reuses_nvenc_arguments_unchanged(tmp_path):
+def test_direct_command_uses_explicit_nvenc_cq18_quality_contract(tmp_path):
     left = _write_eye_sequence(tmp_path / "left", [1])
     right = _write_eye_sequence(tmp_path / "right", [1])
     encoder = VideoEncoder()
@@ -413,7 +413,7 @@ def test_direct_command_reuses_nvenc_arguments_unchanged(tmp_path):
             _direct_settings(video_encoder="nvenc"),
         )
 
-    assert command[-9:] == [
+    assert command[-15:] == [
         "-c:v",
         "hevc_nvenc",
         "-pix_fmt",
@@ -422,6 +422,12 @@ def test_direct_command_reuses_nvenc_arguments_unchanged(tmp_path):
         "p7",
         "-tune",
         "hq",
+        "-rc",
+        "vbr",
+        "-cq",
+        "18",
+        "-b:v",
+        "0",
         str(tmp_path / ".output.direct.tmp.mp4"),
     ]
 
