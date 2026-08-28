@@ -12,7 +12,7 @@ import stat
 from typing import Any, Literal
 
 from ...io.nofollow_io import AcquiredRoot, NoFollowPathError
-from ...utils.path_utils import parse_time_string
+from ...utils.path_utils import format_ffmpeg_time, parse_time_string
 from .bounded_process import (
     BoundedProcessCaptureV1,
     ProcessOutputBudgetError,
@@ -215,9 +215,7 @@ def _hash_open_regular_file(
                 opened_before = os.fstat(handle.fileno())
                 identity = _identity_from_open_handle(handle)
                 if not _matches_acquired_identity(identity, path_identity):
-                    raise FinalAudioInputChangedError(
-                        "selected audio path changed before hashing"
-                    )
+                    raise FinalAudioInputChangedError("selected audio path changed before hashing")
                 while True:
                     if cancelled is not None and cancelled():
                         raise InterruptedError("final audio hashing was cancelled")
@@ -225,9 +223,7 @@ def _hash_open_regular_file(
                     if not chunk:
                         break
                     if count > _U64_MAX - len(chunk):
-                        raise FinalAudioPcmOverflowError(
-                            "selected audio byte count exceeds u64"
-                        )
+                        raise FinalAudioPcmOverflowError("selected audio byte count exceeds u64")
                     count += len(chunk)
                     digest.update(chunk)
                 opened_after = os.fstat(handle.fileno())
@@ -236,14 +232,10 @@ def _hash_open_regular_file(
                     or int(opened_after.st_size) != count
                     or opened_before.st_size != opened_after.st_size
                 ):
-                    raise FinalAudioInputChangedError(
-                        "selected audio source changed while hashing"
-                    )
+                    raise FinalAudioInputChangedError("selected audio source changed while hashing")
             after_identity = acquired.regular_identity(candidate)
             if not _matches_acquired_identity(identity, after_identity):
-                raise FinalAudioInputChangedError(
-                    "selected audio path changed while hashing"
-                )
+                raise FinalAudioInputChangedError("selected audio path changed while hashing")
     except NoFollowPathError as error:
         raise FinalAudioInputChangedError(
             "selected audio path is not a non-link regular file"
@@ -259,17 +251,34 @@ def _regular_nonlink(path: Path) -> bool:
     return stat.S_ISREG(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode)
 
 
-def _resolve_clip_arguments(settings: dict[str, Any]) -> tuple[str, ...]:
+def _resolve_clip_arguments(
+    settings: dict[str, Any],
+    *,
+    frame_count: int,
+    output_rate: Fraction,
+) -> tuple[str, ...]:
     start_value = settings.get("start_time")
     end_value = settings.get("end_time")
     start_seconds = parse_time_string(start_value) if start_value else None
     end_seconds = parse_time_string(end_value) if end_value else None
-    clip_start = max(start_seconds or 0.0, 0.0)
+    source_rate_value = settings.get("source_fps")
+    try:
+        source_rate = Fraction(
+            str(source_rate_value) if source_rate_value is not None else output_rate
+        )
+    except (ValueError, ZeroDivisionError) as error:
+        raise FinalAudioPcmOverflowError("source frame rate must be positive") from error
+    if source_rate <= 0:
+        raise FinalAudioPcmOverflowError("source frame rate must be positive")
+    start_fraction = Fraction(str(max(start_seconds or 0.0, 0.0)))
+    start_frame = int(start_fraction * source_rate)
+    clip_start = Fraction(start_frame, 1) / source_rate
     result: list[str] = []
     if clip_start > 0:
-        result.extend(("-ss", f"{clip_start:g}"))
-    if end_seconds is not None and end_seconds > clip_start:
-        result.extend(("-t", f"{end_seconds - clip_start:g}"))
+        result.extend(("-ss", format_ffmpeg_time(float(clip_start))))
+    if end_seconds is not None and end_seconds > float(clip_start):
+        clip_duration = Fraction(frame_count, 1) / output_rate
+        result.extend(("-t", format_ffmpeg_time(float(clip_duration))))
     for argument in result:
         try:
             encoded = argument.encode("ascii")
@@ -385,6 +394,14 @@ def prepare_selected_audio_v1(
         return SelectedAudioIdentityV1(
             "disabled", None, None, None, None, (), "disabled", None, None, None, None
         )
+    if type(frame_count) is not int or frame_count <= 0:
+        raise FinalAudioPcmOverflowError("video frame count must be positive")
+    try:
+        rate = Fraction(fps)
+    except (ValueError, ZeroDivisionError) as error:
+        raise FinalAudioPcmOverflowError("video frame rate must be positive") from error
+    if rate <= 0:
+        raise FinalAudioPcmOverflowError("video frame rate must be positive")
     flac = Path(output_dir) / "original_audio.flac"
     if _regular_nonlink(flac):
         selection: Literal["original_audio_flac", "original_video"] = "original_audio_flac"
@@ -393,7 +410,11 @@ def prepare_selected_audio_v1(
         selection = "original_video"
         selected_path = Path(original_video)
     hashed = _hash_open_regular_file(selected_path, cancelled=cancelled)
-    clip_arguments = _resolve_clip_arguments(settings)
+    clip_arguments = _resolve_clip_arguments(
+        settings,
+        frame_count=frame_count,
+        output_rate=rate,
+    )
     if cancelled is None:
         stream = _probe_first_audio_stream(hashed.path, clip_arguments)
     else:
@@ -442,11 +463,6 @@ def prepare_selected_audio_v1(
             0,
             None,
         )
-    if type(frame_count) is not int or frame_count <= 0:
-        raise FinalAudioPcmOverflowError("video frame count must be positive")
-    rate = Fraction(fps)
-    if rate <= 0:
-        raise FinalAudioPcmOverflowError("video frame rate must be positive")
     numerator = _checked_mul(frame_count, stream.sample_rate, "audio sample numerator")
     numerator = _checked_mul(numerator, rate.denominator, "audio sample numerator")
     if numerator > _U64_MAX - (rate.numerator - 1):

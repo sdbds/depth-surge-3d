@@ -152,6 +152,33 @@ def test_typed_completed_transition_increments_revision_and_preserves_identity()
     assert ProcessingSettingsArtifactV5.parse(completed.encode()) == completed
 
 
+def test_completed_transition_accepts_selected_clip_frame_count() -> None:
+    initial = _artifact(
+        video_properties={
+            "width": 1920,
+            "height": 1080,
+            "fps": 30.0,
+            "frame_count": 473,
+            "duration": 15.766666666666667,
+            "codec": 875967048,
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+            "sample_aspect_ratio": "1:1",
+        },
+        processing_settings=validate_settings(
+            {"end_time": "00:15"}, source="explicit"
+        ),
+    )
+
+    completed = initial.completed(
+        terminal_at="2026-08-24T12:35:00.123456Z",
+        frames_processed=450,
+        cleanup_status="not_requested",
+    )
+
+    assert completed.to_object()["runtime_info"]["frames_processed"] == 450
+
+
 def test_output_name_and_portable_component_freeze_device_and_unicode_rules() -> None:
     goldens = {
         "CON.foo.mp4": "CON~afc0ef4e07a53c5302a14d2d1fd02201_3D_side-by-side_16x9-1080p.mp4",
@@ -715,6 +742,42 @@ def test_operations_new_job_path_uses_schema5_locator_and_terminal_extent(tmp_pa
         )
         == restarted
     )
+
+
+def test_operations_completed_default_uses_selected_clip_frame_count(tmp_path) -> None:
+    from src.depth_surge_3d.io.operations import (
+        save_processing_settings,
+        update_processing_status,
+    )
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source-fixture")
+    output = tmp_path / "job"
+    settings = validate_settings(
+        {"end_time": "00:15", "keep_intermediates": True}, source="explicit"
+    )
+    path = save_processing_settings(
+        output,
+        "job",
+        settings,
+        {
+            "width": 1920,
+            "height": 1080,
+            "fps": 30.0,
+            "frame_count": 473,
+            "duration": 15.766666666666667,
+            "codec": 875967048,
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+            "sample_aspect_ratio": "1:1",
+        },
+        str(source),
+        transactional_v5=True,
+    )
+
+    assert update_processing_status(path, "completed")
+    completed = ProcessingSettingsArtifactV5.parse(path.read_bytes())
+    assert completed.to_object()["runtime_info"]["frames_processed"] == 450
 
 
 def test_legacy_completed_migration_is_revision_zero_and_preserves_target() -> None:

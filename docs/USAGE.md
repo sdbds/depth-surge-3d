@@ -23,8 +23,8 @@ projection, and retention settings as the CLI.
 # Basic conversion
 python depth_surge_3d.py input_video.mp4
 
-# A short test clip with stronger depth
-python depth_surge_3d.py input_video.mp4 --start 00:30 --end 00:45 \
+# A millisecond-precise test clip with stronger depth
+python depth_surge_3d.py input_video.mp4 --start 00:30.250 --end 00:45.750 \
   --stereo-strength 2.5
 
 # Put the canonical value 0.6 on the display plane

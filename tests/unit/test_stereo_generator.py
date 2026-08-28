@@ -116,7 +116,12 @@ def _make_file_inputs(
     return frame_files, depth_files, {"left_frames": left_dir, "right_frames": right_dir}
 
 
-def _make_manifest_inputs(root: Path, *, count: int = 1):
+def _make_manifest_inputs(
+    root: Path,
+    *,
+    count: int = 1,
+    repeat_after_first: bool = False,
+):
     frame_dir = root / "00_original_frames"
     depth_dir = root / "03_disparity_maps"
     left_dir = root / "04_left_frames"
@@ -126,10 +131,17 @@ def _make_manifest_inputs(root: Path, *, count: int = 1):
     frames: list[Path] = []
     depths: list[Path] = []
     for index in range(1, count + 1):
+        payload_index = 1 if repeat_after_first else index
         frame = frame_dir / f"frame_{index:06d}.png"
         depth = depth_dir / f"frame_{index:06d}.png"
-        assert cv2.imwrite(str(frame), np.full((8, 16, 3), 19 + index, dtype=np.uint8))
-        assert cv2.imwrite(str(depth), np.full((4, 8), 32767 + index, dtype=np.uint16))
+        assert cv2.imwrite(
+            str(frame),
+            np.full((8, 16, 3), 19 + payload_index, dtype=np.uint8),
+        )
+        assert cv2.imwrite(
+            str(depth),
+            np.full((4, 8), 32767 + payload_index, dtype=np.uint16),
+        )
         frames.append(frame)
         depths.append(depth)
     _write_canonical_metadata(depth_dir, [frame.name for frame in frames], (4, 8))
@@ -276,6 +288,58 @@ def test_manifest_pipeline_supports_quality_with_committed_diagnostics(tmp_path:
     assert json.loads((diagnostics / "metadata.json").read_text(encoding="ascii"))[
         "status"
     ] == "complete"
+
+
+def test_quality_manifest_reuses_exact_consecutive_input_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, directories = _make_manifest_inputs(
+        tmp_path,
+        count=3,
+        repeat_after_first=True,
+    )
+    real_render = stereo_generator.render_relative_quality_compact
+    render_calls = 0
+
+    def count_render(**kwargs):
+        nonlocal render_calls
+        render_calls += 1
+        return real_render(**kwargs)
+
+    monkeypatch.setattr(
+        stereo_generator,
+        "render_relative_quality_compact",
+        count_render,
+    )
+
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
+        manifest,
+        directories,
+        _settings(
+            stereo_strength=2.0,
+            stereo_render_mode="quality",
+            occlusion_fill_max_px=8,
+            keep_intermediates=True,
+        ),
+    )
+
+    assert render_calls == 1
+    left_payloads = [
+        (directories["left_frames"] / f"frame_{index:06d}.png").read_bytes()
+        for index in range(1, 4)
+    ]
+    assert left_payloads[0] == left_payloads[1] == left_payloads[2]
+    for index in range(1, 4):
+        frame_name = f"frame_{index:06d}"
+        frame_manifest = json.loads(
+            (
+                tmp_path / "04_stereo_diagnostics" / "frames" / frame_name / "manifest.json"
+            ).read_text(encoding="ascii")
+        )
+        assert frame_manifest["frame_name"] == frame_name
 
 
 def test_mask_pruning_resumes_after_all_migration_manifests_were_committed(

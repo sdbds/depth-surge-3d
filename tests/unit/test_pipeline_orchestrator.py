@@ -620,7 +620,7 @@ class TestCleanupOnlyResume:
         (diagnostics / "metadata.json").write_text(
             '{"status":"payload_pruned"}', encoding="ascii"
         )
-        artifact = Mock(status="in_progress")
+        artifact = Mock(status="in_progress", selected_frame_count=3)
         artifact.to_object.return_value = {
             "metadata": {"cleanup_status": "not_requested"},
             "processing_settings": {"keep_intermediates": False},
@@ -684,11 +684,11 @@ class TestCleanupOnlyResume:
         )
         active_index.parent.mkdir()
         active_index.write_bytes(b"index")
-        artifact = Mock(status="in_progress")
+        artifact = Mock(status="in_progress", selected_frame_count=450)
         artifact.to_object.return_value = {
             "metadata": {"cleanup_status": "not_requested"},
             "processing_settings": {"keep_intermediates": True},
-            "video_properties": {"frame_count": 3},
+            "video_properties": {"frame_count": 473},
             "output_info": {"expected_final_relative_path": "result.mp4"},
             "runtime_info": {"metric_clamp_summary": None},
         }
@@ -744,7 +744,7 @@ class TestCleanupOnlyResume:
                 "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator."
                 "update_processing_status",
                 side_effect=lambda *_args, **_kwargs: events.append("terminal") or True,
-            ),
+            ) as update,
         ):
             assert orchestrator._resume_cleanup_only(tmp_path) is True
 
@@ -760,6 +760,7 @@ class TestCleanupOnlyResume:
             "audit",
         ]
         capability.validate_authenticated_publication.assert_called_once_with()
+        assert update.call_args.args[2]["frames_processed"] == 450
         encoder.adopt_final_encoding_reservation.assert_called_once_with(capability)
         encoder.retire_final_encoding_reservation.assert_called_once_with(success=True)
 
@@ -775,7 +776,7 @@ class TestCleanupOnlyResume:
         )
         active_index.parent.mkdir()
         active_index.write_bytes(b"index")
-        artifact = Mock(status="in_progress")
+        artifact = Mock(status="in_progress", selected_frame_count=3)
         artifact.to_object.return_value = {
             "metadata": {"cleanup_status": "pending"},
             "processing_settings": {"keep_intermediates": False},
@@ -859,6 +860,7 @@ class TestCleanupOnlyResume:
 
         class Artifact:
             status = "in_progress"
+            selected_frame_count = 3
 
             @staticmethod
             def to_object():
@@ -1482,7 +1484,7 @@ def test_legacy_fast_adoption_skips_upstream_manifest_and_stereo_provider(
             settings,
             1,
         )
-        progress_tracker.finish.assert_called_once_with("Video processing complete")
+        progress_tracker.finish.assert_not_called()
         cleanup.assert_not_called()
 
     def test_required_distortion_stage_fails_when_stereo_outputs_are_missing(
@@ -1613,6 +1615,59 @@ def test_legacy_fast_adoption_skips_upstream_manifest_and_stereo_provider(
         stereo_generator.create_stereo_pairs_from_files.assert_not_called()
         video_encoder.create_video_from_stereo_source.assert_not_called()
         saved_to.assert_any_call(directories[stage_key], saved_label)
+
+
+def test_failed_direct_encoding_does_not_finish_progress(tmp_path: Path) -> None:
+    stereo_generator = Mock()
+    stereo_generator.create_stereo_pairs_from_manifest.return_value = True
+    distortion_processor = Mock()
+    distortion_processor.crop_frames.return_value = True
+    vr_assembler = Mock()
+    vr_assembler.resolve_direct_vr_source.return_value = Mock()
+    video_encoder = Mock()
+    video_encoder.create_video_from_stereo_source.return_value = False
+    orchestrator = ProcessingOrchestrator(
+        Mock(),
+        stereo_generator,
+        distortion_processor,
+        Mock(),
+        vr_assembler,
+        video_encoder,
+    )
+    directories = {
+        "base": tmp_path,
+        "left_frames": tmp_path / "left",
+        "right_frames": tmp_path / "right",
+        "left_cropped": tmp_path / "left_cropped",
+        "right_cropped": tmp_path / "right_cropped",
+    }
+    settings = {
+        "apply_distortion": False,
+        "upscale_model": "none",
+        "per_eye_width": 8,
+        "per_eye_height": 8,
+        "vr_format": "side_by_side",
+        "vr_output_width": 16,
+        "vr_output_height": 8,
+        "vr_resolution": "custom",
+        "keep_intermediates": True,
+        "direct_vr_encode": True,
+    }
+    progress_tracker = Mock()
+
+    with patch.object(orchestrator, "_finalize_processing"):
+        result = orchestrator._execute_remaining_steps(
+            directories,
+            settings,
+            Mock(frame_count=1),
+            24.0,
+            "source.mp4",
+            tmp_path,
+            progress_tracker,
+        )
+
+    assert result is False
+    progress_tracker.finish.assert_not_called()
 
 
 class TestHandleStepError:

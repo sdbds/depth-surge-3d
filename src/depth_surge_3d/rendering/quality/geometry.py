@@ -21,7 +21,6 @@ QUALITY_GEOMETRY_NEAREST_VISIT_CAP = 268_435_456
 _STABLE_REGION_REFERENCE_PIXELS = 1080 * 608
 _STABLE_REGION_REFERENCE_AREA = 16
 _STABLE_SAMPLE_MAX_NEIGHBOUR_JUMP_PX = np.float64(0.25)
-_FOREGROUND_MATTE_MIN_DISPLACEMENT_JUMP_PX = np.float64(0.25)
 _EDGE_LOCKED_MOVEMENT_BASE_COST = 4
 _EDGE_LOCKED_MOVEMENT_EDGE_SCALE = 8
 _UINT32_MAX = int(np.iinfo(np.uint32).max)
@@ -346,38 +345,6 @@ def _validate_matching_writeable_raster(
     return values
 
 
-def _shifted_neighbour_slices(
-    shape: tuple[int, int],
-    delta_row: int,
-    delta_column: int,
-) -> tuple[tuple[slice, slice], tuple[slice, slice]]:
-    height, width = shape
-    destination_rows = (
-        slice(-delta_row, height)
-        if delta_row < 0
-        else slice(0, height - delta_row) if delta_row > 0 else slice(None)
-    )
-    source_rows = (
-        slice(0, height + delta_row)
-        if delta_row < 0
-        else slice(delta_row, height) if delta_row > 0 else slice(None)
-    )
-    destination_columns = (
-        slice(-delta_column, width)
-        if delta_column < 0
-        else slice(0, width - delta_column) if delta_column > 0 else slice(None)
-    )
-    source_columns = (
-        slice(0, width + delta_column)
-        if delta_column < 0
-        else slice(delta_column, width) if delta_column > 0 else slice(None)
-    )
-    return (
-        (destination_rows, destination_columns),
-        (source_rows, source_columns),
-    )
-
-
 def _expand_foreground_matte_one_pixel(  # noqa: C901 - validates and mutates one contract.
     near_score: np.ndarray,
     total_disparity_fraction: np.ndarray,
@@ -427,66 +394,14 @@ def _expand_foreground_matte_one_pixel(  # noqa: C901 - validates and mutates on
             shape=shape,
         )
 
-    eligible = np.array(source_valid, copy=True, order="C")
-    if metric_valid is not None:
-        eligible &= metric_valid
-    best_near = np.array(near_score, copy=True, order="C")
-    winner = np.zeros(shape, dtype=np.uint8)
-    directions = (
-        (-1, 0),
-        (1, 0),
-        (0, -1),
-        (0, 1),
+    return native_kd._require_native().expand_foreground_matte_one_pixel(
+        near_score,
+        total_disparity_fraction,
+        source_valid,
+        final_region_map,
+        one_eye_displacement_px,
+        metric_valid,
     )
-
-    for code, (delta_row, delta_column) in enumerate(directions, start=1):
-        destination, source = _shifted_neighbour_slices(
-            shape,
-            delta_row,
-            delta_column,
-        )
-        better = (
-            eligible[source]
-            & (final_region_map[source] != final_region_map[destination])
-            & (near_score[source] > best_near[destination])
-        )
-        best_near[destination][better] = near_score[source][better]
-        winner[destination][better] = np.uint8(code)
-
-    expanded = np.zeros(shape, dtype=np.bool_)
-    for code, (delta_row, delta_column) in enumerate(directions, start=1):
-        destination, source = _shifted_neighbour_slices(
-            shape,
-            delta_row,
-            delta_column,
-        )
-        selected = winner[destination] == np.uint8(code)
-        selected &= (
-            np.abs(one_eye_displacement_px[source] - one_eye_displacement_px[destination])
-            >= _FOREGROUND_MATTE_MIN_DISPLACEMENT_JUMP_PX
-        )
-        expanded[destination][selected] = True
-
-    if bool(np.any(expanded)):
-        for values in (
-            near_score,
-            total_disparity_fraction,
-            source_valid,
-            final_region_map,
-            metric_valid,
-        ):
-            if values is None:
-                continue
-            original = np.array(values, copy=True, order="C")
-            for code, (delta_row, delta_column) in enumerate(directions, start=1):
-                destination, source = _shifted_neighbour_slices(
-                    shape,
-                    delta_row,
-                    delta_column,
-                )
-                selected = expanded[destination] & (winner[destination] == np.uint8(code))
-                np.copyto(values[destination], original[source], where=selected)
-    return np.ascontiguousarray(expanded)
 
 
 def _cross_dilate_mask(mask: np.ndarray) -> np.ndarray:
@@ -568,31 +483,14 @@ def build_relative_eye_offsets_into(
     strength = _validate_float("stereo_strength", stereo_strength, 0.0, 5.0)
     convergence64 = _validate_float("convergence", convergence, 0.0, 1.0)
     direction = _validate_eye(eye)
-    width = near_score.shape[1]
-    scale = np.float64(np.float64(width) * strength)
-    scale = np.float64(scale / np.float64(200.0))
-    for row in range(near_score.shape[0]):
-        np.copyto(row_float64_scratch, near_score[row], casting="unsafe")
-        np.subtract(
-            row_float64_scratch,
-            convergence64,
-            out=row_float64_scratch,
-        )
-        np.multiply(row_float64_scratch, scale, out=row_float64_scratch)
-        np.multiply(
-            row_float64_scratch,
-            np.float64(16.0),
-            out=row_float64_scratch,
-        )
-        if direction < 0:
-            np.negative(row_float64_scratch, out=row_float64_scratch)
-        np.subtract(
-            row_float64_scratch,
-            np.float64(0.5),
-            out=row_float64_scratch,
-        )
-        np.ceil(row_float64_scratch, out=row_float64_scratch)
-        _narrow_offset_row(row_float64_scratch, output_int32[row])
+    native_kd._require_native().build_relative_eye_offsets_into(
+        near_score,
+        float(strength),
+        float(convergence64),
+        direction,
+        output_int32,
+        row_float64_scratch,
+    )
 
 
 def build_geometry_eye_offsets_into(

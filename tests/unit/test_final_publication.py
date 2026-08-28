@@ -136,6 +136,27 @@ def test_stream_input_manifest_validates_schema_and_settings_cardinality(tmp_pat
         )
 
 
+def test_settings_frame_count_uses_selected_clip_extent() -> None:
+    settings = _artifact(
+        video_properties={
+            "width": 1920,
+            "height": 1080,
+            "fps": 30.0,
+            "frame_count": 473,
+            "duration": 15.766666666666667,
+            "codec": 875967048,
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+            "sample_aspect_ratio": "1:1",
+        },
+        processing_settings=validate_settings(
+            {"end_time": "00:15"}, source="explicit"
+        ),
+    )
+
+    assert final_publication_module._settings_frame_count_v1(settings) == 450
+
+
 def test_stream_input_manifest_rejects_name_replacement_after_handle_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

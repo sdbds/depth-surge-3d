@@ -13,15 +13,19 @@ All functions are safe to use in functional contexts and easy to test.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
+
+
+_TIME_SECONDS_COMPONENT = re.compile(r"[+-]?\d+(?:\.\d{1,3})?", flags=re.ASCII)
 
 
 def parse_time_string(time_str: str) -> float | None:
     """
-    Parse time string in mm:ss or hh:mm:ss format to seconds.
+    Parse time string in mm:ss[.SSS] or hh:mm:ss[.SSS] format to seconds.
 
     Args:
-        time_str: Time string in "mm:ss" or "hh:mm:ss" format
+        time_str: Time string in "mm:ss[.SSS]" or "hh:mm:ss[.SSS]" format
 
     Returns:
         Time in seconds, or None if invalid format
@@ -31,18 +35,29 @@ def parse_time_string(time_str: str) -> float | None:
         90.0
         >>> parse_time_string("01:05:30")
         3930.0
+        >>> parse_time_string("00:15.125")
+        15.125
     """
     try:
-        parts = time_str.strip().split(":")
+        parts = [part.strip() for part in time_str.strip().split(":")]
+        if _TIME_SECONDS_COMPONENT.fullmatch(parts[-1]) is None:
+            return None
+        seconds = float(parts[-1])
         if len(parts) == 2:  # mm:ss
-            minutes, seconds = map(int, parts)
+            minutes = int(parts[0])
             return minutes * 60 + seconds
         elif len(parts) == 3:  # hh:mm:ss
-            hours, minutes, seconds = map(int, parts)
+            hours, minutes = map(int, parts[:2])
             return hours * 3600 + minutes * 60 + seconds
         return None
-    except (ValueError, AttributeError):
+    except (IndexError, ValueError, AttributeError):
         return None
+
+
+def format_ffmpeg_time(seconds: float) -> str:
+    """Format seconds without discarding supported millisecond precision."""
+
+    return f"{seconds:.3f}".rstrip("0").rstrip(".")
 
 
 def calculate_frame_range(
@@ -59,8 +74,8 @@ def calculate_frame_range(
     Args:
         total_frames: Total number of frames in video
         fps: Frames per second
-        start_time: Start time in "mm:ss" or "hh:mm:ss" format
-        end_time: End time in "mm:ss" or "hh:mm:ss" format
+        start_time: Start time in "mm:ss[.SSS]" or "hh:mm:ss[.SSS]" format
+        end_time: End time in "mm:ss[.SSS]" or "hh:mm:ss[.SSS]" format
 
     Returns:
         Tuple of (start_frame, end_frame) indices

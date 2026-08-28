@@ -1103,6 +1103,23 @@ def test_create_video_trims_preextracted_audio_to_selected_clip(tmp_path):
     ]
 
 
+def test_audio_input_arguments_preserve_milliseconds_after_one_hour():
+    assert VideoEncoder._build_audio_input_args(
+        "audio.flac",
+        {
+            "start_time": "01:02:03.004",
+            "end_time": "01:02:04.129",
+        },
+    ) == [
+        "-ss",
+        "3723.004",
+        "-t",
+        "1.125",
+        "-i",
+        "audio.flac",
+    ]
+
+
 def test_extract_frames_reuses_complete_existing_sequence(tmp_path):
     """Resuming a stopped job does not decode a complete frame sequence again."""
     frames_dir = tmp_path / "frames"
@@ -1340,7 +1357,7 @@ def test_schema5_assembled_encode_publishes_bound_video_and_manifests(
     ).exists()
 
 
-def test_schema5_provider_count_must_equal_durable_settings_count(
+def test_schema5_provider_count_must_equal_durable_selected_count(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1357,6 +1374,7 @@ def test_schema5_provider_count_must_equal_durable_settings_count(
         frames_parent=PurePosixPath("99_vr_frames"),
     )
     artifact = Mock()
+    artifact.selected_frame_count = 2
     artifact.to_object.return_value = {
         "metadata": {"final_media_publication_generation": None},
         "video_properties": {"frame_count": 2},
@@ -1383,6 +1401,73 @@ def test_schema5_provider_count_must_equal_durable_settings_count(
     reserve.assert_not_called()
 
 
+def test_schema5_provider_count_matches_selected_clip_extent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.core.settings import validate_settings
+    from src.depth_surge_3d.io.settings_artifact import (
+        create_processing_settings_artifact_v5,
+    )
+    from src.depth_surge_3d.processing.video.encoding_provider import (
+        EncodingSequenceProvider,
+    )
+
+    class ReservationReached(RuntimeError):
+        pass
+
+    job = tmp_path / "job"
+    job.mkdir()
+    provider = EncodingSequenceProvider.freeze(
+        mode="assembled_vr",
+        frame_count=450,
+        first_index=0,
+        frames_parent=PurePosixPath("99_vr_frames"),
+    )
+    settings = validate_settings({"end_time": "00:15"}, source="explicit")
+    artifact = create_processing_settings_artifact_v5(
+        batch_name="clipped",
+        source_video="C:/input/source.mp4",
+        source_video_name="source.mp4",
+        source_video_fingerprint="ab" * 16,
+        video_properties={
+            "width": 1920,
+            "height": 1080,
+            "fps": 30.0,
+            "frame_count": 473,
+            "duration": 15.766666666666667,
+            "codec": 875967048,
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+            "sample_aspect_ratio": "1:1",
+        },
+        processing_settings=settings,
+        output_directory=str(job),
+        project_version="0.9.0",
+        creation_now_usec="2026-08-26T12:00:00.000000Z",
+        job_id="01" * 16,
+        job_reservation_generation="02" * 16,
+        job_terminal_reservation_id="03" * 16,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "recover_processing_control_prefix_v1",
+        lambda _root: artifact,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder."
+        "prepare_final_encoding_reservation_v1",
+        lambda **_kwargs: (_ for _ in ()).throw(ReservationReached()),
+    )
+
+    with pytest.raises(ReservationReached):
+        VideoEncoder()._prepare_schema5_publication_context(
+            provider=provider,
+            output_dir=job,
+            settings=settings,
+        )
+
+
 def test_schema5_prelaunch_staged_manifest_mismatch_discards_and_rebuilds_invocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1406,6 +1491,7 @@ def test_schema5_prelaunch_staged_manifest_mismatch_discards_and_rebuilds_invoca
         frames_parent=PurePosixPath("99_vr_frames"),
     )
     artifact = Mock()
+    artifact.selected_frame_count = 1
     artifact.to_object.return_value = {
         "metadata": {"final_media_publication_generation": None},
         "video_properties": {"frame_count": 1, "fps": 24.0},
@@ -1513,6 +1599,8 @@ def test_schema5_manifest_stage_releases_settings_and_prepared_reservation(
     references: dict[str, weakref.ReferenceType[object]] = {}
 
     class Artifact:
+        selected_frame_count = 1
+
         def to_object(self):
             return {
                 "metadata": {"final_media_publication_generation": None},
@@ -1691,6 +1779,8 @@ def test_schema5_manifest_audit_releases_settings_and_prepared_reservation(
     references: dict[str, weakref.ReferenceType[object]] = {}
 
     class Artifact:
+        selected_frame_count = 1
+
         def to_object(self):
             return {
                 "metadata": {"final_media_publication_generation": "44" * 16},

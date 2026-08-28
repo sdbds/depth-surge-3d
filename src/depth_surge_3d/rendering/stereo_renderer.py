@@ -290,6 +290,10 @@ def _downsample_masks(
 
 
 def _convert_image_band(image: torch.Tensor, dtype: np.dtype) -> np.ndarray:
+    if image.device.type == "cuda" and np.dtype(dtype) == np.dtype(np.uint8):
+        values = torch.round(image.detach())
+        values.clamp_(0, 255)
+        return values.to(dtype=torch.uint8).cpu().numpy()
     values = image.detach().cpu().numpy()
     if np.issubdtype(dtype, np.integer):
         integer_limits = np.iinfo(dtype)

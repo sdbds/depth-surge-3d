@@ -2182,7 +2182,7 @@ def prepare_final_encoding_reservation_v1(  # noqa: C901
     producer_required = producer_preview != settings
     del producer_preview
     keep_intermediates = values["processing_settings"]["keep_intermediates"]
-    frame_count = values["video_properties"]["frame_count"]
+    frame_count = _settings_frame_count_v1(settings)
     diagnostics_raw_sha256: str | None = None
     diagnostics_fingerprint: str | None = None
     diagnostics_raw_max: int | None = None
@@ -5622,7 +5622,7 @@ def _stream_input_manifest_identity(
 
 
 def _settings_frame_count_v1(settings: ProcessingSettingsArtifactV5) -> int:
-    frame_count = settings.to_object()["video_properties"]["frame_count"]
+    frame_count = settings.selected_frame_count
     if (
         type(frame_count) is not int
         or not 1 <= frame_count <= _ENCODING_CONTROL_FRAME_CAP

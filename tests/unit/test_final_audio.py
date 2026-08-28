@@ -50,27 +50,27 @@ def test_audio_selects_regular_flac_and_freezes_sample_trim(tmp_path: Path) -> N
             "_probe_first_audio_stream",
             return_value=AudioProbeStream("audio", 48_000, 2),
         ) as probe,
-        patch.object(final_audio, "_decode_pcm_byte_count", return_value=48_000 * 2 * 4),
+        patch.object(final_audio, "_decode_pcm_byte_count", return_value=144_144 * 2 * 4),
     ):
         selected = final_audio.prepare_selected_audio_v1(
             output_dir=tmp_path,
             original_video=original,
             settings=_settings(start_time="00:00:01", end_time="00:00:04"),
-            frame_count=24,
+            frame_count=72,
             fps="24000/1001",
         )
 
     assert selected.selection == "original_audio_flac"
     assert selected.selected_source_path == flac.resolve()
-    assert selected.resolved_clip_arguments == ("-ss", "1", "-t", "3")
+    assert selected.resolved_clip_arguments == ("-ss", "0.959", "-t", "3.003")
     assert selected.disposition == "usable"
-    assert selected.decoded_pcm_bytes == 48_000 * 2 * 4
-    assert selected.audio_end_sample == 48_048
+    assert selected.decoded_pcm_bytes == 144_144 * 2 * 4
+    assert selected.audio_end_sample == 144_144
     assert selected.input_arguments() == (
         "-ss",
-        "1",
+        "0.959",
         "-t",
-        "3",
+        "3.003",
         "-i",
         str(flac.resolve()),
     )
@@ -78,12 +78,56 @@ def test_audio_selects_regular_flac_and_freezes_sample_trim(tmp_path: Path) -> N
         "-map",
         "2:a:0",
         "-filter:a",
-        "atrim=end_sample=48048,asetpts=PTS-STARTPTS",
+        "atrim=end_sample=144144,asetpts=PTS-STARTPTS",
         "-c:a",
         "aac",
     )
     assert "-shortest" not in selected.output_arguments(2)
     probe.assert_called_once_with(flac.resolve(), selected.resolved_clip_arguments)
+
+
+def test_audio_clip_arguments_align_milliseconds_to_selected_video_frames(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "source.mp4"
+    original.write_bytes(b"video-audio")
+
+    with patch.object(final_audio, "_probe_first_audio_stream", return_value=None):
+        selected = final_audio.prepare_selected_audio_v1(
+            output_dir=tmp_path,
+            original_video=original,
+            settings=_settings(start_time="00:00.125", end_time="00:01.375"),
+            frame_count=38,
+            fps="30",
+        )
+
+    assert selected.resolved_clip_arguments == ("-ss", "0.1", "-t", "1.267")
+
+
+def test_audio_clip_arguments_align_milliseconds_after_one_hour(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "source.mp4"
+    original.write_bytes(b"video-audio")
+
+    with patch.object(final_audio, "_probe_first_audio_stream", return_value=None):
+        selected = final_audio.prepare_selected_audio_v1(
+            output_dir=tmp_path,
+            original_video=original,
+            settings=_settings(
+                start_time="01:02:03.004",
+                end_time="01:02:04.129",
+            ),
+            frame_count=33,
+            fps="30",
+        )
+
+    assert selected.resolved_clip_arguments == (
+        "-ss",
+        "3723",
+        "-t",
+        "1.1",
+    )
 
 
 def test_audio_symlink_flac_falls_back_to_original_video(tmp_path: Path) -> None:

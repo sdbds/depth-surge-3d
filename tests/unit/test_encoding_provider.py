@@ -567,6 +567,84 @@ def test_final_probe_contract_validates_exact_generated_video_and_audio() -> Non
     encoding_provider.validate_final_probe_streams(streams, expectation)
 
 
+def test_final_probe_contract_accepts_ffprobe_8_audio_frame_rate_placeholder() -> None:
+    streams = (
+        encoding_provider.FinalProbeStream(
+            {
+                "codec_type": "video",
+                "codec_name": "hevc",
+                "width": 3840,
+                "height": 1080,
+                "pix_fmt": "yuv420p",
+                "sample_aspect_ratio": "1:1",
+                "display_aspect_ratio": "32:9",
+                "avg_frame_rate": "30/1",
+                "nb_read_frames": "450",
+            }
+        ),
+        encoding_provider.FinalProbeStream(
+            {
+                "codec_type": "audio",
+                "codec_name": "aac",
+                "avg_frame_rate": "0/0",
+                "nb_read_frames": "646",
+            }
+        ),
+    )
+    expectation = encoding_provider.FinalContainerExpectation(
+        width=3840,
+        height=1080,
+        fps="30/1",
+        frame_count=450,
+        resolved_encoder="hevc_nvenc",
+        audio_expected=True,
+        audio_packet_upper_bound=647,
+    )
+
+    encoding_provider.validate_final_probe_streams(streams, expectation)
+
+
+def test_final_probe_contract_rejects_audio_frame_rate_other_than_placeholder() -> None:
+    streams = (
+        encoding_provider.FinalProbeStream(
+            {
+                "codec_type": "video",
+                "codec_name": "h264",
+                "width": 8,
+                "height": 4,
+                "pix_fmt": "yuv420p",
+                "sample_aspect_ratio": "1:1",
+                "display_aspect_ratio": "2:1",
+                "avg_frame_rate": "24/1",
+                "nb_read_frames": "1",
+            }
+        ),
+        encoding_provider.FinalProbeStream(
+            {
+                "codec_type": "audio",
+                "codec_name": "aac",
+                "avg_frame_rate": "1/1",
+                "nb_read_frames": "1",
+            }
+        ),
+    )
+    expectation = encoding_provider.FinalContainerExpectation(
+        width=8,
+        height=4,
+        fps="24/1",
+        frame_count=1,
+        resolved_encoder="libx264",
+        audio_expected=True,
+        audio_packet_upper_bound=1,
+    )
+
+    with pytest.raises(
+        encoding_provider.FinalContainerValidationError,
+        match="audio frame rate",
+    ):
+        encoding_provider.validate_final_probe_streams(streams, expectation)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -688,6 +766,58 @@ def test_progress_parser_resets_only_on_strict_numeric_increase() -> None:
 
     with pytest.raises(encoding_provider.EncodingProgressError):
         parser.feed_line(b"frame=2\n")
+
+
+def test_progress_parser_accepts_negative_ffmpeg_output_times() -> None:
+    parser = encoding_provider.FfmpegProgressParser()
+
+    assert parser.feed_line(b"frame=1\n")
+    assert parser.feed_line(b"out_time_us=-66667\n")
+    assert parser.feed_line(b"out_time_ms=-66667\n")
+    assert not parser.feed_line(b"out_time_us=-66667\n")
+    assert parser.feed_line(b"out_time_us=0\n")
+    assert not parser.feed_line(b"progress=end\n")
+    parser.finish()
+
+
+def test_progress_parser_accepts_temporarily_unavailable_ffmpeg_measurements() -> None:
+    parser = encoding_provider.FfmpegProgressParser()
+
+    assert parser.feed_line(b"frame=0\n")
+    assert not parser.feed_line(b"total_size=N/A\n")
+    assert not parser.feed_line(b"out_time_us=N/A\n")
+    assert not parser.feed_line(b"out_time_ms=N/A\n")
+    assert parser.feed_line(b"out_time_us=0\n")
+    assert not parser.feed_line(b"progress=end\n")
+    parser.finish()
+
+
+def test_final_decode_progress_accepts_temporarily_unavailable_output_time() -> None:
+    parser = encoding_provider.FinalDecodeProgressParser()
+
+    assert not parser.feed_line(b"out_time_us=N/A\n")
+    assert not parser.feed_line(b"out_time_ms=N/A\n")
+    assert parser.feed_line(b"frame=1\n")
+    assert not parser.feed_line(b"progress=end\n")
+    parser.finish()
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        b"frame=-1\n",
+        b"total_size=-1\n",
+        b"out_time_us=-0\n",
+        b"out_time_ms=+1\n",
+        b"out_time_us=-9223372036854775809\n",
+        b"out_time_ms=9223372036854775808\n",
+    ],
+)
+def test_progress_parser_rejects_noncanonical_or_out_of_range_counters(
+    line: bytes,
+) -> None:
+    with pytest.raises(encoding_provider.EncodingProgressError):
+        encoding_provider.FfmpegProgressParser().feed_line(line)
 
 
 def test_final_decode_progress_ignores_total_size_for_stall_progress() -> None:

@@ -273,24 +273,11 @@ def build_sparse_region_seeds(
     shape = (int(mapped_regions.shape[0]), int(mapped_regions.shape[1]))
     _validate_bool_raster("edge_band", edge_band, shape=shape)
     erosion_radius = _validate_nonnegative_integer("radius", radius)
-    seeds = np.array(mapped_regions, copy=True, order="C")
-    seeds[edge_band] = np.uint32(0)
-    fragment_map, fragment_regions, fragment_bounds, fragment_count = _label_region_fragments(
-        mapped_regions, edge_band
+    seeds = native_kd._require_native().build_sparse_region_seeds(
+        mapped_regions,
+        edge_band,
+        erosion_radius,
     )
-    for fragment_id in range(1, fragment_count + 1):
-        y0, y1, x0, x1 = (int(value) for value in fragment_bounds[fragment_id])
-        fragment = fragment_map[y0 : y1 + 1, x0 : x1 + 1] == np.uint32(fragment_id)
-        eroded = fragment
-        for _ in range(erosion_radius):
-            eroded = _cross_erode(eroded)
-        selected = eroded if np.any(eroded) else cross_skeleton(fragment)
-        if not np.any(selected):
-            first = int(np.flatnonzero(fragment)[0])
-            selected = np.zeros(fragment.shape, dtype=np.bool_)
-            selected.flat[first] = True
-        seed_view = seeds[y0 : y1 + 1, x0 : x1 + 1]
-        seed_view[selected] = fragment_regions[fragment_id]
     seeds.setflags(write=False)
     return seeds
 

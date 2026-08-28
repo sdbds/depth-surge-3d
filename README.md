@@ -58,8 +58,8 @@ The setup script automatically installs all dependencies, downloads the Video-De
 # Basic usage
 python depth_surge_3d.py input_video.mp4
 
-# Process specific time range with custom settings
-python depth_surge_3d.py input_video.mp4 -s 01:30 -e 03:45 -f over_under --resolution 4k
+# Process a millisecond-precise time range with custom settings
+python depth_surge_3d.py input_video.mp4 --start 01:30.000 --end 03:45.000 -f over_under --vr-resolution 16x9-4k
 
 # Add experimental generic temporal stabilization (CUDA generation only)
 python depth_surge_3d.py input_video.mp4 --temporal-postprocessor vdpp

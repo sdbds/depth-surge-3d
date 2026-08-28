@@ -53,7 +53,9 @@ def test_production_relative_geometry_matches_gate_prototype() -> None:
     assert _result_signature(actual) == _result_signature(expected)
 
 
-def test_production_single_eye_offset_builders_match_gate_prototype() -> None:
+def test_production_single_eye_offset_builders_match_gate_prototype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     production = importlib.import_module("src.depth_surge_3d.rendering.quality.geometry")
     near_score = np.array(
         [[0.9052734375, np.nextafter(np.float32(0.5), np.float32(1.0))]],
@@ -69,6 +71,13 @@ def test_production_single_eye_offset_builders_match_gate_prototype() -> None:
         eye="left",
         output_int32=expected,
         row_float64_scratch=np.empty(near_score.shape[1], dtype=np.float64),
+    )
+    monkeypatch.setattr(
+        production.np,
+        "copyto",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("production entered the scalar row offset builder")
+        ),
     )
     production.build_relative_eye_offsets_into(
         near_score,
@@ -88,7 +97,7 @@ def test_production_native_module_uses_frozen_prebuilt_algorithm() -> None:
 
     assert native.native_available()
     build_info = native.native_build_info()
-    assert build_info["algorithm"] == "quality-implicit-region-kd-median-of-medians-v1"
+    assert build_info["algorithm"] == "quality-implicit-region-kd-hybrid-nth-element-v2"
     assert build_info["kd_stack_capacity"] == 64
     assert build_info["runtime_jit"] is False
     assert len(build_info["source_sha256"]) == 64
@@ -114,7 +123,39 @@ def test_stable_region_support_rejects_low_area_transition_slivers() -> None:
         assert included[regions == np.uint32(region)].any()
 
 
-def test_foreground_matte_expands_only_a_large_nearer_surface_jump() -> None:
+def test_native_foreground_matte_matches_hand_checked_cross_copy() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    near_score = np.array([[0.1, 0.2, 0.8, 0.9, 0.91]], dtype=np.float32)
+    total = np.array([[-0.4, -0.3, 0.3, 0.4, 0.41]], dtype=np.float64)
+    source_valid = np.array([[True, False, True, True, True]], dtype=np.bool_)
+    regions = np.array([[1, 1, 2, 2, 3]], dtype=np.uint32)
+    displacement = np.array([[0.0, 0.0, 4.0, 4.0, 4.1]], dtype=np.float64)
+    metric_valid = np.array([[True, False, True, True, True]], dtype=np.bool_)
+
+    expanded = native_kd._require_native().expand_foreground_matte_one_pixel(
+        near_score,
+        total,
+        source_valid,
+        regions,
+        displacement,
+        metric_valid,
+    )
+
+    assert expanded.tolist() == [[False, True, False, False, False]]
+    np.testing.assert_array_equal(
+        near_score,
+        np.array([[0.1, 0.8, 0.8, 0.9, 0.91]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        total,
+        np.array([[-0.4, 0.3, 0.3, 0.4, 0.41]], dtype=np.float64),
+    )
+    assert source_valid.tolist() == [[True, True, True, True, True]]
+    assert regions.tolist() == [[1, 2, 2, 2, 3]]
+    assert metric_valid.tolist() == [[True, True, True, True, True]]
+
+
+def test_foreground_matte_expands_only_a_large_nearer_surface_jump(monkeypatch) -> None:
     production = importlib.import_module("src.depth_surge_3d.rendering.quality.geometry")
     near_score = np.array([[0.1, 0.2, 0.8, 0.9, 0.91]], dtype=np.float32)
     total = np.array([[-0.4, -0.3, 0.3, 0.4, 0.41]], dtype=np.float64)
@@ -122,14 +163,22 @@ def test_foreground_matte_expands_only_a_large_nearer_surface_jump() -> None:
     regions = np.array([[1, 1, 2, 2, 3]], dtype=np.uint32)
     displacement = np.array([[0.0, 0.0, 4.0, 4.0, 4.1]], dtype=np.float64)
 
-    expanded = production._expand_foreground_matte_one_pixel(
-        near_score,
-        total,
-        source_valid,
-        regions,
-        displacement,
-        metric_valid=None,
-    )
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            production.np,
+            "copyto",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("production entered NumPy foreground-matte copying")
+            ),
+        )
+        expanded = production._expand_foreground_matte_one_pixel(
+            near_score,
+            total,
+            source_valid,
+            regions,
+            displacement,
+            metric_valid=None,
+        )
 
     assert expanded.tolist() == [[False, True, False, False, False]]
     np.testing.assert_array_equal(

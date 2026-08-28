@@ -111,6 +111,51 @@ def test_native_region_fragment_labels_match_the_scalar_oracle() -> None:
         assert np.array_equal(actual_values, expected_values)
 
 
+def test_native_sparse_region_seeds_match_the_scalar_oracle() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    prototype = importlib.import_module("scripts.quality_task0.region_solver")
+    rng = np.random.default_rng(20260828)
+    regions = np.ascontiguousarray(rng.integers(1, 8, size=(37, 53), dtype=np.uint32))
+    regions[2:8, 3:11] = np.uint32(0)
+    regions[25:31, 41:49] = np.uint32(0xFFFFFFFF)
+    band = np.ascontiguousarray(
+        rng.integers(0, 2, size=regions.shape, dtype=np.uint8).astype(np.bool_)
+    )
+
+    for radius in (0, 1, 4):
+        expected = prototype.build_sparse_region_seeds(regions, band, radius=radius)
+        actual = native_kd._require_native().build_sparse_region_seeds(
+            regions,
+            band,
+            radius,
+        )
+
+        assert actual.dtype == np.uint32
+        assert actual.flags.c_contiguous
+        assert actual.tobytes() == expected.tobytes()
+
+
+def test_production_sparse_region_seeds_bypass_scalar_morphology(monkeypatch) -> None:
+    production = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
+    prototype = importlib.import_module("scripts.quality_task0.region_solver")
+    regions = np.ones((11, 16), dtype=np.uint32)
+    regions[:, 8:] = np.uint32(2)
+    band = np.zeros(regions.shape, dtype=np.bool_)
+    band[:, 3:13] = True
+    expected = prototype.build_sparse_region_seeds(regions, band, radius=2)
+    scalar_path_error = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("production entered scalar sparse-seed morphology")
+    )
+    monkeypatch.setattr(production, "_cross_erode", scalar_path_error)
+    monkeypatch.setattr(production, "cross_skeleton", scalar_path_error)
+    monkeypatch.setattr(production, "_label_region_fragments", scalar_path_error)
+
+    actual = production.build_sparse_region_seeds(regions, band, radius=2)
+
+    assert actual.tobytes() == expected.tobytes()
+    assert not actual.flags.writeable
+
+
 def test_native_one_sided_collection_matches_the_scalar_oracle() -> None:
     native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
     prototype = importlib.import_module("scripts.quality_task0.quality_geometry")

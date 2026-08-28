@@ -21,6 +21,7 @@ import numpy as np
 
 from ..core.file_identity import FILE_IDENTITY_ALGORITHM_VERSION
 from ..core.settings import JOB_OUTPUT_NAME_V1_RESOLUTION_PRESETS, validate_settings
+from ..utils.path_utils import calculate_frame_range
 from .canonical_json import (
     CanonicalJsonError,
     canonical_json_bytes,
@@ -431,6 +432,18 @@ def _materialize_processing_settings(values: dict[str, Any]) -> dict[str, Any]:
     return validated
 
 
+def _selected_frame_count_v1(
+    video_properties: dict[str, Any], processing_settings: dict[str, Any]
+) -> int:
+    start_frame, end_frame = calculate_frame_range(
+        video_properties["frame_count"],
+        video_properties["fps"],
+        processing_settings["start_time"],
+        processing_settings["end_time"],
+    )
+    return end_frame - start_frame
+
+
 def _validate_processing_settings(value: object) -> dict[str, Any]:  # noqa: C901
     settings = _closed_object(value, PROCESSING_SETTINGS_V5_KEYS, "processing_settings")
     numeric_ranges = {
@@ -782,7 +795,8 @@ def _validate_complete_object(value: object) -> dict[str, Any]:  # noqa: C901
                 )
             else:
                 _state(
-                    runtime["frames_processed"] == video["frame_count"],
+                    runtime["frames_processed"]
+                    == _selected_frame_count_v1(video, settings),
                     "completed frame count is invalid",
                 )
             projected = duration_seconds_from_ms_v1(duration)
@@ -874,6 +888,12 @@ class ProcessingSettingsArtifactV5:
     @property
     def status(self) -> str:
         return str(self._value["metadata"]["processing_status"])
+
+    @property
+    def selected_frame_count(self) -> int:
+        return _selected_frame_count_v1(
+            self._value["video_properties"], self._value["processing_settings"]
+        )
 
     def _replace(
         self,

@@ -92,6 +92,101 @@ def test_quality_background_finishes_every_lane_and_public_holes_are_clear() -> 
     assert result.right_image.dtype == frame.dtype
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_quality_compact_cpu_cuda_outputs_are_byte_exact() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    generator = np.random.default_rng(20260828)
+    frame = generator.integers(0, 256, size=(9, 48, 3), dtype=np.uint8)
+    canonical = generator.random((5, 24), dtype=np.float32)
+    settings = _quality_settings(stereo_strength=4.0, convergence=0.45)
+
+    cpu = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=settings,
+    )
+    cuda = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cuda"),
+        frame=frame,
+        canonical=canonical,
+        settings=settings,
+    )
+
+    for name in (
+        "left_image",
+        "right_image",
+        "left_coverage_count",
+        "right_coverage_count",
+        "left_repair_bits",
+        "right_repair_bits",
+    ):
+        assert np.array_equal(getattr(cuda, name), getattr(cpu, name))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_quality_cuda_avoids_dense_lane_validity_host_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    generator = np.random.default_rng(20260829)
+    frame = generator.integers(0, 256, size=(9, 48, 3), dtype=np.uint8)
+    canonical = generator.random((5, 24), dtype=np.float32)
+    monkeypatch.setattr(
+        quality,
+        "_accumulate_hole_run_histograms",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("CUDA transferred the dense lane-validity raster")
+        ),
+    )
+
+    result = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cuda"),
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(stereo_strength=4.0, convergence=0.45),
+    )
+
+    assert result.left_coverage_count.shape == frame.shape[:2]
+    assert result.right_coverage_count.shape == frame.shape[:2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_quality_cuda_does_not_allocate_full_frame_lane_mask_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    generator = np.random.default_rng(20260830)
+    frame = generator.integers(0, 256, size=(9, 48, 3), dtype=np.uint8)
+    canonical = generator.random((5, 24), dtype=np.float32)
+    original_empty = quality.torch.empty
+
+    def guarded_empty(*args: object, **kwargs: object) -> torch.Tensor:
+        size = args[0] if args else kwargs.get("size")
+        device_value = kwargs.get("device")
+        if (
+            size is not None
+            and tuple(size) == frame.shape[:2]  # type: ignore[arg-type]
+            and kwargs.get("dtype") == torch.int16
+            and device_value is not None
+            and torch.device(device_value).type == "cuda"  # type: ignore[arg-type]
+        ):
+            raise AssertionError("CUDA allocated a full-frame packed lane mask")
+        return original_empty(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(quality.torch, "empty", guarded_empty)
+
+    result = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cuda"),
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(stereo_strength=4.0, convergence=0.45),
+    )
+
+    assert result.left_coverage_count.shape == frame.shape[:2]
+    assert result.right_coverage_count.shape == frame.shape[:2]
+
+
 def test_missing_lane_background_proxy_preserves_valid_pixel_contribution() -> None:
     quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
     source = np.zeros((9, 9, 3), dtype=np.uint8)
@@ -168,26 +263,248 @@ def test_background_proxy_mask_only_expands_low_coverage_holes() -> None:
     assert mask[5, 13]
 
 
-def test_hole_run_histograms_are_row_bounded_and_exact() -> None:
+def test_native_background_proxy_normalization_matches_float32_rounding() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    values = np.arange(256, dtype=np.uint8)
+    pre_repair = np.empty((17, 256, 3), dtype=np.uint8)
+    pre_repair[:, :, 0] = values
+    pre_repair[:, :, 1] = values[::-1]
+    pre_repair[:, :, 2] = np.bitwise_xor(values, np.uint8(0x55))
+    coverage_shape = (17, 256)
+    coverage = np.broadcast_to(
+        np.arange(17, dtype=np.uint8)[:, None],
+        coverage_shape,
+    ).copy()
+    expected = np.zeros_like(pre_repair)
+    visible = coverage > np.uint8(0)
+    normalized = pre_repair.astype(np.float32)
+    normalized *= np.float32(16.0)
+    np.divide(normalized, coverage[:, :, None], out=normalized, where=visible[:, :, None])
+    expected[visible] = np.clip(np.rint(normalized[visible]), 0, 255).astype(np.uint8)
+
+    actual = native_kd._require_native().normalize_background_proxy_source(
+        pre_repair,
+        coverage,
+    )
+
+    assert actual.shape[:2] == coverage_shape
+    assert actual.dtype == np.uint8
+    assert actual.flags.c_contiguous
+    assert actual.tobytes() == expected.tobytes()
+
+
+def test_native_background_proxy_composition_matches_float32_rounding() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    rng = np.random.default_rng(160255)
+    pre_repair = rng.integers(0, 256, size=(71, 257, 3), dtype=np.uint8)
+    proxy = rng.integers(0, 256, size=pre_repair.shape, dtype=np.uint8)
+    coverage = rng.integers(0, 17, size=pre_repair.shape[:2], dtype=np.uint8)
+    coverage[:, :17] = np.arange(17, dtype=np.uint8)
+    missing_lanes = np.float32(16.0) - coverage.astype(np.float32)
+    repaired = pre_repair.astype(np.float32)
+    repaired += proxy.astype(np.float32) * (missing_lanes[:, :, None] / np.float32(16.0))
+    expected = np.clip(np.rint(repaired), 0, 255).astype(np.uint8)
+    expected[coverage == np.uint8(16)] = pre_repair[coverage == np.uint8(16)]
+
+    actual = native_kd._require_native().composite_background_proxy(
+        pre_repair,
+        coverage,
+        proxy,
+    )
+
+    assert actual.dtype == np.uint8
+    assert actual.flags.c_contiguous
+    assert actual.tobytes() == expected.tobytes()
+
+
+def test_background_proxy_bypasses_full_frame_float32_normalization(monkeypatch) -> None:
     quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    source = np.zeros((9, 9, 3), dtype=np.uint8)
+    source[:, :, 1] = np.uint8(100)
+    pre_repair = source.copy()
+    coverage = np.full((9, 9), 16, dtype=np.uint8)
+    coverage[4, 4] = np.uint8(8)
+    pre_repair[4, 4] = np.asarray([50, 0, 0], dtype=np.uint8)
+    coverage[4, 5] = np.uint8(0)
+    pre_repair[4, 5] = np.uint8(0)
+    monkeypatch.setattr(
+        quality.np,
+        "divide",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("production entered full-frame float32 normalization")
+        ),
+    )
+
+    repaired = quality._composite_background_proxy(
+        pre_repair,
+        coverage,
+        source,
+        radius_px=3,
+        far_side="right",
+        foreground_exclusion_px=3,
+    )
+
+    assert repaired[4, 4].tolist() == [50, 50, 0]
+    np.testing.assert_allclose(repaired[4, 5], [0, 100, 0], atol=2)
+
+
+def test_native_lane_analysis_fuses_coverage_and_row_bounded_histograms() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
     lane_valid = np.ones((2, 2, 16), dtype=np.bool_)
     missing = lane_valid.reshape(2, -1)
     missing[0, [0, 1, 15, 16, 17, 31]] = False
     missing[1, [0, 31]] = False
+    coverage = np.empty((2, 2), dtype=np.uint8)
     lane_histogram = np.zeros(16 * (2 + 1), dtype=np.uint64)
     span_histogram = np.zeros(2 + 1, dtype=np.uint64)
 
-    quality._accumulate_hole_run_histograms(
+    native_kd._require_native().accumulate_lane_hole_run_histograms_into(
         lane_valid,
         lane_histogram,
         span_histogram,
+        coverage,
     )
 
+    assert coverage.tolist() == [[13, 13], [15, 15]]
     assert lane_histogram[1] == 3
     assert lane_histogram[2] == 1
     assert lane_histogram[3] == 1
     assert int(lane_histogram.sum()) == 5
     assert span_histogram.tolist() == [0, 4, 1]
+
+
+def test_native_lane_analysis_matches_scalar_randomized_oracle() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    rng = np.random.default_rng(20260828)
+    lane_valid = np.ascontiguousarray(rng.random((7, 19, 16)) > 0.18)
+    expected_coverage = lane_valid.sum(axis=2, dtype=np.uint16).astype(np.uint8)
+    expected_lane_histogram = np.zeros(16 * 20, dtype=np.uint64)
+    expected_span_histogram = np.zeros(20, dtype=np.uint64)
+    expected_run_count = 0
+    for row in lane_valid:
+        active_start: int | None = None
+        for lane, valid in enumerate(row.reshape(-1)):
+            if not valid and active_start is None:
+                active_start = lane
+            if valid and active_start is not None:
+                lane_length = lane - active_start
+                pixel_span = (lane - 1) // 16 - active_start // 16 + 1
+                expected_lane_histogram[lane_length] += np.uint64(1)
+                expected_span_histogram[pixel_span] += np.uint64(1)
+                expected_run_count += 1
+                active_start = None
+        if active_start is not None:
+            lane_length = row.size - active_start
+            pixel_span = (row.size - 1) // 16 - active_start // 16 + 1
+            expected_lane_histogram[lane_length] += np.uint64(1)
+            expected_span_histogram[pixel_span] += np.uint64(1)
+            expected_run_count += 1
+
+    coverage = np.empty(expected_coverage.shape, dtype=np.uint8)
+    lane_histogram = np.zeros_like(expected_lane_histogram)
+    span_histogram = np.zeros_like(expected_span_histogram)
+    run_count = native_kd._require_native().accumulate_lane_hole_run_histograms_into(
+        lane_valid,
+        lane_histogram,
+        span_histogram,
+        coverage,
+    )
+
+    assert run_count == expected_run_count
+    np.testing.assert_array_equal(coverage, expected_coverage)
+    np.testing.assert_array_equal(lane_histogram, expected_lane_histogram)
+    np.testing.assert_array_equal(span_histogram, expected_span_histogram)
+
+
+def test_native_packed_lane_analysis_matches_bool_input() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    native = native_kd._require_native()
+    rng = np.random.default_rng(20260829)
+    lane_valid = np.ascontiguousarray(rng.random((7, 19, 16)) > 0.18)
+    lane_valid[0, 0] = True
+    lane_valid[0, 1] = False
+    lane_valid[0, 2] = True
+    lane_valid[0, 2, 15] = False
+    lane_weights = np.left_shift(
+        np.uint32(1),
+        np.arange(16, dtype=np.uint32),
+    )
+    packed_missing = np.sum(
+        np.logical_not(lane_valid).astype(np.uint32) * lane_weights,
+        axis=2,
+        dtype=np.uint32,
+    ).astype(np.uint16)
+
+    expected_coverage = np.empty((7, 19), dtype=np.uint8)
+    expected_lane_histogram = np.zeros(16 * 20, dtype=np.uint64)
+    expected_span_histogram = np.zeros(20, dtype=np.uint64)
+    expected_run_count = native.accumulate_lane_hole_run_histograms_into(
+        lane_valid,
+        expected_lane_histogram,
+        expected_span_histogram,
+        expected_coverage,
+    )
+    coverage = np.empty_like(expected_coverage)
+    lane_histogram = np.zeros_like(expected_lane_histogram)
+    span_histogram = np.zeros_like(expected_span_histogram)
+
+    run_count = native.accumulate_packed_lane_hole_run_histograms_into(
+        packed_missing,
+        lane_histogram,
+        span_histogram,
+        coverage,
+    )
+
+    assert run_count == expected_run_count
+    np.testing.assert_array_equal(coverage, expected_coverage)
+    np.testing.assert_array_equal(lane_histogram, expected_lane_histogram)
+    np.testing.assert_array_equal(span_histogram, expected_span_histogram)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_lane_mask_packing_is_bit_exact() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    rng = np.random.default_rng(20260829)
+    lane_valid_host = np.ascontiguousarray(rng.random((7, 19, 16)) > 0.18)
+    lane_valid_host[0, 0] = True
+    lane_valid_host[0, 1] = False
+    lane_valid_host[0, 2] = True
+    lane_valid_host[0, 2, 15] = False
+    lane_valid = torch.as_tensor(lane_valid_host, device="cuda")
+    lane_weights = torch.bitwise_left_shift(
+        torch.ones(16, dtype=torch.int32, device="cuda"),
+        torch.arange(16, dtype=torch.int32, device="cuda"),
+    )
+    expected = np.sum(
+        np.logical_not(lane_valid_host).astype(np.uint32)
+        * np.left_shift(np.uint32(1), np.arange(16, dtype=np.uint32)),
+        axis=2,
+        dtype=np.uint32,
+    ).astype(np.uint16)
+
+    actual = quality._pack_missing_lane_masks(lane_valid, lane_weights)
+
+    assert actual.dtype == torch.int16
+    assert actual.shape == expected.shape
+    np.testing.assert_array_equal(actual.cpu().numpy().view(np.uint16), expected)
+
+
+def test_native_background_proxy_state_fuses_bits_mask_and_counts() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    coverage = np.asarray([[16, 15, 1, 0]], dtype=np.uint8)
+    repair_bits = np.empty_like(coverage)
+    missing_mask = np.empty_like(coverage)
+
+    missing_lanes, missing_pixels = native_kd._require_native().build_background_proxy_state_into(
+        coverage,
+        repair_bits,
+        missing_mask,
+    )
+
+    assert repair_bits.tolist() == [[0, 0x29, 0x29, 0x2A]]
+    assert missing_mask.tolist() == [[0, 1, 1, 1]]
+    assert missing_lanes == 32
+    assert missing_pixels == 3
 
 
 def test_quality_background_avoids_legacy_global_planner(
@@ -249,6 +566,35 @@ def test_quality_background_avoids_legacy_global_planner(
         assert plan.backend_lane_counts == (0, 0, missing_lanes)
         assert plan.fallback_indexed_donor_count == 0
         assert not np.any(bits & np.uint8(0x40))
+
+
+def test_quality_background_avoids_intermediate_none_repair_bits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    frame = np.full((9, 48, 3), 100, dtype=np.uint8)
+    canonical = np.tile(
+        np.linspace(0.0, 1.0, 24, dtype=np.float32),
+        (5, 1),
+    )
+    monkeypatch.setattr(
+        quality,
+        "_none_repair_bits",
+        lambda _coverage: (_ for _ in ()).throw(
+            AssertionError("background path materialized intermediate None repair bits")
+        ),
+    )
+
+    quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(
+            stereo_strength=5.0,
+            convergence=0.45,
+            occlusion_fill="background",
+        ),
+    )
 
 
 def test_quality_compact_result_releases_dense_eye_plans_before_return() -> None:

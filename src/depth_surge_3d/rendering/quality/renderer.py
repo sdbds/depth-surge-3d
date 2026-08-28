@@ -147,6 +147,13 @@ class _CompactEyeResult:
     hole_runs: HoleRunDiagnostics | None = None
 
 
+@dataclass(frozen=True)
+class _UnrepairedEyeResult:
+    image: np.ndarray
+    coverage_count: np.ndarray
+    hole_runs: HoleRunDiagnostics
+
+
 @dataclass
 class _FrameBandState:
     initial_height: int
@@ -381,11 +388,95 @@ def _accumulate_hole_run_histograms(
     lane_valid: np.ndarray,
     lane_histogram: np.ndarray,
     span_histogram: np.ndarray,
+    coverage_output: np.ndarray | None = None,
 ) -> None:
     native_kd._require_native().accumulate_lane_hole_run_histograms_into(
         lane_valid,
         lane_histogram,
         span_histogram,
+        coverage_output,
+    )
+
+
+def _lane_mask_weights(device: torch.device) -> torch.Tensor:
+    return torch.bitwise_left_shift(
+        torch.ones(HORIZONTAL_SUBPIXELS, dtype=torch.int32, device=device),
+        torch.arange(HORIZONTAL_SUBPIXELS, dtype=torch.int32, device=device),
+    )
+
+
+def _pack_missing_lane_masks(
+    lane_valid: torch.Tensor,
+    lane_weights: torch.Tensor,
+) -> torch.Tensor:
+    valid_masks = torch.sum(
+        lane_valid * lane_weights,
+        dim=2,
+        dtype=torch.int32,
+    )
+    valid_masks.bitwise_xor_(0xFFFF)
+    return valid_masks.to(dtype=torch.int16)
+
+
+def _render_unrepaired_eye_once(
+    *,
+    renderer: StereoRenderer,
+    source: np.ndarray,
+    geometry: QualityGeometryResult,
+    offsets: np.ndarray,
+    band_height: int,
+) -> _UnrepairedEyeResult:
+    height, width = source.shape[:2]
+    output = np.empty_like(source)
+    coverage = np.empty((height, width), dtype=np.uint8)
+    lane_histogram = np.zeros(16 * (width + 1), dtype=np.uint64)
+    span_histogram = np.zeros(width + 1, dtype=np.uint64)
+    native_extension = None
+    lane_weights = None
+    if renderer.device.type == "cuda":
+        native_extension = native_kd._require_native()
+        lane_weights = _lane_mask_weights(renderer.device)
+    for start_row in range(0, height, band_height):
+        end_row = min(height, start_row + band_height)
+        band = _quality_splat(renderer, source, geometry, offsets, start_row, end_row)
+        lane_valid = band.splat.valid.reshape(
+            end_row - start_row,
+            width,
+            HORIZONTAL_SUBPIXELS,
+        )
+        if native_extension is None:
+            lane_valid_host = np.ascontiguousarray(lane_valid.detach().numpy())
+            _accumulate_hole_run_histograms(
+                lane_valid_host,
+                lane_histogram,
+                span_histogram,
+                coverage[start_row:end_row],
+            )
+            del lane_valid_host
+        else:
+            if lane_weights is None:
+                raise AssertionError("CUDA lane-mask weights are unavailable")
+            packed_missing = np.ascontiguousarray(
+                _pack_missing_lane_masks(lane_valid, lane_weights).cpu().numpy().view(np.uint16)
+            )
+            native_extension.accumulate_packed_lane_hole_run_histograms_into(
+                packed_missing,
+                lane_histogram,
+                span_histogram,
+                coverage[start_row:end_row],
+            )
+            del packed_missing
+        downsampled = _downsample_subpixel_band(band.splat.colour)
+        output[start_row:end_row] = _convert_image_band(downsampled, source.dtype)
+        del band, lane_valid, downsampled
+    hole_runs = HoleRunDiagnostics(
+        lane_count_histogram=lane_histogram,
+        touched_pixel_span_histogram=span_histogram,
+    )
+    return _UnrepairedEyeResult(
+        output,
+        coverage,
+        hole_runs,
     )
 
 
@@ -397,39 +488,19 @@ def _render_none_eye_once(
     offsets: np.ndarray,
     band_height: int,
 ) -> _CompactEyeResult:
-    height, width = source.shape[:2]
-    output = np.empty_like(source)
-    coverage = np.empty((height, width), dtype=np.uint8)
-    lane_histogram = np.zeros(16 * (width + 1), dtype=np.uint64)
-    span_histogram = np.zeros(width + 1, dtype=np.uint64)
-    for start_row in range(0, height, band_height):
-        end_row = min(height, start_row + band_height)
-        band = _quality_splat(renderer, source, geometry, offsets, start_row, end_row)
-        lane_valid = band.splat.valid.reshape(
-            end_row - start_row,
-            width,
-            HORIZONTAL_SUBPIXELS,
-        )
-        lane_valid_host = np.ascontiguousarray(lane_valid.detach().cpu().numpy())
-        coverage[start_row:end_row] = lane_valid_host.sum(axis=2).astype(np.uint8)
-        _accumulate_hole_run_histograms(
-            lane_valid_host,
-            lane_histogram,
-            span_histogram,
-        )
-        downsampled = _downsample_subpixel_band(band.splat.colour)
-        output[start_row:end_row] = _convert_image_band(downsampled, source.dtype)
-        del band, lane_valid, lane_valid_host, downsampled
-    hole_runs = HoleRunDiagnostics(
-        lane_count_histogram=lane_histogram,
-        touched_pixel_span_histogram=span_histogram,
+    unrepaired = _render_unrepaired_eye_once(
+        renderer=renderer,
+        source=source,
+        geometry=geometry,
+        offsets=offsets,
+        band_height=band_height,
     )
     return _CompactEyeResult(
-        output,
-        coverage,
-        _none_repair_bits(coverage),
+        unrepaired.image,
+        unrepaired.coverage_count,
+        _none_repair_bits(unrepaired.coverage_count),
         None,
-        hole_runs,
+        unrepaired.hole_runs,
     )
 
 
@@ -512,21 +583,8 @@ def _composite_background_proxy(  # noqa: C901 - validation stays at this bounda
     if not bool(np.any(missing)):
         return np.array(pre_repair, copy=True, order="C")
 
-    visible = coverage > np.uint8(0)
-    proxy_source = np.zeros_like(pre_repair)
-    normalized = pre_repair.astype(np.float32)
-    np.multiply(normalized, np.float32(HORIZONTAL_SUBPIXELS), out=normalized)
-    np.divide(
-        normalized,
-        coverage[:, :, None],
-        out=normalized,
-        where=visible[:, :, None],
-    )
-    proxy_source[visible] = np.clip(
-        np.rint(normalized[visible]),
-        0,
-        255,
-    ).astype(np.uint8)
+    native = native_kd._require_native()
+    proxy_source = native.normalize_background_proxy_source(pre_repair, coverage)
 
     mask = _build_background_proxy_mask(
         coverage,
@@ -543,35 +601,24 @@ def _composite_background_proxy(  # noqa: C901 - validation stays at this bounda
             cv2.INPAINT_TELEA,
         )
 
-    missing_lanes = HORIZONTAL_SUBPIXELS - coverage.astype(np.float32)
-    repaired = pre_repair.astype(np.float32)
-    repaired += proxy.astype(np.float32) * (
-        missing_lanes[:, :, None] / np.float32(HORIZONTAL_SUBPIXELS)
-    )
-    output = np.clip(np.rint(repaired), 0, 255).astype(np.uint8)
-    output[~missing] = pre_repair[~missing]
-    return np.ascontiguousarray(output)
+    return native.composite_background_proxy(pre_repair, coverage, proxy)
 
 
 def _background_proxy_repair_state(
     coverage: np.ndarray,
 ) -> tuple[np.ndarray, QualityRepairPlanSummary]:
-    repair_bits = _none_repair_bits(coverage)
-    missing = coverage < np.uint8(HORIZONTAL_SUBPIXELS)
-    repair_bits[missing] &= np.uint8(~0x40 & 0xFF)
-    repair_bits[missing] |= np.uint8(0x08 | 0x20)
-    missing_lanes = int(
-        np.sum(
-            HORIZONTAL_SUBPIXELS - coverage.astype(np.uint16),
-            dtype=np.uint64,
-        )
+    repair_bits = np.empty_like(coverage)
+    missing = np.empty_like(coverage)
+    missing_lanes, missing_pixels = native_kd._require_native().build_background_proxy_state_into(
+        coverage,
+        repair_bits,
+        missing,
     )
-    missing_pixels = int(np.count_nonzero(missing))
+    missing_lanes = int(missing_lanes)
+    missing_pixels = int(missing_pixels)
     component_count = 0
     if missing_pixels:
-        component_count = (
-            int(cv2.connectedComponents(missing.astype(np.uint8), connectivity=4)[0]) - 1
-        )
+        component_count = int(cv2.connectedComponents(missing, connectivity=4)[0]) - 1
     summary = QualityRepairPlanSummary(
         segment_record_count=component_count,
         segment_table_bytes=component_count * REPAIR_RECORD_DTYPE.itemsize,
@@ -779,7 +826,7 @@ def _render_background_eye(
     pre_repair = _retry_after_oom(
         renderer,
         band_state,
-        _render_none_eye_once,
+        _render_unrepaired_eye_once,
         renderer=renderer,
         source=source,
         geometry=geometry,

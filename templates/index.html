@@ -872,18 +872,18 @@
                     </div>
                     <div class="card-body">
                         <div class="mb-3">
-                            <label class="form-label">Start Time (mm:ss or hh:mm:ss)</label>
+                            <label class="form-label">Start Time (mm:ss.SSS or hh:mm:ss.SSS)</label>
                             <div class="input-group">
-                                <input type="text" class="form-control time-input" id="startTime" placeholder="00:00" value="">
-                                <button class="btn btn-outline-secondary" type="button" id="resetStartTime" title="Reset to 00:00">
+                                <input type="text" class="form-control time-input" id="startTime" placeholder="00:00.000" inputmode="decimal" value="">
+                                <button class="btn btn-outline-secondary" type="button" id="resetStartTime" title="Reset to 00:00.000">
                                     <i class="fas fa-undo"></i> Reset
                                 </button>
                             </div>
                         </div>
                         <div class="mb-3">
-                            <label class="form-label">End Time (mm:ss or hh:mm:ss)</label>
+                            <label class="form-label">End Time (mm:ss.SSS or hh:mm:ss.SSS)</label>
                             <div class="input-group">
-                                <input type="text" class="form-control time-input" id="endTime" placeholder="00:30" value="">
+                                <input type="text" class="form-control time-input" id="endTime" placeholder="Video end" inputmode="decimal" value="">
                                 <button class="btn btn-outline-secondary" type="button" id="resetEndTime" title="Reset to video end">
                                     <i class="fas fa-undo"></i> Reset
                                 </button>
@@ -2130,13 +2130,6 @@
             // Update Step 1 display
             updateStep1Display();
 
-            // Set default end time to video duration only if not already set
-            if (!document.getElementById('endTime').value) {
-                const minutes = Math.floor(info.duration / 60);
-                const seconds = Math.floor(info.duration % 60);
-                document.getElementById('endTime').value = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-            }
-
             // Calculate range info
             updateRangeInfo();
         }
@@ -2223,13 +2216,21 @@
         // Parse time string to seconds
         function timeToSeconds(timeStr) {
             if (!timeStr || timeStr.trim() === '') return null;
-            
-            const parts = timeStr.split(':');
+
+            const parts = timeStr.trim().split(':');
+            const secondsPart = parts[parts.length - 1];
+            if (!/^[+-]?\d+(?:\.\d{1,3})?$/.test(secondsPart)) return null;
+
+            const wholeParts = parts.slice(0, -1);
+            if (!wholeParts.every(part => /^[+-]?\d+$/.test(part))) return null;
+
+            const seconds = Number(secondsPart);
             if (parts.length === 2) {
-                const [minutes, seconds] = parts.map(Number);
+                const minutes = Number(parts[0]);
                 return minutes * 60 + seconds;
             } else if (parts.length === 3) {
-                const [hours, minutes, seconds] = parts.map(Number);
+                const hours = Number(parts[0]);
+                const minutes = Number(parts[1]);
                 return hours * 3600 + minutes * 60 + seconds;
             }
             return null;
@@ -2242,8 +2243,10 @@
             const startTime = document.getElementById('startTime').value;
             const endTime = document.getElementById('endTime').value;
             
-            let startSeconds = timeToSeconds(startTime) || 0;
-            let endSeconds = timeToSeconds(endTime) || currentVideoInfo.duration;
+            const parsedStart = timeToSeconds(startTime);
+            const parsedEnd = timeToSeconds(endTime);
+            const startSeconds = parsedStart ?? 0;
+            const endSeconds = parsedEnd ?? currentVideoInfo.duration;
             
             // Ensure end is after start
             if (endSeconds <= startSeconds) {
@@ -2252,16 +2255,15 @@
             }
             
             const duration = endSeconds - startSeconds;
-            const targetFps = document.getElementById('targetFps').value;
-            const fps = targetFps === 'original' ? currentVideoInfo.fps : parseInt(targetFps);
-            const estimatedFrames = Math.round(duration * fps);
-            
-            // Format duration
-            const durationMinutes = Math.floor(duration / 60);
-            const durationSeconds = Math.floor(duration % 60);
-            const durationStr = `${durationMinutes}:${durationSeconds.toString().padStart(2, '0')}`;
-            
-            document.getElementById('rangeDuration').textContent = durationStr;
+            const fps = Number(currentVideoInfo.fps);
+            const totalFrames = Number(currentVideoInfo.frame_count);
+            const startFrame = Math.max(0, Math.min(Math.floor(startSeconds * fps), totalFrames - 1));
+            const endFrame = parsedEnd === null
+                ? totalFrames
+                : Math.max(startFrame + 1, Math.min(Math.floor(endSeconds * fps), totalFrames));
+            const estimatedFrames = endFrame - startFrame;
+
+            document.getElementById('rangeDuration').textContent = `${duration.toFixed(3)}s`;
             document.getElementById('rangeFrames').textContent = estimatedFrames.toLocaleString();
             document.getElementById('rangeInfo').style.display = 'block';
         }
@@ -2450,22 +2452,18 @@
             }
         });
 
-        // Reset start time to 00:00
+        // Reset start time to the beginning
         document.getElementById('resetStartTime').addEventListener('click', function() {
-            document.getElementById('startTime').value = '00:00';
+            document.getElementById('startTime').value = '00:00.000';
             updateRangeInfo();
             saveSettings();
         });
 
-        // Reset end time to video duration
+        // A blank end time means the end of the source video
         document.getElementById('resetEndTime').addEventListener('click', function() {
-            if (currentVideoInfo) {
-                const minutes = Math.floor(currentVideoInfo.duration / 60);
-                const seconds = Math.floor(currentVideoInfo.duration % 60);
-                document.getElementById('endTime').value = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-                updateRangeInfo();
-                saveSettings();
-            }
+            document.getElementById('endTime').value = '';
+            updateRangeInfo();
+            saveSettings();
         });
 
         // Show progress panel
@@ -2884,38 +2882,6 @@
                 if (titleLabel) titleLabel.textContent = frameTypeLabels[frameType] || 'VR Output';
             }
         }
-
-        // Update range info based on video duration and selected range
-        function updateRangeInfo() {
-            if (!currentVideoInfo) return;
-            
-            const startTime = document.getElementById('startTime').value;
-            const endTime = document.getElementById('endTime').value;
-            
-            // Convert time to seconds for calculation
-            function timeToSeconds(timeStr) {
-                if (!timeStr) return null;
-                const parts = timeStr.split(':').map(Number);
-                if (parts.length === 2) {
-                    return parts[0] * 60 + parts[1]; // mm:ss
-                } else if (parts.length === 3) {
-                    return parts[0] * 3600 + parts[1] * 60 + parts[2]; // hh:mm:ss
-                }
-                return null;
-            }
-            
-            const startSeconds = timeToSeconds(startTime) || 0;
-            const endSeconds = timeToSeconds(endTime) || currentVideoInfo.duration;
-            const duration = Math.max(0, endSeconds - startSeconds);
-            const frameCount = Math.round(duration * currentVideoInfo.fps);
-            
-            // Update display elements if they exist
-            const rangeInfo = document.getElementById('rangeInfo');
-            if (rangeInfo) {
-                rangeInfo.textContent = `${duration.toFixed(1)}s (${frameCount} frames)`;
-            }
-        }
-
 
         // Directory operations
         document.getElementById('openCurrentBatchBtn').addEventListener('click', function() {

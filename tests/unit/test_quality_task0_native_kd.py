@@ -27,7 +27,7 @@ def test_native_extension_is_prebuilt_and_reports_frozen_contract() -> None:
 
     assert native_available(), native_load_error()
     build_info = native_build_info()
-    assert build_info["algorithm"] == "quality-implicit-region-kd-median-of-medians-v1"
+    assert build_info["algorithm"] == "quality-implicit-region-kd-hybrid-nth-element-v2"
     assert build_info["kd_stack_capacity"] == 64
     assert build_info["runtime_jit"] is False
     assert len(build_info["source_sha256"]) == 64
@@ -80,6 +80,16 @@ def test_native_optimized_large_build_is_byte_exact_with_python_oracle() -> None
 
     expected = implicit_kd.build_implicit_region_kd(region_ids, region_count=3)
     actual = _api("build_native_implicit_region_kd")(region_ids, region_count=3)
+
+    assert np.array_equal(actual.member_index, expected.member_index)
+    assert np.array_equal(actual.region_offsets, expected.region_offsets)
+
+
+def test_native_large_single_region_build_is_byte_exact_with_python_oracle() -> None:
+    region_ids = np.ones((31, 37), dtype=np.uint32)
+
+    expected = implicit_kd.build_implicit_region_kd(region_ids, region_count=1)
+    actual = _api("build_native_implicit_region_kd")(region_ids, region_count=1)
 
     assert np.array_equal(actual.member_index, expected.member_index)
     assert np.array_equal(actual.region_offsets, expected.region_offsets)

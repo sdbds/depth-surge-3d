@@ -1084,7 +1084,7 @@ def _update_processing_status_v5(
                 terminal_at=now,
                 frames_processed=info.get(
                     "frames_processed",
-                    current.to_object()["video_properties"]["frame_count"],
+                    current.selected_frame_count,
                 ),
                 cleanup_status=completed_cleanup_status,
                 metric_clamp_summary=_bounded_metric_summary(

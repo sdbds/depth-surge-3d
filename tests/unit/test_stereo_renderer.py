@@ -552,6 +552,25 @@ def test_downsampling_uses_fixed_lane_average_and_ties_to_even() -> None:
     assert converted[0, :, 0].tolist() == [128, 126]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_uint8_conversion_rounds_before_host_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = torch.tensor(
+        [[[-1.0, 0.5, 1.5], [2.5, 254.5, 256.0]]],
+        dtype=torch.float32,
+    )
+    expected = _convert_image_band(values, np.dtype(np.uint8))
+
+    def reject_host_rounding(*_args, **_kwargs):
+        raise AssertionError("CUDA uint8 conversion reached NumPy rounding")
+
+    monkeypatch.setattr(np, "rint", reject_host_rounding)
+    actual = _convert_image_band(values.cuda(), np.dtype(np.uint8))
+
+    assert np.array_equal(actual, expected)
+
+
 def test_none_darkens_partial_coverage_while_background_fills_it() -> None:
     frame = np.full((1, 20, 3), 100, dtype=np.uint8)
     canonical = np.ones((1, 20), dtype=np.float32)

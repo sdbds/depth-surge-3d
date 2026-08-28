@@ -86,6 +86,63 @@ def test_progress_runner_requires_semantic_progress_and_terminal_end() -> None:
     assert parser.ended is True
 
 
+def test_progress_runner_accepts_ffmpeg_negative_audio_priming_time() -> None:
+    parser = FfmpegProgressParser()
+    progress = (
+        "frame=1\n"
+        "out_time_us=-66667\n"
+        "out_time_ms=-66667\n"
+        "progress=end\n"
+    )
+
+    result = run_ffmpeg_progress_v1(
+        [
+            sys.executable,
+            "-c",
+            f"import sys; sys.stdout.write({progress!r}); sys.stdout.flush()",
+        ],
+        parser=parser,
+        diagnostic_cap=1024,
+        line_cap=8192,
+        stall_seconds=1.0,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == b""
+    assert parser.ended is True
+
+
+def test_progress_runner_accepts_temporarily_unavailable_ffmpeg_times() -> None:
+    parser = FfmpegProgressParser()
+    progress = (
+        "frame=0\n"
+        "total_size=44\n"
+        "out_time_us=N/A\n"
+        "out_time_ms=N/A\n"
+        "progress=continue\n"
+        "frame=1\n"
+        "out_time_us=0\n"
+        "out_time_ms=0\n"
+        "progress=end\n"
+    )
+
+    result = run_ffmpeg_progress_v1(
+        [
+            sys.executable,
+            "-c",
+            f"import sys; sys.stdout.write({progress!r}); sys.stdout.flush()",
+        ],
+        parser=parser,
+        diagnostic_cap=1024,
+        line_cap=8192,
+        stall_seconds=1.0,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == b""
+    assert parser.ended is True
+
+
 def test_progress_runner_cancellation_terminates_and_reaps_child() -> None:
     started = time.monotonic()
     with pytest.raises(InterruptedError, match="cancellation"):

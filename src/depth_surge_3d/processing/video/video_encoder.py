@@ -40,6 +40,7 @@ from ...io.reservation_protocol import (
 from ...io.settings_artifact import ProcessingSettingsArtifactV5
 from ...utils.path_utils import (
     calculate_frame_range,
+    format_ffmpeg_time,
     generate_output_filename,
     parse_time_string,
 )
@@ -675,7 +676,7 @@ class VideoEncoder:
                 "schema-5 publication lost its settings authority"
             )
         artifact_value = artifact.to_object()
-        frame_count = artifact_value["video_properties"]["frame_count"]
+        frame_count = artifact.selected_frame_count
         if provider.frame_count != frame_count:
             raise ValueError(
                 "encoding provider frame count differs from durable settings"
@@ -1253,9 +1254,9 @@ class VideoEncoder:
 
         args: list[str] = []
         if clip_start > 0:
-            args.extend(["-ss", f"{clip_start:g}"])
+            args.extend(["-ss", format_ffmpeg_time(clip_start)])
         if end_seconds is not None and end_seconds > clip_start:
-            args.extend(["-t", f"{end_seconds - clip_start:g}"])
+            args.extend(["-t", format_ffmpeg_time(end_seconds - clip_start)])
         args.extend(["-i", str(audio_source)])
         return args
 

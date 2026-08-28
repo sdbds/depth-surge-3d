@@ -309,9 +309,9 @@ Note: V2 uses fixed shot-aware temporal inference; V3, See-Through, and MoGe-2 i
     )
 
     # Time range
-    parser.add_argument("--start", help="Start time (format: HH:MM:SS or seconds)")
+    parser.add_argument("--start", help="Start time: MM:SS.mmm or HH:MM:SS.mmm")
 
-    parser.add_argument("--end", help="End time (format: HH:MM:SS or seconds)")
+    parser.add_argument("--end", help="End time: MM:SS.mmm or HH:MM:SS.mmm")
 
     # Depth and stereo parameters
     parser.add_argument(

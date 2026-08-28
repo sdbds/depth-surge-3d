@@ -4,6 +4,9 @@ import inspect
 import tempfile
 import os
 from pathlib import Path
+
+import pytest
+
 from src.depth_surge_3d.utils.path_utils import (
     parse_time_string,
     calculate_frame_range,
@@ -48,6 +51,20 @@ class TestParseTimeString:
         """Test parsing hh:mm:ss format."""
         result = parse_time_string("01:30:45")
         assert result == 5445.0  # 1 hour + 30 minutes + 45 seconds
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("00:15.001", 15.001),
+            ("01:02.345", 62.345),
+            ("01:02:03.004", 3723.004),
+        ],
+    )
+    def test_parse_millisecond_precision(self, value, expected):
+        assert parse_time_string(value) == pytest.approx(expected)
+
+    def test_parse_rejects_precision_beyond_milliseconds(self):
+        assert parse_time_string("00:15.0001") is None
 
     def test_parse_zero_time(self):
         """Test parsing zero time."""
@@ -170,6 +187,17 @@ class TestCalculateFrameRange:
         )
         assert start == int(10 * 29.97)  # 10 seconds * 29.97 fps
         assert end == 1000
+
+    def test_calculate_with_millisecond_time_range(self):
+        start, end = calculate_frame_range(
+            total_frames=473,
+            fps=30.0,
+            start_time="00:00.500",
+            end_time="00:15.767",
+        )
+
+        assert start == 15
+        assert end == 473
 
     def test_calculate_start_at_last_frame(self):
         """Test that start frame at last frame is clamped correctly."""

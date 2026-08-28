@@ -9,7 +9,8 @@ and stereo output.
 - `input_video`: source video path.
 - `-o, --output-dir`: output root. Default: `./output`.
 - `--resume DIRECTORY`: resume a processing directory.
-- `-s, --start` and `-e, --end`: optional time range.
+- `--start` and `--end`: optional time range in `MM:SS.mmm` or
+  `HH:MM:SS.mmm` form. Whole-second values remain valid.
 - `-f, --format`: `side_by_side` or `over_under`.
 - `--vr-resolution`: named per-eye resolution, `auto`, or `custom`.
 - `--target-fps`: output frame rate. Omit it to preserve the source rate.

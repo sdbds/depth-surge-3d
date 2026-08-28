@@ -159,7 +159,7 @@ class ProcessingOrchestrator:
         value = artifact.to_object()
         cleanup_pending = value["metadata"]["cleanup_status"] == "pending"
         keep_intermediates = bool(value["processing_settings"]["keep_intermediates"])
-        frame_count = value["video_properties"]["frame_count"]
+        frame_count = artifact.selected_frame_count
         metric_summary_value = value["runtime_info"].get("metric_clamp_summary")
         metric_summary = (
             dict(metric_summary_value)
@@ -810,12 +810,13 @@ class ProcessingOrchestrator:
             )
 
         # Finalize and cleanup
-        if progress_tracker and hasattr(progress_tracker, "finish"):
-            progress_tracker.finish("Video processing complete")
         finalized = self._finalize_processing(
             success, output_path, video_path, settings, num_frames
         )
-        return success and finalized is not False
+        completed = success and finalized is not False
+        if completed and progress_tracker and hasattr(progress_tracker, "finish"):
+            progress_tracker.finish("Video processing complete")
+        return completed
 
     def _setup_processing(
         self,

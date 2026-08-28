@@ -82,6 +82,7 @@ from ...rendering.quality.renderer import (
     render_relative_quality_compact,
 )
 from ...rendering.quality.types import (
+    CompactStereoRenderResult,
     MetricStereoPrimitiveInput,
     QualityStereoControls,
     RelativeStereoPrimitiveInput,
@@ -2121,11 +2122,37 @@ class StereoPairGenerator:
                 occlusion_fill=occlusion_fill,
             )
 
+        reuse_exact_quality_input = (
+            render_mode == "quality" and capacity_value == 1 and effective_workers == 1
+        )
+        cached_quality_key: tuple[object, ...] | None = None
+        cached_quality_compact: CompactStereoRenderResult | None = None
+
         def render(decoded):
+            nonlocal cached_quality_key, cached_quality_compact
             if not isinstance(decoded, _ManifestDecodedFrame):
                 raise TypeError("manifest decoder returned an invalid ownership payload")
             work = decoded.work
-            if normalized_geometry == "relative":
+            input_key = (
+                work.guide_sha256,
+                work.guide_byte_count,
+                work.guide_shape,
+                work.geometry_sha256,
+                work.geometry_byte_count,
+                work.geometry_shape,
+            )
+            if (
+                reuse_exact_quality_input
+                and cached_quality_compact is not None
+                and cached_quality_key == input_key
+            ):
+                frame = decoded.take_frame()
+                primitive = decoded.take_primitive()
+                del frame, primitive
+                compact = cached_quality_compact
+            elif normalized_geometry == "relative":
+                cached_quality_key = None
+                cached_quality_compact = None
                 assert isinstance(render_settings, StereoRenderSettings)
                 if render_mode == "quality":
                     compact = render_relative_quality_compact(
@@ -2141,6 +2168,8 @@ class StereoPairGenerator:
                         render_settings,
                     )
             else:
+                cached_quality_key = None
+                cached_quality_compact = None
                 if isinstance(render_settings, QualityStereoControls):
                     compact = render_metric_primitives_compact(
                         renderer=self.renderer,
@@ -2155,6 +2184,9 @@ class StereoPairGenerator:
                         _take_metric_primitive(decoded),
                         render_settings,
                     )
+            if reuse_exact_quality_input and cached_quality_compact is None:
+                cached_quality_key = input_key
+                cached_quality_compact = compact
             if decoded.frame is not None or decoded.primitive is not None:
                 raise RuntimeError("manifest render did not consume decoded ownership")
             del decoded
@@ -2214,6 +2246,8 @@ class StereoPairGenerator:
             pre_mutation=revalidate_disk_admission,
             configured_workers=configured_workers,
         )
+        cached_quality_key = None
+        cached_quality_compact = None
         try:
             validate_stereo_provider_replay(
                 provider,

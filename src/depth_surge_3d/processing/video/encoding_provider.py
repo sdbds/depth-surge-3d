@@ -69,6 +69,12 @@ _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _CUSTOM_RESOLUTION = re.compile(r"^custom:([1-9][0-9]{0,4})x([1-9][0-9]{0,4})$")
 _PROGRESS_KEY = re.compile(rb"^[a-z0-9_]{1,32}$")
 _CANONICAL_U64 = re.compile(rb"^(?:0|[1-9][0-9]*)$")
+_CANONICAL_I64 = re.compile(rb"^(?:0|-?[1-9][0-9]*)$")
+# AAC priming can make FFmpeg report a negative output time before time zero.
+_SIGNED_PROGRESS_TIME_KEYS = frozenset(("out_time_us", "out_time_ms"))
+_UNAVAILABLE_PROGRESS_KEYS = _SIGNED_PROGRESS_TIME_KEYS | {"total_size"}
+_I64_MIN = -(1 << 63)
+_I64_MAX = (1 << 63) - 1
 _FORBIDDEN_FILENAME = frozenset('<>:"/\\|?*')
 _DEVICE_NAMES = frozenset(
     {
@@ -1565,8 +1571,15 @@ def validate_final_probe_streams(  # noqa: C901
         if len(audio_streams) != 1:
             raise FinalContainerValidationError("final AAC stream is missing")
         audio = audio_streams[0]
-        if set(audio) != {"codec_type", "codec_name", "nb_read_frames"}:
+        required_audio_keys = {"codec_type", "codec_name", "nb_read_frames"}
+        audio_keys = set(audio)
+        if audio_keys not in (
+            required_audio_keys,
+            required_audio_keys | {"avg_frame_rate"},
+        ):
             raise FinalContainerValidationError("final audio stream fields are incomplete")
+        if "avg_frame_rate" in audio and audio["avg_frame_rate"] != "0/0":
+            raise FinalContainerValidationError("final audio frame rate is invalid")
         if audio["codec_name"] != "aac":
             raise FinalContainerValidationError("final audio codec differs")
         packet_count = _canonical_decimal(
@@ -1580,11 +1593,35 @@ def validate_final_probe_streams(  # noqa: C901
         raise FinalContainerValidationError("final container has unexpected audio")
 
 
+def _parse_progress_numeric_value(key: str, value: bytes) -> int | None:
+    if value == b"N/A" and key in _UNAVAILABLE_PROGRESS_KEYS:
+        return None
+    if key in _SIGNED_PROGRESS_TIME_KEYS:
+        if not _CANONICAL_I64.fullmatch(value):
+            raise EncodingProgressError("progress numeric value is noncanonical")
+        number = int(value)
+        if not _I64_MIN <= number <= _I64_MAX:
+            raise EncodingProgressError("progress numeric value exceeds i64")
+        return number
+
+    if not _CANONICAL_U64.fullmatch(value):
+        raise EncodingProgressError("progress numeric value is noncanonical")
+    number = int(value)
+    if number > 0xFFFFFFFFFFFFFFFF:
+        raise EncodingProgressError("progress numeric value exceeds u64")
+    return number
+
+
 class FfmpegProgressParser:
     """Incremental legal-line parser with semantic stall-reset reporting."""
 
     def __init__(self) -> None:
-        self.maximums = {key: -1 for key in ("frame", "out_time_us", "out_time_ms", "total_size")}
+        self.maximums = {
+            "frame": -1,
+            "out_time_us": _I64_MIN - 1,
+            "out_time_ms": _I64_MIN - 1,
+            "total_size": -1,
+        }
         self.ended = False
 
     def feed_line(self, raw_line: bytes) -> bool:  # noqa: C901
@@ -1605,13 +1642,9 @@ class FfmpegProgressParser:
             raise EncodingProgressError("progress line syntax is invalid")
         decoded_key = key.decode("ascii")
         if decoded_key in self.maximums:
-            if decoded_key == "total_size" and value == b"N/A":
+            number = _parse_progress_numeric_value(decoded_key, value)
+            if number is None:
                 return False
-            if not _CANONICAL_U64.fullmatch(value):
-                raise EncodingProgressError("progress numeric value is noncanonical")
-            number = int(value)
-            if number > 0xFFFFFFFFFFFFFFFF:
-                raise EncodingProgressError("progress numeric value exceeds u64")
             increased = number > self.maximums[decoded_key]
             self.maximums[decoded_key] = max(self.maximums[decoded_key], number)
             return increased
@@ -1635,7 +1668,11 @@ class FinalDecodeProgressParser(FfmpegProgressParser):
     _VALUE_CAP = 256
 
     def __init__(self) -> None:
-        self.maximums = {key: -1 for key in ("frame", "out_time_us", "out_time_ms")}
+        self.maximums = {
+            "frame": -1,
+            "out_time_us": _I64_MIN - 1,
+            "out_time_ms": _I64_MIN - 1,
+        }
         self.ended = False
 
     def feed_line(self, raw_line: bytes) -> bool:
@@ -1660,11 +1697,9 @@ class FinalDecodeProgressParser(FfmpegProgressParser):
             raise EncodingProgressError("progress line syntax is invalid")
         decoded_key = key.decode("ascii")
         if decoded_key in self.maximums:
-            if not _CANONICAL_U64.fullmatch(value):
-                raise EncodingProgressError("progress numeric value is noncanonical")
-            number = int(value)
-            if number > 0xFFFFFFFFFFFFFFFF:
-                raise EncodingProgressError("progress numeric value exceeds u64")
+            number = _parse_progress_numeric_value(decoded_key, value)
+            if number is None:
+                return False
             increased = number > self.maximums[decoded_key]
             self.maximums[decoded_key] = max(self.maximums[decoded_key], number)
             return increased
