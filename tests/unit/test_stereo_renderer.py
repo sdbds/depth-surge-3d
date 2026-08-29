@@ -103,6 +103,61 @@ def test_band_height_uses_measured_sixteen_sample_bound() -> None:
     assert calculate_band_height(16, 3) == 3
 
 
+def test_fast_compact_triton_path_uses_taller_memory_bounded_bands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    height, width = 12, 4
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    geometry = build_relative_geometry(
+        np.full((height, width), 0.5, dtype=np.float32),
+        (height, width),
+        stereo_strength=2.0,
+        convergence=0.5,
+    )
+    eye_offsets = (
+        np.zeros((height, width), dtype=np.int32),
+        np.zeros((height, width), dtype=np.int32),
+    )
+    renderer = StereoRenderer(
+        device="cuda",
+        temporary_budget_bytes=width * SPLAT_BYTES_PER_PIXEL * 9,
+    )
+    attempted_heights: list[int] = []
+
+    monkeypatch.setattr(
+        stereo_renderer_module,
+        "_triton_splat_available",
+        lambda _device: True,
+        raising=False,
+    )
+
+    def capture_band_height(
+        _source,
+        _geometry,
+        _eye_offsets,
+        _settings,
+        band_height,
+        *,
+        metric_stats=None,
+    ):
+        attempted_heights.append(band_height)
+        return metric_stats
+
+    monkeypatch.setattr(renderer, "_render_fast_compact_with_band_height", capture_band_height)
+
+    marker = object()
+    result = renderer._render_fast_compact_core(
+        frame,
+        geometry,
+        eye_offsets,
+        StereoSplatSettings(max_eye_shift_fraction=0.01),
+        metric_stats=marker,
+    )
+
+    assert result is marker
+    assert attempted_heights == [10]
+
+
 def test_renderer_rejects_full_frame_source_indexes_that_do_not_fit_uint32() -> None:
     source = np.broadcast_to(
         np.zeros((1, 1, 3), dtype=np.uint8),
@@ -135,6 +190,62 @@ def test_full_frame_eye_offsets_use_host_float64_and_int32_storage() -> None:
     assert right[0, :3].tolist() == [extreme_offset, -extreme_offset, 0]
 
 
+def test_relative_eye_offsets_avoid_full_frame_numpy_float64_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    numpy_module = np
+
+    class NumpyProxy:
+        def __getattr__(self, name: str):
+            return getattr(numpy_module, name)
+
+        @staticmethod
+        def asarray(values, dtype=None):
+            if dtype == numpy_module.float64 and getattr(values, "ndim", 0) == 2:
+                raise AssertionError("full-frame NumPy float64 materialization")
+            return numpy_module.asarray(values, dtype=dtype)
+
+    canonical = torch.tensor(
+        [[0.0, 0.23064221441745758, 0.5, 1.0]],
+        dtype=torch.float32,
+    )
+    settings = StereoRenderSettings(
+        stereo_strength=0.473053267491137,
+        convergence=0.05202130106440961,
+    )
+    monkeypatch.setattr(stereo_renderer_module, "np", NumpyProxy())
+
+    left, right = calculate_eye_sample_offsets(canonical, settings)
+
+    assert left.tolist() == [[0, 0, 0, 0]]
+    assert right.tolist() == [[0, 0, 0, 0]]
+
+
+def test_relative_eye_offsets_match_the_numpy_float64_operation_order() -> None:
+    generator = np.random.default_rng(20260830)
+    canonical = generator.random((17, 59), dtype=np.float32)
+    settings = StereoRenderSettings(
+        stereo_strength=4.731,
+        convergence=0.3719,
+    )
+    canonical64 = np.asarray(canonical, dtype=np.float64)
+    scale64 = np.float64(canonical.shape[1]) * np.float64(settings.stereo_strength)
+    scale64 /= np.float64(200.0)
+    fine_shift64 = canonical64 - np.float64(settings.convergence)
+    fine_shift64 *= scale64
+    fine_shift64 *= np.float64(HORIZONTAL_SUBPIXELS)
+    expected_left = np.ascontiguousarray(np.ceil(fine_shift64 - np.float64(0.5)).astype(np.int32))
+    expected_right = np.ascontiguousarray(np.ceil(-fine_shift64 - np.float64(0.5)).astype(np.int32))
+
+    actual_left, actual_right = calculate_eye_sample_offsets(
+        torch.from_numpy(canonical),
+        settings,
+    )
+
+    assert np.array_equal(actual_left, expected_left)
+    assert np.array_equal(actual_right, expected_right)
+
+
 def test_geometry_eye_offsets_use_total_disparity_fraction_directly() -> None:
     left, right = calculate_geometry_eye_sample_offsets(
         np.array([[-0.25, 0.0, 0.25]], dtype=np.float64)
@@ -144,6 +255,44 @@ def test_geometry_eye_offsets_use_total_disparity_fraction_directly() -> None:
     assert left.flags.c_contiguous and right.flags.c_contiguous
     assert left.tolist() == [[-6, 0, 6]]
     assert right.tolist() == [[6, 0, -6]]
+
+
+def test_geometry_eye_offsets_avoid_full_frame_numpy_float64_working_plane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    numpy_module = np
+
+    class NumpyProxy:
+        def __getattr__(self, name: str):
+            return getattr(numpy_module, name)
+
+        @staticmethod
+        def asarray(values, dtype=None):
+            if dtype == numpy_module.float64 and getattr(values, "ndim", 0) == 2:
+                raise AssertionError("full-frame NumPy float64 working plane")
+            return numpy_module.asarray(values, dtype=dtype)
+
+    total = np.array([[-0.25, 0.0, 0.25]], dtype=np.float64)
+    monkeypatch.setattr(stereo_renderer_module, "np", NumpyProxy())
+
+    left, right = calculate_geometry_eye_sample_offsets(total)
+
+    assert left.tolist() == [[-6, 0, 6]]
+    assert right.tolist() == [[6, 0, -6]]
+
+
+def test_geometry_eye_offsets_match_the_numpy_float64_operation_order() -> None:
+    generator = np.random.default_rng(20260830)
+    total = generator.uniform(-0.05, 0.05, size=(13, 61)).astype(np.float64)
+    fine_shift = total * np.float64(total.shape[1]) * np.float64(0.5)
+    fine_shift *= np.float64(HORIZONTAL_SUBPIXELS)
+    expected_left = np.ascontiguousarray(np.ceil(fine_shift - np.float64(0.5)).astype(np.int32))
+    expected_right = np.ascontiguousarray(np.ceil(-fine_shift - np.float64(0.5)).astype(np.int32))
+
+    actual_left, actual_right = calculate_geometry_eye_sample_offsets(total)
+
+    assert np.array_equal(actual_left, expected_left)
+    assert np.array_equal(actual_right, expected_right)
 
 
 def test_legacy_and_common_offsets_keep_their_distinct_half_lane_rounding() -> None:
@@ -672,6 +821,240 @@ def test_fast_compact_uses_native_lane_analysis_and_reports_timings(
     assert result.right_coverage_count.shape == frame.shape[:2]
     assert result.left_hole_runs is not None
     assert result.right_hole_runs is not None
+
+
+def test_fast_compact_skips_redundant_device_value_scans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = np.full((2, 5, 3), 127, dtype=np.uint8)
+    canonical = np.linspace(0.0, 1.0, 10, dtype=np.float32).reshape(2, 5)
+
+    def reject_near_score_scan(*_args, **_kwargs):
+        raise AssertionError("Fast compact rendering repeated near-score validation")
+
+    monkeypatch.setattr(
+        "src.depth_surge_3d.rendering.forward_splat._validate_near_score",
+        reject_near_score_scan,
+    )
+
+    result = StereoRenderer(device="cpu").render_relative_fast_compact(
+        frame,
+        canonical,
+        StereoRenderSettings(occlusion_fill="none"),
+    )
+
+    assert result.left_image.shape == frame.shape
+    assert result.right_image.shape == frame.shape
+
+
+def test_fast_compact_rejects_nonfinite_downsampled_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = np.full((1, 3, 3), 127, dtype=np.uint8)
+    canonical = np.full((1, 3), 0.5, dtype=np.float32)
+    original_downsample = stereo_renderer_module._downsample_subpixel_band
+
+    def inject_nonfinite(colour: torch.Tensor) -> torch.Tensor:
+        result = original_downsample(colour).clone()
+        result[0, 0, 0] = torch.nan
+        return result
+
+    monkeypatch.setattr(
+        stereo_renderer_module,
+        "_downsample_subpixel_band",
+        inject_nonfinite,
+    )
+
+    with pytest.raises(ValueError, match="Rendered image contains non-finite values"):
+        StereoRenderer(device="cpu").render_relative_fast_compact(
+            frame,
+            canonical,
+            StereoRenderSettings(occlusion_fill="none"),
+        )
+
+
+def test_fast_compact_reuses_one_preloaded_device_frame_for_both_eyes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator = np.random.default_rng(20260829)
+    frame = generator.integers(0, 256, size=(3, 7, 3), dtype=np.uint8)
+    canonical = generator.random((3, 7), dtype=np.float32)
+    settings = StereoRenderSettings(
+        stereo_strength=3.25,
+        convergence=0.41,
+        occlusion_fill="background",
+    )
+    geometry = build_relative_geometry(
+        canonical,
+        frame.shape[:2],
+        stereo_strength=settings.stereo_strength,
+        convergence=settings.convergence,
+    )
+    offsets = calculate_eye_sample_offsets(
+        torch.from_numpy(np.array(geometry.near_score, copy=True, order="C")),
+        settings,
+    )
+    renderer = StereoRenderer(
+        device="cpu",
+        temporary_budget_bytes=7 * SPLAT_BYTES_PER_PIXEL,
+    )
+    splat_settings = StereoSplatSettings(
+        max_eye_shift_fraction=settings.stereo_strength / 200.0,
+        occlusion_fill=settings.occlusion_fill,
+    )
+    expected = renderer._render_fast_compact_with_band_height(
+        frame,
+        geometry,
+        offsets,
+        splat_settings,
+        1,
+    )
+    device_frame = stereo_renderer_module._FastDeviceFrame(
+        source=torch.from_numpy(frame),
+        near_score=torch.from_numpy(np.array(geometry.near_score, copy=True, order="C")),
+        source_valid=torch.from_numpy(np.array(geometry.source_valid, copy=True, order="C")),
+    )
+    device_offsets = tuple(torch.from_numpy(values) for values in offsets)
+    preload_calls = 0
+
+    def fake_preload(*_args, **_kwargs):
+        nonlocal preload_calls
+        preload_calls += 1
+        return device_frame, device_offsets
+
+    monkeypatch.setattr(renderer, "_preload_fast_device_frame", fake_preload)
+
+    def reject_host_transfer(*_args, **_kwargs):
+        raise AssertionError("preloaded Fast eye performed a host transfer")
+
+    monkeypatch.setattr(stereo_renderer_module.torch, "from_numpy", reject_host_transfer)
+    actual = renderer._render_fast_compact_with_band_height(
+        frame,
+        geometry,
+        offsets,
+        splat_settings,
+        1,
+    )
+
+    assert preload_calls == 1
+    for name in (
+        "left_image",
+        "right_image",
+        "left_coverage_count",
+        "right_coverage_count",
+        "left_repair_bits",
+        "right_repair_bits",
+    ):
+        assert np.array_equal(getattr(actual, name), getattr(expected, name))
+    for eye in ("left", "right"):
+        actual_diagnostics = getattr(actual, f"{eye}_fast_diagnostics")
+        expected_diagnostics = getattr(expected, f"{eye}_fast_diagnostics")
+        assert actual_diagnostics is not None and expected_diagnostics is not None
+        assert np.array_equal(
+            actual_diagnostics.hole_runs.lane_count_histogram,
+            expected_diagnostics.hole_runs.lane_count_histogram,
+        )
+        assert np.array_equal(
+            actual_diagnostics.hole_runs.touched_pixel_span_histogram,
+            expected_diagnostics.hole_runs.touched_pixel_span_histogram,
+        )
+        assert (
+            actual_diagnostics.local_filled_lane_count
+            == expected_diagnostics.local_filled_lane_count
+        )
+        assert (
+            actual_diagnostics.final_unresolved_lane_count
+            == expected_diagnostics.final_unresolved_lane_count
+        )
+
+
+def test_fast_device_preload_oom_releases_memory_and_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = np.zeros((2, 3, 3), dtype=np.uint8)
+    geometry = build_relative_geometry(
+        np.full((2, 3), 0.5, dtype=np.float32),
+        frame.shape[:2],
+        stereo_strength=2.0,
+        convergence=0.5,
+    )
+    offsets = (
+        np.zeros((2, 3), dtype=np.int32),
+        np.zeros((2, 3), dtype=np.int32),
+    )
+    renderer = StereoRenderer(device="cpu")
+    renderer.device = torch.device("cuda")
+    release_calls = 0
+
+    class FailedTransfer:
+        @staticmethod
+        def to(_device):
+            raise torch.cuda.OutOfMemoryError("simulated preload OOM")
+
+    def record_release() -> None:
+        nonlocal release_calls
+        release_calls += 1
+
+    monkeypatch.setattr(
+        stereo_renderer_module.torch,
+        "from_numpy",
+        lambda _values: FailedTransfer(),
+    )
+    monkeypatch.setattr(renderer, "_release_after_oom", record_release)
+
+    assert renderer._preload_fast_device_frame(frame, geometry, offsets) is None
+    assert release_calls == 1
+
+
+def test_fast_band_oom_retry_disables_full_frame_preload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = np.zeros((4, 3, 3), dtype=np.uint8)
+    geometry = build_relative_geometry(
+        np.full((4, 3), 0.5, dtype=np.float32),
+        frame.shape[:2],
+        stereo_strength=2.0,
+        convergence=0.5,
+    )
+    offsets = (
+        np.zeros((4, 3), dtype=np.int32),
+        np.zeros((4, 3), dtype=np.int32),
+    )
+    renderer = StereoRenderer(
+        device="cpu",
+        temporary_budget_bytes=4 * 3 * SPLAT_BYTES_PER_PIXEL,
+    )
+    calls: list[tuple[int, bool]] = []
+    expected = object()
+
+    def render_with_band(
+        *_args,
+        preload_device_frame: bool = True,
+        **_kwargs,
+    ):
+        band_height = int(_args[4])
+        calls.append((band_height, preload_device_frame))
+        if len(calls) == 1:
+            raise torch.cuda.OutOfMemoryError("preload left no room for band scratch")
+        return expected
+
+    monkeypatch.setattr(
+        renderer,
+        "_render_fast_compact_with_band_height",
+        render_with_band,
+    )
+    monkeypatch.setattr(renderer, "_release_after_oom", lambda: None)
+    monkeypatch.setattr(stereo_renderer_module, "_triton_splat_available", lambda _device: False)
+
+    actual = renderer._render_fast_compact_core(
+        frame,
+        geometry,
+        offsets,
+        StereoSplatSettings(max_eye_shift_fraction=0.01),
+    )
+
+    assert actual is expected
+    assert calls == [(4, True), (2, False)]
 
 
 def test_fast_compact_native_diagnostics_match_scalar_fallback(

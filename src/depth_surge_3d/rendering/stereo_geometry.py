@@ -272,10 +272,11 @@ def build_relative_geometry(
         raise ValueError("convergence must be finite and within [0, 1]")
 
     resized = _resize_float32_bilinear(canonical, render_shape)
-    near64 = np.asarray(resized, dtype=np.float64)
-    total = near64 - np.float64(convergence)
-    total *= np.float64(stereo_strength)
-    total /= np.float64(100.0)
+    total_tensor = torch.from_numpy(resized).to(dtype=torch.float64)
+    total_tensor.sub_(float(np.float64(convergence)))
+    total_tensor.mul_(float(np.float64(stereo_strength)))
+    total_tensor.div_(float(np.float64(100.0)))
+    total = total_tensor.numpy()
     return StereoGeometryFrame(
         near_score=np.ascontiguousarray(resized, dtype=np.float32),
         total_disparity_fraction=np.ascontiguousarray(total, dtype=np.float64),

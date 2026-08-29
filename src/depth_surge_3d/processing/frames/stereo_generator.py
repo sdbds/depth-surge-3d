@@ -68,6 +68,7 @@ from ...rendering.quality.diagnostic_transaction import (
     prepare_quality_frame,
     publish_quality_frame,
     StreamingDiagnosticsStageContext,
+    TransientDiagnosticsSpool,
     begin_streaming_diagnostics_stage,
     classify_streaming_diagnostics_root,
     classify_streaming_diagnostics_frame,
@@ -1651,6 +1652,9 @@ class StereoPairGenerator:
         directories: dict[str, Path],
         settings: dict[str, Any],
         progress_tracker=None,
+        *,
+        frame_consumer: Callable[[str, np.ndarray, np.ndarray], None] | None = None,
+        frame_consumer_memory_bytes: int = 0,
     ) -> bool:
         """Restart transient source changes only while the stage is read-only."""
 
@@ -1670,6 +1674,8 @@ class StereoPairGenerator:
                         directories,
                         settings,
                         progress_tracker,
+                        frame_consumer=frame_consumer,
+                        frame_consumer_memory_bytes=frame_consumer_memory_bytes,
                     )
                 except StereoInputIdentityMismatch as error:
                     raise StereoProviderChangedError(str(error)) from error
@@ -1686,6 +1692,9 @@ class StereoPairGenerator:
         directories: dict[str, Path],
         settings: dict[str, Any],
         progress_tracker=None,
+        *,
+        frame_consumer: Callable[[str, np.ndarray, np.ndarray], None] | None = None,
+        frame_consumer_memory_bytes: int = 0,
     ) -> bool:
         """Render one validated durable upstream stereo sequence."""
 
@@ -1714,6 +1723,24 @@ class StereoPairGenerator:
         )
         if render_mode not in {"fast", "quality"}:
             raise ValueError("stereo render mode must be Fast or Quality")
+
+        transient_output = frame_consumer is not None
+        if (
+            isinstance(frame_consumer_memory_bytes, bool)
+            or not isinstance(frame_consumer_memory_bytes, int)
+            or frame_consumer_memory_bytes < 0
+        ):
+            raise ValueError("frame consumer memory bound must be a nonnegative integer")
+        if not transient_output and frame_consumer_memory_bytes:
+            raise ValueError("frame consumer memory bound requires a frame consumer")
+        if transient_output and (
+            render_mode != "quality"
+            or expected_manifest_mode != "relative"
+            or bool(settings.get("keep_intermediates", True))
+        ):
+            raise ValueError(
+                "transient stereo output requires relative Quality without intermediates"
+            )
 
         left_dir = Path(directories["left_frames"])
         right_dir = Path(directories["right_frames"])
@@ -1775,13 +1802,16 @@ class StereoPairGenerator:
         )
         metadata_path = left_dir / "metadata.json"
         content_path = adopted.job_root / "04_stereo_diagnostics" / "quality_input_manifest.json"
-        with AcquiredRoot(adopted.job_root) as acquired:
-            stage_changed = not stage_document.matches(metadata_path, acquired=acquired)
-            if quality_content is not None:
-                stage_changed = stage_changed or not quality_content.matches(
-                    content_path,
-                    acquired=acquired,
-                )
+        if transient_output:
+            stage_changed = True
+        else:
+            with AcquiredRoot(adopted.job_root) as acquired:
+                stage_changed = not stage_document.matches(metadata_path, acquired=acquired)
+                if quality_content is not None:
+                    stage_changed = stage_changed or not quality_content.matches(
+                        content_path,
+                        acquired=acquired,
+                    )
         diagnostics_root_state = (
             "unclaimed"
             if stage_changed
@@ -1903,22 +1933,26 @@ class StereoPairGenerator:
             revalidate_output_actions()
             return True
 
-        disk_plan = _build_stereo_stage_disk_plan(
-            provider=provider,
-            control=control,
-            job_root=adopted.job_root,
-            render_shape=render_shape,
-            render_mode=render_mode,
-            geometry_mode=normalized_geometry,
-            keep_masks=keep_masks,
-            left_dir=left_dir,
-            stage_document=stage_document,
-            quality_content=quality_content,
-        )
-        admit_stereo_stage_disk(disk_plan)
+        disk_plan = None
+        if not transient_output:
+            disk_plan = _build_stereo_stage_disk_plan(
+                provider=provider,
+                control=control,
+                job_root=adopted.job_root,
+                render_shape=render_shape,
+                render_mode=render_mode,
+                geometry_mode=normalized_geometry,
+                keep_masks=keep_masks,
+                left_dir=left_dir,
+                stage_document=stage_document,
+                quality_content=quality_content,
+            )
+            admit_stereo_stage_disk(disk_plan)
 
         def revalidate_disk_admission() -> None:
             revalidate_output_actions()
+            if transient_output:
+                return
             revalidated = _build_stereo_stage_disk_plan(
                 provider=provider,
                 control=control,
@@ -1984,7 +2018,10 @@ class StereoPairGenerator:
                         pending_render_count=control.render_count,
                         quality_active_scratch=quality_active_scratch,
                         quality_slot_bytes=quality_slot_bytes,
-                        retained_bytes=(retained_cache_bytes if reuse_exact_quality_input else 0),
+                        retained_bytes=(
+                            frame_consumer_memory_bytes
+                            + (retained_cache_bytes if reuse_exact_quality_input else 0)
+                        ),
                     )
                 except StereoControlBudgetError:
                     if not reuse_exact_quality_input:
@@ -1995,6 +2032,7 @@ class StereoPairGenerator:
                         pending_render_count=control.render_count,
                         quality_active_scratch=quality_active_scratch,
                         quality_slot_bytes=quality_slot_bytes,
+                        retained_bytes=frame_consumer_memory_bytes,
                     )
                 capacity_value = selection.capacity
                 effective_workers = selection.effective_workers
@@ -2016,12 +2054,16 @@ class StereoPairGenerator:
             capacity_value = selection.capacity
             effective_workers = selection.effective_workers
             writer_workers = effective_workers
+        if transient_output and writer_workers:
+            writer_workers = 1
         mutation_started = False
+        transient_diagnostics: TransientDiagnosticsSpool | None = None
 
         def begin_mutation() -> None:
-            nonlocal mutation_started
-            left_dir.mkdir(parents=True, exist_ok=True)
-            right_dir.mkdir(parents=True, exist_ok=True)
+            nonlocal mutation_started, transient_diagnostics
+            if not transient_output:
+                left_dir.mkdir(parents=True, exist_ok=True)
+                right_dir.mkdir(parents=True, exist_ok=True)
             diagnostics_root = adopted.job_root / "04_stereo_diagnostics"
             diagnostics_frames = diagnostics_root / "frames"
             downstream = self._downstream_stage_directories(directories)
@@ -2127,8 +2169,11 @@ class StereoPairGenerator:
                         )
             if quality_content is not None:
                 quality_content.publish(content_path)
-            stage_document.publish(metadata_path)
-            begin_streaming_diagnostics_stage(diagnostics_context)
+            if transient_output:
+                transient_diagnostics = TransientDiagnosticsSpool(diagnostics_context)
+            else:
+                stage_document.publish(metadata_path)
+                begin_streaming_diagnostics_stage(diagnostics_context)
 
         quality_cache_lock = threading.Lock()
         cached_quality_key: tuple[object, ...] | None = None
@@ -2387,7 +2432,22 @@ class StereoPairGenerator:
 
         def write(write_item: _WriteItem) -> None:
             nonlocal committed
-            _write_pair(write_item)
+            if transient_output:
+                publication = write_item.quality_publication
+                if publication is None or transient_diagnostics is None:
+                    raise RuntimeError("transient Quality writer lacks prepared diagnostics")
+                assert frame_consumer is not None
+                frame_consumer(
+                    write_item.work.frame_name,
+                    publication.left_image,
+                    publication.right_image,
+                )
+                transient_diagnostics.append(
+                    write_item.work.frame_name,
+                    publication.stats_raw,
+                )
+            else:
+                _write_pair(write_item)
             with progress_lock:
                 committed += 1
                 self._report_progress(
@@ -2395,24 +2455,30 @@ class StereoPairGenerator:
                     processed=committed,
                     total=progress_total,
                     work_index=write_item.work.index,
-                    left_path=write_item.work.left_path,
+                    left_path=(None if transient_output else write_item.work.left_path),
                 )
 
         preflight_seconds = time.perf_counter() - stage_started
         pipeline_started = time.perf_counter()
-        self.last_pipeline_stats = run_streaming_stereo_pipeline(
-            provider=provider,
-            plan=control,
-            capacity=capacity_value,
-            effective_workers=effective_workers,
-            writer_workers=writer_workers,
-            decode=decode,
-            render=render,
-            write=write,
-            mutation=begin_mutation,
-            pre_mutation=revalidate_disk_admission,
-            configured_workers=configured_workers,
-        )
+        try:
+            self.last_pipeline_stats = run_streaming_stereo_pipeline(
+                provider=provider,
+                plan=control,
+                capacity=capacity_value,
+                effective_workers=effective_workers,
+                writer_workers=writer_workers,
+                decode=decode,
+                render=render,
+                write=cast(Callable[[object], None], write),
+                mutation=begin_mutation,
+                pre_mutation=revalidate_disk_admission,
+                configured_workers=configured_workers,
+                ordered_render=transient_output,
+            )
+        except BaseException:
+            if transient_diagnostics is not None:
+                transient_diagnostics.abort()
+            raise
         pipeline_seconds = time.perf_counter() - pipeline_started
         consolidation_started = time.perf_counter()
         cached_quality_key = None
@@ -2441,6 +2507,8 @@ class StereoPairGenerator:
             if mask_prune_required:
                 prune_streaming_unreferenced_masks(diagnostics_context)
         except StereoInputIdentityMismatch as error:
+            if transient_diagnostics is not None:
+                transient_diagnostics.abort()
             raise StereoStageInputChangedError(str(error)) from error
         try:
             if quality_content is not None:
@@ -2451,23 +2519,42 @@ class StereoPairGenerator:
                 ):
                     raise ValueError("Quality input content changed after mutation")
         except (StereoInputIdentityMismatch, OSError, TypeError, ValueError) as error:
+            if transient_diagnostics is not None:
+                transient_diagnostics.abort()
             raise StereoStageInputChangedError(str(error)) from error
-        validate_stereo_provider_replay(
-            provider,
-            control,
-            mutation_started=True,
-        )
         try:
-            completion = complete_streaming_diagnostics_stage(
-                diagnostics_context,
-                before_complete_publish=lambda: validate_stereo_provider_replay(
-                    provider,
-                    control,
-                    mutation_started=True,
-                ),
+            validate_stereo_provider_replay(
+                provider,
+                control,
+                mutation_started=True,
             )
+            if transient_output:
+                if transient_diagnostics is None:
+                    raise RuntimeError("transient diagnostics were not initialized")
+                completion = transient_diagnostics.complete(
+                    before_complete_publish=lambda: validate_stereo_provider_replay(
+                        provider,
+                        control,
+                        mutation_started=True,
+                    ),
+                )
+            else:
+                completion = complete_streaming_diagnostics_stage(
+                    diagnostics_context,
+                    before_complete_publish=lambda: validate_stereo_provider_replay(
+                        provider,
+                        control,
+                        mutation_started=True,
+                    ),
+                )
         except StereoInputIdentityMismatch as error:
+            if transient_diagnostics is not None:
+                transient_diagnostics.abort()
             raise StereoStageInputChangedError(str(error)) from error
+        except BaseException:
+            if transient_diagnostics is not None:
+                transient_diagnostics.abort()
+            raise
         if normalized_geometry == "metric":
             summary = completion.summary.value
             assert isinstance(summary, dict)

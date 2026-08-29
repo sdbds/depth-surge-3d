@@ -371,6 +371,280 @@ def run_ffmpeg_progress_v1(  # noqa: C901
     )
 
 
+class FfmpegInputPipeProcessV1:
+    """Feed a child stdin while bounded threads drain FFmpeg output pipes."""
+
+    def __init__(
+        self,
+        *,
+        parser: ProgressLineParser,
+        diagnostic_cap: int,
+        line_cap: int,
+        stall_seconds: float,
+        terminate_grace_seconds: float = 5.0,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> None:
+        if diagnostic_cap < 0 or line_cap <= 0:
+            raise ValueError("input-pipe process caps are invalid")
+        if stall_seconds <= 0 or terminate_grace_seconds <= 0:
+            raise ValueError("input-pipe process deadlines must be positive")
+        self.parser = parser
+        self.diagnostic_cap = diagnostic_cap
+        self.line_cap = line_cap
+        self.stall_seconds = stall_seconds
+        self.terminate_grace_seconds = terminate_grace_seconds
+        self.cancelled = cancelled
+        self._process: subprocess.Popen[bytes] | None = None
+        self._progress: _ProgressState | None = None
+        self._diagnostics: _CapturedStream | None = None
+        self._drain_threads: list[threading.Thread] = []
+        self._watchdog_thread: threading.Thread | None = None
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._operation_active = threading.Event()
+        self._state_lock = threading.Lock()
+        self._termination_lock = threading.Lock()
+        self._last_input_progress = 0.0
+        self._failure: BaseException | None = None
+        self._closed = False
+
+    def start(self, arguments: Sequence[str]) -> None:
+        if not arguments:
+            raise ValueError("input-pipe process arguments cannot be empty")
+        if self._process is not None:
+            raise RuntimeError("input-pipe process has already been started")
+        process = subprocess.Popen(
+            list(arguments),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+        started = time.monotonic()
+        self._process = process
+        self._last_input_progress = started
+        self._progress = _ProgressState(self.parser, self.line_cap, started)
+        self._diagnostics = _CapturedStream(
+            self.diagnostic_cap,
+            "stderr",
+            bytearray(),
+        )
+        self._drain_threads = [
+            threading.Thread(
+                target=_drain_progress,
+                args=(process.stdout, self._progress, self._wake),
+                name="ffmpeg-input-progress-stdout",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_drain_capture,
+                args=(process.stderr, self._diagnostics, self._wake),
+                name="ffmpeg-input-progress-stderr",
+                daemon=True,
+            ),
+        ]
+        for thread in self._drain_threads:
+            thread.start()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog,
+            name="ffmpeg-input-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+
+    def _set_failure(self, error: BaseException) -> BaseException:
+        with self._state_lock:
+            if self._failure is None:
+                self._failure = error
+            selected = self._failure
+        self._wake.set()
+        return selected
+
+    def _current_failure(self) -> BaseException | None:
+        progress = self._progress
+        diagnostics = self._diagnostics
+        if progress is not None and progress.error is not None:
+            error = progress.error
+            if not isinstance(error, BoundedProcessError):
+                error = ProcessPipeError("progress parser failed")
+            return self._set_failure(error)
+        if diagnostics is not None and diagnostics.error is not None:
+            return self._set_failure(ProcessPipeError("FFmpeg diagnostic drain failed"))
+        if diagnostics is not None and diagnostics.overflow:
+            return self._set_failure(
+                ProcessOutputBudgetError(f"stderr exceeded its {diagnostics.cap}-byte cap")
+            )
+        with self._state_lock:
+            return self._failure
+
+    def _terminate(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        with self._termination_lock:
+            _terminate_and_reap(
+                process,
+                grace_seconds=self.terminate_grace_seconds,
+            )
+
+    def _watchdog(self) -> None:
+        process = self._process
+        progress = self._progress
+        assert process is not None and progress is not None
+        while not self._stop.is_set():
+            error = self._current_failure()
+            if error is None and self.cancelled is not None and self.cancelled():
+                error = self._set_failure(
+                    InterruptedError("input-pipe child stopped by cancellation request")
+                )
+            if error is None and self._operation_active.is_set():
+                last_progress = max(
+                    self._last_input_progress,
+                    progress.last_semantic_progress,
+                )
+                if time.monotonic() - last_progress >= self.stall_seconds:
+                    error = self._set_failure(
+                        ProcessTimeoutError(
+                            "FFmpeg input pipe made no progress before its deadline"
+                        )
+                    )
+            if error is not None:
+                try:
+                    self._terminate()
+                except BaseException as terminate_error:  # pragma: no cover - OS-specific
+                    failure = self._set_failure(
+                        ProcessPipeError("input-pipe child could not be reaped")
+                    )
+                    failure.__cause__ = terminate_error
+                return
+            if process.poll() is not None:
+                self._wake.set()
+                return
+            self._wake.wait(0.05)
+            self._wake.clear()
+
+    def _require_open_process(self) -> subprocess.Popen[bytes]:
+        if self._process is None:
+            raise RuntimeError("input-pipe process has not been started")
+        if self._closed:
+            raise RuntimeError("input-pipe process is already closed")
+        return self._process
+
+    def _close_runtime(self, *, terminate: bool) -> None:  # noqa: C901
+        process = self._process
+        if process is None or self._closed:
+            return
+        if terminate or process.poll() is None:
+            self._terminate()
+        else:
+            process.wait()
+        self._stop.set()
+        self._wake.set()
+        watchdog = self._watchdog_thread
+        if watchdog is not None and watchdog is not threading.current_thread():
+            watchdog.join(timeout=self.terminate_grace_seconds)
+        for thread in self._drain_threads:
+            thread.join(timeout=self.terminate_grace_seconds)
+        streams = (process.stdin, process.stdout, process.stderr)
+        for stream in streams:
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        self._closed = True
+        if watchdog is not None and watchdog.is_alive():
+            raise ProcessPipeError("input-pipe watchdog did not terminate")
+        if any(thread.is_alive() for thread in self._drain_threads):
+            raise ProcessPipeError("input-pipe drain did not terminate")
+
+    def _raise_after_cleanup(self, fallback: BaseException) -> None:
+        failure = self._current_failure()
+        try:
+            self._close_runtime(terminate=True)
+        except BaseException as cleanup_error:
+            if failure is None:
+                raise cleanup_error from fallback
+        if failure is not None:
+            raise failure from fallback
+        raise fallback
+
+    def write(self, payload: bytes | bytearray | memoryview) -> None:
+        process = self._require_open_process()
+        assert process.stdin is not None
+        try:
+            view = memoryview(payload).cast("B")
+        except (TypeError, ValueError) as error:
+            raise ValueError("input-pipe payload must be a contiguous byte buffer") from error
+        self._operation_active.set()
+        self._last_input_progress = time.monotonic()
+        try:
+            offset = 0
+            while offset < len(view):
+                failure = self._current_failure()
+                if failure is not None:
+                    self._raise_after_cleanup(failure)
+                if process.poll() is not None:
+                    self._raise_after_cleanup(
+                        ProcessPipeError("input-pipe child exited before consuming its input")
+                    )
+                chunk = view[offset : offset + _READ_BYTES]
+                try:
+                    written = process.stdin.write(chunk)
+                except (BrokenPipeError, OSError):
+                    self._raise_after_cleanup(
+                        ProcessPipeError("input-pipe child stopped accepting input")
+                    )
+                if written is None or written <= 0:
+                    self._raise_after_cleanup(
+                        ProcessPipeError("input-pipe child accepted no input bytes")
+                    )
+                offset += written
+                self._last_input_progress = time.monotonic()
+                self._wake.set()
+        finally:
+            self._operation_active.clear()
+
+    def finish(self) -> ProgressProcessResult:
+        process = self._require_open_process()
+        assert process.stdin is not None
+        self._operation_active.set()
+        self._last_input_progress = time.monotonic()
+        try:
+            try:
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                self._raise_after_cleanup(
+                    ProcessPipeError("input-pipe child stopped before end-of-input")
+                )
+            while process.poll() is None and self._current_failure() is None:
+                self._wake.wait(0.05)
+                self._wake.clear()
+            failure = self._current_failure()
+            self._close_runtime(terminate=failure is not None)
+            if failure is not None:
+                raise failure
+            self.parser.finish()
+            assert process.returncode is not None
+            diagnostics = self._diagnostics
+            assert diagnostics is not None
+            return ProgressProcessResult(
+                stderr=bytes(diagnostics.payload),
+                returncode=process.returncode,
+            )
+        finally:
+            self._operation_active.clear()
+
+    def abort(self) -> None:
+        if self._process is None or self._closed:
+            return
+        self._set_failure(InterruptedError("input-pipe child was aborted"))
+        self._close_runtime(terminate=True)
+
+
 def run_streaming_byte_count_v1(  # noqa: C901
     arguments: Sequence[str],
     *,

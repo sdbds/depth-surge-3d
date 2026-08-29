@@ -965,12 +965,13 @@ def recover_processing_control_prefix_v1(
                 allocation_adapter=allocation_adapter,
                 allocation_counter=allocation_counter,
             )
-            reservation.recover_publication_prefix()
-            artifact = recover_settings_job_v1(
-                root,
-                allocation_adapter=allocation_adapter,
-                allocation_counter=allocation_counter,
-            )
+            if not reservation.requires_explicit_streamed_recovery():
+                reservation.recover_publication_prefix()
+                artifact = recover_settings_job_v1(
+                    root,
+                    allocation_adapter=allocation_adapter,
+                    allocation_counter=allocation_counter,
+                )
     fixed_indexes = (
         settings_index,
         settings_index_temporary,

@@ -506,6 +506,76 @@ class TestApplyDistortion:
         ):
             assert processor.apply_distortion_and_crop(left_files, right_files, fused, settings)
 
+    def test_stream_transform_is_pixel_exact_with_fused_file_path(self, tmp_path):
+        left_source = tmp_path / "left_source"
+        right_source = tmp_path / "right_source"
+        left_output = tmp_path / "left_output"
+        right_output = tmp_path / "right_output"
+        for directory in (left_source, right_source, left_output, right_output):
+            directory.mkdir()
+        rng = np.random.default_rng(37)
+        left = rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+        right = rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+        left_path = left_source / "frame_000000.png"
+        right_path = right_source / "frame_000000.png"
+        assert cv2.imwrite(str(left_path), left)
+        assert cv2.imwrite(str(right_path), right)
+        settings = {
+            "apply_distortion": True,
+            "fisheye_fov": 120,
+            "fisheye_projection": "equisolid",
+            "fisheye_crop_factor": 0.8,
+            "per_eye_width": 40,
+            "per_eye_height": 32,
+        }
+        processor = DistortionProcessor()
+        assert processor.apply_distortion_and_crop(
+            [left_path],
+            [right_path],
+            {"left_cropped": left_output, "right_cropped": right_output},
+            settings,
+        )
+
+        transform = processor.prepare_stream_transform(
+            source_shape=(48, 64),
+            settings=settings,
+        )
+        actual_left, actual_right = transform(left, right)
+
+        np.testing.assert_array_equal(
+            actual_left,
+            cv2.imread(str(left_output / "frame_000000.png")),
+        )
+        np.testing.assert_array_equal(
+            actual_right,
+            cv2.imread(str(right_output / "frame_000000.png")),
+        )
+
+    def test_stream_transform_accepts_only_target_sized_rectilinear_noop(self):
+        processor = DistortionProcessor()
+        settings = {
+            "apply_distortion": False,
+            "crop_factor": 1.0,
+            "per_eye_width": 6,
+            "per_eye_height": 4,
+        }
+        transform = processor.prepare_stream_transform(
+            source_shape=(4, 6),
+            settings=settings,
+        )
+        left = np.zeros((4, 6, 3), dtype=np.uint8)
+        right = np.ones((4, 6, 3), dtype=np.uint8)
+
+        actual_left, actual_right = transform(left, right)
+
+        assert actual_left is left
+        assert actual_right is right
+        with pytest.raises(ValueError, match="no-op"):
+            processor.prepare_stream_transform(
+                source_shape=(4, 8),
+                settings=settings,
+            )
+
 
 class TestCropFrames:
     """Test crop_frames method."""

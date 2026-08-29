@@ -11,7 +11,9 @@ import os
 import shutil
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+import numpy as np
 
 from ...utils import (
     apply_fisheye_square_crop,
@@ -58,6 +60,97 @@ class DistortionProcessor:
             verbose: Enable verbose output
         """
         self.verbose = verbose
+
+    def prepare_stream_transform(
+        self,
+        *,
+        source_shape: tuple[int, int],
+        settings: dict[str, Any],
+    ) -> Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
+        """Freeze the existing distortion/crop math for one in-memory pair."""
+
+        if (
+            not isinstance(source_shape, tuple)
+            or len(source_shape) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in source_shape
+            )
+        ):
+            raise ValueError("stream transform source shape is invalid")
+        source_height, source_width = source_shape
+        target_width = int(settings.get("per_eye_width") or 0)
+        target_height = int(settings.get("per_eye_height") or 0)
+        if target_width <= 0 or target_height <= 0:
+            raise ValueError("stream transform target shape is invalid")
+
+        def validate_pair(
+            left: np.ndarray,
+            right: np.ndarray,
+        ) -> None:
+            expected = (source_height, source_width, 3)
+            if (
+                not isinstance(left, np.ndarray)
+                or not isinstance(right, np.ndarray)
+                or left.dtype != np.uint8
+                or right.dtype != np.uint8
+                or left.shape != expected
+                or right.shape != expected
+            ):
+                raise ValueError("stream transform stereo pair shape changed")
+
+        if not settings.get("apply_distortion"):
+            if not self._crop_is_no_op(settings) or (source_width, source_height) != (
+                target_width,
+                target_height,
+            ):
+                raise ValueError("rectilinear stream transform is limited to a target-sized no-op")
+
+            def unchanged(
+                left: np.ndarray,
+                right: np.ndarray,
+            ) -> tuple[np.ndarray, np.ndarray]:
+                validate_pair(left, right)
+                return left, right
+
+            return unchanged
+
+        x_map, y_map = calculate_fisheye_coordinates(
+            source_width,
+            source_height,
+            settings["fisheye_fov"],
+            settings["fisheye_projection"],
+        )
+        x_map.setflags(write=False)
+        y_map.setflags(write=False)
+        crop_factor = max(
+            0.5,
+            min(2.0, float(settings.get("fisheye_crop_factor", 0.7))),
+        )
+
+        def distort_and_crop(
+            left: np.ndarray,
+            right: np.ndarray,
+        ) -> tuple[np.ndarray, np.ndarray]:
+            validate_pair(left, right)
+            left_result = apply_fisheye_square_crop(
+                remap_fisheye(left, x_map, y_map),
+                target_width,
+                target_height,
+                crop_factor,
+            )
+            right_result = apply_fisheye_square_crop(
+                remap_fisheye(right, x_map, y_map),
+                target_width,
+                target_height,
+                crop_factor,
+            )
+            expected = (target_height, target_width, 3)
+            if left_result.shape != expected or right_result.shape != expected:
+                raise ValueError("stream transform produced the wrong target shape")
+            return left_result, right_result
+
+        return distort_and_crop
 
     def apply_distortion(
         self,

@@ -120,6 +120,17 @@ def _winner_keys(
     source_index_offset: int,
     source_valid: torch.Tensor,
 ) -> torch.Tensor:
+    if near_score.is_cuda:
+        from .fast_splat_triton import triton_winner_keys
+
+        triton_winners = triton_winner_keys(
+            near_score,
+            sample_offsets,
+            source_index_offset,
+            source_valid,
+        )
+        if triton_winners is not None:
+            return triton_winners
     pixel_count = near_score.numel()
     target_count = pixel_count * HORIZONTAL_SUBPIXELS
     source_indexes = torch.arange(
@@ -171,6 +182,39 @@ def _gather_winners(
     )
 
 
+def _forward_splat_band(
+    image: torch.Tensor,
+    near_score: torch.Tensor,
+    sample_offsets: torch.Tensor,
+    *,
+    source_index_offset: int = 0,
+    source_valid: torch.Tensor | None = None,
+    validate_values: bool,
+) -> SubpixelSplatResult:
+    source, source_valid = _validate_inputs(
+        image,
+        near_score,
+        sample_offsets,
+        source_index_offset,
+        source_valid,
+        validate_values=validate_values,
+    )
+    winners = _winner_keys(near_score, sample_offsets, source_index_offset, source_valid)
+    if winners.is_cuda:
+        from .fast_splat_triton import triton_gather_winners
+
+        triton_result = triton_gather_winners(
+            source,
+            near_score,
+            winners,
+            source_index_offset,
+        )
+        if triton_result is not None:
+            colour, disparity, valid = triton_result
+            return SubpixelSplatResult(colour=colour, disparity=disparity, valid=valid)
+    return _gather_winners(source, near_score, winners, source_index_offset)
+
+
 def forward_splat_band(
     image: torch.Tensor,
     near_score: torch.Tensor,
@@ -181,12 +225,29 @@ def forward_splat_band(
 ) -> SubpixelSplatResult:
     """Resolve 16 horizontal samples per source pixel with one integer max."""
 
-    source, source_valid = _validate_inputs(
+    return _forward_splat_band(
         image,
         near_score,
         sample_offsets,
-        source_index_offset,
-        source_valid,
+        source_index_offset=source_index_offset,
+        source_valid=source_valid,
+        validate_values=True,
     )
-    winners = _winner_keys(near_score, sample_offsets, source_index_offset, source_valid)
-    return _gather_winners(source, near_score, winners, source_index_offset)
+
+
+def _forward_splat_band_prevalidated(
+    image: torch.Tensor,
+    near_score: torch.Tensor,
+    sample_offsets: torch.Tensor,
+    *,
+    source_index_offset: int = 0,
+    source_valid: torch.Tensor | None = None,
+) -> SubpixelSplatResult:
+    return _forward_splat_band(
+        image,
+        near_score,
+        sample_offsets,
+        source_index_offset=source_index_offset,
+        source_valid=source_valid,
+        validate_values=False,
+    )

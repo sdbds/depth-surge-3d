@@ -7,6 +7,7 @@ import inspect
 import numpy as np
 import pytest
 
+import src.depth_surge_3d.rendering.stereo_geometry as stereo_geometry_module
 from src.depth_surge_3d.rendering.stereo_geometry import (
     MetricProjectionStats,
     StereoGeometryFrame,
@@ -109,6 +110,56 @@ def test_relative_builder_uses_existing_total_disparity_formula() -> None:
         atol=2e-18,
     )
     assert geometry.source_valid.all()
+
+
+def test_relative_builder_avoids_full_frame_numpy_float64_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    numpy_module = np
+
+    class NumpyProxy:
+        def __getattr__(self, name: str):
+            return getattr(numpy_module, name)
+
+        @staticmethod
+        def asarray(values, dtype=None):
+            if dtype == numpy_module.float64 and getattr(values, "ndim", 0) == 2:
+                raise AssertionError("full-frame NumPy float64 materialization")
+            return numpy_module.asarray(values, dtype=dtype)
+
+    monkeypatch.setattr(stereo_geometry_module, "np", NumpyProxy())
+
+    geometry = build_relative_geometry(
+        np.array([[0.0, 0.5, 1.0]], dtype=np.float32),
+        (1, 3),
+        stereo_strength=2.0,
+        convergence=0.5,
+    )
+
+    np.testing.assert_array_equal(
+        geometry.total_disparity_fraction,
+        np.array([[-0.01, 0.0, 0.01]], dtype=np.float64),
+    )
+
+
+def test_relative_builder_matches_the_numpy_float64_operation_order() -> None:
+    generator = np.random.default_rng(20260830)
+    canonical = generator.random((19, 47), dtype=np.float32)
+    stereo_strength = 4.731
+    convergence = 0.3719
+    expected = np.asarray(canonical, dtype=np.float64)
+    expected = expected - np.float64(convergence)
+    expected *= np.float64(stereo_strength)
+    expected /= np.float64(100.0)
+
+    geometry = build_relative_geometry(
+        canonical,
+        canonical.shape,
+        stereo_strength=stereo_strength,
+        convergence=convergence,
+    )
+
+    assert np.array_equal(geometry.total_disparity_fraction, expected)
 
 
 def test_geometry_frame_owns_immutable_array_storage() -> None:

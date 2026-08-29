@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import builtins
+from pathlib import Path
+import runpy
+
 import numpy as np
 import pytest
 import torch
 
+import src.depth_surge_3d.rendering.forward_splat as forward_splat_module
 from src.depth_surge_3d.rendering.forward_splat import (
     HORIZONTAL_SUBPIXELS,
     _decode_source_index,
@@ -16,6 +21,26 @@ from src.depth_surge_3d.rendering.forward_splat import (
 
 def _offsets(values: list[list[int]], *, device: str = "cpu") -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32, device=device)
+
+
+def test_triton_loader_oserror_keeps_the_optional_backend_importable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_path = (
+        Path(__file__).parents[2] / "src" / "depth_surge_3d" / "rendering" / "fast_splat_triton.py"
+    )
+    real_import = builtins.__import__
+
+    def reject_triton_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "triton":
+            raise OSError("simulated incompatible Triton binary")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_triton_import)
+
+    namespace = runpy.run_path(str(module_path))
+
+    assert namespace["triton"] is None
 
 
 def test_zero_offsets_tile_each_source_pixel_into_sixteen_fine_samples() -> None:
@@ -84,6 +109,29 @@ def test_near_score_may_exceed_one_but_must_be_finite_and_nonnegative() -> None:
     assert forward_splat_band(image, torch.tensor([[12.0]]), offsets).valid.all()
     with pytest.raises(ValueError, match="nonnegative"):
         forward_splat_band(image, torch.tensor([[-0.1]]), offsets)
+
+
+def test_prevalidated_splat_skips_redundant_value_scans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = torch.tensor([[[7, 8, 9]]], dtype=torch.uint8)
+    near_score = torch.tensor([[0.75]], dtype=torch.float32)
+    offsets = _offsets([[0]])
+
+    def reject_value_scan(*_args, **_kwargs):
+        raise AssertionError("prevalidated splat scanned trusted values")
+
+    monkeypatch.setattr(forward_splat_module.torch, "isfinite", reject_value_scan)
+
+    result = forward_splat_module._forward_splat_band_prevalidated(
+        image,
+        near_score,
+        offsets,
+        source_valid=torch.ones_like(near_score, dtype=torch.bool),
+    )
+
+    assert result.valid.all()
+    assert result.colour[0, 0].tolist() == [7.0, 8.0, 9.0]
 
 
 def test_equal_depth_collision_uses_lowest_full_frame_source_index() -> None:
@@ -258,6 +306,76 @@ def test_cuda_matches_cpu_byte_exactly() -> None:
     assert torch.equal(cuda.colour.cpu(), cpu.colour)
     assert torch.equal(cuda.disparity.cpu(), cpu.disparity)
     assert torch.equal(cuda.valid.cpu(), cpu.valid)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_splat_does_not_use_pytorch_scatter_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = torch.tensor(
+        [[[10, 11, 12], [20, 21, 22]]],
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    near_score = torch.tensor([[0.9, 0.1]], dtype=torch.float32, device="cuda")
+    offsets = _offsets([[HORIZONTAL_SUBPIXELS, 0]], device="cuda")
+
+    def reject_scatter_fallback(*_args, **_kwargs):
+        raise AssertionError("CUDA splat used the PyTorch scatter fallback")
+
+    monkeypatch.setattr(torch.Tensor, "scatter_reduce_", reject_scatter_fallback)
+
+    result = forward_splat_band(image, near_score, offsets, source_index_offset=37)
+
+    assert not result.valid[0, :HORIZONTAL_SUBPIXELS].any()
+    assert result.valid[0, HORIZONTAL_SUBPIXELS:].all()
+    assert result.colour[0, HORIZONTAL_SUBPIXELS].tolist() == [10.0, 11.0, 12.0]
+    assert result.disparity[0, HORIZONTAL_SUBPIXELS].item() == pytest.approx(0.9)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_splat_does_not_use_pytorch_gather_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = torch.tensor([[[7, 8, 9]]], dtype=torch.uint8, device="cuda")
+    near_score = torch.tensor([[0.75]], dtype=torch.float32, device="cuda")
+    offsets = _offsets([[1]], device="cuda")
+
+    def reject_gather_fallback(*_args, **_kwargs):
+        raise AssertionError("CUDA splat used the PyTorch gather fallback")
+
+    monkeypatch.setattr(forward_splat_module, "_gather_winners", reject_gather_fallback)
+
+    result = forward_splat_band(image, near_score, offsets, source_index_offset=91)
+
+    assert result.valid.tolist() == [[False] + [True] * (HORIZONTAL_SUBPIXELS - 1)]
+    assert result.colour[0, 1].tolist() == [7.0, 8.0, 9.0]
+    assert result.disparity[0, 1].item() == pytest.approx(0.75)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_splat_falls_back_after_a_triton_compilation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.rendering import fast_splat_triton
+
+    class BrokenKernel:
+        def __getitem__(self, _grid):
+            def launch(*_args, **_kwargs):
+                raise fast_splat_triton.triton.errors.TritonError("simulated compile failure")
+
+            return launch
+
+    monkeypatch.setattr(fast_splat_triton, "_DISABLED_CUDA_DEVICES", set(), raising=False)
+    monkeypatch.setattr(fast_splat_triton, "_winner_keys_kernel", BrokenKernel())
+    image = torch.tensor([[[3, 4, 5]]], dtype=torch.uint8, device="cuda")
+    near_score = torch.tensor([[0.25]], dtype=torch.float32, device="cuda")
+
+    result = forward_splat_band(image, near_score, _offsets([[0]], device="cuda"))
+
+    assert result.valid.all()
+    assert result.colour[0, 0].tolist() == [3.0, 4.0, 5.0]
+    assert not fast_splat_triton.triton_splat_available(image.device)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

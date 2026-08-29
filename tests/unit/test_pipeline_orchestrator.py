@@ -6,13 +6,18 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import weakref
 
+import numpy as np
 import pytest
 
 from src.depth_surge_3d.processing.orchestration.pipeline_orchestrator import (
     ProcessingOrchestrator,
 )
 from src.depth_surge_3d.io.job_lock import JobWriterLock
+from src.depth_surge_3d.io.reservation_protocol import ReservationIncompleteError
 from src.depth_surge_3d.io.resume import LegacyFastAdoptionV1
+from src.depth_surge_3d.processing.frames.stereo_control import (
+    QualityPipelineCapacityError,
+)
 
 
 class TestProcessingOrchestratorInit:
@@ -665,6 +670,7 @@ class TestCleanupOnlyResume:
             "runtime_info": {"metric_clamp_summary": None},
         }
         reservation = Mock()
+        reservation.requires_explicit_streamed_recovery.return_value = False
         reservation.recover_publication_prefix.return_value = Mock(
             phase="publication_authenticated"
         )
@@ -751,6 +757,7 @@ class TestCleanupOnlyResume:
             "runtime_info": {"metric_clamp_summary": None},
         }
         reservation = Mock()
+        reservation.requires_explicit_streamed_recovery.return_value = False
         reservation.recover_publication_prefix.return_value = Mock(
             phase="publication_authenticated"
         )
@@ -833,6 +840,10 @@ class TestCleanupOnlyResume:
 
         class Prepared:
             @staticmethod
+            def requires_explicit_streamed_recovery():
+                return False
+
+            @staticmethod
             def recover_publication_prefix():
                 return SimpleNamespace(phase="publication_authenticated")
 
@@ -901,6 +912,333 @@ class TestCleanupOnlyResume:
 
 
 class TestExecutePipeline:
+    @staticmethod
+    def _streamed_quality_settings(**overrides):
+        settings = {
+            "apply_distortion": True,
+            "crop_factor": 1.0,
+            "direct_vr_encode": True,
+            "fisheye_projection": "equisolid",
+            "keep_intermediates": False,
+            "per_eye_height": 6,
+            "per_eye_width": 8,
+            "stereo_geometry_mode": "relative",
+            "stereo_render_mode": "quality",
+            "upscale_model": "none",
+            "vr_format": "side_by_side",
+            "vr_output_height": 6,
+            "vr_output_width": 16,
+            "vr_resolution": "custom",
+        }
+        settings.update(overrides)
+        return settings
+
+    @pytest.mark.parametrize(
+        ("settings_overrides", "manifest_overrides", "schema5", "active_reservation"),
+        [
+            ({"stereo_render_mode": "fast"}, {}, True, False),
+            ({"stereo_geometry_mode": "metric_camera"}, {}, True, False),
+            ({}, {"geometry_mode": "metric"}, True, False),
+            ({"direct_vr_encode": False}, {}, True, False),
+            ({"keep_intermediates": True}, {}, True, False),
+            ({"upscale_model": "realesrgan"}, {}, True, False),
+            ({"vr_format": "unknown"}, {}, True, False),
+            ({"vr_output_width": 15}, {}, True, False),
+            ({"apply_distortion": False, "crop_factor": 0.9}, {}, True, False),
+            (
+                {"apply_distortion": False, "crop_factor": 1.0},
+                {"render_shape": (7, 8)},
+                True,
+                False,
+            ),
+            ({}, {}, False, False),
+            ({}, {}, True, True),
+        ],
+    )
+    def test_streamed_quality_eligibility_rejects_every_unsupported_gate(
+        self,
+        settings_overrides,
+        manifest_overrides,
+        schema5,
+        active_reservation,
+    ):
+        settings = self._streamed_quality_settings(**settings_overrides)
+        manifest_values = {
+            "frame_count": 2,
+            "geometry_mode": "relative",
+            "render_shape": (6, 8),
+        }
+        manifest_values.update(manifest_overrides)
+
+        assert not ProcessingOrchestrator._streamed_quality_settings_eligible(
+            settings,
+            SimpleNamespace(**manifest_values),
+            schema5_settings=schema5,
+            active_reservation=active_reservation,
+        )
+
+    def test_streamed_quality_eligibility_accepts_distortion_and_rectilinear_noop(self):
+        manifest = SimpleNamespace(
+            frame_count=2,
+            geometry_mode="relative",
+            render_shape=(6, 8),
+        )
+        assert ProcessingOrchestrator._streamed_quality_settings_eligible(
+            self._streamed_quality_settings(),
+            manifest,
+            schema5_settings=True,
+            active_reservation=False,
+        )
+        assert ProcessingOrchestrator._streamed_quality_settings_eligible(
+            self._streamed_quality_settings(apply_distortion=False, crop_factor=1.0),
+            manifest,
+            schema5_settings=True,
+            active_reservation=False,
+        )
+
+    def test_streamed_quality_consumer_bound_charges_maps_transform_and_pipe_copies(self):
+        settings = self._streamed_quality_settings(
+            per_eye_width=1920,
+            per_eye_height=1080,
+            vr_output_width=3840,
+            vr_output_height=1080,
+        )
+        source_pixels = 1920 * 1080
+        target_pixels = 1920 * 1080
+        final_pixels = 3840 * 1080
+        map_bytes = 8 * source_pixels
+        transform_peak = 3 * source_pixels + 6 * target_pixels
+        encoded_copy_bound = 4 * final_pixels + 1024 * 1024
+        pipe_peak = 6 * target_pixels + 3 * final_pixels + 2 * encoded_copy_bound
+
+        assert ProcessingOrchestrator._streamed_quality_consumer_memory_bound(
+            (1080, 1920),
+            settings,
+        ) == map_bytes + max(transform_peak, pipe_peak)
+
+    def test_streamed_quality_session_precedes_render_and_publishes_after_generation(
+        self, tmp_path
+    ):
+        events: list[str] = []
+        session = Mock()
+
+        def write(frame_name, frame):
+            events.append("write")
+            assert frame_name == "frame_000001"
+            assert frame.shape == (6, 16, 3)
+            assert np.all(frame[:, :8] == 17)
+            assert np.all(frame[:, 8:] == 29)
+
+        session.write.side_effect = write
+        session.finish_and_publish.side_effect = lambda: events.append("publish") or True
+        encoder = Mock()
+        encoder.pending_final_encoding_reservation = None
+        encoder.open_streamed_vr_session.side_effect = (
+            lambda **_kwargs: events.append("open") or session
+        )
+        stereo = Mock()
+
+        def render(*_args, frame_consumer=None, frame_consumer_memory_bytes=0):
+            events.append("render")
+            assert frame_consumer is not None
+            assert frame_consumer_memory_bytes == (
+                ProcessingOrchestrator._streamed_quality_consumer_memory_bound(
+                    (6, 8),
+                    settings,
+                )
+            )
+            frame_consumer(
+                "frame_000001",
+                np.full((6, 8, 3), 17, np.uint8),
+                np.full((6, 8, 3), 29, np.uint8),
+            )
+            events.append("render-complete")
+            return True
+
+        stereo.create_stereo_pairs_from_manifest.side_effect = render
+        distortion = Mock()
+        distortion.prepare_stream_transform.side_effect = lambda **_kwargs: events.append(
+            "prepare"
+        ) or (lambda left, right: (left, right))
+        orchestrator = ProcessingOrchestrator(Mock(), stereo, distortion, Mock(), Mock(), encoder)
+        orchestrator._settings_file = tmp_path / "processing-settings-v5.json"
+        settings = self._streamed_quality_settings()
+        directories = {
+            "base": tmp_path,
+            "left_frames": tmp_path / "04_left_frames",
+            "right_frames": tmp_path / "04_right_frames",
+        }
+        manifest = SimpleNamespace(
+            frame_count=1,
+            geometry_mode="relative",
+            render_shape=(6, 8),
+            replay_declared_records=lambda: iter((SimpleNamespace(frame_name="frame_000001"),)),
+        )
+        progress = Mock()
+
+        with (
+            patch.object(orchestrator, "_execute_post_stereo_steps") as legacy_post,
+            patch.object(orchestrator, "_finalize_processing", return_value=True) as finalize,
+        ):
+            assert orchestrator._execute_remaining_steps(
+                directories,
+                settings,
+                manifest,
+                24.0,
+                "source.mp4",
+                tmp_path,
+                progress,
+            )
+
+        assert events == [
+            "prepare",
+            "open",
+            "render",
+            "write",
+            "render-complete",
+            "publish",
+        ]
+        session.abort.assert_not_called()
+        legacy_post.assert_not_called()
+        encoder.create_video.assert_not_called()
+        encoder.create_video_from_stereo_source.assert_not_called()
+        encoder.open_streamed_vr_session.assert_called_once_with(
+            output_dir=tmp_path,
+            original_video="source.mp4",
+            settings=settings,
+            frame_count=1,
+            first_index=1,
+            progress_tracker=progress,
+        )
+        finalize.assert_called_once_with(True, tmp_path, "source.mp4", settings, 1)
+        progress.finish.assert_called_once_with("Video processing complete")
+
+    def test_streamed_quality_aborts_session_when_generation_fails(self, tmp_path):
+        events = []
+        session = Mock()
+        session.abort.side_effect = lambda: events.append("abort")
+        encoder = Mock()
+        encoder.pending_final_encoding_reservation = None
+        encoder.open_streamed_vr_session.return_value = session
+        stereo = Mock()
+        stereo.create_stereo_pairs_from_manifest.return_value = False
+        distortion = Mock()
+        distortion.prepare_stream_transform.return_value = lambda left, right: (left, right)
+        orchestrator = ProcessingOrchestrator(Mock(), stereo, distortion, Mock(), Mock(), encoder)
+        orchestrator._settings_file = tmp_path / "processing-settings-v5.json"
+        manifest = SimpleNamespace(
+            frame_count=1,
+            geometry_mode="relative",
+            render_shape=(6, 8),
+            replay_declared_records=lambda: iter((SimpleNamespace(frame_name="frame_000001"),)),
+        )
+
+        with patch.object(
+            orchestrator,
+            "_handle_step_error",
+            side_effect=lambda message: events.append(("failed", message)) or False,
+        ) as failure:
+            assert not orchestrator._execute_remaining_steps(
+                {
+                    "base": tmp_path,
+                    "left_frames": tmp_path / "04_left_frames",
+                    "right_frames": tmp_path / "04_right_frames",
+                },
+                self._streamed_quality_settings(),
+                manifest,
+                24.0,
+                "source.mp4",
+                tmp_path,
+            )
+
+        session.abort.assert_called_once_with()
+        session.finish_and_publish.assert_not_called()
+        failure.assert_called_once_with("Stereo pair creation failed")
+        assert events == ["abort", ("failed", "Stereo pair creation failed")]
+
+    def test_streamed_quality_does_not_terminalize_when_abort_is_incomplete(self, tmp_path):
+        session = Mock()
+        session.abort.side_effect = ReservationIncompleteError("streamed cleanup remains retryable")
+        encoder = Mock()
+        encoder.pending_final_encoding_reservation = None
+        encoder.open_streamed_vr_session.return_value = session
+        stereo = Mock()
+        stereo.create_stereo_pairs_from_manifest.return_value = False
+        distortion = Mock()
+        distortion.prepare_stream_transform.return_value = lambda left, right: (left, right)
+        orchestrator = ProcessingOrchestrator(Mock(), stereo, distortion, Mock(), Mock(), encoder)
+        orchestrator._settings_file = tmp_path / "processing-settings-v5.json"
+        manifest = SimpleNamespace(
+            frame_count=1,
+            geometry_mode="relative",
+            render_shape=(6, 8),
+            replay_declared_records=lambda: iter((SimpleNamespace(frame_name="frame_000001"),)),
+        )
+
+        with patch.object(orchestrator, "_handle_step_error") as failure:
+            with pytest.raises(ReservationIncompleteError, match="retryable"):
+                orchestrator._execute_remaining_steps(
+                    {
+                        "base": tmp_path,
+                        "left_frames": tmp_path / "04_left_frames",
+                        "right_frames": tmp_path / "04_right_frames",
+                    },
+                    self._streamed_quality_settings(),
+                    manifest,
+                    24.0,
+                    "source.mp4",
+                    tmp_path,
+                )
+
+        session.abort.assert_called_once_with()
+        session.finish_and_publish.assert_not_called()
+        failure.assert_not_called()
+
+    def test_streamed_quality_capacity_rejection_discards_session_and_falls_back(self, tmp_path):
+        session = Mock()
+        encoder = Mock()
+        encoder.pending_final_encoding_reservation = None
+        encoder.open_streamed_vr_session.return_value = session
+        stereo = Mock()
+
+        def render(*_args, frame_consumer=None, **_kwargs):
+            if frame_consumer is not None:
+                raise QualityPipelineCapacityError(
+                    "stream consumer leaves no Quality lifecycle capacity"
+                )
+            return True
+
+        stereo.create_stereo_pairs_from_manifest.side_effect = render
+        distortion = Mock()
+        distortion.prepare_stream_transform.return_value = lambda left, right: (left, right)
+        orchestrator = ProcessingOrchestrator(Mock(), stereo, distortion, Mock(), Mock(), encoder)
+        orchestrator._settings_file = tmp_path / "processing-settings-v5.json"
+        manifest = SimpleNamespace(
+            frame_count=1,
+            geometry_mode="relative",
+            render_shape=(6, 8),
+            replay_declared_records=lambda: iter((SimpleNamespace(frame_name="frame_000001"),)),
+        )
+
+        with patch.object(orchestrator, "_execute_post_stereo_steps", return_value=True) as post:
+            assert orchestrator._execute_remaining_steps(
+                {
+                    "base": tmp_path,
+                    "left_frames": tmp_path / "04_left_frames",
+                    "right_frames": tmp_path / "04_right_frames",
+                },
+                self._streamed_quality_settings(),
+                manifest,
+                24.0,
+                "source.mp4",
+                tmp_path,
+            )
+
+        session.discard_for_file_backed_fallback.assert_called_once_with()
+        session.abort.assert_not_called()
+        assert stereo.create_stereo_pairs_from_manifest.call_count == 2
+        post.assert_called_once()
+
     def test_upstream_path_lists_are_released_before_stereo_preflight(self, tmp_path):
         """The bounded stereo phase cannot inherit either upstream O(N) graph."""
 

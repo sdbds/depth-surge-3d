@@ -20,6 +20,9 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, BinaryIO, Iterator, Literal, cast
 
+import cv2
+import numpy as np
+
 from ...io.operations import (
     get_frame_files,
     get_video_info_ffprobe,
@@ -30,12 +33,16 @@ from ...io.nofollow_io import AcquiredRoot, NoFollowPathError
 from ...io.file_identity import (
     DirectoryIdentityV1,
     PersistedFileIdentityV1,
+    capture_directory_identity,
+    capture_file_identity,
     file_identity_from_open_handle,
 )
+from ...io.durable_publish import OwnedSiblingTemporary
 from ...io.reservation_protocol import (
     SETTINGS_ARTIFACT_RELATIVE_PATH,
     ReservationConflictError,
     ReservationIncompleteError,
+    same_parent_replace_v1,
 )
 from ...io.settings_artifact import ProcessingSettingsArtifactV5
 from ...utils.path_utils import (
@@ -58,6 +65,7 @@ from ...core.file_identity import file_sample_fingerprint
 from ...utils.imaging.png_header import PngHeader, read_png_header
 from .encoding_provider import (
     FINAL_DECODE_DIAGNOSTIC_BYTES,
+    FINAL_ENCODE_DIAGNOSTIC_BYTES,
     EncodingProviderChangedError,
     EncodingProviderError,
     FINAL_ENCODING_LINE_BYTES,
@@ -75,6 +83,7 @@ from .final_publication import (
     EncodingInputPublicationSource,
     FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
     FinalEncodingReservationCapabilityV1,
+    FinalPublicationValidationError,
     FinalPublicationTransactionV4,
     PreparedFinalEncodingReservationV1,
     validate_final_container_evidence_v1,
@@ -84,13 +93,47 @@ from .final_publication import (
 from .bounded_process import (
     BoundedProcessCaptureV1,
     BoundedProcessError,
+    FfmpegInputPipeProcessV1,
     run_ffmpeg_progress_v1,
 )
 from .final_container_validation import validate_final_container_v4
 from .final_audio import SelectedAudioIdentityV1, prepare_selected_audio_v1
+from .streamed_vr_manifest import (
+    CompletedStreamedVrInputManifestV1,
+    StreamedVrInputManifestV1,
+)
+from .streamed_vr_evidence import (
+    StreamedVrInvocationV1,
+    StreamedVrOutputEvidenceV1,
+)
+from .streamed_vr_work import (
+    STREAMED_VR_WORK_INDEX_RELATIVE_PATH,
+    STREAMED_VR_WORK_READY_RELATIVE_PATH,
+    StreamedVrWorkReservationV1,
+)
 
 
 _DIRECT_FRAME_NAME = re.compile(r"^frame_(\d{6,})\.png$")
+
+
+def _write_ahead_control_visible(path: Path) -> bool:
+    """Conservatively observe either name in a write-ahead control pair."""
+
+    temporary = path.with_name(f".{path.name}.create-new.tmp")
+    try:
+        return any(candidate.exists() or candidate.is_symlink() for candidate in (path, temporary))
+    except OSError:
+        return True
+
+
+def _streamed_work_control_visible(root: Path) -> bool:
+    return any(
+        _write_ahead_control_visible(Path(root) / relative)
+        for relative in (
+            STREAMED_VR_WORK_INDEX_RELATIVE_PATH,
+            STREAMED_VR_WORK_READY_RELATIVE_PATH,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -144,38 +187,24 @@ def _open_encoding_manifest_extent_authority(
         or authority.source_parent_identity is None
         or authority.source_identity is None
     ):
-        raise ReservationConflictError(
-            "indexed encoding manifest lacks scalar source authority"
-        )
+        raise ReservationConflictError("indexed encoding manifest lacks scalar source authority")
     try:
         with AcquiredRoot(authority.job_root) as acquired:
             if acquired.persistent_identity != authority.job_root_identity:
-                raise ReservationConflictError(
-                    "encoding manifest job-root identity changed"
-                )
+                raise ReservationConflictError("encoding manifest job-root identity changed")
             if (
                 acquired.directory_identity(authority.source_path.parent)
                 != authority.source_parent_identity
             ):
-                raise ReservationConflictError(
-                    "encoding manifest source parent identity changed"
-                )
+                raise ReservationConflictError("encoding manifest source parent identity changed")
             opener = acquired.open_regular_update if writable else acquired.open_regular
             with opener(authority.source_path) as handle:
-                if (
-                    file_identity_from_open_handle(handle)
-                    != authority.source_identity
-                ):
-                    raise ReservationConflictError(
-                        "encoding manifest source identity changed"
-                    )
+                if file_identity_from_open_handle(handle) != authority.source_identity:
+                    raise ReservationConflictError("encoding manifest source identity changed")
                 yield handle
                 if (
-                    file_identity_from_open_handle(handle)
-                    != authority.source_identity
-                    or acquired.persistent_regular_identity(
-                        authority.source_path
-                    )
+                    file_identity_from_open_handle(handle) != authority.source_identity
+                    or acquired.persistent_regular_identity(authority.source_path)
                     != authority.source_identity
                 ):
                     raise ReservationConflictError(
@@ -193,6 +222,436 @@ def _open_encoding_manifest_extent_authority(
         raise ReservationConflictError(
             "encoding manifest source cannot be opened without following links"
         ) from error
+
+
+class StreamedVrEncodingSession:
+    """Encode ordered assembled PNG payloads and publish through schema 5."""
+
+    def __init__(
+        self,
+        *,
+        encoder: "VideoEncoder",
+        output_dir: Path,
+        settings: dict[str, Any],
+        provider: EncodingSequenceProvider,
+        manifest: StreamedVrInputManifestV1,
+        scratch: OwnedSiblingTemporary,
+        process: FfmpegInputPipeProcessV1,
+        command: list[str],
+        selected_audio: SelectedAudioIdentityV1,
+        resolved_fps: str,
+        resolved_encoder: str,
+        expected_relative_path: str,
+        publication_generation: str,
+        work: StreamedVrWorkReservationV1,
+        cancelled: Callable[[], bool] | None,
+    ) -> None:
+        self.encoder = encoder
+        self.output_dir = Path(output_dir).resolve()
+        self.settings = dict(settings)
+        self.provider = provider
+        self.manifest = manifest
+        self.scratch = scratch
+        self.process = process
+        self.command = list(command)
+        self.selected_audio = selected_audio
+        self.resolved_fps = resolved_fps
+        self.resolved_encoder = resolved_encoder
+        self.expected_relative_path = expected_relative_path
+        self.publication_generation = publication_generation
+        self.work = work
+        self.cancelled = cancelled
+        self._pipe_finished = False
+        self._manifest_completed = False
+        self._scratch_moved = False
+        self._scratch_cleaned = False
+        self._work_retired = False
+        self._published = False
+        self._closed = False
+        self._reservation: FinalEncodingReservationCapabilityV1 | None = None
+
+    def write(self, frame_name: str, vr_frame: np.ndarray) -> None:
+        if self._closed or self._pipe_finished:
+            raise RuntimeError("streamed VR encoding session is closed")
+        if (
+            not isinstance(vr_frame, np.ndarray)
+            or vr_frame.dtype != np.uint8
+            or vr_frame.ndim != 3
+            or vr_frame.shape[2] != 3
+        ):
+            raise ValueError("streamed VR frame must be an RGB8-compatible array")
+        expected_width, expected_height = self.manifest.expected_shape
+        if vr_frame.shape[:2] != (expected_height, expected_width):
+            raise ValueError("streamed VR frame shape differs from the final layout")
+        encoded, payload = cv2.imencode(".png", vr_frame)
+        if not encoded:
+            raise OSError(f"could not encode streamed VR frame: {frame_name}")
+        raw = payload.tobytes()
+        self.manifest.append(frame_name, raw)
+        self.process.write(raw)
+
+    def _private_manifest_authority(
+        self,
+        completed: CompletedStreamedVrInputManifestV1,
+    ) -> _EncodingManifestExtentAuthority:
+        root = self.output_dir
+        path = completed.path.resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as error:
+            raise ReservationConflictError("streamed manifest escaped the job root") from error
+        return _EncodingManifestExtentAuthority(
+            job_root=root,
+            job_root_identity=capture_directory_identity(root),
+            source_path=path,
+            source_parent_identity=capture_directory_identity(path.parent),
+            source_identity=capture_file_identity(path),
+            payload_raw_max=completed.staged.raw_byte_count,
+            logical_byte_count=completed.staged.raw_byte_count,
+            indexed_source=True,
+        )
+
+    def _stage_completed_manifest(
+        self,
+        completed: CompletedStreamedVrInputManifestV1,
+        prepared: PreparedFinalEncodingReservationV1,
+    ) -> EncodingInputPublicationSource:
+        reserved_authority = self.encoder._encoding_manifest_extent_authority(prepared)
+        if completed.path.resolve() == reserved_authority.source_path.resolve():
+            transaction = prepared.input_manifest_transaction
+            if transaction is None:
+                raise ReservationConflictError(
+                    "streamed input reservation was consumed before validation"
+                )
+            phase = transaction.validate_streamed_physical_phase(
+                prefix_byte_count=completed.staged.raw_byte_count,
+                prefix_sha256=completed.staged.raw_sha256,
+            )
+            if phase != "full-source":
+                raise ReservationConflictError("streamed input reservation lost its full source")
+            source = self.encoder._recover_encoding_manifest_source(
+                reserved_authority,
+                expected_frame_count=self.provider.frame_count,
+            )
+            if source is None or (
+                source.fingerprint != completed.staged.fingerprint
+                or source.raw_sha256 != completed.staged.raw_sha256
+                or source.raw_byte_count != completed.staged.raw_byte_count
+            ):
+                raise ReservationConflictError(
+                    "streamed input reservation differs from completed evidence"
+                )
+            return source
+
+        private_authority = self._private_manifest_authority(completed)
+        assert private_authority.job_root is not None
+        assert private_authority.job_root_identity is not None
+        assert private_authority.source_parent_identity is not None
+        assert private_authority.source_identity is not None
+        private_source = EncodingInputPublicationSource(
+            path=private_authority.source_path,
+            fingerprint=completed.staged.fingerprint,
+            raw_sha256=completed.staged.raw_sha256,
+            raw_byte_count=completed.staged.raw_byte_count,
+            logical_byte_count=completed.staged.raw_byte_count,
+            job_root=private_authority.job_root,
+            job_root_identity=private_authority.job_root_identity,
+            source_parent_identity=private_authority.source_parent_identity,
+            source_identity=private_authority.source_identity,
+        ).validated(expected_frame_count=self.provider.frame_count)
+        transaction = prepared.input_manifest_transaction
+        if transaction is None:
+            raise ReservationConflictError("streamed input reservation was consumed before staging")
+
+        def chunks() -> Iterator[bytes]:
+            remaining = completed.staged.raw_byte_count
+            with _open_encoding_manifest_extent_authority(
+                private_authority,
+                writable=False,
+            ) as handle:
+                while remaining:
+                    chunk = handle.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ReservationConflictError(
+                            "streamed input manifest ended during reservation staging"
+                        )
+                    remaining -= len(chunk)
+                    yield chunk
+                if handle.read(1):
+                    raise ReservationConflictError(
+                        "streamed input manifest grew during reservation staging"
+                    )
+
+        transaction.stage_complete_full_streamed(
+            chunks=chunks,
+            prefix_byte_count=completed.staged.raw_byte_count,
+            prefix_sha256=completed.staged.raw_sha256,
+        )
+        private_source.validated(expected_frame_count=self.provider.frame_count)
+        assert reserved_authority.job_root is not None
+        assert reserved_authority.job_root_identity is not None
+        assert reserved_authority.source_parent_identity is not None
+        assert reserved_authority.source_identity is not None
+        assert reserved_authority.logical_byte_count is not None
+        return EncodingInputPublicationSource(
+            path=reserved_authority.source_path,
+            fingerprint=completed.staged.fingerprint,
+            raw_sha256=completed.staged.raw_sha256,
+            raw_byte_count=completed.staged.raw_byte_count,
+            logical_byte_count=reserved_authority.logical_byte_count,
+            job_root=reserved_authority.job_root,
+            job_root_identity=reserved_authority.job_root_identity,
+            source_parent_identity=reserved_authority.source_parent_identity,
+            source_identity=reserved_authority.source_identity,
+        ).validated(expected_frame_count=self.provider.frame_count)
+
+    def _handoff_indexed_scratch(
+        self,
+        capability: FinalEncodingReservationCapabilityV1,
+    ) -> Path:
+        self.scratch.assert_current_identity()
+        sibling = capability.sibling_path
+        if self.scratch.path.parent != sibling.parent or self.scratch.path == sibling:
+            raise ReservationConflictError(
+                "streamed video scratch cannot hand off to its indexed sibling"
+            )
+
+        def namespace_replaced() -> None:
+            self._scratch_moved = True
+
+        try:
+            same_parent_replace_v1(
+                self.scratch.path,
+                sibling,
+                expected_source_identity=self.scratch.source_identity,
+                expected_target_identity=None,
+                expected_parent_identity=self.scratch.parent_identity,
+                replace_existing=False,
+                after_namespace_replace=namespace_replaced,
+            )
+        except BaseException:
+            if not self._scratch_moved:
+                try:
+                    with AcquiredRoot(self.output_dir) as acquired:
+                        source_absent = (
+                            acquired.persistent_identity == self.scratch.parent_identity
+                            and acquired.regular_identity(
+                                self.scratch.path,
+                                missing_ok=True,
+                            )
+                            is None
+                        )
+                        sibling_identity = acquired.persistent_regular_identity(
+                            sibling,
+                            missing_ok=True,
+                        )
+                    if source_absent and sibling_identity == self.scratch.source_identity:
+                        self._scratch_moved = True
+                except Exception:
+                    # Preserve the original replacement failure.  Without exact
+                    # evidence the pre-handoff cleanup path remains conservative.
+                    pass
+            raise
+        self._scratch_moved = True
+        return sibling
+
+    def _finish_and_publish(self) -> bool:
+        result = self.process.finish()
+        self._pipe_finished = True
+        diagnostics = tuple(
+            line for line in result.stderr.decode("utf-8", errors="replace").splitlines() if line
+        )
+        if result.returncode != 0 or result.stderr:
+            self.encoder._print_direct_ffmpeg_failure(
+                result.returncode if result.returncode != 0 else 1,
+                diagnostics,
+            )
+            return False
+        if not self.scratch.path.is_file() or self.scratch.path.stat().st_size == 0:
+            self.encoder._print_direct_ffmpeg_output_validation_failure(diagnostics)
+            return False
+
+        self.selected_audio.revalidate(cancelled=self.cancelled)
+        self.work.validate_ready_work_files()
+        validator = self.encoder._container_validator_for_invocation(
+            self.settings,
+            self.provider.frame_count,
+            self.resolved_fps,
+            self.resolved_encoder,
+            self.selected_audio.audio_end_sample,
+            self.cancelled,
+        )
+        validated_container = validate_final_container_evidence_v1(
+            self.output_dir,
+            self.scratch.path,
+            validator,
+        )
+        if validated_container.identity != self.scratch.source_identity:
+            raise ReservationConflictError("streamed work output identity changed during encoding")
+        publication_settings = recover_processing_control_prefix_v1(self.output_dir)
+        if publication_settings is None:
+            raise ReservationConflictError("streamed work lost its settings authority")
+        prepared = prepare_final_encoding_reservation_v1(
+            job_root=self.output_dir,
+            settings=publication_settings,
+            publication_generation=self.publication_generation,
+            input_manifest_raw_max=self.encoder._encoding_manifest_raw_bound(
+                self.provider,
+                streamed_evidence=True,
+            ),
+            final_manifest_raw_max=1024 * 1024,
+            cancelled=self.cancelled,
+        )
+        capability = FinalEncodingReservationCapabilityV1.from_prepared(prepared)
+        self._reservation = capability
+        self.encoder._pending_final_reservation = capability
+        output_evidence = StreamedVrOutputEvidenceV1(
+            reservation_index_fingerprint=capability.index_fingerprint,
+            sibling_relative_path=capability.sibling_path.name,
+            identity=validated_container.identity,
+            raw_sha256=validated_container.raw_sha256,
+            byte_count=validated_container.byte_count,
+        )
+        completed = self.manifest.complete(output_evidence=output_evidence)
+        self._manifest_completed = True
+        self.work.validate_ready_work_files()
+        manifest_source = self._stage_completed_manifest(completed, prepared)
+        sibling = self._handoff_indexed_scratch(capability)
+        self.work.retire_handoff(
+            final_sibling_path=sibling,
+            output_evidence=validated_container.identity,
+        )
+        self._work_retired = True
+        capability.commit_producer_settings()
+        invocation = self.manifest.invocation
+        if invocation is None or invocation != self.work.index.invocation:
+            raise ReservationConflictError("streamed invocation evidence changed")
+        normalized = invocation.materialized_arguments(completed.staged.fingerprint)
+        current_settings = recover_processing_control_prefix_v1(self.output_dir)
+        if current_settings is None:
+            raise ReservationConflictError("streamed publication lost its producer settings")
+        publication = FinalPublicationTransactionV4(
+            job_root=self.output_dir,
+            settings=current_settings,
+            sibling_relative_path=sibling.name,
+            encoding_input_source=manifest_source,
+            input_stage_fingerprint=completed.staged.fingerprint,
+            resolved_encoding_arguments=normalized,
+            container_validator=None,
+            expected_sibling_identity=validated_container.identity,
+            expected_sibling_sha256=validated_container.raw_sha256,
+            expected_sibling_byte_count=validated_container.byte_count,
+            reservation=capability,
+            retire_reservation=False,
+        )
+        publication.publish()
+        self._published = True
+        self.encoder._pending_final_reservation = capability
+        return True
+
+    def finish_and_publish(self) -> bool:
+        if self._closed:
+            raise RuntimeError("streamed VR encoding session is closed")
+        try:
+            return self._finish_and_publish()
+        except (InterruptedError, ReservationIncompleteError):
+            raise
+        except Exception as error:
+            if self._scratch_moved:
+                raise ReservationIncompleteError(
+                    "streamed final publication remains retryable"
+                ) from error
+            print(f"Error creating streamed VR output video: {error}")
+            return False
+        finally:
+            self._cleanup_resources()
+
+    def _cleanup_resources(self) -> None:  # noqa: C901
+        if self._closed:
+            return
+        cleanup_errors: list[tuple[str, Exception]] = []
+        if not self._pipe_finished:
+            try:
+                self.process.abort()
+            except Exception as error:
+                raise ReservationIncompleteError(
+                    "streamed work cleanup remains retryable"
+                ) from error
+        if self._scratch_moved and not self._work_retired:
+            # The final index and work intent jointly own an in-progress
+            # handoff.  Removing either file here would destroy restart proof.
+            self._closed = True
+            raise ReservationIncompleteError("streamed final handoff remains retryable")
+        try:
+            if self._manifest_completed:
+                self.manifest.cleanup()
+            else:
+                self.manifest.abort()
+        except Exception as error:
+            cleanup_errors.append(("clean streamed input manifest", error))
+        if not self._scratch_cleaned:
+            try:
+                self.scratch.cleanup()
+                self._scratch_cleaned = True
+            except Exception as error:
+                cleanup_errors.append(("clean streamed video scratch", error))
+        if not self._scratch_moved:
+            capability = self._reservation
+            if capability is not None:
+                try:
+                    self.encoder._discard_streamed_prelaunch(
+                        capability,
+                        work=self.work,
+                    )
+                    self._reservation = None
+                except Exception as error:
+                    cleanup_errors.append(("retire streamed final reservation", error))
+            else:
+                try:
+                    self.encoder._discard_streamed_work(self.work)
+                except Exception as error:
+                    cleanup_errors.append(("retire streamed work intent", error))
+        self._closed = True
+        final_control_active = _write_ahead_control_visible(
+            self.output_dir / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+        )
+        retryable_control_active = _streamed_work_control_visible(self.output_dir) or (
+            final_control_active and not self._published
+        )
+        strict_cleanup_failed = any(
+            isinstance(error, ReservationIncompleteError) for _operation, error in cleanup_errors
+        )
+        if retryable_control_active or strict_cleanup_failed:
+            error = ReservationIncompleteError("streamed work cleanup remains retryable")
+            if cleanup_errors:
+                raise error from cleanup_errors[0][1]
+            raise error
+        for operation, error in cleanup_errors:
+            print(f"Warning: Could not {operation}: {error}")
+
+    def abort(self) -> None:
+        self._cleanup_resources()
+
+    def discard_for_file_backed_fallback(self) -> None:
+        """Strictly remove a pre-frame stream before file-backed rendering."""
+
+        if self._closed or self._pipe_finished or self._published:
+            raise RuntimeError("streamed VR session cannot fall back after its launch phase")
+        try:
+            self.process.abort()
+            self.manifest.abort()
+            self.scratch.cleanup()
+            self._scratch_cleaned = True
+            self.encoder._discard_streamed_work(self.work)
+            self._closed = True
+        except ReservationIncompleteError:
+            raise
+        except Exception as error:
+            if _streamed_work_control_visible(self.output_dir):
+                raise ReservationIncompleteError(
+                    "streamed fallback cleanup remains retryable"
+                ) from error
+            raise
 
 
 class VideoEncoder:
@@ -220,9 +679,7 @@ class VideoEncoder:
         """
         self.verbose = verbose
         self.defer_final_reservation_retirement = defer_final_reservation_retirement
-        self._pending_final_reservation: FinalEncodingReservationCapabilityV1 | None = (
-            None
-        )
+        self._pending_final_reservation: FinalEncodingReservationCapabilityV1 | None = None
 
     @property
     def pending_final_encoding_reservation(
@@ -232,9 +689,7 @@ class VideoEncoder:
 
     def adopt_final_encoding_reservation(
         self,
-        reservation: (
-            PreparedFinalEncodingReservationV1 | FinalEncodingReservationCapabilityV1
-        ),
+        reservation: PreparedFinalEncodingReservationV1 | FinalEncodingReservationCapabilityV1,
     ) -> None:
         """Attach an authenticated recovery transaction for index-last retirement."""
 
@@ -259,8 +714,7 @@ class VideoEncoder:
             f".{reservation.index_path.name}.create-new.tmp"
         )
         if not any(
-            path.exists() or path.is_symlink()
-            for path in (reservation.index_path, index_temporary)
+            path.exists() or path.is_symlink() for path in (reservation.index_path, index_temporary)
         ):
             self._pending_final_reservation = None
             return
@@ -269,6 +723,212 @@ class VideoEncoder:
         else:
             reservation.retire_terminal_failure()
         self._pending_final_reservation = None
+
+    def open_streamed_vr_session(  # noqa: C901
+        self,
+        *,
+        output_dir: Path,
+        original_video: str,
+        settings: dict[str, Any],
+        frame_count: int,
+        first_index: int = 0,
+        progress_tracker=None,
+    ) -> StreamedVrEncodingSession:
+        """Open a transient assembled-VR encoder before Quality rendering starts."""
+
+        root = Path(output_dir).resolve()
+        artifact = recover_processing_control_prefix_v1(root)
+        if artifact is None:
+            raise ValueError("streamed VR encoding requires schema-5 settings")
+        if artifact.selected_frame_count != frame_count:
+            raise ValueError("streamed VR frame count differs from durable selected count")
+        active_index = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+        if active_index.exists() or active_index.is_symlink():
+            raise ReservationConflictError(
+                "an active final reservation disables transient streaming"
+            )
+        try:
+            abandoned_work = StreamedVrWorkReservationV1.load(root)
+        except Exception as error:
+            if _streamed_work_control_visible(root):
+                raise ReservationIncompleteError(
+                    "existing streamed work remains retryable"
+                ) from error
+            raise
+        if abandoned_work is not None:
+            self._discard_streamed_work(abandoned_work)
+        if not verify_ffmpeg_installation():
+            raise RuntimeError("FFmpeg is unavailable for streamed VR encoding")
+        values = artifact.to_object()
+        durable_settings = dict(values["processing_settings"])
+        required_keys = (
+            "preserve_audio",
+            "video_encoder",
+            "vr_format",
+            "per_eye_width",
+            "per_eye_height",
+            "vr_output_width",
+            "vr_output_height",
+            "start_time",
+            "end_time",
+            "source_fps",
+        )
+        if any(settings.get(key) != durable_settings.get(key) for key in required_keys):
+            raise ValueError("runtime streamed settings differ from durable settings")
+        expected_relative_path = values["output_info"]["expected_final_relative_path"]
+        publication_generation = values["metadata"][
+            "final_media_publication_generation"
+        ] or secrets.token_hex(16)
+        resolved_fps = self._resolve_schema5_output_fps_value(values)
+        provider = EncodingSequenceProvider.freeze(
+            mode="assembled_vr",
+            frame_count=frame_count,
+            first_index=first_index,
+            frames_parent=PurePosixPath("streamed_vr_frames"),
+        )
+        cancelled = self._cancellation_predicate(progress_tracker)
+        resolved_encoder = self._resolve_encoder_name(
+            durable_settings.get("video_encoder", "auto"),
+            cancelled=cancelled,
+        )
+        selected_audio = prepare_selected_audio_v1(
+            output_dir=root,
+            original_video=original_video,
+            settings=durable_settings,
+            frame_count=frame_count,
+            fps=resolved_fps,
+            cancelled=cancelled,
+        )
+        width = int(durable_settings["vr_output_width"])
+        height = int(durable_settings["vr_output_height"])
+        if width <= 0 or height <= 0:
+            raise ValueError("streamed VR output dimensions must be positive")
+
+        manifest: StreamedVrInputManifestV1 | None = None
+        scratch: OwnedSiblingTemporary | None = None
+        process: FfmpegInputPipeProcessV1 | None = None
+        work: StreamedVrWorkReservationV1 | None = None
+        try:
+            work_generation = secrets.token_hex(16)
+            work_output = root / (f".depth-surge-streamed-vr-{work_generation}-output.tmp.mp4")
+            command = self._build_streamed_vr_command(
+                provider,
+                work_output,
+                durable_settings,
+                selected_audio,
+                resolved_fps,
+                resolved_encoder,
+            )
+            normalized_template = self._normalize_publication_arguments(
+                command=command,
+                image_inputs={"pipe:0": "frames"},
+                selected_audio=selected_audio,
+                runtime_output=work_output,
+                input_stage_fingerprint="self",
+                final_relative_path=expected_relative_path,
+            )
+            metadata = values["metadata"]
+            invocation = StreamedVrInvocationV1(
+                job_id=metadata["job_id"],
+                settings_identity_fingerprint=metadata["settings_identity_fingerprint"],
+                publication_generation=publication_generation,
+                frame_count=provider.frame_count,
+                first_index=provider.first_index,
+                expected_shape=(width, height),
+                resolved_encoder=cast(
+                    Literal["libx264", "libx265", "hevc_nvenc"],
+                    resolved_encoder,
+                ),
+                resolved_fps=resolved_fps,
+                audio_end_sample=selected_audio.audio_end_sample,
+                resolved_arguments_template=normalized_template,
+            )
+            work = StreamedVrWorkReservationV1.prepare(
+                job_root=root,
+                settings=artifact,
+                publication_generation=publication_generation,
+                work_generation=work_generation,
+                expected_final_relative_path=expected_relative_path,
+                invocation=invocation,
+            )
+            manifest = StreamedVrInputManifestV1(
+                job_root=root,
+                provider=provider,
+                expected_shape=(width, height),
+                invocation=invocation,
+                owned_target_path=work.manifest_target_path,
+                owned_temporary_path=work.manifest_temporary_path,
+            )
+            scratch = OwnedSiblingTemporary.create(
+                root / expected_relative_path,
+                temporary=work.output_path,
+            )
+            scratch.close()
+            work.publish_ready(
+                manifest_identity=manifest.owned_source_identity,
+                output_identity=scratch.source_identity,
+            )
+            process = FfmpegInputPipeProcessV1(
+                parser=FfmpegProgressParser(),
+                diagnostic_cap=FINAL_ENCODE_DIAGNOSTIC_BYTES,
+                line_cap=FINAL_ENCODING_LINE_BYTES,
+                stall_seconds=120.0,
+                cancelled=cancelled,
+            )
+            process.start(command)
+            return StreamedVrEncodingSession(
+                encoder=self,
+                output_dir=root,
+                settings=durable_settings,
+                provider=provider,
+                manifest=manifest,
+                scratch=scratch,
+                process=process,
+                command=command,
+                selected_audio=selected_audio,
+                resolved_fps=resolved_fps,
+                resolved_encoder=resolved_encoder,
+                expected_relative_path=expected_relative_path,
+                publication_generation=publication_generation,
+                work=work,
+                cancelled=cancelled,
+            )
+        except BaseException as original_error:
+            cleanup_errors: list[Exception] = []
+            process_abort_failed = False
+            if process is not None:
+                try:
+                    process.abort()
+                except Exception as error:
+                    cleanup_errors.append(error)
+                    process_abort_failed = True
+            if not process_abort_failed:
+                if manifest is not None:
+                    try:
+                        manifest.abort()
+                    except Exception as error:
+                        cleanup_errors.append(error)
+                if scratch is not None:
+                    try:
+                        scratch.cleanup()
+                    except Exception as error:
+                        cleanup_errors.append(error)
+                if work is not None:
+                    try:
+                        self._discard_streamed_work(work)
+                    except Exception as error:
+                        cleanup_errors.append(error)
+            strict_cleanup_failed = any(
+                isinstance(error, ReservationIncompleteError) for error in cleanup_errors
+            )
+            if _streamed_work_control_visible(root) or strict_cleanup_failed:
+                cause = cleanup_errors[0] if cleanup_errors else original_error
+                raise ReservationIncompleteError(
+                    "streamed session setup cleanup remains retryable"
+                ) from cause
+            for error in cleanup_errors:
+                print(f"Warning: Could not clean failed streamed session setup: {error}")
+            raise
 
     def create_video(  # noqa: C901
         self,
@@ -374,9 +1034,7 @@ class VideoEncoder:
             if frames_parent is None:
                 raise ValueError("assembled schema-5 provider has no frames parent")
             assembled_pattern = (
-                Path(os.path.abspath(os.fspath(output_dir))).joinpath(
-                    *frames_parent.parts
-                )
+                Path(os.path.abspath(os.fspath(output_dir))).joinpath(*frames_parent.parts)
                 / "frame_%06d.png"
             )
         cmd.extend(["-i", str(assembled_pattern)])
@@ -471,9 +1129,7 @@ class VideoEncoder:
                     },
                     selected_audio=selected_audio,
                     runtime_output=output_path,
-                    input_stage_fingerprint=(
-                        schema5_context.staged_manifest.fingerprint
-                    ),
+                    input_stage_fingerprint=(schema5_context.staged_manifest.fingerprint),
                     final_relative_path=schema5_context.expected_relative_path,
                 )
                 container_validator = self._container_validator_for_invocation(
@@ -491,17 +1147,13 @@ class VideoEncoder:
                 )
                 publication_settings = recover_processing_control_prefix_v1(output_dir)
                 if publication_settings is None:
-                    raise ReservationConflictError(
-                        "final publication lost its settings authority"
-                    )
+                    raise ReservationConflictError("final publication lost its settings authority")
                 publication = FinalPublicationTransactionV4(
                     job_root=output_dir,
                     settings=publication_settings,
                     sibling_relative_path=output_path.name,
                     encoding_input_source=schema5_context.manifest_source,
-                    input_stage_fingerprint=(
-                        schema5_context.staged_manifest.fingerprint
-                    ),
+                    input_stage_fingerprint=(schema5_context.staged_manifest.fingerprint),
                     resolved_encoding_arguments=normalized,
                     container_validator=None,
                     expected_sibling_identity=validated_container.identity,
@@ -563,9 +1215,7 @@ class VideoEncoder:
         try:
             parent = lexical_parent.relative_to(root)
         except ValueError as error:
-            raise ValueError(
-                "assembled frame parent is outside the job root"
-            ) from error
+            raise ValueError("assembled frame parent is outside the job root") from error
         frame_count = 0
         first_index: int | None = None
         last_index: int | None = None
@@ -573,9 +1223,7 @@ class VideoEncoder:
             with AcquiredRoot(root) as acquired:
                 for entry in acquired.iter_directory(lexical_parent):
                     if cancelled is not None and cancelled():
-                        raise InterruptedError(
-                            "final encoding input audit was cancelled"
-                        )
+                        raise InterruptedError("final encoding input audit was cancelled")
                     match = _DIRECT_FRAME_NAME.fullmatch(entry.name)
                     if match is None:
                         folded = entry.name.casefold()
@@ -588,9 +1236,7 @@ class VideoEncoder:
                     if entry.name != f"frame_{index:06d}.png":
                         raise ValueError("assembled frame padding is noncanonical")
                     frame_count += 1
-                    first_index = (
-                        index if first_index is None else min(first_index, index)
-                    )
+                    first_index = index if first_index is None else min(first_index, index)
                     last_index = index if last_index is None else max(last_index, index)
         except NoFollowPathError as error:
             raise ValueError(str(error)) from error
@@ -620,12 +1266,12 @@ class VideoEncoder:
         cancelled: Callable[[], bool] | None = None,
     ) -> _Schema5EncodingContext | None:
         root = Path(os.path.abspath(os.fspath(output_dir)))
-        left_parent = Path(
-            os.path.abspath(os.fspath(sequence.left_pattern.parent))
-        ).relative_to(root)
-        right_parent = Path(
-            os.path.abspath(os.fspath(sequence.right_pattern.parent))
-        ).relative_to(root)
+        left_parent = Path(os.path.abspath(os.fspath(sequence.left_pattern.parent))).relative_to(
+            root
+        )
+        right_parent = Path(os.path.abspath(os.fspath(sequence.right_pattern.parent))).relative_to(
+            root
+        )
         provider = EncodingSequenceProvider.freeze(
             mode="direct_stereo",
             frame_count=sequence.frame_count,
@@ -672,20 +1318,14 @@ class VideoEncoder:
     ) -> _Schema5EncodingContext:
         artifact = recover_processing_control_prefix_v1(output_dir)
         if artifact is None:
-            raise ReservationConflictError(
-                "schema-5 publication lost its settings authority"
-            )
+            raise ReservationConflictError("schema-5 publication lost its settings authority")
         artifact_value = artifact.to_object()
         frame_count = artifact.selected_frame_count
         if provider.frame_count != frame_count:
-            raise ValueError(
-                "encoding provider frame count differs from durable settings"
-            )
+            raise ValueError("encoding provider frame count differs from durable settings")
         metadata = artifact_value["metadata"]
         publication_generation = metadata["final_media_publication_generation"]
-        expected_relative_path = artifact_value["output_info"][
-            "expected_final_relative_path"
-        ]
+        expected_relative_path = artifact_value["output_info"]["expected_final_relative_path"]
         resolved_fps = self._resolve_schema5_output_fps_value(artifact_value)
         del metadata, artifact_value, artifact
         active_index = output_dir / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
@@ -697,14 +1337,14 @@ class VideoEncoder:
                     raise ReservationConflictError(
                         "active final reservation lost its settings authority"
                     )
-                reservation = load_final_encoding_reservation_v1(
-                    output_dir, phase_settings
-                )
+                reservation = load_final_encoding_reservation_v1(output_dir, phase_settings)
                 del phase_settings
-                capability = FinalEncodingReservationCapabilityV1.from_prepared(
-                    reservation
-                )
+                capability = FinalEncodingReservationCapabilityV1.from_prepared(reservation)
                 self._pending_final_reservation = capability
+                if reservation.requires_explicit_streamed_recovery():
+                    raise ReservationConflictError(
+                        "streamed v3 publication requires evidence-bound recovery"
+                    )
                 recovery = reservation.recover_publication_prefix()
                 recovery_phase = recovery.phase
                 del recovery
@@ -726,17 +1366,10 @@ class VideoEncoder:
                     "input_manifest_committed_no_final_intent",
                     "post_boundary_retry_sibling_present",
                 }:
-                    raise ValueError(
-                        f"unsupported final encoding recovery phase: {recovery_phase}"
-                    )
-                if (
-                    reservation.sibling_path.exists()
-                    or reservation.sibling_path.is_symlink()
-                ):
+                    raise ValueError(f"unsupported final encoding recovery phase: {recovery_phase}")
+                if reservation.sibling_path.exists() or reservation.sibling_path.is_symlink():
                     if not reservation.discard_nonsemantic_sibling():
-                        raise ValueError(
-                            "indexed sibling is not discardable in this phase"
-                        )
+                        raise ValueError("indexed sibling is not discardable in this phase")
                 reservation.reset_incomplete_manifest_sources()
                 authority = self._encoding_manifest_extent_authority(reservation)
                 publication_generation = reservation.index.publication_generation
@@ -767,10 +1400,7 @@ class VideoEncoder:
                             cancelled=cancelled,
                         )
                     except (EncodingProviderError, OSError, ValueError):
-                        if (
-                            recovery_phase != "ready_pre_video"
-                            or not allow_prelaunch_rebuild
-                        ):
+                        if recovery_phase != "ready_pre_video" or not allow_prelaunch_rebuild:
                             raise
                         capability.discard_prelaunch_invocation()
                         allow_prelaunch_rebuild = False
@@ -789,9 +1419,7 @@ class VideoEncoder:
                         job_root=output_dir,
                         settings=phase_settings,
                         publication_generation=publication_generation,
-                        input_manifest_raw_max=self._encoding_manifest_raw_bound(
-                            provider
-                        ),
+                        input_manifest_raw_max=self._encoding_manifest_raw_bound(provider),
                         final_manifest_raw_max=1024 * 1024,
                         cancelled=cancelled,
                     )
@@ -799,25 +1427,19 @@ class VideoEncoder:
                     raise
                 except BaseException:
                     if active_index.is_file():
-                        recovery_settings = recover_processing_control_prefix_v1(
-                            output_dir
-                        )
+                        recovery_settings = recover_processing_control_prefix_v1(output_dir)
                         if recovery_settings is not None:
                             recovered = load_final_encoding_reservation_v1(
                                 output_dir, recovery_settings
                             )
                             self._pending_final_reservation = (
-                                FinalEncodingReservationCapabilityV1.from_prepared(
-                                    recovered
-                                )
+                                FinalEncodingReservationCapabilityV1.from_prepared(recovered)
                             )
                             del recovered, recovery_settings
                     raise
                 finally:
                     del phase_settings
-                capability = FinalEncodingReservationCapabilityV1.from_prepared(
-                    reservation
-                )
+                capability = FinalEncodingReservationCapabilityV1.from_prepared(reservation)
                 self._pending_final_reservation = capability
                 authority = self._encoding_manifest_extent_authority(reservation)
                 del reservation
@@ -848,9 +1470,7 @@ class VideoEncoder:
             return _EncodingManifestExtentAuthority(
                 job_root=None,
                 job_root_identity=None,
-                source_path=(
-                    reservation.job_root / ENCODING_INPUT_MANIFEST_RELATIVE_PATH
-                ),
+                source_path=(reservation.job_root / ENCODING_INPUT_MANIFEST_RELATIVE_PATH),
                 source_parent_identity=None,
                 source_identity=None,
                 payload_raw_max=None,
@@ -910,11 +1530,7 @@ class VideoEncoder:
             authority,
             writable=False,
         ) as handle:
-            prefix = (
-                PreparedFinalEncodingReservationV1._canonical_prefix_byte_count_handle(
-                    handle
-                )
-            )
+            prefix = PreparedFinalEncodingReservationV1._canonical_prefix_byte_count_handle(handle)
             if prefix is None:
                 raise ReservationConflictError(
                     "indexed encoding manifest has a noncanonical payload prefix"
@@ -982,7 +1598,11 @@ class VideoEncoder:
             ) from error
 
     @staticmethod
-    def _encoding_manifest_raw_bound(provider: EncodingSequenceProvider) -> int:
+    def _encoding_manifest_raw_bound(
+        provider: EncodingSequenceProvider,
+        *,
+        streamed_evidence: bool = False,
+    ) -> int:
         parents = tuple(
             parent
             for parent in (
@@ -998,6 +1618,11 @@ class VideoEncoder:
         maximum_path_scalars = maximum_parent_scalars + maximum_index_digits + 18
         per_frame_bound = 96 + view_count * (6 * maximum_path_scalars + 512)
         raw_bound = 4096 + provider.frame_count * per_frame_bound
+        if streamed_evidence:
+            # Invocation vectors are bounded to 64 KiB and the output identity
+            # footer is scalar.  Keep the v2 bound unchanged for file-backed
+            # manifests while admitting the closed v3 evidence envelope.
+            raw_bound += 128 * 1024
         if raw_bound > (1 << 64) - 1:
             raise ValueError("encoding input manifest raw bound exceeds u64")
         return raw_bound
@@ -1112,17 +1737,13 @@ class VideoEncoder:
     ) -> tuple[str, ...]:
         normalized: list[str] = []
         audio_token = selected_audio.normalized_input_token()
-        audio_text = (
-            str(selected_audio.selected_source_path) if selected_audio.usable else None
-        )
+        audio_text = str(selected_audio.selected_source_path) if selected_audio.usable else None
         for index, argument in enumerate(command):
             text = str(argument)
             if index > 0 and command[index - 1] == "-i":
                 view = image_inputs.get(text)
                 if view is not None:
-                    text = (
-                        f"@image-sequence:sha256={input_stage_fingerprint}:view={view}"
-                    )
+                    text = f"@image-sequence:sha256={input_stage_fingerprint}:view={view}"
                 elif audio_text is not None and text == audio_text:
                     assert audio_token is not None
                     text = audio_token
@@ -1131,9 +1752,7 @@ class VideoEncoder:
             if index == len(command) - 1:
                 if text != str(runtime_output):
                     raise ValueError("runtime argv final output path changed")
-                text = "@output:path64=" + FinalPublicationTransactionV4.path64(
-                    final_relative_path
-                )
+                text = "@output:path64=" + FinalPublicationTransactionV4.path64(final_relative_path)
             normalized.append(text)
         return tuple(normalized)
 
@@ -1161,9 +1780,7 @@ class VideoEncoder:
             height=height,
             fps=canonical_fps,
             frame_count=frame_count,
-            resolved_encoder=cast(
-                Literal["libx264", "libx265", "hevc_nvenc"], resolved_encoder
-            ),
+            resolved_encoder=cast(Literal["libx264", "libx265", "hevc_nvenc"], resolved_encoder),
             audio_expected=audio_end_sample is not None,
             audio_packet_upper_bound=packet_bound,
         )
@@ -1343,9 +1960,7 @@ class VideoEncoder:
         """Validate corresponding image2 eye sequences before FFmpeg can start."""
 
         if not left_files or not right_files:
-            raise ValueError(
-                "Direct stereo sequences must contain frames for both eyes"
-            )
+            raise ValueError("Direct stereo sequences must contain frames for both eyes")
         if len(left_files) != len(right_files):
             raise ValueError("Direct stereo sequences must have identical frame counts")
         frame_count = len(left_files)
@@ -1359,19 +1974,13 @@ class VideoEncoder:
             left = Path(left_files[position])
             right = Path(right_files[position])
             if left.parent != left_parent:
-                raise ValueError(
-                    "Direct left-eye frames must have one parent directory"
-                )
+                raise ValueError("Direct left-eye frames must have one parent directory")
             if right.parent != right_parent:
-                raise ValueError(
-                    "Direct right-eye frames must have one parent directory"
-                )
+                raise ValueError("Direct right-eye frames must have one parent directory")
             left_index = self._direct_frame_index(left)
             right_index = self._direct_frame_index(right)
             if left_index != right_index:
-                raise ValueError(
-                    "Direct stereo sequences must have identical frame names"
-                )
+                raise ValueError("Direct stereo sequences must have identical frame names")
             minimum = left_index if minimum is None else min(minimum, left_index)
             maximum = left_index if maximum is None else max(maximum, left_index)
         assert minimum is not None and maximum is not None
@@ -1418,9 +2027,7 @@ class VideoEncoder:
             per_eye_width = int(settings["per_eye_width"])
             per_eye_height = int(settings["per_eye_height"])
         except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(
-                "Direct stereo encoding requires per-eye dimensions"
-            ) from error
+            raise ValueError("Direct stereo encoding requires per-eye dimensions") from error
         if per_eye_width <= 0 or per_eye_height <= 0:
             raise ValueError("Direct stereo per-eye dimensions must be positive")
 
@@ -1463,9 +2070,7 @@ class VideoEncoder:
             command.extend(selected_audio.input_arguments())
         elif preserve_audio:
             audio_file = temporary_output.parent / "original_audio.flac"
-            audio_source: str | Path = (
-                audio_file if audio_file.exists() else original_video
-            )
+            audio_source: str | Path = audio_file if audio_file.exists() else original_video
             command.extend(self._build_audio_input_args(audio_source, settings))
 
         left_matches_target = (
@@ -1561,10 +2166,7 @@ class VideoEncoder:
                 "[stacked]setsar=1[vr]"
             )
         else:
-            scale = (
-                f"scale={per_eye_width}:{per_eye_height}:"
-                "flags=bicubic+accurate_rnd,setsar=1"
-            )
+            scale = f"scale={per_eye_width}:{per_eye_height}:" "flags=bicubic+accurate_rnd,setsar=1"
             filter_graph = (
                 f"[0:v]{scale}[left];[1:v]{scale}[right];"
                 f"[left][right]{stack_filter}=inputs=2:shortest=1[stacked];"
@@ -1573,6 +2175,64 @@ class VideoEncoder:
         command.extend(["-filter_complex", filter_graph, "-map", "[vr]"])
         command.extend(selected_audio.output_arguments(2))
         command.extend(["-frames:v", str(provider.frame_count), "-progress", "pipe:1"])
+        encoder_args, _ = self._build_encoder_cmd(
+            settings.get("video_encoder", "auto"),
+            temporary_output,
+            resolved_encoder=resolved_encoder,
+        )
+        command.extend(encoder_args)
+        return command
+
+    def _build_streamed_vr_command(
+        self,
+        provider: EncodingSequenceProvider,
+        temporary_output: Path,
+        settings: dict[str, Any],
+        selected_audio: SelectedAudioIdentityV1,
+        fps: str,
+        resolved_encoder: str,
+    ) -> list[str]:
+        """Build one assembled PNG image2pipe input without image2 numbering."""
+
+        provider.validated()
+        if provider.mode != "assembled_vr" or provider.frames_parent is None:
+            raise ValueError("streamed VR encoding requires an assembled provider")
+        try:
+            rate = Fraction(fps)
+        except (TypeError, ValueError, ZeroDivisionError) as error:
+            raise ValueError("streamed VR frame rate is invalid") from error
+        if rate <= 0:
+            raise ValueError("streamed VR frame rate must be positive")
+        width = int(settings["vr_output_width"])
+        height = int(settings["vr_output_height"])
+        if width <= 0 or height <= 0:
+            raise ValueError("streamed VR dimensions must be positive")
+        command = [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-xerror",
+            "-nostats",
+            "-framerate",
+            f"{rate.numerator}/{rate.denominator}",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "-i",
+            "pipe:0",
+            *selected_audio.input_arguments(),
+            "-vf",
+            "setsar=1",
+            "-map",
+            "0:v:0",
+            *selected_audio.output_arguments(1),
+            "-frames:v",
+            str(provider.frame_count),
+            "-progress",
+            "pipe:1",
+        ]
         encoder_args, _ = self._build_encoder_cmd(
             settings.get("video_encoder", "auto"),
             temporary_output,
@@ -1640,9 +2300,7 @@ class VideoEncoder:
             cancelled=self._cancellation_predicate(progress_tracker),
         )
         diagnostics = tuple(
-            line
-            for line in result.stderr.decode("utf-8", errors="replace").splitlines()
-            if line
+            line for line in result.stderr.decode("utf-8", errors="replace").splitlines() if line
         )
         if result.stderr:
             return result.returncode if result.returncode != 0 else 1, diagnostics
@@ -1700,9 +2358,7 @@ class VideoEncoder:
                 print(f"  {line}")
 
     @staticmethod
-    def _print_direct_ffmpeg_failure(
-        returncode: int, diagnostics: tuple[str, ...]
-    ) -> None:
+    def _print_direct_ffmpeg_failure(returncode: int, diagnostics: tuple[str, ...]) -> None:
         """Print FFmpeg's bounded diagnostic tail for a failed direct encode."""
 
         print(f"Error: Direct FFmpeg encoding failed with return code {returncode}.")
@@ -1720,6 +2376,393 @@ class VideoEncoder:
         )
         VideoEncoder._print_direct_ffmpeg_diagnostics(diagnostics)
 
+    @staticmethod
+    def _load_schema5_settings_readonly(
+        output_dir: Path,
+    ) -> ProcessingSettingsArtifactV5:
+        """Read fixed settings without advancing an active final reservation."""
+
+        root = Path(output_dir).resolve()
+        path = root / SETTINGS_ARTIFACT_RELATIVE_PATH
+        try:
+            with AcquiredRoot(root) as acquired:
+                root_identity = acquired.persistent_identity
+                with acquired.open_regular(path) as handle:
+                    identity = file_identity_from_open_handle(handle)
+                    raw = handle.read(512 * 1024 + 1)
+                    if (
+                        file_identity_from_open_handle(handle) != identity
+                        or acquired.persistent_regular_identity(path) != identity
+                    ):
+                        raise ReservationConflictError(
+                            "schema-5 settings changed during read-only recovery"
+                        )
+                if acquired.persistent_identity != root_identity:
+                    raise ReservationConflictError(
+                        "schema-5 job root changed during read-only recovery"
+                    )
+        except (NoFollowPathError, FileNotFoundError, OSError) as error:
+            raise ReservationConflictError(
+                "schema-5 settings cannot be read without following links"
+            ) from error
+        if not 0 < len(raw) <= 512 * 1024:
+            raise ReservationConflictError("schema-5 settings exceed their read-only bound")
+        return ProcessingSettingsArtifactV5.parse(raw)
+
+    def _discard_streamed_prelaunch(
+        self,
+        capability: FinalEncodingReservationCapabilityV1,
+        *,
+        work: StreamedVrWorkReservationV1 | None = None,
+    ) -> None:
+        try:
+            capability.discard_prelaunch_invocation()
+            if work is not None:
+                self._discard_streamed_work(work)
+        except ReservationIncompleteError:
+            raise
+        except Exception as error:
+            raise ReservationIncompleteError(
+                "streamed prelaunch retirement remains retryable"
+            ) from error
+        if _write_ahead_control_visible(capability.index_path):
+            raise ReservationIncompleteError("streamed prelaunch retirement remains retryable")
+        if self._pending_final_reservation is capability:
+            self._pending_final_reservation = None
+
+    @staticmethod
+    def _discard_streamed_work(work: StreamedVrWorkReservationV1) -> None:
+        try:
+            work.discard()
+        except ReservationIncompleteError:
+            raise
+        except Exception as error:
+            raise ReservationIncompleteError(
+                "streamed work retirement remains retryable"
+            ) from error
+        if _streamed_work_control_visible(work.job_root):
+            raise ReservationIncompleteError("streamed work retirement remains retryable")
+
+    def _reconcile_streamed_work_handoff(
+        self,
+        *,
+        root: Path,
+        artifact: ProcessingSettingsArtifactV5,
+    ) -> None:
+        """Either finish the proof-preserving work handoff or discard it prelaunch."""
+
+        try:
+            self._reconcile_streamed_work_handoff_once(
+                root=root,
+                artifact=artifact,
+            )
+        except ReservationIncompleteError:
+            raise
+        except Exception as error:
+            if _streamed_work_control_visible(root):
+                raise ReservationIncompleteError(
+                    "streamed work reconciliation remains retryable"
+                ) from error
+            raise
+
+    def _reconcile_streamed_work_handoff_once(
+        self,
+        *,
+        root: Path,
+        artifact: ProcessingSettingsArtifactV5,
+    ) -> None:
+        work = StreamedVrWorkReservationV1.load(root)
+        if work is None:
+            return
+        active_index = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+        if not active_index.is_file() or active_index.is_symlink():
+            self._discard_streamed_work(work)
+            return
+        prepared = load_final_encoding_reservation_v1(root, artifact)
+        capability = FinalEncodingReservationCapabilityV1.from_prepared(prepared)
+        recovery = prepared.observe()
+        if recovery.phase != "ready_pre_video":
+            raise ReservationConflictError(
+                "streamed work overlaps a post-boundary final reservation"
+            )
+        try:
+            authority = self._encoding_manifest_extent_authority(prepared)
+            manifest_source = self._recover_encoding_manifest_source(
+                authority,
+                expected_frame_count=artifact.selected_frame_count,
+            )
+            if manifest_source is None:
+                raise ReservationConflictError(
+                    "streamed handoff lacks a completed reserved manifest"
+                )
+            projection = manifest_source.projection(
+                expected_frame_count=artifact.selected_frame_count,
+            )
+            invocation = projection.streamed_invocation
+            output = projection.streamed_output
+            if (
+                invocation is None
+                or output is None
+                or invocation != work.index.invocation
+                or output.reservation_index_fingerprint != capability.index_fingerprint
+                or output.sibling_relative_path != capability.sibling_path.name
+                or work.output_path.exists()
+                or work.output_path.is_symlink()
+            ):
+                raise ReservationConflictError(
+                    "streamed handoff evidence differs from its two owners"
+                )
+            ready = work.ready
+            if ready is not None and output.identity != ready.output_identity:
+                raise ReservationConflictError(
+                    "streamed handoff output differs from ready evidence"
+                )
+            work.retire_handoff(
+                final_sibling_path=capability.sibling_path,
+                output_evidence=output.identity,
+            )
+        except (
+            FinalPublicationValidationError,
+            ReservationConflictError,
+            OSError,
+            ValueError,
+        ):
+            self._discard_streamed_prelaunch(capability, work=work)
+
+    def _recover_streamed_vr_sibling(  # noqa: C901
+        self,
+        *,
+        output_dir: Path,
+        original_video: str,
+        settings: dict[str, Any],
+        cancelled: Callable[[], bool] | None,
+        artifact: ProcessingSettingsArtifactV5 | None = None,
+    ) -> bool | None:
+        """Publish a completed indexed image2pipe sibling without rendered PNG files."""
+
+        root = Path(output_dir).resolve()
+        artifact = artifact or self._load_schema5_settings_readonly(root)
+        self._reconcile_streamed_work_handoff(root=root, artifact=artifact)
+        active_index = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+        if not active_index.is_file():
+            return None
+        prepared = load_final_encoding_reservation_v1(root, artifact)
+        capability = FinalEncodingReservationCapabilityV1.from_prepared(prepared)
+        self._pending_final_reservation = capability
+        recovery = prepared.observe()
+        supported_phases = {
+            "ready_pre_video",
+            "windows_video_replace_gap_before_input_commit",
+            "windows_video_replace_gap_after_input_commit",
+            "video_replaced_input_intent",
+            "input_manifest_committed_no_final_intent",
+            "post_boundary_retry_sibling_present",
+            "final_manifest_intent",
+            "publication_authenticated",
+        }
+        if recovery.phase not in supported_phases:
+            return None
+        sibling = capability.sibling_path
+        pre_video = recovery.phase == "ready_pre_video"
+        video_path = (
+            sibling
+            if recovery.phase
+            in {
+                "ready_pre_video",
+                "windows_video_replace_gap_before_input_commit",
+                "windows_video_replace_gap_after_input_commit",
+            }
+            else capability.final_video_path
+        )
+        if not video_path.is_file() or video_path.is_symlink():
+            if pre_video:
+                self._discard_streamed_prelaunch(capability)
+            return None
+
+        authority = self._encoding_manifest_extent_authority(prepared)
+        try:
+            manifest_source = self._recover_encoding_manifest_source(
+                authority,
+                expected_frame_count=artifact.selected_frame_count,
+            )
+        except (FinalPublicationValidationError, ReservationConflictError):
+            if pre_video:
+                return None
+            raise
+        if manifest_source is None:
+            return None
+        projection = manifest_source.projection(
+            expected_frame_count=artifact.selected_frame_count,
+        )
+        streamed_parent = PurePosixPath("streamed_vr_frames")
+        invocation = projection.streamed_invocation
+        output_evidence = projection.streamed_output
+        if invocation is None or output_evidence is None:
+            if pre_video:
+                return None
+            raise ReservationConflictError("post-boundary streamed publication lacks v3 evidence")
+        if projection.mode != "assembled_vr" or projection.frames_parent != streamed_parent:
+            if pre_video:
+                self._discard_streamed_prelaunch(capability)
+                return None
+            raise ReservationConflictError("post-boundary streamed manifest changed encoding mode")
+        values = artifact.to_object()
+        durable_settings = dict(values["processing_settings"])
+        required_keys = (
+            "preserve_audio",
+            "video_encoder",
+            "vr_format",
+            "per_eye_width",
+            "per_eye_height",
+            "vr_output_width",
+            "vr_output_height",
+            "start_time",
+            "end_time",
+            "source_fps",
+        )
+        if any(settings.get(key) != durable_settings.get(key) for key in required_keys):
+            raise ValueError("runtime streamed recovery settings differ from durable settings")
+        if not verify_ffmpeg_installation():
+            raise RuntimeError("FFmpeg is unavailable for streamed VR recovery")
+        resolved_fps = self._resolve_schema5_output_fps_value(values)
+        metadata = values["metadata"]
+        expected_relative_path = values["output_info"]["expected_final_relative_path"]
+        try:
+            if (
+                invocation.job_id != metadata["job_id"]
+                or invocation.settings_identity_fingerprint
+                != metadata["settings_identity_fingerprint"]
+                or invocation.publication_generation != prepared.index.publication_generation
+                or metadata["final_media_publication_generation"]
+                not in {None, invocation.publication_generation}
+                or invocation.frame_count != projection.frame_count
+                or invocation.first_index != projection.first_index
+                or invocation.expected_shape
+                != (
+                    int(durable_settings["vr_output_width"]),
+                    int(durable_settings["vr_output_height"]),
+                )
+                or invocation.resolved_fps != resolved_fps
+                or output_evidence.reservation_index_fingerprint != capability.index_fingerprint
+                or output_evidence.sibling_relative_path != sibling.name
+            ):
+                raise ReservationConflictError(
+                    "streamed recovery evidence differs from durable authority"
+                )
+        except (KeyError, TypeError, ValueError, ReservationConflictError) as error:
+            if pre_video:
+                self._discard_streamed_prelaunch(capability)
+                return None
+            raise ReservationConflictError("post-boundary streamed authority differs") from error
+        selected_audio = prepare_selected_audio_v1(
+            output_dir=root,
+            original_video=original_video,
+            settings=durable_settings,
+            frame_count=projection.frame_count,
+            fps=resolved_fps,
+            cancelled=cancelled,
+        )
+        provider = EncodingSequenceProvider.freeze(
+            mode="assembled_vr",
+            frame_count=projection.frame_count,
+            first_index=projection.first_index,
+            frames_parent=streamed_parent,
+        )
+        command = self._build_streamed_vr_command(
+            provider,
+            video_path,
+            durable_settings,
+            selected_audio,
+            resolved_fps,
+            invocation.resolved_encoder,
+        )
+        normalized_template = self._normalize_publication_arguments(
+            command=command,
+            image_inputs={"pipe:0": "frames"},
+            selected_audio=selected_audio,
+            runtime_output=video_path,
+            input_stage_fingerprint="self",
+            final_relative_path=expected_relative_path,
+        )
+        try:
+            selected_audio.revalidate(cancelled=cancelled)
+            if (
+                selected_audio.audio_end_sample != invocation.audio_end_sample
+                or normalized_template != invocation.resolved_arguments_template
+            ):
+                raise ReservationConflictError(
+                    "streamed recovery invocation differs from its launch evidence"
+                )
+        except (OSError, ValueError, ReservationConflictError) as error:
+            if pre_video:
+                self._discard_streamed_prelaunch(capability)
+                return None
+            raise ReservationConflictError("post-boundary streamed invocation differs") from error
+        validator = self._container_validator_for_invocation(
+            durable_settings,
+            projection.frame_count,
+            resolved_fps,
+            invocation.resolved_encoder,
+            selected_audio.audio_end_sample,
+            cancelled,
+        )
+        try:
+            validated_container = validate_final_container_evidence_v1(
+                root,
+                video_path,
+                validator,
+            )
+            if (
+                validated_container.identity != output_evidence.identity
+                or validated_container.raw_sha256 != output_evidence.raw_sha256
+                or validated_container.byte_count != output_evidence.byte_count
+            ):
+                raise ReservationConflictError(
+                    "streamed recovery output differs from persisted evidence"
+                )
+        except (
+            FinalPublicationValidationError,
+            ReservationConflictError,
+            OSError,
+            ValueError,
+        ) as error:
+            if pre_video:
+                self._discard_streamed_prelaunch(capability)
+                return None
+            raise ReservationConflictError("post-boundary streamed output differs") from error
+        normalized = invocation.materialized_arguments(manifest_source.fingerprint)
+        if not pre_video:
+            capability.complete_final_manifest_from_existing_video(
+                input_stage_fingerprint=manifest_source.fingerprint,
+                resolved_encoding_arguments=normalized,
+                expected_video_identity=validated_container.identity,
+                expected_video_sha256=validated_container.raw_sha256,
+                expected_video_byte_count=validated_container.byte_count,
+            )
+            self._pending_final_reservation = capability
+            return True
+        capability.commit_producer_settings()
+        current_settings = recover_processing_control_prefix_v1(root)
+        if current_settings is None:
+            raise ReservationConflictError("streamed recovery lost its producer settings")
+        publication = FinalPublicationTransactionV4(
+            job_root=root,
+            settings=current_settings,
+            sibling_relative_path=sibling.name,
+            encoding_input_source=manifest_source,
+            input_stage_fingerprint=manifest_source.fingerprint,
+            resolved_encoding_arguments=normalized,
+            container_validator=None,
+            expected_sibling_identity=validated_container.identity,
+            expected_sibling_sha256=validated_container.raw_sha256,
+            expected_sibling_byte_count=validated_container.byte_count,
+            reservation=capability,
+            retire_reservation=False,
+        )
+        publication.publish()
+        self._pending_final_reservation = capability
+        return True
+
     def create_video_from_stereo_source(  # noqa: C901
         self,
         source: DirectStereoSource,
@@ -1736,8 +2779,18 @@ class VideoEncoder:
         if source.frame_count != total_frames or source.frame_count <= 0:
             print("Error creating direct VR output video: source frame count changed")
             return False
+        root = Path(os.path.abspath(os.fspath(output_dir)))
+        final_index = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+        final_index_temporary = final_index.with_name(f".{final_index.name}.create-new.tmp")
+        final_active = any(
+            path.exists() or path.is_symlink() for path in (final_index, final_index_temporary)
+        )
         try:
-            recovered_settings = recover_processing_control_prefix_v1(output_dir)
+            recovered_settings = (
+                self._load_schema5_settings_readonly(root)
+                if final_active
+                else recover_processing_control_prefix_v1(root)
+            )
         except InterruptedError:
             raise
         except ReservationIncompleteError:
@@ -1746,7 +2799,6 @@ class VideoEncoder:
             print(f"Error recovering schema-5 video publication: {error}")
             return False
         schema5_present = recovered_settings is not None
-        del recovered_settings
         if not schema5_present:
             # Schema 1-4 compatibility is intentionally isolated on the legacy API.
             left_files = [
@@ -1770,13 +2822,18 @@ class VideoEncoder:
         schema5_context: _Schema5EncodingContext | None = None
         temporary: Path | None = None
         try:
-            root = Path(os.path.abspath(os.fspath(output_dir)))
-            left_parent = Path(
-                os.path.abspath(os.fspath(source.left_parent))
-            ).relative_to(root)
-            right_parent = Path(
-                os.path.abspath(os.fspath(source.right_parent))
-            ).relative_to(root)
+            assert recovered_settings is not None
+            streamed_recovery = self._recover_streamed_vr_sibling(
+                output_dir=root,
+                original_video=original_video,
+                settings=settings,
+                cancelled=cancelled,
+                artifact=recovered_settings,
+            )
+            if streamed_recovery is not None:
+                return streamed_recovery
+            left_parent = Path(os.path.abspath(os.fspath(source.left_parent))).relative_to(root)
+            right_parent = Path(os.path.abspath(os.fspath(source.right_parent))).relative_to(root)
             provider = EncodingSequenceProvider.freeze(
                 mode="direct_stereo",
                 frame_count=source.frame_count,
@@ -1871,13 +2928,9 @@ class VideoEncoder:
                 cancelled=cancelled,
             )
             selected_audio.revalidate(cancelled=cancelled)
-            assert (
-                provider.left_parent is not None and provider.right_parent is not None
-            )
+            assert provider.left_parent is not None and provider.right_parent is not None
             left_pattern = root.joinpath(*provider.left_parent.parts) / "frame_%06d.png"
-            right_pattern = (
-                root.joinpath(*provider.right_parent.parts) / "frame_%06d.png"
-            )
+            right_pattern = root.joinpath(*provider.right_parent.parts) / "frame_%06d.png"
             normalized = self._normalize_publication_arguments(
                 command=command,
                 image_inputs={str(left_pattern): "left", str(right_pattern): "right"},
@@ -1901,9 +2954,7 @@ class VideoEncoder:
             )
             publication_settings = recover_processing_control_prefix_v1(output_dir)
             if publication_settings is None:
-                raise ReservationConflictError(
-                    "final publication lost its settings authority"
-                )
+                raise ReservationConflictError("final publication lost its settings authority")
             publication = FinalPublicationTransactionV4(
                 job_root=output_dir,
                 settings=publication_settings,
@@ -1977,9 +3028,7 @@ class VideoEncoder:
                 settings["vr_resolution"],
             )
             legacy_output_path = output_dir / output_filename
-            temporary = legacy_output_path.with_name(
-                f".{legacy_output_path.stem}.direct.tmp.mp4"
-            )
+            temporary = legacy_output_path.with_name(f".{legacy_output_path.stem}.direct.tmp.mp4")
             temporary.unlink(missing_ok=True)
         try:
             active_index = output_dir / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
@@ -2086,9 +3135,7 @@ class VideoEncoder:
                     },
                     selected_audio=selected_audio,
                     runtime_output=temporary,
-                    input_stage_fingerprint=(
-                        schema5_context.staged_manifest.fingerprint
-                    ),
+                    input_stage_fingerprint=(schema5_context.staged_manifest.fingerprint),
                     final_relative_path=schema5_context.expected_relative_path,
                 )
                 container_validator = self._container_validator_for_invocation(
@@ -2106,17 +3153,13 @@ class VideoEncoder:
                 )
                 publication_settings = recover_processing_control_prefix_v1(output_dir)
                 if publication_settings is None:
-                    raise ReservationConflictError(
-                        "final publication lost its settings authority"
-                    )
+                    raise ReservationConflictError("final publication lost its settings authority")
                 publication = FinalPublicationTransactionV4(
                     job_root=output_dir,
                     settings=publication_settings,
                     sibling_relative_path=temporary.name,
                     encoding_input_source=schema5_context.manifest_source,
-                    input_stage_fingerprint=(
-                        schema5_context.staged_manifest.fingerprint
-                    ),
+                    input_stage_fingerprint=(schema5_context.staged_manifest.fingerprint),
                     resolved_encoding_arguments=normalized,
                     container_validator=None,
                     expected_sibling_identity=validated_container.identity,
@@ -2144,9 +3187,7 @@ class VideoEncoder:
                 try:
                     temporary.unlink(missing_ok=True)
                 except OSError as error:
-                    print(
-                        f"Warning: Could not clean direct VR temporary output: {error}"
-                    )
+                    print(f"Warning: Could not clean direct VR temporary output: {error}")
 
     def extract_frames(
         self,
@@ -2204,11 +3245,7 @@ class VideoEncoder:
                 )
                 is None
             )
-        if (
-            expected_frames > 0
-            and (exact_count or tolerated_vfr_drift)
-            and reusable_manifest
-        ):
+        if expected_frames > 0 and (exact_count or tolerated_vfr_drift) and reusable_manifest:
             print(f"  Reusing {len(existing_frames)} already extracted frames")
             return existing_frames
 

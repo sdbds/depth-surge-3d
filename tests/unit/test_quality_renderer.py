@@ -235,6 +235,110 @@ def test_quality_cuda_avoids_dense_lane_validity_host_analysis(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_quality_cuda_compact_gather_matches_hand_checked_lanes() -> None:
+    fast_splat = importlib.import_module("src.depth_surge_3d.rendering.fast_splat_triton")
+    operation = getattr(fast_splat, "triton_compact_quality_winners", None)
+    assert operation is not None, "compact Quality CUDA gather is unavailable"
+
+    source = torch.tensor(
+        [[[16, 32, 48], [160, 176, 192]]],
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    source_index_offset = 10
+    source_zero = (1 << 32) | (0xFFFFFFFF - source_index_offset)
+    source_one = (1 << 32) | (0xFFFFFFFF - source_index_offset - 1)
+    winners = torch.tensor(
+        [source_zero] * 8 + [source_one] * 4 + [-1] * 4 + [-1] * 16,
+        dtype=torch.int64,
+        device="cuda",
+    )
+
+    compact = operation(source, winners, source_index_offset)
+
+    assert compact is not None
+    colour, packed_missing = compact
+    assert colour.cpu().tolist() == [[[48.0, 60.0, 72.0], [0.0, 0.0, 0.0]]]
+    assert packed_missing.cpu().numpy().view(np.uint16).tolist() == [[0xF000, 0xFFFF]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_quality_cuda_compact_visibility_skips_general_splat_band(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    fast_splat = importlib.import_module("src.depth_surge_3d.rendering.fast_splat_triton")
+    if not fast_splat.triton_splat_available(torch.device("cuda")):
+        pytest.skip("Triton splat is unavailable")
+    generator = np.random.default_rng(20260830)
+    frame = generator.integers(0, 256, size=(9, 48, 3), dtype=np.uint8)
+    canonical = generator.random((5, 24), dtype=np.float32)
+
+    def reject_general_band(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("CUDA Quality materialized the general 16x splat band")
+
+    monkeypatch.setattr(quality, "_quality_splat", reject_general_band)
+
+    result = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cuda"),
+        frame=frame,
+        canonical=canonical,
+        settings=_quality_settings(stereo_strength=4.0, convergence=0.45),
+    )
+
+    assert result.left_image.shape == frame.shape
+    assert result.right_image.shape == frame.shape
+    assert result.left_coverage_count.shape == frame.shape[:2]
+    assert result.right_coverage_count.shape == frame.shape[:2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_quality_cuda_compact_compile_failure_falls_back_byte_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    fast_splat = importlib.import_module("src.depth_surge_3d.rendering.fast_splat_triton")
+    generator = np.random.default_rng(20260830)
+    frame = generator.integers(0, 256, size=(7, 31, 3), dtype=np.uint8)
+    canonical = generator.random((4, 16), dtype=np.float32)
+    settings = _quality_settings(stereo_strength=4.0, convergence=0.45)
+    expected = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=settings,
+    )
+
+    class BrokenKernel:
+        def __getitem__(self, _grid):
+            def launch(*_args: object, **_kwargs: object) -> None:
+                raise fast_splat.triton.errors.TritonError("simulated compact compile failure")
+
+            return launch
+
+    monkeypatch.setattr(fast_splat, "_DISABLED_CUDA_DEVICES", set())
+    monkeypatch.setattr(fast_splat, "_compact_quality_winners_kernel", BrokenKernel())
+
+    actual = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cuda"),
+        frame=frame,
+        canonical=canonical,
+        settings=settings,
+    )
+
+    for name in (
+        "left_image",
+        "right_image",
+        "left_coverage_count",
+        "right_coverage_count",
+        "left_repair_bits",
+        "right_repair_bits",
+    ):
+        assert np.array_equal(getattr(actual, name), getattr(expected, name)), name
+    assert not fast_splat.triton_splat_available(torch.device("cuda"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_quality_cuda_does_not_allocate_full_frame_lane_mask_buffer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

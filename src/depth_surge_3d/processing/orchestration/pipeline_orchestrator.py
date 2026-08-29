@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from ...io.operations import (
     cleanup_intermediate_files,
@@ -29,6 +29,7 @@ from ..frames.stereo_input_manifest import (
     StereoInputManifestV1,
     publish_validated_stereo_input_manifest_v1,
 )
+from ..frames.stereo_control import QualityPipelineCapacityError
 from ...rendering.quality.cleanup_transaction import (
     cleanup_status_for_error,
     commit_payload_pruned,
@@ -47,6 +48,7 @@ from ..video.final_publication import (
 )
 from ...utils.path_utils import generate_output_filename
 from ...utils import (
+    create_vr_frame,
     step_complete,
     saved_to,
     title_bar,
@@ -166,6 +168,8 @@ class ProcessingOrchestrator:
             try:
                 phase_artifact = recover_processing_settings_artifact(settings_file)
                 prepared = load_final_encoding_reservation_v1(output_dir, phase_artifact)
+                if prepared.requires_explicit_streamed_recovery():
+                    return None
                 reservation = FinalEncodingReservationCapabilityV1.from_prepared(prepared)
                 recovery = prepared.recover_publication_prefix()
                 recovery_phase = recovery.phase
@@ -557,6 +561,282 @@ class ProcessingOrchestrator:
         self._release_depth_model_callback()
         self._depth_model_released = True
 
+    @staticmethod
+    def _streamed_quality_settings_eligible(
+        settings: dict[str, Any],
+        stereo_input: StereoInputManifestV1,
+        *,
+        schema5_settings: bool,
+        active_reservation: bool,
+    ) -> bool:
+        """Decide whether the no-retention Quality stream preserves current output."""
+
+        if (
+            not schema5_settings
+            or active_reservation
+            or settings.get("stereo_render_mode", "fast") != "quality"
+            or settings.get("stereo_geometry_mode", "relative") != "relative"
+            or getattr(stereo_input, "geometry_mode", None) != "relative"
+            or settings.get("direct_vr_encode") is not True
+            or settings.get("keep_intermediates", True) is not False
+            or settings.get("upscale_model", "none") != "none"
+            or settings.get("vr_format") not in {"side_by_side", "over_under"}
+        ):
+            return False
+
+        frame_count = getattr(stereo_input, "frame_count", None)
+        render_shape = getattr(stereo_input, "render_shape", None)
+        dimensions = (
+            settings.get("per_eye_width"),
+            settings.get("per_eye_height"),
+            settings.get("vr_output_width"),
+            settings.get("vr_output_height"),
+        )
+        if (
+            isinstance(frame_count, bool)
+            or not isinstance(frame_count, int)
+            or frame_count <= 0
+            or not isinstance(render_shape, tuple)
+            or len(render_shape) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in (*render_shape, *dimensions)
+            )
+        ):
+            return False
+
+        eye_width, eye_height, output_width, output_height = cast(
+            tuple[int, int, int, int],
+            dimensions,
+        )
+        if settings["vr_format"] == "side_by_side":
+            expected_output = (eye_width * 2, eye_height)
+        else:
+            expected_output = (eye_width, eye_height * 2)
+        if (output_width, output_height) != expected_output:
+            return False
+
+        apply_distortion = settings.get("apply_distortion")
+        if apply_distortion is True:
+            return True
+        if apply_distortion is not False:
+            return False
+        try:
+            crop_factor = max(0.5, min(1.0, float(settings.get("crop_factor", 1.0))))
+        except (TypeError, ValueError):
+            return False
+        return crop_factor == 1.0 and render_shape == (eye_height, eye_width)
+
+    def _streamed_quality_path_enabled(
+        self,
+        settings: dict[str, Any],
+        stereo_input: StereoInputManifestV1,
+        output_path: Path,
+    ) -> bool:
+        schema5_settings = bool(
+            self._settings_file is not None
+            and self._settings_file.name == "processing-settings-v5.json"
+        )
+        active_index = Path(output_path) / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+        pending_reservation = getattr(
+            self.video_encoder,
+            "pending_final_encoding_reservation",
+            None,
+        )
+        return self._streamed_quality_settings_eligible(
+            settings,
+            stereo_input,
+            schema5_settings=schema5_settings,
+            active_reservation=(
+                active_index.exists()
+                or active_index.is_symlink()
+                or pending_reservation is not None
+            ),
+        ) and callable(getattr(self.video_encoder, "open_streamed_vr_session", None))
+
+    @staticmethod
+    def _streamed_quality_consumer_memory_bound(
+        source_shape: tuple[int, int],
+        settings: dict[str, Any],
+    ) -> int:
+        """Bound the resident transform, VR frame, and PNG pipe payload bytes."""
+
+        if (
+            not isinstance(source_shape, tuple)
+            or len(source_shape) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in source_shape
+            )
+        ):
+            raise ValueError("streamed consumer source shape is invalid")
+        dimensions = (
+            settings.get("per_eye_width"),
+            settings.get("per_eye_height"),
+            settings.get("vr_output_width"),
+            settings.get("vr_output_height"),
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in dimensions
+        ):
+            raise ValueError("streamed consumer output shape is invalid")
+        eye_width, eye_height, output_width, output_height = cast(
+            tuple[int, int, int, int],
+            dimensions,
+        )
+        source_pixels = source_shape[0] * source_shape[1]
+        target_pixels = eye_width * eye_height
+        final_pixels = output_width * output_height
+        distortion_maps = 8 * source_pixels if settings.get("apply_distortion") is True else 0
+        transform_peak = (
+            3 * source_pixels + 6 * target_pixels if settings.get("apply_distortion") is True else 0
+        )
+        encoded_copy_bound = 4 * final_pixels + 1024 * 1024
+        held_transform_outputs = (
+            6 * target_pixels if settings.get("apply_distortion") is True else 0
+        )
+        pipe_peak = held_transform_outputs + 3 * final_pixels + 2 * encoded_copy_bound
+        return distortion_maps + max(transform_peak, pipe_peak)
+
+    @staticmethod
+    def _streamed_first_frame_index(stereo_input: StereoInputManifestV1) -> int:
+        records = stereo_input.replay_declared_records()
+        try:
+            record = next(records)
+        except StopIteration as error:
+            raise ValueError("streamed stereo input has no frames") from error
+        finally:
+            close = getattr(records, "close", None)
+            if callable(close):
+                close()
+        frame_name = record.frame_name
+        if not isinstance(frame_name, str) or not frame_name.startswith("frame_"):
+            raise ValueError("streamed stereo input frame name is noncanonical")
+        decimal = frame_name[6:]
+        if not decimal or not decimal.isascii() or not decimal.isdecimal():
+            raise ValueError("streamed stereo input frame name is noncanonical")
+        frame_index = int(decimal)
+        if decimal != str(frame_index).zfill(max(6, len(str(frame_index)))):
+            raise ValueError("streamed stereo input frame name is noncanonical")
+        return frame_index
+
+    def _execute_streamed_quality_steps(  # noqa: C901
+        self,
+        directories: dict[str, Path],
+        settings: dict[str, Any],
+        stereo_input: StereoInputManifestV1,
+        video_path: str,
+        output_path: Path,
+        progress_tracker=None,
+    ) -> bool | None:
+        """Run transient Quality rendering, or return None before render to fall back."""
+
+        try:
+            transform_pair = self.distortion_processor.prepare_stream_transform(
+                source_shape=stereo_input.render_shape,
+                settings=settings,
+            )
+            if not callable(transform_pair):
+                raise TypeError("stream transform is not callable")
+            consumer_memory_bytes = self._streamed_quality_consumer_memory_bound(
+                stereo_input.render_shape,
+                settings,
+            )
+            first_index = self._streamed_first_frame_index(stereo_input)
+            session = self.video_encoder.open_streamed_vr_session(
+                output_dir=directories["base"],
+                original_video=video_path,
+                settings=settings,
+                frame_count=stereo_input.frame_count,
+                first_index=first_index,
+                progress_tracker=progress_tracker,
+            )
+        except (InterruptedError, ReservationIncompleteError):
+            raise
+        except Exception as error:
+            if self.verbose:
+                print(f"Quality direct stream unavailable; using file-backed stages: {error}")
+            return None
+
+        session_needs_abort = True
+        try:
+
+            def consume_frame(frame_name, left_frame, right_frame) -> None:
+                left_final, right_final = transform_pair(left_frame, right_frame)
+                session.write(
+                    frame_name,
+                    create_vr_frame(left_final, right_final, settings["vr_format"]),
+                )
+
+            if not self.stereo_generator.create_stereo_pairs_from_manifest(
+                stereo_input,
+                directories,
+                settings,
+                progress_tracker,
+                frame_consumer=consume_frame,
+                frame_consumer_memory_bytes=consumer_memory_bytes,
+            ):
+                # Retire the durable stream authority before a terminal status
+                # makes that authority impossible to authenticate.
+                session_needs_abort = False
+                session.abort()
+                return self._handle_step_error("Stereo pair creation failed")
+
+            num_frames = stereo_input.frame_count
+            print(step_complete(f"Step 3: Created and streamed {num_frames} stereo pairs"))
+            if settings.get("apply_distortion") is True:
+                print(
+                    step_complete(
+                        f"Step 4: Applied {settings['fisheye_projection']} fisheye distortion"
+                    )
+                )
+            print(
+                step_complete(
+                    f"Step 5: Cropped {num_frames} frames to "
+                    f"{settings['per_eye_width']}x{settings['per_eye_height']}"
+                )
+            )
+            print(
+                step_complete(
+                    f"Step 7: Assembled {num_frames} {settings['vr_format']} VR frames in memory"
+                )
+            )
+
+            success = bool(session.finish_and_publish())
+            session_needs_abort = False
+            if success:
+                output_filename = self._expected_output_filename(video_path, settings)
+                print(step_complete("Step 8: Created final video"))
+                self._print_saved_to(
+                    directories["base"],
+                    f"Final output: {output_filename}",
+                )
+
+            finalized = self._finalize_processing(
+                success,
+                output_path,
+                video_path,
+                settings,
+                num_frames,
+            )
+            completed = success and finalized is not False
+            if completed and progress_tracker and hasattr(progress_tracker, "finish"):
+                progress_tracker.finish("Video processing complete")
+            return completed
+        except QualityPipelineCapacityError as error:
+            session.discard_for_file_backed_fallback()
+            session_needs_abort = False
+            if self.verbose:
+                print(
+                    "Quality direct stream exceeds the shared memory budget; "
+                    f"using file-backed stages: {error}"
+                )
+            return None
+        finally:
+            if session_needs_abort:
+                session.abort()
+
     def _execute_remaining_steps(  # noqa: C901
         self,
         directories: dict[str, Path],
@@ -588,6 +868,18 @@ class ProcessingOrchestrator:
         """
         num_frames = stereo_input.frame_count
         self._metric_clamp_summary = None
+
+        if self._streamed_quality_path_enabled(settings, stereo_input, output_path):
+            streamed = self._execute_streamed_quality_steps(
+                directories,
+                settings,
+                stereo_input,
+                video_path,
+                output_path,
+                progress_tracker,
+            )
+            if streamed is not None:
+                return streamed
 
         # Step 3: Create stereo pairs (delegated to stereo_generator)
         if not self.stereo_generator.create_stereo_pairs_from_manifest(

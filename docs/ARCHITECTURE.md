@@ -152,27 +152,68 @@ public hole mask means all 16 lanes remain unresolved after fill.
 
 ## Memory And I/O
 
-CUDA scatter bands use a deterministic byte budget. The measured live set
-includes source color and canonical depth, transferred int32 offsets, expanded
-target/source indexes and in-bounds masks, packed candidates and winners,
-gathered fine-grid color/depth/validity, fill indexes and selected color, and
-scatter workspace. On an RTX 4090, the 16-sample renderer measured at most
-`854.931` allocated bytes per source pixel during a complete 4K render. The
-configured `1280 B/source-pixel` exceeds that measurement plus 25 percent
-headroom. At 4K this permits 54 complete rows, or 40 bands per eye, under the
-256 MiB temporary budget.
+CUDA Fast scatter first attempts two bounded Triton kernels. The first computes
+the 16 packed winner candidates per source pixel directly into the winner
+buffer with integer atomic max; the second decodes and gathers the winners
+without expanded target, candidate, or decoded-index tensors. A Triton import
+or compilation failure disables this path for that CUDA device and preserves
+the byte-identical PyTorch scatter fallback.
 
-The two full-frame int32 eye maps remain host-resident and are sliced for each
-band. They are built from host float64 geometry; all float64 temporaries are
-released when map construction returns, before row-band device rendering
-begins. Background fill and downsampling complete before the next band, and
-final uint8 eye outputs are host arrays. No full-frame image, index, or 16-lane
-buffer is retained on the device.
+CUDA Quality visibility reuses the same packed winner reduction, but its
+default compact path does not gather the general fine-grid disparity, validity,
+or winner-index planes. A Quality-specific Triton kernel reads the 16 winners
+for each output pixel, accumulates the exact uint8 BGR sum, multiplies by the
+binary-exact `1/16`, and emits only the downsampled float32 BGR value plus one
+packed missing-lane mask. The existing native histogram and background repair
+consume that mask unchanged. Triton unavailability or compilation failure
+falls back to the general byte-identical Quality band path.
+
+Both paths use a deterministic byte budget. On an RTX 4090, the Triton live set
+measured `855.819` temporary bytes per band source pixel during a complete 4K
+render. Its configured `1088 B/source-pixel` retains 27.6 percent measured
+headroom and permits 64 complete rows, or 34 bands per eye, under the 256 MiB
+temporary budget. The PyTorch fallback retains the conservative
+`1280 B/source-pixel` bound, 54 rows, and 40 bands per eye because it still
+materializes expanded indexes, masks, and packed candidates.
+
+The two full-frame int32 eye maps are built from host float64 geometry; all
+float64 working tensors are released when map construction returns. Fast CUDA
+rendering then attempts one bounded preload of the source image, near score,
+source-valid mask, and both int32 eye maps so both eyes can reuse them without
+per-band host transfers. For a 4K uint8 relative frame this static set is about
+126.6 MiB and remains separate from the 256 MiB scatter-temporary budget. If
+the preload cannot be allocated, every partial allocation is released and the
+renderer falls back to slicing the host arrays for each band. Both paths are
+byte-identical. CPU rendering always uses the band-sliced path.
+
+Background fill and downsampling still complete before the next band, final
+eye outputs remain host arrays, and no full-frame expanded index, winner, or
+16-lane buffer is retained on the device.
 
 Stereo decode and output work is bounded by both `stereo_io_workers` and a host
 byte budget. End-to-end throughput measurements include decode, render, image
 encoding, and writes; renderer median, p95, mean, host geometry, and offset-transfer
 costs are reported explicitly.
+
+Relative Quality jobs use a transient final-output path only when direct VR
+encoding is enabled, intermediates are not retained, upscaling is disabled,
+schema-5 publication is active without a recovery reservation, and distortion
+plus crop can be reproduced exactly in memory. Rendered pairs are released in
+source order through the existing bounded pipeline, transformed and assembled
+with the same pixel operations as the file-backed stages, encoded to lossless
+PNG in memory, and written to FFmpeg through `image2pipe`. The exact piped PNG
+bytes are authenticated by the encoding-input manifest. This path never writes
+or rereads `04_left_frames`, `04_right_frames`, or cropped RGB PNGs. Unsupported
+settings, retained intermediates, and metric geometry continue through the
+file-backed pipeline. Recovery first completes an evidence-bound streamed-v3
+sibling when one is fully authenticated; all other recoverable states use the
+file-backed pipeline.
+
+Transient Quality diagnostics use one ordered JSONL extent and publish the same
+aggregate summary and completion metadata without per-frame diagnostics files.
+FFmpeg stdin, progress, and diagnostics are drained with fixed-size buffers;
+pipe backpressure propagates to the stereo lifecycle permits, so memory remains
+bounded by configured pipeline capacity rather than frame count.
 
 The legacy in-memory depth API rejects projected outputs over 512 MiB. The main
 video pipeline remains file-backed.
@@ -268,6 +309,9 @@ rollback.
 - `processing/frames/depth_normalizer.py`: representation conversion and pure
   scene canonicalization.
 - `processing/frames/stereo_generator.py`: bounded stereo I/O pipeline.
+- `processing/video/video_encoder.py`: file-backed and bounded `image2pipe`
+  encoding, schema-5 reservation, validation, and final publication.
+- `processing/video/streamed_vr_manifest.py`: exact streamed PNG input evidence.
 - `processing/frames/temporal_stabilizer.py`: VDPP artifact audit, shot resume,
   disk/device preflight, and file-backed generation.
 - `inference/depth/vdpp_temporal_postprocessor.py`: exact bounded 32/4 neural

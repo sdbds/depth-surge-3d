@@ -301,6 +301,135 @@ def test_manifest_pipeline_supports_quality_with_committed_diagnostics(tmp_path:
     )
 
 
+def test_quality_manifest_streams_ordered_pixels_without_rgb_frame_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_root = tmp_path / "baseline"
+    baseline_manifest, baseline_directories = _make_manifest_inputs(
+        baseline_root,
+        count=2,
+    )
+    settings = _settings(
+        stereo_strength=2.0,
+        stereo_render_mode="quality",
+        occlusion_fill_max_px=8,
+        keep_intermediates=True,
+    )
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
+        baseline_manifest,
+        baseline_directories,
+        settings,
+    )
+    expected = [
+        (
+            cv2.imread(str(baseline_directories["left_frames"] / f"frame_{index:06d}.png")),
+            cv2.imread(str(baseline_directories["right_frames"] / f"frame_{index:06d}.png")),
+        )
+        for index in (1, 2)
+    ]
+
+    streamed_root = tmp_path / "streamed"
+    manifest, directories = _make_manifest_inputs(streamed_root, count=2)
+    consumed: list[tuple[str, np.ndarray, np.ndarray]] = []
+
+    def consume(frame_name: str, left: np.ndarray, right: np.ndarray) -> None:
+        consumed.append((frame_name, left.copy(), right.copy()))
+
+    class Progress:
+        @staticmethod
+        def update_progress(*_args, **_kwargs) -> None:
+            return None
+
+        @staticmethod
+        def send_preview_frame(*_args, **_kwargs) -> None:
+            raise AssertionError("transient Quality path exposed a nonexistent RGB file")
+
+    monkeypatch.setattr(
+        stereo_generator,
+        "publish_quality_frame",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("transient Quality path published a per-frame transaction")
+        ),
+    )
+    generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+    assert generator.create_stereo_pairs_from_manifest(
+        manifest,
+        directories,
+        _settings(
+            stereo_strength=2.0,
+            stereo_render_mode="quality",
+            occlusion_fill_max_px=8,
+            keep_intermediates=False,
+        ),
+        Progress(),
+        frame_consumer=consume,
+    )
+
+    assert [name for name, _left, _right in consumed] == [
+        "frame_000001",
+        "frame_000002",
+    ]
+    for (_name, left, right), (expected_left, expected_right) in zip(
+        consumed,
+        expected,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(left, expected_left)
+        np.testing.assert_array_equal(right, expected_right)
+    assert not list(directories["left_frames"].glob("*.png"))
+    assert not list(directories["right_frames"].glob("*.png"))
+    diagnostics = streamed_root / "04_stereo_diagnostics"
+    assert not (diagnostics / "frames").exists()
+    assert (diagnostics / "quality_input_manifest.json").is_file()
+    assert len((diagnostics / "stereo_coverage_frames.jsonl").read_bytes().splitlines()) == 2
+    assert (
+        json.loads((diagnostics / "metadata.json").read_text(encoding="ascii"))["status"]
+        == "complete"
+    )
+    assert generator.last_pipeline_stats is not None
+    assert generator.last_pipeline_stats.writer_thread_count == 1
+
+
+def test_transient_quality_capacity_charges_declared_consumer_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, directories = _make_manifest_inputs(tmp_path, count=2)
+    real_select = stereo_generator.select_quality_pipeline_capacity
+    retained_charges: list[int] = []
+
+    def record_capacity_selection(**kwargs):
+        retained_charges.append(kwargs.get("retained_bytes", 0))
+        return real_select(**kwargs)
+
+    monkeypatch.setattr(
+        stereo_generator,
+        "select_quality_pipeline_capacity",
+        record_capacity_selection,
+    )
+    consumer_bytes = 7 * 1024 * 1024
+
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
+        manifest,
+        directories,
+        _settings(
+            stereo_strength=2.0,
+            stereo_render_mode="quality",
+            occlusion_fill_max_px=8,
+            keep_intermediates=False,
+        ),
+        frame_consumer=lambda _name, _left, _right: None,
+        frame_consumer_memory_bytes=consumer_bytes,
+    )
+
+    assert retained_charges == [consumer_bytes]
+
+
 def test_quality_manifest_prepares_relative_geometry_on_decode_worker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

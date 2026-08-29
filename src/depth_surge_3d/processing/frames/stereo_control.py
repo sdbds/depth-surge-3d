@@ -45,6 +45,10 @@ class StereoControlStateError(StereoControlError):
     """A packed action or replay state is invalid."""
 
 
+class QualityPipelineCapacityError(StereoControlBudgetError):
+    """The pre-mutation Quality lifecycle cannot fit the host-memory budget."""
+
+
 class StereoProviderChangedError(StereoControlError):
     """A pre-mutation replay changed and must restart from read-only audit."""
 
@@ -698,7 +702,9 @@ def select_quality_pipeline_capacity(
                 total,
             )
     if selected is None:
-        raise StereoControlBudgetError("no Quality lifecycle capacity fits the host budget")
+        raise QualityPipelineCapacityError(
+            "no Quality lifecycle capacity fits the host budget"
+        )
     return selected
 
 
@@ -1203,10 +1209,13 @@ def run_streaming_stereo_pipeline(  # noqa: C901
     mutation: Callable[[], None] | None = None,
     pre_mutation: Callable[[], None] | None = None,
     configured_workers: int | None = None,
+    ordered_render: bool = False,
 ) -> StreamingStereoPipelineStats:
     """Drive a capacity-bounded synthetic pipeline without a resident work-item list."""
 
     pipeline_started = time.perf_counter()
+    if not isinstance(ordered_render, bool):
+        raise TypeError("ordered_render must be boolean")
     if plan.render_count == 0:
         if capacity != 0 or effective_workers != 0 or writer_workers not in (None, 0):
             raise ValueError("P=0 requires zero pipeline capacity and workers")
@@ -1368,7 +1377,7 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                     if not put_or_cancel(queues.decode_requests, item):
                         release_item()
                         return
-                    item = None
+                    del item
             finally:
                 for _ in range(effective_workers):
                     if not put_or_cancel(queues.decode_requests, _PIPELINE_SENTINEL):
@@ -1385,7 +1394,7 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                 transferred = False
                 owns_item = queued_item is not _PIPELINE_SENTINEL
                 decode_item: StereoProviderItem | None = None
-                payload: object | None = None
+                decoded_payload: object | None = None
                 try:
                     if queued_item is _PIPELINE_SENTINEL:
                         return
@@ -1395,12 +1404,12 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                     validate_handoff(decode_item)
                     stage_started = trace.begin("decode")
                     try:
-                        payload = decode(decode_item)
+                        decoded_payload = decode(decode_item)
                     finally:
                         trace.end("decode", stage_started)
                     transferred = put_or_cancel(
                         queues.decoded_frames,
-                        (decode_item, payload),
+                        (decode_item, decoded_payload),
                     )
                     if not transferred:
                         return
@@ -1408,7 +1417,7 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                     queues.decode_requests.task_done()
                     queued_item = None
                     decode_item = None
-                    payload = None
+                    decoded_payload = None
                     if owns_item and not transferred:
                         release_item()
         if role == "writer":
@@ -1421,19 +1430,19 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                     continue
                 owns_item = message is not _PIPELINE_SENTINEL
                 write_item: StereoProviderItem | None = None
-                payload: object | None = None
+                write_payload: object | None = None
                 try:
                     if message is _PIPELINE_SENTINEL:
                         return
                     if not isinstance(message, tuple) or len(message) != 2:
                         raise StereoControlStateError("writer received a malformed message")
-                    write_item, payload = message
+                    write_item, write_payload = message
                     if not isinstance(write_item, StereoProviderItem):
                         raise StereoControlStateError("writer received a non-item")
                     validate_handoff(write_item)
                     stage_started = trace.begin("write")
                     try:
-                        write(payload)
+                        write(write_payload)
                     finally:
                         trace.end("write", stage_started)
                     if not put_or_cancel(queues.write_completions, _PIPELINE_COMPLETION):
@@ -1442,7 +1451,7 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                     queues.write_requests.task_done()
                     message = None
                     write_item = None
-                    payload = None
+                    write_payload = None
                     if owns_item:
                         release_item()
 
@@ -1462,6 +1471,11 @@ def run_streaming_stereo_pipeline(  # noqa: C901
     parked_committed_delta = max(0, current_process_committed_bytes() - before_committed)
     rendered = 0
     completions = 0
+    pending_decoded: dict[int, tuple[object, object]] = {}
+    expected_render_indexes = iter(
+        index for index, action in enumerate(plan.actions) if action == StereoAction.RENDER
+    )
+    next_render_index = next(expected_render_indexes, None)
     try:
         validate_stereo_provider_replay(
             provider,
@@ -1475,7 +1489,39 @@ def run_streaming_stereo_pipeline(  # noqa: C901
             mutation()
         group.release()
         while rendered < plan.render_count:
-            decoded_message = coordinator_get(queues.decoded_frames)
+            decoded_message: object | None = None
+            if ordered_render and next_render_index in pending_decoded:
+                assert next_render_index is not None
+                decoded_message = pending_decoded.pop(next_render_index)
+            else:
+                decoded_message = coordinator_get(queues.decoded_frames)
+                queues.decoded_frames.task_done()
+                if ordered_render:
+                    if not isinstance(decoded_message, tuple) or len(decoded_message) != 2:
+                        release_item()
+                        decoded_message = None
+                        raise StereoControlStateError("renderer received a malformed message")
+                    pending_item = decoded_message[0]
+                    if not isinstance(pending_item, StereoProviderItem):
+                        release_item()
+                        decoded_message = None
+                        raise StereoControlStateError("renderer received a non-item")
+                    source_index = pending_item.source_index
+                    if (
+                        source_index in pending_decoded
+                        or plan.actions.get(source_index) != StereoAction.RENDER
+                    ):
+                        release_item()
+                        decoded_message = None
+                        raise StereoControlStateError(
+                            "ordered renderer received an unexpected source index"
+                        )
+                    pending_decoded[source_index] = decoded_message
+                    decoded_message = None
+                    if next_render_index not in pending_decoded:
+                        continue
+                    assert next_render_index is not None
+                    decoded_message = pending_decoded.pop(next_render_index)
             handed_to_writer = False
             render_item: StereoProviderItem | None = None
             payload: object | None = None
@@ -1500,6 +1546,8 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                 if not handed_to_writer:
                     raise_worker_error()
                 rendered += 1
+                if ordered_render:
+                    next_render_index = next(expected_render_indexes, None)
                 while True:
                     try:
                         queues.write_completions.get_nowait()
@@ -1509,7 +1557,6 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                         queues.write_completions.task_done()
                         completions += 1
             finally:
-                queues.decoded_frames.task_done()
                 decoded_message = None
                 render_item = None
                 payload = None
@@ -1534,6 +1581,9 @@ def run_streaming_stereo_pipeline(  # noqa: C901
     except BaseException as error:
         pipeline_cancel.set()
         group.cancel_and_join()
+        for _message in pending_decoded.values():
+            release_item()
+        pending_decoded.clear()
         worker_failure: tuple[str, BaseException] | None = None
         try:
             worker_failure = worker_errors.get_nowait()

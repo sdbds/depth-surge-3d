@@ -15,6 +15,7 @@ import torch
 from .forward_splat import (
     HORIZONTAL_SUBPIXELS,
     SubpixelSplatResult,
+    _forward_splat_band_prevalidated,
     forward_splat_band,
 )
 from .stereo_geometry import (
@@ -27,6 +28,7 @@ from .stereo_geometry import (
 
 GPU_TEMP_BUDGET = 256 * 1024 * 1024
 SPLAT_BYTES_PER_PIXEL = 1280
+TRITON_SPLAT_BYTES_PER_PIXEL = 1088
 
 
 @dataclass(frozen=True)
@@ -93,26 +95,45 @@ class StereoRenderProfile:
     offset_transfer_bytes: int
 
 
+@dataclass(frozen=True)
+class _FastDeviceFrame:
+    source: torch.Tensor
+    near_score: torch.Tensor
+    source_valid: torch.Tensor
+
+
 def calculate_band_height(
     render_width: int,
     render_height: int,
     temporary_budget_bytes: int = GPU_TEMP_BUDGET,
+    *,
+    bytes_per_pixel: int = SPLAT_BYTES_PER_PIXEL,
 ) -> int:
     """Calculate deterministic complete-row band height from a fixed byte budget."""
 
     if render_width <= 0 or render_height <= 0:
         raise ValueError("Render width and height must be positive")
-    if temporary_budget_bytes <= 0:
-        raise ValueError("Temporary GPU budget must be positive")
-    rows = temporary_budget_bytes // (render_width * SPLAT_BYTES_PER_PIXEL)
+    if temporary_budget_bytes <= 0 or bytes_per_pixel <= 0:
+        raise ValueError("Temporary GPU budget and bytes per pixel must be positive")
+    rows = temporary_budget_bytes // (render_width * bytes_per_pixel)
     return min(render_height, max(1, rows))
 
 
-def _narrow_sample_offsets(values: np.ndarray) -> np.ndarray:
-    limits = np.iinfo(np.int32)
-    if values.size and (values.min() < limits.min or values.max() > limits.max):
-        raise ValueError("Projected fine-sample offsets exceed int32 range")
-    return np.ascontiguousarray(values.astype(np.int32))
+def _triton_splat_available(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    from .fast_splat_triton import triton_splat_available
+
+    return triton_splat_available(device)
+
+
+def _narrow_torch_sample_offsets(values: torch.Tensor) -> np.ndarray:
+    limits = torch.iinfo(torch.int32)
+    if values.numel():
+        minimum, maximum = torch.aminmax(values)
+        if minimum < limits.min or maximum > limits.max:
+            raise ValueError("Projected fine-sample offsets exceed int32 range")
+    return values.to(dtype=torch.int32).contiguous().numpy()
 
 
 def calculate_eye_sample_offsets(
@@ -125,19 +146,21 @@ def calculate_eye_sample_offsets(
         raise ValueError("Canonical disparity must be a host-resident 2D tensor")
     if not isinstance(settings, StereoRenderSettings):
         raise TypeError("settings must be StereoRenderSettings")
-    canonical64 = np.asarray(canonical.detach().numpy(), dtype=np.float64)
     width = canonical.shape[1]
     scale64 = np.float64(width) * np.float64(settings.stereo_strength)
     scale64 = scale64 / np.float64(200.0)
-    fine_shift64 = canonical64 - np.float64(settings.convergence)
-    fine_shift64 = fine_shift64 * scale64
-    fine_shift64 = fine_shift64 * np.float64(HORIZONTAL_SUBPIXELS)
+    fine_shift64 = canonical.detach().to(dtype=torch.float64, copy=True).contiguous()
+    fine_shift64.sub_(float(np.float64(settings.convergence)))
+    fine_shift64.mul_(float(scale64))
+    fine_shift64.mul_(float(np.float64(HORIZONTAL_SUBPIXELS)))
 
-    left64 = np.ceil(fine_shift64 - np.float64(0.5))
-    left = _narrow_sample_offsets(left64)
+    left64 = fine_shift64.clone()
+    left64.sub_(float(np.float64(0.5))).ceil_()
+    left = _narrow_torch_sample_offsets(left64)
     del left64
-    right64 = np.ceil(-fine_shift64 - np.float64(0.5))
-    right = _narrow_sample_offsets(right64)
+    right64 = fine_shift64.neg()
+    right64.sub_(float(np.float64(0.5))).ceil_()
+    right = _narrow_torch_sample_offsets(right64)
     return left, right
 
 
@@ -147,13 +170,25 @@ def calculate_geometry_eye_sample_offsets(
     """Build deterministic full-frame fine-lane offsets from common geometry."""
 
     width = total_disparity_fraction.shape[1]
-    fine_shift = np.asarray(total_disparity_fraction, dtype=np.float64)
-    fine_shift = fine_shift * np.float64(width) * np.float64(0.5)
-    fine_shift = fine_shift * np.float64(HORIZONTAL_SUBPIXELS)
-    return (
-        _narrow_sample_offsets(np.ceil(fine_shift - np.float64(0.5))),
-        _narrow_sample_offsets(np.ceil(-fine_shift - np.float64(0.5))),
+    fine_shift64 = torch.from_numpy(
+        np.array(
+            total_disparity_fraction,
+            dtype=np.float64,
+            copy=True,
+            order="C",
+        )
     )
+    fine_shift64.mul_(float(np.float64(width)))
+    fine_shift64.mul_(float(np.float64(0.5)))
+    fine_shift64.mul_(float(np.float64(HORIZONTAL_SUBPIXELS)))
+    left64 = fine_shift64.clone()
+    left64.sub_(float(np.float64(0.5))).ceil_()
+    left = _narrow_torch_sample_offsets(left64)
+    del left64
+    right64 = fine_shift64.neg()
+    right64.sub_(float(np.float64(0.5))).ceil_()
+    right = _narrow_torch_sample_offsets(right64)
+    return left, right
 
 
 def _nearest_valid_indexes(
@@ -557,6 +592,11 @@ class StereoRenderer:
             width,
             height,
             self.temporary_budget_bytes,
+            bytes_per_pixel=(
+                TRITON_SPLAT_BYTES_PER_PIXEL
+                if _triton_splat_available(self.device)
+                else SPLAT_BYTES_PER_PIXEL
+            ),
         )
 
         try:
@@ -884,6 +924,11 @@ class StereoRenderer:
             width,
             height,
             self.temporary_budget_bytes,
+            bytes_per_pixel=(
+                TRITON_SPLAT_BYTES_PER_PIXEL
+                if _triton_splat_available(self.device)
+                else SPLAT_BYTES_PER_PIXEL
+            ),
         )
         try:
             return self._render_fast_compact_with_band_height(
@@ -896,7 +941,20 @@ class StereoRenderer:
             )
         except torch.cuda.OutOfMemoryError:
             self._release_after_oom()
-            retry_band_height = max(1, first_band_height // 2)
+            fallback_band_height = calculate_band_height(
+                width,
+                height,
+                self.temporary_budget_bytes,
+                bytes_per_pixel=(
+                    TRITON_SPLAT_BYTES_PER_PIXEL
+                    if _triton_splat_available(self.device)
+                    else SPLAT_BYTES_PER_PIXEL
+                ),
+            )
+            retry_band_height = max(
+                1,
+                min(first_band_height // 2, fallback_band_height),
+            )
             try:
                 return self._render_fast_compact_with_band_height(
                     source,
@@ -905,6 +963,7 @@ class StereoRenderer:
                     settings,
                     retry_band_height,
                     metric_stats=metric_stats,
+                    preload_device_frame=False,
                 )
             except torch.cuda.OutOfMemoryError as error:
                 self._release_after_oom()
@@ -923,8 +982,24 @@ class StereoRenderer:
         band_height: int,
         *,
         metric_stats=None,
+        preload_device_frame: bool = True,
     ):
         from .quality.types import CompactStereoRenderResult
+
+        preloaded = (
+            self._preload_fast_device_frame(source, geometry, eye_offsets)
+            if preload_device_frame
+            else None
+        )
+        if preloaded is None:
+            device_frame = None
+            device_offsets: tuple[torch.Tensor | None, torch.Tensor | None] = (
+                None,
+                None,
+            )
+        else:
+            device_frame, loaded_offsets = preloaded
+            device_offsets = loaded_offsets
 
         left_started = time.perf_counter()
         left = self._render_fast_eye_compact(
@@ -933,6 +1008,8 @@ class StereoRenderer:
             eye_offsets[0],
             settings,
             band_height,
+            device_frame=device_frame,
+            device_offsets=device_offsets[0],
         )
         left_seconds = time.perf_counter() - left_started
         right_started = time.perf_counter()
@@ -942,6 +1019,8 @@ class StereoRenderer:
             eye_offsets[1],
             settings,
             band_height,
+            device_frame=device_frame,
+            device_offsets=device_offsets[1],
         )
         right_seconds = time.perf_counter() - right_started
         return CompactStereoRenderResult(
@@ -969,6 +1048,9 @@ class StereoRenderer:
         sample_offsets: np.ndarray,
         settings: StereoSplatSettings,
         band_height: int,
+        *,
+        device_frame: _FastDeviceFrame | None = None,
+        device_offsets: torch.Tensor | None = None,
     ):
         from .quality.types import FastEyeDiagnostics, HoleRunDiagnostics
 
@@ -992,25 +1074,34 @@ class StereoRenderer:
         with torch.inference_mode():
             for start_row in range(0, height, band_height):
                 end_row = min(height, start_row + band_height)
-                source_band = torch.from_numpy(np.ascontiguousarray(source[start_row:end_row])).to(
-                    self.device
+                if device_frame is None:
+                    source_band = torch.from_numpy(
+                        np.ascontiguousarray(source[start_row:end_row])
+                    ).to(self.device)
+                    near_score_band = torch.from_numpy(
+                        np.array(
+                            geometry.near_score[start_row:end_row],
+                            copy=True,
+                            order="C",
+                        )
+                    ).to(self.device)
+                    source_valid_band = torch.from_numpy(
+                        np.array(
+                            geometry.source_valid[start_row:end_row],
+                            copy=True,
+                            order="C",
+                        )
+                    ).to(self.device)
+                else:
+                    source_band = device_frame.source[start_row:end_row]
+                    near_score_band = device_frame.near_score[start_row:end_row]
+                    source_valid_band = device_frame.source_valid[start_row:end_row]
+                offset_band = (
+                    self._transfer_offset_band(sample_offsets[start_row:end_row])
+                    if device_offsets is None
+                    else device_offsets[start_row:end_row]
                 )
-                near_score_band = torch.from_numpy(
-                    np.array(
-                        geometry.near_score[start_row:end_row],
-                        copy=True,
-                        order="C",
-                    )
-                ).to(self.device)
-                source_valid_band = torch.from_numpy(
-                    np.array(
-                        geometry.source_valid[start_row:end_row],
-                        copy=True,
-                        order="C",
-                    )
-                ).to(self.device)
-                offset_band = self._transfer_offset_band(sample_offsets[start_row:end_row])
-                splat = forward_splat_band(
+                splat = _forward_splat_band_prevalidated(
                     source_band,
                     near_score_band,
                     offset_band,
@@ -1026,8 +1117,6 @@ class StereoRenderer:
                     rendered = splat.colour
                     hole_mask = ~splat.valid
                     fillable = torch.zeros_like(splat.valid)
-                if not torch.isfinite(rendered).all():
-                    raise ValueError("Rendered image contains non-finite values")
                 row_count = end_row - start_row
                 prefill = splat.valid.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
                 filled = fillable.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
@@ -1046,22 +1135,31 @@ class StereoRenderer:
                     unresolved,
                     background=settings.occlusion_fill == "background",
                 )
+                downsampled = _downsample_subpixel_band(rendered)
                 lane_counts = torch.stack(
                     (
                         torch.count_nonzero(filled),
                         torch.count_nonzero(unresolved),
+                        torch.count_nonzero(~torch.isfinite(downsampled)),
                     )
                 )
+                host_lane_counts = None
+                if self.device.type != "cuda":
+                    host_lane_counts = lane_counts.detach().numpy()
+                    if host_lane_counts[2] != 0:
+                        raise ValueError("Rendered image contains non-finite values")
                 repair = repair_output[start_row:end_row]
                 repair[(coverage > 0) & (coverage < HORIZONTAL_SUBPIXELS)] |= np.uint8(0x01)
                 repair[coverage == 0] |= np.uint8(0x02)
-                downsampled = _downsample_subpixel_band(rendered)
                 output[start_row:end_row] = _convert_image_band(
                     downsampled,
                     source.dtype,
                 )
                 repair |= fine_repair.detach().cpu().numpy()
-                host_lane_counts = lane_counts.detach().cpu().numpy()
+                if host_lane_counts is None:
+                    host_lane_counts = lane_counts.detach().cpu().numpy()
+                    if host_lane_counts[2] != 0:
+                        raise ValueError("Rendered image contains non-finite values")
                 local_filled_lane_count += int(host_lane_counts[0])
                 final_unresolved_lane_count += int(host_lane_counts[1])
                 del (
@@ -1093,6 +1191,51 @@ class StereoRenderer:
             final_unresolved_lane_count=final_unresolved_lane_count,
         )
         return output, coverage_output, repair_output, diagnostics
+
+    def _preload_fast_device_frame(
+        self,
+        source: np.ndarray,
+        geometry: StereoGeometryFrame,
+        eye_offsets: tuple[np.ndarray, np.ndarray],
+    ) -> tuple[_FastDeviceFrame, tuple[torch.Tensor, torch.Tensor]] | None:
+        if self.device.type != "cuda":
+            return None
+        device_source = None
+        device_near_score = None
+        device_source_valid = None
+        left_offsets = None
+        right_offsets = None
+        try:
+            device_source = torch.from_numpy(source).to(self.device)
+            device_near_score = torch.from_numpy(
+                np.array(geometry.near_score, copy=True, order="C")
+            ).to(self.device)
+            device_source_valid = torch.from_numpy(
+                np.array(geometry.source_valid, copy=True, order="C")
+            ).to(self.device)
+            left_offsets = self._transfer_offset_band(eye_offsets[0])
+            right_offsets = self._transfer_offset_band(eye_offsets[1])
+        except torch.cuda.OutOfMemoryError:
+            device_source = None
+            device_near_score = None
+            device_source_valid = None
+            left_offsets = None
+            right_offsets = None
+            self._release_after_oom()
+            return None
+        assert device_source is not None
+        assert device_near_score is not None
+        assert device_source_valid is not None
+        assert left_offsets is not None
+        assert right_offsets is not None
+        return (
+            _FastDeviceFrame(
+                source=device_source,
+                near_score=device_near_score,
+                source_valid=device_source_valid,
+            ),
+            (left_offsets, right_offsets),
+        )
 
     def _transfer_offset_band(self, values: np.ndarray) -> torch.Tensor:
         if self.profile and self.device.type == "cuda":

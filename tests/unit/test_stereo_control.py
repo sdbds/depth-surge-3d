@@ -919,6 +919,49 @@ def test_streaming_pipeline_can_serialize_writes_without_reducing_decoders() -> 
     assert stats.live_threads_after_join == 0
 
 
+def test_streaming_pipeline_can_restore_source_order_before_rendering() -> None:
+    """A slow first decode must not let later frames cross a stream sink."""
+
+    provider = _provider(6)
+    plan = stereo_control.audit_stereo_provider(
+        provider,
+        lambda _item: stereo_control.StereoAction.RENDER,
+    )
+    later_decode_completed = threading.Event()
+    rendered: list[int] = []
+    written: list[int] = []
+
+    def decode(item: stereo_control.StereoProviderItem):
+        if item.source_index == 0:
+            assert later_decode_completed.wait(timeout=5.0)
+        elif item.source_index == 1:
+            later_decode_completed.set()
+        return item
+
+    def render(item: stereo_control.StereoProviderItem):
+        rendered.append(item.source_index)
+        return item
+
+    def write(item: stereo_control.StereoProviderItem) -> None:
+        written.append(item.source_index)
+
+    stats = stereo_control.run_streaming_stereo_pipeline(
+        provider=provider,
+        plan=plan,
+        capacity=3,
+        effective_workers=3,
+        writer_workers=1,
+        decode=decode,
+        render=render,
+        write=write,
+        ordered_render=True,
+    )
+
+    assert rendered == list(range(6))
+    assert written == list(range(6))
+    assert stats.maximum_live_items <= 3
+
+
 def test_capacity_permit_is_released_only_after_large_payload_references_are_gone() -> None:
     provider = _provider(2)
     plan = stereo_control.audit_stereo_provider(

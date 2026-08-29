@@ -802,6 +802,109 @@ def test_streaming_diagnostics_consolidation_replays_names_without_a_sequence_gr
     )
 
 
+def test_transient_diagnostics_spool_completes_without_per_frame_files(
+    tmp_path: Path,
+) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    names = ("frame_0000", "frame_0001")
+    context = diagnostic_transaction.StreamingDiagnosticsStageContext(
+        job_root=tmp_path,
+        frame_count=len(names),
+        frame_names=lambda: iter(names),
+        render_shape=(2, 3),
+        render_mode="quality",
+        geometry_mode="relative",
+        occlusion_fill="background",
+        mask_payloads_enabled=False,
+        rgb_stage_fingerprint="rgb-stage",
+        source_guide_fingerprint="guide-stage",
+        native_geometry_fingerprint="geometry-stage",
+        quality_input_manifest_sha256="d" * 64,
+        native_geometry_sample_count=6,
+    )
+    diagnostic_transaction.begin_streaming_diagnostics_stage(context)
+    spool = diagnostic_transaction.TransientDiagnosticsSpool(context)
+    for frame_name in names:
+        prepared = diagnostic_transaction.prepare_quality_frame(
+            _publication(
+                diagnostic_transaction,
+                tmp_path,
+                keep_masks=False,
+                frame_name=frame_name,
+            )
+        )
+        spool.append(frame_name, prepared.stats_raw)
+
+    completion = spool.complete()
+
+    root = tmp_path / "04_stereo_diagnostics"
+    rows = [
+        json.loads(line)
+        for line in (root / "stereo_coverage_frames.jsonl").read_bytes().splitlines()
+    ]
+    assert [row["frame_name"] for row in rows] == list(names)
+    assert not (root / "frames").exists()
+    assert completion.metadata.static_fields["status"] == "complete"
+    assert diagnostic_transaction.classify_streaming_diagnostics_root(context) == "complete"
+    assert diagnostic_transaction.streaming_diagnostics_aggregates_match(context) is False
+    assert (
+        diagnostic_transaction.classify_streaming_diagnostics_frame(context, names[0]) == "render"
+    )
+
+
+def test_transient_diagnostics_spool_rejects_wrong_order_and_cleans_temporary(
+    tmp_path: Path,
+) -> None:
+    from src.depth_surge_3d.io.durable_publish import publication_temporary_path
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    names = ("frame_0000", "frame_0001")
+    context = diagnostic_transaction.StreamingDiagnosticsStageContext(
+        job_root=tmp_path,
+        frame_count=len(names),
+        frame_names=lambda: iter(names),
+        render_shape=(2, 3),
+        render_mode="quality",
+        geometry_mode="relative",
+        occlusion_fill="background",
+        mask_payloads_enabled=False,
+        rgb_stage_fingerprint="rgb-stage",
+        source_guide_fingerprint="guide-stage",
+        native_geometry_fingerprint="geometry-stage",
+        quality_input_manifest_sha256="e" * 64,
+        native_geometry_sample_count=6,
+    )
+    prepared = diagnostic_transaction.prepare_quality_frame(
+        _publication(
+            diagnostic_transaction,
+            tmp_path,
+            keep_masks=False,
+            frame_name=names[1],
+        )
+    )
+    spool = diagnostic_transaction.TransientDiagnosticsSpool(context)
+
+    with pytest.raises(ValueError, match="source order"):
+        spool.append(names[1], prepared.stats_raw)
+    spool.abort()
+
+    jsonl_path = tmp_path / "04_stereo_diagnostics" / "stereo_coverage_frames.jsonl"
+    assert not publication_temporary_path(jsonl_path).exists()
+
+
+def test_transient_diagnostics_spool_rejects_malformed_statistics(tmp_path: Path) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    context = _streaming_context(diagnostic_transaction, tmp_path, masks=False)
+    spool = diagnostic_transaction.TransientDiagnosticsSpool(context)
+    try:
+        with pytest.raises(ValueError):
+            spool.append("frame_0000", b"{}")
+    finally:
+        spool.abort()
+
+
 def test_streaming_summary_buffers_jsonl_lines(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -55,9 +55,7 @@ def _input_manifest_value(
     mode: str = "assembled_vr",
     first_index: int = 0,
 ) -> dict:
-    frame_names = [
-        f"frame_{index:06d}" for index in range(first_index, first_index + frame_count)
-    ]
+    frame_names = [f"frame_{index:06d}" for index in range(first_index, first_index + frame_count)]
 
     def identities(parent: str) -> list[dict]:
         return [
@@ -114,6 +112,41 @@ def _assembled_arguments(fingerprint: str, relative_path: str) -> tuple[str, ...
     )
 
 
+def _streamed_assembled_arguments(
+    fingerprint: str,
+    relative_path: str,
+) -> tuple[str, ...]:
+    return (
+        "ffmpeg",
+        "-y",
+        "-v",
+        "error",
+        "-framerate",
+        "24/1",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "png",
+        "-i",
+        f"@image-sequence:sha256={fingerprint}:view=frames",
+        "-vf",
+        "setsar=1",
+        "-map",
+        "0:v:0",
+        "-frames:v",
+        "2",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        "18",
+        "-preset",
+        "medium",
+        "@output:path64=" + FinalPublicationTransactionV4.path64(relative_path),
+    )
+
+
 def test_stream_input_manifest_validates_schema_and_settings_cardinality(tmp_path):
     raw, fingerprint = _input_manifest(frame_count=2)
     path = tmp_path / "encoding_input_manifest.json"
@@ -149,9 +182,7 @@ def test_settings_frame_count_uses_selected_clip_extent() -> None:
             "sample_aspect_ratio_denominator": 1,
             "sample_aspect_ratio": "1:1",
         },
-        processing_settings=validate_settings(
-            {"end_time": "00:15"}, source="explicit"
-        ),
+        processing_settings=validate_settings({"end_time": "00:15"}, source="explicit"),
     )
 
     assert final_publication_module._settings_frame_count_v1(settings) == 450
@@ -335,6 +366,71 @@ def _pruning_artifact(frame_count: int = 1):
     )
 
 
+def test_streamed_image2pipe_intent_reconstructs_the_same_container_contract() -> None:
+    raw, fingerprint = _input_manifest(frame_count=2)
+    projection = final_publication_module._parse_input_manifest_projection_v1(
+        raw,
+        expected_frame_count=2,
+    )
+    arguments = _streamed_assembled_arguments(fingerprint, "result.mp4")
+
+    assert (
+        final_publication_module._validate_normalized_argv(
+            arguments,
+            input_stage_fingerprint=fingerprint,
+            relative_path="result.mp4",
+            expected_mode="assembled_vr",
+        )
+        == "assembled_vr"
+    )
+    video_properties = dict(_artifact().to_object()["video_properties"])
+    video_properties["frame_count"] = 2
+    settings = _artifact(
+        video_properties=video_properties,
+        processing_settings=validate_settings(
+            {
+                "keep_intermediates": True,
+                "vr_resolution": "custom:1920x1080",
+                "per_eye_width": 960,
+                "per_eye_height": 1080,
+                "vr_output_width": 1920,
+                "vr_output_height": 1080,
+            },
+            source="explicit",
+        ),
+    )
+    expectation = final_publication_module._final_container_expectation_from_intent_v1(
+        settings=settings,
+        input_projection=projection,
+        arguments=arguments,
+    )
+
+    assert expectation.frame_count == 2
+    assert expectation.fps == "24/1"
+
+
+@pytest.mark.parametrize(
+    ("removed_option", "message"),
+    [("-f", "image2pipe"), ("-vcodec", "PNG codec")],
+)
+def test_streamed_image2pipe_intent_requires_complete_input_declaration(
+    removed_option: str,
+    message: str,
+) -> None:
+    _raw, fingerprint = _input_manifest(frame_count=2)
+    arguments = list(_streamed_assembled_arguments(fingerprint, "result.mp4"))
+    option_index = arguments.index(removed_option)
+    del arguments[option_index : option_index + 2]
+
+    with pytest.raises(FinalPublicationValidationError, match=message):
+        final_publication_module._validate_normalized_argv(
+            tuple(arguments),
+            input_stage_fingerprint=fingerprint,
+            relative_path="result.mp4",
+            expected_mode="assembled_vr",
+        )
+
+
 def _complete_prune_diagnostics(root) -> None:
     diagnostics = root / "04_stereo_diagnostics"
     diagnostics.mkdir(parents=True)
@@ -477,9 +573,7 @@ def _published_pruning_reservation(root, *, diagnostic_frame_count: int = 1):
     if diagnostic_frame_count != 1:
         metadata_path = root / "04_stereo_diagnostics" / "metadata.json"
         metadata = json.loads(metadata_path.read_bytes())
-        metadata["frame_names"] = [
-            f"frame_{index:06d}" for index in range(diagnostic_frame_count)
-        ]
+        metadata["frame_names"] = [f"frame_{index:06d}" for index in range(diagnostic_frame_count)]
         metadata["fingerprint"] = self_fingerprint(metadata)
         metadata_path.write_bytes(canonical_json_bytes(metadata))
     raw, fingerprint = _input_manifest(frame_count=diagnostic_frame_count)
@@ -515,9 +609,7 @@ def _published_pruning_reservation(root, *, diagnostic_frame_count: int = 1):
         retire_reservation=False,
     ).publish()
     entries = reservation.commit_prune_markers()
-    projection = project_diagnostics_metadata(
-        root / "04_stereo_diagnostics" / "metadata.json"
-    )
+    projection = project_diagnostics_metadata(root / "04_stereo_diagnostics" / "metadata.json")
     final_raw = (root / "final_video_manifest.json").read_bytes()
     document = build_payload_pruned_document(
         projection,
@@ -533,9 +625,7 @@ def test_scalar_final_reservation_capability_authorizes_prune_and_pending(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _producer, reservation, _transaction, _document = _published_pruning_reservation(
-        tmp_path
-    )
+    _producer, reservation, _transaction, _document = _published_pruning_reservation(tmp_path)
     capability = FinalEncodingReservationCapabilityV1.from_prepared(reservation)
     del reservation
 
@@ -846,8 +936,7 @@ def test_publication_revalidates_same_inode_bytes_before_hash_and_replace(
             "@image-sequence:sha256=" + input_fingerprint + ":view=frames",
             "@output:path64=" + FinalPublicationTransactionV4.path64(expected),
         ),
-        container_validator=lambda path: path.read_bytes()
-        == b"validated-original-video",
+        container_validator=lambda path: path.read_bytes() == b"validated-original-video",
         expected_sibling_identity=validated_identity,
     )
 
@@ -903,9 +992,7 @@ def test_post_video_crash_is_classified_from_actual_mixed_generation(tmp_path) -
     disposition = audit_final_media_v1(tmp_path, artifact)
     assert disposition.final_video_present is True
     assert disposition.final_video_authenticated is False
-    assert (
-        disposition.final_video_authentication_reason == "publication_validation_failed"
-    )
+    assert disposition.final_video_authentication_reason == "publication_validation_failed"
 
 
 def test_publication_streams_staged_input_manifest_without_read_bytes(
@@ -935,9 +1022,7 @@ def test_publication_streams_staged_input_manifest_without_read_bytes(
             raise AssertionError("encoding manifest must be streamed")
         return original_read_bytes(path)
 
-    monkeypatch.setattr(
-        type(staged_path), "read_bytes", reject_manifest_materialization
-    )
+    monkeypatch.setattr(type(staged_path), "read_bytes", reject_manifest_materialization)
     transaction = FinalPublicationTransactionV4(
         job_root=tmp_path,
         settings=artifact,
@@ -1064,8 +1149,10 @@ def test_final_reservation_threads_cancellation_into_fixed_target_scan(
     artifact = _producer_artifact()
     _install_schema5_job(tmp_path, artifact)
     (tmp_path / "encoding_input_manifest.json").write_bytes(b"existing manifest")
+
     def cancelled() -> bool:
         return False
+
     scan_calls = 0
 
     def cancel_scan(_root, _path, **kwargs):
@@ -1142,9 +1229,7 @@ def test_final_encoding_disk_admission_is_read_only_and_exact_at_boundary(
 ) -> None:
     artifact = _producer_artifact()
     _install_schema5_job(tmp_path, artifact)
-    before = tuple(
-        sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
-    )
+    before = tuple(sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")))
     arguments = {
         "job_root": tmp_path,
         "settings": artifact,
@@ -1166,11 +1251,7 @@ def test_final_encoding_disk_admission_is_read_only_and_exact_at_boundary(
     assert required > 0
     assert captured.value.free_bytes == 0
     assert (
-        tuple(
-            sorted(
-                path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")
-            )
-        )
+        tuple(sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")))
         == before
     )
 
@@ -1180,11 +1261,7 @@ def test_final_encoding_disk_admission_is_read_only_and_exact_at_boundary(
             free_bytes=lambda _path: required - 1,
         )
     assert (
-        tuple(
-            sorted(
-                path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")
-            )
-        )
+        tuple(sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")))
         == before
     )
 
@@ -1203,9 +1280,7 @@ def test_target_descriptor_one_byte_over_bound_fails_before_any_final_mutation(
 
     artifact = _producer_artifact()
     _install_schema5_job(tmp_path, artifact)
-    before = tuple(
-        sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
-    )
+    before = tuple(sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")))
     original_bound = final_publication._final_video_target_descriptor_raw_bound_v1
 
     def one_byte_over(index):
@@ -1242,11 +1317,7 @@ def test_target_descriptor_one_byte_over_bound_fails_before_any_final_mutation(
         )
 
     assert (
-        tuple(
-            sorted(
-                path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")
-            )
-        )
+        tuple(sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")))
         == before
     )
 
@@ -1272,9 +1343,7 @@ def test_pruning_final_reservation_preallocates_every_post_publication_extent(
         final_reservation_id="77" * 16,
     )
 
-    assert [
-        entry["reservation_kind"] for entry in reservation.index.extent_entries
-    ] == [
+    assert [entry["reservation_kind"] for entry in reservation.index.extent_entries] == [
         "producer_settings",
         "encoding_input_manifest",
         "final_video_manifest",
@@ -1298,10 +1367,7 @@ def test_pruning_final_reservation_preallocates_every_post_publication_extent(
     )
     for _entry, transaction, _payload in reservation.prune_marker_transactions:
         assert transaction.target_path.stat().st_size == 0
-        assert (
-            transaction.source_path.stat().st_size
-            == transaction.descriptor.logical_byte_count
-        )
+        assert transaction.source_path.stat().st_size == transaction.descriptor.logical_byte_count
 
 
 @pytest.mark.parametrize(
@@ -1331,9 +1397,7 @@ def test_final_encoding_index_rejects_crossed_diagnostics_binding(
     value = copy.deepcopy(reservation.index.to_object())
     entries = value["extent_entries"]
     diagnostics_entry = next(
-        entry
-        for entry in entries
-        if entry["reservation_kind"] == "diagnostics_payload_pruned"
+        entry for entry in entries if entry["reservation_kind"] == "diagnostics_payload_pruned"
     )
     if invalid_binding == "crossed_hash":
         diagnostics_entry["existing_target_raw_sha256_at_preflight"] = "ab" * 32
@@ -1408,9 +1472,7 @@ def test_pruning_preflight_binds_diagnostics_count_to_schema5_settings(
     )
     _install_schema5_job(tmp_path, artifact)
     _complete_prune_diagnostics(tmp_path)
-    before = tuple(
-        sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
-    )
+    before = tuple(sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")))
 
     with pytest.raises(FinalPublicationValidationError, match="frame count differs"):
         prepare_final_encoding_reservation_v1(
@@ -1428,11 +1490,7 @@ def test_pruning_preflight_binds_diagnostics_count_to_schema5_settings(
         )
 
     assert (
-        tuple(
-            sorted(
-                path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")
-            )
-        )
+        tuple(sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*")))
         == before
     )
 
@@ -1544,19 +1602,13 @@ def test_pruning_final_reservation_reopens_every_indexed_extent(tmp_path) -> Non
     assert reopened.producer_settings_transaction is not None
     assert reopened.producer_settings_payload is None
     assert len(reopened.prune_marker_transactions) == 4
-    assert all(
-        transaction is not None
-        for _, transaction, _ in reopened.prune_marker_transactions
-    )
+    assert all(transaction is not None for _, transaction, _ in reopened.prune_marker_transactions)
     assert reopened.diagnostics_payload_pruned_transaction is not None
     assert reopened.cleanup_pending_settings_transaction is not None
     assert reopened.cleanup_pending_settings_payload is None
 
     producer = reopened.commit_producer_settings()
-    assert (
-        producer.to_object()["metadata"]["final_media_publication_generation"]
-        == "44" * 16
-    )
+    assert producer.to_object()["metadata"]["final_media_publication_generation"] == "44" * 16
     pending = reopened.commit_cleanup_pending_settings()
     assert pending.to_object()["metadata"]["cleanup_status"] == "pending"
 
@@ -1581,9 +1633,7 @@ def test_partial_producer_settings_source_is_reset_before_any_dependent_mutation
         final_reservation_id="77" * 16,
     )
     assert prepared.producer_settings_transaction is not None
-    with prepared.producer_settings_transaction.source_path.open(
-        "r+b", buffering=0
-    ) as handle:
+    with prepared.producer_settings_transaction.source_path.open("r+b", buffering=0) as handle:
         handle.write(b'{"content_fingerprint":"partial')
         handle.flush()
         os.fsync(handle.fileno())
@@ -1596,10 +1646,7 @@ def test_partial_producer_settings_source_is_reset_before_any_dependent_mutation
     )
     committed = reopened.commit_producer_settings()
 
-    assert (
-        committed.to_object()["metadata"]["final_media_publication_generation"]
-        == "44" * 16
-    )
+    assert committed.to_object()["metadata"]["final_media_publication_generation"] == "44" * 16
 
 
 def test_pruning_failure_retirement_leaves_no_unindexed_reservation_objects(
@@ -1781,9 +1828,7 @@ def test_pruning_crash_after_markers_reopens_the_remaining_ordered_prefix(
         allocation_adapter=_test_allocation,
         allocation_counter=_test_allocation_counter,
     )
-    assert all(
-        transaction is None for _, transaction, _ in reopened.prune_marker_transactions
-    )
+    assert all(transaction is None for _, transaction, _ in reopened.prune_marker_transactions)
     assert reopened.diagnostics_payload_pruned_transaction is not None
     assert reopened.cleanup_pending_settings_transaction is not None
 
@@ -1827,9 +1872,7 @@ def test_payload_pruned_recovery_classifies_streamed_physical_states(
     physical_state: str,
     commits: bool,
 ) -> None:
-    producer, _reservation, transaction, document = _published_pruning_reservation(
-        tmp_path
-    )
+    producer, _reservation, transaction, document = _published_pruning_reservation(tmp_path)
     if physical_state in {
         "partial",
         "complete-full",
@@ -1871,18 +1914,14 @@ def test_payload_pruned_recovery_classifies_streamed_physical_states(
 
     assert recovery.phase == "publication_authenticated"
     assert (reopened.diagnostics_payload_pruned_transaction is None) is commits
-    projection = project_diagnostics_metadata(
-        tmp_path / "04_stereo_diagnostics" / "metadata.json"
-    )
+    projection = project_diagnostics_metadata(tmp_path / "04_stereo_diagnostics" / "metadata.json")
     assert projection.status == ("payload_pruned" if commits else "complete")
 
 
 def test_payload_pruned_recovery_rejects_a_foreign_streamed_prefix(
     tmp_path: Path,
 ) -> None:
-    producer, _reservation, transaction, _document = _published_pruning_reservation(
-        tmp_path
-    )
+    producer, _reservation, transaction, _document = _published_pruning_reservation(tmp_path)
     with transaction.source_path.open("r+b", buffering=0) as handle:
         handle.write(b"X")
         handle.flush()
@@ -1993,9 +2032,7 @@ def test_global_recovery_rejects_an_unindexed_final_target_descriptor_pair(
     artifact = _producer_artifact()
     _install_schema5_job(tmp_path, artifact)
     reservation_dir = tmp_path / ".depth-surge-reservations-v1"
-    descriptor = (
-        reservation_dir / f"final-video-target-p-{'44' * 16}-r-{'55' * 16}.json"
-    )
+    descriptor = reservation_dir / f"final-video-target-p-{'44' * 16}-r-{'55' * 16}.json"
     if temporary_only:
         descriptor = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
     descriptor.write_bytes(b'{"unindexed":true}')
@@ -2064,9 +2101,7 @@ def test_global_recovery_rejects_an_unindexed_nested_reserved_payload(
         "input-manifest:descriptor:published",
     ],
 )
-def test_final_reservation_construction_recovers_every_indexed_prefix(
-    tmp_path, stop_event
-) -> None:
+def test_final_reservation_construction_recovers_every_indexed_prefix(tmp_path, stop_event) -> None:
     artifact = _producer_artifact()
     _install_schema5_job(tmp_path, artifact)
 
@@ -2136,9 +2171,7 @@ def test_final_target_descriptor_rewrites_an_index_owned_partial_temporary(
         )
 
     index = json.loads(
-        (tmp_path / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).read_text(
-            encoding="ascii"
-        )
+        (tmp_path / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).read_text(encoding="ascii")
     )
     descriptor = tmp_path / index["final_video_target_descriptor_relative_path"]
     temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
@@ -2474,9 +2507,7 @@ def test_reserved_input_manifest_refuses_a_replaced_preflight_target(tmp_path) -
     assert input_target.read_bytes() == old_raw
 
 
-@pytest.mark.skipif(
-    os.name != "nt", reason="Windows replacement gaps are platform-specific"
-)
+@pytest.mark.skipif(os.name != "nt", reason="Windows replacement gaps are platform-specific")
 def test_reserved_windows_video_replacement_gap_moves_indexed_sibling_forward(
     tmp_path,
 ) -> None:
@@ -3100,10 +3131,7 @@ def test_terminal_update_forwards_durable_producer_intent_before_failed_commit(
         allocation_counter=_test_allocation_counter,
     )
     assert forwarded is not None
-    assert (
-        forwarded.to_object()["metadata"]["final_media_publication_generation"]
-        == "44" * 16
-    )
+    assert forwarded.to_object()["metadata"]["final_media_publication_generation"] == "44" * 16
     failed = forwarded.failed(
         terminal_at="2026-08-24T12:35:00.000000Z",
         diagnostic_code="FINAL_ENCODING_FAILED",
@@ -3428,10 +3456,7 @@ def test_failed_retirement_rejects_swapped_zero_placeholder_before_deletion(
     original_identity = reservation_protocol._identity(reservation.final_video_path)
     reservation.final_video_path.unlink()
     reservation.final_video_path.write_bytes(b"")
-    assert (
-        reservation_protocol._identity(reservation.final_video_path)
-        != original_identity
-    )
+    assert reservation_protocol._identity(reservation.final_video_path) != original_identity
     failed = artifact.failed(
         terminal_at="2026-08-24T12:35:00.000000Z",
         diagnostic_code="FINAL_ENCODING_FAILED",
@@ -3507,9 +3532,7 @@ def test_reserved_publication_rejects_nonempty_owned_placeholder_before_replacem
             retire_reservation=False,
         ).publish()
 
-    assert (
-        reservation.final_video_path.read_bytes() == b"unauthorized-placeholder-bytes"
-    )
+    assert reservation.final_video_path.read_bytes() == b"unauthorized-placeholder-bytes"
     assert reservation.sibling_path.read_bytes() == b"validated-video"
     assert input_transaction.source_path.read_bytes() == source_before
     assert input_transaction.descriptor_path.read_bytes() == descriptor_before
@@ -3624,9 +3647,7 @@ def test_failed_retirement_rejects_nonempty_owned_placeholder_before_any_mutatio
             allocation_counter=_test_allocation_counter,
         )
 
-    assert (
-        reservation.final_video_path.read_bytes() == b"unauthorized-placeholder-bytes"
-    )
+    assert reservation.final_video_path.read_bytes() == b"unauthorized-placeholder-bytes"
     assert reservation.sibling_path.read_bytes() == b"partial-video"
     assert input_transaction.source_path.read_bytes() == source_before
     assert reservation.index_path.is_file()
@@ -3859,9 +3880,7 @@ def test_failed_retirement_preserves_each_legal_post_boundary_publication_prefix
     )
 
 
-@pytest.mark.skipif(
-    os.name != "nt", reason="Windows replacement gaps are platform-specific"
-)
+@pytest.mark.skipif(os.name != "nt", reason="Windows replacement gaps are platform-specific")
 def test_root_control_recovery_restores_final_index_owned_missing_settings(
     tmp_path,
 ) -> None:
@@ -3895,8 +3914,5 @@ def test_root_control_recovery_restores_final_index_owned_missing_settings(
     )
 
     assert recovered is not None
-    assert (
-        recovered.to_object()["metadata"]["final_media_publication_generation"]
-        == "44" * 16
-    )
+    assert recovered.to_object()["metadata"]["final_media_publication_generation"] == "44" * 16
     assert (tmp_path / "processing-settings-v5.json").read_bytes() == payload

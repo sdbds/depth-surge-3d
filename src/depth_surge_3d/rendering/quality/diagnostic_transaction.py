@@ -3357,6 +3357,157 @@ def classify_streaming_diagnostics_root(
         return "unclaimed"
 
 
+class TransientDiagnosticsSpool:
+    """Build complete Quality aggregates without durable per-frame payloads."""
+
+    def __init__(self, context: StreamingDiagnosticsStageContext) -> None:
+        if not isinstance(context, StreamingDiagnosticsStageContext):
+            raise TypeError("transient diagnostics require a streaming context")
+        self.context = context
+        root = context.job_root / "04_stereo_diagnostics"
+        root.mkdir(parents=True, exist_ok=True)
+        self.jsonl_path = root / "stereo_coverage_frames.jsonl"
+        self._owned: OwnedSiblingTemporary | None = OwnedSiblingTemporary.create(self.jsonl_path)
+        self._expected_names = iter(_iter_streaming_frame_names(context))
+        self._next_name = next(self._expected_names, None)
+        self._count = 0
+        self._jsonl_digest = hashlib.sha256()
+        self._ordered_digest = hashlib.sha256(b"[")
+        self._finished = False
+
+    def append(self, frame_name: str, stats_raw: bytes) -> None:
+        """Append one canonical statistics row in exact source order."""
+
+        if self._finished or self._owned is None:
+            raise ValueError("transient diagnostics spool is already closed")
+        if frame_name != self._next_name:
+            raise ValueError("transient diagnostics frames are not in source order")
+        if not isinstance(stats_raw, bytes):
+            raise TypeError("transient diagnostics statistics must be bytes")
+        maximum_line_bytes = 4 * 272 * (self.context.render_shape[1] + 1) + 1024 * 1024
+        if not stats_raw or len(stats_raw) > maximum_line_bytes or b"\n" in stats_raw:
+            raise ValueError("transient diagnostics statistics are unbounded")
+        stats = _parse_streaming_frame_stats(
+            stats_raw,
+            render_width=self.context.render_shape[1],
+        )
+        _validate_frame_statistics_schema(self.context.one_frame(frame_name), stats)
+        expected = {
+            "schema_version": 1,
+            "frame_name": frame_name,
+            "render_mode": self.context.render_mode,
+            "geometry_mode": self.context.geometry_mode,
+            "occlusion_fill": self.context.occlusion_fill,
+            "render_shape": list(self.context.render_shape),
+        }
+        if any(stats.get(key) != value for key, value in expected.items()):
+            raise ValueError("transient diagnostic frame statistics identity changed")
+
+        handle = self._owned.handle
+        if handle.write(stats_raw) != len(stats_raw) or handle.write(b"\n") != 1:
+            raise OSError("short transient diagnostics JSONL write")
+        self._jsonl_digest.update(stats_raw)
+        self._jsonl_digest.update(b"\n")
+        if self._count:
+            self._ordered_digest.update(b",")
+        self._ordered_digest.update(
+            canonical_json_bytes(
+                {
+                    "frame_name": frame_name,
+                    "manifest_sha256": hashlib.sha256(stats_raw).hexdigest(),
+                }
+            )
+        )
+        self._count += 1
+        self._next_name = next(self._expected_names, None)
+
+    def complete(
+        self,
+        *,
+        before_complete_publish: Callable[[], None] | None = None,
+        fault: FaultHook | None = None,
+    ) -> StreamingDiagnosticsCompletion:
+        """Publish the one JSONL extent and the existing aggregate documents."""
+
+        if self._finished or self._owned is None:
+            raise ValueError("transient diagnostics spool is already closed")
+        if self._count != self.context.frame_count or self._next_name is not None:
+            raise ValueError("transient diagnostics spool is incomplete")
+        self._ordered_digest.update(b"]")
+        ordered_fingerprint = self._ordered_digest.hexdigest()
+        jsonl_sha256 = self._jsonl_digest.hexdigest()
+        owned = self._owned
+        try:
+            _call_fault(fault, "before_frames_jsonl_temporary_sync")
+            owned.sync()
+            _call_fault(fault, "after_frames_jsonl_temporary_sync")
+            owned.replace(after_replace=lambda: _call_fault(fault, "after_frames_jsonl_replace"))
+            _call_fault(fault, "after_frames_jsonl_directory_sync")
+        finally:
+            owned.cleanup()
+            self._owned = None
+        self._finished = True
+
+        root = self.context.job_root / "04_stereo_diagnostics"
+        with AcquiredRoot(self.context.job_root) as acquired:
+            if _stream_file_sha256(self.jsonl_path, acquired=acquired) != jsonl_sha256:
+                raise ValueError("transient diagnostics JSONL changed during publication")
+            summary = _streaming_summary_document(
+                self.context,
+                jsonl_path=self.jsonl_path,
+                ordered_fingerprint=ordered_fingerprint,
+                jsonl_sha256=jsonl_sha256,
+                acquired=acquired,
+            )
+            summary.publish(
+                root / "stereo_coverage_summary.json",
+                fault=fault,
+                label="root_summary",
+            )
+            clamp: StreamedCanonicalValue | None = None
+            if self.context.geometry_mode == "metric":
+                assert self.context.left_rgb_parent is not None
+                value = summary.value
+                assert isinstance(value, dict)
+                clamp = build_streamed_canonical_value(_compatibility_clamp_summary(value))
+                clamp.publish(
+                    self.context.left_rgb_parent / "clamp_summary.json",
+                    fault=fault,
+                    label="metric_clamp_summary",
+                )
+        if before_complete_publish is not None:
+            before_complete_publish()
+        metadata = _streaming_diagnostics_metadata(
+            self.context,
+            status="complete",
+            ordered_frame_manifest_fingerprint=ordered_fingerprint,
+            frames_jsonl_sha256=jsonl_sha256,
+            summary_sha256=summary.raw_sha256,
+            metric_clamp_summary_sha256=(None if clamp is None else clamp.raw_sha256),
+        )
+        metadata.publish(
+            root / "metadata.json",
+            fault=fault,
+            label="root_metadata",
+        )
+        return StreamingDiagnosticsCompletion(
+            metadata=metadata,
+            summary=summary,
+            metric_clamp_summary=clamp,
+            ordered_frame_manifest_fingerprint=ordered_fingerprint,
+            frames_jsonl_sha256=jsonl_sha256,
+        )
+
+    def abort(self) -> None:
+        """Remove only this invocation's unpublished JSONL temporary."""
+
+        owned = self._owned
+        self._owned = None
+        self._finished = True
+        if owned is not None:
+            owned.cleanup()
+
+
 def complete_streaming_diagnostics_stage(
     context: StreamingDiagnosticsStageContext,
     *,

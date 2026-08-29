@@ -287,7 +287,7 @@ def _preload_quality_device_frame(
     )
 
 
-def _quality_splat(
+def _quality_device_band(
     renderer: StereoRenderer,
     source: np.ndarray,
     geometry: QualityGeometryResult,
@@ -297,8 +297,7 @@ def _quality_splat(
     *,
     device_frame: _QualityDeviceFrame | None = None,
     device_offsets: torch.Tensor | None = None,
-) -> QualitySplatBand:
-    width = source.shape[1]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if device_frame is None:
         source_band = torch.from_numpy(np.ascontiguousarray(source[start_row:end_row])).to(
             renderer.device
@@ -319,6 +318,31 @@ def _quality_splat(
             if device_offsets is None
             else device_offsets[start_row:end_row]
         )
+    return source_band, near_score_band, source_valid_band, offset_band
+
+
+def _quality_splat(
+    renderer: StereoRenderer,
+    source: np.ndarray,
+    geometry: QualityGeometryResult,
+    offsets: np.ndarray,
+    start_row: int,
+    end_row: int,
+    *,
+    device_frame: _QualityDeviceFrame | None = None,
+    device_offsets: torch.Tensor | None = None,
+) -> QualitySplatBand:
+    width = source.shape[1]
+    source_band, near_score_band, source_valid_band, offset_band = _quality_device_band(
+        renderer,
+        source,
+        geometry,
+        offsets,
+        start_row,
+        end_row,
+        device_frame=device_frame,
+        device_offsets=device_offsets,
+    )
     return _quality_splat_band_prevalidated(
         source_band,
         near_score_band,
@@ -326,6 +350,53 @@ def _quality_splat(
         source_index_offset=start_row * width,
         source_valid=source_valid_band,
     )
+
+
+def _quality_compact_cuda_splat(
+    renderer: StereoRenderer,
+    source: np.ndarray,
+    geometry: QualityGeometryResult,
+    offsets: np.ndarray,
+    start_row: int,
+    end_row: int,
+    *,
+    device_frame: _QualityDeviceFrame | None = None,
+    device_offsets: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if renderer.device.type != "cuda":
+        return None
+    from ..fast_splat_triton import (
+        triton_compact_quality_winners,
+        triton_splat_available,
+    )
+
+    if not triton_splat_available(renderer.device):
+        return None
+    from ..forward_splat import _winner_keys
+
+    source_band, near_score_band, source_valid_band, offset_band = _quality_device_band(
+        renderer,
+        source,
+        geometry,
+        offsets,
+        start_row,
+        end_row,
+        device_frame=device_frame,
+        device_offsets=device_offsets,
+    )
+    winners = _winner_keys(
+        near_score_band,
+        offset_band,
+        start_row * source.shape[1],
+        source_valid_band,
+    )
+    compact = triton_compact_quality_winners(
+        source_band,
+        winners,
+        start_row * source.shape[1],
+    )
+    del winners
+    return compact
 
 
 def _write_analysis_band(
@@ -555,6 +626,31 @@ def _render_unrepaired_eye_once(
             _release_after_oom(renderer)
     for start_row in range(0, height, band_height):
         end_row = min(height, start_row + band_height)
+        compact_cuda = _quality_compact_cuda_splat(
+            renderer,
+            source,
+            geometry,
+            offsets,
+            start_row,
+            end_row,
+            device_frame=device_frame,
+            device_offsets=device_offsets,
+        )
+        if compact_cuda is not None:
+            downsampled, packed_missing_device = compact_cuda
+            packed_missing = np.ascontiguousarray(
+                packed_missing_device.cpu().numpy().view(np.uint16)
+            )
+            assert native_extension is not None
+            native_extension.accumulate_packed_lane_hole_run_histograms_into(
+                packed_missing,
+                lane_histogram,
+                span_histogram,
+                coverage[start_row:end_row],
+            )
+            output[start_row:end_row] = _convert_image_band(downsampled, source.dtype)
+            del compact_cuda, downsampled, packed_missing_device, packed_missing
+            continue
         band = _quality_splat(
             renderer,
             source,

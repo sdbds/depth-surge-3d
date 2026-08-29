@@ -7,6 +7,7 @@ import pytest
 
 from src.depth_surge_3d.processing.video.bounded_process import (
     BoundedProcessCaptureV1,
+    FfmpegInputPipeProcessV1,
     ProcessOutputBudgetError,
     ProcessTimeoutError,
     run_ffmpeg_progress_v1,
@@ -88,12 +89,7 @@ def test_progress_runner_requires_semantic_progress_and_terminal_end() -> None:
 
 def test_progress_runner_accepts_ffmpeg_negative_audio_priming_time() -> None:
     parser = FfmpegProgressParser()
-    progress = (
-        "frame=1\n"
-        "out_time_us=-66667\n"
-        "out_time_ms=-66667\n"
-        "progress=end\n"
-    )
+    progress = "frame=1\n" "out_time_us=-66667\n" "out_time_ms=-66667\n" "progress=end\n"
 
     result = run_ffmpeg_progress_v1(
         [
@@ -201,4 +197,74 @@ def test_streaming_runner_cancellation_terminates_and_reaps_child() -> None:
             terminate_grace_seconds=0.2,
             cancelled=lambda: True,
         )
+    assert time.monotonic() - started < 3.0
+
+
+def test_input_pipe_streams_bytes_while_draining_progress_and_diagnostics() -> None:
+    parser = FfmpegProgressParser()
+    pipe = FfmpegInputPipeProcessV1(
+        parser=parser,
+        diagnostic_cap=4096,
+        line_cap=8192,
+        stall_seconds=2.0,
+    )
+    pipe.start(
+        [
+            sys.executable,
+            "-c",
+            "import sys; "
+            "sys.stderr.buffer.write(b'e'*2048); sys.stderr.flush(); "
+            "payload=sys.stdin.buffer.read(); "
+            "sys.stdout.write(f'frame={len(payload)}\\nprogress=end\\n'); "
+            "sys.stdout.flush()",
+        ]
+    )
+
+    pipe.write(b"x" * 131071)
+    result = pipe.finish()
+
+    assert result.returncode == 0
+    assert result.stderr == b"e" * 2048
+    assert parser.maximums["frame"] == 131071
+    assert parser.ended is True
+
+
+def test_input_pipe_output_overflow_terminates_a_blocked_writer() -> None:
+    pipe = FfmpegInputPipeProcessV1(
+        parser=FfmpegProgressParser(),
+        diagnostic_cap=127,
+        line_cap=8192,
+        stall_seconds=5.0,
+        terminate_grace_seconds=0.2,
+    )
+    pipe.start(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; "
+            "sys.stderr.buffer.write(b'e'*4096); sys.stderr.flush(); "
+            "time.sleep(30)",
+        ]
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ProcessOutputBudgetError, match="stderr"):
+        pipe.write(b"x" * (8 * 1024 * 1024))
+    assert time.monotonic() - started < 3.0
+
+
+def test_input_pipe_cancellation_terminates_a_blocked_writer() -> None:
+    started = time.monotonic()
+    pipe = FfmpegInputPipeProcessV1(
+        parser=FfmpegProgressParser(),
+        diagnostic_cap=1024,
+        line_cap=8192,
+        stall_seconds=30.0,
+        terminate_grace_seconds=0.2,
+        cancelled=lambda: time.monotonic() - started >= 0.1,
+    )
+    pipe.start([sys.executable, "-c", "import time; time.sleep(30)"])
+
+    with pytest.raises(InterruptedError, match="cancellation"):
+        pipe.write(b"x" * (8 * 1024 * 1024))
     assert time.monotonic() - started < 3.0

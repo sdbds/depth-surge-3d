@@ -14,6 +14,9 @@ import numpy as np
 import pytest
 
 from src.depth_surge_3d.processing.video.video_encoder import VideoEncoder
+from src.depth_surge_3d.core.settings import validate_settings
+from src.depth_surge_3d.io.operations import save_processing_settings
+from src.depth_surge_3d.io.settings_artifact import ProcessingSettingsArtifactV5
 
 
 pytestmark = pytest.mark.integration
@@ -228,6 +231,84 @@ def test_libx264_direct_encode_preserves_layout_rate_and_count(
         left_eye, right_eye = frame[:48], frame[48:]
     _assert_eye_content(left_eye, letter="L", dominant_channel=2)
     _assert_eye_content(right_eye, letter="R", dominant_channel=0)
+
+
+def test_schema5_image2pipe_session_preserves_layout_rate_and_authentication(
+    tmp_path: Path,
+) -> None:
+    _require_ffmpeg()
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source identity only")
+    job = tmp_path / "job"
+    settings = validate_settings(
+        {
+            "target_fps": 24,
+            "vr_format": "side_by_side",
+            "vr_resolution": "custom:64x48",
+            "per_eye_width": 64,
+            "per_eye_height": 48,
+            "vr_output_width": 128,
+            "vr_output_height": 48,
+            "preserve_audio": False,
+            "direct_vr_encode": True,
+            "keep_intermediates": True,
+            "video_encoder": "libx264",
+        },
+        source="explicit",
+    )
+    settings_file = save_processing_settings(
+        job,
+        "job",
+        settings,
+        {
+            "width": 64,
+            "height": 48,
+            "fps": 24.0,
+            "frame_count": _FRAME_COUNT,
+            "duration": _FRAME_COUNT / 24.0,
+            "codec": 0,
+            "sample_aspect_ratio_numerator": 1,
+            "sample_aspect_ratio_denominator": 1,
+            "sample_aspect_ratio": "1:1",
+        },
+        str(source),
+        transactional_v5=True,
+    )
+    encoder = VideoEncoder()
+    session = encoder.open_streamed_vr_session(
+        output_dir=job,
+        original_video=str(source),
+        settings=settings,
+        frame_count=_FRAME_COUNT,
+        first_index=1,
+    )
+    for index in range(1, _FRAME_COUNT + 1):
+        left = np.zeros((48, 64, 3), np.uint8)
+        left[:, :] = (20 * index, 40, 220)
+        cv2.putText(left, "L", (8, 34), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        right = np.zeros((48, 64, 3), np.uint8)
+        right[:, :] = (220, 40, 20 * index)
+        cv2.putText(right, "R", (8, 34), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        session.write(f"frame_{index:06d}", np.concatenate((left, right), axis=1))
+
+    assert session.finish_and_publish()
+
+    artifact = ProcessingSettingsArtifactV5.parse(settings_file.read_bytes())
+    relative = artifact.to_object()["output_info"]["expected_final_relative_path"]
+    output = job / relative
+    streams = _probe(output, count_frames=True)["streams"]
+    assert len(streams) == 1
+    assert streams[0]["codec_name"] == "h264"
+    assert (streams[0]["width"], streams[0]["height"]) == (128, 48)
+    assert streams[0]["avg_frame_rate"] == "24/1"
+    assert streams[0]["nb_read_frames"] == str(_FRAME_COUNT)
+    decoded = _read_first_frame(output)
+    _assert_eye_content(decoded[:, :64], letter="L", dominant_channel=2)
+    _assert_eye_content(decoded[:, 64:], letter="R", dominant_channel=0)
+    assert not (job / "streamed_vr_frames").exists()
+    assert not list(job.glob(".depth-surge-image2pipe-*.tmp.mp4"))
+    assert encoder.pending_final_encoding_reservation is not None
+    encoder.pending_final_encoding_reservation.validate_authenticated_publication()
 
 
 def test_direct_encode_maps_generated_flac_to_one_aac_stream(tmp_path):

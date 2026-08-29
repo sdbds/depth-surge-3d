@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import shutil
+import subprocess
 import sys
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +43,9 @@ from depth_surge_3d.processing.frames.source_frame_manifest import (  # noqa: E4
 from depth_surge_3d.processing.orchestration.video_processor import (  # noqa: E402
     VideoProcessor,
 )
+from depth_surge_3d.processing.orchestration.pipeline_orchestrator import (  # noqa: E402
+    ProcessingOrchestrator,
+)
 from depth_surge_3d.processing.video.video_encoder import VideoEncoder  # noqa: E402
 from depth_surge_3d.rendering.stereo_renderer import (  # noqa: E402
     SPLAT_BYTES_PER_PIXEL,
@@ -50,6 +56,10 @@ from depth_surge_3d.utils.imaging.png_header import read_png_header  # noqa: E40
 
 
 pytestmark = pytest.mark.integration
+
+_REAL_RETIRE_FINAL_ENCODING_RESERVATION = VideoEncoder.retire_final_encoding_reservation
+_REAL_CREATE_VIDEO_FROM_STEREO_SOURCE = VideoEncoder.create_video_from_stereo_source
+_REAL_STREAMED_QUALITY_ELIGIBILITY = ProcessingOrchestrator._streamed_quality_settings_eligible
 
 _FRAME_COUNT = 3
 _FRAME_SHAPE = (6, 8)
@@ -150,6 +160,11 @@ class _PipelineResult:
 
     @property
     def final_video(self) -> Path:
+        if self.settings_file is not None and self.settings_file.is_file():
+            values = json.loads(self.settings_file.read_text(encoding="utf-8"))
+            expected = values.get("output_info", {}).get("expected_final_relative_path")
+            if isinstance(expected, str) and expected:
+                return self.output_dir / expected
         return self.output_dir / generate_output_filename(
             self.source_video.name,
             self.settings["vr_format"],
@@ -200,13 +215,7 @@ class _PipelineHarness:
         monkeypatch.setattr(
             VideoEncoder,
             "create_video",
-            lambda _encoder,
-            vr_frames,
-            output,
-            video,
-            settings,
-            *,
-            progress_tracker=None: self._create_authenticated_video(
+            lambda _encoder, vr_frames, output, video, settings, *, progress_tracker=None: self._create_authenticated_video(
                 _encoder,
                 vr_frames,
                 output,
@@ -225,9 +234,7 @@ class _PipelineHarness:
         monkeypatch.setattr(
             orchestrator_module,
             "audit_final_media_v1",
-            lambda *_args, **_kwargs: SimpleNamespace(
-                final_video_authenticated=True
-            ),
+            lambda *_args, **_kwargs: SimpleNamespace(final_video_authenticated=True),
         )
         real_finalize = MetricGeometryStore.finalize
         real_open_existing = MetricGeometryStore.open_existing
@@ -312,13 +319,7 @@ class _PipelineHarness:
         monkeypatch.setattr(
             encoder_module.VideoEncoder,
             "create_video",
-            lambda _encoder,
-            vr_frames,
-            output,
-            video,
-            settings,
-            *,
-            progress_tracker=None: self._create_authenticated_video(
+            lambda _encoder, vr_frames, output, video, settings, *, progress_tracker=None: self._create_authenticated_video(
                 _encoder,
                 vr_frames,
                 output,
@@ -384,9 +385,7 @@ class _PipelineHarness:
         settings = self.settings(geometry_mode, **overrides)
         processor = VideoProcessor(estimator)
         if fail_stereo:
-            processor.stereo_generator.create_stereo_pairs_from_manifest = (
-                self._fail_stereo
-            )
+            processor.stereo_generator.create_stereo_pairs_from_manifest = self._fail_stereo
         self._active_tracker = progress
         self._active_output_dir = output_dir
         self._stage_observations = []
@@ -453,10 +452,22 @@ class _PipelineHarness:
     ) -> bool:
         packed = sorted(vr_frames_dir.glob("*.png"))
         assert len(packed) == _FRAME_COUNT
+        if settings["vr_format"] == "side_by_side":
+            expected_shape = (
+                int(settings["per_eye_height"]),
+                int(settings["per_eye_width"]) * 2,
+                3,
+            )
+        else:
+            expected_shape = (
+                int(settings["per_eye_height"]) * 2,
+                int(settings["per_eye_width"]),
+                3,
+            )
         for path in packed:
             image = cv2.imread(str(path), cv2.IMREAD_COLOR)
             assert image is not None
-            assert image.shape == (480, 1708, 3)
+            assert image.shape == expected_shape
         output = output_dir / generate_output_filename(
             Path(video_path).name,
             settings["vr_format"],
@@ -531,6 +542,39 @@ def _png_pixel_hashes(directory: Path) -> dict[str, str]:
         assert image is not None
         hashes[path.name] = _array_sha256(image)
     return hashes
+
+
+def _decode_video_frames(path: Path, shape: tuple[int, int]) -> list[np.ndarray]:
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-map",
+            "0:v:0",
+            "-vsync",
+            "0",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "pipe:1",
+        ],
+        check=False,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    height, width = shape
+    frame_bytes = height * width * 3
+    assert len(completed.stdout) % frame_bytes == 0
+    return [
+        np.frombuffer(completed.stdout, np.uint8, frame_bytes, offset)
+        .reshape(height, width, 3)
+        .copy()
+        for offset in range(0, len(completed.stdout), frame_bytes)
+    ]
 
 
 def _output_tree_snapshot(directory: Path) -> dict[str, tuple[str, str | None]]:
@@ -869,6 +913,127 @@ def test_no_retention_failure_keeps_completed_stage_and_reports_required_inferen
         "MoGe inference is required to build the selected geometry stage"
     )
     assert _output_tree_snapshot(output_dir) == output_before
+
+
+def test_relative_quality_image2pipe_matches_retained_direct_encode(
+    pipeline_harness: _PipelineHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("FFmpeg and ffprobe are required")
+    monkeypatch.setattr(
+        VideoEncoder,
+        "retire_final_encoding_reservation",
+        _REAL_RETIRE_FINAL_ENCODING_RESERVATION,
+    )
+    shared = {
+        "apply_distortion": True,
+        "crop_factor": 1.0,
+        "direct_vr_encode": True,
+        "per_eye_height": 48,
+        "per_eye_width": 64,
+        "stereo_render_mode": "quality",
+        "upscale_model": "none",
+        "video_encoder": "libx264",
+        "vr_output_height": 48,
+        "vr_output_width": 128,
+        "vr_resolution": "custom:128x48",
+    }
+
+    expected_payload_hashes: list[str] = []
+
+    def capture_file_backed_payloads(
+        encoder,
+        source,
+        output_dir,
+        original_video,
+        settings,
+        *,
+        total_frames,
+        progress_tracker=None,
+    ):
+        for index in range(source.first_index, source.first_index + source.frame_count):
+            name = f"frame_{index:06d}.png"
+            left = cv2.imread(str(source.left_parent / name))
+            right = cv2.imread(str(source.right_parent / name))
+            assert left is not None and right is not None
+            encoded, payload = cv2.imencode(".png", np.hstack((left, right)))
+            assert encoded
+            expected_payload_hashes.append(hashlib.sha256(payload.tobytes()).hexdigest())
+        return _REAL_CREATE_VIDEO_FROM_STEREO_SOURCE(
+            encoder,
+            source,
+            output_dir,
+            original_video,
+            settings,
+            total_frames=total_frames,
+            progress_tracker=progress_tracker,
+        )
+
+    monkeypatch.setattr(
+        ProcessingOrchestrator,
+        "_streamed_quality_settings_eligible",
+        staticmethod(lambda *_args, **_kwargs: False),
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "create_video_from_stereo_source",
+        capture_file_backed_payloads,
+    )
+    file_backed_started = time.perf_counter()
+    file_backed = pipeline_harness.run(
+        "relative",
+        output_dir=pipeline_harness.root / "quality-file-backed",
+        keep_intermediates=False,
+        **shared,
+    )
+    file_backed_seconds = time.perf_counter() - file_backed_started
+    monkeypatch.setattr(
+        ProcessingOrchestrator,
+        "_streamed_quality_settings_eligible",
+        staticmethod(_REAL_STREAMED_QUALITY_ELIGIBILITY),
+    )
+    monkeypatch.setattr(
+        VideoEncoder,
+        "create_video_from_stereo_source",
+        _REAL_CREATE_VIDEO_FROM_STEREO_SOURCE,
+    )
+    streamed_started = time.perf_counter()
+    streamed = pipeline_harness.run(
+        "relative",
+        output_dir=pipeline_harness.root / "quality-streamed",
+        keep_intermediates=False,
+        **shared,
+    )
+    streamed_seconds = time.perf_counter() - streamed_started
+
+    assert file_backed.success and streamed.success
+    streamed_manifest = json.loads(
+        (streamed.output_dir / "encoding_input_manifest.json").read_text(encoding="utf-8")
+    )
+    assert [frame["sha256"] for frame in streamed_manifest["frames"]] == (expected_payload_hashes)
+    assert not (streamed.output_dir / "04_left_frames").exists()
+    assert not (streamed.output_dir / "04_right_frames").exists()
+    assert not (streamed.output_dir / "06_left_cropped").exists()
+    assert not (streamed.output_dir / "06_right_cropped").exists()
+
+    file_backed_frames = _decode_video_frames(file_backed.final_video, (48, 128))
+    streamed_frames = _decode_video_frames(streamed.final_video, (48, 128))
+    assert len(file_backed_frames) == len(streamed_frames) == _FRAME_COUNT
+    assert all(
+        np.array_equal(file_backed_frame, streamed_frame)
+        for file_backed_frame, streamed_frame in zip(
+            file_backed_frames,
+            streamed_frames,
+        )
+    )
+    print(
+        "quality-image2pipe-benchmark "
+        f"file_backed_seconds={file_backed_seconds:.6f} "
+        f"streamed_seconds={streamed_seconds:.6f} "
+        f"file_backed_fps={_FRAME_COUNT / file_backed_seconds:.3f} "
+        f"streamed_fps={_FRAME_COUNT / streamed_seconds:.3f}"
+    )
 
 
 def _load_cli_module():
