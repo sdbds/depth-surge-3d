@@ -73,8 +73,8 @@ DEFAULT_SETTINGS = {
     "target_fps": 60,
     "min_resolution": "1080p",
     "preserve_audio": True,
-    "keep_intermediates": True,
-    "direct_vr_encode": False,
+    "keep_intermediates": False,
+    "direct_vr_encode": True,
     "apply_distortion": True,
     "output_dir": "./output",
     "experimental_frame_interpolation": False,  # Experimental feature with quality warnings
@@ -280,7 +280,7 @@ UPSCALE_MODELS = ["none", "x2", "x4", "x4-conservative"]
 # Step 1: Extract Frames (00_original_frames)
 # Step 2: Analyze scenes and generate canonical disparity
 # Step 3: Create Stereo Pairs (04_left_frames, 04_right_frames)
-# Step 4: Apply Distortion - OPTIONAL (05_left_distorted, 05_right_distorted)
+# Step 4: Apply Distortion - OPTIONAL (fused directly into Step 5 by the orchestrator)
 # Step 5: Crop Frames (06_left_cropped, 06_right_cropped)
 # Step 6: Upscale Frames - OPTIONAL (07_left_upscaled, 07_right_upscaled)
 # Step 7: Assemble VR Frames (99_vr_frames)
@@ -294,8 +294,8 @@ INTERMEDIATE_DIRS = {
     "disparity_stabilized": "03_disparity_stabilized",  # Optional VDPP output
     "left_frames": "04_left_frames",  # Step 3: Stereo pair - left eye
     "right_frames": "04_right_frames",  # Step 3: Stereo pair - right eye
-    "left_distorted": "05_left_distorted",  # Step 4: Fisheye distortion - left (optional)
-    "right_distorted": "05_right_distorted",  # Step 4: Fisheye distortion - right (optional)
+    "left_distorted": "05_left_distorted",  # Legacy two-stage distortion output - left
+    "right_distorted": "05_right_distorted",  # Legacy two-stage distortion output - right
     "left_cropped": "06_left_cropped",  # Step 5: Center cropped - left
     "right_cropped": "06_right_cropped",  # Step 5: Center cropped - right
     "left_upscaled": "07_left_upscaled",  # Step 6: AI upscaled - left (optional)

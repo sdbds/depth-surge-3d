@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 import gc
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -241,6 +242,59 @@ def test_relative_provider_replay_streams_each_declared_payload_identity(
     assert calls == 4
 
 
+def test_provider_replay_buffers_manifest_lines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor, provider, _guide_paths, _geometry_paths = _published_relative_provider(
+        tmp_path,
+        count=2,
+    )
+    original_regular_file = stereo_input_manifest._regular_file
+    line_reads = 0
+    chunk_reads = 0
+
+    class CountingRaw(io.RawIOBase):
+        def __init__(self, handle) -> None:
+            self._handle = handle
+
+        def readable(self) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            return self._handle.fileno()
+
+        def readinto(self, target) -> int:
+            nonlocal chunk_reads
+            chunk_reads += 1
+            return self._handle.readinto(target)
+
+        def readline(self, size: int = -1) -> bytes:
+            nonlocal line_reads
+            line_reads += 1
+            return self._handle.readline(size)
+
+        def close(self) -> None:
+            self._handle.close()
+            super().close()
+
+    def counted_regular_file(path: Path, **kwargs):
+        handle, metadata = original_regular_file(path, **kwargs)
+        if Path(path) == descriptor.path:
+            return CountingRaw(handle), metadata
+        return handle, metadata
+
+    monkeypatch.setattr(
+        stereo_input_manifest,
+        "_regular_file",
+        counted_regular_file,
+    )
+
+    assert len(list(provider.replay())) == 2
+    assert line_reads == 0
+    assert chunk_reads <= 2
+
+
 def test_provider_replay_uses_one_acquired_root_instance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -474,9 +528,7 @@ def test_action_replay_wraps_iterator_failures_as_post_mutation_input_change(
             if failure_position == "middle" and item.source_index == 0:
                 raise ValueError("injected provider iteration failure")
         if failure_position == "after_last":
-            raise stereo_control.StereoControlStateError(
-                "injected provider iteration failure"
-            )
+            raise stereo_control.StereoControlStateError("injected provider iteration failure")
 
     changed = stereo_control.ReplayableStereoProvider(original.generation, replay)
 
@@ -501,6 +553,66 @@ def test_quality_capacity_is_exactly_one_and_p_zero_creates_no_control() -> None
         1,
         6 * 1024 * 1024,
     )
+
+
+def test_quality_capacity_overlaps_decode_render_and_write_when_memory_allows() -> None:
+    selection = stereo_control.select_quality_pipeline_capacity(
+        configured_workers=8,
+        pending_render_count=60,
+        quality_active_scratch=240 * 1024 * 1024,
+        quality_slot_bytes=72 * 1024 * 1024,
+    )
+
+    assert selection.capacity == 4
+    assert selection.effective_workers == 4
+    assert selection.writer_workers == 3
+    assert selection.thread_bytes == 16 * 1024 * 1024
+    assert selection.total_bytes == 472 * 1024 * 1024
+
+
+def test_quality_capacity_charges_a_retained_duplicate_cache() -> None:
+    selection = stereo_control.select_quality_pipeline_capacity(
+        configured_workers=8,
+        pending_render_count=60,
+        quality_active_scratch=240 * 1024 * 1024,
+        quality_slot_bytes=72 * 1024 * 1024,
+        retained_bytes=72 * 1024 * 1024,
+    )
+
+    assert selection.capacity == 3
+    assert selection.effective_workers == 3
+    assert selection.writer_workers == 3
+    assert selection.thread_bytes == 14 * 1024 * 1024
+    assert selection.total_bytes == 470 * 1024 * 1024
+
+
+def test_quality_capacity_falls_back_to_two_when_third_slot_exceeds_budget() -> None:
+    selection = stereo_control.select_quality_pipeline_capacity(
+        configured_workers=8,
+        pending_render_count=60,
+        quality_active_scratch=384 * 1024 * 1024,
+        quality_slot_bytes=60 * 1024 * 1024,
+    )
+
+    assert selection.capacity == 2
+    assert selection.effective_workers == 2
+    assert selection.writer_workers == 2
+    assert selection.thread_bytes == 10 * 1024 * 1024
+    assert selection.total_bytes == 454 * 1024 * 1024
+
+
+def test_quality_capacity_falls_back_to_one_when_overlap_exceeds_budget() -> None:
+    selection = stereo_control.select_quality_pipeline_capacity(
+        configured_workers=8,
+        pending_render_count=60,
+        quality_active_scratch=450 * 1024 * 1024,
+        quality_slot_bytes=72 * 1024 * 1024,
+    )
+
+    assert selection.capacity == 1
+    assert selection.effective_workers == 1
+    assert selection.writer_workers == 1
+    assert selection.total_bytes == 456 * 1024 * 1024
 
 
 def test_fast_capacity_uses_the_unique_largest_eligible_integer() -> None:
@@ -775,6 +887,36 @@ def test_streaming_pipeline_forces_bounded_decode_render_write_overlap(workers: 
     assert stats.decode_render_overlap
     assert stats.render_write_overlap
     assert stats.work_item_copies == 0
+    assert stats.pipeline_wall_seconds > 0.0
+    assert stats.decode_busy_seconds > 0.0
+    assert stats.render_busy_seconds > 0.0
+    assert stats.write_busy_seconds > 0.0
+
+
+def test_streaming_pipeline_can_serialize_writes_without_reducing_decoders() -> None:
+    provider = _provider(24)
+    plan = stereo_control.audit_stereo_provider(
+        provider,
+        lambda _item: stereo_control.StereoAction.RENDER,
+    )
+
+    stats = stereo_control.run_streaming_stereo_pipeline(
+        provider=provider,
+        plan=plan,
+        capacity=3,
+        effective_workers=3,
+        writer_workers=1,
+        decode=lambda item: item,
+        render=lambda item: item,
+        write=lambda _item: None,
+    )
+
+    assert (stats.decoded, stats.rendered, stats.written) == (24, 24, 24)
+    assert stats.actual_thread_count == 5
+    assert stats.decoder_thread_count == 3
+    assert stats.writer_thread_count == 1
+    assert stats.calculated_thread_bytes == 10 * 1024 * 1024
+    assert stats.live_threads_after_join == 0
 
 
 def test_capacity_permit_is_released_only_after_large_payload_references_are_gone() -> None:
@@ -991,9 +1133,7 @@ def test_downstream_mutation_input_change_is_typed_after_the_boundary() -> None:
             render=lambda item: item,
             write=lambda _item: None,
             mutation=lambda: (_ for _ in ()).throw(
-                stereo_control.StereoInputIdentityMismatch(
-                    "injected mutation replay change"
-                )
+                stereo_control.StereoInputIdentityMismatch("injected mutation replay change")
             ),
         )
 

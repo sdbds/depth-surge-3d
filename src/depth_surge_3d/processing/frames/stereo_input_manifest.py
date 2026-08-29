@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import io
 import json
 import math
 import os
@@ -11,7 +12,7 @@ from pathlib import Path, PurePosixPath
 import secrets
 import stat
 import struct
-from typing import Any, BinaryIO, Iterable, Iterator, Literal, Mapping, Sequence
+from typing import Any, BinaryIO, cast, Iterable, Iterator, Literal, Mapping, Sequence
 import zlib
 
 import numpy as np
@@ -85,9 +86,7 @@ def _regular_file(
     acquired: AcquiredRoot | None = None,
 ) -> tuple[BinaryIO, os.stat_result]:
     if acquired is not None:
-        if job_root is not None and acquired.root != Path(
-            os.path.abspath(os.fspath(job_root))
-        ):
+        if job_root is not None and acquired.root != Path(os.path.abspath(os.fspath(job_root))):
             raise StereoControlStateError("stereo input acquired the wrong job root")
         handle = acquired.open_regular(path)
         return handle, os.fstat(handle.fileno())
@@ -157,13 +156,7 @@ def _parse_png_header(raw: bytes, path: Path) -> dict[str, int]:
         raw,
         16,
     )
-    if (
-        width <= 0
-        or height <= 0
-        or compression != 0
-        or filtering != 0
-        or interlace not in {0, 1}
-    ):
+    if width <= 0 or height <= 0 or compression != 0 or filtering != 0 or interlace not in {0, 1}:
         raise StereoControlStateError(f"stereo input PNG header is unsupported: {path}")
     return {
         "bit_depth": int(bit_depth),
@@ -201,10 +194,7 @@ def _png_identity(
         acquired=acquired,
     )
     header = _parse_png_header(raw_header, path)
-    if (
-        header["bit_depth"] != expected_bit_depth
-        or header["color_type"] != expected_color_type
-    ):
+    if header["bit_depth"] != expected_bit_depth or header["color_type"] != expected_color_type:
         raise StereoControlStateError(f"stereo input PNG format is invalid: {path}")
     return {
         "byte_count": byte_count,
@@ -314,7 +304,9 @@ def _next_pair(
     try:
         geometry = Path(next(geometry_iterator))
     except StopIteration as error:
-        raise StereoControlStateError("geometry sequence ended before its declared count") from error
+        raise StereoControlStateError(
+            "geometry sequence ended before its declared count"
+        ) from error
     return guide, geometry
 
 
@@ -718,9 +710,13 @@ def load_stereo_input_manifest_v1(
         ):
             raise StereoControlStateError("relative stereo input scalar metadata is invalid")
     else:
-        if scale_bits is not None or isinstance(resolved_auto, bool) or not isinstance(
-            resolved_auto,
-            (int, float),
+        if (
+            scale_bits is not None
+            or isinstance(resolved_auto, bool)
+            or not isinstance(
+                resolved_auto,
+                (int, float),
+            )
         ):
             raise StereoControlStateError("metric stereo input scalar metadata is invalid")
         resolved_auto = float(resolved_auto)
@@ -828,14 +824,18 @@ def _validate_item(
         suffix=geometry_suffix,
     )
     if descriptor.geometry_mode == "relative":
-        if set(geometry) != {
-            "byte_count",
-            "frame_name",
-            "payload_kind",
-            "png_header",
-            "relative_path",
-            "sha256",
-        } or geometry.get("payload_kind") != "canonical_png":
+        if (
+            set(geometry)
+            != {
+                "byte_count",
+                "frame_name",
+                "payload_kind",
+                "png_header",
+                "relative_path",
+                "sha256",
+            }
+            or geometry.get("payload_kind") != "canonical_png"
+        ):
             raise StereoControlStateError("relative geometry identity schema changed")
         if geometry.get("png_header") != {
             "bit_depth": 16,
@@ -938,61 +938,71 @@ def _scan_manifest(
     payload_validation: Literal["none", "identity", "content"],
     acquired: AcquiredRoot | None = None,
 ) -> Iterator[tuple[dict[str, Any], Path, Path]]:
+    reader = (
+        handle
+        if isinstance(handle, io.BufferedReader)
+        else io.BufferedReader(cast(Any, handle), buffer_size=STEREO_INPUT_PAYLOAD_STREAM_BYTES)
+    )
+    owns_reader = reader is not handle
     digest = hashlib.sha256()
     raw_byte_count = 0
-    header_raw = _read_line(handle)
-    if header_raw is None:
-        raise StereoControlStateError("stereo input manifest is empty")
-    digest.update(header_raw)
-    raw_byte_count += len(header_raw)
-    _validate_header(_parse_line(header_raw), descriptor)
-    first_frame_index: int | None = None
-    for source_index in range(descriptor.frame_count):
-        raw = _read_line(handle)
-        if raw is None:
-            raise StereoControlStateError("stereo input manifest ended before its frame count")
-        digest.update(raw)
-        raw_byte_count += len(raw)
-        value, frame_index = _validate_item(
-            _parse_line(raw),
-            descriptor=descriptor,
-            expected_source_index=source_index,
-            expected_frame_index=(
-                None if first_frame_index is None else first_frame_index + source_index
-            ),
-        )
-        if first_frame_index is None:
-            first_frame_index = frame_index
-        if payload_validation != "none":
-            guide_path = _actual_identity_matches(
-                descriptor,
-                value["guide"],
-                guide=True,
-                payload_validation=payload_validation,
-                acquired=acquired,
+    try:
+        header_raw = _read_line(reader)
+        if header_raw is None:
+            raise StereoControlStateError("stereo input manifest is empty")
+        digest.update(header_raw)
+        raw_byte_count += len(header_raw)
+        _validate_header(_parse_line(header_raw), descriptor)
+        first_frame_index: int | None = None
+        for source_index in range(descriptor.frame_count):
+            raw = _read_line(reader)
+            if raw is None:
+                raise StereoControlStateError("stereo input manifest ended before its frame count")
+            digest.update(raw)
+            raw_byte_count += len(raw)
+            value, frame_index = _validate_item(
+                _parse_line(raw),
+                descriptor=descriptor,
+                expected_source_index=source_index,
+                expected_frame_index=(
+                    None if first_frame_index is None else first_frame_index + source_index
+                ),
             )
-            geometry_path = _actual_identity_matches(
-                descriptor,
-                value["geometry"],
-                guide=False,
-                payload_validation=payload_validation,
-                acquired=acquired,
-            )
-        else:
-            guide_path = descriptor.job_root.joinpath(
-                *PurePosixPath(value["guide"]["relative_path"]).parts
-            )
-            geometry_path = descriptor.job_root.joinpath(
-                *PurePosixPath(value["geometry"]["relative_path"]).parts
-            )
-        yield value, guide_path, geometry_path
-    if _read_line(handle) is not None:
-        raise StereoControlStateError("stereo input manifest exceeds its frame count")
-    if (
-        raw_byte_count != descriptor.raw_byte_count
-        or digest.hexdigest() != descriptor.raw_sha256
-    ):
-        raise StereoControlStateError("stereo input manifest raw identity changed")
+            if first_frame_index is None:
+                first_frame_index = frame_index
+            if payload_validation != "none":
+                guide_path = _actual_identity_matches(
+                    descriptor,
+                    value["guide"],
+                    guide=True,
+                    payload_validation=payload_validation,
+                    acquired=acquired,
+                )
+                geometry_path = _actual_identity_matches(
+                    descriptor,
+                    value["geometry"],
+                    guide=False,
+                    payload_validation=payload_validation,
+                    acquired=acquired,
+                )
+            else:
+                guide_path = descriptor.job_root.joinpath(
+                    *PurePosixPath(value["guide"]["relative_path"]).parts
+                )
+                geometry_path = descriptor.job_root.joinpath(
+                    *PurePosixPath(value["geometry"]["relative_path"]).parts
+                )
+            yield value, guide_path, geometry_path
+        if _read_line(reader) is not None:
+            raise StereoControlStateError("stereo input manifest exceeds its frame count")
+        if (
+            raw_byte_count != descriptor.raw_byte_count
+            or digest.hexdigest() != descriptor.raw_sha256
+        ):
+            raise StereoControlStateError("stereo input manifest raw identity changed")
+    finally:
+        if owns_reader:
+            reader.detach()
 
 
 def _validate_descriptor_manifest(descriptor: StereoInputManifestV1) -> None:
@@ -1046,9 +1056,7 @@ class _ManifestReplay:
                     acquired=acquired,
                 ):
                     if _file_version(os.fstat(handle.fileno())) != original_version:
-                        raise StereoControlStateError(
-                            "stereo input manifest changed during replay"
-                        )
+                        raise StereoControlStateError("stereo input manifest changed during replay")
                     frame_name = value["frame_name"]
                     yield StereoProviderItem(
                         audit_generation_id=self.generation.audit_generation_id,
@@ -1066,7 +1074,6 @@ class _ManifestReplay:
                         guide_shape=self.descriptor.render_shape,
                         geometry_shape=self.descriptor.native_shape,
                         frame_json_bound=(
-                            4 * 272 * (self.descriptor.render_shape[1] + 1)
-                            + 1024 * 1024
+                            4 * 272 * (self.descriptor.render_shape[1] + 1) + 1024 * 1024
                         ),
                     )

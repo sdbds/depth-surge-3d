@@ -14,6 +14,7 @@ import secrets
 import struct
 import sys
 import threading
+import time
 from typing import Callable, Iterable, Iterator, Protocol, cast
 
 from ...io.stereo_contract import (
@@ -236,6 +237,7 @@ class StereoControlAuditPlan:
     frame_name_json_array_bytes: int
     maximum_fast_relative_item_bytes: int
     maximum_fast_metric_item_bytes: int
+    has_consecutive_render_input: bool
     control_residency: "StereoControlResidencyEvidence"
 
     @property
@@ -337,7 +339,10 @@ def _validate_provider_item(
         if (
             not isinstance(shape, tuple)
             or len(shape) != 2
-            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in shape)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in shape
+            )
         ):
             raise StereoControlStateError("provider image shape is invalid")
     expected_guide = f"{stem}.png"
@@ -395,6 +400,8 @@ def audit_stereo_provider(
     frame_name_json_array_bytes = 2
     maximum_fast_relative_item_bytes = 0
     maximum_fast_metric_item_bytes = 0
+    previous_render_input: tuple[object, ...] | None = None
+    has_consecutive_render_input = False
     expected_index = 0
     for item in provider.replay():
         if expected_index >= generation.frame_count:
@@ -421,6 +428,16 @@ def audit_stereo_provider(
         )
         frame_name_json_array_bytes += len(item.frame_name) + 2 + int(expected_index > 0)
         if action is StereoAction.RENDER:
+            render_input = (
+                item.guide_sha256,
+                item.guide_byte_count,
+                item.guide_shape,
+                item.geometry_sha256,
+                item.geometry_byte_count,
+                item.geometry_shape,
+            )
+            has_consecutive_render_input |= previous_render_input == render_input
+            previous_render_input = render_input
             output_pixels = item.guide_shape[0] * item.guide_shape[1]
             native_pixels = item.geometry_shape[0] * item.geometry_shape[1]
             compressed = item.guide_byte_count + item.geometry_byte_count
@@ -462,6 +479,7 @@ def audit_stereo_provider(
         frame_name_json_array_bytes=frame_name_json_array_bytes,
         maximum_fast_relative_item_bytes=maximum_fast_relative_item_bytes,
         maximum_fast_metric_item_bytes=maximum_fast_metric_item_bytes,
+        has_consecutive_render_input=has_consecutive_render_input,
         control_residency=residency,
     )
     if plan.persistent_control_bytes > STEREO_CONTROL_OVERHEAD:
@@ -524,9 +542,7 @@ def validate_stereo_action_replay(
         replay = provider.replay()
         for item in replay:
             if expected_index >= plan.generation.frame_count:
-                raise StereoControlStateError(
-                    "provider replay exceeds its frozen frame count"
-                )
+                raise StereoControlStateError("provider replay exceeds its frozen frame count")
             _validate_provider_item(item, plan.generation, expected_index)
             _update_item_digest(digest, item)
             try:
@@ -547,9 +563,7 @@ def validate_stereo_action_replay(
     except (StereoControlError, OSError, TypeError, ValueError) as error:
         raise StereoProviderChangedError(str(error)) from error
     if expected_index != plan.generation.frame_count:
-        raise StereoProviderChangedError(
-            "provider replay ended before its frozen frame count"
-        )
+        raise StereoProviderChangedError("provider replay ended before its frozen frame count")
     if digest.hexdigest() != plan.item_stream_sha256:
         raise StereoProviderChangedError("provider item identity changed")
     if render_count != plan.render_count or migrate_count != plan.migrate_count:
@@ -615,6 +629,15 @@ class FastPipelineCapacity:
     total_bytes: int
 
 
+@dataclass(frozen=True)
+class QualityPipelineCapacity:
+    capacity: int
+    effective_workers: int
+    writer_workers: int
+    thread_bytes: int
+    total_bytes: int
+
+
 def quality_pipeline_capacity(pending_render_count: int) -> tuple[int, int, int]:
     if isinstance(pending_render_count, bool) or not isinstance(pending_render_count, int):
         raise TypeError("pending render count must be an integer")
@@ -623,6 +646,60 @@ def quality_pipeline_capacity(pending_render_count: int) -> tuple[int, int, int]
     if pending_render_count == 0:
         return 0, 0, 0
     return 1, 1, 3 * STEREO_IO_THREAD_BYTES
+
+
+def select_quality_pipeline_capacity(
+    *,
+    configured_workers: int,
+    pending_render_count: int,
+    quality_active_scratch: int,
+    quality_slot_bytes: int,
+    retained_bytes: int = 0,
+) -> QualityPipelineCapacity:
+    """Overlap Quality decode, render, and write under the fixed host budget."""
+
+    if isinstance(configured_workers, bool) or not isinstance(configured_workers, int):
+        raise TypeError("configured stereo workers must be an integer")
+    if configured_workers < 1 or configured_workers > 16:
+        raise ValueError("configured stereo workers must be in 1..16")
+    if isinstance(pending_render_count, bool) or not isinstance(pending_render_count, int):
+        raise TypeError("pending render count must be an integer")
+    if pending_render_count < 0:
+        raise ValueError("pending render count must be nonnegative")
+    if quality_active_scratch < 0 or quality_slot_bytes <= 0 or retained_bytes < 0:
+        raise ValueError("Quality scratch and slot byte counts are invalid")
+    if pending_render_count == 0:
+        return QualityPipelineCapacity(
+            0,
+            0,
+            0,
+            0,
+            quality_active_scratch + retained_bytes,
+        )
+
+    selected: QualityPipelineCapacity | None = None
+    candidate_max = min(4, configured_workers, pending_render_count)
+    for capacity in range(1, candidate_max + 1):
+        effective_workers = min(configured_workers, capacity)
+        writer_workers = min(3, effective_workers)
+        thread_bytes = (1 + effective_workers + writer_workers) * STEREO_IO_THREAD_BYTES
+        total = (
+            quality_active_scratch
+            + retained_bytes
+            + (capacity - 1) * quality_slot_bytes
+            + thread_bytes
+        )
+        if total <= STEREO_HOST_BUDGET:
+            selected = QualityPipelineCapacity(
+                capacity,
+                effective_workers,
+                writer_workers,
+                thread_bytes,
+                total,
+            )
+    if selected is None:
+        raise StereoControlBudgetError("no Quality lifecycle capacity fits the host budget")
+    return selected
 
 
 def select_fast_pipeline_capacity(
@@ -876,12 +953,15 @@ def _empty_worker_group() -> ParkedStereoWorkers:
     )
 
 
-def _thread_names(effective_workers: int) -> list[tuple[str, str, int]]:
+def _thread_names(
+    effective_workers: int,
+    writer_workers: int,
+) -> list[tuple[str, str, int]]:
     names = [("stereo-feeder-0", "feeder", 0)]
     names.extend(
         (f"stereo-decoder-{index}", "decoder", index) for index in range(effective_workers)
     )
-    names.extend((f"stereo-writer-{index}", "writer", index) for index in range(effective_workers))
+    names.extend((f"stereo-writer-{index}", "writer", index) for index in range(writer_workers))
     return names
 
 
@@ -909,6 +989,7 @@ def create_parked_stereo_workers(  # noqa: C901
     *,
     pending_render_count: int,
     effective_workers: int,
+    writer_workers: int | None = None,
     worker: Callable[[str, int], None],
     stack_adapter: Callable[[], StackReservationEvidence] | None = None,
     stack_size_api: Callable[..., int] = threading.stack_size,
@@ -917,14 +998,23 @@ def create_parked_stereo_workers(  # noqa: C901
     """Create in fixed order, attest while parked, and restore global stack state."""
 
     if pending_render_count == 0:
-        if effective_workers != 0:
+        if effective_workers != 0 or writer_workers not in (None, 0):
             raise ValueError("P=0 requires zero effective workers")
         return _empty_worker_group()
     if pending_render_count < 0 or effective_workers < 1 or effective_workers > 16:
         raise ValueError("nonzero stereo work requires 1..16 effective workers")
+    if writer_workers is None:
+        writer_workers = effective_workers
+    if (
+        isinstance(writer_workers, bool)
+        or not isinstance(writer_workers, int)
+        or writer_workers < 1
+        or writer_workers > effective_workers
+    ):
+        raise ValueError("writer workers must be in 1..effective workers")
     if stack_adapter is None:
         stack_adapter = attest_current_thread_stack
-    names = _thread_names(effective_workers)
+    names = _thread_names(effective_workers, writer_workers)
     start_gate = threading.Event()
     cancel_event = threading.Event()
     reports: queue.Queue[tuple[str, StackReservationEvidence | BaseException]] = queue.Queue(
@@ -1031,6 +1121,10 @@ class StreamingStereoPipelineStats:
     work_item_copies: int
     parked_committed_delta_bytes: int
     live_threads_after_join: int
+    pipeline_wall_seconds: float
+    decode_busy_seconds: float
+    render_busy_seconds: float
+    write_busy_seconds: float
     configured_workers: int = 0
     feeder_thread_count: int = 0
     decoder_thread_count: int = 0
@@ -1063,6 +1157,7 @@ class _StreamingTrace:
         self.decode_render_overlap = False
         self.render_write_overlap = False
         self.decoder_writer_overlap = False
+        self.busy_seconds = {"decode": 0.0, "render": 0.0, "write": 0.0}
 
     def item_started(self) -> None:
         with self.lock:
@@ -1073,18 +1168,22 @@ class _StreamingTrace:
         with self.lock:
             self.live_items -= 1
 
-    def begin(self, stage: str) -> None:
+    def begin(self, stage: str) -> float:
+        started = time.perf_counter()
         with self.lock:
             setattr(self, f"active_{stage}", getattr(self, f"active_{stage}") + 1)
             self.decode_render_overlap |= self.active_decode > 0 and self.active_render > 0
             self.render_write_overlap |= self.active_render > 0 and self.active_write > 0
             self.decoder_writer_overlap |= self.active_decode > 0 and self.active_write > 0
+        return started
 
-    def end(self, stage: str) -> None:
+    def end(self, stage: str, started: float) -> None:
+        elapsed = time.perf_counter() - started
         with self.lock:
             setattr(self, f"active_{stage}", getattr(self, f"active_{stage}") - 1)
             counter = {"decode": "decoded", "render": "rendered", "write": "written"}[stage]
             setattr(self, counter, getattr(self, counter) + 1)
+            self.busy_seconds[stage] += elapsed
 
 
 _PIPELINE_SENTINEL = object()
@@ -1097,6 +1196,7 @@ def run_streaming_stereo_pipeline(  # noqa: C901
     plan: StereoControlAuditPlan,
     capacity: int,
     effective_workers: int,
+    writer_workers: int | None = None,
     decode: Callable[[StereoProviderItem], object],
     render: Callable[[object], object],
     write: Callable[[object], object],
@@ -1106,8 +1206,9 @@ def run_streaming_stereo_pipeline(  # noqa: C901
 ) -> StreamingStereoPipelineStats:
     """Drive a capacity-bounded synthetic pipeline without a resident work-item list."""
 
+    pipeline_started = time.perf_counter()
     if plan.render_count == 0:
-        if capacity != 0 or effective_workers != 0:
+        if capacity != 0 or effective_workers != 0 or writer_workers not in (None, 0):
             raise ValueError("P=0 requires zero pipeline capacity and workers")
         if configured_workers is None:
             configured_workers = 0
@@ -1137,10 +1238,23 @@ def run_streaming_stereo_pipeline(  # noqa: C901
             work_item_copies=0,
             parked_committed_delta_bytes=0,
             live_threads_after_join=0,
+            pipeline_wall_seconds=time.perf_counter() - pipeline_started,
+            decode_busy_seconds=0.0,
+            render_busy_seconds=0.0,
+            write_busy_seconds=0.0,
             configured_workers=configured_workers,
         )
     if capacity <= 0 or effective_workers <= 0:
         raise ValueError("nonzero render work requires positive capacity and workers")
+    if writer_workers is None:
+        writer_workers = effective_workers
+    if (
+        isinstance(writer_workers, bool)
+        or not isinstance(writer_workers, int)
+        or writer_workers < 1
+        or writer_workers > effective_workers
+    ):
+        raise ValueError("writer workers must be in 1..effective workers")
     if configured_workers is None:
         configured_workers = effective_workers
     if configured_workers < effective_workers or configured_workers > 16:
@@ -1279,11 +1393,11 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                         raise StereoControlStateError("decoder received a non-item")
                     decode_item = queued_item
                     validate_handoff(decode_item)
-                    trace.begin("decode")
+                    stage_started = trace.begin("decode")
                     try:
                         payload = decode(decode_item)
                     finally:
-                        trace.end("decode")
+                        trace.end("decode", stage_started)
                     transferred = put_or_cancel(
                         queues.decoded_frames,
                         (decode_item, payload),
@@ -1317,11 +1431,11 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                     if not isinstance(write_item, StereoProviderItem):
                         raise StereoControlStateError("writer received a non-item")
                     validate_handoff(write_item)
-                    trace.begin("write")
+                    stage_started = trace.begin("write")
                     try:
                         write(payload)
                     finally:
-                        trace.end("write")
+                        trace.end("write", stage_started)
                     if not put_or_cancel(queues.write_completions, _PIPELINE_COMPLETION):
                         return
                 finally:
@@ -1341,6 +1455,7 @@ def run_streaming_stereo_pipeline(  # noqa: C901
     group = create_parked_stereo_workers(
         pending_render_count=plan.render_count,
         effective_workers=effective_workers,
+        writer_workers=writer_workers,
         worker=worker,
     )
     actual_threads = group.live_thread_count
@@ -1373,11 +1488,11 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                     raise StereoControlStateError("renderer received a non-item")
                 payload = decoded_message[1]
                 validate_handoff(render_item)
-                trace.begin("render")
+                stage_started = trace.begin("render")
                 try:
                     rendered_payload = render(payload)
                 finally:
-                    trace.end("render")
+                    trace.end("render", stage_started)
                 handed_to_writer = put_or_cancel(
                     queues.write_requests,
                     (render_item, rendered_payload),
@@ -1401,7 +1516,7 @@ def run_streaming_stereo_pipeline(  # noqa: C901
                 rendered_payload = None
                 if not handed_to_writer:
                     release_item()
-        for _ in range(effective_workers):
+        for _ in range(writer_workers):
             if not put_or_cancel(queues.write_requests, _PIPELINE_SENTINEL):
                 raise_worker_error()
         while completions < plan.render_count:
@@ -1462,10 +1577,14 @@ def run_streaming_stereo_pipeline(  # noqa: C901
         work_item_copies=0,
         parked_committed_delta_bytes=parked_committed_delta,
         live_threads_after_join=live_threads_after_join,
+        pipeline_wall_seconds=time.perf_counter() - pipeline_started,
+        decode_busy_seconds=trace.busy_seconds["decode"],
+        render_busy_seconds=trace.busy_seconds["render"],
+        write_busy_seconds=trace.busy_seconds["write"],
         configured_workers=configured_workers,
         feeder_thread_count=1,
         decoder_thread_count=effective_workers,
-        writer_thread_count=effective_workers,
+        writer_thread_count=writer_workers,
         calculated_thread_bytes=actual_threads * STEREO_IO_THREAD_BYTES,
         previous_stack_bytes=group.stats.previous_stack_bytes,
         restored_stack_bytes=group.stats.restored_stack_bytes,

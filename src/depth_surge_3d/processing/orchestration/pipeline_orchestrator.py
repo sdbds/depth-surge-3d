@@ -112,21 +112,15 @@ class ProcessingOrchestrator:
         self.preselected_depth_files = preselected_depth_files
         self.preselected_render_source = preselected_render_source
         self.legacy_fast_adoption = legacy_fast_adoption
-        if (self.preselected_depth_files is None) != (
-            preselected_render_source is None
-        ):
-            raise ValueError(
-                "preselected files and render source must be supplied together"
-            )
+        if (self.preselected_depth_files is None) != (preselected_render_source is None):
+            raise ValueError("preselected files and render source must be supplied together")
         if preselected_render_source is not None and preselected_render_source not in {
             "base",
             "stabilized",
         }:
             raise ValueError("preselected render source must be base or stabilized")
         self._depth_model_released = False
-        self._settings_file: Path | None = (
-            None  # Track settings file for error handling
-        )
+        self._settings_file: Path | None = None  # Track settings file for error handling
         self._start_time: float = 0.0  # Track processing start time
         self._metric_clamp_summary: dict[str, Any] | None = None
         if hasattr(self.video_encoder, "defer_final_reservation_retirement"):
@@ -162,9 +156,7 @@ class ProcessingOrchestrator:
         frame_count = artifact.selected_frame_count
         metric_summary_value = value["runtime_info"].get("metric_clamp_summary")
         metric_summary = (
-            dict(metric_summary_value)
-            if isinstance(metric_summary_value, dict)
-            else None
+            dict(metric_summary_value) if isinstance(metric_summary_value, dict) else None
         )
         del metric_summary_value, value, artifact
         reservation: FinalEncodingReservationCapabilityV1 | None = None
@@ -173,12 +165,8 @@ class ProcessingOrchestrator:
         if active_index.is_file():
             try:
                 phase_artifact = recover_processing_settings_artifact(settings_file)
-                prepared = load_final_encoding_reservation_v1(
-                    output_dir, phase_artifact
-                )
-                reservation = FinalEncodingReservationCapabilityV1.from_prepared(
-                    prepared
-                )
+                prepared = load_final_encoding_reservation_v1(output_dir, phase_artifact)
+                reservation = FinalEncodingReservationCapabilityV1.from_prepared(prepared)
                 recovery = prepared.recover_publication_prefix()
                 recovery_phase = recovery.phase
                 del recovery, prepared, phase_artifact
@@ -192,9 +180,7 @@ class ProcessingOrchestrator:
                 except Exception as error:
                     print(f"Error: Active final publication is invalid: {error}")
                     return False
-                adopt = getattr(
-                    self.video_encoder, "adopt_final_encoding_reservation", None
-                )
+                adopt = getattr(self.video_encoder, "adopt_final_encoding_reservation", None)
                 if not callable(adopt):
                     print("Error: Video encoder cannot adopt active final publication")
                     return False
@@ -209,16 +195,12 @@ class ProcessingOrchestrator:
         except (OSError, ValueError):
             payload_pruned = False
         if (cleanup_pending or payload_pruned) and reservation is None:
-            print(
-                "Error: Cleanup-only recovery requires the active final encoding reservation"
-            )
+            print("Error: Cleanup-only recovery requires the active final encoding reservation")
             return False
         if not cleanup_pending and not payload_pruned and not publication_authenticated:
             return None
         if not publication_authenticated:
-            print(
-                "Error: Cleanup-only recovery lacks an authenticated active publication"
-            )
+            print("Error: Cleanup-only recovery lacks an authenticated active publication")
             return False
         self._settings_file = settings_file
         if keep_intermediates:
@@ -228,17 +210,14 @@ class ProcessingOrchestrator:
                 try:
                     commit_payload_pruned(output_dir, reservation=reservation)
                 except Exception as error:
-                    print(
-                        f"Error: Could not commit payload-pruned diagnostics: {error}"
-                    )
+                    print(f"Error: Could not commit payload-pruned diagnostics: {error}")
                     return False
             if not cleanup_pending:
                 try:
-                    committed = commit_cleanup_pending_status(
+                    commit_cleanup_pending_status(
                         settings_file,
                         reservation=reservation,
                     )
-                    del committed
                 except Exception as error:
                     print(f"Error: Could not commit cleanup-pending settings: {error}")
                     return False
@@ -247,8 +226,7 @@ class ProcessingOrchestrator:
             except Exception as error:
                 cleanup_status = cleanup_status_for_error(error)
                 print(
-                    "Warning: Intermediate cleanup remains pending "
-                    f"({cleanup_status}): {error}"
+                    "Warning: Intermediate cleanup remains pending " f"({cleanup_status}): {error}"
                 )
                 return False
             else:
@@ -268,9 +246,7 @@ class ProcessingOrchestrator:
         except Exception as error:
             print(f"Error: Could not retire cleanup reservation: {error}")
             return False
-        if reservation is not None and not self._retire_final_encoding_reservation(
-            success=True
-        ):
+        if reservation is not None and not self._retire_final_encoding_reservation(success=True):
             return False
         try:
             completed = recover_processing_settings_artifact(settings_file)
@@ -322,9 +298,7 @@ class ProcessingOrchestrator:
             elif not job_lock.is_acquired:
                 raise ValueError("The supplied job writer lock is not acquired")
             elif job_lock.output_dir.resolve() != output_dir.resolve():
-                raise ValueError(
-                    "The supplied job writer lock belongs to another output directory"
-                )
+                raise ValueError("The supplied job writer lock belongs to another output directory")
             recover_processing_control_prefix_v1(output_dir)
             cleanup_vdpp_private_work(output_dir, job_lock)
 
@@ -491,14 +465,10 @@ class ProcessingOrchestrator:
 
         fps = video_properties.get("fps", 30.0)
 
-        metric_mode = (
-            settings.get("stereo_geometry_mode", "relative") == "metric_camera"
-        )
+        metric_mode = settings.get("stereo_geometry_mode", "relative") == "metric_camera"
         selected_is_stabilized = self.preselected_render_source == "stabilized"
         if metric_mode and self.preselected_depth_files is not None:
-            raise ValueError(
-                "Preselected disparity cannot satisfy metric_camera geometry"
-            )
+            raise ValueError("Preselected disparity cannot satisfy metric_camera geometry")
         if metric_mode and settings.get("temporal_postprocessor", "off") != "off":
             raise ValueError("VDPP is available only with relative stereo geometry")
 
@@ -512,11 +482,7 @@ class ProcessingOrchestrator:
                 raise ValueError("Preselected render-disparity producer changed")
             geometry_files = list(self.preselected_depth_files)
             self._release_depth_model()
-            print(
-                step_complete(
-                    f"Step 2: Reused {len(geometry_files)} render disparity maps"
-                )
-            )
+            print(step_complete(f"Step 2: Reused {len(geometry_files)} render disparity maps"))
         else:
             if self.depth_processor is None:
                 raise RuntimeError("Depth generation requires a configured estimator")
@@ -529,32 +495,17 @@ class ProcessingOrchestrator:
                 self._release_depth_model()
             if geometry_files is None:
                 return False
-            geometry_label = (
-                "metric geometry frames" if metric_mode else "canonical disparity maps"
-            )
-            saved_label = (
-                "Metric geometry frames" if metric_mode else "Canonical disparity maps"
-            )
-            geometry_dir = directories.get(
-                "metric_geometry" if metric_mode else "disparity_maps"
-            )
-            print(
-                step_complete(
-                    f"Step 2: Prepared {len(geometry_files)} {geometry_label}"
-                )
-            )
+            geometry_label = "metric geometry frames" if metric_mode else "canonical disparity maps"
+            saved_label = "Metric geometry frames" if metric_mode else "Canonical disparity maps"
+            geometry_dir = directories.get("metric_geometry" if metric_mode else "disparity_maps")
+            print(step_complete(f"Step 2: Prepared {len(geometry_files)} {geometry_label}"))
             self._print_saved_to(geometry_dir, saved_label)
         print()  # Blank line after step
 
         effective_geometry_files = geometry_files
-        if (
-            settings.get("temporal_postprocessor", "off") == "vdpp"
-            and not selected_is_stabilized
-        ):
+        if settings.get("temporal_postprocessor", "off") == "vdpp" and not selected_is_stabilized:
             if self.temporal_stabilizer is None:
-                raise RuntimeError(
-                    "VDPP was requested but no temporal stabilizer is configured"
-                )
+                raise RuntimeError("VDPP was requested but no temporal stabilizer is configured")
             effective_geometry_files = self.temporal_stabilizer.generate_files(
                 geometry_files,
                 settings,
@@ -573,12 +524,8 @@ class ProcessingOrchestrator:
                 "Stabilized disparity maps",
             )
             print()
-        elif (
-            selected_is_stabilized and settings.get("temporal_postprocessor") != "vdpp"
-        ):
-            raise ValueError(
-                "Stabilized render input cannot satisfy temporal_postprocessor=off"
-            )
+        elif selected_is_stabilized and settings.get("temporal_postprocessor") != "vdpp":
+            raise ValueError("Stabilized render input cannot satisfy temporal_postprocessor=off")
 
         stereo_input = publish_validated_stereo_input_manifest_v1(
             job_root=directories["base"],
@@ -694,42 +641,31 @@ class ProcessingOrchestrator:
             left_dir = directories.get("left_frames")
             right_dir = directories.get("right_frames")
             if left_dir is None or right_dir is None:
-                return self._handle_step_error(
-                    "Distortion source directories are missing"
-                )
+                return self._handle_step_error("Distortion source directories are missing")
             left_files = sorted(left_dir.glob("*.png"))
             right_files = sorted(right_dir.glob("*.png"))
             if (
                 len(left_files) != num_frames
                 or len(right_files) != num_frames
-                or [path.stem for path in left_files]
-                != [path.stem for path in right_files]
+                or [path.stem for path in left_files] != [path.stem for path in right_files]
             ):
-                return self._handle_step_error(
-                    "Distortion source frame manifest is incomplete"
-                )
-            if not self.distortion_processor.apply_distortion(
+                return self._handle_step_error("Distortion source frame manifest is incomplete")
+            if not self.distortion_processor.apply_distortion_and_crop(
                 left_files, right_files, directories, settings, progress_tracker
             ):
-                return self._handle_step_error("Distortion failed")
+                return self._handle_step_error("Distortion and cropping failed")
             print(
                 step_complete(
                     f"Step 4: Applied {settings['fisheye_projection']} fisheye distortion"
                 )
             )
-            self._print_saved_to(
-                directories.get("left_distorted"), "Distorted left frames"
-            )
-            self._print_saved_to(
-                directories.get("right_distorted"), "Distorted right frames"
-            )
             print()  # Blank line after left/right pair
-
-        # Step 5: Crop frames (delegated to distortion_processor)
-        if not self.distortion_processor.crop_frames(
-            directories, settings, progress_tracker, num_frames
-        ):
-            return self._handle_step_error("Frame cropping failed")
+        else:
+            # Step 5: Crop rectilinear frames when distortion is disabled.
+            if not self.distortion_processor.crop_frames(
+                directories, settings, progress_tracker, num_frames
+            ):
+                return self._handle_step_error("Frame cropping failed")
         print(
             step_complete(
                 f"Step 5: Cropped {num_frames} frames to {settings['per_eye_width']}x{settings['per_eye_height']}"
@@ -741,21 +677,15 @@ class ProcessingOrchestrator:
 
         # Step 6: Apply AI upscaling (optional - delegated to upscaler)
         if settings.get("upscale_model", "none") != "none":
-            if not self.upscaler.apply_upscaling(
-                directories, settings, progress_tracker
-            ):
+            if not self.upscaler.apply_upscaling(directories, settings, progress_tracker):
                 return self._handle_step_error("Upscaling failed")
             print(
                 step_complete(
                     f"Step 6: Upscaled {num_frames} frames using {settings['upscale_model']}"
                 )
             )
-            self._print_saved_to(
-                directories.get("left_upscaled"), "Upscaled left frames"
-            )
-            self._print_saved_to(
-                directories.get("right_upscaled"), "Upscaled right frames"
-            )
+            self._print_saved_to(directories.get("left_upscaled"), "Upscaled left frames")
+            self._print_saved_to(directories.get("right_upscaled"), "Upscaled right frames")
             print()  # Blank line after left/right pair
 
         if settings.get("direct_vr_encode", False):
@@ -764,9 +694,7 @@ class ProcessingOrchestrator:
             )
             if direct_source is None:
                 return self._handle_step_error("Direct VR source validation failed")
-            print(
-                step_complete("Step 7: Deferred VR assembly to direct FFmpeg encoding")
-            )
+            print(step_complete("Step 7: Deferred VR assembly to direct FFmpeg encoding"))
             success = self.video_encoder.create_video_from_stereo_source(
                 direct_source,
                 directories["base"],
@@ -805,9 +733,7 @@ class ProcessingOrchestrator:
         if success:
             output_filename = self._expected_output_filename(video_path, settings)
             print(step_complete("Step 8: Created final video"))
-            self._print_saved_to(
-                directories["base"], f"Final output: {output_filename}"
-            )
+            self._print_saved_to(directories["base"], f"Final output: {output_filename}")
 
         # Finalize and cleanup
         finalized = self._finalize_processing(
@@ -848,6 +774,8 @@ class ProcessingOrchestrator:
             omitted_intermediates.add("disparity_stabilized")
         if settings.get("direct_vr_encode", False):
             omitted_intermediates.add("vr_frames")
+        if settings.get("apply_distortion") is True:
+            omitted_intermediates.update({"left_distorted", "right_distorted"})
         batch_name = f"{Path(video_path).stem}_{int(time.time())}"
         fixed_settings = output_path / "processing-settings-v5.json"
         if fixed_settings.is_file():
@@ -874,17 +802,14 @@ class ProcessingOrchestrator:
                 omitted_intermediates=omitted_intermediates,
             )
         else:
-            directories = create_output_directories(
-                output_path, settings["keep_intermediates"]
-            )
+            directories = create_output_directories(output_path, settings["keep_intermediates"])
 
         print(f"\n{title_bar('=== Depth Surge 3D Video Processing ===')}")
         print(f"Input: {video_path}")
         print(f"Output: {output_path}")
         if settings.get("depth_model_version") == "v2":
             print(
-                "Using Video-Depth-Anything V2 for temporal consistency "
-                "within detected shots\n"
+                "Using Video-Depth-Anything V2 for temporal consistency " "within detected shots\n"
             )
         else:
             print(f"Using depth backend: {settings.get('depth_model_version', 'v3')}\n")
@@ -939,9 +864,7 @@ class ProcessingOrchestrator:
                 try:
                     recovery = active_reservation.recover_publication_prefix()
                     if recovery.phase != "publication_authenticated":
-                        raise ValueError(
-                            "final publication did not reach its authenticated phase"
-                        )
+                        raise ValueError("final publication did not reach its authenticated phase")
                     active_reservation.validate_authenticated_publication()
                 except Exception as error:
                     print(f"Error: Final publication validation failed: {error}")
@@ -994,9 +917,7 @@ class ProcessingOrchestrator:
                     "cleanup_status": cleanup_status,
                 }
                 if self._metric_clamp_summary is not None:
-                    runtime_info["metric_clamp_summary"] = dict(
-                        self._metric_clamp_summary
-                    )
+                    runtime_info["metric_clamp_summary"] = dict(self._metric_clamp_summary)
                 if not update_processing_status(
                     self._settings_file,
                     "completed",
@@ -1008,9 +929,7 @@ class ProcessingOrchestrator:
                     return False
                 if schema5_settings:
                     try:
-                        completed = recover_processing_settings_artifact(
-                            self._settings_file
-                        )
+                        completed = recover_processing_settings_artifact(self._settings_file)
                         audit = audit_final_media_v1(output_path, completed)
                     except Exception as error:
                         print(f"Error: Completed final-media audit failed: {error}")
@@ -1112,9 +1031,7 @@ class ProcessingOrchestrator:
                 step_total=total,
             )
 
-    def _print_saved_to(
-        self, directory: Path | None, message_prefix: str = "Saved to"
-    ) -> None:
+    def _print_saved_to(self, directory: Path | None, message_prefix: str = "Saved to") -> None:
         """
         Print save location message.
 
@@ -1144,7 +1061,5 @@ class ProcessingOrchestrator:
         """
         print(f"Error: {error_msg}")
         if self._settings_file:
-            update_processing_status(
-                self._settings_file, "failed", {"error": error_msg}
-            )
+            update_processing_status(self._settings_file, "failed", {"error": error_msg})
         return False

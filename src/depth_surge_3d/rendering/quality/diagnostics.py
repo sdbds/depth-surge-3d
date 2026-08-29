@@ -106,39 +106,55 @@ def validate_diagnostics_cardinality_dimensions(
     return pixels
 
 
-def _histogram_total(histogram: np.ndarray) -> int:
-    total = 0
-    for count in histogram:
-        total = checked_u64_add("histogram_total", total, int(count))
-    return total
+def _histogram_cumulative(histogram: np.ndarray) -> np.ndarray:
+    values = np.asarray(histogram)
+    if values.ndim != 1 or not np.issubdtype(values.dtype, np.integer):
+        raise TypeError("histogram must be a one-dimensional integer array")
+    if np.issubdtype(values.dtype, np.signedinteger) and np.any(values < 0):
+        raise DiagnosticsCardinalityError("histogram_total", (int(values.min()),))
+    normalized = values.astype(np.uint64, copy=False)
+    cumulative = np.cumsum(normalized, dtype=np.uint64)
+    if cumulative.size > 1 and np.any(cumulative[1:] < cumulative[:-1]):
+        raise DiagnosticsCardinalityError(
+            "histogram_total",
+            (int(normalized.max()), int(normalized.size)),
+        )
+    return cumulative
 
 
-def _histogram_max(histogram: np.ndarray) -> int:
-    for value in range(int(histogram.size) - 1, -1, -1):
-        if int(histogram[value]):
-            return value
-    return 0
-
-
-def _linear_percentile_from_histogram(histogram: np.ndarray, percentile: float) -> float:
-    total = _histogram_total(histogram)
-    if total == 0:
-        return 0.0
+def _histogram_metrics(
+    histogram: np.ndarray,
+    percentile: float,
+) -> tuple[int, int, float]:
+    cumulative = _histogram_cumulative(histogram)
+    if cumulative.size == 0 or int(cumulative[-1]) == 0:
+        return 0, 0, 0.0
+    total = int(cumulative[-1])
+    values = np.asarray(histogram)
+    maximum = int(values.size - 1 - np.argmax(values[::-1] != 0))
     position = percentile * (total - 1)
     lower_index = int(math.floor(position))
     upper_index = int(math.ceil(position))
+    lower = int(np.searchsorted(cumulative, np.uint64(lower_index), side="right"))
+    upper = int(np.searchsorted(cumulative, np.uint64(upper_index), side="right"))
+    interpolated = float(lower) + (float(upper) - float(lower)) * (position - lower_index)
+    return total, maximum, interpolated
 
-    def value_at(index: int) -> int:
-        seen = 0
-        for value in range(int(histogram.size)):
-            seen += int(histogram[value])
-            if index < seen:
-                return value
-        raise RuntimeError("histogram index is outside its total")
 
-    lower = value_at(lower_index)
-    upper = value_at(upper_index)
-    return float(lower) + (float(upper) - float(lower)) * (position - lower_index)
+def _histogram_total(histogram: np.ndarray) -> int:
+    cumulative = _histogram_cumulative(histogram)
+    return 0 if cumulative.size == 0 else int(cumulative[-1])
+
+
+def _histogram_max(histogram: np.ndarray) -> int:
+    values = np.asarray(histogram)
+    if not values.size or not np.any(values):
+        return 0
+    return int(values.size - 1 - np.argmax(values[::-1] != 0))
+
+
+def _linear_percentile_from_histogram(histogram: np.ndarray, percentile: float) -> float:
+    return _histogram_metrics(histogram, percentile)[2]
 
 
 def _prefill_run_histograms(
@@ -279,7 +295,8 @@ def _eye_stats(
         coverage.shape[1],
         streamed_hole_runs,
     )
-    lane_p95 = _linear_percentile_from_histogram(lane_histogram, 0.95)
+    lane_count, lane_max, lane_p95 = _histogram_metrics(lane_histogram, 0.95)
+    _span_count, span_max, span_p95 = _histogram_metrics(span_histogram, 0.95)
     quality_budgets: dict[str, Any] | None
     if render_mode == "fast":
         if fast_diagnostics is None:
@@ -349,14 +366,14 @@ def _eye_stats(
         "state_pixel_counts": state_counts,
         "state_pixel_ratios": state_ratios,
         "hole_runs": {
-            "count": _histogram_total(lane_histogram),
+            "count": lane_count,
             "lane_count_histogram": _histogram_pairs(lane_histogram),
             "touched_pixel_span_histogram": _histogram_pairs(span_histogram),
-            "lane_count_max": _histogram_max(lane_histogram),
+            "lane_count_max": lane_max,
             "lane_count_p95": lane_p95,
-            "touched_pixel_span_max": _histogram_max(span_histogram),
-            "touched_pixel_span_p95": _linear_percentile_from_histogram(span_histogram, 0.95),
-            "physical_width_px_max": float(_histogram_max(lane_histogram)) / 16.0,
+            "touched_pixel_span_max": span_max,
+            "touched_pixel_span_p95": span_p95,
+            "physical_width_px_max": float(lane_max) / 16.0,
             "physical_width_px_p95": lane_p95 / 16.0,
         },
         "backend_lane_counts": backend_lanes,
@@ -459,9 +476,7 @@ def _merge_histogram_pairs(
         source = enumerate(pairs.bins) if isinstance(pairs, DenseHistogramPairs) else pairs
         for value, count in source:
             index = int(value)
-            merged[index] = np.uint64(
-                checked_u64_add(field, int(merged[index]), int(count))
-            )
+            merged[index] = np.uint64(checked_u64_add(field, int(merged[index]), int(count)))
     return merged
 
 
@@ -663,6 +678,7 @@ def build_diagnostics_summary(  # noqa: C901
         if not frame_names:
             raise ValueError("diagnostics frame names must be nonempty")
         expected_frame_count = len(frame_names)
+
         def replay_frame_names() -> Iterable[str]:
             return iter(frame_names)
 
@@ -709,9 +725,7 @@ def build_diagnostics_summary(  # noqa: C901
     eye_accumulators = {name: eye_accumulator() for name in ("left", "right")}
     valid_count = 0
     clamped_count = 0
-    clamped_fractions: list[float] | None = (
-        [] if clamped_fraction_replay is None else None
-    )
+    clamped_fractions: list[float] | None = [] if clamped_fraction_replay is None else None
     clamped_fraction_sum = 0.0
     clamped_fraction_max = 0.0
     affected_frame_count = 0
@@ -982,9 +996,7 @@ def build_diagnostics_summary(  # noqa: C901
             "clamped_fractions": streamed_fractions,
             "affected_frame_count": affected_frame_count,
             "mean_clamped_fraction": (
-                clamped_fraction_sum / float(expected_frame_count)
-                if expected_frame_count
-                else 0.0
+                clamped_fraction_sum / float(expected_frame_count) if expected_frame_count else 0.0
             ),
             "max_clamped_fraction": clamped_fraction_max,
         }

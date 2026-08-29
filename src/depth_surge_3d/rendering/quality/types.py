@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Integral
 from typing import Any, Literal
 
@@ -151,6 +151,7 @@ class CompactStereoRenderResult:
     right_hole_runs: HoleRunDiagnostics | None = None
     left_fast_diagnostics: FastEyeDiagnostics | None = None
     right_fast_diagnostics: FastEyeDiagnostics | None = None
+    performance_seconds: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         shape = self.left_image.shape

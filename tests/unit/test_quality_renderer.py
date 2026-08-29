@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import threading
 
 import numpy as np
 import pytest
@@ -39,6 +40,88 @@ def test_quality_strength_zero_is_exact_and_has_no_repair_bits() -> None:
     assert np.all(result.right_coverage_count == 16)
     assert not result.left_repair_bits.any()
     assert not result.right_repair_bits.any()
+    assert set(result.performance_seconds) == {
+        "geometry_baseline",
+        "geometry_region_solve",
+        "geometry_index_build",
+        "geometry_nearest_query",
+        "geometry_finalize",
+        "left_eye",
+        "right_eye",
+        "total",
+    }
+    assert all(value >= 0.0 for value in result.performance_seconds.values())
+    assert result.performance_seconds["total"] > 0.0
+
+
+def test_prepared_relative_quality_matches_monolithic_render() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    generator = np.random.default_rng(20260828)
+    frame = generator.integers(0, 256, size=(9, 32, 3), dtype=np.uint8)
+    canonical = generator.random((5, 16), dtype=np.float32)
+    settings = _quality_settings(
+        stereo_strength=3.5,
+        convergence=0.4,
+        occlusion_fill="background",
+    )
+
+    monolithic = quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=frame,
+        canonical=canonical,
+        settings=settings,
+    )
+    prepared = quality.prepare_relative_quality_frame(
+        frame=frame,
+        canonical=canonical,
+        settings=settings,
+    )
+    split = quality.render_prepared_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        prepared=prepared,
+    )
+
+    for name in (
+        "left_image",
+        "right_image",
+        "left_coverage_count",
+        "right_coverage_count",
+        "left_repair_bits",
+        "right_repair_bits",
+    ):
+        assert np.array_equal(getattr(split, name), getattr(monolithic, name)), name
+    assert split.left_plan == monolithic.left_plan
+    assert split.right_plan == monolithic.right_plan
+    assert split.geometry_nearest == monolithic.geometry_nearest
+    assert split.quality_limits == monolithic.quality_limits
+
+
+def test_quality_background_overlaps_left_repair_with_right_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    render_thread = threading.get_ident()
+    finish_threads: list[int] = []
+    original_finish = quality._finish_background_eye
+
+    def record_finish(**kwargs):
+        finish_threads.append(threading.get_ident())
+        return original_finish(**kwargs)
+
+    monkeypatch.setattr(quality, "_finish_background_eye", record_finish)
+    quality.render_relative_quality_compact(
+        renderer=StereoRenderer(device="cpu"),
+        frame=np.full((8, 24, 3), 100, dtype=np.uint8),
+        canonical=np.linspace(0.0, 1.0, 48, dtype=np.float32).reshape(4, 12),
+        settings=_quality_settings(
+            stereo_strength=4.0,
+            occlusion_fill="background",
+        ),
+    )
+
+    assert len(finish_threads) == 2
+    assert render_thread in finish_threads
+    assert any(thread != render_thread for thread in finish_threads)
 
 
 def test_quality_none_records_partial_and_full_holes_without_repair() -> None:
@@ -673,13 +756,24 @@ def test_quality_background_preflight_models_the_one_pass_proxy() -> None:
     assert "quality-planning" not in phases
     assert "quality-pass-b" not in phases
     assert phases["quality-geometry-matte"] == (
-        68 * pixels + 18 * native_pixels + quality.QUALITY_RUNTIME_OVERHEAD_BYTES
+        68 * pixels
+        + 18 * native_pixels
+        + quality.QUALITY_RUNTIME_OVERHEAD_BYTES
+        + quality.QUALITY_AUXILIARY_THREAD_BYTES
     )
     assert phases["quality-background-visibility"] == (
-        40 * pixels + 9 * native_pixels + histogram_bytes + quality.QUALITY_RUNTIME_OVERHEAD_BYTES
+        40 * pixels
+        + 9 * native_pixels
+        + histogram_bytes
+        + quality.QUALITY_RUNTIME_OVERHEAD_BYTES
+        + quality.QUALITY_AUXILIARY_THREAD_BYTES
     )
     assert phases["quality-background-proxy"] == (
-        100 * pixels + 9 * native_pixels + histogram_bytes + quality.QUALITY_RUNTIME_OVERHEAD_BYTES
+        100 * pixels
+        + 9 * native_pixels
+        + histogram_bytes
+        + quality.QUALITY_RUNTIME_OVERHEAD_BYTES
+        + quality.QUALITY_AUXILIARY_THREAD_BYTES
     )
 
 
@@ -719,6 +813,147 @@ def test_quality_band_height_does_not_change_rgb_or_compact_masks() -> None:
         "right_repair_bits",
     ):
         assert np.array_equal(getattr(full, name), getattr(one_row, name))
+
+
+def test_quality_cuda_budget_uses_only_a_bounded_share_of_live_free_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    renderer = StereoRenderer(device="cpu")
+    renderer.device = torch.device("cuda")
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda _device: (8 * 1024**3, 24 * 1024**3),
+    )
+    assert quality._quality_temporary_budget_bytes(renderer) == 512 * 1024 * 1024
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda _device: (2 * 1024**3, 24 * 1024**3),
+    )
+    assert quality._quality_temporary_budget_bytes(renderer) == 256 * 1024 * 1024
+
+    explicitly_smaller = StereoRenderer(
+        device="cpu",
+        temporary_budget_bytes=256 * 1024 * 1024,
+    )
+    explicitly_smaller.device = torch.device("cuda")
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda _device: (8 * 1024**3, 24 * 1024**3),
+    )
+    assert quality._quality_temporary_budget_bytes(explicitly_smaller) == 256 * 1024 * 1024
+
+    explicitly_larger = StereoRenderer(
+        device="cpu",
+        temporary_budget_bytes=768 * 1024 * 1024,
+    )
+    explicitly_larger.device = torch.device("cuda")
+    assert quality._quality_temporary_budget_bytes(explicitly_larger) == 768 * 1024 * 1024
+
+
+def test_quality_preloaded_device_frame_preserves_banded_eye_and_uploads_offsets_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    generator = np.random.default_rng(20260829)
+    source = generator.integers(0, 256, size=(6, 19, 3), dtype=np.uint8)
+    near_score = generator.random((6, 19), dtype=np.float32)
+    source_valid = generator.random((6, 19)) > 0.1
+    offsets = generator.integers(-24, 25, size=(6, 19), dtype=np.int32)
+
+    class Geometry:
+        pass
+
+    geometry = Geometry()
+    geometry.near_score = np.ascontiguousarray(near_score)
+    geometry.source_valid = np.ascontiguousarray(source_valid)
+    renderer = StereoRenderer(device="cpu")
+    transfer_shapes: list[tuple[int, ...]] = []
+
+    def record_transfer(values: np.ndarray) -> torch.Tensor:
+        transfer_shapes.append(values.shape)
+        return torch.from_numpy(values)
+
+    monkeypatch.setattr(renderer, "_transfer_offset_band", record_transfer)
+    baseline = quality._render_unrepaired_eye_once(
+        renderer=renderer,
+        source=source,
+        geometry=geometry,
+        offsets=offsets,
+        band_height=2,
+    )
+    assert transfer_shapes == [(2, 19), (2, 19), (2, 19)]
+
+    transfer_shapes.clear()
+    preloaded = quality._render_unrepaired_eye_once(
+        renderer=renderer,
+        source=source,
+        geometry=geometry,
+        offsets=offsets,
+        band_height=2,
+        device_frame=quality._QualityDeviceFrame(
+            source=torch.from_numpy(source),
+            near_score=torch.from_numpy(geometry.near_score),
+            source_valid=torch.from_numpy(geometry.source_valid),
+        ),
+    )
+
+    assert transfer_shapes == [(6, 19)]
+    assert np.array_equal(preloaded.image, baseline.image)
+    assert np.array_equal(preloaded.coverage_count, baseline.coverage_count)
+    assert np.array_equal(
+        preloaded.hole_runs.lane_count_histogram,
+        baseline.hole_runs.lane_count_histogram,
+    )
+    assert np.array_equal(
+        preloaded.hole_runs.touched_pixel_span_histogram,
+        baseline.hole_runs.touched_pixel_span_histogram,
+    )
+
+
+def test_quality_preloaded_frame_falls_back_when_full_offset_upload_ooms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    source = np.zeros((4, 7, 3), dtype=np.uint8)
+    offsets = np.zeros((4, 7), dtype=np.int32)
+
+    class Geometry:
+        pass
+
+    geometry = Geometry()
+    geometry.near_score = np.zeros((4, 7), dtype=np.float32)
+    geometry.source_valid = np.ones((4, 7), dtype=np.bool_)
+    renderer = StereoRenderer(device="cpu")
+    transfers: list[tuple[int, ...]] = []
+
+    def transfer(values: np.ndarray) -> torch.Tensor:
+        transfers.append(values.shape)
+        if values.shape == offsets.shape:
+            raise torch.cuda.OutOfMemoryError("simulated full offset upload OOM")
+        return torch.from_numpy(values)
+
+    monkeypatch.setattr(renderer, "_transfer_offset_band", transfer)
+    result = quality._render_unrepaired_eye_once(
+        renderer=renderer,
+        source=source,
+        geometry=geometry,
+        offsets=offsets,
+        band_height=2,
+        device_frame=quality._QualityDeviceFrame(
+            source=torch.from_numpy(source),
+            near_score=torch.from_numpy(geometry.near_score),
+            source_valid=torch.from_numpy(geometry.source_valid),
+        ),
+    )
+
+    assert transfers == [(4, 7), (2, 7), (2, 7)]
+    assert np.array_equal(result.image, source)
 
 
 def test_quality_pass_retries_once_from_the_start_after_cuda_oom(

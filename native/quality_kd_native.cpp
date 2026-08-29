@@ -4,14 +4,17 @@
 #include "quality_kd_build_identity.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -28,6 +31,54 @@ constexpr std::uint64_t kUint32Max = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint64_t kRepairRecordCap = (64ULL * 1024ULL * 1024ULL) / 16ULL;
 constexpr std::uint8_t kDividerAddMarker = 0x40;
 constexpr std::uint32_t kPackedCoordinateLimit = 0xffff;
+constexpr std::size_t kGeometryQueryWorkerCap = 8;
+constexpr std::size_t kIndexBuildWorkerCap = 8;
+constexpr std::size_t kEdgeBandWorkerCap = 8;
+constexpr std::size_t kNativeSpawnedWorkerCap = 7;
+constexpr std::uint32_t kEdgeBandRowsPerWorker = 128;
+constexpr py::ssize_t kGeometryQueriesPerWorker = 4096;
+constexpr py::ssize_t kGeometryQueryBlockSize = 64;
+
+std::atomic<std::size_t> g_native_spawned_workers{0};
+
+class NativeWorkerLease {
+public:
+    explicit NativeWorkerLease(std::size_t requested) {
+        std::size_t observed = g_native_spawned_workers.load(std::memory_order_relaxed);
+        while (observed < kNativeSpawnedWorkerCap) {
+            const std::size_t claimed = std::min(
+                requested,
+                kNativeSpawnedWorkerCap - observed
+            );
+            if (claimed == 0) {
+                return;
+            }
+            if (g_native_spawned_workers.compare_exchange_weak(
+                observed,
+                observed + claimed,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed
+            )) {
+                claimed_ = claimed;
+                return;
+            }
+        }
+    }
+
+    NativeWorkerLease(const NativeWorkerLease&) = delete;
+    NativeWorkerLease& operator=(const NativeWorkerLease&) = delete;
+
+    ~NativeWorkerLease() {
+        if (claimed_ != 0) {
+            g_native_spawned_workers.fetch_sub(claimed_, std::memory_order_release);
+        }
+    }
+
+    std::size_t worker_count() const { return claimed_ + 1; }
+
+private:
+    std::size_t claimed_ = 0;
+};
 
 class QualityNativeBudgetError : public std::runtime_error {
 public:
@@ -659,27 +710,130 @@ py::tuple query_geometry_batch(
     auto* visit_output = result_visits.mutable_data();
     {
         py::gil_scoped_release release;
+        bool parallel_safe = true;
         for (py::ssize_t query = 0; query < query_count; ++query) {
             const std::uint32_t region = region_values[query];
-            if (region == 0 || region > region_count) {
-                throw std::invalid_argument("query region exceeds the canonical region count");
+            if (
+                region == 0 ||
+                region > region_count ||
+                offset_values[region - 1] == offset_values[region] ||
+                !std::isfinite(y_values[query]) ||
+                !std::isfinite(x_values[query])
+            ) {
+                parallel_safe = false;
+                break;
             }
-            if (!std::isfinite(y_values[query]) || !std::isfinite(x_values[query])) {
-                throw std::invalid_argument("geometry query coordinates must be finite");
+        }
+
+        const auto sequential_query = [&]() {
+            for (py::ssize_t query = 0; query < query_count; ++query) {
+                const std::uint32_t region = region_values[query];
+                if (region == 0 || region > region_count) {
+                    throw std::invalid_argument(
+                        "query region exceeds the canonical region count"
+                    );
+                }
+                if (!std::isfinite(y_values[query]) || !std::isfinite(x_values[query])) {
+                    throw std::invalid_argument("geometry query coordinates must be finite");
+                }
+                const GeometryBest best = query_geometry_one(
+                    member_values,
+                    offset_values[region - 1],
+                    offset_values[region],
+                    width32,
+                    width_divider,
+                    y_values[query],
+                    x_values[query],
+                    budget_values,
+                    &visit_output[query]
+                );
+                sample_output[query] = best.sample_index;
+                distance_output[query] = best.distance2;
             }
-            const GeometryBest best = query_geometry_one(
-                member_values,
-                offset_values[region - 1],
-                offset_values[region],
-                width32,
-                width_divider,
-                y_values[query],
-                x_values[query],
-                budget_values,
-                &visit_output[query]
-            );
-            sample_output[query] = best.sample_index;
-            distance_output[query] = best.distance2;
+        };
+
+        const std::size_t hardware_workers = std::max(
+            1U,
+            std::thread::hardware_concurrency()
+        );
+        const std::size_t useful_workers = static_cast<std::size_t>(
+            (query_count + kGeometryQueriesPerWorker - 1) / kGeometryQueriesPerWorker
+        );
+        const std::size_t desired_worker_count = std::min(
+            {kGeometryQueryWorkerCap, hardware_workers, std::max<std::size_t>(1, useful_workers)}
+        );
+        NativeWorkerLease worker_lease(
+            parallel_safe && desired_worker_count > 1 ? desired_worker_count - 1 : 0
+        );
+        const std::size_t worker_count = parallel_safe ? worker_lease.worker_count() : 1;
+        if (!parallel_safe || worker_count == 1) {
+            sequential_query();
+        } else {
+            std::atomic<py::ssize_t> next_query{0};
+            const auto worker = [&]() {
+                while (true) {
+                    const py::ssize_t start = next_query.fetch_add(
+                        kGeometryQueryBlockSize,
+                        std::memory_order_relaxed
+                    );
+                    if (start >= query_count) {
+                        return;
+                    }
+                    const py::ssize_t stop = std::min(
+                        query_count,
+                        start + kGeometryQueryBlockSize
+                    );
+                    for (py::ssize_t query = start; query < stop; ++query) {
+                        const std::uint32_t region = region_values[query];
+                        std::uint64_t local_budget[2] = {
+                            0,
+                            std::numeric_limits<std::uint64_t>::max(),
+                        };
+                        const GeometryBest best = query_geometry_one(
+                            member_values,
+                            offset_values[region - 1],
+                            offset_values[region],
+                            width32,
+                            width_divider,
+                            y_values[query],
+                            x_values[query],
+                            local_budget,
+                            &visit_output[query]
+                        );
+                        sample_output[query] = best.sample_index;
+                        distance_output[query] = best.distance2;
+                    }
+                }
+            };
+
+            std::vector<std::thread> workers;
+            workers.reserve(worker_count - 1);
+            try {
+                for (std::size_t index = 1; index < worker_count; ++index) {
+                    workers.emplace_back(worker);
+                }
+            } catch (...) {
+                for (auto& thread : workers) {
+                    thread.join();
+                }
+                throw;
+            }
+            worker();
+            for (auto& thread : workers) {
+                thread.join();
+            }
+
+            std::uint64_t consumed = budget_values[0];
+            const std::uint64_t limit = budget_values[1];
+            for (py::ssize_t query = 0; query < query_count; ++query) {
+                const std::uint64_t visits = visit_output[query];
+                if (visits > limit - consumed) {
+                    budget_values[0] = limit;
+                    throw std::runtime_error("quality geometry visit cap exceeded");
+                }
+                consumed += visits;
+            }
+            budget_values[0] = consumed;
         }
     }
     return py::make_tuple(
@@ -697,15 +851,26 @@ public:
         const std::uint32_t* region_rank_bits,
         std::uint32_t region_rank_count,
         std::int32_t* position,
-        std::uint32_t capacity
+        std::vector<std::uint32_t>&& pixel_storage
     )
         : distance_(distance),
           owner_(owner),
           region_rank_bits_(region_rank_bits),
           region_rank_count_(region_rank_count),
           position_(position),
-          heap_pixel_(capacity),
-          capacity_(capacity) {}
+          heap_pixel_(std::move(pixel_storage)),
+          capacity_(static_cast<std::uint32_t>(heap_pixel_.size())) {}
+
+    void initialize_candidates(std::uint64_t initial_decrease_keys) {
+        const std::uint32_t source_length = capacity_;
+        for (std::uint32_t source_slot = 0; source_slot < source_length; ++source_slot) {
+            const std::uint32_t pixel = heap_pixel_[source_slot];
+            if (owner_[pixel] != 0) {
+                insert(pixel);
+            }
+        }
+        decrease_keys += initial_decrease_keys;
+    }
 
     void push_or_decrease(std::uint32_t pixel) {
         const std::int32_t slot = position_[pixel];
@@ -990,46 +1155,41 @@ py::tuple solve_geodesic_regions(
     auto* distance_values = distance.mutable_data();
     auto* position_values = position.mutable_data();
     std::uint32_t band_count = 0;
+    {
+        py::gil_scoped_release release;
+        for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
+            if (seed_values[pixel] >= rank_count) {
+                throw std::invalid_argument(
+                    "seed region exceeds region_rank_bits"
+                );
+            }
+            band_count += band_values[pixel] != 0;
+        }
+    }
+    std::vector<std::uint32_t> band_pixels(band_count);
     std::uint32_t max_live_entries = 0;
     std::uint64_t insertions = 0;
     std::uint64_t decrease_keys = 0;
     std::uint64_t pop_count = 0;
     {
         py::gil_scoped_release release;
-        std::copy(seed_values, seed_values + sample_count, owner_values);
-        std::fill(
-            distance_values,
-            distance_values + sample_count,
-            std::numeric_limits<std::uint64_t>::max()
-        );
-        std::fill(position_values, position_values + sample_count, -1);
+        std::uint32_t band_cursor = 0;
         for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
-            if (owner_values[pixel] >= rank_count) {
-                throw std::invalid_argument(
-                    "seed region exceeds region_rank_bits"
-                );
-            }
+            owner_values[pixel] = seed_values[pixel];
+            distance_values[pixel] = std::numeric_limits<std::uint64_t>::max();
+            position_values[pixel] = -1;
             if (band_values[pixel] != 0) {
-                ++band_count;
+                band_pixels[band_cursor++] = pixel;
             }
         }
-
-        IndexedRegionHeap heap(
-            distance_values,
-            owner_values,
-            rank_values,
-            rank_count,
-            position_values,
-            band_count
-        );
-        for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
-            if (band_values[pixel] != 0 && owner_values[pixel] != 0) {
+        for (const std::uint32_t pixel : band_pixels) {
+            if (owner_values[pixel] != 0) {
                 distance_values[pixel] = 0;
-                heap.push_or_decrease(pixel);
             }
         }
-        for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
-            if (band_values[pixel] == 0 || owner_values[pixel] != 0) {
+        std::uint64_t initial_decrease_keys = 0;
+        for (const std::uint32_t pixel : band_pixels) {
+            if (owner_values[pixel] != 0) {
                 continue;
             }
             visit_four_neighbours(pixel, height, width, [&](std::uint32_t neighbour) {
@@ -1037,23 +1197,36 @@ py::tuple solve_geodesic_regions(
                 if (band_values[neighbour] != 0 || region == 0) {
                     return;
                 }
-                relax_region_pixel(
+                const std::uint64_t candidate_distance = bgr_movement_cost(
+                    guide_values,
+                    neighbour,
                     pixel,
-                    bgr_movement_cost(
-                        guide_values,
-                        neighbour,
-                        pixel,
-                        movement_base_cost,
-                        movement_edge_scale
-                    ),
-                    region,
-                    distance_values,
-                    owner_values,
-                    rank_values,
-                    heap
+                    movement_base_cost,
+                    movement_edge_scale
                 );
+                if (!region_candidate_is_better(
+                    candidate_distance,
+                    region,
+                    distance_values[pixel],
+                    owner_values[pixel],
+                    rank_values
+                )) {
+                    return;
+                }
+                initial_decrease_keys += owner_values[pixel] != 0;
+                distance_values[pixel] = candidate_distance;
+                owner_values[pixel] = region;
             });
         }
+        IndexedRegionHeap heap(
+            distance_values,
+            owner_values,
+            rank_values,
+            rank_count,
+            position_values,
+            std::move(band_pixels)
+        );
+        heap.initialize_candidates(initial_decrease_keys);
         while (!heap.empty()) {
             const std::uint32_t pixel = heap.pop();
             const std::uint64_t source_distance = distance_values[pixel];
@@ -1087,10 +1260,8 @@ py::tuple solve_geodesic_regions(
                 );
             });
         }
-        for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
-            if (band_values[pixel] != 0 && owner_values[pixel] == 0) {
-                throw std::invalid_argument("edge-band component has no seed");
-            }
+        if (heap.pop_count != band_count) {
+            throw std::invalid_argument("edge-band component has no seed");
         }
         max_live_entries = heap.max_live_entries;
         insertions = heap.insertions;
@@ -2702,15 +2873,79 @@ py::tuple build_index(
                 --column;
             }
         }
-        for (std::uint32_t region_index = 0; region_index < region_count; ++region_index) {
-            partition_region_tree(
-                member_values,
-                offset_values[region_index],
-                offset_values[region_index + 1],
-                static_cast<std::uint32_t>(height),
-                width32,
-                packed_coordinates
-            );
+        const std::size_t hardware_workers = std::max<std::size_t>(
+            1,
+            std::thread::hardware_concurrency()
+        );
+        const std::size_t desired_worker_count = std::min<std::size_t>(
+            {kIndexBuildWorkerCap, hardware_workers, region_count}
+        );
+        NativeWorkerLease worker_lease(
+            desired_worker_count > 1 ? desired_worker_count - 1 : 0
+        );
+        const std::size_t worker_count = worker_lease.worker_count();
+        if (worker_count == 1) {
+            for (
+                std::uint32_t region_index = 0;
+                region_index < region_count;
+                ++region_index
+            ) {
+                partition_region_tree(
+                    member_values,
+                    offset_values[region_index],
+                    offset_values[region_index + 1],
+                    static_cast<std::uint32_t>(height),
+                    width32,
+                    packed_coordinates
+                );
+            }
+        } else {
+            std::atomic<std::uint32_t> next_region{0};
+            std::vector<std::exception_ptr> errors(worker_count);
+            const auto worker = [&](std::size_t worker_index) {
+                try {
+                    while (true) {
+                        const std::uint32_t region_index = next_region.fetch_add(
+                            1,
+                            std::memory_order_relaxed
+                        );
+                        if (region_index >= region_count) {
+                            return;
+                        }
+                        partition_region_tree(
+                            member_values,
+                            offset_values[region_index],
+                            offset_values[region_index + 1],
+                            static_cast<std::uint32_t>(height),
+                            width32,
+                            packed_coordinates
+                        );
+                    }
+                } catch (...) {
+                    errors[worker_index] = std::current_exception();
+                }
+            };
+            std::vector<std::thread> workers;
+            workers.reserve(worker_count - 1);
+            try {
+                for (std::size_t index = 1; index < worker_count; ++index) {
+                    workers.emplace_back(worker, index);
+                }
+            } catch (...) {
+                for (auto& thread : workers) {
+                    thread.join();
+                }
+                throw;
+            }
+            worker(0);
+            for (auto& thread : workers) {
+                thread.join();
+            }
+            for (const auto& error : errors) {
+                if (error) {
+                    std::rethrow_exception(error);
+                }
+            }
         }
         if (packed_coordinates) {
             for (std::uint32_t cursor = 0; cursor < included_count; ++cursor) {
@@ -6481,44 +6716,87 @@ py::array build_four_connected_edge_band_native(
     const auto is_region = [](std::uint32_t value) {
         return value != 0 && value != std::numeric_limits<std::uint32_t>::max();
     };
+    const auto parallel_rows = [&](auto callback) {
+        const std::size_t hardware_workers = std::max(
+            1U,
+            std::thread::hardware_concurrency()
+        );
+        const std::size_t useful_workers = std::max<std::size_t>(
+            1,
+            (height + kEdgeBandRowsPerWorker - 1) / kEdgeBandRowsPerWorker
+        );
+        const std::size_t desired_worker_count = std::min(
+            {kEdgeBandWorkerCap, hardware_workers, useful_workers}
+        );
+        NativeWorkerLease worker_lease(
+            desired_worker_count > 1 ? desired_worker_count - 1 : 0
+        );
+        const std::size_t worker_count = worker_lease.worker_count();
+        if (worker_count == 1) {
+            callback(0, height);
+            return;
+        }
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count - 1);
+        const auto run_worker = [&](std::size_t worker) {
+            const auto start = static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(height) * worker / worker_count
+            );
+            const auto stop = static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(height) * (worker + 1) / worker_count
+            );
+            callback(start, stop);
+        };
+        try {
+            for (std::size_t worker = 1; worker < worker_count; ++worker) {
+                workers.emplace_back(run_worker, worker);
+            }
+        } catch (...) {
+            for (auto& thread : workers) {
+                thread.join();
+            }
+            throw;
+        }
+        run_worker(0);
+        for (auto& thread : workers) {
+            thread.join();
+        }
+    };
     {
         py::gil_scoped_release release;
-        for (std::uint32_t row = 0; row < height; ++row) {
-            for (std::uint32_t column = 0; column < width; ++column) {
-                const std::uint64_t pixel = static_cast<std::uint64_t>(row) * width + column;
-                const std::uint32_t region = regions[pixel];
-                if (!is_region(region)) {
-                    continue;
-                }
-                if (
-                    column + 1 < width && is_region(regions[pixel + 1]) &&
-                    region != regions[pixel + 1]
-                ) {
-                    current[pixel] = 1;
-                    current[pixel + 1] = 1;
-                }
-                if (
-                    row + 1 < height && is_region(regions[pixel + width]) &&
-                    region != regions[pixel + width]
-                ) {
-                    current[pixel] = 1;
-                    current[pixel + width] = 1;
-                }
-            }
-        }
-        for (std::uint32_t iteration = 0; iteration < radius; ++iteration) {
-            std::fill(next.begin(), next.end(), 0);
-            for (std::uint32_t row = 0; row < height; ++row) {
+        parallel_rows([&](std::uint32_t start_row, std::uint32_t stop_row) {
+            for (std::uint32_t row = start_row; row < stop_row; ++row) {
                 for (std::uint32_t column = 0; column < width; ++column) {
                     const std::uint64_t pixel =
                         static_cast<std::uint64_t>(row) * width + column;
-                    next[pixel] = current[pixel] ||
-                        (row > 0 && current[pixel - width]) ||
-                        (column > 0 && current[pixel - 1]) ||
-                        (column + 1 < width && current[pixel + 1]) ||
-                        (row + 1 < height && current[pixel + width]);
+                    const std::uint32_t region = regions[pixel];
+                    current[pixel] = is_region(region) && (
+                        (row != 0 && is_region(regions[pixel - width]) &&
+                         region != regions[pixel - width]) ||
+                        (row + 1 < height && is_region(regions[pixel + width]) &&
+                         region != regions[pixel + width]) ||
+                        (column != 0 && is_region(regions[pixel - 1]) &&
+                         region != regions[pixel - 1]) ||
+                        (column + 1 < width && is_region(regions[pixel + 1]) &&
+                         region != regions[pixel + 1])
+                    );
                 }
             }
+        });
+        for (std::uint32_t iteration = 0; iteration < radius; ++iteration) {
+            parallel_rows([&](std::uint32_t start_row, std::uint32_t stop_row) {
+                for (std::uint32_t row = start_row; row < stop_row; ++row) {
+                    for (std::uint32_t column = 0; column < width; ++column) {
+                        const std::uint64_t pixel =
+                            static_cast<std::uint64_t>(row) * width + column;
+                        next[pixel] = current[pixel] ||
+                            (row > 0 && current[pixel - width]) ||
+                            (column > 0 && current[pixel - 1]) ||
+                            (column + 1 < width && current[pixel + 1]) ||
+                            (row + 1 < height && current[pixel + width]);
+                    }
+                }
+            });
             current.swap(next);
         }
     }
@@ -6640,50 +6918,48 @@ py::tuple label_region_fragments_native(
     );
 }
 
-bool cross_erode_mask(
+bool cross_erode_fragment_pixels(
+    const std::vector<std::uint32_t>& pixels,
+    std::uint32_t pixel_count,
     const std::vector<std::uint8_t>& input,
     std::vector<std::uint8_t>& output,
     std::uint32_t height,
     std::uint32_t width
 ) {
-    std::fill(output.begin(), output.end(), 0);
-    if (height <= 2 || width <= 2) {
-        return false;
-    }
     bool any = false;
-    for (std::uint32_t row = 1; row + 1 < height; ++row) {
-        for (std::uint32_t column = 1; column + 1 < width; ++column) {
-            const std::uint64_t pixel =
-                static_cast<std::uint64_t>(row) * width + column;
-            const std::uint8_t selected = input[pixel] &&
-                input[pixel - width] &&
-                input[pixel + width] &&
-                input[pixel - 1] &&
-                input[pixel + 1];
-            output[pixel] = selected;
-            any = any || selected != 0;
-        }
+    for (std::uint32_t index = 0; index < pixel_count; ++index) {
+        const std::uint32_t pixel = pixels[index];
+        const std::uint32_t row = pixel / width;
+        const std::uint32_t column = pixel % width;
+        const std::uint8_t selected =
+            row != 0 &&
+            row + 1 < height &&
+            column != 0 &&
+            column + 1 < width &&
+            input[pixel] != 0 &&
+            input[pixel - width] != 0 &&
+            input[pixel + width] != 0 &&
+            input[pixel - 1] != 0 &&
+            input[pixel + 1] != 0;
+        output[pixel] = selected;
+        any = any || selected != 0;
     }
     return any;
 }
 
-void cross_dilate_mask(
+bool cross_dilate_contains_pixel(
     const std::vector<std::uint8_t>& input,
-    std::vector<std::uint8_t>& output,
+    std::uint32_t pixel,
     std::uint32_t height,
     std::uint32_t width
 ) {
-    for (std::uint32_t row = 0; row < height; ++row) {
-        for (std::uint32_t column = 0; column < width; ++column) {
-            const std::uint64_t pixel =
-                static_cast<std::uint64_t>(row) * width + column;
-            output[pixel] = input[pixel] ||
-                (row > 0 && input[pixel - width]) ||
-                (row + 1 < height && input[pixel + width]) ||
-                (column > 0 && input[pixel - 1]) ||
-                (column + 1 < width && input[pixel + 1]);
-        }
-    }
+    const std::uint32_t row = pixel / width;
+    const std::uint32_t column = pixel % width;
+    return input[pixel] != 0 ||
+        (row != 0 && input[pixel - width] != 0) ||
+        (row + 1 < height && input[pixel + width] != 0) ||
+        (column != 0 && input[pixel - 1] != 0) ||
+        (column + 1 < width && input[pixel + 1] != 0);
 }
 
 py::array build_sparse_region_seeds_native(
@@ -6718,6 +6994,8 @@ py::array build_sparse_region_seeds_native(
         band_count += band[pixel] != 0;
     }
     std::vector<std::uint32_t> queue(band_count);
+    std::vector<std::uint8_t> current(sample_count, 0);
+    std::vector<std::uint8_t> eroded(sample_count, 0);
     {
         py::gil_scoped_release release;
         for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
@@ -6735,18 +7013,10 @@ py::array build_sparse_region_seeds_native(
             std::uint32_t tail = 1;
             queue[0] = start;
             visited[start] = 1;
-            std::uint32_t min_row = start / width;
-            std::uint32_t max_row = min_row;
-            std::uint32_t min_column = start % width;
-            std::uint32_t max_column = min_column;
             while (head < tail) {
                 const std::uint32_t pixel = queue[head++];
                 const std::uint32_t row = pixel / width;
                 const std::uint32_t column = pixel % width;
-                min_row = std::min(min_row, row);
-                max_row = std::max(max_row, row);
-                min_column = std::min(min_column, column);
-                max_column = std::max(max_column, column);
                 const auto enqueue = [&](std::uint32_t neighbour) {
                     if (
                         band[neighbour] == 0 ||
@@ -6772,96 +7042,76 @@ py::array build_sparse_region_seeds_native(
                 }
             }
 
-            const std::uint32_t fragment_height = max_row - min_row + 1;
-            const std::uint32_t fragment_width = max_column - min_column + 1;
-            const std::size_t fragment_size = static_cast<std::size_t>(
-                static_cast<std::uint64_t>(fragment_height) * fragment_width
-            );
-            std::vector<std::uint8_t> fragment(fragment_size, 0);
             for (std::uint32_t index = 0; index < tail; ++index) {
-                const std::uint32_t pixel = queue[index];
-                const std::uint32_t local_row = pixel / width - min_row;
-                const std::uint32_t local_column = pixel % width - min_column;
-                fragment[
-                    static_cast<std::uint64_t>(local_row) * fragment_width + local_column
-                ] = 1;
+                current[queue[index]] = 1;
             }
 
-            std::vector<std::uint8_t> current(fragment);
-            std::vector<std::uint8_t> eroded(fragment_size, 0);
             bool current_any = true;
             for (std::uint32_t iteration = 0; iteration < radius && current_any; ++iteration) {
-                current_any = cross_erode_mask(
+                current_any = cross_erode_fragment_pixels(
+                    queue,
+                    tail,
                     current,
                     eroded,
-                    fragment_height,
-                    fragment_width
+                    height,
+                    width
                 );
                 current.swap(eroded);
             }
 
-            std::vector<std::uint8_t> selected(fragment_size, 0);
+            bool selected_any = false;
             if (current_any) {
-                selected = std::move(current);
+                for (std::uint32_t index = 0; index < tail; ++index) {
+                    const std::uint32_t pixel = queue[index];
+                    if (current[pixel] == 0) {
+                        continue;
+                    }
+                    seeds[pixel] = region;
+                    selected_any = true;
+                }
             } else {
-                current = fragment;
+                for (std::uint32_t index = 0; index < tail; ++index) {
+                    const std::uint32_t pixel = queue[index];
+                    current[pixel] = 1;
+                    eroded[pixel] = 0;
+                }
                 current_any = true;
-                std::vector<std::uint8_t> opened(fragment_size, 0);
                 while (current_any) {
-                    const bool eroded_any = cross_erode_mask(
+                    const bool eroded_any = cross_erode_fragment_pixels(
+                        queue,
+                        tail,
                         current,
                         eroded,
-                        fragment_height,
-                        fragment_width
+                        height,
+                        width
                     );
-                    cross_dilate_mask(
-                        eroded,
-                        opened,
-                        fragment_height,
-                        fragment_width
-                    );
-                    for (std::size_t pixel = 0; pixel < fragment_size; ++pixel) {
-                        selected[pixel] = selected[pixel] ||
-                            (current[pixel] != 0 && opened[pixel] == 0);
+                    for (std::uint32_t index = 0; index < tail; ++index) {
+                        const std::uint32_t pixel = queue[index];
+                        if (
+                            current[pixel] != 0 &&
+                            !cross_dilate_contains_pixel(
+                                eroded,
+                                pixel,
+                                height,
+                                width
+                            )
+                        ) {
+                            seeds[pixel] = region;
+                            selected_any = true;
+                        }
                     }
                     current.swap(eroded);
                     current_any = eroded_any;
                 }
             }
 
-            bool selected_any = false;
-            for (std::uint32_t local_row = 0; local_row < fragment_height; ++local_row) {
-                for (
-                    std::uint32_t local_column = 0;
-                    local_column < fragment_width;
-                    ++local_column
-                ) {
-                    const std::uint64_t local_pixel =
-                        static_cast<std::uint64_t>(local_row) * fragment_width +
-                        local_column;
-                    if (selected[local_pixel] == 0) {
-                        continue;
-                    }
-                    const std::uint64_t pixel =
-                        static_cast<std::uint64_t>(min_row + local_row) * width +
-                        min_column + local_column;
-                    seeds[pixel] = region;
-                    selected_any = true;
-                }
-            }
             if (!selected_any) {
-                for (std::size_t local_pixel = 0; local_pixel < fragment_size; ++local_pixel) {
-                    if (fragment[local_pixel] == 0) {
-                        continue;
-                    }
-                    const std::uint32_t local_row =
-                        static_cast<std::uint32_t>(local_pixel / fragment_width);
-                    const std::uint32_t local_column =
-                        static_cast<std::uint32_t>(local_pixel % fragment_width);
-                    seeds[static_cast<std::uint64_t>(min_row + local_row) * width +
-                          min_column + local_column] = region;
-                    break;
-                }
+                seeds[start] = region;
+            }
+            for (std::uint32_t index = 0; index < tail; ++index) {
+                const std::uint32_t pixel = queue[index];
+                current[pixel] = 0;
+                eroded[pixel] = 0;
             }
         }
     }
@@ -8018,6 +8268,15 @@ py::dict build_info() {
     result["algorithm"] = "quality-implicit-region-kd-hybrid-nth-element-v2";
     result["kd_stack_capacity"] = kStackCapacity;
     result["runtime_jit"] = false;
+    result["index_build_parallelism"] = "deterministic-region-std-thread-v1";
+    result["index_build_worker_cap"] = kIndexBuildWorkerCap;
+    result["geometry_query_parallelism"] = "deterministic-std-thread-v1";
+    result["geometry_query_worker_cap"] = kGeometryQueryWorkerCap;
+    result["edge_band_parallelism"] = "deterministic-row-std-thread-v1";
+    result["edge_band_worker_cap"] = kEdgeBandWorkerCap;
+    result["native_spawned_worker_cap"] = kNativeSpawnedWorkerCap;
+    result["sparse_seed_morphology"] = "active-fragment-pixels-v1";
+    result["geodesic_workset"] = "band-pixel-heap-storage-v1";
     result["source_sha256"] = QUALITY_KD_SOURCE_SHA256;
     return result;
 }

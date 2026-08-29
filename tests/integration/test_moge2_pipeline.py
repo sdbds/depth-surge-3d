@@ -352,6 +352,7 @@ class _PipelineHarness:
                 "crop_factor": 1.0,
                 "preserve_audio": False,
                 "target_fps": "original",
+                "direct_vr_encode": False,
                 "keep_intermediates": True,
                 "vr_format": "side_by_side",
                 "vr_resolution": "16x9-480p",
@@ -927,6 +928,8 @@ def test_cli_dispatch_reaches_metric_pipeline(
             "--depth-resolution",
             "8",
             "--no-audio",
+            "--keep-intermediates",
+            "--no-direct-vr-encode",
         ],
     )
 
@@ -1025,6 +1028,8 @@ def test_web_dispatch_reaches_relative_pipeline(
                     "depth_resolution": 8,
                     "target_fps": None,
                     "preserve_audio": False,
+                    "keep_intermediates": True,
+                    "direct_vr_encode": False,
                 },
             },
         )

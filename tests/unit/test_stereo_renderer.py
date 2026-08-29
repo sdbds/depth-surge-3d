@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+import src.depth_surge_3d.rendering.stereo_renderer as stereo_renderer_module
 from src.depth_surge_3d.rendering.forward_splat import (
     HORIZONTAL_SUBPIXELS,
     SubpixelSplatResult,
@@ -631,6 +632,114 @@ def test_row_band_height_does_not_change_any_output_byte_or_mask() -> None:
 
     for field in StereoRenderResult.__dataclass_fields__:
         assert np.array_equal(getattr(actual, field), getattr(expected, field))
+
+
+def test_fast_compact_uses_native_lane_analysis_and_reports_timings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator = np.random.default_rng(20260828)
+    frame = generator.integers(0, 256, size=(7, 19, 3), dtype=np.uint8)
+    canonical = generator.random((5, 13), dtype=np.float32)
+
+    def reject_scalar_histogram(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Fast compact rendering used the scalar histogram")
+
+    monkeypatch.setattr(
+        stereo_renderer_module,
+        "_update_hole_histograms",
+        reject_scalar_histogram,
+    )
+    result = StereoRenderer(device="cpu").render_relative_fast_compact(
+        frame,
+        canonical,
+        StereoRenderSettings(
+            stereo_strength=3.75,
+            convergence=0.42,
+            occlusion_fill="background",
+        ),
+    )
+
+    assert set(result.performance_seconds) == {
+        "fast_geometry",
+        "fast_offset_build",
+        "left_eye",
+        "right_eye",
+        "total",
+    }
+    assert result.performance_seconds["total"] > 0.0
+    assert all(value >= 0.0 for value in result.performance_seconds.values())
+    assert result.left_coverage_count.shape == frame.shape[:2]
+    assert result.right_coverage_count.shape == frame.shape[:2]
+    assert result.left_hole_runs is not None
+    assert result.right_hole_runs is not None
+
+
+def test_fast_compact_native_diagnostics_match_scalar_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator = np.random.default_rng(20260829)
+    frame = generator.integers(0, 256, size=(9, 23, 3), dtype=np.uint8)
+    canonical = generator.random((5, 13), dtype=np.float32)
+    settings = StereoRenderSettings(
+        stereo_strength=4.25,
+        convergence=0.37,
+        occlusion_fill="background",
+    )
+    renderer = StereoRenderer(device="cpu")
+
+    with monkeypatch.context() as fallback:
+        fallback.setattr(stereo_renderer_module, "_native_lane_analyzer", lambda: None)
+        expected = renderer.render_relative_fast_compact(frame, canonical, settings)
+    actual = renderer.render_relative_fast_compact(frame, canonical, settings)
+
+    for name in (
+        "left_image",
+        "right_image",
+        "left_coverage_count",
+        "right_coverage_count",
+        "left_repair_bits",
+        "right_repair_bits",
+    ):
+        assert np.array_equal(getattr(actual, name), getattr(expected, name))
+    for eye in ("left", "right"):
+        actual_runs = getattr(actual, f"{eye}_hole_runs")
+        expected_runs = getattr(expected, f"{eye}_hole_runs")
+        assert actual_runs is not None and expected_runs is not None
+        assert np.array_equal(
+            actual_runs.lane_count_histogram,
+            expected_runs.lane_count_histogram,
+        )
+        assert np.array_equal(
+            actual_runs.touched_pixel_span_histogram,
+            expected_runs.touched_pixel_span_histogram,
+        )
+        actual_fast = getattr(actual, f"{eye}_fast_diagnostics")
+        expected_fast = getattr(expected, f"{eye}_fast_diagnostics")
+        assert actual_fast is not None and expected_fast is not None
+        assert actual_fast.local_filled_lane_count == expected_fast.local_filled_lane_count
+        assert actual_fast.final_unresolved_lane_count == expected_fast.final_unresolved_lane_count
+
+
+@pytest.mark.parametrize(
+    ("background", "expected"),
+    [(False, 0x44), (True, 0x4C)],
+)
+def test_fast_repair_flags_preserve_filled_and_unresolved_bits(
+    background: bool,
+    expected: int,
+) -> None:
+    filled = torch.zeros((1, 1, HORIZONTAL_SUBPIXELS), dtype=torch.bool)
+    unresolved = torch.zeros_like(filled)
+    filled[0, 0, 2] = True
+    unresolved[0, 0, 9] = True
+
+    flags = stereo_renderer_module._fast_repair_lane_flags(
+        filled,
+        unresolved,
+        background=background,
+    )
+
+    assert flags.tolist() == [[expected]]
 
 
 def test_second_cuda_oom_reports_frame_and_both_attempted_heights(

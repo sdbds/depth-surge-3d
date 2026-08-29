@@ -40,7 +40,10 @@ def _artifact(**overrides: object) -> ProcessingSettingsArtifactV5:
             "sample_aspect_ratio_denominator": 1,
             "sample_aspect_ratio": "1:1",
         },
-        "processing_settings": validate_settings({}, source="explicit"),
+        "processing_settings": validate_settings(
+            {"direct_vr_encode": False, "keep_intermediates": True},
+            source="explicit",
+        ),
         "output_directory": "C:/output",
         "project_version": "0.9.0",
         "creation_now_usec": "2026-08-24T12:34:56.123456Z",
@@ -166,7 +169,12 @@ def test_completed_transition_accepts_selected_clip_frame_count() -> None:
             "sample_aspect_ratio": "1:1",
         },
         processing_settings=validate_settings(
-            {"end_time": "00:15"}, source="explicit"
+            {
+                "direct_vr_encode": False,
+                "end_time": "00:15",
+                "keep_intermediates": True,
+            },
+            source="explicit",
         ),
     )
 

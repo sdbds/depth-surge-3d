@@ -80,6 +80,10 @@ _EXISTING_BOOLEAN_SETTINGS = {
     "apply_distortion",
     "experimental_frame_interpolation",
 }
+_PERSISTED_DISK_DEFAULT_OVERRIDES = {
+    "direct_vr_encode": False,
+    "keep_intermediates": True,
+}
 _EXISTING_CHOICE_SETTINGS = {
     "stereo_render_mode": {"fast", "quality"},
     "stereo_geometry_mode": {"relative", "metric_camera"},
@@ -338,7 +342,11 @@ def validate_settings(
         for name in removed + unknown:
             provided.pop(name, None)
 
-    validated = dict(DEFAULT_SETTINGS)
+    validated: dict[str, Any] = dict(DEFAULT_SETTINGS)
+    if source == "legacy_disk":
+        for override_name, override_value in _PERSISTED_DISK_DEFAULT_OVERRIDES.items():
+            if override_name not in provided:
+                validated[override_name] = override_value
     for name, value in provided.items():
         validated[name] = _validate_value(name, value)
     for name, value in tuple(validated.items()):
@@ -399,8 +407,11 @@ def parse_saved_processing_settings(
                     f"{required} is required by settings schema "
                     f"{PROCESSING_SETTINGS_SCHEMA_VERSION}"
                 )
+        persisted_values = dict(values)
+        for name, value in _PERSISTED_DISK_DEFAULT_OVERRIDES.items():
+            persisted_values.setdefault(name, value)
         return SavedSettingsResult(
-            settings=validate_settings(values, source="explicit"),
+            settings=validate_settings(persisted_values, source="explicit"),
             source_version=source_version,
             migrated=False,
             removed_settings=(),
@@ -448,7 +459,7 @@ def resolve_stereo_render_mode(
     is_resume: bool,
     renderer_device_type: object,
 ) -> StereoRenderMode:
-    """Resolve omission while keeping the library-level Fast default separate."""
+    """Resolve omission to Fast while preserving explicit and resumed choices."""
 
     if override is not None:
         return _choice(
@@ -458,5 +469,5 @@ def resolve_stereo_render_mode(
         return _choice(
             "stereo_render_mode", persisted, {"fast", "quality"}
         )  # type: ignore[return-value]
-    device_type = str(renderer_device_type).split(":", 1)[0].lower()
-    return "quality" if device_type == "cuda" else "fast"
+    del renderer_device_type
+    return "fast"

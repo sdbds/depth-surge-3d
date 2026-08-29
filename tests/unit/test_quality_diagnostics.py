@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import json
 from pathlib import Path
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -74,6 +77,7 @@ def _publication(
     module,
     root: Path,
     *,
+    compact: CompactStereoRenderResult | None = None,
     keep_masks: bool = True,
     frame_name: str = "frame_0001",
     render_mode: str = "quality",
@@ -83,7 +87,7 @@ def _publication(
         frame_name=frame_name,
         left_rgb_path=root / "04_left_frames" / f"{frame_name}.png",
         right_rgb_path=root / "04_right_frames" / f"{frame_name}.png",
-        compact=_compact(),
+        compact=compact or _compact(),
         geometry_mode="relative",
         occlusion_fill="background",
         rgb_stage_fingerprint="rgb-stage",
@@ -171,6 +175,81 @@ def test_quality_frame_manifest_is_published_last_with_exact_payload_hashes(
         raw = payload_path.read_bytes()
         assert identity["byte_count"] == len(raw)
         assert identity["sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+def test_shared_quality_png_payloads_encode_once_across_concurrent_publications(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    compact = _compact()
+    shared = diagnostic_transaction.SharedQualityPngPayloads(
+        compact=compact,
+        keep_masks=False,
+    )
+    real_encode = diagnostic_transaction._png_buffer
+    encode_calls = 0
+    encode_lock = threading.Lock()
+
+    def count_encode(values):
+        nonlocal encode_calls
+        with encode_lock:
+            encode_calls += 1
+        time.sleep(0.02)
+        return real_encode(values)
+
+    monkeypatch.setattr(diagnostic_transaction, "_png_buffer", count_encode)
+
+    def publish(index: int):
+        publication = _publication(
+            diagnostic_transaction,
+            tmp_path,
+            compact=compact,
+            keep_masks=False,
+            frame_name=f"frame_{index:06d}",
+        )
+        prepared = diagnostic_transaction.prepare_quality_frame(
+            publication,
+            png_payloads=shared,
+        )
+        return diagnostic_transaction.publish_quality_frame(prepared)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        manifests = list(pool.map(publish, range(1, 4)))
+
+    assert encode_calls == 2
+    assert [manifest["frame_name"] for manifest in manifests] == [
+        "frame_000001",
+        "frame_000002",
+        "frame_000003",
+    ]
+    for side in ("04_left_frames", "04_right_frames"):
+        payloads = [
+            (tmp_path / side / f"frame_{index:06d}.png").read_bytes() for index in range(1, 4)
+        ]
+        assert len(set(payloads)) == 1
+
+
+def test_shared_quality_png_payloads_reject_a_different_compact_result(tmp_path: Path) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    shared = diagnostic_transaction.SharedQualityPngPayloads(
+        compact=_compact(),
+        keep_masks=False,
+    )
+    publication = _publication(
+        diagnostic_transaction,
+        tmp_path,
+        compact=_compact(),
+        keep_masks=False,
+    )
+
+    with pytest.raises(ValueError, match="do not match"):
+        diagnostic_transaction.prepare_quality_frame(
+            publication,
+            png_payloads=shared,
+        )
 
 
 def test_quality_frame_preserves_an_unowned_payload_temporary(tmp_path: Path) -> None:
@@ -353,9 +432,7 @@ def test_quality_frame_encodes_and_writes_each_png_before_encoding_the_next(
     monkeypatch.setattr(diagnostic_transaction.cv2, "imencode", encode)
     monkeypatch.setattr(diagnostic_transaction, "_write_temporary", write)
 
-    diagnostic_transaction.publish_quality_frame(
-        _publication(diagnostic_transaction, tmp_path)
-    )
+    diagnostic_transaction.publish_quality_frame(_publication(diagnostic_transaction, tmp_path))
 
     assert pending_png_buffers == 0
 
@@ -507,13 +584,7 @@ def test_streaming_frame_stats_replays_sparse_histograms_without_dense_frame_bin
     diagnostic_transaction.publish_quality_frame(
         _publication(diagnostic_transaction, tmp_path, keep_masks=False)
     )
-    raw = (
-        tmp_path
-        / "04_stereo_diagnostics"
-        / "frames"
-        / "frame_0001"
-        / "stats.json"
-    ).read_bytes()
+    raw = (tmp_path / "04_stereo_diagnostics" / "frames" / "frame_0001" / "stats.json").read_bytes()
     expected = json.loads(raw)
     monkeypatch.setattr(
         diagnostic_transaction.np,
@@ -532,9 +603,7 @@ def test_streaming_frame_stats_replays_sparse_histograms_without_dense_frame_bin
         ]
         assert list(holes["touched_pixel_span_histogram"]) == [
             tuple(pair)
-            for pair in expected["eyes"][eye]["hole_runs"][
-                "touched_pixel_span_histogram"
-            ]
+            for pair in expected["eyes"][eye]["hole_runs"]["touched_pixel_span_histogram"]
         ]
 
 
@@ -542,24 +611,12 @@ def test_streaming_frame_stats_replays_sparse_histograms_without_dense_frame_bin
     "mutate",
     [
         lambda stats: stats.__setitem__("schema_version", True),
-        lambda stats: stats["eyes"]["left"]["hole_runs"].__setitem__(
-            "lane_count_p95", 0
-        ),
-        lambda stats: stats["eyes"]["left"]["hole_runs"].__setitem__(
-            "lane_count_p95", -0.0
-        ),
-        lambda stats: stats["eyes"]["left"]["state_pixel_counts"].__setitem__(
-            "unexpected", 0
-        ),
-        lambda stats: stats["eyes"]["left"]["backend_lane_counts"].__setitem__(
-            "local", -1
-        ),
-        lambda stats: stats["eyes"]["left"]["backend_lane_counts"].__setitem__(
-            "local", 97
-        ),
-        lambda stats: stats["geometry_nearest"].__setitem__(
-            "indexed_sample_count", 5
-        ),
+        lambda stats: stats["eyes"]["left"]["hole_runs"].__setitem__("lane_count_p95", 0),
+        lambda stats: stats["eyes"]["left"]["hole_runs"].__setitem__("lane_count_p95", -0.0),
+        lambda stats: stats["eyes"]["left"]["state_pixel_counts"].__setitem__("unexpected", 0),
+        lambda stats: stats["eyes"]["left"]["backend_lane_counts"].__setitem__("local", -1),
+        lambda stats: stats["eyes"]["left"]["backend_lane_counts"].__setitem__("local", 97),
+        lambda stats: stats["geometry_nearest"].__setitem__("indexed_sample_count", 5),
     ],
     ids=(
         "bool-as-int",
@@ -580,13 +637,7 @@ def test_frame_statistics_schema_rejects_noncanonical_nested_values(
     diagnostic_transaction.publish_quality_frame(
         _publication(diagnostic_transaction, tmp_path, keep_masks=False)
     )
-    raw = (
-        tmp_path
-        / "04_stereo_diagnostics"
-        / "frames"
-        / "frame_0001"
-        / "stats.json"
-    ).read_bytes()
+    raw = (tmp_path / "04_stereo_diagnostics" / "frames" / "frame_0001" / "stats.json").read_bytes()
     stats = diagnostic_transaction._parse_streaming_frame_stats(raw, render_width=3)
     mutate(stats)
     context = _streaming_context(diagnostic_transaction, tmp_path, masks=False).one_frame(
@@ -605,6 +656,22 @@ def test_diagnostics_checked_u64_add_rejects_aggregate_overflow() -> None:
 
     with pytest.raises(DiagnosticsCardinalityError):
         checked_u64_add("test_total", 2**64 - 1, 1)
+
+
+def test_histogram_metrics_are_exact_and_reject_uint64_overflow() -> None:
+    from src.depth_surge_3d.rendering.quality.diagnostics import (
+        DiagnosticsCardinalityError,
+        _histogram_metrics,
+    )
+
+    histogram = np.array([0, 1, 2, 1], dtype=np.uint64)
+
+    assert _histogram_metrics(histogram, 0.95) == (4, 3, 2.8499999999999996)
+    with pytest.raises(DiagnosticsCardinalityError):
+        _histogram_metrics(
+            np.array([np.iinfo(np.uint64).max, 1], dtype=np.uint64),
+            0.95,
+        )
 
 
 def test_diagnostics_directory_audit_rejects_foreign_entry_without_draining() -> None:
@@ -717,16 +784,80 @@ def test_streaming_diagnostics_consolidation_replays_names_without_a_sequence_gr
     assert [row["frame_name"] for row in rows] == list(names)
     assert completion.metadata.raw_byte_count == (root / "metadata.json").stat().st_size
     assert diagnostic_transaction.streaming_diagnostics_aggregates_match(context)
-    assert diagnostic_transaction.classify_streaming_diagnostics_frame(
-        context,
-        names[0],
-    ) == "reuse"
+    assert (
+        diagnostic_transaction.classify_streaming_diagnostics_frame(
+            context,
+            names[0],
+        )
+        == "reuse"
+    )
 
     (tmp_path / "04_left_frames" / f"{names[1]}.png").write_bytes(b"damaged")
-    assert diagnostic_transaction.classify_streaming_diagnostics_frame(
-        context,
-        names[1],
-    ) == "render"
+    assert (
+        diagnostic_transaction.classify_streaming_diagnostics_frame(
+            context,
+            names[1],
+        )
+        == "render"
+    )
+
+
+def test_streaming_summary_buffers_jsonl_lines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    context = _streaming_context(diagnostic_transaction, tmp_path, masks=False)
+    diagnostic_transaction.begin_streaming_diagnostics_stage(context)
+    diagnostic_transaction.publish_quality_frame(
+        _publication(
+            diagnostic_transaction,
+            tmp_path,
+            keep_masks=False,
+            frame_name="frame_0000",
+        )
+    )
+    diagnostic_transaction.complete_streaming_diagnostics_stage(context)
+    original_open_regular = diagnostic_transaction.AcquiredRoot.open_regular
+    line_reads = 0
+
+    class CountingRaw(io.RawIOBase):
+        def __init__(self, handle) -> None:
+            self._handle = handle
+
+        def readable(self) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            return self._handle.fileno()
+
+        def readinto(self, target) -> int:
+            return self._handle.readinto(target)
+
+        def readline(self, size: int = -1) -> bytes:
+            nonlocal line_reads
+            line_reads += 1
+            return self._handle.readline(size)
+
+        def close(self) -> None:
+            self._handle.close()
+            super().close()
+
+    def counted_open_regular(acquired, path: Path):
+        handle = original_open_regular(acquired, path)
+        if Path(path).name == "stereo_coverage_frames.jsonl":
+            return CountingRaw(handle)
+        return handle
+
+    monkeypatch.setattr(
+        diagnostic_transaction.AcquiredRoot,
+        "open_regular",
+        counted_open_regular,
+    )
+
+    assert diagnostic_transaction.streaming_diagnostics_aggregates_match(context)
+    assert line_reads == 0
 
 
 def test_diagnostics_metadata_projection_streams_frame_names_without_read_bytes(
@@ -776,6 +907,83 @@ def test_diagnostics_metadata_projection_streams_frame_names_without_read_bytes(
     assert projection.raw_sha256 == document.raw_sha256
     assert projection.raw_byte_count == document.raw_byte_count
     assert tuple(projection.iter_frame_names()) == names
+
+
+def test_diagnostics_metadata_projection_accepts_full_cleanup_authorization(
+    tmp_path: Path,
+) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    names = ("frame_000000",)
+    context = diagnostic_transaction.StreamingDiagnosticsStageContext(
+        job_root=tmp_path,
+        frame_count=1,
+        frame_names=lambda: iter(names),
+        render_shape=(2, 3),
+        render_mode="fast",
+        geometry_mode="relative",
+        occlusion_fill="background",
+        mask_payloads_enabled=False,
+        rgb_stage_fingerprint="a" * 64,
+        source_guide_fingerprint="b" * 64,
+        native_geometry_fingerprint=None,
+        quality_input_manifest_sha256=None,
+    )
+    document = diagnostic_transaction._streaming_diagnostics_metadata(
+        context,
+        status="complete",
+        ordered_frame_manifest_fingerprint="c" * 64,
+        frames_jsonl_sha256="d" * 64,
+        summary_sha256="e" * 64,
+    )
+    path = tmp_path / "04_stereo_diagnostics" / "metadata.json"
+    document.publish(path)
+    complete = diagnostic_transaction.project_diagnostics_metadata(path)
+    fields = dict(complete.static_fields)
+    fields.update(
+        {
+            "final_video_manifest_sha256": "f" * 64,
+            "frame_names": list(names),
+            "metric_clamp_summary_sha256": None,
+            "ordered_frame_manifest_fingerprint": None,
+            "prune_entries": [
+                {
+                    "cleanup_contract_version": 2,
+                    "directory_identity": {
+                        "file_identity": {
+                            "file_id": f"{index:032x}",
+                            "volume_serial": "1" * 16,
+                        },
+                        "kind": "windows",
+                    },
+                    "marker": {
+                        "name": f".depth-surge-prune-v2-{index:032x}.marker",
+                        "sha256": f"{index:064x}",
+                    },
+                    "operation": "delete_tree",
+                    "relative_path": f"stage-{index}",
+                    "stage_key": f"stage_{index}",
+                }
+                for index in range(16)
+            ],
+            "pruned_from": {
+                "frames_jsonl_sha256": "d" * 64,
+                "metric_clamp_summary_sha256": None,
+                "ordered_frame_manifest_fingerprint": "c" * 64,
+                "previous_diagnostics_fingerprint": complete.fingerprint,
+                "previous_status": "complete",
+                "summary_sha256": "e" * 64,
+            },
+            "status": "payload_pruned",
+        }
+    )
+    fields["fingerprint"] = diagnostic_transaction.self_fingerprint(fields)
+    path.write_bytes(diagnostic_transaction.canonical_json_bytes(fields))
+
+    projection = diagnostic_transaction.project_diagnostics_metadata(path)
+
+    assert projection.validate_state_contract() is projection
+    assert len(projection.static_fields["prune_entries"]) == 16
 
 
 def test_diagnostics_projection_rejects_the_first_frame_over_control_cap(
@@ -967,9 +1175,12 @@ def test_streaming_completion_fault_boundaries_resume_to_identical_complete_root
 
     metadata_path = tmp_path / "04_stereo_diagnostics" / "metadata.json"
     observed = json.loads(metadata_path.read_text(encoding="ascii"))["status"]
-    expected = "complete" if phase.startswith("after_root_metadata_replace") or phase == (
-        "after_root_metadata_directory_sync"
-    ) else "building"
+    expected = (
+        "complete"
+        if phase.startswith("after_root_metadata_replace")
+        or phase == ("after_root_metadata_directory_sync")
+        else "building"
+    )
     assert observed == expected
 
     diagnostic_transaction.complete_streaming_diagnostics_stage(context)

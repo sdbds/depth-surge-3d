@@ -2,9 +2,9 @@
 
 ## Stereo Renderer
 
-The Stereo Pair Generation step exposes `Quality` and `Fast`. Quality is the
-offline highest-quality path and defaults to an 8 px local fill limit at 1080p;
-the input accepts `1..32`. Fast retains the historical renderer. Selecting
+The Stereo Pair Generation step exposes `Fast` and `Quality`. New jobs default
+to Fast on every execution device. Quality remains an explicit offline choice,
+defaults to an 8 px local fill limit at 1080p, and accepts `1..32`. Selecting
 Quality with an effective CPU device displays a warning rather than silently
 downgrading the job.
 

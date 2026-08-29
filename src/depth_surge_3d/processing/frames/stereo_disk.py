@@ -85,6 +85,7 @@ class StereoStageDiskPlanBuilder:
     ) -> None:
         self._volume_key = volume_key
         self._allocation_unit = allocation_unit
+        self._directory_targets: dict[Path, tuple[Hashable, int]] = {}
         self._paths: dict[Hashable, Path] = {}
         self._units: dict[Hashable, int] = {}
         self._required: dict[Hashable, int] = {}
@@ -95,6 +96,10 @@ class StereoStageDiskPlanBuilder:
 
     def _target(self, path: Path) -> tuple[Hashable, int]:
         path = Path(path)
+        directory = Path(os.path.abspath(os.fspath(path))).parent
+        cached = self._directory_targets.get(directory)
+        if cached is not None:
+            return cached
         key = self._volume_key(path)
         unit = max(4096, int(self._allocation_unit(path)))
         if unit <= 0:
@@ -108,7 +113,9 @@ class StereoStageDiskPlanBuilder:
         self._maximum_overlap.setdefault(key, 0)
         self._maximum_overlap_entries.setdefault(key, 0)
         self._first_mutation.setdefault(key, 0)
-        return key, unit
+        target = (key, unit)
+        self._directory_targets[directory] = target
+        return target
 
     @staticmethod
     def _allocated(logical_bytes: int, unit: int) -> int:
@@ -159,11 +166,7 @@ class StereoStageDiskPlanBuilder:
             required = (
                 self._required[key]
                 + self._maximum_overlap[key]
-                + unit
-                * (
-                    self._directory_entries[key]
-                    + self._maximum_overlap_entries[key]
-                )
+                + unit * (self._directory_entries[key] + self._maximum_overlap_entries[key])
             )
             requirements.append(
                 StereoVolumeRequirement(

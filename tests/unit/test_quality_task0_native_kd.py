@@ -28,6 +28,15 @@ def test_native_extension_is_prebuilt_and_reports_frozen_contract() -> None:
     assert native_available(), native_load_error()
     build_info = native_build_info()
     assert build_info["algorithm"] == "quality-implicit-region-kd-hybrid-nth-element-v2"
+    assert build_info["index_build_parallelism"] == "deterministic-region-std-thread-v1"
+    assert 1 <= build_info["index_build_worker_cap"] <= 32
+    assert build_info["geometry_query_parallelism"] == "deterministic-std-thread-v1"
+    assert 1 <= build_info["geometry_query_worker_cap"] <= 32
+    assert build_info["edge_band_parallelism"] == "deterministic-row-std-thread-v1"
+    assert 1 <= build_info["edge_band_worker_cap"] <= 32
+    assert build_info["native_spawned_worker_cap"] == 7
+    assert build_info["sparse_seed_morphology"] == "active-fragment-pixels-v1"
+    assert build_info["geodesic_workset"] == "band-pixel-heap-storage-v1"
     assert build_info["kd_stack_capacity"] == 64
     assert build_info["runtime_jit"] is False
     assert len(build_info["source_sha256"]) == 64
@@ -256,3 +265,25 @@ def test_native_geometry_batch_uses_distinct_fatal_budget_error() -> None:
         )
 
     assert budget.consumed == 0
+
+
+def test_native_parallel_geometry_batch_preserves_ordered_budget_failure() -> None:
+    build_native = _api("build_native_implicit_region_kd")
+    query_native = _api("query_native_geometry_batch")
+    index = build_native(np.ones((17, 19), dtype=np.uint32), region_count=1)
+    query_count = 4096
+    query_regions = np.ones(query_count, dtype=np.uint32)
+    target_y = np.linspace(-2.0, 19.0, query_count, dtype=np.float64)
+    target_x = np.linspace(21.0, -3.0, query_count, dtype=np.float64)
+    budget = implicit_kd.VisitBudget(limit=1234)
+
+    with pytest.raises(implicit_kd.QualityGeometryQueryBudgetError, match="visit cap"):
+        query_native(
+            index,
+            query_regions,
+            target_y,
+            target_x,
+            budget=budget,
+        )
+
+    assert budget.consumed == 1234

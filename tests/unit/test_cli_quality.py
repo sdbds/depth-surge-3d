@@ -36,19 +36,18 @@ def test_cli_accepts_explicit_quality_controls(cli_module) -> None:
     assert settings["occlusion_fill_max_px"] == 10
 
 
-@pytest.mark.parametrize(("device", "expected"), [("cuda", "quality"), ("cpu", "fast")])
-def test_cli_resolves_omitted_mode_from_effective_device(
+@pytest.mark.parametrize("device", ["cuda", "cpu"])
+def test_cli_defaults_omitted_mode_to_fast_on_every_device(
     monkeypatch: pytest.MonkeyPatch,
     cli_module,
     device: str,
-    expected: str,
 ) -> None:
     monkeypatch.setattr(cli_module, "_effective_vdpp_device", lambda _requested: device)
     args = cli_module.create_argument_parser().parse_args(["input.mp4"])
 
     settings = cli_module._build_processing_settings(args)
 
-    assert settings["stereo_render_mode"] == expected
+    assert settings["stereo_render_mode"] == "fast"
 
 
 def test_cli_rejects_invalid_quality_limit_before_processing(cli_module) -> None:
@@ -64,6 +63,38 @@ def test_cli_omitted_quality_limit_uses_new_job_default(cli_module) -> None:
     settings = cli_module._build_processing_settings(args)
 
     assert settings["occlusion_fill_max_px"] == 8
+
+
+def test_cli_defaults_to_cleanup_intermediates(cli_module) -> None:
+    parser = cli_module.create_argument_parser()
+
+    omitted = cli_module._build_processing_settings(parser.parse_args(["input.mp4"]))
+    kept = cli_module._build_processing_settings(
+        parser.parse_args(["input.mp4", "--keep-intermediates"])
+    )
+    discarded = cli_module._build_processing_settings(
+        parser.parse_args(["input.mp4", "--no-intermediates"])
+    )
+
+    assert omitted["keep_intermediates"] is False
+    assert kept["keep_intermediates"] is True
+    assert discarded["keep_intermediates"] is False
+
+
+def test_cli_direct_vr_encoding_defaults_on_and_can_be_disabled(cli_module) -> None:
+    parser = cli_module.create_argument_parser()
+
+    omitted = cli_module._build_processing_settings(parser.parse_args(["input.mp4"]))
+    direct = cli_module._build_processing_settings(
+        parser.parse_args(["input.mp4", "--direct-vr-encode"])
+    )
+    assembled = cli_module._build_processing_settings(
+        parser.parse_args(["input.mp4", "--no-direct-vr-encode"])
+    )
+
+    assert omitted["direct_vr_encode"] is True
+    assert direct["direct_vr_encode"] is True
+    assert assembled["direct_vr_encode"] is False
 
 
 def test_cli_resume_stereo_overrides_are_presence_aware(cli_module) -> None:

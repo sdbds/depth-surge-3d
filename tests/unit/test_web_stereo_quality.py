@@ -21,29 +21,27 @@ def test_web_quality_controls_are_visible_and_submitted(web_app) -> None:
     assert 'min="1" max="32"' in html
     assert 'id="stereoQualityCpuWarning"' in html
     assert "stereo_render_mode: document.getElementById('stereoRenderMode').value" not in html
-    assert (
-        "settings.stereo_render_mode = document.getElementById('stereoRenderMode').value"
-        in html
-    )
+    assert "settings.stereo_render_mode = document.getElementById('stereoRenderMode').value" in html
     assert "if (stereoRenderModeExplicit) {\n                settings.stereo_render_mode" in html
     assert "occlusion_fill_max_px: parseInt(" in html
     assert "let stereoRenderModeExplicit = false;" in html
-    assert "const cudaDefault = requestedDevice === 'cuda'" in html
-    assert "systemCudaAvailable === true" in html
-    assert "document.getElementById('stereoRenderMode').value =" in html
-    assert "cudaDefault ? 'quality' : 'fast';" in html
+    assert "const cudaDefault = requestedDevice === 'cuda'" not in html
+    assert "cudaDefault ? 'quality' : 'fast';" not in html
+    assert "document.getElementById('stereoRenderMode').value = 'fast';" in html
     assert "stereoRenderModeExplicit = true;" in html
+    assert 'id="keepIntermediates" checked' not in html
+    assert "keepIntermediates: false" in html
 
 
-@pytest.mark.parametrize(("device", "expected"), [("cuda", "quality"), ("cpu", "fast")])
-def test_web_omitted_mode_resolves_from_effective_device(
-    web_app, monkeypatch: pytest.MonkeyPatch, device: str, expected: str
+@pytest.mark.parametrize("device", ["cuda", "cpu"])
+def test_web_omitted_mode_defaults_to_fast_on_every_device(
+    web_app, monkeypatch: pytest.MonkeyPatch, device: str
 ) -> None:
     monkeypatch.setattr(web_app, "_effective_web_renderer_device", lambda _settings: device)
 
     settings = web_app._resolve_new_web_stereo_settings({"device": "auto"})
 
-    assert settings["stereo_render_mode"] == expected
+    assert settings["stereo_render_mode"] == "fast"
     assert settings["occlusion_fill_max_px"] == 8
 
 

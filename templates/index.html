@@ -1343,7 +1343,7 @@
                             </label>
                         </div>
                         <div class="form-check mb-2">
-                            <input class="form-check-input" type="checkbox" id="keepIntermediates" checked>
+                            <input class="form-check-input" type="checkbox" id="keepIntermediates">
                             <label class="form-check-label" for="keepIntermediates">
                                 Keep Intermediate Files
                             </label>
@@ -1352,10 +1352,10 @@
                             </small>
                         </div>
                         <div class="form-check mb-2">
-                            <input class="form-check-input" type="checkbox" id="directVrEncode">
+                            <input class="form-check-input" type="checkbox" id="directVrEncode" checked>
                             <label class="form-check-label" for="directVrEncode">
                                 Direct FFmpeg VR Encoding
-                                <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Advanced: encode directly from left/right frames and skip assembled VR-frame files."></i>
+                                <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Encode directly from left/right frames and skip assembled VR-frame files."></i>
                             </label>
                         </div>
                         <div class="mb-3">
@@ -2159,11 +2159,7 @@
 
         function applyStereoRenderModeDefault() {
             if (stereoRenderModeExplicit) return;
-            const requestedDevice = document.getElementById('device').value;
-            const cudaDefault = requestedDevice === 'cuda'
-                || (requestedDevice === 'auto' && systemCudaAvailable === true);
-            document.getElementById('stereoRenderMode').value =
-                cudaDefault ? 'quality' : 'fast';
+            document.getElementById('stereoRenderMode').value = 'fast';
         }
 
         function updateStereoQualityControls() {
@@ -3288,8 +3284,8 @@
                 depthResolution: 'auto',
                 depthModelType: 'metric',
                 preserveAudio: true,
-                keepIntermediates: true,
-                directVrEncode: false,
+                keepIntermediates: false,
+                directVrEncode: true,
                 videoEncoder: 'auto',
                 applyDistortion: true,
                 fisheyeProjection: 'stereographic',

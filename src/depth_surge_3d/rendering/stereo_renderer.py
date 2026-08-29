@@ -5,7 +5,7 @@ from __future__ import annotations
 import gc
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from numbers import Integral
 from typing import Literal
 
@@ -330,22 +330,124 @@ def _update_hole_histograms(
             cursor = end_cursor
 
 
+def _lane_mask_weights(device: torch.device) -> torch.Tensor:
+    return torch.bitwise_left_shift(
+        torch.ones(HORIZONTAL_SUBPIXELS, dtype=torch.int32, device=device),
+        torch.arange(HORIZONTAL_SUBPIXELS, dtype=torch.int32, device=device),
+    )
+
+
+def _pack_missing_lane_masks(
+    lane_valid: torch.Tensor,
+    lane_weights: torch.Tensor,
+) -> torch.Tensor:
+    valid_masks = torch.sum(
+        lane_valid * lane_weights,
+        dim=2,
+        dtype=torch.int32,
+    )
+    valid_masks.bitwise_xor_(0xFFFF)
+    return valid_masks.to(dtype=torch.int16)
+
+
+def _native_lane_analyzer():
+    from .quality import native_kd
+
+    if not native_kd.native_available():
+        return None
+    return native_kd._require_native()
+
+
+def _analyze_lane_validity(
+    lane_valid: torch.Tensor,
+    lane_histogram: np.ndarray,
+    span_histogram: np.ndarray,
+    coverage_output: np.ndarray,
+    *,
+    native_extension,
+    lane_weights: torch.Tensor | None,
+) -> None:
+    if native_extension is None:
+        host_valid = np.ascontiguousarray(lane_valid.detach().cpu().numpy())
+        coverage_output[:] = np.sum(host_valid, axis=2, dtype=np.uint16).astype(np.uint8)
+        _update_hole_histograms(host_valid, lane_histogram, span_histogram)
+        return
+    if lane_valid.device.type == "cuda":
+        if lane_weights is None:
+            raise AssertionError("CUDA lane-mask weights are unavailable")
+        packed_missing = np.ascontiguousarray(
+            _pack_missing_lane_masks(lane_valid, lane_weights).cpu().numpy().view(np.uint16)
+        )
+        native_extension.accumulate_packed_lane_hole_run_histograms_into(
+            packed_missing,
+            lane_histogram,
+            span_histogram,
+            coverage_output,
+        )
+        return
+    host_valid = np.ascontiguousarray(lane_valid.detach().numpy())
+    native_extension.accumulate_lane_hole_run_histograms_into(
+        host_valid,
+        lane_histogram,
+        span_histogram,
+        coverage_output,
+    )
+
+
+def _fast_repair_lane_flags(
+    filled: torch.Tensor,
+    unresolved: torch.Tensor,
+    *,
+    background: bool,
+) -> torch.Tensor:
+    """Collapse fine-lane outcomes without losing overlapping state bits."""
+
+    filled_flags = torch.any(filled, dim=2).to(dtype=torch.uint8)
+    filled_flags.mul_(0x04)
+    unresolved_flags = torch.any(unresolved, dim=2).to(dtype=torch.uint8)
+    unresolved_flags.mul_(0x48 if background else 0x40)
+    filled_flags.bitwise_or_(unresolved_flags)
+    return filled_flags
+
+
+def _attach_fast_performance(
+    result,
+    *,
+    geometry_seconds: float,
+    offset_seconds: float,
+    total_started: float,
+):
+    return replace(
+        result,
+        performance_seconds={
+            "fast_geometry": float(geometry_seconds),
+            "fast_offset_build": float(offset_seconds),
+            **result.performance_seconds,
+            "total": time.perf_counter() - total_started,
+        },
+    )
+
+
 class StereoRenderer:
-    """Render stereo pairs without full-frame device-resident intermediates."""
+    """Render stereo pairs without full-frame device-resident splat intermediates."""
 
     def __init__(
         self,
         device: str | torch.device | None = None,
         *,
-        temporary_budget_bytes: int = GPU_TEMP_BUDGET,
+        temporary_budget_bytes: int | None = None,
         profile: bool = False,
     ) -> None:
+        temporary_budget_is_default = temporary_budget_bytes is None
+        if temporary_budget_bytes is None:
+            temporary_budget_bytes = GPU_TEMP_BUDGET
         if temporary_budget_bytes <= 0:
             raise ValueError("Temporary GPU budget must be positive")
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self.temporary_budget_bytes = temporary_budget_bytes
+        self._temporary_budget_is_default = temporary_budget_is_default
         self.profile = profile
         self.last_profile: StereoRenderProfile | None = None
         self._offset_transfer_seconds = 0.0
@@ -654,6 +756,7 @@ class StereoRenderer:
     ):
         """Render legacy RGB while retaining only compact diagnostic planes."""
 
+        total_started = time.perf_counter()
         source = np.asarray(frame)
         canonical_values = np.asarray(canonical, dtype=np.float32)
         self._validate_inputs(source, canonical_values, settings)
@@ -661,15 +764,19 @@ class StereoRenderer:
             raise ValueError("Fast compact rendering requires fast settings")
         source = np.ascontiguousarray(source)
         height, width = source.shape[:2]
+        geometry_started = time.perf_counter()
         geometry = build_relative_geometry(
             canonical_values,
             (height, width),
             stereo_strength=settings.stereo_strength,
             convergence=settings.convergence,
         )
+        geometry_seconds = time.perf_counter() - geometry_started
         del frame, canonical, canonical_values
+        offset_started = time.perf_counter()
         legacy_near_score = torch.from_numpy(np.array(geometry.near_score, copy=True, order="C"))
         eye_offsets = calculate_eye_sample_offsets(legacy_near_score, settings)
+        offset_seconds = time.perf_counter() - offset_started
         result = self._render_fast_compact_core(
             source,
             geometry,
@@ -680,7 +787,12 @@ class StereoRenderer:
             ),
         )
         del source, geometry, legacy_near_score, eye_offsets
-        return result
+        return _attach_fast_performance(
+            result,
+            geometry_seconds=geometry_seconds,
+            offset_seconds=offset_seconds,
+            total_started=total_started,
+        )
 
     def render_metric_primitives_fast_compact(
         self,
@@ -690,8 +802,10 @@ class StereoRenderer:
     ):
         """Consume one owned metric primitive without retaining native arrays."""
 
+        total_started = time.perf_counter()
         metric = primitives.metric
         source = np.asarray(frame)
+        geometry_started = time.perf_counter()
         geometry, metric_stats = build_metric_geometry(
             metric.inverse_depth,
             metric.valid,
@@ -702,13 +816,14 @@ class StereoRenderer:
             max_disparity_percent=float(primitives.max_disparity_percent),
             retained_crop_width=primitives.retained_crop_width,
         )
+        geometry_seconds = time.perf_counter() - geometry_started
         del primitives, metric
         self._validate_geometry_inputs(source, geometry, settings)
         source = np.ascontiguousarray(source)
         del frame
-        eye_offsets = calculate_geometry_eye_sample_offsets(
-            geometry.total_disparity_fraction
-        )
+        offset_started = time.perf_counter()
+        eye_offsets = calculate_geometry_eye_sample_offsets(geometry.total_disparity_fraction)
+        offset_seconds = time.perf_counter() - offset_started
         result = self._render_fast_compact_core(
             source,
             geometry,
@@ -717,7 +832,12 @@ class StereoRenderer:
             metric_stats=metric_stats,
         )
         del source, geometry, eye_offsets
-        return result
+        return _attach_fast_performance(
+            result,
+            geometry_seconds=geometry_seconds,
+            offset_seconds=offset_seconds,
+            total_started=total_started,
+        )
 
     def render_geometry_fast_compact(
         self,
@@ -729,16 +849,25 @@ class StereoRenderer:
     ):
         """Render common Fast geometry without public boolean-mask allocations."""
 
+        total_started = time.perf_counter()
         source = np.asarray(frame)
         self._validate_geometry_inputs(source, geometry, settings)
         source = np.ascontiguousarray(source)
+        offset_started = time.perf_counter()
         eye_offsets = calculate_geometry_eye_sample_offsets(geometry.total_disparity_fraction)
-        return self._render_fast_compact_core(
+        offset_seconds = time.perf_counter() - offset_started
+        result = self._render_fast_compact_core(
             source,
             geometry,
             eye_offsets,
             settings,
             metric_stats=metric_stats,
+        )
+        return _attach_fast_performance(
+            result,
+            geometry_seconds=0.0,
+            offset_seconds=offset_seconds,
+            total_started=total_started,
         )
 
     def _render_fast_compact_core(
@@ -797,6 +926,7 @@ class StereoRenderer:
     ):
         from .quality.types import CompactStereoRenderResult
 
+        left_started = time.perf_counter()
         left = self._render_fast_eye_compact(
             source,
             geometry,
@@ -804,6 +934,8 @@ class StereoRenderer:
             settings,
             band_height,
         )
+        left_seconds = time.perf_counter() - left_started
+        right_started = time.perf_counter()
         right = self._render_fast_eye_compact(
             source,
             geometry,
@@ -811,6 +943,7 @@ class StereoRenderer:
             settings,
             band_height,
         )
+        right_seconds = time.perf_counter() - right_started
         return CompactStereoRenderResult(
             left_image=left[0],
             right_image=right[0],
@@ -823,6 +956,10 @@ class StereoRenderer:
             right_hole_runs=right[3].hole_runs,
             left_fast_diagnostics=left[3],
             right_fast_diagnostics=right[3],
+            performance_seconds={
+                "left_eye": left_seconds,
+                "right_eye": right_seconds,
+            },
         )
 
     def _render_fast_eye_compact(
@@ -845,6 +982,12 @@ class StereoRenderer:
         final_unresolved_lane_count = 0
         max_gap_width = math.ceil(width * settings.max_eye_shift_fraction) + 2
         max_gap_samples = HORIZONTAL_SUBPIXELS * max_gap_width
+        native_extension = _native_lane_analyzer()
+        lane_weights = (
+            _lane_mask_weights(self.device)
+            if native_extension is not None and self.device.type == "cuda"
+            else None
+        )
 
         with torch.inference_mode():
             for start_row in range(0, height, band_height):
@@ -886,33 +1029,41 @@ class StereoRenderer:
                 if not torch.isfinite(rendered).all():
                     raise ValueError("Rendered image contains non-finite values")
                 row_count = end_row - start_row
-                prefill = np.ascontiguousarray(splat.valid.detach().cpu().numpy()).reshape(
-                    row_count, width, HORIZONTAL_SUBPIXELS
+                prefill = splat.valid.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
+                filled = fillable.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
+                unresolved = hole_mask.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
+                coverage = coverage_output[start_row:end_row]
+                _analyze_lane_validity(
+                    prefill,
+                    lane_histogram,
+                    span_histogram,
+                    coverage,
+                    native_extension=native_extension,
+                    lane_weights=lane_weights,
                 )
-                filled = np.ascontiguousarray(fillable.detach().cpu().numpy()).reshape(
-                    row_count, width, HORIZONTAL_SUBPIXELS
+                fine_repair = _fast_repair_lane_flags(
+                    filled,
+                    unresolved,
+                    background=settings.occlusion_fill == "background",
                 )
-                unresolved = np.ascontiguousarray(hole_mask.detach().cpu().numpy()).reshape(
-                    row_count, width, HORIZONTAL_SUBPIXELS
+                lane_counts = torch.stack(
+                    (
+                        torch.count_nonzero(filled),
+                        torch.count_nonzero(unresolved),
+                    )
                 )
-                coverage = np.sum(prefill, axis=2, dtype=np.uint16).astype(np.uint8)
-                coverage_output[start_row:end_row] = coverage
                 repair = repair_output[start_row:end_row]
                 repair[(coverage > 0) & (coverage < HORIZONTAL_SUBPIXELS)] |= np.uint8(0x01)
                 repair[coverage == 0] |= np.uint8(0x02)
-                repair[np.any(filled, axis=2)] |= np.uint8(0x04)
-                unresolved_pixels = np.any(unresolved, axis=2)
-                repair[unresolved_pixels] |= np.uint8(0x40)
-                if settings.occlusion_fill == "background":
-                    repair[unresolved_pixels] |= np.uint8(0x08)
-                local_filled_lane_count += int(np.count_nonzero(filled))
-                final_unresolved_lane_count += int(np.count_nonzero(unresolved))
-                _update_hole_histograms(prefill, lane_histogram, span_histogram)
                 downsampled = _downsample_subpixel_band(rendered)
                 output[start_row:end_row] = _convert_image_band(
                     downsampled,
                     source.dtype,
                 )
+                repair |= fine_repair.detach().cpu().numpy()
+                host_lane_counts = lane_counts.detach().cpu().numpy()
+                local_filled_lane_count += int(host_lane_counts[0])
+                final_unresolved_lane_count += int(host_lane_counts[1])
                 del (
                     source_band,
                     near_score_band,
@@ -925,7 +1076,9 @@ class StereoRenderer:
                     prefill,
                     filled,
                     unresolved,
-                    unresolved_pixels,
+                    fine_repair,
+                    lane_counts,
+                    host_lane_counts,
                     coverage,
                     repair,
                     downsampled,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import math
+import time
 from typing import Iterator, Literal
 
 import numpy as np
@@ -70,6 +71,7 @@ class QualityGeometryResult:
     final_region_hash_before_resample: str
     final_region_hash_after_resample: str
     lifetime: GeometryLifetimeTrace
+    performance_seconds: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -547,6 +549,7 @@ def build_relative_quality_geometry(
 ) -> QualityGeometryResult:
     """Execute the ten frozen Quality steps for a relative primitive."""
 
+    build_started = time.perf_counter()
     destination_shape = _validate_geometry_inputs(
         guide_bgr,
         canonical,
@@ -583,6 +586,8 @@ def build_relative_quality_geometry(
     recorder.allocate(2, "fast_baseline", near_score.nbytes + total.nbytes + source_valid.nbytes)
     recorder.checkpoint(2, "fast_baseline_complete")
 
+    region_started = time.perf_counter()
+    baseline_seconds = region_started - build_started
     regions = _solve_final_regions(
         guide_bgr,
         low_regions,
@@ -591,11 +596,15 @@ def build_relative_quality_geometry(
         destination_shape,
         recorder,
     )
+    index_started = time.perf_counter()
+    region_seconds = index_started - region_started
     index = native_kd.build_native_implicit_region_kd(
         regions.source_region_map,
         region_count=regions.region_count,
         include=regions.stable_sample_include,
     )
+    query_started = time.perf_counter()
+    index_seconds = query_started - index_started
     recorder.allocate(6, "retained_zero_index", index.index_bytes)
     recorder.checkpoint(7, "final_geodesic_region_selection")
     budget = VisitBudget(visit_cap)
@@ -607,6 +616,8 @@ def build_relative_quality_geometry(
         budget,
         recorder,
     )
+    finalize_started = time.perf_counter()
+    query_seconds = finalize_started - query_started
     recorder.checkpoint(8, "primitive_resample_complete")
     recorder.release(9, "retained_zero_index")
     del index
@@ -639,6 +650,7 @@ def build_relative_quality_geometry(
         convergence64,
     )
     recorder.checkpoint(10, "derived_geometry_complete")
+    finalize_seconds = time.perf_counter() - finalize_started
     result = _freeze_quality_result(
         near_score=near_score,
         total=total,
@@ -649,6 +661,13 @@ def build_relative_quality_geometry(
         diagnostics=diagnostics,
         displacement=displacement,
         recorder=recorder,
+        performance_seconds={
+            "geometry_baseline": baseline_seconds,
+            "geometry_region_solve": region_seconds,
+            "geometry_index_build": index_seconds,
+            "geometry_nearest_query": query_seconds,
+            "geometry_finalize": finalize_seconds,
+        },
     )
     return result
 
@@ -668,6 +687,7 @@ def build_metric_quality_geometry(
 ) -> QualityGeometryResult:
     """Execute primitive resampling before metric projection and clamp stats."""
 
+    build_started = time.perf_counter()
     destination_shape = _validate_metric_geometry_inputs(
         guide_bgr,
         inverse_depth,
@@ -733,6 +753,8 @@ def build_metric_quality_geometry(
     recorder.allocate(2, "fast_baseline", baseline_bytes)
     recorder.checkpoint(2, "fast_baseline_complete")
 
+    region_started = time.perf_counter()
+    baseline_seconds = region_started - build_started
     regions = _solve_final_regions(
         guide_bgr,
         low_regions,
@@ -741,11 +763,15 @@ def build_metric_quality_geometry(
         destination_shape,
         recorder,
     )
+    index_started = time.perf_counter()
+    region_seconds = index_started - region_started
     index = native_kd.build_native_implicit_region_kd(
         regions.source_region_map,
         region_count=regions.region_count,
         include=regions.stable_sample_include,
     )
+    query_started = time.perf_counter()
+    index_seconds = query_started - index_started
     recorder.allocate(6, "retained_zero_index", index.index_bytes)
     recorder.checkpoint(7, "final_geodesic_region_selection")
     budget = VisitBudget(visit_cap)
@@ -757,6 +783,8 @@ def build_metric_quality_geometry(
         budget,
         recorder,
     )
+    finalize_started = time.perf_counter()
+    query_seconds = finalize_started - query_started
     recorder.checkpoint(8, "primitive_resample_complete")
     recorder.release(9, "retained_zero_index")
     del index
@@ -797,6 +825,7 @@ def build_metric_quality_geometry(
         destination_shape[1],
     )
     recorder.checkpoint(10, "derived_geometry_complete")
+    finalize_seconds = time.perf_counter() - finalize_started
     return _freeze_quality_result(
         near_score=baseline.near_score,
         total=baseline.total_disparity_fraction,
@@ -807,6 +836,13 @@ def build_metric_quality_geometry(
         diagnostics=diagnostics,
         displacement=displacement,
         recorder=recorder,
+        performance_seconds={
+            "geometry_baseline": baseline_seconds,
+            "geometry_region_solve": region_seconds,
+            "geometry_index_build": index_seconds,
+            "geometry_nearest_query": query_seconds,
+            "geometry_finalize": finalize_seconds,
+        },
     )
 
 
@@ -1504,6 +1540,7 @@ def _freeze_quality_result(
     diagnostics: _ResampleDiagnostics,
     displacement: np.ndarray,
     recorder: _LifetimeRecorder,
+    performance_seconds: dict[str, float],
 ) -> QualityGeometryResult:
     max_jump = _max_four_neighbour_jump(displacement)
     predicted_gap = int(math.ceil(max_jump)) + 2
@@ -1538,6 +1575,7 @@ def _freeze_quality_result(
         final_region_hash_before_resample=region_state.final_region_hash,
         final_region_hash_after_resample=after_hash,
         lifetime=recorder.freeze(),
+        performance_seconds=dict(performance_seconds),
     )
 
 

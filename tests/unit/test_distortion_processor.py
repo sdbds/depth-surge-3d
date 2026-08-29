@@ -447,6 +447,65 @@ class TestApplyDistortion:
 
         assert result is False
 
+    def test_fused_distortion_crop_is_byte_exact_and_reusable(self, tmp_path):
+        """The fused path removes Stage 5 without changing Stage 6 bytes."""
+        left_source = tmp_path / "left_source"
+        right_source = tmp_path / "right_source"
+        for directory in (left_source, right_source):
+            directory.mkdir()
+
+        rng = np.random.default_rng(29)
+        left_files = []
+        right_files = []
+        for index in range(3):
+            left_path = left_source / f"frame_{index:04d}.png"
+            right_path = right_source / f"frame_{index:04d}.png"
+            assert cv2.imwrite(str(left_path), rng.integers(0, 256, (48, 64, 3), dtype=np.uint8))
+            assert cv2.imwrite(str(right_path), rng.integers(0, 256, (48, 64, 3), dtype=np.uint8))
+            left_files.append(left_path)
+            right_files.append(right_path)
+
+        baseline = {
+            "left_distorted": tmp_path / "baseline_left_distorted",
+            "right_distorted": tmp_path / "baseline_right_distorted",
+            "left_cropped": tmp_path / "baseline_left_cropped",
+            "right_cropped": tmp_path / "baseline_right_cropped",
+        }
+        fused = {
+            "left_cropped": tmp_path / "fused_left_cropped",
+            "right_cropped": tmp_path / "fused_right_cropped",
+        }
+        for directory in (*baseline.values(), *fused.values()):
+            directory.mkdir()
+
+        settings = {
+            "apply_distortion": True,
+            "fisheye_fov": 120,
+            "fisheye_projection": "equisolid",
+            "fisheye_crop_factor": 0.8,
+            "per_eye_width": 40,
+            "per_eye_height": 32,
+        }
+        processor = DistortionProcessor()
+
+        assert processor.apply_distortion(left_files, right_files, baseline, settings)
+        assert processor.crop_frames(baseline, settings, total_frames=3)
+        assert processor.apply_distortion_and_crop(left_files, right_files, fused, settings)
+
+        for eye in ("left", "right"):
+            baseline_files = sorted(baseline[f"{eye}_cropped"].glob("*.png"))
+            fused_files = sorted(fused[f"{eye}_cropped"].glob("*.png"))
+            assert [path.name for path in fused_files] == [path.name for path in baseline_files]
+            assert [path.read_bytes() for path in fused_files] == [
+                path.read_bytes() for path in baseline_files
+            ]
+
+        with patch(
+            "src.depth_surge_3d.processing.frames.distortion_processor.cv2.imread",
+            side_effect=AssertionError("reusable fused output must not decode"),
+        ):
+            assert processor.apply_distortion_and_crop(left_files, right_files, fused, settings)
+
 
 class TestCropFrames:
     """Test crop_frames method."""

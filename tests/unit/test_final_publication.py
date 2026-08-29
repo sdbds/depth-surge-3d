@@ -2196,6 +2196,8 @@ def test_reserved_publication_retires_descriptors_then_index_last(tmp_path) -> N
     initial = _artifact(
         processing_settings=validate_settings(
             {
+                "direct_vr_encode": False,
+                "keep_intermediates": True,
                 "vr_resolution": "custom:1920x1080",
                 "per_eye_width": 960,
                 "per_eye_height": 1080,

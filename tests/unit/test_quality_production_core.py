@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 
 import numpy as np
+import pytest
 
 from scripts.quality_task0 import quality_geometry as prototype_geometry
 
@@ -98,6 +99,11 @@ def test_production_native_module_uses_frozen_prebuilt_algorithm() -> None:
     assert native.native_available()
     build_info = native.native_build_info()
     assert build_info["algorithm"] == "quality-implicit-region-kd-hybrid-nth-element-v2"
+    assert build_info["index_build_parallelism"] == "deterministic-region-std-thread-v1"
+    assert 1 <= build_info["index_build_worker_cap"] <= 32
+    assert build_info["geometry_query_parallelism"] == "deterministic-std-thread-v1"
+    assert 1 <= build_info["geometry_query_worker_cap"] <= 32
+    assert build_info["native_spawned_worker_cap"] == 7
     assert build_info["kd_stack_capacity"] == 64
     assert build_info["runtime_jit"] is False
     assert len(build_info["source_sha256"]) == 64

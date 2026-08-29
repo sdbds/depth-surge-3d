@@ -19,9 +19,19 @@ from src.depth_surge_3d.core.settings import (
 from src.depth_surge_3d.core.constants import DEFAULT_SETTINGS
 
 
-def test_direct_vr_encode_defaults_off() -> None:
-    assert DEFAULT_SETTINGS["direct_vr_encode"] is False
+def test_direct_vr_encode_defaults_on_for_new_jobs_and_off_for_legacy_omission() -> None:
+    assert DEFAULT_SETTINGS["direct_vr_encode"] is True
+    assert validate_settings({}, source="explicit")["direct_vr_encode"] is True
     assert validate_settings({}, source="legacy_disk")["direct_vr_encode"] is False
+
+
+def test_legacy_intermediate_retention_omission_preserves_historical_default() -> None:
+    assert validate_settings({}, source="legacy_disk")["keep_intermediates"] is True
+
+
+def test_intermediate_retention_defaults_off() -> None:
+    assert DEFAULT_SETTINGS["keep_intermediates"] is False
+    assert validate_settings({}, source="explicit")["keep_intermediates"] is False
 
 
 @pytest.mark.parametrize("value", [0, 1, "false", "true", None])
@@ -173,6 +183,20 @@ def test_v5_accepts_materialized_nullable_numeric_fields() -> None:
     assert loaded.settings["preview_update_interval"] is None
 
 
+def test_v5_omission_preserves_historical_storage_defaults() -> None:
+    loaded = parse_saved_processing_settings(
+        {
+            "temporal_postprocessor": "off",
+            "stereo_render_mode": "fast",
+            "occlusion_fill_max_px": 8,
+        },
+        saved_version=5,
+    )
+
+    assert loaded.settings["direct_vr_encode"] is False
+    assert loaded.settings["keep_intermediates"] is True
+
+
 def test_future_schema_fails_without_mutating_input() -> None:
     raw = {"temporal_postprocessor": "vdpp", "future_knob": True}
     original = dict(raw)
@@ -271,9 +295,9 @@ def test_schema_four_migrates_to_fast_and_limit_eight() -> None:
 @pytest.mark.parametrize(
     ("persisted", "override", "is_resume", "device", "expected"),
     [
-        (None, None, False, "cuda", "quality"),
-        (None, None, False, "cuda:0", "quality"),
-        (None, None, False, "CUDA", "quality"),
+        (None, None, False, "cuda", "fast"),
+        (None, None, False, "cuda:0", "fast"),
+        (None, None, False, "CUDA", "fast"),
         (None, None, False, "cpu", "fast"),
         ("quality", None, False, "cpu", "fast"),
         ("quality", None, True, "cpu", "quality"),

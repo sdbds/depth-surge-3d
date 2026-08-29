@@ -24,7 +24,11 @@ BUILD_OUTPUT = ROOT / "build" / "quality-task0-native-artifacts" / sysconfig.get
 def _compile_arguments() -> list[str]:
     if os.name == "nt":
         return ["/O2", "/std:c++17", "/EHsc", "/permissive-", "/fp:strict"]
-    return ["-O3", "-std=c++17", "-fvisibility=hidden", "-ffp-contract=off"]
+    return ["-O3", "-std=c++17", "-fvisibility=hidden", "-ffp-contract=off", "-pthread"]
+
+
+def _link_arguments() -> list[str]:
+    return [] if os.name == "nt" else ["-pthread"]
 
 
 def build_native_extension(
@@ -38,8 +42,7 @@ def build_native_extension(
     source_sha256 = hashlib.sha256(SOURCE.read_bytes()).hexdigest()
     identity_header = build_temp / "quality_kd_build_identity.h"
     identity_header.write_text(
-        "#pragma once\n"
-        f'#define QUALITY_KD_SOURCE_SHA256 "{source_sha256}"\n',
+        "#pragma once\n" f'#define QUALITY_KD_SOURCE_SHA256 "{source_sha256}"\n',
         encoding="ascii",
     )
     extension = Extension(
@@ -48,6 +51,7 @@ def build_native_extension(
         include_dirs=[str(build_temp), np.get_include(), *include_paths()],
         language="c++",
         extra_compile_args=_compile_arguments(),
+        extra_link_args=_link_arguments(),
     )
     distribution = Distribution(
         {

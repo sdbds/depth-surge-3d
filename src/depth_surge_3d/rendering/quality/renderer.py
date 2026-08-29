@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import gc
 import math
+import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Literal
+from typing import Callable, Iterator, Literal
 
 import cv2
 import numpy as np
@@ -52,7 +54,18 @@ from .visibility import QualitySplatBand, _quality_splat_band_prevalidated
 
 QUALITY_HOST_BUDGET_BYTES = 512 * 1024 * 1024
 QUALITY_RUNTIME_OVERHEAD_BYTES = 16 * 1024 * 1024
+QUALITY_NATIVE_SPAWNED_WORKER_CAP = 7
+QUALITY_PYTHON_REPAIR_WORKER_COUNT = 1
+QUALITY_AUXILIARY_THREAD_STACK_BYTES = 8 * 1024 * 1024
+QUALITY_AUXILIARY_THREAD_COUNT = (
+    QUALITY_NATIVE_SPAWNED_WORKER_CAP + QUALITY_PYTHON_REPAIR_WORKER_COUNT
+)
+QUALITY_AUXILIARY_THREAD_BYTES = (
+    QUALITY_AUXILIARY_THREAD_COUNT * QUALITY_AUXILIARY_THREAD_STACK_BYTES
+)
 QUALITY_SPLAT_BYTES_PER_PIXEL = 1536
+QUALITY_CUDA_BUDGET_CAP_BYTES = 512 * 1024 * 1024
+QUALITY_CUDA_FREE_BUDGET_DIVISOR = 8
 QUALITY_SCATTER_WORKSPACE_BYTES = 12 * 1024 * 1024
 QUALITY_SCATTER_CHUNK_PIXELS = QUALITY_SCATTER_WORKSPACE_BYTES // (HORIZONTAL_SUBPIXELS * 4)
 
@@ -68,6 +81,27 @@ def _calculate_quality_band_height(
         raise ValueError("Quality temporary GPU budget must be positive")
     rows = temporary_budget_bytes // (render_width * QUALITY_SPLAT_BYTES_PER_PIXEL)
     return min(render_height, max(1, rows))
+
+
+def _quality_temporary_budget_bytes(renderer: StereoRenderer) -> int:
+    """Grow only the default budget while retaining most live free VRAM."""
+
+    configured = int(renderer.temporary_budget_bytes)
+    if (
+        renderer.device.type != "cuda"
+        or not getattr(renderer, "_temporary_budget_is_default", False)
+        or configured >= QUALITY_CUDA_BUDGET_CAP_BYTES
+    ):
+        return configured
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(renderer.device)
+    except (AssertionError, RuntimeError):
+        return configured
+    adaptive = min(
+        QUALITY_CUDA_BUDGET_CAP_BYTES,
+        int(free_bytes) // QUALITY_CUDA_FREE_BUDGET_DIVISOR,
+    )
+    return max(configured, adaptive)
 
 
 def _quality_public_memory_preflight(
@@ -97,29 +131,42 @@ def _quality_public_memory_preflight(
         )
     histogram_bytes = 272 * (width + 1)
     runtime = QUALITY_RUNTIME_OVERHEAD_BYTES
+    auxiliary_threads = QUALITY_AUXILIARY_THREAD_BYTES
     phases = {
-        "quality-lowres-region": 3 * output_pixels + 22 * native_pixels + runtime,
-        "quality-geometry-nearest": 64 * output_pixels + 17 * native_pixels + runtime,
-        "quality-region": 52 * output_pixels + 18 * native_pixels + runtime,
-        "quality-geometry-matte": 68 * output_pixels + 18 * native_pixels + runtime,
+        "quality-lowres-region": (
+            3 * output_pixels + 22 * native_pixels + runtime + auxiliary_threads
+        ),
+        "quality-geometry-nearest": (
+            64 * output_pixels + 17 * native_pixels + runtime + auxiliary_threads
+        ),
+        "quality-region": (52 * output_pixels + 18 * native_pixels + runtime + auxiliary_threads),
+        "quality-geometry-matte": (
+            68 * output_pixels + 18 * native_pixels + runtime + auxiliary_threads
+        ),
     }
     if occlusion_fill == "background":
-        visibility = 40 * output_pixels + 9 * native_pixels + histogram_bytes + runtime
-        proxy = 100 * output_pixels + 9 * native_pixels + histogram_bytes + runtime
+        visibility = (
+            40 * output_pixels + 9 * native_pixels + histogram_bytes + runtime + auxiliary_threads
+        )
+        proxy = (
+            100 * output_pixels + 9 * native_pixels + histogram_bytes + runtime + auxiliary_threads
+        )
         phases["quality-background-visibility"] = visibility
         phases["quality-background-proxy"] = proxy
         if materialize_public_masks:
             phases["quality-public"] = max(
                 proxy,
-                14 * output_pixels + histogram_bytes + runtime,
+                14 * output_pixels + histogram_bytes + runtime + auxiliary_threads,
             )
     else:
-        visibility = 40 * output_pixels + 9 * native_pixels + histogram_bytes + runtime
+        visibility = (
+            40 * output_pixels + 9 * native_pixels + histogram_bytes + runtime + auxiliary_threads
+        )
         phases["quality-none-visibility"] = visibility
         if materialize_public_masks:
             phases["quality-none-public"] = max(
                 visibility,
-                14 * output_pixels + histogram_bytes + runtime,
+                14 * output_pixels + histogram_bytes + runtime + auxiliary_threads,
             )
     phase, required = max(phases.items(), key=lambda item: item[1])
     if required > QUALITY_HOST_BUDGET_BYTES:
@@ -147,11 +194,27 @@ class _CompactEyeResult:
     hole_runs: HoleRunDiagnostics | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedRelativeQualityFrame:
+    source: np.ndarray
+    geometry: QualityGeometryResult
+    settings: StereoRenderSettings
+    indexed_sample_count: int
+    prepare_seconds: float
+
+
 @dataclass(frozen=True)
 class _UnrepairedEyeResult:
     image: np.ndarray
     coverage_count: np.ndarray
     hole_runs: HoleRunDiagnostics
+
+
+@dataclass(frozen=True)
+class _QualityDeviceFrame:
+    source: torch.Tensor
+    near_score: torch.Tensor
+    source_valid: torch.Tensor
 
 
 @dataclass
@@ -190,6 +253,40 @@ def _retry_after_oom(
             state.current_height = state.retry_height
 
 
+def _preload_quality_device_frame(
+    renderer: StereoRenderer,
+    source: np.ndarray,
+    geometry: QualityGeometryResult,
+) -> _QualityDeviceFrame | None:
+    if renderer.device.type != "cuda":
+        return None
+    device_source = None
+    device_near_score = None
+    device_source_valid = None
+    try:
+        device_source = torch.from_numpy(source).to(renderer.device)
+        device_near_score = torch.from_numpy(
+            np.array(geometry.near_score, copy=True, order="C")
+        ).to(renderer.device)
+        device_source_valid = torch.from_numpy(
+            np.array(geometry.source_valid, copy=True, order="C")
+        ).to(renderer.device)
+    except torch.cuda.OutOfMemoryError:
+        device_source = None
+        device_near_score = None
+        device_source_valid = None
+        _release_after_oom(renderer)
+        return None
+    assert device_source is not None
+    assert device_near_score is not None
+    assert device_source_valid is not None
+    return _QualityDeviceFrame(
+        source=device_source,
+        near_score=device_near_score,
+        source_valid=device_source_valid,
+    )
+
+
 def _quality_splat(
     renderer: StereoRenderer,
     source: np.ndarray,
@@ -197,18 +294,31 @@ def _quality_splat(
     offsets: np.ndarray,
     start_row: int,
     end_row: int,
+    *,
+    device_frame: _QualityDeviceFrame | None = None,
+    device_offsets: torch.Tensor | None = None,
 ) -> QualitySplatBand:
     width = source.shape[1]
-    source_band = torch.from_numpy(np.ascontiguousarray(source[start_row:end_row])).to(
-        renderer.device
-    )
-    near_score_band = torch.from_numpy(
-        np.array(geometry.near_score[start_row:end_row], copy=True, order="C")
-    ).to(renderer.device)
-    source_valid_band = torch.from_numpy(
-        np.array(geometry.source_valid[start_row:end_row], copy=True, order="C")
-    ).to(renderer.device)
-    offset_band = renderer._transfer_offset_band(offsets[start_row:end_row])
+    if device_frame is None:
+        source_band = torch.from_numpy(np.ascontiguousarray(source[start_row:end_row])).to(
+            renderer.device
+        )
+        near_score_band = torch.from_numpy(
+            np.array(geometry.near_score[start_row:end_row], copy=True, order="C")
+        ).to(renderer.device)
+        source_valid_band = torch.from_numpy(
+            np.array(geometry.source_valid[start_row:end_row], copy=True, order="C")
+        ).to(renderer.device)
+        offset_band = renderer._transfer_offset_band(offsets[start_row:end_row])
+    else:
+        source_band = device_frame.source[start_row:end_row]
+        near_score_band = device_frame.near_score[start_row:end_row]
+        source_valid_band = device_frame.source_valid[start_row:end_row]
+        offset_band = (
+            renderer._transfer_offset_band(offsets[start_row:end_row])
+            if device_offsets is None
+            else device_offsets[start_row:end_row]
+        )
     return _quality_splat_band_prevalidated(
         source_band,
         near_score_band,
@@ -425,6 +535,7 @@ def _render_unrepaired_eye_once(
     geometry: QualityGeometryResult,
     offsets: np.ndarray,
     band_height: int,
+    device_frame: _QualityDeviceFrame | None = None,
 ) -> _UnrepairedEyeResult:
     height, width = source.shape[:2]
     output = np.empty_like(source)
@@ -436,9 +547,24 @@ def _render_unrepaired_eye_once(
     if renderer.device.type == "cuda":
         native_extension = native_kd._require_native()
         lane_weights = _lane_mask_weights(renderer.device)
+    device_offsets = None
+    if device_frame is not None:
+        try:
+            device_offsets = renderer._transfer_offset_band(offsets)
+        except torch.cuda.OutOfMemoryError:
+            _release_after_oom(renderer)
     for start_row in range(0, height, band_height):
         end_row = min(height, start_row + band_height)
-        band = _quality_splat(renderer, source, geometry, offsets, start_row, end_row)
+        band = _quality_splat(
+            renderer,
+            source,
+            geometry,
+            offsets,
+            start_row,
+            end_row,
+            device_frame=device_frame,
+            device_offsets=device_offsets,
+        )
         lane_valid = band.splat.valid.reshape(
             end_row - start_row,
             width,
@@ -487,6 +613,7 @@ def _render_none_eye_once(
     geometry: QualityGeometryResult,
     offsets: np.ndarray,
     band_height: int,
+    device_frame: _QualityDeviceFrame | None = None,
 ) -> _CompactEyeResult:
     unrepaired = _render_unrepaired_eye_once(
         renderer=renderer,
@@ -494,6 +621,7 @@ def _render_none_eye_once(
         geometry=geometry,
         offsets=offsets,
         band_height=band_height,
+        device_frame=device_frame,
     )
     return _CompactEyeResult(
         unrepaired.image,
@@ -832,8 +960,25 @@ def _render_background_eye(
         geometry=geometry,
         offsets=offsets,
     )
+    return _finish_background_eye(
+        pre_repair=pre_repair,
+        source=source,
+        eye=eye,
+        controls_limit_px=controls_limit_px,
+        predicted_gap_px=geometry.predicted_gap_px,
+    )
+
+
+def _finish_background_eye(
+    *,
+    pre_repair: _UnrepairedEyeResult,
+    source: np.ndarray,
+    eye: Literal["left", "right"],
+    controls_limit_px: int,
+    predicted_gap_px: int,
+) -> _CompactEyeResult:
     safe_limit = max(1, math.floor(controls_limit_px * source.shape[0] / 1080.0 + 0.5))
-    local_limit = min(safe_limit, geometry.predicted_gap_px)
+    local_limit = min(safe_limit, predicted_gap_px)
     image = _composite_background_proxy(
         pre_repair.image,
         pre_repair.coverage_count,
@@ -851,6 +996,94 @@ def _render_background_eye(
         repair_bits,
         summary,
         pre_repair.hole_runs,
+    )
+
+
+def _render_quality_eyes(
+    *,
+    renderer: StereoRenderer,
+    source: np.ndarray,
+    geometry: QualityGeometryResult,
+    offset_builder: Callable[[Literal["left", "right"]], np.ndarray],
+    occlusion_fill: Literal["none", "background"],
+    controls_limit_px: int,
+) -> tuple[_CompactEyeResult, _CompactEyeResult, dict[str, float]]:
+    height, width = source.shape[:2]
+    initial_height = _calculate_quality_band_height(
+        width,
+        height,
+        _quality_temporary_budget_bytes(renderer),
+    )
+    device_frame = _preload_quality_device_frame(renderer, source, geometry)
+    band_state = _FrameBandState(
+        initial_height=initial_height,
+        retry_height=max(1, initial_height // 2),
+        current_height=initial_height,
+    )
+    if occlusion_fill == "none":
+        eyes: list[_CompactEyeResult] = []
+        eye_seconds: dict[str, float] = {}
+        for eye in ("left", "right"):
+            eye_started = time.perf_counter()
+            offsets = offset_builder(eye)
+            result = _retry_after_oom(
+                renderer,
+                band_state,
+                _render_none_eye_once,
+                renderer=renderer,
+                source=source,
+                geometry=geometry,
+                offsets=offsets,
+                device_frame=device_frame,
+            )
+            eyes.append(result)
+            del offsets
+            eye_seconds[f"{eye}_eye"] = time.perf_counter() - eye_started
+        return eyes[0], eyes[1], eye_seconds
+
+    def render_unrepaired(eye: Literal["left", "right"]):
+        started = time.perf_counter()
+        offsets = offset_builder(eye)
+        result = _retry_after_oom(
+            renderer,
+            band_state,
+            _render_unrepaired_eye_once,
+            renderer=renderer,
+            source=source,
+            geometry=geometry,
+            offsets=offsets,
+            device_frame=device_frame,
+        )
+        del offsets
+        return result, time.perf_counter() - started
+
+    def finish(pre_repair: _UnrepairedEyeResult, eye: Literal["left", "right"]):
+        started = time.perf_counter()
+        result = _finish_background_eye(
+            pre_repair=pre_repair,
+            source=source,
+            eye=eye,
+            controls_limit_px=controls_limit_px,
+            predicted_gap_px=geometry.predicted_gap_px,
+        )
+        return result, time.perf_counter() - started
+
+    left_pre_repair, left_prefix_seconds = render_unrepaired("left")
+    with ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="quality-left-repair",
+    ) as executor:
+        left_future = executor.submit(finish, left_pre_repair, "left")
+        right_pre_repair, right_prefix_seconds = render_unrepaired("right")
+        right, right_finish_seconds = finish(right_pre_repair, "right")
+        left, left_finish_seconds = left_future.result()
+    return (
+        left,
+        right,
+        {
+            "left_eye": left_prefix_seconds + left_finish_seconds,
+            "right_eye": right_prefix_seconds + right_finish_seconds,
+        },
     )
 
 
@@ -915,57 +1148,26 @@ def _render_metric_quality_eyes(
     source: np.ndarray,
     geometry: QualityGeometryResult,
     controls: QualityStereoControls,
-) -> tuple[_CompactEyeResult, _CompactEyeResult]:
-    height, width = source.shape[:2]
-    initial_height = _calculate_quality_band_height(
-        width,
-        height,
-        renderer.temporary_budget_bytes,
+) -> tuple[_CompactEyeResult, _CompactEyeResult, dict[str, float]]:
+    return _render_quality_eyes(
+        renderer=renderer,
+        source=source,
+        geometry=geometry,
+        offset_builder=lambda eye: _build_metric_eye_offsets(geometry, eye),
+        occlusion_fill=controls.occlusion_fill,
+        controls_limit_px=controls.occlusion_fill_max_px,
     )
-    band_state = _FrameBandState(
-        initial_height=initial_height,
-        retry_height=max(1, initial_height // 2),
-        current_height=initial_height,
-    )
-    eyes: list[_CompactEyeResult] = []
-    for eye in ("left", "right"):
-        offsets = _build_metric_eye_offsets(geometry, eye)
-        if controls.occlusion_fill == "none":
-            result = _retry_after_oom(
-                renderer,
-                band_state,
-                _render_none_eye_once,
-                renderer=renderer,
-                source=source,
-                geometry=geometry,
-                offsets=offsets,
-            )
-        else:
-            result = _render_background_eye(
-                renderer=renderer,
-                source=source,
-                geometry=geometry,
-                offsets=offsets,
-                eye=eye,
-                controls_limit_px=controls.occlusion_fill_max_px,
-                band_state=band_state,
-            )
-        eyes.append(result)
-        del offsets
-    return eyes[0], eyes[1]
 
 
-def render_relative_quality_compact(
+def prepare_relative_quality_frame(
     *,
-    renderer: StereoRenderer,
     frame: np.ndarray,
     canonical: np.ndarray,
     settings: StereoRenderSettings,
-) -> CompactStereoRenderResult:
-    """Render relative primitives with sequential compact Quality eyes."""
+) -> PreparedRelativeQualityFrame:
+    """Build deterministic CPU geometry before the GPU eye stage."""
 
-    if not isinstance(renderer, StereoRenderer):
-        raise TypeError("renderer must be StereoRenderer")
+    prepare_started = time.perf_counter()
     if not isinstance(settings, StereoRenderSettings) or settings.stereo_render_mode != "quality":
         raise ValueError("Quality rendering requires StereoRenderSettings in quality mode")
     frame_values = np.asarray(frame)
@@ -992,43 +1194,39 @@ def render_relative_quality_compact(
         convergence=settings.convergence,
     )
     indexed_sample_count = int(canonical_values.size)
-    del canonical, canonical_input, canonical_values, frame, frame_values
-    initial_height = _calculate_quality_band_height(
-        width,
-        height,
-        renderer.temporary_budget_bytes,
+    return PreparedRelativeQualityFrame(
+        source=source,
+        geometry=geometry,
+        settings=settings,
+        indexed_sample_count=indexed_sample_count,
+        prepare_seconds=time.perf_counter() - prepare_started,
     )
-    band_state = _FrameBandState(
-        initial_height=initial_height,
-        retry_height=max(1, initial_height // 2),
-        current_height=initial_height,
+
+
+def render_prepared_relative_quality_compact(
+    *,
+    renderer: StereoRenderer,
+    prepared: PreparedRelativeQualityFrame,
+) -> CompactStereoRenderResult:
+    """Render GPU eyes from one owned, precomputed relative geometry frame."""
+
+    render_started = time.perf_counter()
+    if not isinstance(renderer, StereoRenderer):
+        raise TypeError("renderer must be StereoRenderer")
+    if not isinstance(prepared, PreparedRelativeQualityFrame):
+        raise TypeError("prepared must be PreparedRelativeQualityFrame")
+    source = prepared.source
+    geometry = prepared.geometry
+    settings = prepared.settings
+    height = source.shape[0]
+    left, right, eye_seconds = _render_quality_eyes(
+        renderer=renderer,
+        source=source,
+        geometry=geometry,
+        offset_builder=lambda eye: _build_eye_offsets(geometry, settings, eye),
+        occlusion_fill=settings.occlusion_fill,
+        controls_limit_px=settings.occlusion_fill_max_px,
     )
-    eyes: list[_CompactEyeResult] = []
-    for eye in ("left", "right"):
-        offsets = _build_eye_offsets(geometry, settings, eye)
-        if settings.occlusion_fill == "none":
-            result = _retry_after_oom(
-                renderer,
-                band_state,
-                _render_none_eye_once,
-                renderer=renderer,
-                source=source,
-                geometry=geometry,
-                offsets=offsets,
-            )
-        else:
-            result = _render_background_eye(
-                renderer=renderer,
-                source=source,
-                geometry=geometry,
-                offsets=offsets,
-                eye=eye,
-                controls_limit_px=settings.occlusion_fill_max_px,
-                band_state=band_state,
-            )
-        eyes.append(result)
-        del offsets
-    left, right = eyes
     safe_limit = max(
         1,
         math.floor(settings.occlusion_fill_max_px * height / 1080.0 + 0.5),
@@ -1056,7 +1254,7 @@ def render_relative_quality_compact(
         left_plan=left.plan,
         right_plan=right.plan,
         geometry_nearest={
-            "indexed_sample_count": indexed_sample_count,
+            "indexed_sample_count": prepared.indexed_sample_count,
             "query_count": int(geometry.geometry_query_count),
             "visited_nodes_total": int(geometry.geometry_visited_nodes_total),
             "visited_nodes_max": int(geometry.geometry_visited_nodes_max),
@@ -1064,9 +1262,33 @@ def render_relative_quality_compact(
         quality_limits=quality_limits,
         left_hole_runs=left.hole_runs,
         right_hole_runs=right.hole_runs,
+        performance_seconds={
+            **geometry.performance_seconds,
+            **eye_seconds,
+            "total": prepared.prepare_seconds + time.perf_counter() - render_started,
+        },
     )
-    del source, geometry, eyes, left, right
     return result
+
+
+def render_relative_quality_compact(
+    *,
+    renderer: StereoRenderer,
+    frame: np.ndarray,
+    canonical: np.ndarray,
+    settings: StereoRenderSettings,
+) -> CompactStereoRenderResult:
+    """Render relative primitives through the split Quality work stages."""
+
+    prepared = prepare_relative_quality_frame(
+        frame=frame,
+        canonical=canonical,
+        settings=settings,
+    )
+    return render_prepared_relative_quality_compact(
+        renderer=renderer,
+        prepared=prepared,
+    )
 
 
 def render_metric_primitives_compact(
@@ -1078,6 +1300,7 @@ def render_metric_primitives_compact(
 ) -> CompactStereoRenderResult:
     """Render native metric primitives after edge-aware Quality resampling."""
 
+    total_started = time.perf_counter()
     if not isinstance(renderer, StereoRenderer):
         raise TypeError("renderer must be StereoRenderer")
     if not isinstance(primitives, MetricStereoPrimitiveInput):
@@ -1117,7 +1340,7 @@ def render_metric_primitives_compact(
     )
     indexed_sample_count = int(metric.inverse_depth.size)
     del frame, frame_values, primitives, metric
-    left, right = _render_metric_quality_eyes(
+    left, right, eye_seconds = _render_metric_quality_eyes(
         renderer=renderer,
         source=source,
         geometry=geometry,
@@ -1152,6 +1375,11 @@ def render_metric_primitives_compact(
         quality_limits=quality_limits,
         left_hole_runs=left.hole_runs,
         right_hole_runs=right.hole_runs,
+        performance_seconds={
+            **geometry.performance_seconds,
+            **eye_seconds,
+            "total": time.perf_counter() - total_started,
+        },
     )
     del source, geometry, left, right
     return result

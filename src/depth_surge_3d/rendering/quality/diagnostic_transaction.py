@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Iterator, Literal
@@ -94,9 +95,7 @@ def canonical_json_bytes(value: object) -> bytes:
             return
         if isinstance(current, (float, np.floating)):
             output.write(
-                json.dumps(float(current), allow_nan=False, separators=(",", ":")).encode(
-                    "ascii"
-                )
+                json.dumps(float(current), allow_nan=False, separators=(",", ":")).encode("ascii")
             )
             return
         if isinstance(current, str):
@@ -170,6 +169,90 @@ class QualityFramePublication:
         object.__setattr__(self, "job_root", root)
 
 
+class SharedQualityPngPayloads:
+    """Lazily encode one immutable PNG payload per compact raster."""
+
+    __slots__ = ("_condition", "_errors", "_payloads", "_sources", "_states")
+
+    _PENDING = 0
+    _ENCODING = 1
+    _READY = 2
+    _FAILED = 3
+
+    def __init__(
+        self,
+        *,
+        compact: CompactStereoRenderResult,
+        keep_masks: bool,
+    ) -> None:
+        if not isinstance(compact, CompactStereoRenderResult):
+            raise TypeError("shared PNG payloads require a compact render result")
+        if not isinstance(keep_masks, bool):
+            raise TypeError("shared PNG mask selection must be boolean")
+        self._sources: dict[str, np.ndarray | None] = {
+            "left_rgb": compact.left_image,
+            "right_rgb": compact.right_image,
+            "left_coverage": compact.left_coverage_count if keep_masks else None,
+            "left_repair": compact.left_repair_bits if keep_masks else None,
+            "right_coverage": compact.right_coverage_count if keep_masks else None,
+            "right_repair": compact.right_repair_bits if keep_masks else None,
+        }
+        self._states = {name: self._PENDING for name in self._sources}
+        self._payloads: dict[str, np.ndarray] = {}
+        self._errors: dict[str, BaseException] = {}
+        self._condition = threading.Condition()
+
+    def matches(self, compact: CompactStereoRenderResult, *, keep_masks: bool) -> bool:
+        expected = (
+            compact.left_image,
+            compact.right_image,
+            compact.left_coverage_count if keep_masks else None,
+            compact.left_repair_bits if keep_masks else None,
+            compact.right_coverage_count if keep_masks else None,
+            compact.right_repair_bits if keep_masks else None,
+        )
+        return all(
+            source is candidate
+            for source, candidate in zip(self._sources.values(), expected, strict=True)
+        )
+
+    def payload(self, name: str) -> np.ndarray | None:
+        try:
+            source = self._sources[name]
+        except KeyError as error:
+            raise ValueError(f"unknown shared PNG payload: {name}") from error
+        if source is None:
+            return None
+
+        with self._condition:
+            while True:
+                state = self._states[name]
+                if state == self._READY:
+                    return self._payloads[name]
+                if state == self._FAILED:
+                    raise OSError(f"shared PNG encoding failed for {name}") from self._errors[name]
+                if state == self._PENDING:
+                    self._states[name] = self._ENCODING
+                    break
+                self._condition.wait()
+
+        try:
+            payload = _png_buffer(source)
+            payload.setflags(write=False)
+        except BaseException as error:
+            with self._condition:
+                self._errors[name] = error
+                self._states[name] = self._FAILED
+                self._condition.notify_all()
+            raise
+
+        with self._condition:
+            self._payloads[name] = payload
+            self._states[name] = self._READY
+            self._condition.notify_all()
+        return payload
+
+
 @dataclass(frozen=True)
 class PreparedQualityFramePublication:
     """Writer payload with frame statistics serialized and planning state released."""
@@ -192,16 +275,24 @@ class PreparedQualityFramePublication:
     keep_masks: bool
     render_mode: Literal["fast", "quality"]
     quality_limits: dict[str, dict[str, int | float]] | None
+    png_payloads: SharedQualityPngPayloads | None = None
 
 
 def prepare_quality_frame(
     publication: QualityFramePublication,
+    *,
+    png_payloads: SharedQualityPngPayloads | None = None,
 ) -> PreparedQualityFramePublication:
     """Serialize variable diagnostics before crossing the writer queue boundary."""
 
     if not isinstance(publication, QualityFramePublication):
         raise TypeError("publication must be QualityFramePublication")
     compact = publication.compact
+    if png_payloads is not None:
+        if not isinstance(png_payloads, SharedQualityPngPayloads):
+            raise TypeError("png_payloads must be SharedQualityPngPayloads")
+        if not png_payloads.matches(compact, keep_masks=publication.keep_masks):
+            raise ValueError("shared PNG payloads do not match the compact render result")
     stats = build_quality_frame_stats(
         compact,
         frame_name=publication.frame_name,
@@ -228,6 +319,7 @@ def prepare_quality_frame(
         keep_masks=publication.keep_masks,
         render_mode=publication.render_mode,
         quality_limits=compact.quality_limits,
+        png_payloads=png_payloads,
     )
 
 
@@ -384,9 +476,7 @@ class StreamingDiagnosticsStageContext:
             render_mode=self.render_mode,
             geometry_mode=self.geometry_mode,
             occlusion_fill=self.occlusion_fill,
-            mask_payloads_enabled=(
-                self.mask_payloads_enabled if masks is None else masks
-            ),
+            mask_payloads_enabled=(self.mask_payloads_enabled if masks is None else masks),
             rgb_stage_fingerprint=self.rgb_stage_fingerprint,
             source_guide_fingerprint=self.source_guide_fingerprint,
             native_geometry_fingerprint=self.native_geometry_fingerprint,
@@ -540,7 +630,12 @@ def publish_quality_frame(
             if source is None:
                 payload_identities[name] = None
                 continue
-            raw = _png_buffer(source) if encode_png else source
+            if encode_png and publication.png_payloads is not None:
+                raw = publication.png_payloads.payload(name)
+                if raw is None:
+                    raise RuntimeError("enabled PNG payload is absent from its shared cache")
+            else:
+                raw = _png_buffer(source) if encode_png else source
             payload_identities[name] = _identity(root, path, raw)
             temporaries[path] = _write_temporary(
                 path,
@@ -571,13 +666,10 @@ def publish_quality_frame(
             if identity is None:
                 continue
             path = next(
-                path for source_name, path, _source, _png in payload_sources
-                if source_name == name
+                path for source_name, path, _source, _png in payload_sources if source_name == name
             )
             temporaries[path].replace(
-                after_replace=lambda name=name: _call_fault(
-                    fault, f"after_{name}_replace"
-                ),
+                after_replace=lambda name=name: _call_fault(fault, f"after_{name}_replace"),
             )
             _call_fault(fault, f"after_{name}_directory_sync")
         _call_fault(fault, "before_manifest_replace")
@@ -820,10 +912,14 @@ def _parse_streaming_frame_stats(
         )
         spans.append((array_start, array_end, histogram))
         search_from = array_end
-    if raw.find(b'"lane_count_histogram":', search_from) >= 0 or raw.find(
-        b'"touched_pixel_span_histogram":',
-        search_from,
-    ) >= 0:
+    if (
+        raw.find(b'"lane_count_histogram":', search_from) >= 0
+        or raw.find(
+            b'"touched_pixel_span_histogram":',
+            search_from,
+        )
+        >= 0
+    ):
         raise ValueError("diagnostic frame statistics contain extra histograms")
 
     compact_parts: list[bytes] = []
@@ -973,9 +1069,7 @@ def _sparse_histogram_metrics(
         seen = next_seen
     if lower is None or upper is None:
         raise ValueError(f"{field} percentile lookup exceeded its total")
-    percentile = float(lower) + (float(upper) - float(lower)) * (
-        position - float(lower_index)
-    )
+    percentile = float(lower) + (float(upper) - float(lower)) * (position - float(lower_index))
     return total, maximum, percentile
 
 
@@ -1043,9 +1137,10 @@ def _validate_eye_statistics(
         maximum_bucket=context.render_shape[1],
         maximum_count=lane_count,
     )
-    if lane_total != span_total or _json_u64(
-        holes["count"], f"{field}.hole_runs.count", maximum=lane_count
-    ) != lane_total:
+    if (
+        lane_total != span_total
+        or _json_u64(holes["count"], f"{field}.hole_runs.count", maximum=lane_count) != lane_total
+    ):
         raise ValueError(f"{field}.hole_runs histogram totals disagree")
     integer_derived = {
         "lane_count_max": lane_max,
@@ -1106,7 +1201,9 @@ def _validate_eye_statistics(
         f"{field}.final_unresolved_lane_count",
         maximum=lane_count,
     )
-    requires_quality_plan = context.render_mode == "quality" and context.occlusion_fill == "background"
+    requires_quality_plan = (
+        context.render_mode == "quality" and context.occlusion_fill == "background"
+    )
     if requires_quality_plan:
         _validate_quality_limits(value["quality_limits"], f"{field}.quality_limits")
     elif value["quality_limits"] is not None:
@@ -1254,9 +1351,7 @@ def _validate_frame_statistics_schema(
         )
         indexed = _json_u64(nearest_value["indexed_sample_count"], "geometry_nearest.indexed")
         if indexed != context.native_geometry_sample_count:
-            raise ValueError(
-                "geometry-nearest indexed sample count differs from native geometry"
-            )
+            raise ValueError("geometry-nearest indexed sample count differs from native geometry")
         query_count = _json_u64(
             nearest_value["query_count"],
             "geometry_nearest.query_count",
@@ -1713,9 +1808,7 @@ def _legacy_fast_documents(
             "availability": "legacy_fast_unavailable",
             "eyes": None,
             "frame_count": context.frame_count,
-            "frame_names": ReplayableJsonArray(
-                lambda: _iter_streaming_frame_names(context)
-            ),
+            "frame_names": ReplayableJsonArray(lambda: _iter_streaming_frame_names(context)),
             "frames_jsonl_sha256": jsonl_sha256,
             "geometry_mode": context.geometry_mode,
             "geometry_nearest": None,
@@ -1996,10 +2089,7 @@ def _streamable_diagnostics_value(value: object) -> object:
 
         return ReplayableJsonArray(replay)
     if isinstance(value, dict):
-        return {
-            key: _streamable_diagnostics_value(item)
-            for key, item in value.items()
-        }
+        return {key: _streamable_diagnostics_value(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_streamable_diagnostics_value(item) for item in value]
     if isinstance(value, tuple):
@@ -2072,24 +2162,25 @@ def _iter_streaming_jsonl(
         return
     maximum_line_bytes = 4 * 272 * (context.render_shape[1] + 1) + 1024 * 1024
     count = 0
-    with acquired.open_regular(path) as handle:
-        while True:
-            line = handle.readline(maximum_line_bytes + 1)
-            if not line:
-                break
-            if len(line) > maximum_line_bytes or not line.endswith(b"\n"):
-                raise ValueError("diagnostics JSONL row is unbounded or unterminated")
-            if count >= context.frame_count:
-                raise ValueError("diagnostics JSONL exceeds its frame count")
-            count += 1
-            value = _parse_streaming_frame_stats(
-                line,
-                render_width=context.render_shape[1],
-                raw_end=len(line) - 1,
-            )
-            line = None
-            yield value
-            del value
+    with acquired.open_regular(path) as raw_handle:
+        with io.BufferedReader(raw_handle, buffer_size=1024 * 1024) as handle:
+            while True:
+                line = handle.readline(maximum_line_bytes + 1)
+                if not line:
+                    break
+                if len(line) > maximum_line_bytes or not line.endswith(b"\n"):
+                    raise ValueError("diagnostics JSONL row is unbounded or unterminated")
+                if count >= context.frame_count:
+                    raise ValueError("diagnostics JSONL exceeds its frame count")
+                count += 1
+                value = _parse_streaming_frame_stats(
+                    line,
+                    render_width=context.render_shape[1],
+                    raw_end=len(line) - 1,
+                )
+                line = None
+                yield value
+                del value
     if count != context.frame_count:
         raise ValueError("diagnostics JSONL row count differs from the frame sequence")
 
@@ -2130,9 +2221,7 @@ class _ExactCanonicalReader:
             available = len(self._buffer) - self._buffer_offset
             if available:
                 take = min(byte_count - len(chunks), available)
-                chunks.extend(
-                    self._buffer[self._buffer_offset : self._buffer_offset + take]
-                )
+                chunks.extend(self._buffer[self._buffer_offset : self._buffer_offset + take])
                 self._buffer_offset += take
                 continue
             self._buffer = self.handle.read(max(64 * 1024, byte_count - len(chunks)))
@@ -2236,12 +2325,15 @@ class _ExactCanonicalReader:
     ) -> object:
         if maximum_bytes <= 0:
             raise ValueError("diagnostics canonical value bound must be positive")
-        if min(
-            maximum_depth,
-            maximum_containers,
-            maximum_scalars,
-            maximum_string_bytes,
-        ) <= 0:
+        if (
+            min(
+                maximum_depth,
+                maximum_containers,
+                maximum_scalars,
+                maximum_string_bytes,
+            )
+            <= 0
+        ):
             raise ValueError("diagnostics canonical parser bounds must be positive")
         raw = bytearray(self._read_exact(1))
         first = raw[0]
@@ -2420,6 +2512,8 @@ _DIAGNOSTICS_METADATA_KEYS = {
     "summary_sha256",
 }
 _DIAGNOSTICS_SMALL_FIELD_MAX_BYTES = 64 * 1024
+_DIAGNOSTICS_PRUNE_ENTRIES_MAX_CONTAINERS = 1 + 16 * 4
+_DIAGNOSTICS_PRUNE_ENTRIES_MAX_SCALARS = 16 * 21
 
 
 @dataclass(frozen=True, slots=True)
@@ -2452,8 +2546,7 @@ class DiagnosticsMetadataProjection:
             or type(fields.get("stats_schema_version")) is not int
             or fields.get("frame_manifest_schema_version") != 1
             or type(fields.get("frame_manifest_schema_version")) is not int
-            or status
-            not in {"building", "complete", "legacy_fast_unavailable", "payload_pruned"}
+            or status not in {"building", "complete", "legacy_fast_unavailable", "payload_pruned"}
             or render_mode not in {"fast", "quality"}
             or geometry_mode not in {"relative", "metric"}
             or fields.get("occlusion_fill") not in {"none", "background"}
@@ -2537,8 +2630,7 @@ class DiagnosticsMetadataProjection:
                 "summary_sha256",
                 "metric_clamp_summary_sha256",
             }
-            or pruned_from.get("previous_status")
-            not in {"complete", "legacy_fast_unavailable"}
+            or pruned_from.get("previous_status") not in {"complete", "legacy_fast_unavailable"}
             or not _is_hex64(pruned_from.get("previous_diagnostics_fingerprint"))
             or not _is_hex64(pruned_from.get("ordered_frame_manifest_fingerprint"))
             or pruned_from.get("frames_jsonl_sha256") != frames_hash
@@ -2606,9 +2698,7 @@ def _diagnostics_metadata_events(
     previous_index: int | None = None
     with acquired.open_regular(path) as handle:
         bounded = (
-            _BoundedReadHandle(handle, raw_byte_count)
-            if raw_byte_count is not None
-            else handle
+            _BoundedReadHandle(handle, raw_byte_count) if raw_byte_count is not None else handle
         )
         reader = _ExactCanonicalReader(bounded)
         ordered_keys = sorted(_DIAGNOSTICS_METADATA_KEYS)
@@ -2627,6 +2717,12 @@ def _diagnostics_metadata_events(
             if key != "frame_names":
                 static_fields[key] = reader.canonical_value(
                     maximum_bytes=_DIAGNOSTICS_SMALL_FIELD_MAX_BYTES,
+                    maximum_containers=(
+                        _DIAGNOSTICS_PRUNE_ENTRIES_MAX_CONTAINERS if key == "prune_entries" else 32
+                    ),
+                    maximum_scalars=(
+                        _DIAGNOSTICS_PRUNE_ENTRIES_MAX_SCALARS if key == "prune_entries" else 256
+                    ),
                 )
                 continue
             reader.expect(b"[")
@@ -2732,11 +2828,7 @@ def _quality_frame_index(value: object) -> int:
         raise ValueError("Quality content frame name is not a string")
     match = re.fullmatch(r"frame_([0-9]+)", value, flags=re.ASCII)
     index = int(match.group(1)) if match is not None else -1
-    if (
-        match is None
-        or index > (1 << 64) - 1
-        or value != f"frame_{index:06d}"
-    ):
+    if match is None or index > (1 << 64) - 1 or value != f"frame_{index:06d}":
         raise ValueError("Quality content frame name is noncanonical")
     return index
 
@@ -2863,8 +2955,7 @@ def _validate_quality_geometry(
         }
         or geometry.get("inverse_depth_dtype") != "float32"
         or geometry.get("valid_dtype") != "bool"
-        or geometry.get("members")
-        != ["inverse_depth.npy", "valid.npy", "focal_x_normalized.npy"]
+        or geometry.get("members") != ["inverse_depth.npy", "valid.npy", "focal_x_normalized.npy"]
         or not isinstance(geometry.get("native_shape"), list)
         or len(geometry["native_shape"]) != 2
         or any(type(value) is not int or value <= 0 for value in geometry["native_shape"])
@@ -2922,9 +3013,7 @@ def project_quality_input_manifest(  # noqa: C901
                         )
                     if frame_count:
                         reader.expect(b",")
-                    frame_index = _quality_frame_index(
-                        reader.canonical_string(maximum_bytes=1024)
-                    )
+                    frame_index = _quality_frame_index(reader.canonical_string(maximum_bytes=1024))
                     if first_frame_index is None:
                         first_frame_index = frame_index
                     elif frame_index != first_frame_index + frame_count:
@@ -2941,9 +3030,7 @@ def project_quality_input_manifest(  # noqa: C901
                     if geometry_count:
                         reader.expect(b",")
                         geometry_digest.update(b",")
-                    value = reader.canonical_value(
-                        maximum_bytes=_DIAGNOSTICS_SMALL_FIELD_MAX_BYTES
-                    )
+                    value = reader.canonical_value(maximum_bytes=_DIAGNOSTICS_SMALL_FIELD_MAX_BYTES)
                     if first_frame_index is None:
                         raise ValueError("Quality geometry precedes its frame sequence")
                     kind = _validate_quality_geometry(
@@ -2966,9 +3053,7 @@ def project_quality_input_manifest(  # noqa: C901
                     if guide_count:
                         reader.expect(b",")
                         guide_digest.update(b",")
-                    value = reader.canonical_value(
-                        maximum_bytes=_DIAGNOSTICS_SMALL_FIELD_MAX_BYTES
-                    )
+                    value = reader.canonical_value(maximum_bytes=_DIAGNOSTICS_SMALL_FIELD_MAX_BYTES)
                     if first_frame_index is None:
                         raise ValueError("Quality guides precede their frame sequence")
                     _validate_quality_guide(
@@ -3189,9 +3274,7 @@ def _streaming_summary_document(
         _iter_streaming_jsonl(jsonl_path, context, acquired=acquired),
         frame_name_replay=lambda: _iter_streaming_frame_names(context),
         frame_count=context.frame_count,
-        clamped_fraction_replay=(
-            replay_fractions if context.geometry_mode == "metric" else None
-        ),
+        clamped_fraction_replay=(replay_fractions if context.geometry_mode == "metric" else None),
         render_shape=context.render_shape,
         render_mode=context.render_mode,
         geometry_mode=context.geometry_mode,
@@ -3235,9 +3318,7 @@ def streaming_diagnostics_aggregates_match(
                 assert context.left_rgb_parent is not None
                 value = summary.value
                 assert isinstance(value, dict)
-                clamp = build_streamed_canonical_value(
-                    _compatibility_clamp_summary(value)
-                )
+                clamp = build_streamed_canonical_value(_compatibility_clamp_summary(value))
                 if not clamp.matches(
                     context.left_rgb_parent / "clamp_summary.json",
                     acquired=acquired,
@@ -3249,9 +3330,7 @@ def streaming_diagnostics_aggregates_match(
                 ordered_frame_manifest_fingerprint=ordered_fingerprint,
                 frames_jsonl_sha256=jsonl_sha256,
                 summary_sha256=summary.raw_sha256,
-                metric_clamp_summary_sha256=(
-                    None if clamp is None else clamp.raw_sha256
-                ),
+                metric_clamp_summary_sha256=(None if clamp is None else clamp.raw_sha256),
             )
             return metadata.matches(root / "metadata.json", acquired=acquired)
     except (OSError, ValueError, KeyError, TypeError, NoFollowPathError):
@@ -3381,11 +3460,7 @@ def migrate_streaming_frame_manifest(
         frame_dir / "manifest.json",
         canonical_json_bytes(migrated),
         fault=fault,
-        label=(
-            "mask_migration"
-            if source_index is None
-            else f"mask_migration_{source_index}"
-        ),
+        label=("mask_migration" if source_index is None else f"mask_migration_{source_index}"),
     )
     _audit_frame_transaction(current, frame_name)
 
@@ -3399,12 +3474,7 @@ def prune_streaming_unreferenced_masks(
         raise ValueError("mask pruning requires a disabled target policy")
     with AcquiredRoot(context.job_root) as acquired:
         for frame_name in _iter_streaming_frame_names(context):
-            frame_dir = (
-                context.job_root
-                / "04_stereo_diagnostics"
-                / "frames"
-                / frame_name
-            )
+            frame_dir = context.job_root / "04_stereo_diagnostics" / "frames" / frame_name
             with SafeTreeMutation(
                 context.job_root,
                 (frame_dir,),

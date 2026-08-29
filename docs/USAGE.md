@@ -98,8 +98,8 @@ output/video_timestamp/
 |-- 03_disparity_stabilized/  # present only when VDPP is requested
 |-- 04_left_frames/
 |-- 04_right_frames/
-|-- 05_left_distorted/
-|-- 05_right_distorted/
+|-- 05_left_distorted/       # legacy two-stage jobs only; fused distortion omits it
+|-- 05_right_distorted/      # legacy two-stage jobs only; fused distortion omits it
 |-- 06_left_cropped/
 |-- 06_right_cropped/
 |-- 07_left_upscaled/

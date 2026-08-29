@@ -234,7 +234,16 @@ def _build_processing_settings(args: argparse.Namespace) -> dict[str, object]:
             "crop_factor": args.crop_factor,
             "fisheye_crop_factor": args.fisheye_crop_factor,
             "preserve_audio": not args.no_audio,
-            "keep_intermediates": not args.no_intermediates,
+            "keep_intermediates": (
+                DEFAULT_SETTINGS["keep_intermediates"]
+                if args.keep_intermediates is None
+                else args.keep_intermediates
+            ),
+            "direct_vr_encode": (
+                DEFAULT_SETTINGS["direct_vr_encode"]
+                if args.direct_vr_encode is None
+                else args.direct_vr_encode
+            ),
             "target_fps": args.target_fps,
             "experimental_frame_interpolation": args.experimental_frame_interpolation,
             "upscale_model": args.upscale_model,
@@ -336,7 +345,7 @@ Note: V2 uses fixed shot-aware temporal inference; V3, See-Through, and MoGe-2 i
         "--stereo-render-mode",
         choices=["fast", "quality"],
         default=None,
-        help="Stereo renderer (default: quality on CUDA, fast on CPU)",
+        help="Stereo renderer (default: fast)",
     )
     parser.add_argument(
         "--occlusion-fill-max-px",
@@ -475,9 +484,34 @@ Note: V2 uses fixed shot-aware temporal inference; V3, See-Through, and MoGe-2 i
 
     # Output options
     parser.add_argument("--no-audio", action="store_true", help="Do not preserve audio in output")
-    parser.add_argument(
-        "--no-intermediates", action="store_true", help="Do not keep intermediate processing files"
+    retention_group = parser.add_mutually_exclusive_group()
+    retention_group.add_argument(
+        "--keep-intermediates",
+        dest="keep_intermediates",
+        action="store_true",
+        help="Keep intermediate processing files after a successful run",
     )
+    retention_group.add_argument(
+        "--no-intermediates",
+        dest="keep_intermediates",
+        action="store_false",
+        help="Remove intermediate processing files after a successful run (default)",
+    )
+    parser.set_defaults(keep_intermediates=None)
+    direct_encode_group = parser.add_mutually_exclusive_group()
+    direct_encode_group.add_argument(
+        "--direct-vr-encode",
+        dest="direct_vr_encode",
+        action="store_true",
+        help="Encode directly from the final left/right eye frames (default)",
+    )
+    direct_encode_group.add_argument(
+        "--no-direct-vr-encode",
+        dest="direct_vr_encode",
+        action="store_false",
+        help="Assemble Stage 7 VR frames before encoding",
+    )
+    parser.set_defaults(direct_vr_encode=None)
     parser.add_argument("--target-fps", type=int, help="Target output FPS (default: match source)")
 
     # Experimental features

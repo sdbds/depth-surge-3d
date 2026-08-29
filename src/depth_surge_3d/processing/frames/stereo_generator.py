@@ -11,7 +11,7 @@ import shutil
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
@@ -29,6 +29,7 @@ from ...io.nofollow_io import (
     SafeTreeMutation,
     open_regular_beneath,
 )
+from ...io.stereo_contract import StereoControlBudgetError
 from ...io.content_manifest import (
     StreamedQualityInputManifest,
     build_streamed_quality_input_manifest,
@@ -58,6 +59,7 @@ from ...rendering.quality.diagnostic_transaction import (
     DiagnosticsStageContext,
     PreparedQualityFramePublication,
     QualityFramePublication,
+    SharedQualityPngPayloads,
     audit_diagnostics_stage,
     begin_diagnostics_stage,
     canonical_json_bytes,
@@ -77,8 +79,11 @@ from ...rendering.quality.diagnostic_transaction import (
 from ...rendering.quality.renderer import (
     QUALITY_HOST_BUDGET_BYTES,
     QUALITY_RUNTIME_OVERHEAD_BYTES,
+    PreparedRelativeQualityFrame,
     _quality_public_memory_preflight,
+    prepare_relative_quality_frame,
     render_metric_primitives_compact,
+    render_prepared_relative_quality_compact,
     render_relative_quality_compact,
 )
 from ...rendering.quality.types import (
@@ -101,9 +106,9 @@ from .stereo_control import (
     StreamingStereoPipelineStats,
     audit_stereo_provider,
     iter_stereo_action,
-    quality_pipeline_capacity,
     run_streaming_stereo_pipeline,
     select_fast_pipeline_capacity,
+    select_quality_pipeline_capacity,
     validate_stereo_action_replay,
     validate_stereo_provider_replay,
     PackedStereoActions,
@@ -150,16 +155,9 @@ def _quality_stage_memory_phases(
     histogram_bytes = 272 * (int(render_shape[1]) + 1)
     runtime = QUALITY_RUNTIME_OVERHEAD_BYTES
     phases: dict[str, int] = {}
-    content_payload = (
-        5 * control.maximum_source_native_pixels
-        if geometry_mode == "metric"
-        else 0
-    )
+    content_payload = 5 * control.maximum_source_native_pixels if geometry_mode == "metric" else 0
     content_peak = (
-        content_payload
-        + QUALITY_CONTENT_STREAM_BYTES
-        + runtime
-        + STEREO_CONTROL_OVERHEAD
+        content_payload + QUALITY_CONTENT_STREAM_BYTES + runtime + STEREO_CONTROL_OVERHEAD
     )
     phases["quality-input-content-audit"] = content_peak
     if consolidation_planned:
@@ -187,10 +185,7 @@ def _quality_stage_memory_phases(
                 + runtime
             )
         writer_peak = (
-            23 * output_pixels
-            + histogram_bytes
-            + control.maximum_frame_json_bound
-            + runtime
+            23 * output_pixels + histogram_bytes + control.maximum_frame_json_bound + runtime
         )
         lifecycle_peak = max(decode_peak, writer_peak, *render_phases.values())
         phases["quality-file-pipeline"] = (
@@ -199,9 +194,7 @@ def _quality_stage_memory_phases(
 
     if consolidation_planned:
         metric_fraction_bound = (
-            33 * control.generation.frame_count + 2
-            if geometry_mode == "metric"
-            else 0
+            33 * control.generation.frame_count + 2 if geometry_mode == "metric" else 0
         )
         root_json_bound = (
             control.maximum_frame_json_bound
@@ -302,9 +295,7 @@ def _build_stereo_stage_disk_plan(
     metric_fraction_bound = (
         33 * control.generation.frame_count + 2 if geometry_mode == "metric" else 0
     )
-    root_json_bound = (
-        frame_bound + control.frame_name_json_array_bytes + metric_fraction_bound
-    )
+    root_json_bound = frame_bound + control.frame_name_json_array_bytes + metric_fraction_bound
     jsonl_bound = control.generation.frame_count * (frame_bound + 1)
     clamp_bound = control.frame_name_json_array_bytes + metric_fraction_bound + 1024 * 1024
     root_artifacts: list[tuple[Path, int]] = [
@@ -715,11 +706,30 @@ class _DecodedMessage:
         return permit, frame, render_input, projection_stats
 
 
+@dataclass(frozen=True, slots=True)
+class _ReusableQualityFrame:
+    compact: CompactStereoRenderResult
+    png_payloads: SharedQualityPngPayloads
+
+
+def _exact_quality_input_key(item: StereoProviderItem) -> tuple[object, ...]:
+    return (
+        item.guide_sha256,
+        item.guide_byte_count,
+        item.guide_shape,
+        item.geometry_sha256,
+        item.geometry_byte_count,
+        item.geometry_shape,
+    )
+
+
 @dataclass(slots=True)
 class _ManifestDecodedFrame:
     work: StereoProviderItem
     frame: np.ndarray | None
     primitive: RelativeStereoPrimitiveInput | MetricStereoPrimitiveInput | None
+    prepared_quality: PreparedRelativeQualityFrame | None = None
+    reused_quality: _ReusableQualityFrame | None = None
 
     def take_frame(self) -> np.ndarray:
         frame = self.frame
@@ -734,6 +744,20 @@ class _ManifestDecodedFrame:
             raise RuntimeError("manifest primitive ownership was already transferred")
         self.primitive = None
         return primitive
+
+    def take_prepared_quality(self) -> PreparedRelativeQualityFrame:
+        prepared = self.prepared_quality
+        if prepared is None:
+            raise RuntimeError("prepared Quality frame ownership was already transferred")
+        self.prepared_quality = None
+        return prepared
+
+    def take_reused_quality(self) -> _ReusableQualityFrame:
+        reusable = self.reused_quality
+        if reusable is None:
+            raise RuntimeError("reused Quality frame ownership was already transferred")
+        self.reused_quality = None
+        return reusable
 
 
 def _take_relative_canonical(payload: _ManifestDecodedFrame) -> np.ndarray:
@@ -819,18 +843,17 @@ def _atomic_write_png(path: Path, image: np.ndarray) -> None:
         owned.cleanup()
 
 
-def _decode_verified_png(
+def _read_verified_stereo_input(
     path: Path,
     *,
     job_root: Path,
     expected_sha256: str,
     expected_byte_count: int,
-    flags: int,
-) -> np.ndarray:
-    """Decode only the exact regular-file bytes bound by the provider item."""
+) -> bytearray:
+    """Read only the exact regular-file bytes bound by the provider item."""
 
     if expected_byte_count <= 0:
-        raise ValueError("verified PNG byte count must be positive")
+        raise ValueError("verified stereo input byte count must be positive")
     try:
         handle = open_regular_beneath(job_root, path)
     except (OSError, ValueError) as error:
@@ -850,9 +873,26 @@ def _decode_verified_png(
         if handle.readinto(tail):
             raise StereoInputIdentityMismatch(f"stereo input grew during decode: {path}")
     if hashlib.sha256(raw).hexdigest() != expected_sha256:
-        raise StereoInputIdentityMismatch(
-            f"stereo input content changed before decode: {path}"
-        )
+        raise StereoInputIdentityMismatch(f"stereo input content changed before decode: {path}")
+    return raw
+
+
+def _decode_verified_png(
+    path: Path,
+    *,
+    job_root: Path,
+    expected_sha256: str,
+    expected_byte_count: int,
+    flags: int,
+) -> np.ndarray:
+    """Decode only the exact regular-file bytes bound by the provider item."""
+
+    raw = _read_verified_stereo_input(
+        path,
+        job_root=job_root,
+        expected_sha256=expected_sha256,
+        expected_byte_count=expected_byte_count,
+    )
     decoded = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), flags)
     if decoded is None:
         raise StereoInputIdentityMismatch(f"Could not decode frozen PNG: {path}")
@@ -1381,6 +1421,9 @@ class StereoPairGenerator:
         self._renderer = renderer
         self.last_pipeline_stats: StereoPipelineStats | StreamingStereoPipelineStats | None = None
         self.last_metric_clamp_summary: dict[str, Any] | None = None
+        self.last_render_performance_seconds: dict[str, float] = {}
+        self.last_rendered_frame_count = 0
+        self.last_stage_performance_seconds: dict[str, float] = {}
 
     @property
     def renderer(self) -> StereoRenderer:
@@ -1435,9 +1478,7 @@ class StereoPairGenerator:
                     "center_crop_algorithm_version": CENTER_CROP_ALGORITHM_VERSION,
                     "effective_convergence_distance_m": float(effective_convergence),
                     "kind": "metric",
-                    "max_disparity_percent": float(
-                        settings.get("max_disparity_percent", 2.0)
-                    ),
+                    "max_disparity_percent": float(settings.get("max_disparity_percent", 2.0)),
                     "projection_algorithm_version": METRIC_PROJECTION_ALGORITHM_VERSION,
                     "requested_convergence_distance": (
                         "auto" if requested == "auto" else float(requested)
@@ -1470,9 +1511,7 @@ class StereoPairGenerator:
                     "algorithm_version": QUALITY_STEREO_ALGORITHM_VERSION,
                     "encoding": "uint8_png",
                     "geometry_mode": geometry_mode,
-                    "native_geometry_fingerprint": (
-                        quality_content.native_geometry_fingerprint
-                    ),
+                    "native_geometry_fingerprint": (quality_content.native_geometry_fingerprint),
                     "occlusion_fill": occlusion_fill,
                     "projection": projection,
                     "quality_input_manifest_sha256": quality_content.raw_sha256,
@@ -1518,9 +1557,7 @@ class StereoPairGenerator:
                 {
                     "center_crop_algorithm_version": CENTER_CROP_ALGORITHM_VERSION,
                     "effective_convergence_distance_m": float(effective_convergence),
-                    "max_disparity_percent": float(
-                        settings.get("max_disparity_percent", 2.0)
-                    ),
+                    "max_disparity_percent": float(settings.get("max_disparity_percent", 2.0)),
                     "projection_algorithm_version": METRIC_PROJECTION_ALGORITHM_VERSION,
                     "requested_convergence_distance": (
                         "auto" if requested == "auto" else float(requested)
@@ -1568,14 +1605,13 @@ class StereoPairGenerator:
             source_guide_fingerprint = quality_content.source_guide_fingerprint
             native_geometry_fingerprint = quality_content.native_geometry_fingerprint
             content_sha = quality_content.raw_sha256
+
         def replay_source_names():
             count = 0
             try:
                 for item in provider.replay():
                     if item.source_index != count:
-                        raise StereoInputIdentityMismatch(
-                            "diagnostics source replay order changed"
-                        )
+                        raise StereoInputIdentityMismatch("diagnostics source replay order changed")
                     count += 1
                     yield item.frame_name
                 if count != manifest.frame_count:
@@ -1653,8 +1689,12 @@ class StereoPairGenerator:
     ) -> bool:
         """Render one validated durable upstream stereo sequence."""
 
+        stage_started = time.perf_counter()
         self.last_pipeline_stats = None
         self.last_metric_clamp_summary = None
+        self.last_render_performance_seconds = {}
+        self.last_rendered_frame_count = 0
+        self.last_stage_performance_seconds = {}
         adopted = load_stereo_input_manifest_v1(
             manifest.path,
             job_root=manifest.job_root,
@@ -1747,8 +1787,17 @@ class StereoPairGenerator:
             if stage_changed
             else classify_streaming_diagnostics_root(diagnostics_context)
         )
-        reset_diagnostics_root = (
-            stage_changed or diagnostics_root_state == "unclaimed"
+        reset_diagnostics_root = stage_changed or diagnostics_root_state == "unclaimed"
+        mask_prune_required = (
+            not diagnostics_context.mask_payloads_enabled
+            and not reset_diagnostics_root
+            and (
+                diagnostics_root_state == "building"
+                or classify_streaming_diagnostics_root(
+                    replace(diagnostics_context, mask_payloads_enabled=True)
+                )
+                != "unclaimed"
+            )
         )
 
         def classify(item: StereoProviderItem) -> StereoAction:
@@ -1834,8 +1883,9 @@ class StereoPairGenerator:
                     "stereo retained aggregate action changed during read-only audit"
                 )
 
+        quality_memory_phases: dict[str, int] | None = None
         if render_mode == "quality":
-            _quality_stage_memory_preflight(
+            quality_memory_phases = _quality_stage_memory_preflight(
                 control=control,
                 render_shape=render_shape,
                 native_shape=adopted.native_shape,
@@ -1890,10 +1940,65 @@ class StereoPairGenerator:
         configured_workers = validate_stereo_io_workers(
             settings.get("stereo_io_workers", _default_stereo_io_workers())
         )
+        reuse_exact_quality_input = False
         if render_mode == "quality":
-            capacity_value, effective_workers, _thread_bytes = quality_pipeline_capacity(
-                control.render_count
-            )
+            if control.render_count == 0:
+                capacity_value = 0
+                effective_workers = 0
+                writer_workers = 0
+            else:
+                assert quality_memory_phases is not None
+                output_pixels = render_shape[0] * render_shape[1]
+                histogram_bytes = 272 * (render_shape[1] + 1)
+                if normalized_geometry == "metric":
+                    decode_slot = (
+                        3 * output_pixels
+                        + 5 * control.maximum_native_pixels
+                        + control.maximum_compressed_payload_bytes
+                        + QUALITY_RUNTIME_OVERHEAD_BYTES
+                    )
+                else:
+                    decode_slot = (
+                        3 * output_pixels
+                        + 2 * control.maximum_native_pixels
+                        + control.maximum_compressed_payload_bytes
+                        + QUALITY_RUNTIME_OVERHEAD_BYTES
+                    )
+                writer_slot = (
+                    23 * output_pixels
+                    + histogram_bytes
+                    + control.maximum_frame_json_bound
+                    + QUALITY_RUNTIME_OVERHEAD_BYTES
+                )
+                quality_active_scratch = (
+                    quality_memory_phases["quality-file-pipeline"] - QUALITY_IO_THREAD_BYTES
+                )
+                quality_slot_bytes = max(decode_slot, writer_slot)
+                reuse_exact_quality_input = control.has_consecutive_render_input
+                retained_cache_bytes = (
+                    23 * output_pixels + histogram_bytes + control.maximum_frame_json_bound
+                )
+                try:
+                    selection = select_quality_pipeline_capacity(
+                        configured_workers=configured_workers,
+                        pending_render_count=control.render_count,
+                        quality_active_scratch=quality_active_scratch,
+                        quality_slot_bytes=quality_slot_bytes,
+                        retained_bytes=(retained_cache_bytes if reuse_exact_quality_input else 0),
+                    )
+                except StereoControlBudgetError:
+                    if not reuse_exact_quality_input:
+                        raise
+                    reuse_exact_quality_input = False
+                    selection = select_quality_pipeline_capacity(
+                        configured_workers=configured_workers,
+                        pending_render_count=control.render_count,
+                        quality_active_scratch=quality_active_scratch,
+                        quality_slot_bytes=quality_slot_bytes,
+                    )
+                capacity_value = selection.capacity
+                effective_workers = selection.effective_workers
+                writer_workers = selection.writer_workers
         else:
             maximum_item = (
                 control.maximum_fast_metric_item_bytes
@@ -1904,14 +2009,13 @@ class StereoPairGenerator:
                 configured_workers=configured_workers,
                 pending_render_count=control.render_count,
                 fast_active_scratch=(
-                    272 * (render_shape[1] + 1)
-                    + 1024 * 1024
-                    + STEREO_CONTROL_OVERHEAD
+                    272 * (render_shape[1] + 1) + 1024 * 1024 + STEREO_CONTROL_OVERHEAD
                 ),
                 fast_slot_bytes=maximum_item + HOST_SLOT_OVERHEAD,
             )
             capacity_value = selection.capacity
             effective_workers = selection.effective_workers
+            writer_workers = effective_workers
         mutation_started = False
 
         def begin_mutation() -> None:
@@ -2026,7 +2130,34 @@ class StereoPairGenerator:
             stage_document.publish(metadata_path)
             begin_streaming_diagnostics_stage(diagnostics_context)
 
+        quality_cache_lock = threading.Lock()
+        cached_quality_key: tuple[object, ...] | None = None
+        cached_quality_frame: _ReusableQualityFrame | None = None
+
         def decode(item: StereoProviderItem):
+            if reuse_exact_quality_input:
+                input_key = _exact_quality_input_key(item)
+                with quality_cache_lock:
+                    reused = cached_quality_frame if cached_quality_key == input_key else None
+                if reused is not None:
+                    _read_verified_stereo_input(
+                        item.guide_path,
+                        job_root=adopted.job_root,
+                        expected_sha256=item.guide_sha256,
+                        expected_byte_count=item.guide_byte_count,
+                    )
+                    _read_verified_stereo_input(
+                        item.geometry_path,
+                        job_root=adopted.job_root,
+                        expected_sha256=item.geometry_sha256,
+                        expected_byte_count=item.geometry_byte_count,
+                    )
+                    return _ManifestDecodedFrame(
+                        item,
+                        None,
+                        None,
+                        reused_quality=reused,
+                    )
             frame = _decode_verified_png(
                 item.guide_path,
                 job_root=adopted.job_root,
@@ -2035,9 +2166,7 @@ class StereoPairGenerator:
                 flags=cv2.IMREAD_COLOR,
             )
             if frame.shape != (*item.guide_shape, 3) or frame.dtype != np.uint8:
-                raise StereoInputIdentityMismatch(
-                    f"guide PNG shape changed: {item.guide_path}"
-                )
+                raise StereoInputIdentityMismatch(f"guide PNG shape changed: {item.guide_path}")
             if normalized_geometry == "relative":
                 encoded = _decode_verified_png(
                     item.geometry_path,
@@ -2084,16 +2213,24 @@ class StereoPairGenerator:
                 assert retained_crop_width is not None and effective_convergence is not None
                 primitive = MetricStereoPrimitiveInput(
                     metric=metric,
-                    virtual_baseline_mm=np.float64(
-                        settings.get("virtual_baseline_mm", 63.0)
-                    ),
+                    virtual_baseline_mm=np.float64(settings.get("virtual_baseline_mm", 63.0)),
                     convergence_distance_m=np.float64(effective_convergence),
-                    max_disparity_percent=np.float64(
-                        settings.get("max_disparity_percent", 2.0)
-                    ),
+                    max_disparity_percent=np.float64(settings.get("max_disparity_percent", 2.0)),
                     retained_crop_width=retained_crop_width,
                 )
-            return _ManifestDecodedFrame(item, frame, primitive)
+            decoded = _ManifestDecodedFrame(item, frame, primitive)
+            if (
+                normalized_geometry == "relative"
+                and render_mode == "quality"
+                and capacity_value > 1
+            ):
+                assert isinstance(render_settings, StereoRenderSettings)
+                decoded.prepared_quality = prepare_relative_quality_frame(
+                    frame=decoded.take_frame(),
+                    canonical=_take_relative_canonical(decoded),
+                    settings=render_settings,
+                )
+            return decoded
 
         if normalized_geometry == "relative":
             render_settings: StereoRenderSettings | StereoSplatSettings | QualityStereoControls = (
@@ -2122,72 +2259,96 @@ class StereoPairGenerator:
                 occlusion_fill=occlusion_fill,
             )
 
-        reuse_exact_quality_input = (
-            render_mode == "quality" and capacity_value == 1 and effective_workers == 1
-        )
-        cached_quality_key: tuple[object, ...] | None = None
-        cached_quality_compact: CompactStereoRenderResult | None = None
-
         def render(decoded):
-            nonlocal cached_quality_key, cached_quality_compact
+            nonlocal cached_quality_key, cached_quality_frame
             if not isinstance(decoded, _ManifestDecodedFrame):
                 raise TypeError("manifest decoder returned an invalid ownership payload")
             work = decoded.work
-            input_key = (
-                work.guide_sha256,
-                work.guide_byte_count,
-                work.guide_shape,
-                work.geometry_sha256,
-                work.geometry_byte_count,
-                work.geometry_shape,
-            )
-            if (
-                reuse_exact_quality_input
-                and cached_quality_compact is not None
-                and cached_quality_key == input_key
-            ):
-                frame = decoded.take_frame()
-                primitive = decoded.take_primitive()
-                del frame, primitive
-                compact = cached_quality_compact
-            elif normalized_geometry == "relative":
-                cached_quality_key = None
-                cached_quality_compact = None
-                assert isinstance(render_settings, StereoRenderSettings)
-                if render_mode == "quality":
-                    compact = render_relative_quality_compact(
-                        renderer=self.renderer,
-                        frame=decoded.take_frame(),
-                        canonical=_take_relative_canonical(decoded),
-                        settings=render_settings,
-                    )
-                else:
-                    compact = self.renderer.render_relative_fast_compact(
-                        decoded.take_frame(),
-                        _take_relative_canonical(decoded),
-                        render_settings,
-                    )
+            input_key = _exact_quality_input_key(work) if reuse_exact_quality_input else None
+            performed_render = True
+            reusable_quality: _ReusableQualityFrame | None = None
+            if decoded.reused_quality is not None:
+                reusable_quality = decoded.take_reused_quality()
+                compact = reusable_quality.compact
+                performed_render = False
             else:
-                cached_quality_key = None
-                cached_quality_compact = None
-                if isinstance(render_settings, QualityStereoControls):
-                    compact = render_metric_primitives_compact(
-                        renderer=self.renderer,
-                        frame=decoded.take_frame(),
-                        primitives=_take_metric_primitive(decoded),
-                        controls=render_settings,
-                    )
+                if reuse_exact_quality_input:
+                    with quality_cache_lock:
+                        reusable_quality = (
+                            cached_quality_frame if cached_quality_key == input_key else None
+                        )
+                        if reusable_quality is None:
+                            cached_quality_key = None
+                            cached_quality_frame = None
+                if reusable_quality is not None:
+                    if decoded.prepared_quality is not None:
+                        decoded.take_prepared_quality()
+                    else:
+                        decoded.take_frame()
+                        decoded.take_primitive()
+                    compact = reusable_quality.compact
+                    performed_render = False
+                elif normalized_geometry == "relative":
+                    assert isinstance(render_settings, StereoRenderSettings)
+                    if render_mode == "quality":
+                        if decoded.prepared_quality is not None:
+                            compact = render_prepared_relative_quality_compact(
+                                renderer=self.renderer,
+                                prepared=decoded.take_prepared_quality(),
+                            )
+                        else:
+                            compact = render_relative_quality_compact(
+                                renderer=self.renderer,
+                                frame=decoded.take_frame(),
+                                canonical=_take_relative_canonical(decoded),
+                                settings=render_settings,
+                            )
+                    else:
+                        compact = self.renderer.render_relative_fast_compact(
+                            decoded.take_frame(),
+                            _take_relative_canonical(decoded),
+                            render_settings,
+                        )
                 else:
-                    assert isinstance(render_settings, StereoSplatSettings)
-                    compact = self.renderer.render_metric_primitives_fast_compact(
-                        decoded.take_frame(),
-                        _take_metric_primitive(decoded),
-                        render_settings,
+                    if isinstance(render_settings, QualityStereoControls):
+                        compact = render_metric_primitives_compact(
+                            renderer=self.renderer,
+                            frame=decoded.take_frame(),
+                            primitives=_take_metric_primitive(decoded),
+                            controls=render_settings,
+                        )
+                    else:
+                        assert isinstance(render_settings, StereoSplatSettings)
+                        compact = self.renderer.render_metric_primitives_fast_compact(
+                            decoded.take_frame(),
+                            _take_metric_primitive(decoded),
+                            render_settings,
+                        )
+            if reuse_exact_quality_input:
+                assert input_key is not None
+                if reusable_quality is None:
+                    reusable_quality = _ReusableQualityFrame(
+                        compact=compact,
+                        png_payloads=SharedQualityPngPayloads(
+                            compact=compact,
+                            keep_masks=keep_masks,
+                        ),
                     )
-            if reuse_exact_quality_input and cached_quality_compact is None:
-                cached_quality_key = input_key
-                cached_quality_compact = compact
-            if decoded.frame is not None or decoded.primitive is not None:
+                with quality_cache_lock:
+                    cached_quality_key = input_key
+                    cached_quality_frame = reusable_quality
+            if performed_render:
+                self.last_rendered_frame_count += 1
+                for name, elapsed in compact.performance_seconds.items():
+                    self.last_render_performance_seconds[name] = (
+                        self.last_render_performance_seconds.get(name, 0.0) + float(elapsed)
+                    )
+            if (
+                decoded.frame is not None
+                or decoded.primitive is not None
+                or decoded.prepared_quality is not None
+                or decoded.reused_quality is not None
+            ):
                 raise RuntimeError("manifest render did not consume decoded ownership")
             del decoded
             publication = prepare_quality_frame(
@@ -2202,7 +2363,10 @@ class StereoPairGenerator:
                     rgb_stage_fingerprint=stage_fingerprint,
                     keep_masks=keep_masks,
                     render_mode=render_mode,
-                )
+                ),
+                png_payloads=(
+                    reusable_quality.png_payloads if reusable_quality is not None else None
+                ),
             )
             return _WriteItem(
                 work=work,
@@ -2234,11 +2398,14 @@ class StereoPairGenerator:
                     left_path=write_item.work.left_path,
                 )
 
+        preflight_seconds = time.perf_counter() - stage_started
+        pipeline_started = time.perf_counter()
         self.last_pipeline_stats = run_streaming_stereo_pipeline(
             provider=provider,
             plan=control,
             capacity=capacity_value,
             effective_workers=effective_workers,
+            writer_workers=writer_workers,
             decode=decode,
             render=render,
             write=write,
@@ -2246,8 +2413,10 @@ class StereoPairGenerator:
             pre_mutation=revalidate_disk_admission,
             configured_workers=configured_workers,
         )
+        pipeline_seconds = time.perf_counter() - pipeline_started
+        consolidation_started = time.perf_counter()
         cached_quality_key = None
-        cached_quality_compact = None
+        cached_quality_frame = None
         try:
             validate_stereo_provider_replay(
                 provider,
@@ -2269,7 +2438,7 @@ class StereoPairGenerator:
                         work_index=item.source_index,
                         left_path=item.left_path,
                     )
-            if not diagnostics_context.mask_payloads_enabled:
+            if mask_prune_required:
                 prune_streaming_unreferenced_masks(diagnostics_context)
         except StereoInputIdentityMismatch as error:
             raise StereoStageInputChangedError(str(error)) from error
@@ -2310,11 +2479,67 @@ class StereoPairGenerator:
                 "affected_frame_count": metric_summary["affected_frame_count"],
                 "mean_clamped_fraction": metric_summary["mean_clamped_fraction"],
                 "max_clamped_fraction": metric_summary["max_clamped_fraction"],
-                "compatibility_summary_sha256": (
-                    completion.metric_clamp_summary.raw_sha256
-                ),
+                "compatibility_summary_sha256": (completion.metric_clamp_summary.raw_sha256),
             }
+        consolidation_seconds = time.perf_counter() - consolidation_started
+        self.last_stage_performance_seconds = {
+            "preflight": preflight_seconds,
+            "pipeline": pipeline_seconds,
+            "consolidation": consolidation_seconds,
+            "total": preflight_seconds + pipeline_seconds + consolidation_seconds,
+        }
+        self._publish_performance_report(directories, settings)
         return True
+
+    def _publish_performance_report(
+        self,
+        directories: dict[str, Path],
+        settings: dict[str, Any],
+    ) -> None:
+        stats = self.last_pipeline_stats
+        if stats is None:
+            return
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "render_mode": str(settings.get("stereo_render_mode", "fast")),
+            "geometry_mode": str(settings.get("stereo_geometry_mode", "relative")),
+            "pipeline": asdict(stats),
+            "rendered_frame_count": self.last_rendered_frame_count,
+            "render_seconds": dict(self.last_render_performance_seconds),
+            "stage_seconds": dict(self.last_stage_performance_seconds),
+        }
+        path = Path(directories["base"]) / "stereo-performance-v1.json"
+        try:
+            _atomic_write_json(path, payload)
+        except OSError as error:
+            print(f"Warning: Could not persist stereo performance metrics: {error}")
+            return
+        pipeline = payload["pipeline"]
+        print(
+            "Stereo performance: "
+            f"wall={float(pipeline.get('pipeline_wall_seconds', 0.0)):.3f}s, "
+            f"decode={float(pipeline.get('decode_busy_seconds', 0.0)):.3f}s, "
+            f"render={float(pipeline.get('render_busy_seconds', 0.0)):.3f}s, "
+            f"write={float(pipeline.get('write_busy_seconds', 0.0)):.3f}s"
+        )
+        stages = payload["stage_seconds"]
+        if stages:
+            print(
+                "Stereo stage timing: "
+                f"preflight={float(stages.get('preflight', 0.0)):.3f}s, "
+                f"pipeline={float(stages.get('pipeline', 0.0)):.3f}s, "
+                f"consolidation={float(stages.get('consolidation', 0.0)):.3f}s, "
+                f"total={float(stages.get('total', 0.0)):.3f}s"
+            )
+        if self.last_render_performance_seconds:
+            render = self.last_render_performance_seconds
+            mode = str(payload["render_mode"]).capitalize()
+            print(
+                f"{mode} render performance: "
+                f"geometry={sum(value for name, value in render.items() if name.startswith('geometry_') or name == 'fast_geometry'):.3f}s, "
+                f"nearest={render.get('geometry_nearest_query', 0.0):.3f}s, "
+                f"eyes={render.get('left_eye', 0.0) + render.get('right_eye', 0.0):.3f}s"
+            )
 
     def _build_stage_plan(
         self,

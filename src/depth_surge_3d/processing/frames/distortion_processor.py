@@ -36,6 +36,7 @@ from .stage_manifest import (
 
 DISTORTION_STAGE_ALGORITHM_VERSION = "fisheye-distortion-v1"
 CROP_STAGE_ALGORITHM_VERSION = "vr-crop-v2"
+FUSED_DISTORTION_CROP_STAGE_ALGORITHM_VERSION = "fisheye-distortion-crop-v1"
 
 
 class DistortionProcessor:
@@ -138,6 +139,85 @@ class DistortionProcessor:
             print(f"Error applying distortion: {e}")
             return False
 
+    def apply_distortion_and_crop(
+        self,
+        left_files: list[Path],
+        right_files: list[Path],
+        directories: dict[str, Path],
+        settings: dict[str, Any],
+        progress_tracker=None,
+    ) -> bool:
+        """Apply fisheye distortion and write cropped frames without Stage 5 PNGs."""
+
+        try:
+            if not settings.get("apply_distortion"):
+                return False
+            if not self._frame_pair_manifest_is_complete(left_files, right_files):
+                return False
+            outputs = self._crop_outputs(directories)
+            if outputs is None:
+                return False
+            left_output, right_output = outputs
+            identity = build_stage_identity(
+                stage="crop",
+                algorithm_version=FUSED_DISTORTION_CROP_STAGE_ALGORITHM_VERSION,
+                frame_names=[path.name for path in left_files],
+                source_files=[*left_files, *right_files],
+                settings={
+                    "apply_distortion": True,
+                    "fisheye_fov": settings["fisheye_fov"],
+                    "fisheye_projection": settings["fisheye_projection"],
+                    "fisheye_crop_factor": settings.get("fisheye_crop_factor"),
+                    "per_eye_width": settings.get("per_eye_width"),
+                    "per_eye_height": settings.get("per_eye_height"),
+                },
+            )
+            output_directories = (left_output, right_output)
+            if stage_is_reusable(identity, output_directories):
+                return True
+            clear_stage_outputs(output_directories)
+
+            source_header = uniform_png_frame_pair_header(left_files, right_files)
+            if source_header is None:
+                return False
+            x_map, y_map = calculate_fisheye_coordinates(
+                source_header.width,
+                source_header.height,
+                settings["fisheye_fov"],
+                settings["fisheye_projection"],
+            )
+            x_map.setflags(write=False)
+            y_map.setflags(write=False)
+            source_eye_pixels = source_header.width * source_header.height
+            target_eye_pixels = int(settings.get("per_eye_width") or 0) * int(
+                settings.get("per_eye_height") or 0
+            )
+            worker_count = calculate_frame_stage_workers(
+                len(left_files), max(source_eye_pixels, target_eye_pixels) * 64
+            )
+            self._run_distortion_crop_frame_pairs(
+                left_files,
+                right_files,
+                left_output,
+                right_output,
+                x_map,
+                y_map,
+                int(settings["per_eye_width"]),
+                int(settings["per_eye_height"]),
+                max(
+                    0.5,
+                    min(2.0, float(settings.get("fisheye_crop_factor", 0.7))),
+                ),
+                worker_count,
+                progress_tracker,
+            )
+            return self._complete_pair_stage(
+                identity, output_directories, left_output / left_files[0].name
+            )
+        except Exception as e:
+            print(f"Error applying fused distortion and crop: {e}")
+            return False
+
     @staticmethod
     def _frame_pair_manifest_is_complete(
         left_files: list[Path], right_files: list[Path], total_frames: int = 0
@@ -191,11 +271,61 @@ class DistortionProcessor:
             ),
         )
 
+    def _run_distortion_crop_frame_pairs(
+        self,
+        left_files: list[Path],
+        right_files: list[Path],
+        left_output: Path,
+        right_output: Path,
+        x_map,
+        y_map,
+        target_width: int,
+        target_height: int,
+        crop_factor: float,
+        worker_count: int,
+        progress_tracker,
+    ) -> None:
+        def transform_one(item) -> None:
+            left_file, right_file = item
+            if not self._distort_and_crop_single_frame_pair(
+                left_file,
+                right_file,
+                left_output,
+                right_output,
+                x_map,
+                y_map,
+                target_width,
+                target_height,
+                crop_factor,
+            ):
+                raise OSError(f"Could not distort and crop frame pair: {left_file}")
+
+        run_ordered_frame_tasks(
+            zip(left_files, right_files),
+            transform_one,
+            worker_count=worker_count,
+            on_ordered_result=lambda index, _result: self._report_fused_progress(
+                progress_tracker, index, len(left_files)
+            ),
+        )
+
     @staticmethod
     def _report_distortion_progress(progress_tracker, index: int, total: int) -> None:
         if progress_tracker:
             progress_tracker.update_progress(
                 "Applying distortion",
+                phase="distortion",
+                frame_num=index + 1,
+                step_name="Fisheye Distortion",
+                step_progress=index + 1,
+                step_total=total,
+            )
+
+    @staticmethod
+    def _report_fused_progress(progress_tracker, index: int, total: int) -> None:
+        if progress_tracker:
+            progress_tracker.update_progress(
+                f"Distorting and cropping frame {index + 1}/{total}",
                 phase="distortion",
                 frame_num=index + 1,
                 step_name="Fisheye Distortion",
@@ -238,6 +368,55 @@ class DistortionProcessor:
             cv2.imwrite(str(left_output / f"{frame_name}.png"), left_distorted)
             and cv2.imwrite(str(right_output / f"{frame_name}.png"), right_distorted)
         )
+
+    @classmethod
+    def _distort_and_crop_single_frame_pair(
+        cls,
+        left_file: Path,
+        right_file: Path,
+        left_output: Path,
+        right_output: Path,
+        x_map,
+        y_map,
+        target_width: int,
+        target_height: int,
+        crop_factor: float,
+    ) -> bool:
+        return cls._distort_and_crop_single_frame(
+            left_file,
+            left_output / left_file.name,
+            x_map,
+            y_map,
+            target_width,
+            target_height,
+            crop_factor,
+        ) and cls._distort_and_crop_single_frame(
+            right_file,
+            right_output / left_file.name,
+            x_map,
+            y_map,
+            target_width,
+            target_height,
+            crop_factor,
+        )
+
+    @staticmethod
+    def _distort_and_crop_single_frame(
+        source: Path,
+        destination: Path,
+        x_map,
+        y_map,
+        target_width: int,
+        target_height: int,
+        crop_factor: float,
+    ) -> bool:
+        image = cv2.imread(str(source))
+        if image is None:
+            print(f"Error: Could not load {source}")
+            return False
+        distorted = remap_fisheye(image, x_map, y_map)
+        cropped = apply_fisheye_square_crop(distorted, target_width, target_height, crop_factor)
+        return bool(cv2.imwrite(str(destination), cropped))
 
     def crop_frames(
         self,

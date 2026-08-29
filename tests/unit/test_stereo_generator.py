@@ -154,7 +154,12 @@ def _make_manifest_inputs(
     return manifest, {"base": root, "left_frames": left_dir, "right_frames": right_dir}
 
 
-def _make_metric_manifest_inputs(root: Path):
+def _make_metric_manifest_inputs(
+    root: Path,
+    *,
+    count: int = 2,
+    repeat_after_first: bool = False,
+):
     frame_dir = root / "00_original_frames"
     metric_dir = root / "03_metric_geometry"
     left_dir = root / "04_left_frames"
@@ -162,9 +167,13 @@ def _make_metric_manifest_inputs(root: Path):
     for directory in (frame_dir, metric_dir, left_dir, right_dir):
         directory.mkdir(parents=True)
     frames: list[Path] = []
-    for index in range(2):
+    for index in range(count):
+        payload_index = 0 if repeat_after_first else index
         frame = frame_dir / f"frame_{index:06d}.png"
-        assert cv2.imwrite(str(frame), np.full((4, 8, 3), 20 + index, dtype=np.uint8))
+        assert cv2.imwrite(
+            str(frame),
+            np.full((4, 8, 3), 20 + payload_index, dtype=np.uint8),
+        )
         frames.append(frame)
     store = MetricGeometryStore.open_or_create(
         metric_dir,
@@ -176,10 +185,11 @@ def _make_metric_manifest_inputs(root: Path):
         preflight_required_bytes=0,
     )
     for index, frame in enumerate(frames):
+        payload_index = 0 if repeat_after_first else index
         store.write_frame(
             frame.name,
             MetricGeometryFrame(
-                np.full((2, 4), 1.0 / (index + 1), dtype=np.float32),
+                np.full((2, 4), 1.0 / (payload_index + 1), dtype=np.float32),
                 np.ones((2, 4), dtype=np.bool_),
                 np.float32(0.5),
             ),
@@ -285,9 +295,50 @@ def test_manifest_pipeline_supports_quality_with_committed_diagnostics(tmp_path:
     diagnostics = tmp_path / "04_stereo_diagnostics"
     assert (diagnostics / "frames" / "frame_000001" / "manifest.json").is_file()
     assert (diagnostics / "stereo_coverage_summary.json").is_file()
-    assert json.loads((diagnostics / "metadata.json").read_text(encoding="ascii"))[
-        "status"
-    ] == "complete"
+    assert (
+        json.loads((diagnostics / "metadata.json").read_text(encoding="ascii"))["status"]
+        == "complete"
+    )
+
+
+def test_quality_manifest_prepares_relative_geometry_on_decode_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, directories = _make_manifest_inputs(tmp_path, count=2)
+    main_thread = threading.get_ident()
+    prepare_threads: list[int] = []
+    prepare_lock = threading.Lock()
+    real_prepare = stereo_generator.prepare_relative_quality_frame
+
+    def observe_prepare(**kwargs):
+        with prepare_lock:
+            prepare_threads.append(threading.get_ident())
+        return real_prepare(**kwargs)
+
+    monkeypatch.setattr(
+        stereo_generator,
+        "prepare_relative_quality_frame",
+        observe_prepare,
+    )
+    generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+
+    assert generator.create_stereo_pairs_from_manifest(
+        manifest,
+        directories,
+        _settings(
+            stereo_strength=2.0,
+            stereo_render_mode="quality",
+            occlusion_fill_max_px=8,
+        ),
+    )
+
+    assert len(prepare_threads) == manifest.frame_count
+    assert main_thread not in prepare_threads
+    assert generator.last_pipeline_stats is not None
+    assert generator.last_pipeline_stats.configured_capacity == 2
+    assert generator.last_pipeline_stats.decoder_thread_count == 2
+    assert generator.last_pipeline_stats.writer_thread_count == 2
 
 
 def test_quality_manifest_reuses_exact_consecutive_input_pair(
@@ -300,17 +351,28 @@ def test_quality_manifest_reuses_exact_consecutive_input_pair(
         repeat_after_first=True,
     )
     real_render = stereo_generator.render_relative_quality_compact
+    real_select = stereo_generator.select_quality_pipeline_capacity
     render_calls = 0
+    retained_charges: list[int] = []
 
     def count_render(**kwargs):
         nonlocal render_calls
         render_calls += 1
         return real_render(**kwargs)
 
+    def record_capacity_selection(**kwargs):
+        retained_charges.append(kwargs.get("retained_bytes", 0))
+        return real_select(**kwargs)
+
     monkeypatch.setattr(
         stereo_generator,
         "render_relative_quality_compact",
         count_render,
+    )
+    monkeypatch.setattr(
+        stereo_generator,
+        "select_quality_pipeline_capacity",
+        record_capacity_selection,
     )
 
     assert StereoPairGenerator(
@@ -323,10 +385,13 @@ def test_quality_manifest_reuses_exact_consecutive_input_pair(
             stereo_render_mode="quality",
             occlusion_fill_max_px=8,
             keep_intermediates=True,
+            stereo_io_workers=1,
         ),
     )
 
     assert render_calls == 1
+    assert len(retained_charges) == 1
+    assert retained_charges[0] > 0
     left_payloads = [
         (directories["left_frames"] / f"frame_{index:06d}.png").read_bytes()
         for index in range(1, 4)
@@ -342,6 +407,170 @@ def test_quality_manifest_reuses_exact_consecutive_input_pair(
         assert frame_manifest["frame_name"] == frame_name
 
 
+def test_quality_manifest_reuses_exact_input_across_overlapped_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    manifest, directories = _make_manifest_inputs(
+        tmp_path,
+        count=6,
+        repeat_after_first=True,
+    )
+    real_prepare = stereo_generator.prepare_relative_quality_frame
+    real_render = stereo_generator.render_prepared_relative_quality_compact
+    prepare_calls = 0
+    render_calls = 0
+    png_encode_calls = 0
+    calls_lock = threading.Lock()
+    real_png_encode = diagnostic_transaction._png_buffer
+
+    def count_prepare(**kwargs):
+        nonlocal prepare_calls
+        with calls_lock:
+            prepare_calls += 1
+        return real_prepare(**kwargs)
+
+    def count_render(**kwargs):
+        nonlocal render_calls
+        with calls_lock:
+            render_calls += 1
+        return real_render(**kwargs)
+
+    def count_png_encode(values):
+        nonlocal png_encode_calls
+        with calls_lock:
+            png_encode_calls += 1
+        return real_png_encode(values)
+
+    monkeypatch.setattr(
+        stereo_generator,
+        "prepare_relative_quality_frame",
+        count_prepare,
+    )
+    monkeypatch.setattr(
+        stereo_generator,
+        "render_prepared_relative_quality_compact",
+        count_render,
+    )
+    monkeypatch.setattr(diagnostic_transaction, "_png_buffer", count_png_encode)
+    generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+
+    assert generator.create_stereo_pairs_from_manifest(
+        manifest,
+        directories,
+        _settings(
+            stereo_strength=2.0,
+            stereo_render_mode="quality",
+            occlusion_fill_max_px=8,
+            keep_intermediates=True,
+            stereo_io_workers=8,
+        ),
+    )
+
+    assert generator.last_pipeline_stats is not None
+    assert generator.last_pipeline_stats.configured_capacity == 4
+    assert generator.last_pipeline_stats.decoder_thread_count == 4
+    assert generator.last_pipeline_stats.writer_thread_count == 3
+    assert 1 <= prepare_calls <= generator.last_pipeline_stats.configured_capacity
+    assert render_calls == 1
+    assert png_encode_calls == 6
+    assert generator.last_rendered_frame_count == 1
+    for side in ("left_frames", "right_frames"):
+        payloads = [
+            (directories[side] / f"frame_{index:06d}.png").read_bytes() for index in range(1, 7)
+        ]
+        assert len(set(payloads)) == 1
+
+
+def test_quality_reuse_revalidates_each_duplicate_input_after_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, directories = _make_manifest_inputs(
+        tmp_path,
+        count=3,
+        repeat_after_first=True,
+    )
+    original_publish = stereo_generator.publish_quality_frame
+    published = 0
+
+    def mutate_next_input(publication, **kwargs):
+        nonlocal published
+        result = original_publish(publication, **kwargs)
+        published += 1
+        if published == 1:
+            (tmp_path / "00_original_frames" / "frame_000002.png").write_bytes(b"changed")
+        return result
+
+    monkeypatch.setattr(stereo_generator, "publish_quality_frame", mutate_next_input)
+
+    with pytest.raises(stereo_generator.StereoStageInputChangedError):
+        StereoPairGenerator(
+            renderer=StereoRenderer(device="cpu")
+        ).create_stereo_pairs_from_manifest(
+            manifest,
+            directories,
+            _settings(
+                stereo_strength=2.0,
+                stereo_render_mode="quality",
+                occlusion_fill_max_px=8,
+                keep_intermediates=False,
+                stereo_io_workers=1,
+            ),
+        )
+
+    assert published == 1
+
+
+def test_quality_manifest_reuses_exact_metric_input_across_overlapped_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, directories = _make_metric_manifest_inputs(
+        tmp_path,
+        count=5,
+        repeat_after_first=True,
+    )
+    real_render = stereo_generator.render_metric_primitives_compact
+    render_calls = 0
+
+    def count_render(**kwargs):
+        nonlocal render_calls
+        render_calls += 1
+        return real_render(**kwargs)
+
+    monkeypatch.setattr(
+        stereo_generator,
+        "render_metric_primitives_compact",
+        count_render,
+    )
+    generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+
+    assert generator.create_stereo_pairs_from_manifest(
+        manifest,
+        directories,
+        _settings(
+            stereo_geometry_mode="metric_camera",
+            stereo_render_mode="quality",
+            metric_convergence_distance="auto",
+            max_disparity_percent=2.0,
+            keep_intermediates=False,
+        ),
+    )
+
+    assert generator.last_pipeline_stats is not None
+    assert generator.last_pipeline_stats.configured_capacity == 2
+    assert render_calls == 1
+    assert generator.last_rendered_frame_count == 1
+    for side in ("left_frames", "right_frames"):
+        payloads = [
+            (directories[side] / f"frame_{index:06d}.png").read_bytes() for index in range(5)
+        ]
+        assert len(set(payloads)) == 1
+
+
 def test_mask_pruning_resumes_after_all_migration_manifests_were_committed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -353,7 +582,9 @@ def test_mask_pruning_resumes_after_all_migration_manifests_were_committed(
         occlusion_fill_max_px=8,
         keep_intermediates=True,
     )
-    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
         manifest,
         directories,
         settings,
@@ -366,7 +597,9 @@ def test_mask_pruning_resumes_after_all_migration_manifests_were_committed(
     monkeypatch.setattr(stereo_generator, "prune_streaming_unreferenced_masks", fail_prune)
     settings["keep_intermediates"] = False
     with pytest.raises(OSError, match="crash before mask pruning"):
-        StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+        StereoPairGenerator(
+            renderer=StereoRenderer(device="cpu")
+        ).create_stereo_pairs_from_manifest(
             manifest,
             directories,
             settings,
@@ -377,7 +610,9 @@ def test_mask_pruning_resumes_after_all_migration_manifests_were_committed(
         original_prune,
     )
 
-    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
         manifest,
         directories,
         settings,
@@ -400,13 +635,7 @@ def test_mask_migration_retires_a_crash_residue_before_republishing(
     )
     generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
     assert generator.create_stereo_pairs_from_manifest(manifest, directories, settings)
-    committed = (
-        tmp_path
-        / "04_stereo_diagnostics"
-        / "frames"
-        / "frame_000001"
-        / "manifest.json"
-    )
+    committed = tmp_path / "04_stereo_diagnostics" / "frames" / "frame_000001" / "manifest.json"
     residue = stereo_generator.publication_temporary_path(committed)
     residue.write_bytes(committed.read_bytes())
 
@@ -431,7 +660,9 @@ def test_streaming_progress_advances_after_each_committed_render_then_migration(
         stereo_render_mode="quality",
         keep_intermediates=True,
     )
-    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
         manifest,
         directories,
         base,
@@ -448,7 +679,9 @@ def test_streaming_progress_advances_after_each_committed_render_then_migration(
         ),
     )
 
-    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
         manifest,
         directories,
         {**base, "keep_intermediates": False},
@@ -467,7 +700,9 @@ def test_streaming_progress_reports_manifest_only_migrations(
         stereo_render_mode="quality",
         keep_intermediates=True,
     )
-    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
         manifest,
         directories,
         base,
@@ -483,7 +718,9 @@ def test_streaming_progress_reports_manifest_only_migrations(
         ),
     )
 
-    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
         manifest,
         directories,
         {**base, "keep_intermediates": False},
@@ -502,7 +739,9 @@ def test_streaming_progress_does_not_advance_for_failed_migration(
         stereo_render_mode="quality",
         keep_intermediates=True,
     )
-    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
         manifest,
         directories,
         base,
@@ -527,7 +766,9 @@ def test_streaming_progress_does_not_advance_for_failed_migration(
 
     error: OSError | None = None
     try:
-        StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+        StereoPairGenerator(
+            renderer=StereoRenderer(device="cpu")
+        ).create_stereo_pairs_from_manifest(
             manifest,
             directories,
             {**base, "keep_intermediates": False},
@@ -553,7 +794,9 @@ def test_unclaimed_diagnostics_root_never_reuses_orphan_frame_transactions(
         occlusion_fill_max_px=8,
         keep_intermediates=False,
     )
-    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
         manifest,
         directories,
         settings,
@@ -578,9 +821,7 @@ def test_unclaimed_diagnostics_root_never_reuses_orphan_frame_transactions(
     publication_observations: list[tuple[bool, bool]] = []
 
     def publish_after_root_retirement(self, path):
-        publication_observations.append(
-            (not diagnostics_root.exists(), not residue.exists())
-        )
+        publication_observations.append((not diagnostics_root.exists(), not residue.exists()))
         return original_publish(self, path)
 
     monkeypatch.setattr(
@@ -594,11 +835,44 @@ def test_unclaimed_diagnostics_root_never_reuses_orphan_frame_transactions(
 
     assert publication_observations == [(True, True)]
     assert not residue.exists()
-    assert (
-        capture_directory_identity(diagnostics_root) != previous_root_identity
-    )
+    assert capture_directory_identity(diagnostics_root) != previous_root_identity
     assert generator.last_pipeline_stats is not None
     assert generator.last_pipeline_stats.decoded == manifest.frame_count
+
+
+@pytest.mark.parametrize("render_mode", ["fast", "quality"])
+def test_manifest_pipeline_persists_stage_performance_report(
+    tmp_path: Path,
+    render_mode: str,
+) -> None:
+    manifest, directories = _make_manifest_inputs(tmp_path, count=2)
+    settings = _settings(
+        stereo_strength=0.0,
+        stereo_render_mode=render_mode,
+        keep_intermediates=False,
+    )
+    generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+
+    assert generator.create_stereo_pairs_from_manifest(manifest, directories, settings)
+
+    report = json.loads((tmp_path / "stereo-performance-v1.json").read_text())
+    assert report["schema_version"] == 1
+    assert report["render_mode"] == render_mode
+    assert report["pipeline"]["pipeline_wall_seconds"] > 0.0
+    assert report["pipeline"]["render_busy_seconds"] > 0.0
+    assert report["rendered_frame_count"] == manifest.frame_count
+    assert report["render_seconds"]["total"] > 0.0
+    assert report["stage_seconds"]["preflight"] >= 0.0
+    assert report["stage_seconds"]["pipeline"] > 0.0
+    assert report["stage_seconds"]["consolidation"] >= 0.0
+    assert report["stage_seconds"]["total"] >= sum(
+        report["stage_seconds"][name] for name in ("preflight", "pipeline", "consolidation")
+    )
+    if render_mode == "quality":
+        assert report["render_seconds"]["geometry_nearest_query"] >= 0.0
+        assert report["pipeline"]["configured_capacity"] == min(2, manifest.frame_count)
+    else:
+        assert report["render_seconds"]["fast_geometry"] >= 0.0
 
 
 def test_downstream_is_invalidated_before_the_first_stereo_deletion(
@@ -712,7 +986,9 @@ def test_claimed_complete_root_rerenders_only_the_damaged_frame_transaction(
         occlusion_fill_max_px=8,
         keep_intermediates=False,
     )
-    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
         manifest,
         directories,
         settings,
@@ -744,9 +1020,7 @@ def test_post_mutation_manifest_replay_change_is_always_typed_fatal(
     manifest, directories = _make_manifest_inputs(tmp_path)
 
     def changed(*_args, **_kwargs):
-        raise stereo_generator.StereoInputIdentityMismatch(
-            f"injected {boundary} replay change"
-        )
+        raise stereo_generator.StereoInputIdentityMismatch(f"injected {boundary} replay change")
 
     render_mode = "quality" if boundary == "content" else "fast"
     if boundary == "content":
@@ -762,7 +1036,9 @@ def test_post_mutation_manifest_replay_change_is_always_typed_fatal(
         stereo_generator.StereoStageInputChangedError,
         match=f"injected {boundary} replay change",
     ):
-        StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+        StereoPairGenerator(
+            renderer=StereoRenderer(device="cpu")
+        ).create_stereo_pairs_from_manifest(
             manifest,
             directories,
             _settings(
@@ -815,6 +1091,7 @@ def test_real_manifest_replay_protocol_error_after_mutation_is_not_retried(
 
     assert generator.attempts == 1
 
+
 def test_pre_mutation_provider_change_restarts_from_a_fresh_read_only_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -842,7 +1119,9 @@ def test_pre_mutation_provider_change_restarts_from_a_fresh_read_only_generation
     monkeypatch.setattr(stereo_generator.StereoInputManifestV1, "open_provider", open_provider)
     monkeypatch.setattr(stereo_generator, "run_streaming_stereo_pipeline", run_pipeline)
 
-    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
         manifest,
         directories,
         _settings(
@@ -865,7 +1144,9 @@ def test_reused_output_damage_is_reclassified_before_noop_success(
         stereo_render_mode="quality",
         keep_intermediates=False,
     )
-    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
         manifest,
         directories,
         settings,
@@ -904,7 +1185,9 @@ def test_mixed_action_damage_restarts_before_the_first_mutation(
         stereo_render_mode="quality",
         keep_intermediates=False,
     )
-    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
         manifest,
         directories,
         settings,
@@ -964,7 +1247,9 @@ def test_metric_semantic_content_audit_cannot_run_before_quality_stage_preflight
     monkeypatch.setattr(stereo_generator, "_quality_stage_memory_preflight", reject_stage)
 
     with pytest.raises(stereo_generator.QualityHostBudgetError):
-        StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_manifest(
+        StereoPairGenerator(
+            renderer=StereoRenderer(device="cpu")
+        ).create_stereo_pairs_from_manifest(
             manifest,
             directories,
             _settings(
@@ -1043,9 +1328,7 @@ def test_manifest_pipeline_supports_metric_fast_and_quality(
     for index in range(2):
         frame_name = f"frame_{index:06d}"
         assert (directories["left_frames"] / f"{frame_name}.png").is_file()
-        manifest_path = (
-            tmp_path / "04_stereo_diagnostics" / "frames" / frame_name / "manifest.json"
-        )
+        manifest_path = tmp_path / "04_stereo_diagnostics" / "frames" / frame_name / "manifest.json"
         assert json.loads(manifest_path.read_text(encoding="ascii"))["geometry_mode"] == "metric"
     assert (directories["left_frames"] / "clamp_summary.json").is_file()
     assert generator.last_metric_clamp_summary is not None
@@ -1093,9 +1376,7 @@ def test_quality_file_pipeline_uses_one_slot_and_publishes_compact_diagnostics(
         (directories["left_frames"] / "metadata.json").read_text(encoding="ascii")
     )
     assert rgb_metadata["schema_version"] == 2
-    assert rgb_metadata["algorithm_version"] == (
-        "torch-horizontal-16x-rgb-geodesic-repair-v10"
-    )
+    assert rgb_metadata["algorithm_version"] == ("torch-horizontal-16x-rgb-geodesic-repair-v10")
     diagnostics_metadata = json.loads(
         (tmp_path / "04_stereo_diagnostics" / "metadata.json").read_text(encoding="ascii")
     )
@@ -1136,7 +1417,9 @@ def test_writer_queue_keeps_serialized_stats_not_dense_histograms(
     monkeypatch.setattr(stereo_generator, "prepare_quality_frame", prepare)
     monkeypatch.setattr(stereo_generator, "publish_quality_frame", publish)
 
-    assert StereoPairGenerator(renderer=StereoRenderer(device="cpu")).create_stereo_pairs_from_files(
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_files(
         frame_files,
         depth_files,
         directories,
@@ -1315,6 +1598,34 @@ def test_quality_mask_true_to_false_migrates_manifests_without_rerendering(
         assert manifest["mask_payloads_enabled"] is False
         assert manifest["payloads"]["left_coverage"] is None
         assert not (frame_dir / "left_coverage.png").exists()
+
+
+def test_new_mask_free_stage_skips_unreferenced_mask_prune(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, directories = _make_manifest_inputs(tmp_path, count=2)
+
+    def forbidden_prune(_context) -> None:
+        raise AssertionError("a fresh mask-free stage has no masks to prune")
+
+    monkeypatch.setattr(
+        stereo_generator,
+        "prune_streaming_unreferenced_masks",
+        forbidden_prune,
+    )
+
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
+        manifest,
+        directories,
+        _settings(
+            stereo_render_mode="fast",
+            stereo_strength=0.0,
+            keep_intermediates=False,
+        ),
+    )
 
 
 def test_quality_mask_false_to_true_rerenders_every_frame(

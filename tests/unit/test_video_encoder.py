@@ -1257,6 +1257,8 @@ def test_schema5_assembled_encode_publishes_bound_video_and_manifests(
     settings = validate_settings(
         {
             "preserve_audio": False,
+            "direct_vr_encode": False,
+            "keep_intermediates": True,
             "video_encoder": "libx264",
             "target_fps": "original",
             "vr_resolution": "custom:4x4",
@@ -1939,6 +1941,8 @@ def test_schema5_assembled_launch_uses_provider_path_and_one_final_launch_gate(
         str(tmp_path / "source.mp4"),
         {
             "preserve_audio": False,
+            "direct_vr_encode": False,
+            "keep_intermediates": True,
             "video_encoder": "libx264",
             "vr_format": "side_by_side",
             "vr_resolution": "custom",
@@ -2133,6 +2137,8 @@ def test_schema5_failed_encode_keeps_reservation_available_for_terminal_retireme
     settings = validate_settings(
         {
             "preserve_audio": False,
+            "direct_vr_encode": False,
+            "keep_intermediates": True,
             "video_encoder": "libx264",
             "vr_resolution": "custom:4x4",
             "per_eye_width": 4,
@@ -2210,6 +2216,8 @@ def test_schema5_manifest_staging_failure_keeps_new_reservation_for_terminal_ret
     settings = validate_settings(
         {
             "preserve_audio": False,
+            "direct_vr_encode": False,
+            "keep_intermediates": True,
             "video_encoder": "libx264",
             "vr_resolution": "custom:4x4",
             "per_eye_width": 4,
@@ -2322,6 +2330,7 @@ def test_schema5_direct_encode_uses_provider_and_same_publication_contract(
         {
             "preserve_audio": False,
             "direct_vr_encode": True,
+            "keep_intermediates": True,
             "video_encoder": "libx264",
             "target_fps": "original",
             "vr_resolution": "custom:4x4",
@@ -2608,6 +2617,8 @@ def test_schema5_post_boundary_restart_reencodes_without_rewriting_input_manifes
     settings = validate_settings(
         {
             "preserve_audio": False,
+            "direct_vr_encode": False,
+            "keep_intermediates": True,
             "video_encoder": "libx264",
             "vr_resolution": "custom:4x4",
             "per_eye_width": 4,
