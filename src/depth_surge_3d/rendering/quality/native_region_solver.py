@@ -16,6 +16,7 @@ def solve_native_geodesic_regions(
     *,
     movement_base_cost: int = 256,
     movement_edge_scale: int = 8,
+    mutable_region_map: bool = False,
 ) -> region_solver.GeodesicSolveResult:
     """Assign a full render band using the build-time native indexed heap."""
 
@@ -33,6 +34,8 @@ def solve_native_geodesic_regions(
         "movement_edge_scale",
         movement_edge_scale,
     )
+    if not isinstance(mutable_region_map, bool):
+        raise TypeError("mutable_region_map must be a bool")
     native = native_kd._require_native()
     try:
         owner, distance, position, statistics = native.solve_geodesic_regions(
@@ -47,7 +50,8 @@ def solve_native_geodesic_regions(
         if "quality region queue" in str(error):
             raise QualityRegionQueueBudgetError(str(error)) from error
         raise
-    for values in (owner, distance, position):
+    frozen_values = (distance, position) if mutable_region_map else (owner, distance, position)
+    for values in frozen_values:
         values.setflags(write=False)
     return region_solver.GeodesicSolveResult(
         region_map=owner,

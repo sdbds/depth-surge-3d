@@ -16,7 +16,7 @@ from src.depth_surge_3d.io.job_lock import JobWriterLock
 from src.depth_surge_3d.io.reservation_protocol import ReservationIncompleteError
 from src.depth_surge_3d.io.resume import LegacyFastAdoptionV1
 from src.depth_surge_3d.processing.frames.stereo_control import (
-    QualityPipelineCapacityError,
+    StereoPipelineCapacityError,
 )
 
 
@@ -913,7 +913,7 @@ class TestCleanupOnlyResume:
 
 class TestExecutePipeline:
     @staticmethod
-    def _streamed_quality_settings(**overrides):
+    def _streamed_stereo_settings(**overrides):
         settings = {
             "apply_distortion": True,
             "crop_factor": 1.0,
@@ -923,7 +923,7 @@ class TestExecutePipeline:
             "per_eye_height": 6,
             "per_eye_width": 8,
             "stereo_geometry_mode": "relative",
-            "stereo_render_mode": "quality",
+            "stereo_render_mode": "fast",
             "upscale_model": "none",
             "vr_format": "side_by_side",
             "vr_output_height": 6,
@@ -936,7 +936,7 @@ class TestExecutePipeline:
     @pytest.mark.parametrize(
         ("settings_overrides", "manifest_overrides", "schema5", "active_reservation"),
         [
-            ({"stereo_render_mode": "fast"}, {}, True, False),
+            ({"stereo_render_mode": "draft"}, {}, True, False),
             ({"stereo_geometry_mode": "metric_camera"}, {}, True, False),
             ({}, {"geometry_mode": "metric"}, True, False),
             ({"direct_vr_encode": False}, {}, True, False),
@@ -955,14 +955,14 @@ class TestExecutePipeline:
             ({}, {}, True, True),
         ],
     )
-    def test_streamed_quality_eligibility_rejects_every_unsupported_gate(
+    def test_streamed_stereo_eligibility_rejects_every_unsupported_gate(
         self,
         settings_overrides,
         manifest_overrides,
         schema5,
         active_reservation,
     ):
-        settings = self._streamed_quality_settings(**settings_overrides)
+        settings = self._streamed_stereo_settings(**settings_overrides)
         manifest_values = {
             "frame_count": 2,
             "geometry_mode": "relative",
@@ -970,34 +970,42 @@ class TestExecutePipeline:
         }
         manifest_values.update(manifest_overrides)
 
-        assert not ProcessingOrchestrator._streamed_quality_settings_eligible(
+        assert not ProcessingOrchestrator._streamed_stereo_settings_eligible(
             settings,
             SimpleNamespace(**manifest_values),
             schema5_settings=schema5,
             active_reservation=active_reservation,
         )
 
-    def test_streamed_quality_eligibility_accepts_distortion_and_rectilinear_noop(self):
+    @pytest.mark.parametrize("render_mode", ["fast", "quality"])
+    def test_streamed_stereo_eligibility_accepts_supported_render_modes(
+        self,
+        render_mode,
+    ):
         manifest = SimpleNamespace(
             frame_count=2,
             geometry_mode="relative",
             render_shape=(6, 8),
         )
-        assert ProcessingOrchestrator._streamed_quality_settings_eligible(
-            self._streamed_quality_settings(),
+        assert ProcessingOrchestrator._streamed_stereo_settings_eligible(
+            self._streamed_stereo_settings(stereo_render_mode=render_mode),
             manifest,
             schema5_settings=True,
             active_reservation=False,
         )
-        assert ProcessingOrchestrator._streamed_quality_settings_eligible(
-            self._streamed_quality_settings(apply_distortion=False, crop_factor=1.0),
+        assert ProcessingOrchestrator._streamed_stereo_settings_eligible(
+            self._streamed_stereo_settings(
+                stereo_render_mode=render_mode,
+                apply_distortion=False,
+                crop_factor=1.0,
+            ),
             manifest,
             schema5_settings=True,
             active_reservation=False,
         )
 
-    def test_streamed_quality_consumer_bound_charges_maps_transform_and_pipe_copies(self):
-        settings = self._streamed_quality_settings(
+    def test_streamed_stereo_consumer_bound_charges_maps_transform_and_pipe_copies(self):
+        settings = self._streamed_stereo_settings(
             per_eye_width=1920,
             per_eye_height=1080,
             vr_output_width=3840,
@@ -1008,17 +1016,14 @@ class TestExecutePipeline:
         final_pixels = 3840 * 1080
         map_bytes = 8 * source_pixels
         transform_peak = 3 * source_pixels + 6 * target_pixels
-        encoded_copy_bound = 4 * final_pixels + 1024 * 1024
-        pipe_peak = 6 * target_pixels + 3 * final_pixels + 2 * encoded_copy_bound
+        pipe_peak = 6 * target_pixels + 9 * final_pixels
 
-        assert ProcessingOrchestrator._streamed_quality_consumer_memory_bound(
+        assert ProcessingOrchestrator._streamed_stereo_consumer_memory_bound(
             (1080, 1920),
             settings,
         ) == map_bytes + max(transform_peak, pipe_peak)
 
-    def test_streamed_quality_session_precedes_render_and_publishes_after_generation(
-        self, tmp_path
-    ):
+    def test_streamed_stereo_session_precedes_render_and_publishes_after_generation(self, tmp_path):
         events: list[str] = []
         session = Mock()
 
@@ -1042,7 +1047,7 @@ class TestExecutePipeline:
             events.append("render")
             assert frame_consumer is not None
             assert frame_consumer_memory_bytes == (
-                ProcessingOrchestrator._streamed_quality_consumer_memory_bound(
+                ProcessingOrchestrator._streamed_stereo_consumer_memory_bound(
                     (6, 8),
                     settings,
                 )
@@ -1062,7 +1067,7 @@ class TestExecutePipeline:
         ) or (lambda left, right: (left, right))
         orchestrator = ProcessingOrchestrator(Mock(), stereo, distortion, Mock(), Mock(), encoder)
         orchestrator._settings_file = tmp_path / "processing-settings-v5.json"
-        settings = self._streamed_quality_settings()
+        settings = self._streamed_stereo_settings()
         directories = {
             "base": tmp_path,
             "left_frames": tmp_path / "04_left_frames",
@@ -1113,7 +1118,7 @@ class TestExecutePipeline:
         finalize.assert_called_once_with(True, tmp_path, "source.mp4", settings, 1)
         progress.finish.assert_called_once_with("Video processing complete")
 
-    def test_streamed_quality_aborts_session_when_generation_fails(self, tmp_path):
+    def test_streamed_stereo_aborts_session_when_generation_fails(self, tmp_path):
         events = []
         session = Mock()
         session.abort.side_effect = lambda: events.append("abort")
@@ -1144,7 +1149,7 @@ class TestExecutePipeline:
                     "left_frames": tmp_path / "04_left_frames",
                     "right_frames": tmp_path / "04_right_frames",
                 },
-                self._streamed_quality_settings(),
+                self._streamed_stereo_settings(),
                 manifest,
                 24.0,
                 "source.mp4",
@@ -1156,7 +1161,7 @@ class TestExecutePipeline:
         failure.assert_called_once_with("Stereo pair creation failed")
         assert events == ["abort", ("failed", "Stereo pair creation failed")]
 
-    def test_streamed_quality_does_not_terminalize_when_abort_is_incomplete(self, tmp_path):
+    def test_streamed_stereo_does_not_terminalize_when_abort_is_incomplete(self, tmp_path):
         session = Mock()
         session.abort.side_effect = ReservationIncompleteError("streamed cleanup remains retryable")
         encoder = Mock()
@@ -1183,7 +1188,7 @@ class TestExecutePipeline:
                         "left_frames": tmp_path / "04_left_frames",
                         "right_frames": tmp_path / "04_right_frames",
                     },
-                    self._streamed_quality_settings(),
+                    self._streamed_stereo_settings(),
                     manifest,
                     24.0,
                     "source.mp4",
@@ -1194,7 +1199,7 @@ class TestExecutePipeline:
         session.finish_and_publish.assert_not_called()
         failure.assert_not_called()
 
-    def test_streamed_quality_capacity_rejection_discards_session_and_falls_back(self, tmp_path):
+    def test_streamed_stereo_capacity_rejection_discards_session_and_falls_back(self, tmp_path):
         session = Mock()
         encoder = Mock()
         encoder.pending_final_encoding_reservation = None
@@ -1203,8 +1208,8 @@ class TestExecutePipeline:
 
         def render(*_args, frame_consumer=None, **_kwargs):
             if frame_consumer is not None:
-                raise QualityPipelineCapacityError(
-                    "stream consumer leaves no Quality lifecycle capacity"
+                raise StereoPipelineCapacityError(
+                    "stream consumer leaves no stereo lifecycle capacity"
                 )
             return True
 
@@ -1227,7 +1232,7 @@ class TestExecutePipeline:
                     "left_frames": tmp_path / "04_left_frames",
                     "right_frames": tmp_path / "04_right_frames",
                 },
-                self._streamed_quality_settings(),
+                self._streamed_stereo_settings(),
                 manifest,
                 24.0,
                 "source.mp4",

@@ -114,6 +114,13 @@ class _RawStageContext:
     candidate_scene_fingerprint: str
 
 
+@dataclass(frozen=True)
+class _ReusableRawChunk:
+    source_frames: np.ndarray
+    source_sizes: tuple[int, ...]
+    depth_batch: DepthBatch
+
+
 class DepthMapProcessor:
     """
     Depth map generation with canonical caching and memory management.
@@ -970,6 +977,9 @@ class DepthMapProcessor:
             )
 
         total_chunks = (len(frame_files) + chunk_size - 1) // chunk_size
+        retain_for_reuse = bool(getattr(self.depth_estimator, "exact_input_batch_reuse", False))
+        previous_chunk: _ReusableRawChunk | None = None
+        reused_frame_count = 0
         for chunk_start in range(0, len(frame_files), chunk_size):
             chunk_end = min(chunk_start + chunk_size, len(frame_files))
             chunk_files = frame_files[chunk_start:chunk_end]
@@ -977,8 +987,9 @@ class DepthMapProcessor:
             if raw_store is not None and all(
                 raw_store.path_for(name).is_file() for name in chunk_names
             ):
+                previous_chunk = None
                 continue
-            raw_store = self._infer_raw_chunk(
+            raw_store, previous_chunk, reused = self._infer_raw_chunk(
                 chunk_files,
                 chunk_names,
                 frame_names,
@@ -992,7 +1003,11 @@ class DepthMapProcessor:
                 target_fps,
                 estimated_shape,
                 estimated_storage_bytes,
+                previous_chunk,
+                retain_for_reuse=retain_for_reuse,
             )
+            if reused:
+                reused_frame_count += len(chunk_files)
             self._report_raw_chunk_progress(
                 progress_tracker,
                 chunk_start // chunk_size + 1,
@@ -1004,6 +1019,11 @@ class DepthMapProcessor:
         if raw_store is None:
             raise RuntimeError("Depth estimator produced no raw depth")
         raw_store.flush_metadata()
+        if reused_frame_count:
+            print(
+                f"  Reused exact depth for {reused_frame_count} frames "
+                "from identical consecutive batches"
+            )
         return raw_store
 
     @staticmethod
@@ -1455,16 +1475,32 @@ class DepthMapProcessor:
         target_fps: Any,
         estimated_shape: tuple[int, int],
         estimated_storage_bytes: int,
-    ) -> RawDepthStore:
+        previous_chunk: _ReusableRawChunk | None,
+        *,
+        retain_for_reuse: bool,
+    ) -> tuple[RawDepthStore, _ReusableRawChunk | None, bool]:
         chunk_frames = self._load_chunk_frames(chunk_files, settings)
         if chunk_frames is None or len(chunk_frames) != len(chunk_files):
             raise OSError("Not all source frames could be loaded for depth inference")
-        result = self.depth_estimator.estimate_depth_batch(
-            np.asarray(chunk_frames),
-            target_fps=target_fps,
-            input_size=input_size,
-            fp32=False,
+        source_frames = np.asarray(chunk_frames)
+        source_sizes = (
+            tuple(path.stat().st_size for path in chunk_files) if retain_for_reuse else ()
         )
+        reused = retain_for_reuse and self._raw_chunk_matches(
+            previous_chunk,
+            source_frames,
+            source_sizes,
+        )
+        if reused:
+            assert previous_chunk is not None
+            result = previous_chunk.depth_batch
+        else:
+            result = self.depth_estimator.estimate_depth_batch(
+                source_frames,
+                target_fps=target_fps,
+                input_size=input_size,
+                fp32=False,
+            )
         if not isinstance(result, DepthBatch):
             raise TypeError("File-backed depth inference requires a DepthBatch result")
         if len(result.values) != len(chunk_files):
@@ -1508,7 +1544,26 @@ class DepthMapProcessor:
                     storage_bytes=selected_bytes,
                     keep_intermediates=bool(settings.get("keep_intermediates", False)),
                 )
-        return raw_store
+        reusable = (
+            _ReusableRawChunk(source_frames, source_sizes, result) if retain_for_reuse else None
+        )
+        return raw_store, reusable, reused
+
+    @staticmethod
+    def _raw_chunk_matches(
+        previous_chunk: _ReusableRawChunk | None,
+        source_frames: np.ndarray,
+        source_sizes: tuple[int, ...],
+    ) -> bool:
+        if previous_chunk is None:
+            return False
+        previous_frames = previous_chunk.source_frames
+        return (
+            previous_chunk.source_sizes == source_sizes
+            and previous_frames.shape == source_frames.shape
+            and previous_frames.dtype == source_frames.dtype
+            and np.array_equal(previous_frames, source_frames)
+        )
 
     def _write_metric_geometry_stage(
         self,

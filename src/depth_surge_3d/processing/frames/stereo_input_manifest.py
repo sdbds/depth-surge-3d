@@ -1038,7 +1038,7 @@ class _ManifestReplay:
     def __call__(self) -> Iterator[StereoProviderItem]:
         try:
             yield from self._iter_items()
-        except StereoControlStateError as error:
+        except (StereoControlStateError, OSError, TypeError, ValueError) as error:
             raise StereoInputIdentityMismatch(str(error)) from error
 
     def _iter_items(self) -> Iterator[StereoProviderItem]:

@@ -194,6 +194,7 @@ def _publish_chunks(
     fault: PublishFault | None,
     label: str,
     description: str,
+    before_replace: Callable[[], None] | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -218,6 +219,8 @@ def _publish_chunks(
         if digest.hexdigest() != raw_sha256 or byte_count != raw_byte_count:
             raise CanonicalJsonError(f"{description} replay changed")
         emit(f"before_{label}_replace")
+        if before_replace is not None:
+            before_replace()
         owned.replace(
             after_replace=lambda: emit(f"after_{label}_replace"),
         )
@@ -249,6 +252,7 @@ class StreamedCanonicalObject:
         *,
         fault: PublishFault | None = None,
         label: str = "canonical_json",
+        before_replace: Callable[[], None] | None = None,
     ) -> None:
         _publish_chunks(
             path,
@@ -258,6 +262,7 @@ class StreamedCanonicalObject:
             fault=fault,
             label=label,
             description="streamed canonical JSON",
+            before_replace=before_replace,
         )
 
     def matches(self, path: Path, *, acquired: AcquiredRoot | None = None) -> bool:

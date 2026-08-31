@@ -27,6 +27,16 @@ class LowResolutionRegionResult:
 
 
 @dataclass(frozen=True)
+class StableSurfaceSupportResult:
+    """Fused stable-sample, surface-region, and interior support outputs."""
+
+    surface_regions: LowResolutionRegionResult
+    stable_samples: np.ndarray
+    stable_surfaces: np.ndarray
+    stable_sample_include: np.ndarray
+
+
+@dataclass(frozen=True)
 class GeodesicSolveResult:
     """Task 0 output including scratch diagnostics used by the gate."""
 
@@ -74,6 +84,71 @@ def build_low_resolution_regions(
         region_map=region_map,
         canonical_keys=canonical_keys,
         region_rank_bits=region_rank_bits,
+    )
+
+
+def build_stable_surface_support(
+    initial_region_map: np.ndarray,
+    stable_regions: np.ndarray,
+    one_eye_displacement_px: np.ndarray,
+    near_score: np.ndarray,
+) -> StableSurfaceSupportResult:
+    """Build stable surface support without synthetic displacement rasters."""
+
+    _validate_region_map(initial_region_map)
+    shape = (int(initial_region_map.shape[0]), int(initial_region_map.shape[1]))
+    if (
+        not isinstance(stable_regions, np.ndarray)
+        or stable_regions.dtype != np.bool_
+        or stable_regions.ndim != 1
+        or not stable_regions.flags.c_contiguous
+    ):
+        raise TypeError("stable_regions must be a C-contiguous bool vector")
+    if (
+        not isinstance(one_eye_displacement_px, np.ndarray)
+        or one_eye_displacement_px.dtype != np.float64
+        or one_eye_displacement_px.shape != shape
+        or not one_eye_displacement_px.flags.c_contiguous
+    ):
+        raise TypeError("one_eye_displacement_px must be a matching C-contiguous float64 raster")
+    if (
+        not isinstance(near_score, np.ndarray)
+        or near_score.dtype != np.float32
+        or near_score.shape != shape
+        or not near_score.flags.c_contiguous
+    ):
+        raise TypeError("near_score must be a matching C-contiguous float32 raster")
+    (
+        region_map,
+        canonical_keys,
+        region_rank_bits,
+        stable_samples,
+        stable_surfaces,
+        stable_sample_include,
+    ) = native_kd._require_native().build_stable_surface_support(
+        initial_region_map,
+        stable_regions,
+        one_eye_displacement_px,
+        near_score,
+    )
+    for values in (
+        region_map,
+        canonical_keys,
+        region_rank_bits,
+        stable_samples,
+        stable_surfaces,
+        stable_sample_include,
+    ):
+        values.setflags(write=False)
+    return StableSurfaceSupportResult(
+        surface_regions=LowResolutionRegionResult(
+            region_map=region_map,
+            canonical_keys=canonical_keys,
+            region_rank_bits=region_rank_bits,
+        ),
+        stable_samples=stable_samples,
+        stable_surfaces=stable_surfaces,
+        stable_sample_include=stable_sample_include,
     )
 
 
@@ -280,6 +355,60 @@ def build_sparse_region_seeds(
     )
     seeds.setflags(write=False)
     return seeds
+
+
+def build_sparse_stable_region_seeds(
+    mapped_regions: np.ndarray,
+    edge_band: np.ndarray,
+    stable_initial: np.ndarray,
+    stable_surfaces: np.ndarray,
+    *,
+    radius: int,
+) -> np.ndarray:
+    """Build sparse seeds and discard unstable owners in one native pass."""
+
+    _validate_region_map(mapped_regions)
+    shape = (int(mapped_regions.shape[0]), int(mapped_regions.shape[1]))
+    _validate_bool_raster("edge_band", edge_band, shape=shape)
+    _validate_bool_raster("stable_initial", stable_initial, shape=shape)
+    if (
+        not isinstance(stable_surfaces, np.ndarray)
+        or stable_surfaces.dtype != np.bool_
+        or stable_surfaces.ndim != 1
+        or not stable_surfaces.shape[0]
+        or not stable_surfaces.flags.c_contiguous
+    ):
+        raise TypeError("stable_surfaces must be a non-empty C-contiguous bool vector")
+    erosion_radius = _validate_nonnegative_integer("radius", radius)
+    seeds = native_kd._require_native().build_sparse_stable_region_seeds(
+        mapped_regions,
+        edge_band,
+        stable_initial,
+        stable_surfaces,
+        erosion_radius,
+    )
+    seeds.setflags(write=False)
+    return seeds
+
+
+def select_stable_region_support(
+    region_map: np.ndarray,
+    *,
+    region_count: int,
+    area_threshold: int,
+) -> np.ndarray:
+    """Select stable low-resolution regions with known label cardinality."""
+
+    _validate_region_map(region_map)
+    count = _validate_positive_dimension("region_count", region_count)
+    threshold = _validate_positive_dimension("area_threshold", area_threshold)
+    stable = native_kd._require_native().select_stable_region_support(
+        region_map,
+        count,
+        threshold,
+    )
+    stable.setflags(write=False)
+    return stable
 
 
 def integer_bgr_movement_cost(left: np.ndarray, right: np.ndarray) -> int:

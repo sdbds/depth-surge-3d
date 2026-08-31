@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pytest
 
 from src.depth_surge_3d.processing.video.bounded_process import (
@@ -23,7 +24,7 @@ from src.depth_surge_3d.processing.video.final_container_validation import (
 )
 
 
-def _probe_raw() -> bytes:
+def _probe_raw(frame_count: int = 1) -> bytes:
     return json.dumps(
         {
             "programs": [],
@@ -37,7 +38,7 @@ def _probe_raw() -> bytes:
                     "sample_aspect_ratio": "1:1",
                     "display_aspect_ratio": "2:1",
                     "avg_frame_rate": "24/1",
-                    "nb_read_frames": "1",
+                    "nb_read_frames": str(frame_count),
                 }
             ],
             "stream_groups": [],
@@ -46,19 +47,35 @@ def _probe_raw() -> bytes:
     ).encode("ascii")
 
 
-def _expectation() -> FinalContainerExpectation:
+def _expectation(frame_count: int = 1) -> FinalContainerExpectation:
     return FinalContainerExpectation(
         width=8,
         height=4,
         fps="24/1",
-        frame_count=1,
+        frame_count=frame_count,
         resolved_encoder="libx264",
         audio_expected=False,
         audio_packet_upper_bound=0,
     )
 
 
-def test_final_container_validator_runs_exact_probe_and_full_decode(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("cpu_count", "frame_count", "expected_threads"),
+    [
+        (None, 48, 1),
+        (1, 48, 1),
+        (2, 48, 2),
+        (4, 48, 4),
+        (8, 48, 8),
+        (32, 48, 8),
+        (32, 1, 1),
+        (32, 3, 3),
+    ],
+)
+def test_final_container_validator_runs_exact_probe_and_full_decode(
+    tmp_path, monkeypatch, cpu_count, frame_count, expected_threads
+) -> None:
+    monkeypatch.setattr(os, "cpu_count", lambda: cpu_count)
     video = tmp_path / "candidate.mp4"
     video.write_bytes(b"candidate")
     calls: list[tuple[str, ...]] = []
@@ -70,19 +87,19 @@ def test_final_container_validator_runs_exact_probe_and_full_decode(tmp_path) ->
             "stderr_cap": 64 * 1024,
             "timeout_seconds": 32,
         }
-        return BoundedProcessResult(_probe_raw(), b"", 0)
+        return BoundedProcessResult(_probe_raw(frame_count), b"", 0)
 
     def progress_runner(arguments, *, parser, **limits):
         calls.append(tuple(arguments))
         assert limits["diagnostic_cap"] == 256 * 1024
-        parser.feed_line(b"frame=1\n")
+        parser.feed_line(f"frame={frame_count}\n".encode("ascii"))
         parser.feed_line(b"progress=end\n")
         parser.finish()
         return ProgressProcessResult(b"", 0)
 
     assert validate_final_container_v4(
         video,
-        _expectation(),
+        _expectation(frame_count),
         finite_runner=finite_runner,
         progress_runner=progress_runner,
     )
@@ -90,6 +107,8 @@ def test_final_container_validator_runs_exact_probe_and_full_decode(tmp_path) ->
         "ffprobe",
         "-v",
         "error",
+        "-threads:v",
+        str(expected_threads),
         "-count_frames",
         "-show_entries",
         "stream=codec_type,codec_name,width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate,nb_read_frames",
@@ -231,8 +250,40 @@ def test_final_container_maps_decode_process_budget_failures(tmp_path, error, ex
         validate_final_container_v4(
             video,
             _expectation(),
-            finite_runner=lambda *_args, **_kwargs: BoundedProcessResult(
-                _probe_raw(), b"", 0
-            ),
+            finite_runner=lambda *_args, **_kwargs: BoundedProcessResult(_probe_raw(), b"", 0),
             progress_runner=fail_decode,
         )
+
+
+@pytest.mark.parametrize("cancel_stage", ["probe", "decode"])
+def test_final_container_preserves_cancellation_in_both_validation_passes(
+    tmp_path, cancel_stage
+) -> None:
+    video = tmp_path / "candidate.mp4"
+    video.write_bytes(b"candidate")
+    stages = []
+
+    def cancelled():
+        return True
+
+    def finite_runner(arguments, **limits):
+        stages.append("probe")
+        assert limits["cancelled"] is cancelled
+        if cancel_stage == "probe":
+            raise InterruptedError("cancelled in probe")
+        return BoundedProcessResult(_probe_raw(), b"", 0)
+
+    def progress_runner(arguments, **limits):
+        stages.append("decode")
+        assert limits["cancelled"] is cancelled
+        raise InterruptedError("cancelled in decode")
+
+    with pytest.raises(InterruptedError, match=f"cancelled in {cancel_stage}"):
+        validate_final_container_v4(
+            video,
+            _expectation(),
+            cancelled=cancelled,
+            finite_runner=finite_runner,
+            progress_runner=progress_runner,
+        )
+    assert stages == (["probe"] if cancel_stage == "probe" else ["probe", "decode"])

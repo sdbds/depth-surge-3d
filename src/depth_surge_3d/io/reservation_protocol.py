@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import errno
 import hashlib
 import json
@@ -206,16 +207,25 @@ def minimum_admission_forecast(
     )
 
 
+def _is_zero_filled(raw: bytes, start: int = 0) -> bool:
+    """Check a nonempty suffix at a valid offset without copying plain bytes."""
+
+    if type(raw) is bytes:
+        remaining = len(raw) - start
+        return remaining > 0 and raw[start] == 0 and raw.count(0, start) == remaining
+    tail = raw[start:] if start else raw
+    return bool(tail) and all(byte == 0 for byte in tail)
+
+
 def classify_payload_frame(raw: bytes, expected_payload: bytes) -> str:
     if not expected_payload or b"\x00" in expected_payload:
         raise ValueError("canonical reservation payload must be nonempty and NUL-free")
     if raw == expected_payload:
         return "complete-short"
-    if raw and all(byte == 0 for byte in raw):
+    if _is_zero_filled(raw):
         return "zero"
     if len(raw) > len(expected_payload) and raw.startswith(expected_payload):
-        tail = raw[len(expected_payload) :]
-        if tail and all(byte == 0 for byte in tail):
+        if _is_zero_filled(raw, len(expected_payload)):
             return "complete-full"
     return "partial"
 
@@ -243,6 +253,77 @@ def _sync_parent(
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+@lru_cache(maxsize=1)
+def _windows_relative_file_bindings() -> tuple:
+    """Reuse ABI declarations only; every acquisition retains fresh native state."""
+    import ctypes
+    from ctypes import wintypes
+
+    class IoStatusBlock(ctypes.Structure):
+        _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_void_p)]
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.USHORT),
+            ("maximum_length", wintypes.USHORT),
+            ("buffer", wintypes.LPWSTR),
+        ]
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.ULONG),
+            ("root_directory", wintypes.HANDLE),
+            ("object_name", ctypes.POINTER(UnicodeString)),
+            ("attributes", wintypes.ULONG),
+            ("security_descriptor", wintypes.LPVOID),
+            ("security_qos", wintypes.LPVOID),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    nt_create_file = ntdll.NtCreateFile
+    nt_create_file.argtypes = (
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        ctypes.POINTER(ObjectAttributes),
+        ctypes.POINTER(IoStatusBlock),
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    nt_create_file.restype = ctypes.c_long
+    ntstatus_to_error = ntdll.RtlNtStatusToDosError
+    ntstatus_to_error.argtypes = (ctypes.c_long,)
+    ntstatus_to_error.restype = wintypes.DWORD
+    return (
+        IoStatusBlock,
+        UnicodeString,
+        ObjectAttributes,
+        create_file,
+        close_handle,
+        nt_create_file,
+        ntstatus_to_error,
+    )
 
 
 @contextmanager
@@ -310,60 +391,15 @@ def _open_relative_regular_file(
     import msvcrt
     from ctypes import wintypes
 
-    class IoStatusBlock(ctypes.Structure):
-        _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_void_p)]
-
-    class UnicodeString(ctypes.Structure):
-        _fields_ = [
-            ("length", wintypes.USHORT),
-            ("maximum_length", wintypes.USHORT),
-            ("buffer", wintypes.LPWSTR),
-        ]
-
-    class ObjectAttributes(ctypes.Structure):
-        _fields_ = [
-            ("length", wintypes.ULONG),
-            ("root_directory", wintypes.HANDLE),
-            ("object_name", ctypes.POINTER(UnicodeString)),
-            ("attributes", wintypes.ULONG),
-            ("security_descriptor", wintypes.LPVOID),
-            ("security_qos", wintypes.LPVOID),
-        ]
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    ntdll = ctypes.WinDLL("ntdll")
-    create_file = kernel32.CreateFileW
-    create_file.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    )
-    create_file.restype = wintypes.HANDLE
-    close_handle = kernel32.CloseHandle
-    close_handle.argtypes = (wintypes.HANDLE,)
-    close_handle.restype = wintypes.BOOL
-    nt_create_file = ntdll.NtCreateFile
-    nt_create_file.argtypes = (
-        ctypes.POINTER(wintypes.HANDLE),
-        wintypes.DWORD,
-        ctypes.POINTER(ObjectAttributes),
-        ctypes.POINTER(IoStatusBlock),
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-    )
-    nt_create_file.restype = ctypes.c_long
-    ntstatus_to_error = ntdll.RtlNtStatusToDosError
-    ntstatus_to_error.argtypes = (ctypes.c_long,)
-    ntstatus_to_error.restype = wintypes.DWORD
+    (
+        IoStatusBlock,
+        UnicodeString,
+        ObjectAttributes,
+        create_file,
+        close_handle,
+        nt_create_file,
+        ntstatus_to_error,
+    ) = _windows_relative_file_bindings()
     invalid_handle = ctypes.c_void_p(-1).value
     parent_handle = create_file(
         str(path.parent),
@@ -5649,7 +5685,7 @@ def _parse_terminal_source_payload(
     from .settings_artifact import ProcessingSettingsArtifactV5, SettingsArtifactError
 
     if full_length:
-        if raw and all(byte == 0 for byte in raw):
+        if _is_zero_filled(raw):
             return None
         nul = raw.find(b"\x00")
         if nul <= 0 or any(raw[nul:]):

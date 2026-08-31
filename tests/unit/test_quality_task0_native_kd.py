@@ -34,9 +34,22 @@ def test_native_extension_is_prebuilt_and_reports_frozen_contract() -> None:
     assert 1 <= build_info["geometry_query_worker_cap"] <= 32
     assert build_info["edge_band_parallelism"] == "deterministic-row-std-thread-v1"
     assert 1 <= build_info["edge_band_worker_cap"] <= 32
+    assert build_info["foreground_matte_copy_strategy"] == "sparse-winner-records-dense-fallback-v1"
+    assert build_info["foreground_matte_sparse_record_limit_divisor"] == 4
+    assert build_info["foreground_matte_winner_scan"] == "fused-destination-order-v1"
+    assert build_info["foreground_matte_candidate_domain"] == "edge-band-v1"
+    assert build_info["background_proxy_preparation"] == "fused-lut-sliding-window-mask-bounds-v2"
+    assert build_info["background_proxy_inpaint_domain"] == "exact-padded-mask-roi-v1"
+    assert build_info["stable_region_selection"] == "known-cardinality-native-v1"
+    assert build_info["stable_surface_support"] == "min-root-guarded-scan-fused-v2"
+    assert build_info["local_geometry_query"] == "exact-bounded-grid-kd-fallback-v1"
+    assert build_info["local_geometry_query_radius"] == 16
+    assert build_info["local_geometry_query_parallelism"] == "deterministic-block-std-thread-v1"
+    assert build_info["four_neighbour_jump_parallelism"] == "deterministic-row-std-thread-v1"
+    assert 1 <= build_info["four_neighbour_jump_worker_cap"] <= 32
     assert build_info["native_spawned_worker_cap"] == 7
     assert build_info["sparse_seed_morphology"] == "active-fragment-pixels-v1"
-    assert build_info["geodesic_workset"] == "band-pixel-heap-storage-v1"
+    assert build_info["geodesic_workset"] == "band-pixel-cached-4ary-heap-storage-v2"
     assert build_info["kd_stack_capacity"] == 64
     assert build_info["runtime_jit"] is False
     assert len(build_info["source_sha256"]) == 64

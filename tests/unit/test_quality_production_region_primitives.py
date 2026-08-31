@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import importlib
 
 import numpy as np
@@ -79,6 +80,33 @@ def test_native_mapping_and_edge_band_match_the_scalar_oracle(monkeypatch) -> No
     assert np.array_equal(actual_band, expected_band)
 
 
+def test_native_nearest_label_upsample_is_exact_under_concurrent_calls() -> None:
+    production = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
+    prototype = importlib.import_module("scripts.quality_task0.region_solver")
+    rng = np.random.default_rng(20260831)
+    labels = np.ascontiguousarray(rng.integers(1, 5000, size=(37, 53), dtype=np.uint32))
+    expected = prototype.nearest_label_upsample(
+        labels,
+        render_height=131,
+        render_width=197,
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        actual = list(
+            executor.map(
+                lambda _index: production.nearest_label_upsample(
+                    labels,
+                    render_height=131,
+                    render_width=197,
+                ),
+                range(12),
+            )
+        )
+
+    assert all(values.tobytes() == expected.tobytes() for values in actual)
+    assert all(not values.flags.writeable for values in actual)
+
+
 def test_native_region_fragment_labels_match_the_scalar_oracle() -> None:
     native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
     prototype = importlib.import_module("scripts.quality_task0.region_solver")
@@ -143,9 +171,10 @@ def test_production_sparse_region_seeds_bypass_scalar_morphology(monkeypatch) ->
     band = np.zeros(regions.shape, dtype=np.bool_)
     band[:, 3:13] = True
     expected = prototype.build_sparse_region_seeds(regions, band, radius=2)
-    scalar_path_error = lambda *_args: (_ for _ in ()).throw(
-        AssertionError("production entered scalar sparse-seed morphology")
-    )
+
+    def scalar_path_error(*_args):
+        raise AssertionError("production entered scalar sparse-seed morphology")
+
     monkeypatch.setattr(production, "_cross_erode", scalar_path_error)
     monkeypatch.setattr(production, "cross_skeleton", scalar_path_error)
     monkeypatch.setattr(production, "_label_region_fragments", scalar_path_error)
@@ -154,6 +183,39 @@ def test_production_sparse_region_seeds_bypass_scalar_morphology(monkeypatch) ->
 
     assert actual.tobytes() == expected.tobytes()
     assert not actual.flags.writeable
+
+
+def test_native_stable_sparse_region_seeds_match_the_composed_scalar_oracle() -> None:
+    production = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
+    prototype = importlib.import_module("scripts.quality_task0.region_solver")
+    rng = np.random.default_rng(2026083101)
+    regions = np.ascontiguousarray(rng.integers(1, 8, size=(37, 53), dtype=np.uint32))
+    band = np.ascontiguousarray(rng.random(regions.shape) < 0.37, dtype=np.bool_)
+    stable_initial = np.ascontiguousarray(rng.random(regions.shape) < 0.81, dtype=np.bool_)
+    stable_surfaces = np.array(
+        [False, True, False, True, True, False, True, True],
+        dtype=np.bool_,
+    )
+
+    for radius in (0, 1, 4):
+        expected = np.array(
+            prototype.build_sparse_region_seeds(regions, band, radius=radius),
+            copy=True,
+            order="C",
+        )
+        expected[~stable_initial] = np.uint32(0)
+        expected[~stable_surfaces[expected]] = np.uint32(0)
+
+        actual = production.build_sparse_stable_region_seeds(
+            regions,
+            band,
+            stable_initial,
+            stable_surfaces,
+            radius=radius,
+        )
+
+        assert actual.tobytes() == expected.tobytes()
+        assert not actual.flags.writeable
 
 
 def test_native_one_sided_collection_matches_the_scalar_oracle() -> None:

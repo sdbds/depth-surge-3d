@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import ctypes
 from enum import IntEnum
@@ -28,6 +29,10 @@ STEREO_CONTROL_OVERHEAD = 4 * 1024 * 1024
 STEREO_HOST_BUDGET = 512 * 1024 * 1024
 STEREO_IO_THREAD_BYTES = 2 * 1024 * 1024
 STEREO_REQUESTED_STACK_BYTES = 512 * 1024
+QUALITY_PNG_ENCODER_MAX_WORKERS = 4
+QUALITY_PNG_ENCODER_STACK_RESERVE_BYTES = 2 * 1024 * 1024
+# Standard executor stacks need their own reserve plus thread/TLS runtime slack.
+QUALITY_PNG_ENCODER_THREAD_BYTES = 4 * 1024 * 1024
 STEREO_CONTROL_MANIFEST_STREAM_BYTES = 1024 * 1024
 STEREO_CONTROL_JSON_STATE_BYTES = 256 * 1024
 STEREO_CONTROL_DIAGNOSTICS_STATE_BYTES = 512 * 1024
@@ -45,7 +50,11 @@ class StereoControlStateError(StereoControlError):
     """A packed action or replay state is invalid."""
 
 
-class QualityPipelineCapacityError(StereoControlBudgetError):
+class StereoPipelineCapacityError(StereoControlBudgetError):
+    """A stereo lifecycle cannot fit the fixed host-memory budget."""
+
+
+class QualityPipelineCapacityError(StereoPipelineCapacityError):
     """The pre-mutation Quality lifecycle cannot fit the host-memory budget."""
 
 
@@ -638,6 +647,7 @@ class QualityPipelineCapacity:
     capacity: int
     effective_workers: int
     writer_workers: int
+    png_encoder_workers: int
     thread_bytes: int
     total_bytes: int
 
@@ -652,13 +662,14 @@ def quality_pipeline_capacity(pending_render_count: int) -> tuple[int, int, int]
     return 1, 1, 3 * STEREO_IO_THREAD_BYTES
 
 
-def select_quality_pipeline_capacity(
+def select_quality_pipeline_capacity(  # noqa: C901
     *,
     configured_workers: int,
     pending_render_count: int,
     quality_active_scratch: int,
     quality_slot_bytes: int,
     retained_bytes: int = 0,
+    png_payloads_per_item: int = 0,
 ) -> QualityPipelineCapacity:
     """Overlap Quality decode, render, and write under the fixed host budget."""
 
@@ -670,15 +681,20 @@ def select_quality_pipeline_capacity(
         raise TypeError("pending render count must be an integer")
     if pending_render_count < 0:
         raise ValueError("pending render count must be nonnegative")
+    if isinstance(png_payloads_per_item, bool) or not isinstance(png_payloads_per_item, int):
+        raise TypeError("Quality PNG payload count must be an integer")
+    if png_payloads_per_item < 0 or png_payloads_per_item > 6:
+        raise ValueError("Quality PNG payload count must be in 0..6")
     if quality_active_scratch < 0 or quality_slot_bytes <= 0 or retained_bytes < 0:
         raise ValueError("Quality scratch and slot byte counts are invalid")
     if pending_render_count == 0:
         return QualityPipelineCapacity(
-            0,
-            0,
-            0,
-            0,
-            quality_active_scratch + retained_bytes,
+            capacity=0,
+            effective_workers=0,
+            writer_workers=0,
+            png_encoder_workers=0,
+            thread_bytes=0,
+            total_bytes=quality_active_scratch + retained_bytes,
         )
 
     selected: QualityPipelineCapacity | None = None
@@ -686,25 +702,41 @@ def select_quality_pipeline_capacity(
     for capacity in range(1, candidate_max + 1):
         effective_workers = min(configured_workers, capacity)
         writer_workers = min(3, effective_workers)
-        thread_bytes = (1 + effective_workers + writer_workers) * STEREO_IO_THREAD_BYTES
-        total = (
+        pipeline_thread_count = 1 + effective_workers + writer_workers
+        base_thread_bytes = pipeline_thread_count * STEREO_IO_THREAD_BYTES
+        base_total = (
             quality_active_scratch
             + retained_bytes
             + (capacity - 1) * quality_slot_bytes
-            + thread_bytes
+            + base_thread_bytes
         )
+        available_png_threads = max(
+            0,
+            (STEREO_HOST_BUDGET - base_total) // QUALITY_PNG_ENCODER_THREAD_BYTES,
+        )
+        png_encoder_workers = min(
+            QUALITY_PNG_ENCODER_MAX_WORKERS,
+            configured_workers,
+            pending_render_count * png_payloads_per_item,
+            capacity * png_payloads_per_item,
+            available_png_threads,
+        )
+        if png_encoder_workers < 2:
+            png_encoder_workers = 0
+        png_thread_bytes = png_encoder_workers * QUALITY_PNG_ENCODER_THREAD_BYTES
+        thread_bytes = base_thread_bytes + png_thread_bytes
+        total = base_total + png_thread_bytes
         if total <= STEREO_HOST_BUDGET:
             selected = QualityPipelineCapacity(
-                capacity,
-                effective_workers,
-                writer_workers,
-                thread_bytes,
-                total,
+                capacity=capacity,
+                effective_workers=effective_workers,
+                writer_workers=writer_workers,
+                png_encoder_workers=png_encoder_workers,
+                thread_bytes=thread_bytes,
+                total_bytes=total,
             )
     if selected is None:
-        raise QualityPipelineCapacityError(
-            "no Quality lifecycle capacity fits the host budget"
-        )
+        raise QualityPipelineCapacityError("no Quality lifecycle capacity fits the host budget")
     return selected
 
 
@@ -714,6 +746,7 @@ def select_fast_pipeline_capacity(
     pending_render_count: int,
     fast_active_scratch: int,
     fast_slot_bytes: int,
+    retained_bytes: int = 0,
 ) -> FastPipelineCapacity:
     """Choose the unique largest eligible capacity from the frozen formula."""
 
@@ -725,20 +758,20 @@ def select_fast_pipeline_capacity(
         raise TypeError("pending render count must be an integer")
     if pending_render_count < 0:
         raise ValueError("pending render count must be nonnegative")
+    if fast_active_scratch < 0 or fast_slot_bytes <= 0 or retained_bytes < 0:
+        raise ValueError("Fast scratch, slot, and retained byte counts are invalid")
     if pending_render_count == 0:
-        return FastPipelineCapacity(0, 0, 0, fast_active_scratch)
-    if fast_active_scratch < 0 or fast_slot_bytes <= 0:
-        raise ValueError("Fast scratch and slot byte counts are invalid")
+        return FastPipelineCapacity(0, 0, 0, fast_active_scratch + retained_bytes)
     candidate_max = min(2 * configured_workers, pending_render_count)
     selected: FastPipelineCapacity | None = None
     for capacity in range(1, candidate_max + 1):
         effective_workers = min(configured_workers, capacity)
         thread_bytes = (1 + 2 * effective_workers) * STEREO_IO_THREAD_BYTES
-        total = fast_active_scratch + thread_bytes + capacity * fast_slot_bytes
+        total = fast_active_scratch + retained_bytes + thread_bytes + capacity * fast_slot_bytes
         if total <= STEREO_HOST_BUDGET:
             selected = FastPipelineCapacity(capacity, effective_workers, thread_bytes, total)
     if selected is None:
-        raise StereoControlBudgetError("no Fast lifecycle capacity fits the host budget")
+        raise StereoPipelineCapacityError("no Fast lifecycle capacity fits the host budget")
     return selected
 
 
@@ -991,6 +1024,132 @@ def _attest_stack(evidence: StackReservationEvidence) -> None:
         raise StereoThreadBudgetError("attestation", "invalid committed stack bytes", 0, 0)
 
 
+def _attest_executor_stack(evidence: StackReservationEvidence) -> None:
+    if not isinstance(evidence, StackReservationEvidence):
+        raise StereoThreadBudgetError("attestation", "adapter returned no evidence", 0, 0)
+    if evidence.granularity_bytes <= 0:
+        raise StereoThreadBudgetError("attestation", "invalid platform granularity", 0, 0)
+    if (
+        evidence.reserve_bytes <= 0
+        or evidence.reserve_bytes > QUALITY_PNG_ENCODER_STACK_RESERVE_BYTES
+    ):
+        raise StereoThreadBudgetError(
+            "attestation",
+            f"executor stack reserve {evidence.reserve_bytes} exceeds "
+            f"the stack limit {QUALITY_PNG_ENCODER_STACK_RESERVE_BYTES}",
+            0,
+            0,
+        )
+    if evidence.committed_bytes < 0 or evidence.committed_bytes > evidence.reserve_bytes:
+        raise StereoThreadBudgetError("attestation", "invalid committed stack bytes", 0, 0)
+
+
+def create_attested_stereo_executor(  # noqa: C901
+    *,
+    worker_count: int,
+    thread_name_prefix: str,
+    stack_adapter: Callable[[], StackReservationEvidence] | None = None,
+    stack_size_api: Callable[..., int] = threading.stack_size,
+    attestation_timeout_seconds: float = 10.0,
+) -> tuple[ThreadPoolExecutor, StereoThreadCreationStats]:
+    """Prime a fixed executor and prove every worker fits its charged stack budget."""
+
+    if isinstance(worker_count, bool) or not isinstance(worker_count, int):
+        raise TypeError("executor worker count must be an integer")
+    if worker_count < 1 or worker_count > 16:
+        raise ValueError("executor worker count must be in 1..16")
+    if not isinstance(thread_name_prefix, str) or not thread_name_prefix:
+        raise ValueError("executor thread name prefix must be nonempty")
+    if stack_adapter is None:
+        stack_adapter = attest_current_thread_stack
+
+    release = threading.Event()
+    reports: queue.Queue[tuple[str, StackReservationEvidence | BaseException]] = queue.Queue(
+        maxsize=worker_count
+    )
+    executor: ThreadPoolExecutor | None = None
+    parked: list[Future[None]] = []
+    previous_stack = 0
+    restored_stack = 0
+    failure_stage = "creation"
+    failure: BaseException | None = None
+    evidence_by_name: dict[str, StackReservationEvidence] = {}
+
+    def attest_and_park() -> None:
+        name = threading.current_thread().name
+        try:
+            report: StackReservationEvidence | BaseException = stack_adapter()
+        except BaseException as error:
+            report = error
+        reports.put((name, report))
+        release.wait()
+
+    with _STEREO_THREAD_CREATION_LOCK:
+        try:
+            previous_stack = stack_size_api()
+            failure_stage = "stack setting"
+            stack_size_api(STEREO_REQUESTED_STACK_BYTES)
+            failure_stage = "construction"
+            executor = ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix=thread_name_prefix,
+            )
+            for _ in range(worker_count):
+                parked.append(executor.submit(attest_and_park))
+            failure_stage = "attestation"
+            for _ in range(worker_count):
+                try:
+                    name, report = reports.get(timeout=attestation_timeout_seconds)
+                except queue.Empty as error:
+                    raise TimeoutError("executor worker attestation timed out") from error
+                if isinstance(report, BaseException):
+                    raise report
+                _attest_executor_stack(report)
+                if name in evidence_by_name:
+                    raise RuntimeError("executor did not prime distinct worker threads")
+                evidence_by_name[name] = report
+        except BaseException as error:
+            failure = error
+        finally:
+            try:
+                failure_stage = "restoration" if failure is None else failure_stage
+                stack_size_api(previous_stack)
+                restored_stack = previous_stack
+            except BaseException as restore_error:
+                if failure is None:
+                    failure = restore_error
+                    failure_stage = "restoration"
+
+    try:
+        release.set()
+        if failure is not None:
+            raise StereoThreadBudgetError(
+                failure_stage,
+                str(failure),
+                len(parked),
+                len(parked),
+            ) from failure
+
+        assert executor is not None
+        for future in parked:
+            future.result()
+        names = tuple(evidence_by_name)
+        return executor, StereoThreadCreationStats(
+            thread_names=names,
+            requested_stack_bytes=STEREO_REQUESTED_STACK_BYTES,
+            previous_stack_bytes=previous_stack,
+            restored_stack_bytes=restored_stack,
+            stack_evidence=tuple(evidence_by_name[name] for name in names),
+        )
+    except BaseException:
+        release.set()
+        for future in parked:
+            future.cancel()
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        raise
+
+
 def create_parked_stereo_workers(  # noqa: C901
     *,
     pending_render_count: int,
@@ -1140,6 +1299,7 @@ class StreamingStereoPipelineStats:
     restored_stack_bytes: int = 0
     stack_granularity_bytes: tuple[int, ...] = ()
     reported_stack_reserve_bytes: tuple[int, ...] = ()
+    png_encoder_thread_count: int = 0
 
 
 @dataclass(frozen=True)

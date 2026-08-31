@@ -43,9 +43,12 @@ class DiagnosticsCardinalityError(ValueError):
 
 
 def _u64_operand(field: str, value: object) -> int:
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
-        raise DiagnosticsCardinalityError(field, (value,))
-    normalized = int(value)
+    if type(value) is int:
+        normalized = value
+    else:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+            raise DiagnosticsCardinalityError(field, (value,))
+        normalized = int(value)
     if normalized < 0 or normalized > _U64_MAX:
         raise DiagnosticsCardinalityError(field, (value,))
     return normalized
@@ -271,6 +274,27 @@ def _backend_counts(
     )
 
 
+def _repair_state_counts(repair_bits: np.ndarray) -> dict[str, int]:
+    # Match the native dtype identity check; equivalent metadata dtypes stay on NumPy.
+    if (
+        type(repair_bits) is np.ndarray
+        and repair_bits.dtype is np.dtype(np.uint8)
+        and repair_bits.ndim == 2
+        and repair_bits.flags.c_contiguous
+    ):
+        from . import native_kd
+
+        native = native_kd._require_native() if native_kd.native_available() else None
+        counter = getattr(native, "count_repair_state_bits", None)
+        if counter is not None:
+            counts = counter(repair_bits)
+            return {name: int(counts[bit.bit_length() - 1]) for name, bit in _STATE_BITS.items()}
+    return {
+        name: int(np.count_nonzero(repair_bits & np.uint8(bit)))
+        for name, bit in _STATE_BITS.items()
+    }
+
+
 def _eye_stats(
     coverage: np.ndarray,
     repair_bits: np.ndarray,
@@ -282,10 +306,7 @@ def _eye_stats(
     fast_diagnostics: FastEyeDiagnostics | None,
 ) -> dict[str, Any]:
     pixel_count = int(coverage.size)
-    state_counts = {
-        name: int(np.count_nonzero(repair_bits & np.uint8(bit)))
-        for name, bit in _STATE_BITS.items()
-    }
+    state_counts = _repair_state_counts(repair_bits)
     state_ratios = {
         name: (float(count) / float(pixel_count) if pixel_count else 0.0)
         for name, count in state_counts.items()
@@ -307,7 +328,7 @@ def _eye_stats(
             "fallback": 0,
         }
         backend_pixels = {
-            "local": int(np.count_nonzero(repair_bits & np.uint8(0x04))),
+            "local": state_counts["local_filled"],
             "exemplar": 0,
             "fallback": 0,
         }

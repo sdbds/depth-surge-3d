@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import threading
 
+import cv2
 import numpy as np
 import pytest
 import torch
@@ -480,6 +481,87 @@ def test_native_background_proxy_normalization_matches_float32_rounding() -> Non
     assert actual.tobytes() == expected.tobytes()
 
 
+@pytest.mark.parametrize(("far_side", "direction"), [("left", -1), ("right", 1)])
+@pytest.mark.parametrize("foreground_exclusion_px", [1, 8, 32])
+def test_native_background_proxy_preparation_matches_frozen_composed_oracle(
+    far_side: str,
+    direction: int,
+    foreground_exclusion_px: int,
+) -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    rng = np.random.default_rng(2026083105 + foreground_exclusion_px + direction)
+    pre_repair = rng.integers(0, 256, size=(37, 53, 3), dtype=np.uint8)
+    coverage = rng.integers(0, 17, size=pre_repair.shape[:2], dtype=np.uint8)
+    native = native_kd._require_native()
+    expected_proxy_source = native.normalize_background_proxy_source(
+        pre_repair,
+        coverage,
+    )
+    expected_mask = np.ascontiguousarray(
+        quality._build_background_proxy_mask(
+            coverage,
+            far_side=far_side,
+            foreground_exclusion_px=foreground_exclusion_px,
+        ),
+        dtype=np.uint8,
+    )
+    expected_mask *= np.uint8(255)
+    expected_repair_bits = np.empty_like(coverage)
+    expected_missing = np.empty_like(coverage)
+    expected_missing_lanes, expected_missing_pixels = native.build_background_proxy_state_into(
+        coverage,
+        expected_repair_bits,
+        expected_missing,
+    )
+
+    (
+        proxy_source,
+        mask,
+        repair_bits,
+        missing,
+        missing_lanes,
+        missing_pixels,
+        masked_pixels,
+        mask_bounds,
+    ) = native.prepare_background_proxy(
+        pre_repair,
+        coverage,
+        direction,
+        foreground_exclusion_px,
+    )
+
+    assert proxy_source.tobytes() == expected_proxy_source.tobytes()
+    assert mask.tobytes() == expected_mask.tobytes()
+    assert repair_bits.tobytes() == expected_repair_bits.tobytes()
+    assert missing.tobytes() == expected_missing.tobytes()
+    assert int(missing_lanes) == int(expected_missing_lanes)
+    assert int(missing_pixels) == int(expected_missing_pixels)
+    assert int(masked_pixels) == int(np.count_nonzero(expected_mask))
+    x, y, width, height = cv2.boundingRect(expected_mask)
+    assert tuple(int(value) for value in mask_bounds) == (
+        y,
+        y + height,
+        x,
+        x + width,
+    )
+    for values in (proxy_source, mask, repair_bits, missing):
+        assert values.dtype == np.uint8
+        assert values.flags.c_contiguous
+
+
+def test_native_background_proxy_preparation_rejects_invalid_coverage() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+
+    with pytest.raises(ValueError, match="coverage exceeds"):
+        native_kd._require_native().prepare_background_proxy(
+            np.zeros((1, 1, 3), dtype=np.uint8),
+            np.asarray([[17]], dtype=np.uint8),
+            1,
+            8,
+        )
+
+
 def test_native_background_proxy_composition_matches_float32_rounding() -> None:
     native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
     rng = np.random.default_rng(160255)
@@ -533,6 +615,119 @@ def test_background_proxy_bypasses_full_frame_float32_normalization(monkeypatch)
 
     assert repaired[4, 4].tolist() == [50, 50, 0]
     np.testing.assert_allclose(repaired[4, 5], [0, 100, 0], atol=2)
+
+
+def test_background_finish_uses_fused_native_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    rng = np.random.default_rng(2026083107)
+    source = rng.integers(0, 256, size=(11, 19, 3), dtype=np.uint8)
+    pre_repair = source.copy()
+    coverage = np.full(source.shape[:2], 16, dtype=np.uint8)
+    coverage[2:9, 7:12] = rng.integers(0, 16, size=(7, 5), dtype=np.uint8)
+    pre_repair[coverage < np.uint8(16)] //= np.uint8(2)
+    expected_image = quality._composite_background_proxy(
+        pre_repair,
+        coverage,
+        source,
+        radius_px=1,
+        far_side="right",
+        foreground_exclusion_px=1,
+    )
+    expected_bits, expected_summary = quality._background_proxy_repair_state(coverage)
+    hole_runs = quality.HoleRunDiagnostics(
+        lane_count_histogram=np.zeros(16 * 20, dtype=np.uint64),
+        touched_pixel_span_histogram=np.zeros(20, dtype=np.uint64),
+    )
+    unrepaired = quality._UnrepairedEyeResult(pre_repair, coverage, hole_runs)
+
+    def old_path_error(*_args, **_kwargs):
+        raise AssertionError("production entered the composed background proxy path")
+
+    monkeypatch.setattr(quality, "_composite_background_proxy", old_path_error)
+    monkeypatch.setattr(quality, "_background_proxy_repair_state", old_path_error)
+    monkeypatch.setattr(quality, "_build_background_proxy_mask", old_path_error)
+
+    actual = quality._finish_background_eye(
+        pre_repair=unrepaired,
+        source=source,
+        eye="right",
+        controls_limit_px=4,
+        predicted_gap_px=4,
+    )
+
+    assert actual.image.tobytes() == expected_image.tobytes()
+    assert actual.repair_bits.tobytes() == expected_bits.tobytes()
+    assert actual.plan == expected_summary
+    assert actual.coverage_count is coverage
+    assert actual.hole_runs is hole_runs
+
+
+@pytest.mark.parametrize("radius_px", [1, 2, 3])
+def test_background_proxy_roi_inpaint_matches_full_frame_exactly(
+    radius_px: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    rng = np.random.default_rng(2026083111 + radius_px)
+    proxy_source = rng.integers(0, 256, size=(97, 151, 3), dtype=np.uint8)
+    mask = np.zeros(proxy_source.shape[:2], dtype=np.uint8)
+    mask[21:58, 39:91] = np.uint8(255)
+    mask[32:47, 50:77] = np.uint8(0)
+    bounds = (21, 58, 39, 91)
+    expected = cv2.inpaint(
+        proxy_source,
+        mask,
+        float(radius_px),
+        cv2.INPAINT_TELEA,
+    )
+    original_inpaint = quality.cv2.inpaint
+    inpaint_shapes: list[tuple[int, int]] = []
+
+    def recording_inpaint(image, inpaint_mask, radius, method):
+        inpaint_shapes.append(tuple(image.shape[:2]))
+        return original_inpaint(image, inpaint_mask, radius, method)
+
+    monkeypatch.setattr(quality.cv2, "inpaint", recording_inpaint)
+    actual = quality._inpaint_background_proxy(
+        np.array(proxy_source, copy=True, order="C"),
+        mask,
+        radius_px=radius_px,
+        mask_bounds=bounds,
+    )
+
+    assert inpaint_shapes == [
+        (
+            bounds[1] - bounds[0] + 2 * (radius_px + 1),
+            bounds[3] - bounds[2] + 2 * (radius_px + 1),
+        )
+    ]
+    assert actual.tobytes() == expected.tobytes()
+
+
+def test_background_proxy_roi_inpaint_skips_empty_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    proxy_source = np.arange(9 * 13 * 3, dtype=np.uint8).reshape(9, 13, 3)
+    mask = np.zeros((9, 13), dtype=np.uint8)
+    monkeypatch.setattr(
+        quality.cv2,
+        "inpaint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("empty background proxy mask entered OpenCV inpaint")
+        ),
+    )
+
+    actual = quality._inpaint_background_proxy(
+        proxy_source,
+        mask,
+        radius_px=3,
+        mask_bounds=(0, 0, 0, 0),
+    )
+
+    assert actual is proxy_source
 
 
 def test_native_lane_analysis_fuses_coverage_and_row_bounded_histograms() -> None:
@@ -840,6 +1035,32 @@ def test_quality_public_budget_rejects_before_materializing_broadcast_input(
             canonical=canonical,
             settings=_quality_settings(),
         )
+
+
+@pytest.mark.parametrize("occlusion_fill", ["none", "background"])
+@pytest.mark.parametrize("materialize_public_masks", [False, True])
+def test_quality_geodesic_preflight_charges_cached_priorities_without_raising_peak(
+    occlusion_fill, materialize_public_masks
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    pixels = 1080 * 1920
+    native_pixels = 608 * 1080
+    phases = quality._quality_public_memory_preflight(
+        render_shape=(1080, 1920),
+        native_shape=(608, 1080),
+        occlusion_fill=occlusion_fill,
+        materialize_public_masks=materialize_public_masks,
+    )
+    previous_region_bytes = (
+        52 * pixels
+        + 18 * native_pixels
+        + quality.QUALITY_RUNTIME_OVERHEAD_BYTES
+        + quality.QUALITY_AUXILIARY_THREAD_BYTES
+    )
+
+    assert phases["quality-region"] == previous_region_bytes + 16 * pixels
+    previous_phases = dict(phases, **{"quality-region": previous_region_bytes})
+    assert max(phases.values()) == max(previous_phases.values())
 
 
 def test_quality_background_preflight_models_the_one_pass_proxy() -> None:

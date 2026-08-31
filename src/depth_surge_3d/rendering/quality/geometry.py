@@ -19,6 +19,8 @@ from ..stereo_geometry import (
 
 
 QUALITY_GEOMETRY_NEAREST_VISIT_CAP = 268_435_456
+_LOCAL_GEOMETRY_QUERY_RADIUS_PX = 16
+_GEOMETRY_QUERY_CHUNK_CAP = 65_536
 _STABLE_REGION_REFERENCE_PIXELS = 1080 * 608
 _STABLE_REGION_REFERENCE_AREA = 16
 _STABLE_SAMPLE_MAX_NEIGHBOUR_JUMP_PX = np.float64(0.25)
@@ -113,6 +115,8 @@ class _ResampleDiagnostics:
     visited_nodes_total: int
     visited_nodes_max: int
     index_bytes: int
+    index_build_seconds: float
+    query_seconds: float
 
 
 class _LifetimeRecorder:
@@ -355,10 +359,19 @@ def _expand_foreground_matte_one_pixel(  # noqa: C901 - validates and mutates on
     one_eye_displacement_px: np.ndarray,
     *,
     metric_valid: np.ndarray | None,
+    candidate_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Move the outer antialiasing pixel with the nearer stable surface."""
 
-    _validate_native_primitive("near_score", near_score)
+    if (
+        not isinstance(near_score, np.ndarray)
+        or near_score.dtype != np.float32
+        or near_score.ndim != 2
+        or near_score.shape[0] <= 0
+        or near_score.shape[1] <= 0
+        or not near_score.flags.c_contiguous
+    ):
+        raise TypeError("near_score must be a nonempty C-contiguous float32 raster")
     shape = near_score.shape
     if not near_score.flags.writeable:
         raise ValueError("near_score must be writeable")
@@ -374,7 +387,14 @@ def _expand_foreground_matte_one_pixel(  # noqa: C901 - validates and mutates on
         dtype=np.dtype(np.bool_),
         shape=shape,
     )
-    _validate_source_regions(final_region_map, shape)
+    if (
+        not isinstance(final_region_map, np.ndarray)
+        or final_region_map.dtype != np.uint32
+        or final_region_map.ndim != 2
+        or final_region_map.shape != shape
+        or not final_region_map.flags.c_contiguous
+    ):
+        raise TypeError("final_region_map must be a matching C-contiguous uint32 raster")
     if not final_region_map.flags.writeable:
         raise ValueError("final_region_map must be writeable")
     _validate_matching_writeable_raster(
@@ -383,11 +403,6 @@ def _expand_foreground_matte_one_pixel(  # noqa: C901 - validates and mutates on
         dtype=np.dtype(np.float64),
         shape=shape,
     )
-    if (
-        not np.isfinite(total_disparity_fraction).all()
-        or not np.isfinite(one_eye_displacement_px).all()
-    ):
-        raise ValueError("foreground matte geometry must contain only finite values")
     if metric_valid is not None:
         _validate_matching_writeable_raster(
             "metric_valid",
@@ -395,6 +410,13 @@ def _expand_foreground_matte_one_pixel(  # noqa: C901 - validates and mutates on
             dtype=np.dtype(np.bool_),
             shape=shape,
         )
+    if candidate_mask is not None and (
+        not isinstance(candidate_mask, np.ndarray)
+        or candidate_mask.dtype != np.bool_
+        or candidate_mask.shape != shape
+        or not candidate_mask.flags.c_contiguous
+    ):
+        raise TypeError("candidate_mask must be a matching C-contiguous bool raster")
 
     return native_kd._require_native().expand_foreground_matte_one_pixel(
         near_score,
@@ -403,6 +425,7 @@ def _expand_foreground_matte_one_pixel(  # noqa: C901 - validates and mutates on
         final_region_map,
         one_eye_displacement_px,
         metric_valid,
+        candidate_mask,
     )
 
 
@@ -596,31 +619,19 @@ def build_relative_quality_geometry(
         destination_shape,
         recorder,
     )
-    index_started = time.perf_counter()
-    region_seconds = index_started - region_started
-    index = native_kd.build_native_implicit_region_kd(
-        regions.source_region_map,
-        region_count=regions.region_count,
-        include=regions.stable_sample_include,
-    )
-    query_started = time.perf_counter()
-    index_seconds = query_started - index_started
-    recorder.allocate(6, "retained_zero_index", index.index_bytes)
-    recorder.checkpoint(7, "final_geodesic_region_selection")
+    del low_regions, low_displacement
+    region_seconds = time.perf_counter() - region_started
     budget = VisitBudget(visit_cap)
     diagnostics = _resample_primitives_in_place(
         (canonical,),
         (near_score,),
         regions,
-        index,
         budget,
         recorder,
     )
     finalize_started = time.perf_counter()
-    query_seconds = finalize_started - query_started
     recorder.checkpoint(8, "primitive_resample_complete")
     recorder.release(9, "retained_zero_index")
-    del index
 
     _update_relative_total_inside_band(
         total,
@@ -642,6 +653,7 @@ def build_relative_quality_geometry(
         regions.final_region_map,
         displacement,
         metric_valid=None,
+        candidate_mask=regions.edge_band,
     )
     displacement = _relative_displacement(
         near_score,
@@ -664,8 +676,8 @@ def build_relative_quality_geometry(
         performance_seconds={
             "geometry_baseline": baseline_seconds,
             "geometry_region_solve": region_seconds,
-            "geometry_index_build": index_seconds,
-            "geometry_nearest_query": query_seconds,
+            "geometry_index_build": diagnostics.index_build_seconds,
+            "geometry_nearest_query": diagnostics.query_seconds,
             "geometry_finalize": finalize_seconds,
         },
     )
@@ -763,31 +775,19 @@ def build_metric_quality_geometry(
         destination_shape,
         recorder,
     )
-    index_started = time.perf_counter()
-    region_seconds = index_started - region_started
-    index = native_kd.build_native_implicit_region_kd(
-        regions.source_region_map,
-        region_count=regions.region_count,
-        include=regions.stable_sample_include,
-    )
-    query_started = time.perf_counter()
-    index_seconds = query_started - index_started
-    recorder.allocate(6, "retained_zero_index", index.index_bytes)
-    recorder.checkpoint(7, "final_geodesic_region_selection")
+    del low_regions, low_displacement, low_near
+    region_seconds = time.perf_counter() - region_started
     budget = VisitBudget(visit_cap)
     diagnostics = _resample_primitives_in_place(
         (baseline.native_weight, baseline.native_weighted_inverse),
         (baseline.resized_weight, baseline.resized_weighted_inverse),
         regions,
-        index,
         budget,
         recorder,
     )
     finalize_started = time.perf_counter()
-    query_seconds = finalize_started - query_started
     recorder.checkpoint(8, "primitive_resample_complete")
     recorder.release(9, "retained_zero_index")
-    del index
 
     _update_metric_derived_inside_band(
         baseline,
@@ -810,6 +810,7 @@ def build_metric_quality_geometry(
         regions.final_region_map,
         displacement,
         metric_valid=baseline.resized_valid,
+        candidate_mask=regions.edge_band,
     )
     baseline.stats = _recount_metric_stats(
         baseline.near_score,
@@ -839,8 +840,8 @@ def build_metric_quality_geometry(
         performance_seconds={
             "geometry_baseline": baseline_seconds,
             "geometry_region_solve": region_seconds,
-            "geometry_index_build": index_seconds,
-            "geometry_nearest_query": query_seconds,
+            "geometry_index_build": diagnostics.index_build_seconds,
+            "geometry_nearest_query": diagnostics.query_seconds,
             "geometry_finalize": finalize_seconds,
         },
     )
@@ -856,23 +857,24 @@ def _solve_final_regions(
 ) -> _RegionState:
     initial_region_map = low_regions.region_map
     area_threshold = _stable_region_area_threshold(initial_region_map.shape)
-    stable_regions = _select_stable_region_support(
+    initial_region_count = int(low_regions.region_rank_bits.size) - 1
+    stable_regions = region_solver.select_stable_region_support(
         initial_region_map,
+        region_count=initial_region_count,
         area_threshold=area_threshold,
     )
-    stable_regions, stable_samples = _select_stable_sample_support(
+    stable_support = region_solver.build_stable_surface_support(
         initial_region_map,
         stable_regions,
         low_displacement,
-    )
-    surface_regions, stable_surfaces = _build_stable_surface_regions(
-        initial_region_map,
-        stable_samples,
         low_near_score,
     )
+    stable_samples = stable_support.stable_samples
+    surface_regions = stable_support.surface_regions
+    stable_surfaces = stable_support.stable_surfaces
+    stable_sample_include = stable_support.stable_sample_include
     source_region_map = surface_regions.region_map
     region_count = int(surface_regions.region_rank_bits.size) - 1
-    stable_sample_include = _stable_interior_support(source_region_map, stable_samples)
     initial = region_solver.nearest_label_upsample(
         source_region_map,
         render_height=render_shape[0],
@@ -902,11 +904,13 @@ def _solve_final_regions(
         uncertainty = _cross_dilate_mask(uncertainty)
     edge_band |= uncertainty
     edge_band.setflags(write=False)
-    seeds = region_solver.build_sparse_region_seeds(initial, edge_band, radius=radius)
-    seeds = np.array(seeds, copy=True, order="C")
-    seeds[~stable_initial] = np.uint32(0)
-    seeds[~stable_surfaces[seeds]] = np.uint32(0)
-    seeds.setflags(write=False)
+    seeds = region_solver.build_sparse_stable_region_seeds(
+        initial,
+        edge_band,
+        stable_initial,
+        stable_surfaces,
+        radius=radius,
+    )
     morphology_bytes = (
         initial.nbytes
         + stable_initial.nbytes
@@ -925,13 +929,14 @@ def _solve_final_regions(
         surface_regions.region_rank_bits,
         movement_base_cost=_EDGE_LOCKED_MOVEMENT_BASE_COST,
         movement_edge_scale=_EDGE_LOCKED_MOVEMENT_EDGE_SCALE,
+        mutable_region_map=True,
     )
     solver_bytes = (
         geodesic.distance.nbytes + geodesic.heap_position.nbytes + geodesic.heap_pixel_bytes
     )
     recorder.allocate(4, "geodesic_solver_scratch", solver_bytes)
     recorder.checkpoint(4, "final_geodesic_region_map_complete")
-    final_region_map = np.array(geodesic.region_map, copy=True, order="C")
+    final_region_map = geodesic.region_map
     recorder.allocate(4, "final_region_map", final_region_map.nbytes)
     edge_count = int(np.count_nonzero(edge_band))
     final_hash = _array_sha256(final_region_map)
@@ -964,18 +969,13 @@ def _resample_primitives_in_place(
     source_primitives: tuple[np.ndarray, ...],
     output_primitives: tuple[np.ndarray, ...],
     regions: _RegionState,
-    index: ImplicitRegionKdIndex,
     budget: VisitBudget,
     recorder: _LifetimeRecorder,
 ) -> _ResampleDiagnostics:
     if len(source_primitives) != len(output_primitives) or not source_primitives:
         raise ValueError("source and output primitive tuples must match")
-    render_shape = (
-        int(regions.final_region_map.shape[0]),
-        int(regions.final_region_map.shape[1]),
-    )
     query_capacity = regions.edge_band_pixel_count
-    recorder.allocate(7, "retained_zero_query_scratch", 40 * query_capacity)
+    recorder.allocate(6, "retained_zero_query_scratch", 40 * query_capacity)
     query_pixels = np.empty(query_capacity, dtype=np.uint32)
     query_regions = np.empty(query_capacity, dtype=np.uint32)
     query_y = np.empty(query_capacity, dtype=np.float64)
@@ -987,24 +987,28 @@ def _resample_primitives_in_place(
         query_y,
         query_x,
     )
-    visits = _resolve_stable_surface_queries(
+    query_started = time.perf_counter()
+    visits_total, visits_max, index_bytes, index_build_seconds = _resolve_stable_surface_queries(
         source_primitives,
         output_primitives,
-        render_shape,
-        index,
+        regions,
         budget,
         query_pixels,
         query_regions,
         query_y,
         query_x,
         query_count,
+        recorder,
     )
+    query_seconds = time.perf_counter() - query_started - index_build_seconds
     recorder.release(8, "retained_zero_query_scratch")
     return _ResampleDiagnostics(
         query_count=query_count,
-        visited_nodes_total=int(visits.sum(dtype=np.uint64)),
-        visited_nodes_max=int(visits.max()) if visits.size else 0,
-        index_bytes=index.index_bytes,
+        visited_nodes_total=visits_total,
+        visited_nodes_max=visits_max,
+        index_bytes=index_bytes,
+        index_build_seconds=index_build_seconds,
+        query_seconds=query_seconds,
     )
 
 
@@ -1041,31 +1045,116 @@ def _collect_stable_surface_queries(
 def _resolve_stable_surface_queries(
     source_primitives: tuple[np.ndarray, ...],
     output_primitives: tuple[np.ndarray, ...],
-    render_shape: tuple[int, int],
-    index: ImplicitRegionKdIndex,
+    regions: _RegionState,
     budget: VisitBudget,
     query_pixels: np.ndarray,
     query_regions: np.ndarray,
     query_y: np.ndarray,
     query_x: np.ndarray,
     query_count: int,
-) -> np.ndarray:
+    recorder: _LifetimeRecorder,
+) -> tuple[int, int, int, float]:
     if query_count == 0:
-        return np.empty(0, dtype=np.uint32)
-    result = native_kd.query_native_geometry_batch(
-        index,
-        np.ascontiguousarray(query_regions[:query_count]),
-        np.ascontiguousarray(query_y[:query_count]),
-        np.ascontiguousarray(query_x[:query_count]),
-        budget=budget,
+        recorder.allocate(6, "retained_zero_index", 0)
+        recorder.checkpoint(7, "final_geodesic_region_selection")
+        return 0, 0, 0, 0.0
+    # The four query vectors use 24Q bytes; owned results use 8Q. At most
+    # 38 bytes per chunk item remain live, within 40Q plus 30 fixed bytes.
+    chunk_size = min(_GEOMETRY_QUERY_CHUNK_CAP, max(1, query_count // 8))
+    samples = np.empty(query_count, dtype=np.uint32)
+    local_visits = np.empty(query_count, dtype=np.uint32)
+    visits_total = 0
+    visits_max = 0
+    fallback_regions = None
+    for start in range(0, query_count, chunk_size):
+        stop = min(start + chunk_size, query_count)
+        local = native_kd.query_native_local_geometry_batch(
+            regions.source_region_map,
+            regions.stable_sample_include,
+            query_regions[start:stop],
+            query_y[start:stop],
+            query_x[start:stop],
+            radius_px=_LOCAL_GEOMETRY_QUERY_RADIUS_PX,
+            budget=budget,
+        )
+        samples[start:stop] = local.sample_index
+        local_visits[start:stop] = local.visited_nodes
+        visits_total += int(local.visited_nodes.sum(dtype=np.uint64))
+        visits_max = max(visits_max, int(local.visited_nodes.max()))
+        unresolved = ~local.found
+        if bool(np.any(unresolved)):
+            if fallback_regions is None:
+                recorder.allocate(
+                    6, "retained_zero_index_build_scratch", 2 * regions.region_count + 1
+                )
+                fallback_regions = np.zeros(regions.region_count + 1, dtype=np.bool_)
+            fallback_regions[query_regions[start:stop][unresolved]] = True
+        del local, unresolved
+    index_bytes = 0
+    index_build_seconds = 0.0
+    if fallback_regions is not None:
+        index_started = time.perf_counter()
+        index = native_kd.build_native_implicit_region_kd(
+            regions.source_region_map,
+            region_count=regions.region_count,
+            include=regions.stable_sample_include,
+            allowed_regions=fallback_regions,
+        )
+        index_build_seconds = time.perf_counter() - index_started
+        index_bytes = index.index_bytes
+        recorder.allocate(6, "retained_zero_index", index_bytes)
+        del fallback_regions
+        recorder.release(6, "retained_zero_index_build_scratch")
+        # Keep all local debits before all KD debits, including on failure.
+        for start in range(0, query_count, chunk_size):
+            stop = min(start + chunk_size, query_count)
+            extra_visits, combined_max = _resolve_stable_query_fallback(
+                index,
+                query_regions[start:stop],
+                query_y[start:stop],
+                query_x[start:stop],
+                samples[start:stop],
+                local_visits[start:stop],
+                budget,
+            )
+            visits_total += extra_visits
+            visits_max = max(visits_max, combined_max)
+    else:
+        recorder.allocate(6, "retained_zero_index", 0)
+    recorder.checkpoint(7, "final_geodesic_region_selection")
+    for start in range(0, query_count, chunk_size):
+        stop = min(start + chunk_size, query_count)
+        pixels = query_pixels[start:stop]
+        for source, output in zip(source_primitives, output_primitives, strict=True):
+            output.reshape(-1)[pixels] = source.reshape(-1)[samples[start:stop]]
+    return visits_total, visits_max, index_bytes, index_build_seconds
+
+
+def _resolve_stable_query_fallback(
+    index: ImplicitRegionKdIndex,
+    query_regions: np.ndarray,
+    query_y: np.ndarray,
+    query_x: np.ndarray,
+    samples: np.ndarray,
+    local_visits: np.ndarray,
+    budget: VisitBudget,
+) -> tuple[int, int]:
+    unresolved = samples == np.uint32(_UINT32_MAX)
+    if not bool(np.any(unresolved)):
+        return 0, 0
+    selected_regions = query_regions[unresolved]
+    selected_y = query_y[unresolved]
+    selected_x = query_x[unresolved]
+    fallback = native_kd.query_native_geometry_batch(
+        index, selected_regions, selected_y, selected_x, budget=budget
     )
-    if not np.all(result.found):
+    del selected_regions, selected_y, selected_x
+    if not np.all(fallback.found):
         raise RuntimeError("selected stable surface has no indexed native member")
-    pixels = query_pixels[:query_count]
-    samples = result.sample_index
-    for source, output in zip(source_primitives, output_primitives, strict=True):
-        output.reshape(-1)[pixels] = source.reshape(-1)[samples]
-    return result.visited_nodes
+    samples[unresolved] = fallback.sample_index
+    combined_visits = local_visits[unresolved].astype(np.uint64)
+    combined_visits += fallback.visited_nodes
+    return int(fallback.visited_nodes.sum(dtype=np.uint64)), int(combined_visits.max())
 
 
 def _collect_one_sided_queries(
@@ -1351,14 +1440,13 @@ def _update_relative_total_inside_band(
     strength: np.float64,
     convergence: np.float64,
 ) -> None:
-    for row, edge_row in enumerate(edge_band):
-        if not np.any(edge_row):
-            continue
-        values = near_score[row, edge_row].astype(np.float64)
-        np.subtract(values, convergence, out=values)
-        np.multiply(values, strength, out=values)
-        np.divide(values, np.float64(100.0), out=values)
-        total[row, edge_row] = values
+    native_kd.update_native_relative_total_inside_band(
+        total,
+        near_score,
+        edge_band,
+        strength=strength,
+        convergence=convergence,
+    )
 
 
 def _build_metric_baseline(
@@ -1580,12 +1668,7 @@ def _freeze_quality_result(
 
 
 def _max_four_neighbour_jump(displacement: np.ndarray) -> float:
-    maximum = np.float64(0.0)
-    if displacement.shape[1] > 1:
-        maximum = max(maximum, np.max(np.abs(displacement[:, 1:] - displacement[:, :-1])))
-    if displacement.shape[0] > 1:
-        maximum = max(maximum, np.max(np.abs(displacement[1:, :] - displacement[:-1, :])))
-    return float(maximum)
+    return native_kd.max_native_four_neighbour_jump(displacement)
 
 
 def _array_sha256(values: np.ndarray) -> str:

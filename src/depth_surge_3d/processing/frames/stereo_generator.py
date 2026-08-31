@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Executor
 import hashlib
 import json
 import math
@@ -95,6 +96,7 @@ from ...rendering.quality.types import (
 )
 from .metric_geometry import MetricGeometryFrame, MetricGeometryStore
 from .stereo_control import (
+    QUALITY_PNG_ENCODER_THREAD_BYTES,
     STEREO_CONTROL_OVERHEAD,
     StereoAction,
     StereoControlError,
@@ -106,6 +108,8 @@ from .stereo_control import (
     StereoStageInputChangedError,
     StreamingStereoPipelineStats,
     audit_stereo_provider,
+    create_attested_stereo_executor,
+    current_process_committed_bytes,
     iter_stereo_action,
     run_streaming_stereo_pipeline,
     select_fast_pipeline_capacity,
@@ -908,9 +912,12 @@ def _stereo_creation_failed(error: Exception) -> bool:
     return False
 
 
-def _write_pair(item: _WriteItem) -> None:
+def _write_pair(item: _WriteItem, *, png_executor: Executor | None = None) -> None:
     if item.quality_publication is not None:
-        publish_quality_frame(item.quality_publication)
+        if png_executor is None:
+            publish_quality_frame(item.quality_publication)
+        else:
+            publish_quality_frame(item.quality_publication, png_executor=png_executor)
     else:
         _atomic_write_png(item.work.left_path, item.left_image)
         _atomic_write_png(item.work.right_path, item.right_image)
@@ -1610,7 +1617,8 @@ class StereoPairGenerator:
         def replay_source_names():
             count = 0
             try:
-                for item in provider.replay():
+                # Names authenticate the manifest; stage boundaries audit payload content.
+                for item in manifest.replay_declared_records():
                     if item.source_index != count:
                         raise StereoInputIdentityMismatch("diagnostics source replay order changed")
                     count += 1
@@ -1734,12 +1742,10 @@ class StereoPairGenerator:
         if not transient_output and frame_consumer_memory_bytes:
             raise ValueError("frame consumer memory bound requires a frame consumer")
         if transient_output and (
-            render_mode != "quality"
-            or expected_manifest_mode != "relative"
-            or bool(settings.get("keep_intermediates", True))
+            expected_manifest_mode != "relative" or bool(settings.get("keep_intermediates", True))
         ):
             raise ValueError(
-                "transient stereo output requires relative Quality without intermediates"
+                "transient stereo output requires relative geometry without intermediates"
             )
 
         left_dir = Path(directories["left_frames"])
@@ -1925,12 +1931,12 @@ class StereoPairGenerator:
             )
             adopted.audit_payloads()
         if not mutation_required:
+            revalidate_output_actions()
             validate_stereo_provider_replay(
                 provider,
                 control,
                 mutation_started=False,
             )
-            revalidate_output_actions()
             return True
 
         disk_plan = None
@@ -1975,6 +1981,7 @@ class StereoPairGenerator:
             settings.get("stereo_io_workers", _default_stereo_io_workers())
         )
         reuse_exact_quality_input = False
+        png_encoder_workers = 0
         if render_mode == "quality":
             if control.render_count == 0:
                 capacity_value = 0
@@ -2012,6 +2019,7 @@ class StereoPairGenerator:
                 retained_cache_bytes = (
                     23 * output_pixels + histogram_bytes + control.maximum_frame_json_bound
                 )
+                png_payloads_per_item = 0 if transient_output else (6 if keep_masks else 2)
                 try:
                     selection = select_quality_pipeline_capacity(
                         configured_workers=configured_workers,
@@ -2022,6 +2030,7 @@ class StereoPairGenerator:
                             frame_consumer_memory_bytes
                             + (retained_cache_bytes if reuse_exact_quality_input else 0)
                         ),
+                        png_payloads_per_item=png_payloads_per_item,
                     )
                 except StereoControlBudgetError:
                     if not reuse_exact_quality_input:
@@ -2033,10 +2042,12 @@ class StereoPairGenerator:
                         quality_active_scratch=quality_active_scratch,
                         quality_slot_bytes=quality_slot_bytes,
                         retained_bytes=frame_consumer_memory_bytes,
+                        png_payloads_per_item=png_payloads_per_item,
                     )
                 capacity_value = selection.capacity
                 effective_workers = selection.effective_workers
                 writer_workers = selection.writer_workers
+                png_encoder_workers = selection.png_encoder_workers
         else:
             maximum_item = (
                 control.maximum_fast_metric_item_bytes
@@ -2050,6 +2061,7 @@ class StereoPairGenerator:
                     272 * (render_shape[1] + 1) + 1024 * 1024 + STEREO_CONTROL_OVERHEAD
                 ),
                 fast_slot_bytes=maximum_item + HOST_SLOT_OVERHEAD,
+                retained_bytes=frame_consumer_memory_bytes,
             )
             capacity_value = selection.capacity
             effective_workers = selection.effective_workers
@@ -2435,7 +2447,7 @@ class StereoPairGenerator:
             if transient_output:
                 publication = write_item.quality_publication
                 if publication is None or transient_diagnostics is None:
-                    raise RuntimeError("transient Quality writer lacks prepared diagnostics")
+                    raise RuntimeError("transient stereo writer lacks prepared diagnostics")
                 assert frame_consumer is not None
                 frame_consumer(
                     write_item.work.frame_name,
@@ -2447,7 +2459,7 @@ class StereoPairGenerator:
                     publication.stats_raw,
                 )
             else:
-                _write_pair(write_item)
+                _write_pair(write_item, png_executor=png_executor)
             with progress_lock:
                 committed += 1
                 self._report_progress(
@@ -2460,8 +2472,21 @@ class StereoPairGenerator:
 
         preflight_seconds = time.perf_counter() - stage_started
         pipeline_started = time.perf_counter()
+        png_executor: Executor | None = None
+        png_executor_stats = None
+        png_executor_committed_delta = 0
         try:
-            self.last_pipeline_stats = run_streaming_stereo_pipeline(
+            if png_encoder_workers:
+                before_png_executor = current_process_committed_bytes()
+                png_executor, png_executor_stats = create_attested_stereo_executor(
+                    worker_count=png_encoder_workers,
+                    thread_name_prefix="quality-png",
+                )
+                png_executor_committed_delta = max(
+                    0,
+                    current_process_committed_bytes() - before_png_executor,
+                )
+            pipeline_stats = run_streaming_stereo_pipeline(
                 provider=provider,
                 plan=control,
                 capacity=capacity_value,
@@ -2479,6 +2504,35 @@ class StereoPairGenerator:
             if transient_diagnostics is not None:
                 transient_diagnostics.abort()
             raise
+        finally:
+            if png_executor is not None:
+                png_executor.shutdown(wait=True, cancel_futures=True)
+        if png_executor_stats is not None:
+            pipeline_stats = replace(
+                pipeline_stats,
+                actual_thread_count=(pipeline_stats.actual_thread_count + png_encoder_workers),
+                parked_committed_delta_bytes=(
+                    pipeline_stats.parked_committed_delta_bytes + png_executor_committed_delta
+                ),
+                calculated_thread_bytes=(
+                    pipeline_stats.calculated_thread_bytes
+                    + png_encoder_workers * QUALITY_PNG_ENCODER_THREAD_BYTES
+                ),
+                stack_granularity_bytes=(
+                    pipeline_stats.stack_granularity_bytes
+                    + tuple(
+                        evidence.granularity_bytes for evidence in png_executor_stats.stack_evidence
+                    )
+                ),
+                reported_stack_reserve_bytes=(
+                    pipeline_stats.reported_stack_reserve_bytes
+                    + tuple(
+                        evidence.reserve_bytes for evidence in png_executor_stats.stack_evidence
+                    )
+                ),
+                png_encoder_thread_count=png_encoder_workers,
+            )
+        self.last_pipeline_stats = pipeline_stats
         pipeline_seconds = time.perf_counter() - pipeline_started
         consolidation_started = time.perf_counter()
         cached_quality_key = None

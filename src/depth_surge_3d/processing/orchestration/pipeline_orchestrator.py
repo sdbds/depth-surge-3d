@@ -29,7 +29,7 @@ from ..frames.stereo_input_manifest import (
     StereoInputManifestV1,
     publish_validated_stereo_input_manifest_v1,
 )
-from ..frames.stereo_control import QualityPipelineCapacityError
+from ..frames.stereo_control import StereoPipelineCapacityError
 from ...rendering.quality.cleanup_transaction import (
     cleanup_status_for_error,
     commit_payload_pruned,
@@ -562,19 +562,19 @@ class ProcessingOrchestrator:
         self._depth_model_released = True
 
     @staticmethod
-    def _streamed_quality_settings_eligible(
+    def _streamed_stereo_settings_eligible(
         settings: dict[str, Any],
         stereo_input: StereoInputManifestV1,
         *,
         schema5_settings: bool,
         active_reservation: bool,
     ) -> bool:
-        """Decide whether the no-retention Quality stream preserves current output."""
+        """Decide whether the no-retention stereo stream preserves current output."""
 
         if (
             not schema5_settings
             or active_reservation
-            or settings.get("stereo_render_mode", "fast") != "quality"
+            or settings.get("stereo_render_mode", "fast") not in ("fast", "quality")
             or settings.get("stereo_geometry_mode", "relative") != "relative"
             or getattr(stereo_input, "geometry_mode", None) != "relative"
             or settings.get("direct_vr_encode") is not True
@@ -627,7 +627,7 @@ class ProcessingOrchestrator:
             return False
         return crop_factor == 1.0 and render_shape == (eye_height, eye_width)
 
-    def _streamed_quality_path_enabled(
+    def _streamed_stereo_path_enabled(
         self,
         settings: dict[str, Any],
         stereo_input: StereoInputManifestV1,
@@ -643,7 +643,7 @@ class ProcessingOrchestrator:
             "pending_final_encoding_reservation",
             None,
         )
-        return self._streamed_quality_settings_eligible(
+        return self._streamed_stereo_settings_eligible(
             settings,
             stereo_input,
             schema5_settings=schema5_settings,
@@ -655,11 +655,11 @@ class ProcessingOrchestrator:
         ) and callable(getattr(self.video_encoder, "open_streamed_vr_session", None))
 
     @staticmethod
-    def _streamed_quality_consumer_memory_bound(
+    def _streamed_stereo_consumer_memory_bound(
         source_shape: tuple[int, int],
         settings: dict[str, Any],
     ) -> int:
-        """Bound the resident transform, VR frame, and PNG pipe payload bytes."""
+        """Bound transforms plus assembled BGR, converted RGB, and immutable pipe bytes."""
 
         if (
             not isinstance(source_shape, tuple)
@@ -692,11 +692,10 @@ class ProcessingOrchestrator:
         transform_peak = (
             3 * source_pixels + 6 * target_pixels if settings.get("apply_distortion") is True else 0
         )
-        encoded_copy_bound = 4 * final_pixels + 1024 * 1024
         held_transform_outputs = (
             6 * target_pixels if settings.get("apply_distortion") is True else 0
         )
-        pipe_peak = held_transform_outputs + 3 * final_pixels + 2 * encoded_copy_bound
+        pipe_peak = held_transform_outputs + 9 * final_pixels
         return distortion_maps + max(transform_peak, pipe_peak)
 
     @staticmethod
@@ -721,7 +720,7 @@ class ProcessingOrchestrator:
             raise ValueError("streamed stereo input frame name is noncanonical")
         return frame_index
 
-    def _execute_streamed_quality_steps(  # noqa: C901
+    def _execute_streamed_stereo_steps(  # noqa: C901
         self,
         directories: dict[str, Path],
         settings: dict[str, Any],
@@ -730,7 +729,7 @@ class ProcessingOrchestrator:
         output_path: Path,
         progress_tracker=None,
     ) -> bool | None:
-        """Run transient Quality rendering, or return None before render to fall back."""
+        """Run transient stereo rendering, or return None before render to fall back."""
 
         try:
             transform_pair = self.distortion_processor.prepare_stream_transform(
@@ -739,7 +738,7 @@ class ProcessingOrchestrator:
             )
             if not callable(transform_pair):
                 raise TypeError("stream transform is not callable")
-            consumer_memory_bytes = self._streamed_quality_consumer_memory_bound(
+            consumer_memory_bytes = self._streamed_stereo_consumer_memory_bound(
                 stereo_input.render_shape,
                 settings,
             )
@@ -756,7 +755,7 @@ class ProcessingOrchestrator:
             raise
         except Exception as error:
             if self.verbose:
-                print(f"Quality direct stream unavailable; using file-backed stages: {error}")
+                print(f"Stereo direct stream unavailable; using file-backed stages: {error}")
             return None
 
         session_needs_abort = True
@@ -824,12 +823,12 @@ class ProcessingOrchestrator:
             if completed and progress_tracker and hasattr(progress_tracker, "finish"):
                 progress_tracker.finish("Video processing complete")
             return completed
-        except QualityPipelineCapacityError as error:
+        except StereoPipelineCapacityError as error:
             session.discard_for_file_backed_fallback()
             session_needs_abort = False
             if self.verbose:
                 print(
-                    "Quality direct stream exceeds the shared memory budget; "
+                    "Stereo direct stream exceeds the shared memory budget; "
                     f"using file-backed stages: {error}"
                 )
             return None
@@ -869,8 +868,8 @@ class ProcessingOrchestrator:
         num_frames = stereo_input.frame_count
         self._metric_clamp_summary = None
 
-        if self._streamed_quality_path_enabled(settings, stereo_input, output_path):
-            streamed = self._execute_streamed_quality_steps(
+        if self._streamed_stereo_path_enabled(settings, stereo_input, output_path):
+            streamed = self._execute_streamed_stereo_steps(
                 directories,
                 settings,
                 stereo_input,

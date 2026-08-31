@@ -44,7 +44,7 @@ def test_native_geodesic_solver_matches_python_oracle_exactly() -> None:
     assert actual.queue_insertions == expected.queue_insertions
     assert actual.queue_decrease_keys == expected.queue_decrease_keys
     assert actual.queue_pops == expected.queue_pops
-    assert actual.heap_pixel_bytes == expected.heap_pixel_bytes
+    assert actual.heap_pixel_bytes == 20 * int(np.count_nonzero(band))
     assert actual.heap_position_bytes == expected.heap_position_bytes
     assert actual.distance_bytes == expected.distance_bytes
     assert not actual.region_map.flags.writeable

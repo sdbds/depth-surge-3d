@@ -1,6 +1,7 @@
 """Unit tests for final video encoding."""
 
 import gc
+import hashlib
 import inspect
 import io
 import json
@@ -177,6 +178,26 @@ def _streamed_schema5_job(tmp_path: Path, *, frame_count: int = 1):
     return source, job, settings, settings_file
 
 
+def _select_streamed_test_format(monkeypatch, input_format):
+    if input_format == "rgb24":
+        return
+    from src.depth_surge_3d.processing.video import video_encoder as module
+
+    build_command = VideoEncoder._build_streamed_vr_command
+    create_manifest = module.StreamedVrInputManifestV1
+
+    def legacy_command(*args, **kwargs):
+        kwargs["input_format"] = "png"
+        return build_command(*args, **kwargs)
+
+    def legacy_manifest(*args, **kwargs):
+        kwargs["input_format"] = "png"
+        return create_manifest(*args, **kwargs)
+
+    monkeypatch.setattr(VideoEncoder, "_build_streamed_vr_command", legacy_command)
+    monkeypatch.setattr(module, "StreamedVrInputManifestV1", legacy_manifest)
+
+
 def test_streamed_vr_command_uses_one_png_image2pipe_input(tmp_path) -> None:
     from src.depth_surge_3d.processing.video.encoding_provider import (
         EncodingSequenceProvider,
@@ -209,6 +230,95 @@ def test_streamed_vr_command_uses_one_png_image2pipe_input(tmp_path) -> None:
     assert command[command.index("-framerate") + 1] == "24000/1001"
     assert command[command.index("-frames:v") + 1] == "3"
     assert command[-1] == str(output)
+
+
+def test_streamed_vr_command_binds_rgb24_format_and_shape_before_input(tmp_path) -> None:
+    from src.depth_surge_3d.processing.video.encoding_provider import EncodingSequenceProvider
+
+    provider = EncodingSequenceProvider.freeze(
+        mode="assembled_vr",
+        frame_count=3,
+        first_index=7,
+        frames_parent=PurePosixPath("streamed_vr_frames"),
+    )
+    command = VideoEncoder()._build_streamed_vr_command(
+        provider,
+        tmp_path / "raw.mp4",
+        _direct_settings(vr_output_width=12, vr_output_height=4),
+        _disabled_audio(),
+        "24000/1001",
+        "libx264",
+        input_format="rgb24",
+    )
+    before_input = command[: command.index("-i")]
+    assert before_input[before_input.index("-f") + 1] == "rawvideo"
+    assert before_input[before_input.index("-pixel_format") + 1] == "rgb24"
+    assert before_input[before_input.index("-video_size") + 1] == "12x4"
+    assert before_input[before_input.index("-framerate") + 1] == "24000/1001"
+    assert "-vcodec" not in command
+    assert command.count("-i") == 1
+    assert command[command.index("-i") + 1] == "pipe:0"
+    assert command[command.index("-pix_fmt") + 1] == "yuv420p"
+    assert command[command.index("-crf") + 1] == "18"
+    assert command[command.index("-preset") + 1] == "medium"
+
+
+@pytest.mark.parametrize("layout", ["contiguous", "strided", "negative_stride", "readonly"])
+def test_new_streamed_session_pipes_immutable_rgb_without_png_or_source_mutation(
+    tmp_path, monkeypatch, layout
+):
+    source, job, settings, _settings_file = _streamed_schema5_job(tmp_path)
+    piped = []
+
+    class InputPipe:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self, command):
+            assert command[command.index("-f") + 1] == "rawvideo"
+
+        def write(self, payload):
+            piped.append(payload)
+
+        def abort(self):
+            pass
+
+    def reject_png(*_args, **_kwargs):
+        raise AssertionError("raw streaming attempted PNG compression")
+
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.verify_ffmpeg_installation",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.FfmpegInputPipeProcessV1", InputPipe
+    )
+    monkeypatch.setattr(cv2, "imencode", reject_png)
+    frame = np.arange(4 * 8 * 3, dtype=np.uint8).reshape(4, 8, 3)
+    if layout == "strided":
+        frame = np.arange(8 * 16 * 3, dtype=np.uint8).reshape(8, 16, 3)[::2, ::2]
+    elif layout == "negative_stride":
+        frame = frame[::-1, ::-1]
+    elif layout == "readonly":
+        frame.setflags(write=False)
+    before = frame.tobytes()
+    expected = frame[:, :, [2, 1, 0]].tobytes()
+    session = VideoEncoder().open_streamed_vr_session(
+        output_dir=job,
+        original_video=str(source),
+        settings=settings,
+        frame_count=1,
+        first_index=1,
+    )
+    try:
+        session.write("frame_000001", frame)
+        assert len(piped) == 1
+        assert type(piped[0]) is bytes
+        assert piped[0] == expected
+        assert len(piped[0]) == 96
+        assert frame.tobytes() == before
+    finally:
+        session.abort()
 
 
 @pytest.mark.parametrize("start", [0, 1, 1_000_000])
@@ -1423,14 +1533,17 @@ def test_schema5_assembled_encode_publishes_bound_video_and_manifests(tmp_path, 
     assert not (job / ".depth-surge-reservations-v1/final-encoding-reservation-v1.json").exists()
 
 
+@pytest.mark.parametrize("input_format", ["png", "rgb24"])
 def test_schema5_streamed_session_publishes_without_frame_directories(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    input_format: str,
 ) -> None:
     from src.depth_surge_3d.core.settings import validate_settings
     from src.depth_surge_3d.io.operations import save_processing_settings
     from src.depth_surge_3d.io.settings_artifact import ProcessingSettingsArtifactV5
 
+    _select_streamed_test_format(monkeypatch, input_format)
     source = tmp_path / "source.mp4"
     source.write_bytes(b"source")
     job = tmp_path / "job"
@@ -1527,23 +1640,37 @@ def test_schema5_streamed_session_publishes_without_frame_directories(
     assert not (job / "04_left_frames").exists()
     assert not (job / "04_right_frames").exists()
     assert len(piped) == 2
-    assert np.array_equal(cv2.imdecode(np.frombuffer(piped[0], np.uint8), 1), first)
-    assert np.array_equal(cv2.imdecode(np.frombuffer(piped[1], np.uint8), 1), second)
+    for payload, expected_frame in zip(piped, [first, second], strict=True):
+        encoded = np.frombuffer(payload, np.uint8)
+        decoded = (
+            cv2.imdecode(encoded, 1)
+            if input_format == "png"
+            else encoded.reshape(4, 8, 3)[:, :, ::-1]
+        )
+        assert np.array_equal(decoded, expected_frame)
     command = launches[0]
     assert command[command.index("-i") + 1] == "pipe:0"
     assert "-start_number" not in command
     manifest = json.loads((job / "encoding_input_manifest.json").read_bytes())
-    assert manifest["algorithm_version"] == "encoding-input-sequence-v3"
-    assert manifest["schema_version"] == 2
+    assert manifest["algorithm_version"] == (
+        "encoding-input-sequence-v3" if input_format == "png" else "encoding-input-sequence-v4"
+    )
+    assert manifest["schema_version"] == (2 if input_format == "png" else 3)
     assert manifest["frame_stream_invocation"]["resolved_encoder"] == "libx264"
     assert manifest["streamed_output"]["sibling_relative_path"].endswith(".tmp.mp4")
+    suffix = "png" if input_format == "png" else "rgb"
     assert [item["relative_path"] for item in manifest["frames"]] == [
-        "streamed_vr_frames/frame_000001.png",
-        "streamed_vr_frames/frame_000002.png",
+        f"streamed_vr_frames/frame_000001.{suffix}",
+        f"streamed_vr_frames/frame_000002.{suffix}",
     ]
+    for identity, payload in zip(manifest["frames"], piped, strict=True):
+        assert identity["byte_count"] == len(payload)
+        assert identity["sha256"] == hashlib.sha256(payload).hexdigest()
     final_manifest = json.loads((job / "final_video_manifest.json").read_bytes())
     arguments = final_manifest["resolved_encoding_arguments"]
-    assert arguments[arguments.index("-f") + 1] == "image2pipe"
+    assert arguments[arguments.index("-f") + 1] == (
+        "image2pipe" if input_format == "png" else "rawvideo"
+    )
     assert "-start_number" not in arguments
     assert encoder.pending_final_encoding_reservation is not None
     assert not (job / ".depth-surge-streamed-vr-work-v1.json").exists()
@@ -1934,6 +2061,7 @@ def test_streamed_post_boundary_overlap_remains_retryable(
     assert work_index.read_bytes() == b"active-work"
 
 
+@pytest.mark.parametrize("input_format", ["png", "rgb24"])
 @pytest.mark.parametrize(
     "crash_boundary",
     [
@@ -1947,6 +2075,7 @@ def test_schema5_streamed_sibling_recovers_without_file_backed_reencode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     crash_boundary: str,
+    input_format: str,
 ) -> None:
     from src.depth_surge_3d.processing.frames.vr_assembler import DirectStereoSource
     from src.depth_surge_3d.processing.video.final_publication import (
@@ -1987,13 +2116,15 @@ def test_schema5_streamed_sibling_recovers_without_file_backed_reencode(
     )
     monkeypatch.setattr(VideoEncoder, "_validate_final_container", lambda *_args: True)
 
-    session = VideoEncoder().open_streamed_vr_session(
-        output_dir=job,
-        original_video=str(source),
-        settings=settings,
-        frame_count=1,
-        first_index=1,
-    )
+    with monkeypatch.context() as launch_patch:
+        _select_streamed_test_format(launch_patch, input_format)
+        session = VideoEncoder().open_streamed_vr_session(
+            output_dir=job,
+            original_video=str(source),
+            settings=settings,
+            frame_count=1,
+            first_index=1,
+        )
     session.write("frame_000001", np.full((4, 8, 3), 17, dtype=np.uint8))
     original_publish = FinalPublicationTransactionV4.publish
     from src.depth_surge_3d.processing.video.final_publication import (
@@ -2090,7 +2221,9 @@ def test_schema5_streamed_sibling_recovers_without_file_backed_reencode(
     )
     final_manifest = json.loads((job / "final_video_manifest.json").read_bytes())
     arguments = final_manifest["resolved_encoding_arguments"]
-    assert arguments[arguments.index("-f") + 1] == "image2pipe"
+    assert arguments[arguments.index("-f") + 1] == (
+        "image2pipe" if input_format == "png" else "rawvideo"
+    )
 
 
 def test_schema5_partial_streamed_reservation_falls_back_to_file_backed_reencode(

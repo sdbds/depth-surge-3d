@@ -68,6 +68,8 @@ QUALITY_CUDA_BUDGET_CAP_BYTES = 512 * 1024 * 1024
 QUALITY_CUDA_FREE_BUDGET_DIVISOR = 8
 QUALITY_SCATTER_WORKSPACE_BYTES = 12 * 1024 * 1024
 QUALITY_SCATTER_CHUNK_PIXELS = QUALITY_SCATTER_WORKSPACE_BYTES // (HORIZONTAL_SUBPIXELS * 4)
+QUALITY_INPAINT_ROI_AREA_NUMERATOR = 9
+QUALITY_INPAINT_ROI_AREA_DENOMINATOR = 10
 
 
 def _calculate_quality_band_height(
@@ -110,6 +112,7 @@ def _quality_public_memory_preflight(
     native_shape: tuple[int, int],
     occlusion_fill: Literal["none", "background"],
     materialize_public_masks: bool,
+    geometry_mode: Literal["relative", "metric"] = "relative",
 ) -> dict[str, int]:
     height, width = render_shape
     native_height, native_width = native_shape
@@ -132,14 +135,24 @@ def _quality_public_memory_preflight(
     histogram_bytes = 272 * (width + 1)
     runtime = QUALITY_RUNTIME_OVERHEAD_BYTES
     auxiliary_threads = QUALITY_AUXILIARY_THREAD_BYTES
+    geometry_payload = (
+        21 * output_pixels + 9 * native_pixels
+        if geometry_mode == "relative"
+        else 29 * output_pixels + 18 * native_pixels
+    )
     phases = {
         "quality-lowres-region": (
             3 * output_pixels + 22 * native_pixels + runtime + auxiliary_threads
         ),
         "quality-geometry-nearest": (
-            64 * output_pixels + 17 * native_pixels + runtime + auxiliary_threads
+            geometry_payload
+            + 40 * output_pixels
+            + 10 * native_pixels  # KD members/offsets, allowed regions, and native seen flags.
+            + 5
+            + runtime
+            + auxiliary_threads
         ),
-        "quality-region": (52 * output_pixels + 18 * native_pixels + runtime + auxiliary_threads),
+        "quality-region": (68 * output_pixels + 18 * native_pixels + runtime + auxiliary_threads),
         "quality-geometry-matte": (
             68 * output_pixels + 18 * native_pixels + runtime + auxiliary_threads
         ),
@@ -753,6 +766,47 @@ def _build_background_proxy_mask(
     return np.ascontiguousarray(exclusion_zone)
 
 
+def _inpaint_background_proxy(
+    proxy_source: np.ndarray,
+    mask: np.ndarray,
+    *,
+    radius_px: int,
+    mask_bounds: tuple[int, int, int, int],
+) -> np.ndarray:
+    start_row, end_row, start_column, end_column = mask_bounds
+    if end_row <= start_row or end_column <= start_column:
+        return proxy_source
+
+    height, width = mask.shape
+    halo = radius_px + 1
+    roi_start_row = max(0, start_row - halo)
+    roi_end_row = min(height, end_row + halo)
+    roi_start_column = max(0, start_column - halo)
+    roi_end_column = min(width, end_column + halo)
+    roi_pixels = (roi_end_row - roi_start_row) * (roi_end_column - roi_start_column)
+    if (
+        roi_pixels * QUALITY_INPAINT_ROI_AREA_DENOMINATOR
+        >= height * width * QUALITY_INPAINT_ROI_AREA_NUMERATOR
+    ):
+        return cv2.inpaint(
+            proxy_source,
+            mask,
+            float(radius_px),
+            cv2.INPAINT_TELEA,
+        )
+
+    row_slice = slice(roi_start_row, roi_end_row)
+    column_slice = slice(roi_start_column, roi_end_column)
+    repaired_roi = cv2.inpaint(
+        proxy_source[row_slice, column_slice],
+        mask[row_slice, column_slice],
+        float(radius_px),
+        cv2.INPAINT_TELEA,
+    )
+    proxy_source[row_slice, column_slice] = repaired_roi
+    return proxy_source
+
+
 def _composite_background_proxy(  # noqa: C901 - validation stays at this boundary.
     pre_repair: np.ndarray,
     coverage: np.ndarray,
@@ -818,11 +872,13 @@ def _composite_background_proxy(  # noqa: C901 - validation stays at this bounda
     if bool(np.all(mask)):
         proxy = np.array(source, copy=True, order="C")
     else:
-        proxy = cv2.inpaint(
+        mask_u8 = np.ascontiguousarray(mask, dtype=np.uint8) * np.uint8(255)
+        x, y, width, height = cv2.boundingRect(mask_u8)
+        proxy = _inpaint_background_proxy(
             proxy_source,
-            np.ascontiguousarray(mask, dtype=np.uint8) * np.uint8(255),
-            float(radius),
-            cv2.INPAINT_TELEA,
+            mask_u8,
+            radius_px=radius,
+            mask_bounds=(y, y + height, x, x + width),
         )
 
     return native.composite_background_proxy(pre_repair, coverage, proxy)
@@ -843,7 +899,20 @@ def _background_proxy_repair_state(
     component_count = 0
     if missing_pixels:
         component_count = int(cv2.connectedComponents(missing, connectivity=4)[0]) - 1
-    summary = QualityRepairPlanSummary(
+    return repair_bits, _background_proxy_summary(
+        missing_lanes=missing_lanes,
+        missing_pixels=missing_pixels,
+        component_count=component_count,
+    )
+
+
+def _background_proxy_summary(
+    *,
+    missing_lanes: int,
+    missing_pixels: int,
+    component_count: int,
+) -> QualityRepairPlanSummary:
+    return QualityRepairPlanSummary(
         segment_record_count=component_count,
         segment_table_bytes=component_count * REPAIR_RECORD_DTYPE.itemsize,
         backend_lane_counts=(0, 0, missing_lanes),
@@ -860,7 +929,6 @@ def _background_proxy_repair_state(
         fallback_visited_nodes_p95=0.0,
         exemplar_donor_evaluation_count=0,
     )
-    return repair_bits, summary
 
 
 def _background_repair_bits(
@@ -1075,16 +1143,47 @@ def _finish_background_eye(
 ) -> _CompactEyeResult:
     safe_limit = max(1, math.floor(controls_limit_px * source.shape[0] / 1080.0 + 0.5))
     local_limit = min(safe_limit, predicted_gap_px)
-    image = _composite_background_proxy(
+    native = native_kd._require_native()
+    (
+        proxy_source,
+        mask,
+        repair_bits,
+        missing,
+        missing_lanes,
+        missing_pixels,
+        masked_pixels,
+        mask_bounds,
+    ) = native.prepare_background_proxy(
         pre_repair.image,
         pre_repair.coverage_count,
-        source,
-        radius_px=min(3, max(1, local_limit)),
-        far_side=eye,
-        foreground_exclusion_px=local_limit,
+        1 if eye == "right" else -1,
+        local_limit,
     )
-    repair_bits, summary = _background_proxy_repair_state(
-        pre_repair.coverage_count,
+    missing_pixels = int(missing_pixels)
+    if not missing_pixels:
+        image = np.array(pre_repair.image, copy=True, order="C")
+        component_count = 0
+    else:
+        if int(masked_pixels) == int(mask.size):
+            proxy = np.array(source, copy=True, order="C")
+        else:
+            radius = min(3, max(1, local_limit))
+            proxy = _inpaint_background_proxy(
+                proxy_source,
+                mask,
+                radius_px=radius,
+                mask_bounds=tuple(int(value) for value in mask_bounds),
+            )
+        image = native.composite_background_proxy(
+            pre_repair.image,
+            pre_repair.coverage_count,
+            proxy,
+        )
+        component_count = int(cv2.connectedComponents(missing, connectivity=4)[0]) - 1
+    summary = _background_proxy_summary(
+        missing_lanes=int(missing_lanes),
+        missing_pixels=missing_pixels,
+        component_count=component_count,
     )
     return _CompactEyeResult(
         image,
@@ -1418,6 +1517,7 @@ def render_metric_primitives_compact(
         native_shape=(int(metric_shape[0]), int(metric_shape[1])),
         occlusion_fill=controls.occlusion_fill,
         materialize_public_masks=False,
+        geometry_mode="metric",
     )
     source = np.ascontiguousarray(frame_values)
     if source.dtype != np.uint8 or source.ndim != 3 or source.shape[2] != 3:

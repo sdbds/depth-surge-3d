@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import inspect
 
@@ -7,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+import src.depth_surge_3d.rendering.fast_fill_triton as fast_fill_triton_module
 import src.depth_surge_3d.rendering.stereo_renderer as stereo_renderer_module
 from src.depth_surge_3d.rendering.forward_splat import (
     HORIZONTAL_SUBPIXELS,
@@ -103,6 +105,106 @@ def test_band_height_uses_measured_sixteen_sample_bound() -> None:
     assert calculate_band_height(16, 3) == 3
 
 
+def test_fast_default_cuda_budget_limits_4k_to_seventeen_bands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    renderer = StereoRenderer(device="cuda")
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda _device: (8 * 1024**3, 16 * 1024**3),
+    )
+
+    actual = stereo_renderer_module._fast_temporary_budget_bytes(
+        renderer,
+        render_width=3840,
+        render_height=2160,
+        bytes_per_pixel=1088,
+    )
+
+    assert actual == 534_773_760
+
+
+def test_fast_default_cuda_budget_does_not_grow_1080p(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    renderer = StereoRenderer(device="cuda")
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda _device: (8 * 1024**3, 16 * 1024**3),
+    )
+
+    actual = stereo_renderer_module._fast_temporary_budget_bytes(
+        renderer,
+        render_width=1920,
+        render_height=1080,
+        bytes_per_pixel=1088,
+    )
+
+    assert actual == 268_435_456
+
+
+def test_fast_cuda_budget_preserves_explicit_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    renderer = StereoRenderer(device="cuda", temporary_budget_bytes=123_456_789)
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda _device: (8 * 1024**3, 16 * 1024**3),
+    )
+
+    actual = stereo_renderer_module._fast_temporary_budget_bytes(
+        renderer,
+        render_width=3840,
+        render_height=2160,
+        bytes_per_pixel=1088,
+    )
+
+    assert actual == 123_456_789
+
+
+def test_fast_default_cuda_budget_keeps_baseline_when_vram_is_low(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    renderer = StereoRenderer(device="cuda")
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda _device: (1024**3, 8 * 1024**3),
+    )
+
+    actual = stereo_renderer_module._fast_temporary_budget_bytes(
+        renderer,
+        render_width=3840,
+        render_height=2160,
+        bytes_per_pixel=1088,
+    )
+
+    assert actual == 268_435_456
+
+
+def test_fast_default_cuda_budget_keeps_baseline_when_vram_query_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    renderer = StereoRenderer(device="cuda")
+
+    def fail_query(_device: torch.device) -> tuple[int, int]:
+        raise RuntimeError("simulated CUDA query failure")
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", fail_query)
+
+    actual = stereo_renderer_module._fast_temporary_budget_bytes(
+        renderer,
+        render_width=3840,
+        render_height=2160,
+        bytes_per_pixel=1088,
+    )
+
+    assert actual == 268_435_456
+
+
 def test_fast_compact_triton_path_uses_taller_memory_bounded_bands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -156,6 +258,90 @@ def test_fast_compact_triton_path_uses_taller_memory_bounded_bands(
 
     assert result is marker
     assert attempted_heights == [10]
+
+
+def test_fast_compact_default_cuda_path_uses_adaptive_4k_band_height(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = np.broadcast_to(
+        np.zeros((1, 1, 3), dtype=np.uint8),
+        (2160, 3840, 3),
+    )
+    renderer = StereoRenderer(device="cuda")
+    attempted_heights: list[int] = []
+    marker = object()
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda _device: (8 * 1024**3, 16 * 1024**3),
+    )
+    monkeypatch.setattr(
+        stereo_renderer_module,
+        "_triton_splat_available",
+        lambda _device: True,
+    )
+
+    def capture_band_height(*args, **_kwargs):
+        attempted_heights.append(int(args[4]))
+        return marker
+
+    monkeypatch.setattr(
+        renderer,
+        "_render_fast_compact_with_band_height",
+        capture_band_height,
+    )
+
+    result = renderer._render_fast_compact_core(
+        frame,
+        object(),
+        (object(), object()),
+        StereoSplatSettings(max_eye_shift_fraction=0.01),
+    )
+
+    assert result is marker
+    assert attempted_heights == [128]
+
+
+def test_public_fast_default_cuda_path_uses_adaptive_4k_band_height(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = np.broadcast_to(
+        np.zeros((1, 1, 3), dtype=np.uint8),
+        (2160, 3840, 3),
+    )
+    offsets = (np.zeros((1, 1), dtype=np.int32),) * 2
+    renderer = StereoRenderer(device="cuda")
+    attempted_heights: list[int] = []
+    marker = object()
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda _device: (8 * 1024**3, 16 * 1024**3),
+    )
+    monkeypatch.setattr(
+        stereo_renderer_module,
+        "_triton_splat_available",
+        lambda _device: True,
+    )
+
+    def capture_band_height(*args, **_kwargs):
+        attempted_heights.append(int(args[4]))
+        return marker
+
+    monkeypatch.setattr(renderer, "_render_with_band_height", capture_band_height)
+
+    result = renderer._render_splat_core(
+        frame,
+        object(),
+        offsets,
+        StereoSplatSettings(max_eye_shift_fraction=0.01),
+        0.0,
+    )
+
+    assert result is marker
+    assert attempted_heights == [128]
 
 
 def test_renderer_rejects_full_frame_source_indexes_that_do_not_fit_uint32() -> None:
@@ -1099,6 +1285,226 @@ def test_fast_compact_native_diagnostics_match_scalar_fallback(
         actual_fast = getattr(actual, f"{eye}_fast_diagnostics")
         expected_fast = getattr(expected, f"{eye}_fast_diagnostics")
         assert actual_fast is not None and expected_fast is not None
+        assert actual_fast.local_filled_lane_count == expected_fast.local_filled_lane_count
+        assert actual_fast.final_unresolved_lane_count == expected_fast.final_unresolved_lane_count
+
+
+def test_fast_lane_analysis_queue_matches_synchronous_native_results() -> None:
+    native = stereo_renderer_module._native_lane_analyzer()
+    assert native is not None
+    generator = np.random.default_rng(20260830)
+    packed_missing = generator.integers(
+        0,
+        1 << HORIZONTAL_SUBPIXELS,
+        size=(7, 19),
+        dtype=np.uint16,
+    )
+    expected_coverage = np.empty(packed_missing.shape, dtype=np.uint8)
+    expected_lane_histogram = np.zeros(
+        HORIZONTAL_SUBPIXELS * (packed_missing.shape[1] + 1),
+        dtype=np.uint64,
+    )
+    expected_span_histogram = np.zeros(packed_missing.shape[1] + 1, dtype=np.uint64)
+    native.accumulate_packed_lane_hole_run_histograms_into(
+        packed_missing,
+        expected_lane_histogram,
+        expected_span_histogram,
+        expected_coverage,
+    )
+
+    coverage = np.empty_like(expected_coverage)
+    lane_histogram = np.zeros_like(expected_lane_histogram)
+    span_histogram = np.zeros_like(expected_span_histogram)
+    with stereo_renderer_module._FastLaneAnalysisQueue(
+        native,
+        async_threshold_seconds=0.0,
+    ) as analysis:
+        analysis.submit(
+            packed_missing[:3],
+            lane_histogram,
+            span_histogram,
+            coverage[:3],
+        )
+        analysis.submit(
+            packed_missing[3:],
+            lane_histogram,
+            span_histogram,
+            coverage[3:],
+        )
+        np.testing.assert_array_equal(coverage, expected_coverage)
+
+    np.testing.assert_array_equal(lane_histogram, expected_lane_histogram)
+    np.testing.assert_array_equal(span_histogram, expected_span_histogram)
+
+
+def test_fast_lane_analysis_queue_propagates_worker_failure() -> None:
+    class BrokenNative:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def accumulate_packed_lane_hole_run_histograms_into(self, *_args) -> None:
+            self.calls += 1
+            if self.calls > 1:
+                raise RuntimeError("injected lane-analysis failure")
+
+    packed_missing = np.zeros((1, 2), dtype=np.uint16)
+    coverage = np.empty((1, 2), dtype=np.uint8)
+    lane_histogram = np.zeros(HORIZONTAL_SUBPIXELS * 3, dtype=np.uint64)
+    span_histogram = np.zeros(3, dtype=np.uint64)
+
+    with pytest.raises(RuntimeError, match="injected lane-analysis failure"):
+        with stereo_renderer_module._FastLaneAnalysisQueue(
+            BrokenNative(),
+            async_threshold_seconds=0.0,
+        ) as analysis:
+            analysis.submit(
+                packed_missing,
+                lane_histogram,
+                span_histogram,
+                coverage,
+            )
+            analysis.submit(
+                packed_missing,
+                lane_histogram,
+                span_histogram,
+                coverage,
+            )
+
+
+def test_fast_lane_analysis_queue_does_not_create_a_worker_for_fast_native_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native = stereo_renderer_module._native_lane_analyzer()
+    assert native is not None
+    packed_missing = np.zeros((1, 2), dtype=np.uint16)
+    coverage = np.empty((1, 2), dtype=np.uint8)
+    lane_histogram = np.zeros(HORIZONTAL_SUBPIXELS * 3, dtype=np.uint64)
+    span_histogram = np.zeros(3, dtype=np.uint64)
+
+    monkeypatch.setattr(
+        stereo_renderer_module,
+        "ThreadPoolExecutor",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("worker created")),
+    )
+    with stereo_renderer_module._FastLaneAnalysisQueue(
+        native,
+        async_threshold_seconds=float("inf"),
+    ) as analysis:
+        analysis.submit(
+            packed_missing,
+            lane_histogram,
+            span_histogram,
+            coverage,
+        )
+
+    assert coverage.tolist() == [[HORIZONTAL_SUBPIXELS, HORIZONTAL_SUBPIXELS]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_fast_async_lane_analysis_matches_synchronous_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator = np.random.default_rng(20260830)
+    frame = generator.integers(0, 256, size=(17, 31, 3), dtype=np.uint8)
+    canonical = generator.random((13, 23), dtype=np.float32)
+    settings = StereoRenderSettings(
+        stereo_strength=4.25,
+        convergence=0.37,
+        occlusion_fill="background",
+    )
+    renderer = StereoRenderer(device="cuda")
+
+    with monkeypatch.context() as synchronous:
+        synchronous.setattr(
+            stereo_renderer_module,
+            "_FastLaneAnalysisQueue",
+            lambda _native: nullcontext(None),
+        )
+        expected = renderer.render_relative_fast_compact(frame, canonical, settings)
+    actual = renderer.render_relative_fast_compact(frame, canonical, settings)
+
+    for name in (
+        "left_image",
+        "right_image",
+        "left_coverage_count",
+        "right_coverage_count",
+        "left_repair_bits",
+        "right_repair_bits",
+    ):
+        np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
+    for eye in ("left", "right"):
+        actual_runs = getattr(actual, f"{eye}_hole_runs")
+        expected_runs = getattr(expected, f"{eye}_hole_runs")
+        assert actual_runs is not None and expected_runs is not None
+        np.testing.assert_array_equal(
+            actual_runs.lane_count_histogram,
+            expected_runs.lane_count_histogram,
+        )
+        np.testing.assert_array_equal(
+            actual_runs.touched_pixel_span_histogram,
+            expected_runs.touched_pixel_span_histogram,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_fast_fused_background_fill_matches_torch_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator = np.random.default_rng(20260830)
+    frame = generator.integers(0, 256, size=(17, 31, 3), dtype=np.uint8)
+    canonical = generator.random((13, 23), dtype=np.float32)
+    settings = StereoRenderSettings(
+        stereo_strength=4.25,
+        convergence=0.37,
+        occlusion_fill="background",
+    )
+    renderer = StereoRenderer(device="cuda")
+
+    with monkeypatch.context() as fallback:
+        fallback.setattr(
+            fast_fill_triton_module,
+            "triton_background_fill",
+            lambda *_args, **_kwargs: None,
+        )
+        expected = renderer.render_relative_fast_compact(frame, canonical, settings)
+
+    fused_calls = 0
+    fused_fill = fast_fill_triton_module.triton_background_fill
+
+    def record_fused_call(*args, **kwargs):
+        nonlocal fused_calls
+        fused_calls += 1
+        return fused_fill(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fast_fill_triton_module,
+        "triton_background_fill",
+        record_fused_call,
+    )
+    actual = renderer.render_relative_fast_compact(frame, canonical, settings)
+
+    assert fused_calls > 0
+    for name in (
+        "left_image",
+        "right_image",
+        "left_coverage_count",
+        "right_coverage_count",
+        "left_repair_bits",
+        "right_repair_bits",
+    ):
+        np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
+    for eye in ("left", "right"):
+        actual_fast = getattr(actual, f"{eye}_fast_diagnostics")
+        expected_fast = getattr(expected, f"{eye}_fast_diagnostics")
+        assert actual_fast is not None and expected_fast is not None
+        np.testing.assert_array_equal(
+            actual_fast.hole_runs.lane_count_histogram,
+            expected_fast.hole_runs.lane_count_histogram,
+        )
+        np.testing.assert_array_equal(
+            actual_fast.hole_runs.touched_pixel_span_histogram,
+            expected_fast.hole_runs.touched_pixel_span_histogram,
+        )
         assert actual_fast.local_filled_lane_count == expected_fast.local_filled_lane_count
         assert actual_fast.final_unresolved_lane_count == expected_fast.final_unresolved_lane_count
 

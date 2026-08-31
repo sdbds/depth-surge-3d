@@ -252,6 +252,204 @@ def test_shared_quality_png_payloads_reject_a_different_compact_result(tmp_path:
         )
 
 
+def test_parallel_quality_png_encoding_is_byte_identical_and_concurrent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    serial_root = tmp_path / "serial"
+    parallel_root = tmp_path / "parallel"
+    serial_manifest = diagnostic_transaction.publish_quality_frame(
+        _publication(diagnostic_transaction, serial_root)
+    )
+    real_encode = diagnostic_transaction._png_buffer
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def observe_encode(values):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            time.sleep(0.02)
+            return real_encode(values)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(diagnostic_transaction, "_png_buffer", observe_encode)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        parallel_manifest = diagnostic_transaction.publish_quality_frame(
+            _publication(diagnostic_transaction, parallel_root),
+            png_executor=pool,
+        )
+
+    assert peak >= 2
+    assert parallel_manifest == serial_manifest
+    serial_files = {
+        path.relative_to(serial_root): path.read_bytes()
+        for path in serial_root.rglob("*")
+        if path.is_file()
+    }
+    parallel_files = {
+        path.relative_to(parallel_root): path.read_bytes()
+        for path in parallel_root.rglob("*")
+        if path.is_file()
+    }
+    assert parallel_files == serial_files
+
+
+def test_parallel_quality_png_failure_waits_and_publishes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    root = tmp_path / "failed"
+    real_encode = diagnostic_transaction._png_buffer
+    active = 0
+    calls = 0
+    lock = threading.Lock()
+    concurrent_start = threading.Event()
+
+    def fail_one_encode(values):
+        nonlocal active, calls
+        with lock:
+            calls += 1
+            call = calls
+            active += 1
+            if active >= 2:
+                concurrent_start.set()
+        try:
+            if call == 1:
+                assert concurrent_start.wait(timeout=2.0)
+                raise OSError("injected PNG encode failure")
+            time.sleep(0.08)
+            return real_encode(values)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(diagnostic_transaction, "_png_buffer", fail_one_encode)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        with pytest.raises(OSError, match="injected PNG encode failure"):
+            diagnostic_transaction.publish_quality_frame(
+                _publication(diagnostic_transaction, root),
+                png_executor=pool,
+            )
+        with lock:
+            assert active == 0
+        assert not [path for path in root.rglob("*") if path.is_file()]
+
+
+def test_parallel_quality_png_submit_failure_drains_started_encodes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    real_encode = diagnostic_transaction._png_buffer
+    started = threading.Event()
+    active = 0
+    lock = threading.Lock()
+
+    def slow_encode(values):
+        nonlocal active
+        with lock:
+            active += 1
+        started.set()
+        try:
+            time.sleep(0.08)
+            return real_encode(values)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(diagnostic_transaction, "_png_buffer", slow_encode)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        real_submit = pool.submit
+        submissions = 0
+
+        def fail_third_submit(fn, *args, **kwargs):
+            nonlocal submissions
+            submissions += 1
+            if submissions == 3:
+                assert started.wait(timeout=2.0)
+                raise RuntimeError("injected PNG submit failure")
+            return real_submit(fn, *args, **kwargs)
+
+        monkeypatch.setattr(pool, "submit", fail_third_submit)
+        with pytest.raises(RuntimeError, match="injected PNG submit failure"):
+            diagnostic_transaction.publish_quality_frame(
+                _publication(diagnostic_transaction, tmp_path),
+                png_executor=pool,
+            )
+
+        with lock:
+            assert active == 0
+        assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+
+
+def test_parallel_shared_png_failure_drains_every_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    compact = _compact()
+    shared = diagnostic_transaction.SharedQualityPngPayloads(compact=compact, keep_masks=False)
+    real_encode = diagnostic_transaction._png_buffer
+    active = 0
+    left_calls = 0
+    lock = threading.Lock()
+    publication_start = threading.Barrier(3)
+
+    def fail_shared_left(values):
+        nonlocal active, left_calls
+        with lock:
+            active += 1
+            if values is compact.left_image:
+                left_calls += 1
+        try:
+            time.sleep(0.04)
+            if values is compact.left_image:
+                raise OSError("injected shared PNG failure")
+            return real_encode(values)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(diagnostic_transaction, "_png_buffer", fail_shared_left)
+    with ThreadPoolExecutor(max_workers=4) as encoders:
+
+        def publish(index: int):
+            prepared = diagnostic_transaction.prepare_quality_frame(
+                _publication(
+                    diagnostic_transaction,
+                    tmp_path,
+                    compact=compact,
+                    keep_masks=False,
+                    frame_name=f"frame_{index:06d}",
+                ),
+                png_payloads=shared,
+            )
+            publication_start.wait(timeout=2.0)
+            return diagnostic_transaction.publish_quality_frame(prepared, png_executor=encoders)
+
+        with ThreadPoolExecutor(max_workers=3) as writers:
+            publications = [writers.submit(publish, index) for index in range(1, 4)]
+            for publication in publications:
+                with pytest.raises(OSError, match="shared PNG"):
+                    publication.result(timeout=5.0)
+            with lock:
+                assert active == 0
+                assert left_calls == 1
+            assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+
+
 def test_quality_frame_preserves_an_unowned_payload_temporary(tmp_path: Path) -> None:
     from src.depth_surge_3d.io.durable_publish import (
         OwnedTemporaryCollisionError,
@@ -555,19 +753,20 @@ def test_frame_stats_keep_dense_histograms_until_canonical_serialization(
             stereo_render_mode="quality",
         ),
     )
-    monkeypatch.setattr(
-        "src.depth_surge_3d.rendering.quality.diagnostics.np.flatnonzero",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("dense histogram expansion is forbidden")
-        ),
-    )
+    with monkeypatch.context() as stats_patch:
+        stats_patch.setattr(
+            "src.depth_surge_3d.rendering.quality.diagnostics.np.flatnonzero",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("dense histogram expansion is forbidden")
+            ),
+        )
 
-    stats = build_quality_frame_stats(
-        compact,
-        frame_name="frame_000000",
-        geometry_mode="relative",
-        occlusion_fill="none",
-    )
+        stats = build_quality_frame_stats(
+            compact,
+            frame_name="frame_000000",
+            geometry_mode="relative",
+            occlusion_fill="none",
+        )
 
     dense = stats["eyes"]["left"]["hole_runs"]["lane_count_histogram"]
     assert isinstance(dense, DenseHistogramPairs)

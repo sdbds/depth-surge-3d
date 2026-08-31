@@ -5,12 +5,13 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 import errno
+from functools import lru_cache
 import os
 from pathlib import Path
 import re
 import stat
 import sys
-from typing import BinaryIO, Literal, TypeAlias
+from typing import BinaryIO, Callable, Literal, TypeAlias
 
 
 LINUX_UUID_DIRECTORY = "/dev/disk/by-uuid"
@@ -200,14 +201,14 @@ class DirectoryIdentityV1:
         return cls(kind, inner)
 
 
-def _windows_handle_identity(
-    handle: int,
-    *,
-    require_directory: bool,
-    allow_reparse: bool = False,
-) -> tuple[WindowsFileIdentityV1, int, int]:
-    if os.name != "nt":
-        raise PersistentIdentityCapabilityError("Windows FileIdInfo is unavailable")
+@lru_cache(maxsize=1)
+def _windows_identity_bindings() -> tuple[
+    type[ctypes.Structure],
+    type[ctypes.Structure],
+    type[ctypes.Structure],
+    Callable[..., int],
+]:
+    """Cache ABI declarations only; each identity query keeps fresh result buffers."""
     from ctypes import wintypes
 
     class FileId128(ctypes.Structure):
@@ -236,6 +237,22 @@ def _windows_handle_identity(
     ).GetFileInformationByHandleEx
     get_info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
     get_info.restype = wintypes.BOOL
+    return FileIdInfo, FileStandardInfo, FileAttributeTagInfo, get_info
+
+
+def _windows_handle_identity(
+    handle: int,
+    *,
+    require_directory: bool,
+    allow_reparse: bool = False,
+) -> tuple[WindowsFileIdentityV1, int, int]:
+    if os.name != "nt":
+        raise PersistentIdentityCapabilityError("Windows FileIdInfo is unavailable")
+    from ctypes import wintypes
+
+    FileIdInfo, FileStandardInfo, FileAttributeTagInfo, get_info = (
+        _windows_identity_bindings()
+    )
 
     def query(info_class: int, target: ctypes.Structure, label: str) -> None:
         if not get_info(

@@ -570,6 +570,43 @@ def test_quality_capacity_overlaps_decode_render_and_write_when_memory_allows() 
     assert selection.total_bytes == 472 * 1024 * 1024
 
 
+def test_quality_capacity_charges_bounded_parallel_png_encoders() -> None:
+    selection = stereo_control.select_quality_pipeline_capacity(
+        configured_workers=8,
+        pending_render_count=60,
+        quality_active_scratch=240 * 1024 * 1024,
+        quality_slot_bytes=72 * 1024 * 1024,
+        png_payloads_per_item=6,
+    )
+
+    assert selection.capacity == 4
+    assert selection.effective_workers == 4
+    assert selection.writer_workers == 3
+    assert selection.png_encoder_workers == 4
+    assert selection.thread_bytes == 32 * 1024 * 1024
+    assert selection.total_bytes == 488 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    ("remaining_mib", "png_workers"), [(0, 0), (4, 0), (8, 2), (12, 3), (16, 4)]
+)
+def test_quality_capacity_preserves_lifecycle_slots_and_png_runtime_slack(
+    remaining_mib: int, png_workers: int
+) -> None:
+    selection = stereo_control.select_quality_pipeline_capacity(
+        configured_workers=8,
+        pending_render_count=60,
+        quality_active_scratch=(280 - remaining_mib) * 1024 * 1024,
+        quality_slot_bytes=72 * 1024 * 1024,
+        png_payloads_per_item=6,
+    )
+
+    assert selection.capacity == 4
+    assert selection.png_encoder_workers == png_workers
+    assert selection.thread_bytes == (16 + png_workers * 4) * 1024 * 1024
+    assert selection.total_bytes == (512 - remaining_mib + png_workers * 4) * 1024 * 1024
+
+
 def test_quality_capacity_charges_a_retained_duplicate_cache() -> None:
     selection = stereo_control.select_quality_pipeline_capacity(
         configured_workers=8,
@@ -628,6 +665,35 @@ def test_fast_capacity_uses_the_unique_largest_eligible_integer() -> None:
     assert selection.thread_bytes == 18 * 1024 * 1024
     assert selection.total_bytes == 506 * 1024 * 1024
     assert selection.total_bytes <= stereo_control.STEREO_HOST_BUDGET
+
+
+def test_fast_capacity_charges_retained_consumer_memory() -> None:
+    selection = stereo_control.select_fast_pipeline_capacity(
+        configured_workers=4,
+        pending_render_count=20,
+        fast_active_scratch=8 * 1024 * 1024,
+        fast_slot_bytes=96 * 1024 * 1024,
+        retained_bytes=72 * 1024 * 1024,
+    )
+
+    assert selection.capacity == 4
+    assert selection.effective_workers == 4
+    assert selection.thread_bytes == 18 * 1024 * 1024
+    assert selection.total_bytes == 482 * 1024 * 1024
+    assert selection.total_bytes <= stereo_control.STEREO_HOST_BUDGET
+
+
+def test_fast_capacity_rejection_uses_shared_pipeline_error() -> None:
+    with pytest.raises(
+        stereo_control.StereoPipelineCapacityError,
+        match="Fast lifecycle capacity",
+    ):
+        stereo_control.select_fast_pipeline_capacity(
+            configured_workers=1,
+            pending_render_count=1,
+            fast_active_scratch=500 * 1024 * 1024,
+            fast_slot_bytes=96 * 1024 * 1024,
+        )
 
 
 def _fixed_stack_evidence() -> stereo_control.StackReservationEvidence:
@@ -744,6 +810,114 @@ def test_attestation_failure_cancels_and_joins_every_started_worker() -> None:
         )
 
     assert captured.value.started_threads == captured.value.joined_threads
+
+
+def test_attested_executor_primes_and_joins_every_bounded_worker() -> None:
+    executor, stats = stereo_control.create_attested_stereo_executor(
+        worker_count=3,
+        thread_name_prefix="quality-png-test",
+    )
+    try:
+        assert len(stats.thread_names) == 3
+        assert len(set(stats.thread_names)) == 3
+        assert len(stats.stack_evidence) == 3
+        assert all(
+            evidence.reserve_bytes <= stereo_control.QUALITY_PNG_ENCODER_STACK_RESERVE_BYTES
+            for evidence in stats.stack_evidence
+        )
+        assert list(executor.map(lambda value: value + 1, range(3))) == [1, 2, 3]
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    assert not [
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("quality-png-test")
+    ]
+
+
+def test_attested_executor_failure_joins_every_primed_worker() -> None:
+    calls = 0
+
+    def fail_one_attestation() -> stereo_control.StackReservationEvidence:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected executor attestation failure")
+        return _fixed_stack_evidence()
+
+    with pytest.raises(
+        stereo_control.StereoThreadBudgetError,
+        match="attestation",
+    ) as captured:
+        stereo_control.create_attested_stereo_executor(
+            worker_count=3,
+            thread_name_prefix="quality-png-failed-test",
+            stack_adapter=fail_one_attestation,
+        )
+
+    assert captured.value.started_threads == captured.value.joined_threads == 3
+    assert not [
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("quality-png-failed-test")
+    ]
+
+
+def test_attested_executor_rejects_stack_using_thread_runtime_slack() -> None:
+    def oversized_stack() -> stereo_control.StackReservationEvidence:
+        return replace(_fixed_stack_evidence(), reserve_bytes=3 * 1024 * 1024)
+
+    with pytest.raises(stereo_control.StereoThreadBudgetError, match="stack reserve") as captured:
+        stereo_control.create_attested_stereo_executor(
+            worker_count=2,
+            thread_name_prefix="quality-png-oversized-test",
+            stack_adapter=oversized_stack,
+        )
+
+    assert captured.value.started_threads == captured.value.joined_threads == 2
+    assert not [
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("quality-png-oversized-test")
+    ]
+
+
+@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, RuntimeError])
+def test_attested_executor_joins_workers_when_priming_result_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch, failure_type: type[BaseException]
+) -> None:
+    real_executor = stereo_control.ThreadPoolExecutor
+    real_result = stereo_control.Future.result
+    created = []
+
+    def capture_executor(**kwargs):
+        executor = real_executor(**kwargs)
+        created.append(executor)
+        return executor
+
+    def interrupt_result(_future, timeout=None):
+        monkeypatch.setattr(stereo_control.Future, "result", real_result)
+        raise failure_type("injected priming interruption")
+
+    monkeypatch.setattr(stereo_control, "ThreadPoolExecutor", capture_executor)
+    monkeypatch.setattr(stereo_control.Future, "result", interrupt_result)
+    try:
+        with pytest.raises(failure_type, match="injected priming interruption"):
+            stereo_control.create_attested_stereo_executor(
+                worker_count=2,
+                thread_name_prefix="quality-png-interrupted-test",
+                stack_adapter=_fixed_stack_evidence,
+            )
+
+        assert not [
+            thread.name
+            for thread in threading.enumerate()
+            if thread.name.startswith("quality-png-interrupted-test")
+        ]
+    finally:
+        for executor in created:
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 @pytest.mark.parametrize("failure", ["setting", "restoration"])

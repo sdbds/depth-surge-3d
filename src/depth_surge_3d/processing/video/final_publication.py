@@ -15,7 +15,7 @@ import secrets
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Callable, Literal, cast
+from typing import BinaryIO, Callable, Iterable, Literal, cast
 
 from ...rendering.quality.cleanup_transaction import (
     _validate_payload_pruned_projection,
@@ -71,6 +71,7 @@ from .final_container_validation import (
 from .streamed_vr_evidence import (
     StreamedVrInvocationV1,
     StreamedVrOutputEvidenceV1,
+    validate_raw_rgb24_input_v1,
 )
 from ...io.reservation_protocol import (
     AllocationAdapter,
@@ -1636,9 +1637,7 @@ class PreparedFinalEncodingReservationV1:
                 )
             prefix = self._canonical_prefix_byte_count(transaction.source_path)
             if prefix in {None, 0} or prefix > transaction.descriptor.payload_raw_max:
-                raise ReservationConflictError(
-                    "streamed final-manifest intent is incomplete"
-                )
+                raise ReservationConflictError("streamed final-manifest intent is incomplete")
             with transaction.open_authenticated_source() as handle:
                 raw = handle.read(prefix)
                 if len(raw) != prefix:
@@ -1684,8 +1683,7 @@ class PreparedFinalEncodingReservationV1:
         metadata = settings.to_object()["metadata"]
         if (
             metadata["final_media_producer_contract_version"] != 4
-            or metadata["final_media_publication_generation"]
-            != self.index.publication_generation
+            or metadata["final_media_publication_generation"] != self.index.publication_generation
         ):
             raise ReservationConflictError(
                 "existing-video completion lacks producer settings authority"
@@ -1704,8 +1702,7 @@ class PreparedFinalEncodingReservationV1:
             or invocation.materialized_arguments(input_stage_fingerprint)
             != resolved_encoding_arguments
             or output.reservation_index_fingerprint != self.index.fingerprint
-            or output.sibling_relative_path
-            != self.index.sibling_video_temporary_relative_path
+            or output.sibling_relative_path != self.index.sibling_video_temporary_relative_path
             or output.identity != expected_video_identity
             or output.raw_sha256 != expected_video_sha256
             or output.byte_count != expected_video_byte_count
@@ -1729,9 +1726,7 @@ class PreparedFinalEncodingReservationV1:
                         identity != expected_video_identity
                         or acquired.persistent_regular_identity(final_path) != identity
                     ):
-                        raise ReservationConflictError(
-                            "existing streamed video identity changed"
-                        )
+                        raise ReservationConflictError("existing streamed video identity changed")
         except (NoFollowPathError, FileNotFoundError, OSError) as error:
             raise ReservationConflictError(
                 "existing streamed video cannot be acquired without following links"
@@ -4912,6 +4907,7 @@ _ENCODING_CONTROL_FRAME_CAP = 4_194_304
 _MAX_SUPPORTED_IMAGE2_INDEX = 2_147_483_646
 _ENCODING_MANIFEST_STREAM_BYTES = 64 * 1024
 _ENCODING_MANIFEST_VALUE_MAX_BYTES = 1024 * 1024
+_ENCODING_MANIFEST_TOKEN_DELIMITERS = re.compile(rb'["\\{}]')
 _FRAME_STEM = re.compile(r"frame_([0-9]+)", flags=re.ASCII)
 
 
@@ -4928,6 +4924,7 @@ class _EncodingInputManifestProjection:
     frames_parent: PurePosixPath | None
     streamed_invocation: StreamedVrInvocationV1 | None
     streamed_output: StreamedVrOutputEvidenceV1 | None
+    raw_pixel_format: Literal["rgb24"] | None = None
 
 
 class _EncodingManifestReader:
@@ -4998,29 +4995,17 @@ class _EncodingManifestReader:
             )
 
     def json_string_token(self) -> bytes:
-        if self.peek_byte() != ord('"'):
-            raise FinalPublicationValidationError("encoding input manifest expected a JSON string")
-        token = bytearray()
-        escaped = False
-        while True:
-            if len(token) >= _ENCODING_MANIFEST_VALUE_MAX_BYTES:
-                raise FinalPublicationValidationError(
-                    "encoding input manifest string exceeds its bound"
-                )
-            byte = self.take_byte()
-            token.append(byte)
-            if len(token) == 1:
-                continue
-            if byte == ord('"') and not escaped:
-                return bytes(token)
-            if byte == ord("\\"):
-                escaped = not escaped
-            else:
-                escaped = False
+        return self._json_token(object_value=False)
 
     def json_object_token(self) -> bytes:
-        if self.peek_byte() != ord("{"):
-            raise FinalPublicationValidationError("encoding input manifest expected a JSON object")
+        return self._json_token(object_value=True)
+
+    def _json_token(self, *, object_value: bool) -> bytes:
+        description = "object" if object_value else "string"
+        if self.peek_byte() != (ord("{") if object_value else ord('"')):
+            raise FinalPublicationValidationError(
+                f"encoding input manifest expected a JSON {description}"
+            )
         token = bytearray()
         depth = 0
         in_string = False
@@ -5028,30 +5013,47 @@ class _EncodingManifestReader:
         while True:
             if len(token) >= _ENCODING_MANIFEST_VALUE_MAX_BYTES:
                 raise FinalPublicationValidationError(
-                    "encoding input manifest object exceeds its bound"
+                    f"encoding input manifest {description} exceeds its bound"
                 )
-            byte = self.take_byte()
-            token.append(byte)
-            if in_string:
-                if byte == ord('"') and not escaped:
-                    in_string = False
-                if byte == ord("\\"):
-                    escaped = not escaped
-                else:
-                    escaped = False
-                continue
-            if byte == ord('"'):
-                in_string = True
-            elif byte == ord("{"):
-                depth += 1
-            elif byte == ord("}"):
-                depth -= 1
-                if depth == 0:
-                    return bytes(token)
-                if depth < 0:
-                    raise FinalPublicationValidationError(
-                        "encoding input manifest object nesting is invalid"
-                    )
+            if not self._fill():
+                raise FinalPublicationValidationError("encoding input manifest ended unexpectedly")
+            start = self.position
+            end = min(len(self.buffer), start + _ENCODING_MANIFEST_VALUE_MAX_BYTES - len(token))
+            escaped_position = start if escaped else -1
+            complete = False
+            # Scan delimiters in C, retaining only lexical state across bounded chunks.
+            for match in _ENCODING_MANIFEST_TOKEN_DELIMITERS.finditer(self.buffer, start, end):
+                position = match.start()
+                byte = self.buffer[position]
+                if in_string:
+                    if position == escaped_position:
+                        continue
+                    if byte == ord("\\"):
+                        escaped_position = position + 1
+                    elif byte == ord('"'):
+                        in_string = False
+                        if not object_value:
+                            end = position + 1
+                            complete = True
+                            break
+                elif byte == ord('"'):
+                    in_string = True
+                elif byte == ord("{"):
+                    depth += 1
+                elif byte == ord("}"):
+                    depth -= 1
+                    if depth == 0:
+                        end = position + 1
+                        complete = True
+                        break
+                    if depth < 0:
+                        raise FinalPublicationValidationError(
+                            "encoding input manifest object nesting is invalid"
+                        )
+            escaped = escaped_position == end
+            token.extend(self.take(end - start))
+            if complete:
+                return bytes(token)
 
 
 def _canonical_frame_stem_v1(index: int) -> str:
@@ -5071,48 +5073,88 @@ def _parse_bounded_canonical_value(raw: bytes, *, description: str) -> object:
         ) from error
 
 
-def _parse_frame_names_v1(
+def _buffered_canonical_array_v1(
     reader: _EncodingManifestReader,
+) -> tuple[list[object], int] | None:
+    start = reader.position
+    if start >= len(reader.buffer) or reader.buffer[start] != ord("["):
+        return None
+    maximum = min(_ENCODING_MANIFEST_STREAM_BYTES, _ENCODING_MANIFEST_VALUE_MAX_BYTES)
+    end = reader.buffer.find(b"]", start + 1, start + maximum)
+    if end < 0:
+        return None
+    # A bracket inside a string or nested array fails strict decoding and falls back.
+    raw = reader.buffer[start : end + 1]
+    try:
+        value = strict_canonical_json_loads(raw, max_bytes=maximum)
+    except (CanonicalJsonError, RecursionError):
+        return None
+    if type(value) is not list:
+        return None
+    return value, len(raw)
+
+
+def _buffered_array_items_v1(
+    reader: _EncodingManifestReader,
+    *,
+    object_values: bool,
+) -> tuple[list[object], int] | None:
+    start = reader.position
+    opening = ord("{") if object_values else ord('"')
+    if start >= len(reader.buffer) or reader.buffer[start] != opening:
+        return None
+    maximum = min(_ENCODING_MANIFEST_STREAM_BYTES, _ENCODING_MANIFEST_VALUE_MAX_BYTES)
+    stop = start + max(0, maximum - 2)
+    closing = reader.buffer.find(b"]", start, stop)
+    boundary = reader.buffer.rfind(b"},{" if object_values else b'","', start, stop)
+    for end in (closing, boundary + 1 if boundary >= 0 else -1):
+        if end <= start:
+            continue
+        raw = b"[" + reader.buffer[start:end] + b"]"
+        try:
+            values = strict_canonical_json_loads(raw, max_bytes=maximum)
+        except (CanonicalJsonError, RecursionError):
+            continue
+        if type(values) is list and values:
+            return values, end - start
+    return None
+
+
+def _extend_frame_names_v1(
+    names: Iterable[object],
+    *,
+    first_index: int | None,
+    count: int,
+) -> tuple[int | None, int]:
+    for name in names:
+        if type(name) is not str:
+            raise FinalPublicationValidationError("encoding input frame name is not a string")
+        match = _FRAME_STEM.fullmatch(name)
+        if match is None:
+            raise FinalPublicationValidationError("encoding input frame name is noncanonical")
+        index = int(match.group(1))
+        if name != _canonical_frame_stem_v1(index):
+            raise FinalPublicationValidationError(
+                "encoding input frame name padding is noncanonical"
+            )
+        if first_index is None:
+            first_index = index
+        elif index != first_index + count:
+            raise FinalPublicationValidationError("encoding input frame names are not gap-free")
+        count += 1
+        if count > _ENCODING_CONTROL_FRAME_CAP:
+            raise FinalPublicationValidationError(
+                "encoding input frame count exceeds the control cap"
+            )
+    return first_index, count
+
+
+def _frame_names_projection_v1(
+    first_index: int | None,
+    count: int,
     *,
     expected_frame_count: int | None,
 ) -> tuple[int, int]:
-    reader.expect(b"[")
-    count = 0
-    first_index: int | None = None
-    if reader.peek_byte() == ord("]"):
-        reader.expect(b"]")
-    else:
-        while True:
-            name = _parse_bounded_canonical_value(
-                reader.json_string_token(),
-                description="frame name",
-            )
-            if type(name) is not str:
-                raise FinalPublicationValidationError("encoding input frame name is not a string")
-            match = _FRAME_STEM.fullmatch(name)
-            if match is None:
-                raise FinalPublicationValidationError("encoding input frame name is noncanonical")
-            index = int(match.group(1))
-            if name != _canonical_frame_stem_v1(index):
-                raise FinalPublicationValidationError(
-                    "encoding input frame name padding is noncanonical"
-                )
-            if first_index is None:
-                first_index = index
-            elif index != first_index + count:
-                raise FinalPublicationValidationError("encoding input frame names are not gap-free")
-            count += 1
-            if count > _ENCODING_CONTROL_FRAME_CAP:
-                raise FinalPublicationValidationError(
-                    "encoding input frame count exceeds the control cap"
-                )
-            separator = reader.take_byte()
-            if separator == ord("]"):
-                break
-            if separator != ord(","):
-                raise FinalPublicationValidationError(
-                    "encoding input frame-name array is malformed"
-                )
     if count < 1 or first_index is None:
         raise FinalPublicationValidationError("encoding input frame list is empty")
     if first_index + count - 1 > _MAX_SUPPORTED_IMAGE2_INDEX:
@@ -5126,11 +5168,72 @@ def _parse_frame_names_v1(
     return first_index, count
 
 
+def _parse_frame_names_v1(
+    reader: _EncodingManifestReader,
+    *,
+    expected_frame_count: int | None,
+) -> tuple[int, int]:
+    buffered = _buffered_canonical_array_v1(reader)
+    if buffered is not None:
+        values, byte_count = buffered
+        try:
+            first_index, count = _extend_frame_names_v1(values, first_index=None, count=0)
+            result = _frame_names_projection_v1(
+                first_index, count, expected_frame_count=expected_frame_count
+            )
+        except (FinalPublicationValidationError, ValueError):
+            pass
+        else:
+            reader.take(byte_count)
+            return result
+
+    reader.expect(b"[")
+    first_index, count = None, 0
+    attempted_loaded = -1
+    if reader.peek_byte() == ord("]"):
+        reader.expect(b"]")
+    else:
+        while True:
+            batched = False
+            if reader.loaded != attempted_loaded:
+                attempted_loaded = reader.loaded
+                buffered = _buffered_array_items_v1(reader, object_values=False)
+                if buffered is not None:
+                    values, byte_count = buffered
+                    try:
+                        next_state = _extend_frame_names_v1(
+                            values, first_index=first_index, count=count
+                        )
+                    except (FinalPublicationValidationError, ValueError):
+                        pass
+                    else:
+                        reader.take(byte_count)
+                        first_index, count = next_state
+                        batched = True
+            if not batched:
+                name = _parse_bounded_canonical_value(
+                    reader.json_string_token(), description="frame name"
+                )
+                first_index, count = _extend_frame_names_v1(
+                    (name,), first_index=first_index, count=count
+                )
+            separator = reader.take_byte()
+            if separator == ord("]"):
+                break
+            if separator != ord(","):
+                raise FinalPublicationValidationError(
+                    "encoding input frame-name array is malformed"
+                )
+
+    return _frame_names_projection_v1(first_index, count, expected_frame_count=expected_frame_count)
+
+
 def _validate_identity_path_v1(
     relative_path: object,
     *,
     expected_stem: str,
     expected_parent: str | None,
+    suffix: str = ".png",
 ) -> str:
     if type(relative_path) is not str or not relative_path:
         raise FinalPublicationValidationError("encoding input image path is invalid")
@@ -5146,7 +5249,7 @@ def _validate_identity_path_v1(
         )
     if PurePosixPath(relative_path).as_posix() != relative_path:
         raise FinalPublicationValidationError("encoding input image path is noncanonical")
-    if parts[-1] != f"{expected_stem}.png":
+    if parts[-1] != f"{expected_stem}{suffix}":
         raise FinalPublicationValidationError(
             "encoding input image filename differs from its frame name"
         )
@@ -5156,13 +5259,12 @@ def _validate_identity_path_v1(
     return parent
 
 
-def _parse_image_identity_v1(
-    raw: bytes,
+def _validate_image_identity_v1(
+    value: object,
     *,
     expected_stem: str,
     expected_parent: str | None,
 ) -> tuple[str, tuple[int, int]]:
-    value = _parse_bounded_canonical_value(raw, description="image identity")
     if type(value) is not dict or set(value) != {
         "byte_count",
         "png_header",
@@ -5205,19 +5307,84 @@ def _parse_image_identity_v1(
     return parent, (width, height)
 
 
+def _validate_raw_rgb24_identity_v1(
+    value: object,
+    *,
+    expected_stem: str,
+    expected_parent: str | None,
+) -> tuple[str, tuple[int, int]]:
+    if type(value) is not dict or set(value) != {
+        "byte_count",
+        "raw_frame",
+        "relative_path",
+        "sha256",
+    }:
+        raise FinalPublicationValidationError("raw RGB24 identity schema is not closed")
+    header = value["raw_frame"]
+    if type(header) is not dict or set(header) != {"width", "height", "pixel_format"}:
+        raise FinalPublicationValidationError("raw RGB24 frame schema is not closed")
+    width, height = header["width"], header["height"]
+    if (
+        type(width) is not int
+        or not 1 <= width <= 2**32 - 1
+        or type(height) is not int
+        or not 1 <= height <= 2**32 - 1
+        or header["pixel_format"] != "rgb24"
+    ):
+        raise FinalPublicationValidationError("raw RGB24 frame format is invalid")
+    byte_count = value["byte_count"]
+    if (
+        type(byte_count) is not int
+        or not 1 <= byte_count <= 2**64 - 1
+        or byte_count != width * height * 3
+    ):
+        raise FinalPublicationValidationError("raw RGB24 byte count differs from its dimensions")
+    if type(value["sha256"]) is not str or _HEX64.fullmatch(value["sha256"]) is None:
+        raise FinalPublicationValidationError("raw RGB24 hash is invalid")
+    parent = _validate_identity_path_v1(
+        value["relative_path"],
+        expected_stem=expected_stem,
+        expected_parent=expected_parent,
+        suffix=".rgb",
+    )
+    return parent, (width, height)
+
+
 def _parse_identity_array_v1(
     reader: _EncodingManifestReader,
     *,
     first_index: int,
     frame_count: int,
+    raw_rgb24: bool = False,
 ) -> tuple[int, str, tuple[int, int]] | None:
     if reader.peek_byte() == ord("n"):
         reader.expect(b"null")
         return None
+    buffered = _buffered_canonical_array_v1(reader)
+    if buffered is not None and type(frame_count) is int and 1 <= len(buffered[0]) <= frame_count:
+        values, byte_count = buffered
+        try:
+            state = _extend_identity_array_v1(
+                values,
+                first_index=first_index,
+                frame_count=frame_count,
+                raw_rgb24=raw_rgb24,
+                count=0,
+                parent=None,
+                first_header=None,
+            )
+            result = _identity_array_projection_v1(*state, frame_count=frame_count)
+        except (FinalPublicationValidationError, ValueError):
+            pass
+        else:
+            reader.take(byte_count)
+            return result
+
     reader.expect(b"[")
     count = 0
     parent: str | None = None
     first_header: tuple[int, int] | None = None
+    attempted_loaded = -1
     if reader.peek_byte() == ord("]"):
         reader.expect(b"]")
     else:
@@ -5226,23 +5393,91 @@ def _parse_identity_array_v1(
                 raise FinalPublicationValidationError(
                     "encoding input identity array exceeds frame cardinality"
                 )
-            parent, header = _parse_image_identity_v1(
-                reader.json_object_token(),
-                expected_stem=_canonical_frame_stem_v1(first_index + count),
-                expected_parent=parent,
-            )
-            if first_header is None:
-                first_header = header
-            elif header != first_header:
-                raise FinalPublicationValidationError(
-                    "encoding input image shape changes within a sequence"
+            batched = False
+            if reader.loaded != attempted_loaded:
+                attempted_loaded = reader.loaded
+                buffered = _buffered_array_items_v1(reader, object_values=True)
+                if buffered is not None:
+                    values, byte_count = buffered
+                    try:
+                        next_state = _extend_identity_array_v1(
+                            values,
+                            first_index=first_index,
+                            frame_count=frame_count,
+                            raw_rgb24=raw_rgb24,
+                            count=count,
+                            parent=parent,
+                            first_header=first_header,
+                        )
+                    except (FinalPublicationValidationError, ValueError):
+                        pass
+                    else:
+                        reader.take(byte_count)
+                        count, parent, first_header = next_state
+                        batched = True
+            if not batched:
+                value = _parse_bounded_canonical_value(
+                    reader.json_object_token(),
+                    description="raw RGB24 identity" if raw_rgb24 else "image identity",
                 )
-            count += 1
+                count, parent, first_header = _extend_identity_array_v1(
+                    (value,),
+                    first_index=first_index,
+                    frame_count=frame_count,
+                    raw_rgb24=raw_rgb24,
+                    count=count,
+                    parent=parent,
+                    first_header=first_header,
+                )
             separator = reader.take_byte()
             if separator == ord("]"):
                 break
             if separator != ord(","):
                 raise FinalPublicationValidationError("encoding input identity array is malformed")
+
+    return _identity_array_projection_v1(count, parent, first_header, frame_count=frame_count)
+
+
+def _extend_identity_array_v1(
+    values: Iterable[object],
+    *,
+    first_index: int,
+    frame_count: int,
+    raw_rgb24: bool,
+    count: int,
+    parent: str | None,
+    first_header: tuple[int, int] | None,
+) -> tuple[int, str | None, tuple[int, int] | None]:
+    validate_identity = (
+        _validate_raw_rgb24_identity_v1 if raw_rgb24 else _validate_image_identity_v1
+    )
+    for value in values:
+        if count >= frame_count:
+            raise FinalPublicationValidationError(
+                "encoding input identity array exceeds frame cardinality"
+            )
+        parent, header = validate_identity(
+            value,
+            expected_stem=_canonical_frame_stem_v1(first_index + count),
+            expected_parent=parent,
+        )
+        if first_header is None:
+            first_header = header
+        elif header != first_header:
+            raise FinalPublicationValidationError(
+                "encoding input image shape changes within a sequence"
+            )
+        count += 1
+    return count, parent, first_header
+
+
+def _identity_array_projection_v1(
+    count: int,
+    parent: str | None,
+    first_header: tuple[int, int] | None,
+    *,
+    frame_count: int,
+) -> tuple[int, str, tuple[int, int]]:
     if count != frame_count:
         raise FinalPublicationValidationError(
             "encoding input identity cardinality differs from frame names"
@@ -5268,7 +5503,7 @@ def _parse_encoding_input_manifest_stream_v1(
     reader = _EncodingManifestReader(handle, raw_byte_count=raw_byte_count)
     reader.expect(_INPUT_MANIFEST_ALGORITHM_PREFIX)
     algorithm_digit = reader.take(1)
-    if algorithm_digit not in {b"2", b"3"}:
+    if algorithm_digit not in {b"2", b"3", b"4"}:
         raise FinalPublicationValidationError("encoding input algorithm version is invalid")
     reader.expect(b'","fingerprint":"')
     fingerprint_raw = reader.take(64)
@@ -5308,13 +5543,12 @@ def _parse_encoding_input_manifest_stream_v1(
             ) from error
         reader.expect(b',"frames":')
     elif next_key != "frames":
-        raise FinalPublicationValidationError(
-            "encoding input post-frame-names key is invalid"
-        )
+        raise FinalPublicationValidationError("encoding input post-frame-names key is invalid")
     frames_sequence = _parse_identity_array_v1(
         reader,
         first_index=first_index,
         frame_count=frame_count,
+        raw_rgb24=algorithm_digit == b"4",
     )
     reader.expect(b',"left":')
     left_sequence = _parse_identity_array_v1(
@@ -5341,7 +5575,7 @@ def _parse_encoding_input_manifest_stream_v1(
     streamed_output: StreamedVrOutputEvidenceV1 | None = None
     if schema_byte == b"1":
         reader.expect(b"}")
-    elif schema_byte == b"2":
+    elif schema_byte in {b"2", b"3"}:
         reader.expect(b',"streamed_output":')
         try:
             streamed_output = StreamedVrOutputEvidenceV1.from_object(
@@ -5351,24 +5585,22 @@ def _parse_encoding_input_manifest_stream_v1(
                 )
             )
         except (TypeError, ValueError) as error:
-            raise FinalPublicationValidationError(
-                "streamed output evidence is invalid"
-            ) from error
+            raise FinalPublicationValidationError("streamed output evidence is invalid") from error
         reader.expect(b"}")
     else:
         raise FinalPublicationValidationError("encoding input schema version is invalid")
     if algorithm_digit == b"2" and (
-        schema_byte != b"1"
-        or streamed_invocation is not None
-        or streamed_output is not None
+        schema_byte != b"1" or streamed_invocation is not None or streamed_output is not None
     ):
         raise FinalPublicationValidationError("encoding input v2 schema is inconsistent")
     if algorithm_digit == b"3" and (
-        schema_byte != b"2"
-        or streamed_invocation is None
-        or streamed_output is None
+        schema_byte != b"2" or streamed_invocation is None or streamed_output is None
     ):
         raise FinalPublicationValidationError("encoding input v3 schema is incomplete")
+    if algorithm_digit == b"4" and (
+        schema_byte != b"3" or streamed_invocation is None or streamed_output is None
+    ):
+        raise FinalPublicationValidationError("encoding input v4 schema is incomplete")
     if mode == "direct_stereo":
         if frames_sequence is not None or left_sequence is None or right_sequence is None:
             raise FinalPublicationValidationError(
@@ -5379,9 +5611,9 @@ def _parse_encoding_input_manifest_stream_v1(
             "assembled encoding input manifest has the wrong array shape"
         )
     if streamed_invocation is not None:
-        assert frames_sequence is not None
         if (
             mode != "assembled_vr"
+            or frames_sequence is None
             or streamed_invocation.frame_count != frame_count
             or streamed_invocation.first_index != first_index
             or streamed_invocation.expected_shape != frames_sequence[2]
@@ -5391,13 +5623,26 @@ def _parse_encoding_input_manifest_stream_v1(
             )
         assert streamed_output is not None
         expected_sibling = (
-            f".depth-surge-final-v4-"
-            f"{streamed_invocation.publication_generation}.tmp.mp4"
+            f".depth-surge-final-v4-" f"{streamed_invocation.publication_generation}.tmp.mp4"
         )
         if streamed_output.sibling_relative_path != expected_sibling:
             raise FinalPublicationValidationError(
                 "streamed output sibling differs from its publication generation"
             )
+        transport = _normalized_image_transport_v1(
+            streamed_invocation.resolved_arguments_template, mode
+        )
+        if algorithm_digit == b"4":
+            if (
+                transport != "rawvideo"
+                or validate_raw_rgb24_input_v1(streamed_invocation.resolved_arguments_template)
+                != streamed_invocation.expected_shape
+            ):
+                raise FinalPublicationValidationError(
+                    "raw RGB24 invocation shape or transport differs"
+                )
+        elif transport != "image2pipe":
+            raise FinalPublicationValidationError("PNG invocation requires image2pipe transport")
     if raw_byte_count is not None and reader.consumed != raw_byte_count:
         raise FinalPublicationValidationError(
             "encoding input raw byte count includes trailing bytes"
@@ -5418,6 +5663,7 @@ def _parse_encoding_input_manifest_stream_v1(
         frames_parent=(PurePosixPath(frames_sequence[1]) if frames_sequence is not None else None),
         streamed_invocation=streamed_invocation,
         streamed_output=streamed_output,
+        raw_pixel_format="rgb24" if algorithm_digit == b"4" else None,
     )
 
 
@@ -5744,9 +5990,24 @@ def _normalized_option_values_v1(
 def _normalized_image_transport_v1(
     arguments: tuple[str, ...],
     mode: Literal["direct_stereo", "assembled_vr"],
-) -> Literal["image2", "image2pipe"]:
+) -> Literal["image2", "image2pipe", "rawvideo"]:
     formats = _normalized_option_values_v1(arguments, "-f")
     input_codecs = _normalized_option_values_v1(arguments, "-vcodec")
+    raw_options = _normalized_option_values_v1(arguments, "-pixel_format") + (
+        _normalized_option_values_v1(arguments, "-video_size")
+    )
+    if formats == ("rawvideo",):
+        if mode != "assembled_vr":
+            raise FinalPublicationValidationError("raw RGB24 transport requires assembled VR")
+        try:
+            validate_raw_rgb24_input_v1(arguments)
+        except ValueError as error:
+            raise FinalPublicationValidationError(
+                "raw RGB24 input declaration is invalid"
+            ) from error
+        return "rawvideo"
+    if raw_options:
+        raise FinalPublicationValidationError("raw input options cannot bind a PNG transport")
     if not formats and not input_codecs:
         return "image2"
     if mode != "assembled_vr":
@@ -5794,16 +6055,20 @@ def _final_container_expectation_from_intent_v1(
             "normalized argv frame limit differs from the input manifest"
         )
     transport = _normalized_image_transport_v1(arguments, input_projection.mode)
+    if (transport == "rawvideo") != (input_projection.raw_pixel_format == "rgb24"):
+        raise FinalPublicationValidationError("encoding transport differs from raw frame evidence")
+    if transport == "rawvideo" and validate_raw_rgb24_input_v1(arguments) != (width, height):
+        raise FinalPublicationValidationError("raw RGB24 dimensions differ from durable settings")
     start_values = _normalized_option_values_v1(arguments, "-start_number")
     expected_start_count = (
-        0 if transport == "image2pipe" else (1 if input_projection.mode == "assembled_vr" else 2)
+        0 if transport != "image2" else (1 if input_projection.mode == "assembled_vr" else 2)
     )
     if start_values != (str(input_projection.first_index),) * expected_start_count:
         raise FinalPublicationValidationError(
             "normalized argv start number differs from the input manifest"
         )
     rate_values = _normalized_option_values_v1(arguments, "-framerate")
-    expected_rate_count = 1 if transport == "image2pipe" else expected_start_count
+    expected_rate_count = 1 if transport != "image2" else expected_start_count
     if len(rate_values) != expected_rate_count or len(set(rate_values)) != 1:
         raise FinalPublicationValidationError(
             "normalized argv frame rate is incomplete or inconsistent"
@@ -6326,8 +6591,7 @@ class FinalPublicationTransactionV4:
             reservation_phase = recovery.phase
             if (
                 streamed_output is not None
-                and streamed_output.reservation_index_fingerprint
-                != reservation.index.fingerprint
+                and streamed_output.reservation_index_fingerprint != reservation.index.fingerprint
             ):
                 raise FinalPublicationValidationError(
                     "streamed output differs from the final reservation"

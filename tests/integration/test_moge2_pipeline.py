@@ -59,7 +59,7 @@ pytestmark = pytest.mark.integration
 
 _REAL_RETIRE_FINAL_ENCODING_RESERVATION = VideoEncoder.retire_final_encoding_reservation
 _REAL_CREATE_VIDEO_FROM_STEREO_SOURCE = VideoEncoder.create_video_from_stereo_source
-_REAL_STREAMED_QUALITY_ELIGIBILITY = ProcessingOrchestrator._streamed_quality_settings_eligible
+_REAL_STREAMED_STEREO_ELIGIBILITY = ProcessingOrchestrator._streamed_stereo_settings_eligible
 
 _FRAME_COUNT = 3
 _FRAME_SHAPE = (6, 8)
@@ -915,9 +915,11 @@ def test_no_retention_failure_keeps_completed_stage_and_reports_required_inferen
     assert _output_tree_snapshot(output_dir) == output_before
 
 
-def test_relative_quality_image2pipe_matches_retained_direct_encode(
+@pytest.mark.parametrize("render_mode", ["fast", "quality"])
+def test_relative_rawvideo_matches_retained_direct_encode(
     pipeline_harness: _PipelineHarness,
     monkeypatch: pytest.MonkeyPatch,
+    render_mode: str,
 ) -> None:
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         pytest.skip("FFmpeg and ffprobe are required")
@@ -932,7 +934,7 @@ def test_relative_quality_image2pipe_matches_retained_direct_encode(
         "direct_vr_encode": True,
         "per_eye_height": 48,
         "per_eye_width": 64,
-        "stereo_render_mode": "quality",
+        "stereo_render_mode": render_mode,
         "upscale_model": "none",
         "video_encoder": "libx264",
         "vr_output_height": 48,
@@ -957,9 +959,9 @@ def test_relative_quality_image2pipe_matches_retained_direct_encode(
             left = cv2.imread(str(source.left_parent / name))
             right = cv2.imread(str(source.right_parent / name))
             assert left is not None and right is not None
-            encoded, payload = cv2.imencode(".png", np.hstack((left, right)))
-            assert encoded
-            expected_payload_hashes.append(hashlib.sha256(payload.tobytes()).hexdigest())
+            assembled = np.hstack((left, right))
+            payload = np.ascontiguousarray(assembled[:, :, ::-1]).tobytes()
+            expected_payload_hashes.append(hashlib.sha256(payload).hexdigest())
         return _REAL_CREATE_VIDEO_FROM_STEREO_SOURCE(
             encoder,
             source,
@@ -972,7 +974,7 @@ def test_relative_quality_image2pipe_matches_retained_direct_encode(
 
     monkeypatch.setattr(
         ProcessingOrchestrator,
-        "_streamed_quality_settings_eligible",
+        "_streamed_stereo_settings_eligible",
         staticmethod(lambda *_args, **_kwargs: False),
     )
     monkeypatch.setattr(
@@ -983,15 +985,15 @@ def test_relative_quality_image2pipe_matches_retained_direct_encode(
     file_backed_started = time.perf_counter()
     file_backed = pipeline_harness.run(
         "relative",
-        output_dir=pipeline_harness.root / "quality-file-backed",
+        output_dir=pipeline_harness.root / f"{render_mode}-file-backed",
         keep_intermediates=False,
         **shared,
     )
     file_backed_seconds = time.perf_counter() - file_backed_started
     monkeypatch.setattr(
         ProcessingOrchestrator,
-        "_streamed_quality_settings_eligible",
-        staticmethod(_REAL_STREAMED_QUALITY_ELIGIBILITY),
+        "_streamed_stereo_settings_eligible",
+        staticmethod(_REAL_STREAMED_STEREO_ELIGIBILITY),
     )
     monkeypatch.setattr(
         VideoEncoder,
@@ -1001,7 +1003,7 @@ def test_relative_quality_image2pipe_matches_retained_direct_encode(
     streamed_started = time.perf_counter()
     streamed = pipeline_harness.run(
         "relative",
-        output_dir=pipeline_harness.root / "quality-streamed",
+        output_dir=pipeline_harness.root / f"{render_mode}-streamed",
         keep_intermediates=False,
         **shared,
     )
@@ -1011,7 +1013,17 @@ def test_relative_quality_image2pipe_matches_retained_direct_encode(
     streamed_manifest = json.loads(
         (streamed.output_dir / "encoding_input_manifest.json").read_text(encoding="utf-8")
     )
-    assert [frame["sha256"] for frame in streamed_manifest["frames"]] == (expected_payload_hashes)
+    assert streamed_manifest["algorithm_version"] == "encoding-input-sequence-v4"
+    assert streamed_manifest["schema_version"] == 3
+    assert streamed_manifest["frames"] == [
+        {
+            "sha256": digest,
+            "byte_count": 3 * 128 * 48,
+            "raw_frame": {"width": 128, "height": 48, "pixel_format": "rgb24"},
+            "relative_path": f"streamed_vr_frames/frame_{index:06d}.rgb",
+        }
+        for index, digest in enumerate(expected_payload_hashes, start=1)
+    ]
     assert not (streamed.output_dir / "04_left_frames").exists()
     assert not (streamed.output_dir / "04_right_frames").exists()
     assert not (streamed.output_dir / "06_left_cropped").exists()
@@ -1028,7 +1040,7 @@ def test_relative_quality_image2pipe_matches_retained_direct_encode(
         )
     )
     print(
-        "quality-image2pipe-benchmark "
+        f"{render_mode}-rawvideo-benchmark "
         f"file_backed_seconds={file_backed_seconds:.6f} "
         f"streamed_seconds={streamed_seconds:.6f} "
         f"file_backed_fps={_FRAME_COUNT / file_backed_seconds:.3f} "

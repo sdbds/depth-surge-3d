@@ -7,6 +7,7 @@ import gc
 import json
 import hashlib
 import threading
+import time
 import weakref
 from pathlib import Path
 from unittest.mock import patch
@@ -301,9 +302,11 @@ def test_manifest_pipeline_supports_quality_with_committed_diagnostics(tmp_path:
     )
 
 
-def test_quality_manifest_streams_ordered_pixels_without_rgb_frame_files(
+@pytest.mark.parametrize("render_mode", ["fast", "quality"])
+def test_relative_manifest_streams_ordered_pixels_without_rgb_frame_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    render_mode: str,
 ) -> None:
     baseline_root = tmp_path / "baseline"
     baseline_manifest, baseline_directories = _make_manifest_inputs(
@@ -312,7 +315,7 @@ def test_quality_manifest_streams_ordered_pixels_without_rgb_frame_files(
     )
     settings = _settings(
         stereo_strength=2.0,
-        stereo_render_mode="quality",
+        stereo_render_mode=render_mode,
         occlusion_fill_max_px=8,
         keep_intermediates=True,
     )
@@ -345,13 +348,13 @@ def test_quality_manifest_streams_ordered_pixels_without_rgb_frame_files(
 
         @staticmethod
         def send_preview_frame(*_args, **_kwargs) -> None:
-            raise AssertionError("transient Quality path exposed a nonexistent RGB file")
+            raise AssertionError("transient stereo path exposed a nonexistent RGB file")
 
     monkeypatch.setattr(
         stereo_generator,
         "publish_quality_frame",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("transient Quality path published a per-frame transaction")
+            AssertionError("transient stereo path published a per-frame transaction")
         ),
     )
     generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
@@ -360,7 +363,7 @@ def test_quality_manifest_streams_ordered_pixels_without_rgb_frame_files(
         directories,
         _settings(
             stereo_strength=2.0,
-            stereo_render_mode="quality",
+            stereo_render_mode=render_mode,
             occlusion_fill_max_px=8,
             keep_intermediates=False,
         ),
@@ -383,14 +386,14 @@ def test_quality_manifest_streams_ordered_pixels_without_rgb_frame_files(
     assert not list(directories["right_frames"].glob("*.png"))
     diagnostics = streamed_root / "04_stereo_diagnostics"
     assert not (diagnostics / "frames").exists()
-    assert (diagnostics / "quality_input_manifest.json").is_file()
+    assert (diagnostics / "quality_input_manifest.json").is_file() == (render_mode == "quality")
     assert len((diagnostics / "stereo_coverage_frames.jsonl").read_bytes().splitlines()) == 2
-    assert (
-        json.loads((diagnostics / "metadata.json").read_text(encoding="ascii"))["status"]
-        == "complete"
-    )
+    metadata = json.loads((diagnostics / "metadata.json").read_text(encoding="ascii"))
+    assert metadata["status"] == "complete"
+    assert metadata["render_mode"] == render_mode
     assert generator.last_pipeline_stats is not None
     assert generator.last_pipeline_stats.writer_thread_count == 1
+    assert generator.last_pipeline_stats.png_encoder_thread_count == 0
 
 
 def test_transient_quality_capacity_charges_declared_consumer_memory(
@@ -421,6 +424,42 @@ def test_transient_quality_capacity_charges_declared_consumer_memory(
             stereo_strength=2.0,
             stereo_render_mode="quality",
             occlusion_fill_max_px=8,
+            keep_intermediates=False,
+        ),
+        frame_consumer=lambda _name, _left, _right: None,
+        frame_consumer_memory_bytes=consumer_bytes,
+    )
+
+    assert retained_charges == [consumer_bytes]
+
+
+def test_transient_fast_capacity_charges_declared_consumer_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, directories = _make_manifest_inputs(tmp_path, count=2)
+    real_select = stereo_generator.select_fast_pipeline_capacity
+    retained_charges: list[int] = []
+
+    def record_capacity_selection(**kwargs):
+        retained_charges.append(kwargs.get("retained_bytes", 0))
+        return real_select(**kwargs)
+
+    monkeypatch.setattr(
+        stereo_generator,
+        "select_fast_pipeline_capacity",
+        record_capacity_selection,
+    )
+    consumer_bytes = 7 * 1024 * 1024
+
+    assert StereoPairGenerator(
+        renderer=StereoRenderer(device="cpu")
+    ).create_stereo_pairs_from_manifest(
+        manifest,
+        directories,
+        _settings(
+            stereo_strength=2.0,
+            stereo_render_mode="fast",
             keep_intermediates=False,
         ),
         frame_consumer=lambda _name, _left, _right: None,
@@ -611,6 +650,97 @@ def test_quality_manifest_reuses_exact_input_across_overlapped_pipeline(
             (directories[side] / f"frame_{index:06d}.png").read_bytes() for index in range(1, 7)
         ]
         assert len(set(payloads)) == 1
+
+
+def test_quality_file_pipeline_parallelizes_png_encoding_beyond_writers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    manifest, directories = _make_manifest_inputs(tmp_path, count=4)
+    real_encode = diagnostic_transaction._png_buffer
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def observe_encode(values):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            time.sleep(0.02)
+            return real_encode(values)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(diagnostic_transaction, "_png_buffer", observe_encode)
+    generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+
+    assert generator.create_stereo_pairs_from_manifest(
+        manifest,
+        directories,
+        _settings(
+            stereo_render_mode="quality",
+            occlusion_fill_max_px=8,
+            keep_intermediates=True,
+            stereo_io_workers=8,
+        ),
+    )
+
+    stats = generator.last_pipeline_stats
+    assert stats is not None
+    assert stats.png_encoder_thread_count == 4
+    assert stats.actual_thread_count == (
+        stats.feeder_thread_count
+        + stats.decoder_thread_count
+        + stats.writer_thread_count
+        + stats.png_encoder_thread_count
+    )
+    assert stats.calculated_thread_bytes == (
+        (stats.actual_thread_count - stats.png_encoder_thread_count) * 2 * 1024 * 1024
+        + stats.png_encoder_thread_count * 4 * 1024 * 1024
+    )
+    assert peak > stats.writer_thread_count
+    assert not [
+        thread.name for thread in threading.enumerate() if thread.name.startswith("quality-png")
+    ]
+
+
+def test_quality_png_encoder_failure_joins_pool_without_publishing_a_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction
+
+    manifest, directories = _make_manifest_inputs(tmp_path, count=2)
+
+    def fail_encode(_values):
+        raise OSError("injected pipeline PNG encode failure")
+
+    monkeypatch.setattr(diagnostic_transaction, "_png_buffer", fail_encode)
+    generator = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+
+    with pytest.raises(OSError, match="injected pipeline PNG encode failure"):
+        generator.create_stereo_pairs_from_manifest(
+            manifest,
+            directories,
+            _settings(
+                stereo_render_mode="quality",
+                occlusion_fill_max_px=8,
+                keep_intermediates=True,
+                stereo_io_workers=8,
+            ),
+        )
+
+    assert not list(directories["left_frames"].glob("*.png"))
+    assert not list(directories["right_frames"].glob("*.png"))
+    assert not list((tmp_path / "04_stereo_diagnostics" / "frames").rglob("manifest.json"))
+    assert not [
+        thread.name for thread in threading.enumerate() if thread.name.startswith("quality-png")
+    ]
 
 
 def test_quality_reuse_revalidates_each_duplicate_input_after_mutation(

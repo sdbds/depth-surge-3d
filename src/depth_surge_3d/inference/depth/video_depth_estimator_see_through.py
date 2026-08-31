@@ -171,6 +171,7 @@ class SeeThroughDepthEstimator:
 
     model_type = "see_through"
     max_batch_size = 1
+    exact_input_batch_reuse = True
 
     def __init__(
         self,

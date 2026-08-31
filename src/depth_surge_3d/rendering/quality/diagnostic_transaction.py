@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Executor, FIRST_EXCEPTION, Future, wait
 import hashlib
 import io
 import json
@@ -54,7 +55,21 @@ from .types import CompactStereoRenderResult, DenseHistogramPairs
 FaultHook = Callable[[str], None]
 _HEX_64 = frozenset("0123456789abcdef")
 _U64_MAX = 2**64 - 1
+_CANONICAL_UINT_TOKEN = re.compile(rb"[0-9]+")
 _QUALITY_RECORD_ARENA_BYTES = 64 * 1024 * 1024
+
+
+def _iter_dense_histogram_pairs(bins: np.ndarray) -> Iterator[tuple[int, int]]:
+    if type(bins) is not np.ndarray:
+        for bucket in range(int(bins.size)):
+            count = int(bins[bucket])
+            if count:
+                yield bucket, count
+        return
+    for start in range(0, int(bins.size), 4096):
+        block = bins[start : start + 4096]
+        for index in np.flatnonzero(block):
+            yield start + int(index), int(block[index])
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -66,10 +81,7 @@ def canonical_json_bytes(value: object) -> bytes:
         if isinstance(current, DenseHistogramPairs):
             output.write(b"[")
             first = True
-            for bucket in range(int(current.bins.size)):
-                count = int(current.bins[bucket])
-                if count == 0:
-                    continue
+            for bucket, count in _iter_dense_histogram_pairs(current.bins):
                 if not first:
                     output.write(b",")
                 output.write(f"[{bucket},{count}]".encode("ascii"))
@@ -511,6 +523,51 @@ def _png_buffer(values: np.ndarray) -> np.ndarray:
     return payload
 
 
+def _encode_png_payloads(  # noqa: C901
+    publication: PreparedQualityFramePublication,
+    payload_sources: tuple[tuple[str, Path, np.ndarray | bytes | None, bool], ...],
+    executor: Executor,
+) -> dict[str, np.ndarray]:
+    """Encode all enabled rasters before the transaction owns any filesystem state."""
+
+    futures: dict[str, Future[np.ndarray | None]] = {}
+    try:
+        for name, _path, source, encode_png in payload_sources:
+            if source is None or not encode_png:
+                continue
+            if publication.png_payloads is None:
+                futures[name] = executor.submit(_png_buffer, source)
+            else:
+                futures[name] = executor.submit(publication.png_payloads.payload, name)
+    except BaseException:
+        for future in futures.values():
+            future.cancel()
+        wait(futures.values())
+        raise
+
+    done, pending = wait(futures.values(), return_when=FIRST_EXCEPTION)
+    failure: BaseException | None = None
+    for future in futures.values():
+        if future in done and not future.cancelled():
+            failure = future.exception()
+            if failure is not None:
+                break
+    if failure is not None:
+        for future in pending:
+            future.cancel()
+        wait(futures.values())
+        raise failure
+
+    wait(futures.values())
+    payloads: dict[str, np.ndarray] = {}
+    for name, future in futures.items():
+        payload = future.result()
+        if payload is None:
+            raise RuntimeError("enabled PNG payload is absent from its shared cache")
+        payloads[name] = payload
+    return payloads
+
+
 def _identity(root: Path, path: Path, raw: bytes | np.ndarray) -> dict[str, Any]:
     view = memoryview(raw).cast("B")
     return {
@@ -555,10 +612,11 @@ def _call_fault(fault: FaultHook | None, stage: str) -> None:
         fault(stage)
 
 
-def publish_quality_frame(
+def publish_quality_frame(  # noqa: C901
     publication: QualityFramePublication | PreparedQualityFramePublication,
     *,
     fault: FaultHook | None = None,
+    png_executor: Executor | None = None,
 ) -> dict[str, Any]:
     """Publish every payload first and the authenticated manifest last."""
 
@@ -625,12 +683,19 @@ def publish_quality_frame(
     manifest["fingerprint"] = self_fingerprint(manifest)
     manifest_path = frame_dir / "manifest.json"
     temporaries: dict[Path, OwnedSiblingTemporary] = {}
+    encoded_pngs = (
+        _encode_png_payloads(publication, payload_sources, png_executor)
+        if png_executor is not None
+        else None
+    )
     try:
         for name, path, source, encode_png in payload_sources:
             if source is None:
                 payload_identities[name] = None
                 continue
-            if encode_png and publication.png_payloads is not None:
+            if encode_png and encoded_pngs is not None:
+                raw = encoded_pngs.pop(name)
+            elif encode_png and publication.png_payloads is not None:
                 raw = publication.png_payloads.payload(name)
                 if raw is None:
                     raise RuntimeError("enabled PNG payload is absent from its shared cache")
@@ -771,7 +836,7 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _parse_canonical_object(raw: bytes) -> dict[str, Any]:
+def _decode_canonical_json_object(raw: bytes) -> dict[str, Any]:
     try:
         value = json.loads(
             raw.decode("ascii"),
@@ -782,43 +847,45 @@ def _parse_canonical_object(raw: bytes) -> dict[str, Any]:
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("diagnostics JSON is not canonical ASCII JSON") from error
-    if not isinstance(value, dict) or canonical_json_bytes(value) != raw:
+    # Decoded JSON contains no NumPy scalars or streamed histogram objects.
+    if (
+        not isinstance(value, dict)
+        or json.dumps(
+            value,
+            sort_keys=True,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("ascii")
+        != raw
+    ):
         raise ValueError("diagnostics JSON bytes are not canonical")
     return value
+
+
+def _parse_canonical_object(raw: bytes) -> dict[str, Any]:
+    return _decode_canonical_json_object(raw)
 
 
 def _parse_canonical_small_object(raw: bytes) -> dict[str, Any]:
     """Decode canonical JSON after variable histogram arrays were removed."""
 
-    try:
-        value = json.loads(
-            raw.decode("ascii"),
-            object_pairs_hook=_reject_duplicate_pairs,
-            parse_constant=lambda value: (_ for _ in ()).throw(
-                ValueError(f"invalid JSON constant: {value}")
-            ),
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("diagnostics JSON is not canonical ASCII JSON") from error
-    if not isinstance(value, dict) or canonical_json_bytes(value) != raw:
-        raise ValueError("diagnostics JSON bytes are not canonical")
-    return value
+    return _decode_canonical_json_object(raw)
 
 
 def _parse_canonical_uint(raw: bytearray | bytes, cursor: int) -> tuple[int, int]:
-    start = cursor
-    length = len(raw)
-    while cursor < length and 48 <= raw[cursor] <= 57:
-        cursor += 1
-    if cursor == start:
+    token = _CANONICAL_UINT_TOKEN.match(raw, cursor)
+    if token is None:
         raise ValueError("diagnostic histogram integer is missing")
-    token = raw[start:cursor]
-    if len(token) > 1 and token[0] == 48:
+    end = token.end()
+    if end - cursor > 1 and raw[cursor] == 48:
         raise ValueError("diagnostic histogram integer is noncanonical")
-    value = int(token)
-    if value > np.iinfo(np.uint64).max:
+    if end - cursor > 20:
         raise ValueError("diagnostic histogram integer exceeds uint64")
-    return value, cursor
+    value = int(token.group())
+    if value > _U64_MAX:
+        raise ValueError("diagnostic histogram integer exceeds uint64")
+    return value, end
 
 
 @dataclass(frozen=True, slots=True)
@@ -2082,10 +2149,8 @@ def _streamable_diagnostics_value(value: object) -> object:
         bins = value.bins
 
         def replay():
-            for bucket in range(int(bins.size)):
-                count = int(bins[bucket])
-                if count:
-                    yield [bucket, count]
+            for bucket, count in _iter_dense_histogram_pairs(bins):
+                yield [bucket, count]
 
         return ReplayableJsonArray(replay)
     if isinstance(value, dict):
@@ -3475,8 +3540,6 @@ class TransientDiagnosticsSpool:
                     fault=fault,
                     label="metric_clamp_summary",
                 )
-        if before_complete_publish is not None:
-            before_complete_publish()
         metadata = _streaming_diagnostics_metadata(
             self.context,
             status="complete",
@@ -3489,6 +3552,7 @@ class TransientDiagnosticsSpool:
             root / "metadata.json",
             fault=fault,
             label="root_metadata",
+            before_replace=before_complete_publish,
         )
         return StreamingDiagnosticsCompletion(
             metadata=metadata,
@@ -3561,8 +3625,6 @@ def complete_streaming_diagnostics_stage(
                 fault=fault,
                 label="metric_clamp_summary",
             )
-    if before_complete_publish is not None:
-        before_complete_publish()
     metadata = _streaming_diagnostics_metadata(
         context,
         status="complete",
@@ -3575,6 +3637,7 @@ def complete_streaming_diagnostics_stage(
         root / "metadata.json",
         fault=fault,
         label="root_metadata",
+        before_replace=before_complete_publish,
     )
     return StreamingDiagnosticsCompletion(
         metadata=metadata,

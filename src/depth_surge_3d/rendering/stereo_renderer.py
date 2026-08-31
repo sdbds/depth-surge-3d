@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 import gc
 import math
 import time
@@ -29,6 +32,9 @@ from .stereo_geometry import (
 GPU_TEMP_BUDGET = 256 * 1024 * 1024
 SPLAT_BYTES_PER_PIXEL = 1280
 TRITON_SPLAT_BYTES_PER_PIXEL = 1088
+_FAST_CUDA_BUDGET_CAP_BYTES = 512 * 1024 * 1024
+_FAST_CUDA_FREE_BUDGET_DIVISOR = 8
+_FAST_CUDA_TARGET_MAX_BANDS_PER_EYE = 17
 
 
 @dataclass(frozen=True)
@@ -96,10 +102,55 @@ class StereoRenderProfile:
 
 
 @dataclass(frozen=True)
+class _FastRelativeGeometry:
+    """Owned raster fields for the validated relative-offset path."""
+
+    near_score: np.ndarray
+    source_valid: np.ndarray
+
+
+@dataclass(frozen=True)
 class _FastDeviceFrame:
     source: torch.Tensor
     near_score: torch.Tensor
     source_valid: torch.Tensor
+
+
+@dataclass
+class _FastRelativeOffsets:
+    """Keep host inputs for fallback, never resident device allocations."""
+
+    near_score: torch.Tensor
+    settings: StereoRenderSettings
+    build_seconds: float = field(default=0.0, init=False)
+    _host_offsets: tuple[np.ndarray, np.ndarray] | None = field(default=None, init=False)
+
+    def host_offsets(self) -> tuple[np.ndarray, np.ndarray]:
+        if self._host_offsets is None:
+            started = time.perf_counter()
+            self._host_offsets = calculate_eye_sample_offsets(self.near_score, self.settings)
+            self.build_seconds += time.perf_counter() - started
+        return self._host_offsets
+
+    def device_offsets(
+        self, near_score: torch.Tensor, *, profile: bool
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        from .fast_offsets_triton import triton_relative_offsets_prevalidated
+
+        if profile:
+            torch.cuda.synchronize(near_score.device)
+        started = time.perf_counter()
+        try:
+            result = triton_relative_offsets_prevalidated(
+                near_score,
+                stereo_strength=self.settings.stereo_strength,
+                convergence=self.settings.convergence,
+            )
+            if profile:
+                torch.cuda.synchronize(near_score.device)
+            return result
+        finally:
+            self.build_seconds += time.perf_counter() - started
 
 
 def calculate_band_height(
@@ -117,6 +168,41 @@ def calculate_band_height(
         raise ValueError("Temporary GPU budget and bytes per pixel must be positive")
     rows = temporary_budget_bytes // (render_width * bytes_per_pixel)
     return min(render_height, max(1, rows))
+
+
+def _fast_temporary_budget_bytes(
+    renderer: StereoRenderer,
+    *,
+    render_width: int,
+    render_height: int,
+    bytes_per_pixel: int,
+) -> int:
+    """Grow the default CUDA budget only enough to bound band dispatches."""
+
+    configured = int(renderer.temporary_budget_bytes)
+    if renderer.device.type != "cuda" or not getattr(
+        renderer, "_temporary_budget_is_default", False
+    ):
+        return configured
+    target_rows = max(
+        1,
+        math.ceil(render_height / _FAST_CUDA_TARGET_MAX_BANDS_PER_EYE),
+    )
+    target_budget = min(
+        _FAST_CUDA_BUDGET_CAP_BYTES,
+        render_width * target_rows * bytes_per_pixel,
+    )
+    if target_budget <= configured:
+        return configured
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(renderer.device)
+    except (AssertionError, RuntimeError):
+        return configured
+    adaptive = min(
+        target_budget,
+        int(free_bytes) // _FAST_CUDA_FREE_BUDGET_DIVISOR,
+    )
+    return max(configured, adaptive)
 
 
 def _triton_splat_available(device: torch.device) -> bool:
@@ -197,6 +283,12 @@ def _nearest_valid_indexes(
     height, width = valid.shape
     columns = torch.arange(width, dtype=torch.int32, device=valid.device).view(1, width)
     columns = columns.expand(height, width)
+    if valid.device.type == "cuda":
+        from .fast_scan_triton import triton_nearest_valid_indexes
+
+        boundaries = triton_nearest_valid_indexes(valid)
+        if boundaries is not None:
+            return columns, boundaries[0], boundaries[1]
     left_seed = torch.where(valid, columns, -1)
     left_index = torch.cummax(left_seed, dim=1).values
     del left_seed
@@ -258,6 +350,20 @@ def _fill_background_band_state(
         raise ValueError("Maximum gap width must be non-negative")
 
     columns, left_index, right_index = _nearest_valid_indexes(valid)
+    if image.device.type == "cuda":
+        from .fast_fill_triton import triton_background_fill
+
+        fused = triton_background_fill(
+            image,
+            valid,
+            projected,
+            left_index,
+            right_index,
+            max_gap_samples=max_gap_samples,
+        )
+        if fused is not None:
+            del columns, left_index, right_index
+            return fused
     selected, has_candidate = _select_fill_indexes(
         projected,
         columns,
@@ -341,6 +447,56 @@ def _convert_image_band(image: torch.Tensor, dtype: np.dtype) -> np.ndarray:
     return values.astype(dtype, copy=False)
 
 
+def _download_fast_cuda_band(
+    image: torch.Tensor,
+    lane_valid: torch.Tensor,
+    lane_weights: torch.Tensor,
+    repair: torch.Tensor,
+    lane_counts: torch.Tensor,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Download uint8 RGB and native diagnostics with one bounded CUDA copy."""
+
+    values = torch.round(image.detach())
+    values.clamp_(0, 255)
+    rgb = values.to(dtype=torch.uint8)
+    missing = _pack_missing_lane_masks(lane_valid, lane_weights)
+    payload = torch.cat(
+        (
+            lane_counts.view(torch.uint8),
+            missing.view(torch.uint8).reshape(-1),
+            rgb.reshape(-1),
+            repair.reshape(-1),
+        )
+    )
+    return _download_fast_cuda_payload(
+        payload,
+        tuple(image.shape),
+        tuple(repair.shape),
+        count_bytes=int(lane_counts.numel() * lane_counts.element_size()),
+    )
+
+
+def _download_fast_cuda_payload(
+    payload: torch.Tensor,
+    image_shape: tuple[int, ...],
+    repair_shape: tuple[int, ...],
+    *,
+    count_bytes: int = 24,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Expose aligned views of either producer's identical bounded packet."""
+
+    host = payload.cpu().numpy()
+    pixel_count = math.prod(repair_shape)
+    mask_end = count_bytes + 2 * pixel_count
+    rgb_end = mask_end + 3 * pixel_count
+    return (
+        host[mask_end:rgb_end].reshape(image_shape),
+        host[count_bytes:mask_end].view(np.uint16).reshape(repair_shape),
+        host[rgb_end:].reshape(repair_shape),
+        host[:count_bytes].view(np.int64),
+    )
+
+
 def _update_hole_histograms(
     lane_valid: np.ndarray,
     lane_histogram: np.ndarray,
@@ -393,6 +549,113 @@ def _native_lane_analyzer():
     return native_kd._require_native()
 
 
+def _packed_lane_coverage_lut() -> np.ndarray:
+    values = np.arange(1 << HORIZONTAL_SUBPIXELS, dtype=np.uint16)
+    bits = np.unpackbits(values.view(np.uint8).reshape(-1, 2), axis=1)
+    return np.ascontiguousarray(
+        HORIZONTAL_SUBPIXELS - np.sum(bits, axis=1, dtype=np.uint8),
+        dtype=np.uint8,
+    )
+
+
+_PACKED_LANE_COVERAGE = _packed_lane_coverage_lut()
+
+
+class _FastLaneAnalysisQueue:
+    """Overlap exact native hole statistics with subsequent CUDA bands."""
+
+    _MAX_PENDING = 2
+    _DEFAULT_ASYNC_THRESHOLD_SECONDS = 0.002
+    _DEFAULT_DEFERRED_ASYNC_THRESHOLD_SECONDS = 0.0005
+
+    def __init__(
+        self,
+        native_extension,
+        *,
+        async_threshold_seconds: float | None = None,
+    ) -> None:
+        self._native_extension = native_extension
+        self._async_threshold_seconds = (
+            None if async_threshold_seconds is None else float(async_threshold_seconds)
+        )
+        self._executor: ThreadPoolExecutor | None = None
+        self._pending: deque[Future[object]] = deque()
+        self._closed = False
+
+    def __enter__(self) -> _FastLaneAnalysisQueue:
+        return self
+
+    def __exit__(self, exception_type, _exception, _traceback) -> Literal[False]:
+        failure: BaseException | None = None
+        while self._pending:
+            try:
+                self._pending.popleft().result()
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+        self._closed = True
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=exception_type is not None)
+        if exception_type is None and failure is not None:
+            raise failure
+        return False
+
+    def submit(
+        self,
+        packed_missing: np.ndarray,
+        lane_histogram: np.ndarray,
+        span_histogram: np.ndarray,
+        coverage_output: np.ndarray,
+        *,
+        defer_coverage: bool = False,
+    ) -> None:
+        """Deferred coverage is readable only after joining the submitted work."""
+
+        if self._closed:
+            raise RuntimeError("Fast lane-analysis queue is closed")
+        if self._executor is None:
+            threshold = self._async_threshold_seconds
+            if threshold is None:
+                threshold = (
+                    self._DEFAULT_DEFERRED_ASYNC_THRESHOLD_SECONDS
+                    if defer_coverage
+                    else self._DEFAULT_ASYNC_THRESHOLD_SECONDS
+                )
+            started = time.perf_counter()
+            self._native_extension.accumulate_packed_lane_hole_run_histograms_into(
+                packed_missing,
+                lane_histogram,
+                span_histogram,
+                coverage_output,
+            )
+            if time.perf_counter() - started >= threshold:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="fast-lane-analysis",
+                )
+            return
+        if not defer_coverage:
+            coverage_output[:] = _PACKED_LANE_COVERAGE[packed_missing]
+        if len(self._pending) >= self._MAX_PENDING:
+            self._pending.popleft().result()
+        assert self._executor is not None
+        self._pending.append(
+            self._executor.submit(
+                self._native_extension.accumulate_packed_lane_hole_run_histograms_into,
+                packed_missing,
+                lane_histogram,
+                span_histogram,
+                coverage_output if defer_coverage else None,
+            )
+        )
+
+    def finish_pending(self) -> None:
+        """Finish queued updates before their histogram buffers become immutable."""
+
+        while self._pending:
+            self._pending.popleft().result()
+
+
 def _analyze_lane_validity(
     lane_valid: torch.Tensor,
     lane_histogram: np.ndarray,
@@ -401,6 +664,7 @@ def _analyze_lane_validity(
     *,
     native_extension,
     lane_weights: torch.Tensor | None,
+    analysis_queue: _FastLaneAnalysisQueue | None = None,
 ) -> None:
     if native_extension is None:
         host_valid = np.ascontiguousarray(lane_valid.detach().cpu().numpy())
@@ -413,16 +677,45 @@ def _analyze_lane_validity(
         packed_missing = np.ascontiguousarray(
             _pack_missing_lane_masks(lane_valid, lane_weights).cpu().numpy().view(np.uint16)
         )
-        native_extension.accumulate_packed_lane_hole_run_histograms_into(
+        _analyze_packed_lane_validity(
             packed_missing,
             lane_histogram,
             span_histogram,
             coverage_output,
+            native_extension=native_extension,
+            analysis_queue=analysis_queue,
         )
         return
     host_valid = np.ascontiguousarray(lane_valid.detach().numpy())
     native_extension.accumulate_lane_hole_run_histograms_into(
         host_valid,
+        lane_histogram,
+        span_histogram,
+        coverage_output,
+    )
+
+
+def _analyze_packed_lane_validity(
+    packed_missing: np.ndarray,
+    lane_histogram: np.ndarray,
+    span_histogram: np.ndarray,
+    coverage_output: np.ndarray,
+    *,
+    native_extension,
+    analysis_queue: _FastLaneAnalysisQueue | None,
+    defer_coverage: bool = False,
+) -> None:
+    if analysis_queue is not None:
+        analysis_queue.submit(
+            packed_missing,
+            lane_histogram,
+            span_histogram,
+            coverage_output,
+            defer_coverage=defer_coverage,
+        )
+        return
+    native_extension.accumulate_packed_lane_hole_run_histograms_into(
+        packed_missing,
         lane_histogram,
         span_histogram,
         coverage_output,
@@ -588,17 +881,25 @@ class StereoRenderer:
         geometry_bytes = sum(values.nbytes for values in eye_offsets)
         self._offset_transfer_seconds = 0.0
         self._offset_transfer_bytes = 0
+        bytes_per_pixel = (
+            TRITON_SPLAT_BYTES_PER_PIXEL
+            if _triton_splat_available(self.device)
+            else SPLAT_BYTES_PER_PIXEL
+        )
+        temporary_budget_bytes = _fast_temporary_budget_bytes(
+            self,
+            render_width=width,
+            render_height=height,
+            bytes_per_pixel=bytes_per_pixel,
+        )
         first_band_height = calculate_band_height(
             width,
             height,
-            self.temporary_budget_bytes,
-            bytes_per_pixel=(
-                TRITON_SPLAT_BYTES_PER_PIXEL
-                if _triton_splat_available(self.device)
-                else SPLAT_BYTES_PER_PIXEL
-            ),
+            temporary_budget_bytes,
+            bytes_per_pixel=bytes_per_pixel,
         )
 
+        render_failed = False
         try:
             result = self._render_with_band_height(
                 source,
@@ -608,6 +909,9 @@ class StereoRenderer:
                 first_band_height,
             )
         except torch.cuda.OutOfMemoryError:
+            render_failed = True
+        # Drop the failed attempt's traceback before releasing and retrying.
+        if render_failed:
             self._release_after_oom()
             retry_band_height = max(1, first_band_height // 2)
             try:
@@ -805,17 +1109,27 @@ class StereoRenderer:
         source = np.ascontiguousarray(source)
         height, width = source.shape[:2]
         geometry_started = time.perf_counter()
-        geometry = build_relative_geometry(
-            canonical_values,
-            (height, width),
-            stereo_strength=settings.stereo_strength,
-            convergence=settings.convergence,
+        if (
+            not math.isfinite(settings.stereo_strength)
+            or not 0.0 <= settings.stereo_strength <= 5.0
+        ):
+            raise ValueError("stereo_strength must be finite and within [0, 5]")
+        if not math.isfinite(settings.convergence) or not 0.0 <= settings.convergence <= 1.0:
+            raise ValueError("convergence must be finite and within [0, 1]")
+        # Relative offsets do not consume the common float64 disparity plane.
+        legacy_near_score = self._resize_canonical(canonical_values, (height, width)).clone()
+        geometry = _FastRelativeGeometry(
+            near_score=legacy_near_score.numpy(),
+            source_valid=np.ones((height, width), dtype=np.bool_),
         )
         geometry_seconds = time.perf_counter() - geometry_started
         del frame, canonical, canonical_values
         offset_started = time.perf_counter()
-        legacy_near_score = torch.from_numpy(np.array(geometry.near_score, copy=True, order="C"))
-        eye_offsets = calculate_eye_sample_offsets(legacy_near_score, settings)
+        eye_offsets = (
+            _FastRelativeOffsets(legacy_near_score, settings)
+            if self.device.type == "cuda"
+            else calculate_eye_sample_offsets(legacy_near_score, settings)
+        )
         offset_seconds = time.perf_counter() - offset_started
         result = self._render_fast_compact_core(
             source,
@@ -826,6 +1140,8 @@ class StereoRenderer:
                 occlusion_fill=settings.occlusion_fill,
             ),
         )
+        if isinstance(eye_offsets, _FastRelativeOffsets):
+            offset_seconds += eye_offsets.build_seconds
         del source, geometry, legacy_near_score, eye_offsets
         return _attach_fast_performance(
             result,
@@ -913,22 +1229,29 @@ class StereoRenderer:
     def _render_fast_compact_core(
         self,
         source: np.ndarray,
-        geometry: StereoGeometryFrame,
-        eye_offsets: tuple[np.ndarray, np.ndarray],
+        geometry: StereoGeometryFrame | _FastRelativeGeometry,
+        eye_offsets: tuple[np.ndarray, np.ndarray] | _FastRelativeOffsets,
         settings: StereoSplatSettings,
         *,
         metric_stats=None,
     ):
         height, width = source.shape[:2]
+        bytes_per_pixel = (
+            TRITON_SPLAT_BYTES_PER_PIXEL
+            if _triton_splat_available(self.device)
+            else SPLAT_BYTES_PER_PIXEL
+        )
+        temporary_budget_bytes = _fast_temporary_budget_bytes(
+            self,
+            render_width=width,
+            render_height=height,
+            bytes_per_pixel=bytes_per_pixel,
+        )
         first_band_height = calculate_band_height(
             width,
             height,
-            self.temporary_budget_bytes,
-            bytes_per_pixel=(
-                TRITON_SPLAT_BYTES_PER_PIXEL
-                if _triton_splat_available(self.device)
-                else SPLAT_BYTES_PER_PIXEL
-            ),
+            temporary_budget_bytes,
+            bytes_per_pixel=bytes_per_pixel,
         )
         try:
             return self._render_fast_compact_with_band_height(
@@ -940,44 +1263,42 @@ class StereoRenderer:
                 metric_stats=metric_stats,
             )
         except torch.cuda.OutOfMemoryError:
+            pass
+        # Drop the failed attempt's traceback before releasing and retrying.
+        self._release_after_oom()
+        fallback_band_height = calculate_band_height(
+            width,
+            height,
+            self.temporary_budget_bytes,
+            bytes_per_pixel=bytes_per_pixel,
+        )
+        retry_band_height = max(
+            1,
+            min(first_band_height // 2, fallback_band_height),
+        )
+        try:
+            return self._render_fast_compact_with_band_height(
+                source,
+                geometry,
+                eye_offsets,
+                settings,
+                retry_band_height,
+                metric_stats=metric_stats,
+                preload_device_frame=False,
+            )
+        except torch.cuda.OutOfMemoryError as error:
             self._release_after_oom()
-            fallback_band_height = calculate_band_height(
-                width,
-                height,
-                self.temporary_budget_bytes,
-                bytes_per_pixel=(
-                    TRITON_SPLAT_BYTES_PER_PIXEL
-                    if _triton_splat_available(self.device)
-                    else SPLAT_BYTES_PER_PIXEL
-                ),
-            )
-            retry_band_height = max(
-                1,
-                min(first_band_height // 2, fallback_band_height),
-            )
-            try:
-                return self._render_fast_compact_with_band_height(
-                    source,
-                    geometry,
-                    eye_offsets,
-                    settings,
-                    retry_band_height,
-                    metric_stats=metric_stats,
-                    preload_device_frame=False,
-                )
-            except torch.cuda.OutOfMemoryError as error:
-                self._release_after_oom()
-                raise RuntimeError(
-                    "CUDA stereo rendering ran out of memory for frame "
-                    f"{width}x{height}; attempted band heights "
-                    f"{first_band_height} and {retry_band_height}"
-                ) from error
+            raise RuntimeError(
+                "CUDA stereo rendering ran out of memory for frame "
+                f"{width}x{height}; attempted band heights "
+                f"{first_band_height} and {retry_band_height}"
+            ) from error
 
     def _render_fast_compact_with_band_height(
         self,
         source: np.ndarray,
-        geometry: StereoGeometryFrame,
-        eye_offsets: tuple[np.ndarray, np.ndarray],
+        geometry: StereoGeometryFrame | _FastRelativeGeometry,
+        eye_offsets: tuple[np.ndarray, np.ndarray] | _FastRelativeOffsets,
         settings: StereoSplatSettings,
         band_height: int,
         *,
@@ -997,31 +1318,46 @@ class StereoRenderer:
                 None,
                 None,
             )
+            host_offsets = (
+                eye_offsets.host_offsets()
+                if isinstance(eye_offsets, _FastRelativeOffsets)
+                else eye_offsets
+            )
         else:
             device_frame, loaded_offsets = preloaded
             device_offsets = loaded_offsets
+            host_offsets = (None, None)
 
-        left_started = time.perf_counter()
-        left = self._render_fast_eye_compact(
-            source,
-            geometry,
-            eye_offsets[0],
-            settings,
-            band_height,
-            device_frame=device_frame,
-            device_offsets=device_offsets[0],
+        native_extension = _native_lane_analyzer() if self.device.type == "cuda" else None
+        analysis_context = (
+            _FastLaneAnalysisQueue(native_extension)
+            if native_extension is not None
+            else nullcontext(None)
         )
-        left_seconds = time.perf_counter() - left_started
-        right_started = time.perf_counter()
-        right = self._render_fast_eye_compact(
-            source,
-            geometry,
-            eye_offsets[1],
-            settings,
-            band_height,
-            device_frame=device_frame,
-            device_offsets=device_offsets[1],
-        )
+        with analysis_context as analysis_queue:
+            left_started = time.perf_counter()
+            left = self._render_fast_eye_compact(
+                source,
+                geometry,
+                host_offsets[0],
+                settings,
+                band_height,
+                device_frame=device_frame,
+                device_offsets=device_offsets[0],
+                analysis_queue=analysis_queue,
+            )
+            left_seconds = time.perf_counter() - left_started
+            right_started = time.perf_counter()
+            right = self._render_fast_eye_compact(
+                source,
+                geometry,
+                host_offsets[1],
+                settings,
+                band_height,
+                device_frame=device_frame,
+                device_offsets=device_offsets[1],
+                analysis_queue=analysis_queue,
+            )
         right_seconds = time.perf_counter() - right_started
         return CompactStereoRenderResult(
             left_image=left[0],
@@ -1044,16 +1380,18 @@ class StereoRenderer:
     def _render_fast_eye_compact(
         self,
         source: np.ndarray,
-        geometry: StereoGeometryFrame,
-        sample_offsets: np.ndarray,
+        geometry: StereoGeometryFrame | _FastRelativeGeometry,
+        sample_offsets: np.ndarray | None,
         settings: StereoSplatSettings,
         band_height: int,
         *,
         device_frame: _FastDeviceFrame | None = None,
         device_offsets: torch.Tensor | None = None,
+        analysis_queue: _FastLaneAnalysisQueue | None = None,
     ):
         from .quality.types import FastEyeDiagnostics, HoleRunDiagnostics
 
+        assert sample_offsets is not None or device_offsets is not None
         height, width = source.shape[:2]
         output = np.empty_like(source)
         coverage_output = np.empty((height, width), dtype=np.uint8)
@@ -1070,6 +1408,7 @@ class StereoRenderer:
             if native_extension is not None and self.device.type == "cuda"
             else None
         )
+        batched_download = lane_weights is not None and source.dtype == np.dtype(np.uint8)
 
         with torch.inference_mode():
             for start_row in range(0, height, band_height):
@@ -1122,40 +1461,90 @@ class StereoRenderer:
                 filled = fillable.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
                 unresolved = hole_mask.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
                 coverage = coverage_output[start_row:end_row]
-                _analyze_lane_validity(
-                    prefill,
-                    lane_histogram,
-                    span_histogram,
-                    coverage,
-                    native_extension=native_extension,
-                    lane_weights=lane_weights,
-                )
-                fine_repair = _fast_repair_lane_flags(
-                    filled,
-                    unresolved,
-                    background=settings.occlusion_fill == "background",
-                )
-                downsampled = _downsample_subpixel_band(rendered)
-                lane_counts = torch.stack(
-                    (
-                        torch.count_nonzero(filled),
-                        torch.count_nonzero(unresolved),
-                        torch.count_nonzero(~torch.isfinite(downsampled)),
+                if not batched_download:
+                    _analyze_lane_validity(
+                        prefill,
+                        lane_histogram,
+                        span_histogram,
+                        coverage,
+                        native_extension=native_extension,
+                        lane_weights=lane_weights,
+                        analysis_queue=analysis_queue,
                     )
-                )
+                fused_payload = None
+                if batched_download:
+                    from .fast_output_triton import triton_fast_band_payload
+
+                    fused_payload = triton_fast_band_payload(
+                        rendered,
+                        prefill,
+                        filled,
+                        unresolved,
+                        background=settings.occlusion_fill == "background",
+                        include_coverage_flags=True,
+                    )
                 host_lane_counts = None
-                if self.device.type != "cuda":
+                fine_repair = downsampled = lane_counts = None
+                if fused_payload is not None:
+                    host_image, packed_missing, host_repair, host_lane_counts = (
+                        _download_fast_cuda_payload(
+                            fused_payload, (row_count, width, 3), (row_count, width)
+                        )
+                    )
+                else:
+                    fine_repair = _fast_repair_lane_flags(
+                        filled,
+                        unresolved,
+                        background=settings.occlusion_fill == "background",
+                    )
+                    downsampled = _downsample_subpixel_band(rendered)
+                    lane_counts = torch.stack(
+                        (
+                            torch.count_nonzero(filled),
+                            torch.count_nonzero(unresolved),
+                            torch.count_nonzero(~torch.isfinite(downsampled)),
+                        )
+                    )
+                    if batched_download:
+                        assert lane_weights is not None
+                        host_image, packed_missing, host_repair, host_lane_counts = (
+                            _download_fast_cuda_band(
+                                downsampled, prefill, lane_weights, fine_repair, lane_counts
+                            )
+                        )
+                if batched_download:
+                    _analyze_packed_lane_validity(
+                        packed_missing,
+                        lane_histogram,
+                        span_histogram,
+                        coverage,
+                        native_extension=native_extension,
+                        analysis_queue=analysis_queue,
+                        defer_coverage=fused_payload is not None,
+                    )
+                    if host_lane_counts[2] != 0:
+                        raise ValueError("Rendered image contains non-finite values")
+                elif self.device.type != "cuda":
                     host_lane_counts = lane_counts.detach().numpy()
                     if host_lane_counts[2] != 0:
                         raise ValueError("Rendered image contains non-finite values")
                 repair = repair_output[start_row:end_row]
-                repair[(coverage > 0) & (coverage < HORIZONTAL_SUBPIXELS)] |= np.uint8(0x01)
-                repair[coverage == 0] |= np.uint8(0x02)
-                output[start_row:end_row] = _convert_image_band(
-                    downsampled,
-                    source.dtype,
-                )
-                repair |= fine_repair.detach().cpu().numpy()
+                if fused_payload is not None:
+                    repair[:] = host_repair
+                else:
+                    repair[(coverage > 0) & (coverage < HORIZONTAL_SUBPIXELS)] |= np.uint8(0x01)
+                    repair[coverage == 0] |= np.uint8(0x02)
+                if batched_download:
+                    output[start_row:end_row] = host_image
+                    if fused_payload is None:
+                        repair |= host_repair
+                    del host_image, packed_missing, host_repair
+                else:
+                    output[start_row:end_row] = _convert_image_band(
+                        downsampled,
+                        source.dtype,
+                    )
+                    repair |= fine_repair.detach().cpu().numpy()
                 if host_lane_counts is None:
                     host_lane_counts = lane_counts.detach().cpu().numpy()
                     if host_lane_counts[2] != 0:
@@ -1175,12 +1564,15 @@ class StereoRenderer:
                     filled,
                     unresolved,
                     fine_repair,
+                    fused_payload,
                     lane_counts,
                     host_lane_counts,
                     coverage,
                     repair,
                     downsampled,
                 )
+        if analysis_queue is not None:
+            analysis_queue.finish_pending()
         hole_runs = HoleRunDiagnostics(
             lane_count_histogram=lane_histogram,
             touched_pixel_span_histogram=span_histogram,
@@ -1195,8 +1587,8 @@ class StereoRenderer:
     def _preload_fast_device_frame(
         self,
         source: np.ndarray,
-        geometry: StereoGeometryFrame,
-        eye_offsets: tuple[np.ndarray, np.ndarray],
+        geometry: StereoGeometryFrame | _FastRelativeGeometry,
+        eye_offsets: tuple[np.ndarray, np.ndarray] | _FastRelativeOffsets,
     ) -> tuple[_FastDeviceFrame, tuple[torch.Tensor, torch.Tensor]] | None:
         if self.device.type != "cuda":
             return None
@@ -1205,6 +1597,8 @@ class StereoRenderer:
         device_source_valid = None
         left_offsets = None
         right_offsets = None
+        loaded_offsets = None
+        preload_failed = False
         try:
             device_source = torch.from_numpy(source).to(self.device)
             device_near_score = torch.from_numpy(
@@ -1213,14 +1607,28 @@ class StereoRenderer:
             device_source_valid = torch.from_numpy(
                 np.array(geometry.source_valid, copy=True, order="C")
             ).to(self.device)
-            left_offsets = self._transfer_offset_band(eye_offsets[0])
-            right_offsets = self._transfer_offset_band(eye_offsets[1])
+            if isinstance(eye_offsets, _FastRelativeOffsets):
+                loaded_offsets = eye_offsets.device_offsets(device_near_score, profile=self.profile)
+            if loaded_offsets is None:
+                host_offsets = (
+                    eye_offsets.host_offsets()
+                    if isinstance(eye_offsets, _FastRelativeOffsets)
+                    else eye_offsets
+                )
+                left_offsets = self._transfer_offset_band(host_offsets[0])
+                right_offsets = self._transfer_offset_band(host_offsets[1])
+            else:
+                left_offsets, right_offsets = loaded_offsets
         except torch.cuda.OutOfMemoryError:
             device_source = None
             device_near_score = None
             device_source_valid = None
             left_offsets = None
             right_offsets = None
+            loaded_offsets = None
+            preload_failed = True
+        if preload_failed:
+            # Helper tracebacks may retain CUDA inputs even after locals are cleared.
             self._release_after_oom()
             return None
         assert device_source is not None

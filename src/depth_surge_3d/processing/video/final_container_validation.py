@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+import os
 from pathlib import Path
 import stat
 
@@ -32,6 +33,7 @@ FINAL_PROBE_TIMEOUT_BASE_SECONDS = 30
 FINAL_PROBE_TIMEOUT_PER_1000_WORK_UNITS_SECONDS = 2
 FINAL_PROBE_TIMEOUT_MAX_SECONDS = 21_600
 FINAL_PROBE_BYTES_PER_WORK_UNIT = 64 * 1024
+FINAL_PROBE_VIDEO_THREADS_MAX = 8
 FINAL_DECODE_STALL_SECONDS = 120.0
 _U64_MAX = 0xFFFFFFFFFFFFFFFF
 
@@ -162,10 +164,16 @@ def validate_final_container_v4(
         expectation,
     )
 
+    # FFprobe defaults to one decoder thread; cap parallelism instead of using auto.
+    probe_video_threads = min(
+        FINAL_PROBE_VIDEO_THREADS_MAX, os.cpu_count() or 1, expectation.frame_count
+    )
     probe_arguments = (
         ffprobe,
         "-v",
         "error",
+        "-threads:v",
+        str(probe_video_threads),
         "-count_frames",
         "-show_entries",
         "stream=codec_type,codec_name,width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate,nb_read_frames",
@@ -183,13 +191,9 @@ def validate_final_container_v4(
             finite_limits["cancelled"] = cancelled
         probe = finite_runner(probe_arguments, **finite_limits)
     except ProcessTimeoutError as error:
-        raise FinalContainerProbeTimeoutError(
-            "final FFprobe exceeded its deadline"
-        ) from error
+        raise FinalContainerProbeTimeoutError("final FFprobe exceeded its deadline") from error
     except ProcessOutputBudgetError as error:
-        raise FinalContainerProbeBudgetError(
-            "final FFprobe exceeded its output budget"
-        ) from error
+        raise FinalContainerProbeBudgetError("final FFprobe exceeded its output budget") from error
     if probe.returncode != 0 or probe.stderr:
         raise FinalContainerProcessError("final FFprobe emitted diagnostics or failed")
     try:

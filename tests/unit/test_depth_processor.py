@@ -71,6 +71,38 @@ class FakeMogeEstimator:
         )
 
 
+class CallStampedEstimator:
+    """Expose inference calls in raw values so chunk reuse is directly observable."""
+
+    camera_model = "none"
+    model_path = None
+    backend_id = "chunk-reuse-test"
+    model_size = "small"
+    exact_input_batch_reuse = True
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    @staticmethod
+    def get_model_info() -> dict[str, object]:
+        return {
+            "family": "processor-test",
+            "revision": "exact-chunk-reuse-v1",
+        }
+
+    @staticmethod
+    def estimate_output_shape(
+        frame_width: int, frame_height: int, input_size: int
+    ) -> tuple[int, int]:
+        del frame_width, frame_height, input_size
+        return 2, 3
+
+    def estimate_depth_batch(self, frames: np.ndarray, **_kwargs) -> DepthBatch:
+        self.calls += 1
+        values = np.full((len(frames), 2, 3), self.calls, dtype=np.float32)
+        return DepthBatch(values, DepthRepresentation.INVERSE_DEPTH)
+
+
 @pytest.fixture
 def frame_files(tmp_path: Path) -> list[Path]:
     frame_dir = tmp_path / "frames"
@@ -730,6 +762,201 @@ class TestGenerateDepthMaps:
         )
         assert estimator.estimate_depth_batch.call_count == 2
         assert clear_gpu_memory.call_count == 1
+
+    def test_identical_complete_chunks_reuse_exact_depth_result_but_short_tail_does_not(
+        self,
+        mock_progress_tracker,
+        tmp_path: Path,
+    ) -> None:
+        frame_dir = tmp_path / "frames"
+        frame_dir.mkdir()
+        frame_files = []
+        for index in range(5):
+            path = frame_dir / f"frame_{index:04d}.png"
+            assert cv2.imwrite(str(path), np.full((8, 6, 3), 37, dtype=np.uint8))
+            frame_files.append(path)
+
+        estimator = CallStampedEstimator()
+        processor = DepthMapProcessor(estimator)
+        directories = make_depth_directories(tmp_path)
+        settings = {
+            "depth_resolution": "8",
+            "target_fps": 30,
+            "keep_intermediates": True,
+            "super_sample": "none",
+            "scene_detection": False,
+            "raw_storage_dtype": "float32",
+        }
+
+        with (
+            patch.object(processor, "_determine_chunk_params", return_value=(2, 8)),
+            patch.object(processor, "_clear_gpu_memory"),
+        ):
+            assert processor.generate_depth_map_files(
+                frame_files,
+                settings,
+                directories,
+                mock_progress_tracker,
+            )
+
+        assert estimator.calls == 2
+        raw_values = []
+        for path in sorted(directories["depth_raw"].glob("*.npz")):
+            with np.load(path) as payload:
+                raw_values.append(np.array(payload["values"], copy=True))
+        assert len(raw_values) == 5
+        for values in raw_values[:4]:
+            np.testing.assert_array_equal(values, np.ones((2, 3), dtype=np.float32))
+        np.testing.assert_array_equal(
+            raw_values[4],
+            np.full((2, 3), 2, dtype=np.float32),
+        )
+
+    def test_chunk_reuse_rejects_one_pixel_difference(
+        self,
+        mock_progress_tracker,
+        tmp_path: Path,
+    ) -> None:
+        frame_dir = tmp_path / "frames"
+        frame_dir.mkdir()
+        frame_files = []
+        for index, value in enumerate((37, 37, 37, 38)):
+            path = frame_dir / f"frame_{index:04d}.png"
+            assert cv2.imwrite(str(path), np.full((8, 6, 3), value, dtype=np.uint8))
+            frame_files.append(path)
+
+        estimator = CallStampedEstimator()
+        processor = DepthMapProcessor(estimator)
+        with (
+            patch.object(processor, "_determine_chunk_params", return_value=(2, 8)),
+            patch.object(processor, "_clear_gpu_memory"),
+        ):
+            assert processor.generate_depth_map_files(
+                frame_files,
+                {
+                    "depth_resolution": "8",
+                    "target_fps": 30,
+                    "keep_intermediates": True,
+                    "super_sample": "none",
+                    "scene_detection": False,
+                    "raw_storage_dtype": "float32",
+                },
+                make_depth_directories(tmp_path),
+                mock_progress_tracker,
+            )
+
+        assert estimator.calls == 2
+
+    def test_chunk_reuse_requires_estimator_exactness_capability(
+        self,
+        mock_progress_tracker,
+        tmp_path: Path,
+    ) -> None:
+        frame_dir = tmp_path / "frames"
+        frame_dir.mkdir()
+        frame_files = []
+        for index in range(4):
+            path = frame_dir / f"frame_{index:04d}.png"
+            assert cv2.imwrite(str(path), np.full((8, 6, 3), 37, dtype=np.uint8))
+            frame_files.append(path)
+
+        estimator = CallStampedEstimator()
+        estimator.exact_input_batch_reuse = False
+        processor = DepthMapProcessor(estimator)
+        with (
+            patch.object(processor, "_determine_chunk_params", return_value=(2, 8)),
+            patch.object(processor, "_clear_gpu_memory"),
+        ):
+            assert processor.generate_depth_map_files(
+                frame_files,
+                {
+                    "depth_resolution": "8",
+                    "target_fps": 30,
+                    "keep_intermediates": True,
+                    "super_sample": "none",
+                    "scene_detection": False,
+                    "raw_storage_dtype": "float32",
+                },
+                make_depth_directories(tmp_path),
+                mock_progress_tracker,
+            )
+
+        assert estimator.calls == 2
+
+    def test_chunk_reuse_size_prefilter_avoids_full_pixel_scan(self) -> None:
+        frames = np.zeros((2, 8, 6, 3), dtype=np.uint8)
+        previous = SimpleNamespace(source_frames=frames.copy(), source_sizes=(101, 102))
+
+        with patch.object(
+            depth_processor.np,
+            "array_equal",
+            side_effect=AssertionError("pixel scan must be skipped"),
+        ):
+            assert not DepthMapProcessor._raw_chunk_matches(
+                previous,
+                frames,
+                (101, 103),
+            )
+
+    def test_chunk_reuse_does_not_cross_a_resumed_complete_chunk(
+        self,
+        mock_progress_tracker,
+        tmp_path: Path,
+    ) -> None:
+        frame_dir = tmp_path / "frames"
+        frame_dir.mkdir()
+        frame_files = []
+        for index, value in enumerate((37, 37, 81, 81, 37, 37)):
+            path = frame_dir / f"frame_{index:04d}.png"
+            assert cv2.imwrite(str(path), np.full((8, 6, 3), value, dtype=np.uint8))
+            frame_files.append(path)
+
+        estimator = CallStampedEstimator()
+        processor = DepthMapProcessor(estimator)
+        directories = make_depth_directories(tmp_path)
+        settings = {
+            "depth_resolution": "8",
+            "target_fps": 30,
+            "keep_intermediates": True,
+            "super_sample": "none",
+            "scene_detection": False,
+            "raw_storage_dtype": "float32",
+        }
+
+        with (
+            patch.object(processor, "_determine_chunk_params", return_value=(2, 8)),
+            patch.object(processor, "_clear_gpu_memory"),
+        ):
+            assert processor.generate_depth_map_files(
+                frame_files,
+                settings,
+                directories,
+                mock_progress_tracker,
+            )
+
+        for index in (0, 1, 4, 5):
+            (directories["depth_raw"] / f"frame_{index:04d}.npz").unlink()
+        for path in directories["disparity_maps"].iterdir():
+            path.unlink()
+        estimator.calls = 0
+
+        with (
+            patch.object(processor, "_determine_chunk_params", return_value=(2, 8)),
+            patch.object(processor, "_clear_gpu_memory"),
+        ):
+            assert processor.generate_depth_map_files(
+                frame_files,
+                settings,
+                directories,
+                mock_progress_tracker,
+            )
+
+        assert estimator.calls == 2
+        with np.load(directories["depth_raw"] / "frame_0004.npz") as payload:
+            np.testing.assert_array_equal(
+                payload["values"],
+                np.full((2, 3), 2, dtype=np.float32),
+            )
 
     def test_moge_chunk_persists_focal_with_depth_and_keeps_canonical_output(
         self, mock_progress_tracker, temp_frames, tmp_path

@@ -44,6 +44,7 @@ class TestSeeThroughDepthEstimator:
         assert estimator.denoising_steps == 4
         assert estimator.seed == 1026
         assert estimator.max_batch_size == 1
+        assert estimator.exact_input_batch_reuse is True
         assert estimator.model is None
         assert estimator.inference_precision == "float32"
 

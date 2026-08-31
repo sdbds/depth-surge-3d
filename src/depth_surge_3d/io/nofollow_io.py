@@ -7,6 +7,7 @@ import errno
 import hashlib
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 import stat
 import secrets
@@ -1093,6 +1094,97 @@ class _PosixAcquiredRoot:
             os.close(parent)
 
 
+@lru_cache(maxsize=1)
+def _windows_root_bindings() -> tuple:
+    """Cache native declarations, never acquired roots or query result buffers."""
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    get_directory = kernel32.GetFileInformationByHandleEx
+    get_directory.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    get_directory.restype = wintypes.BOOL
+    set_information = kernel32.SetFileInformationByHandle
+    set_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    set_information.restype = wintypes.BOOL
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.USHORT),
+            ("maximum_length", wintypes.USHORT),
+            ("buffer", wintypes.LPWSTR),
+        ]
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.ULONG),
+            ("root_directory", wintypes.HANDLE),
+            ("object_name", ctypes.POINTER(UnicodeString)),
+            ("attributes", wintypes.ULONG),
+            ("security_descriptor", wintypes.LPVOID),
+            ("security_qos", wintypes.LPVOID),
+        ]
+
+    class IoStatusBlock(ctypes.Structure):
+        _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+    nt_create_file = ntdll.NtCreateFile
+    nt_create_file.argtypes = (
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        ctypes.POINTER(ObjectAttributes),
+        ctypes.POINTER(IoStatusBlock),
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    nt_create_file.restype = ctypes.c_long
+    status_to_error = ntdll.RtlNtStatusToDosError
+    status_to_error.argtypes = (ctypes.c_long,)
+    status_to_error.restype = wintypes.DWORD
+    return (
+        kernel32,
+        ntdll,
+        close_handle,
+        create_file,
+        get_directory,
+        set_information,
+        UnicodeString,
+        ObjectAttributes,
+        IoStatusBlock,
+        nt_create_file,
+        status_to_error,
+    )
+
+
 class _WindowsAcquiredRoot:  # noqa: C901
     def __init__(self, root: Path) -> None:
         from ctypes import wintypes
@@ -1109,81 +1201,20 @@ class _WindowsAcquiredRoot:  # noqa: C901
             PersistentIdentitySchemaError,
         )
         self._identity_from_handle = windows_identity_from_handle
-        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        self._ntdll = ctypes.WinDLL("ntdll")
+        (
+            self._kernel32,
+            self._ntdll,
+            self._close_handle,
+            self._create_file,
+            self._get_directory,
+            self._set_information,
+            self._unicode_string,
+            self._object_attributes,
+            self._io_status_block,
+            self._nt_create_file,
+            self._status_to_error,
+        ) = _windows_root_bindings()
         self._invalid_handle = wintypes.HANDLE(-1).value
-        self._close_handle = self._kernel32.CloseHandle
-        self._close_handle.argtypes = (wintypes.HANDLE,)
-        self._close_handle.restype = wintypes.BOOL
-        self._create_file = self._kernel32.CreateFileW
-        self._create_file.argtypes = (
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.HANDLE,
-        )
-        self._create_file.restype = wintypes.HANDLE
-        self._get_directory = self._kernel32.GetFileInformationByHandleEx
-        self._get_directory.argtypes = (
-            wintypes.HANDLE,
-            ctypes.c_int,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-        )
-        self._get_directory.restype = wintypes.BOOL
-        self._set_information = self._kernel32.SetFileInformationByHandle
-        self._set_information.argtypes = (
-            wintypes.HANDLE,
-            ctypes.c_int,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-        )
-        self._set_information.restype = wintypes.BOOL
-
-        class UnicodeString(ctypes.Structure):
-            _fields_ = [
-                ("length", wintypes.USHORT),
-                ("maximum_length", wintypes.USHORT),
-                ("buffer", wintypes.LPWSTR),
-            ]
-
-        class ObjectAttributes(ctypes.Structure):
-            _fields_ = [
-                ("length", wintypes.ULONG),
-                ("root_directory", wintypes.HANDLE),
-                ("object_name", ctypes.POINTER(UnicodeString)),
-                ("attributes", wintypes.ULONG),
-                ("security_descriptor", wintypes.LPVOID),
-                ("security_qos", wintypes.LPVOID),
-            ]
-
-        class IoStatusBlock(ctypes.Structure):
-            _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
-
-        self._unicode_string = UnicodeString
-        self._object_attributes = ObjectAttributes
-        self._io_status_block = IoStatusBlock
-        self._nt_create_file = self._ntdll.NtCreateFile
-        self._nt_create_file.argtypes = (
-            ctypes.POINTER(wintypes.HANDLE),
-            wintypes.DWORD,
-            ctypes.POINTER(ObjectAttributes),
-            ctypes.POINTER(IoStatusBlock),
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-        )
-        self._nt_create_file.restype = ctypes.c_long
-        self._status_to_error = self._ntdll.RtlNtStatusToDosError
-        self._status_to_error.argtypes = (ctypes.c_long,)
-        self._status_to_error.restype = wintypes.DWORD
 
         handle = self._create_file(
             str(root),

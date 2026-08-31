@@ -38,6 +38,65 @@ def _argument_value(arguments: tuple[str, ...], option: str) -> str:
     return arguments[positions[0] + 1]
 
 
+def validate_raw_rgb24_input_v1(arguments: tuple[str, ...]) -> tuple[int, int]:
+    """Validate the closed raw input prefix of a normalized FFmpeg invocation."""
+
+    if not arguments or arguments[0] != "ffmpeg":
+        raise ValueError("raw RGB24 invocation must start with ffmpeg")
+    try:
+        input_index = arguments.index("-i")
+    except ValueError as error:
+        raise ValueError("raw RGB24 invocation lacks its image input") from error
+    if (
+        input_index + 1 >= len(arguments)
+        or re.fullmatch(
+            r"@image-sequence:sha256=(?:self|[0-9a-f]{64}):view=frames",
+            arguments[input_index + 1],
+            flags=re.ASCII,
+        )
+        is None
+    ):
+        raise ValueError("raw RGB24 options must bind the first image input")
+    if sum(value.startswith("@image-sequence:") for value in arguments) != 1:
+        raise ValueError("raw RGB24 requires exactly one image input")
+    required = {"-f", "-pixel_format", "-video_size", "-framerate"}
+    if any(arguments.count(option) != 1 for option in required) or "-vcodec" in arguments:
+        raise ValueError("raw RGB24 input options are missing or duplicated")
+    switches = {"-y", "-xerror", "-nostats"}
+    values: dict[str, str] = {}
+    seen: set[str] = set()
+    position = 1
+    while position < input_index:
+        option = arguments[position]
+        if option in seen:
+            raise ValueError("raw RGB24 input options are duplicated")
+        seen.add(option)
+        if option in switches:
+            position += 1
+            continue
+        if option not in required | {"-v"} or position + 1 >= input_index:
+            raise ValueError("raw RGB24 input has an unsupported option or override")
+        values[option] = arguments[position + 1]
+        position += 2
+    if not required <= values.keys():
+        raise ValueError("raw RGB24 options must precede their image input")
+    if values["-f"] != "rawvideo" or values["-pixel_format"] != "rgb24":
+        raise ValueError("raw RGB24 input format is invalid")
+    size = re.fullmatch(r"([1-9][0-9]{0,9})x([1-9][0-9]{0,9})", values["-video_size"], re.ASCII)
+    if size is None:
+        raise ValueError("raw RGB24 video size is noncanonical")
+    width, height = (int(value) for value in size.groups())
+    if width > 2**32 - 1 or height > 2**32 - 1 or width * height * 3 > 2**64 - 1:
+        raise ValueError("raw RGB24 video size exceeds its bounds")
+    try:
+        rate = Fraction(values["-framerate"])
+    except (ValueError, ZeroDivisionError) as error:
+        raise ValueError("raw RGB24 frame rate is invalid") from error
+    if rate <= 0 or values["-framerate"] != f"{rate.numerator}/{rate.denominator}":
+        raise ValueError("raw RGB24 frame rate is noncanonical")
+    return width, height
+
+
 @dataclass(frozen=True, slots=True)
 class StreamedVrInvocationV1:
     """Exact non-recursive FFmpeg invocation template bound before launch."""

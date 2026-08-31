@@ -225,7 +225,7 @@ def _open_encoding_manifest_extent_authority(
 
 
 class StreamedVrEncodingSession:
-    """Encode ordered assembled PNG payloads and publish through schema 5."""
+    """Encode ordered assembled frame payloads and publish through schema 5."""
 
     def __init__(
         self,
@@ -279,14 +279,18 @@ class StreamedVrEncodingSession:
             or vr_frame.ndim != 3
             or vr_frame.shape[2] != 3
         ):
-            raise ValueError("streamed VR frame must be an RGB8-compatible array")
+            raise ValueError("streamed VR frame must be a BGR8 array")
         expected_width, expected_height = self.manifest.expected_shape
         if vr_frame.shape[:2] != (expected_height, expected_width):
             raise ValueError("streamed VR frame shape differs from the final layout")
-        encoded, payload = cv2.imencode(".png", vr_frame)
-        if not encoded:
-            raise OSError(f"could not encode streamed VR frame: {frame_name}")
-        raw = payload.tobytes()
+        if self.manifest.input_format == "rgb24":
+            # Match PNG's decoded RGB order without mutating the caller's BGR frame.
+            raw = cv2.cvtColor(vr_frame, cv2.COLOR_BGR2RGB).tobytes()
+        else:
+            encoded, payload = cv2.imencode(".png", vr_frame)
+            if not encoded:
+                raise OSError(f"could not encode streamed VR frame: {frame_name}")
+            raw = payload.tobytes()
         self.manifest.append(frame_name, raw)
         self.process.write(raw)
 
@@ -734,7 +738,7 @@ class VideoEncoder:
         first_index: int = 0,
         progress_tracker=None,
     ) -> StreamedVrEncodingSession:
-        """Open a transient assembled-VR encoder before Quality rendering starts."""
+        """Open a transient assembled-VR encoder before stereo rendering starts."""
 
         root = Path(output_dir).resolve()
         artifact = recover_processing_control_prefix_v1(root)
@@ -818,6 +822,7 @@ class VideoEncoder:
                 selected_audio,
                 resolved_fps,
                 resolved_encoder,
+                input_format="rgb24",
             )
             normalized_template = self._normalize_publication_arguments(
                 command=command,
@@ -855,6 +860,7 @@ class VideoEncoder:
                 job_root=root,
                 provider=provider,
                 expected_shape=(width, height),
+                input_format="rgb24",
                 invocation=invocation,
                 owned_target_path=work.manifest_target_path,
                 owned_temporary_path=work.manifest_temporary_path,
@@ -2191,8 +2197,10 @@ class VideoEncoder:
         selected_audio: SelectedAudioIdentityV1,
         fps: str,
         resolved_encoder: str,
+        *,
+        input_format: Literal["png", "rgb24"] = "png",
     ) -> list[str]:
-        """Build one assembled PNG image2pipe input without image2 numbering."""
+        """Build one explicit assembled image input without image2 numbering."""
 
         provider.validated()
         if provider.mode != "assembled_vr" or provider.frames_parent is None:
@@ -2207,6 +2215,19 @@ class VideoEncoder:
         height = int(settings["vr_output_height"])
         if width <= 0 or height <= 0:
             raise ValueError("streamed VR dimensions must be positive")
+        if input_format == "rgb24":
+            input_arguments = [
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                "rgb24",
+                "-video_size",
+                f"{width}x{height}",
+            ]
+        elif input_format == "png":
+            input_arguments = ["-f", "image2pipe", "-vcodec", "png"]
+        else:
+            raise ValueError("streamed VR input format is unsupported")
         command = [
             "ffmpeg",
             "-y",
@@ -2216,10 +2237,7 @@ class VideoEncoder:
             "-nostats",
             "-framerate",
             f"{rate.numerator}/{rate.denominator}",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
+            *input_arguments,
             "-i",
             "pipe:0",
             *selected_audio.input_arguments(),
@@ -2538,7 +2556,7 @@ class VideoEncoder:
         cancelled: Callable[[], bool] | None,
         artifact: ProcessingSettingsArtifactV5 | None = None,
     ) -> bool | None:
-        """Publish a completed indexed image2pipe sibling without rendered PNG files."""
+        """Publish a completed streamed sibling without rendered frame files."""
 
         root = Path(output_dir).resolve()
         artifact = artifact or self._load_schema5_settings_readonly(root)
@@ -2675,6 +2693,7 @@ class VideoEncoder:
             selected_audio,
             resolved_fps,
             invocation.resolved_encoder,
+            input_format=projection.raw_pixel_format or "png",
         )
         normalized_template = self._normalize_publication_arguments(
             command=command,

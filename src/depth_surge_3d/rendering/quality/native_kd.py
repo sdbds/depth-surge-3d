@@ -91,12 +91,20 @@ def build_native_implicit_region_kd(
     *,
     region_count: int,
     include: np.ndarray | None = None,
+    allowed_regions: np.ndarray | None = None,
 ) -> ImplicitRegionKdIndex:
     """Build one native index after the shared strict Python validation."""
 
     height, width, count = _validate_inputs(region_ids, region_count, include)
+    if allowed_regions is not None and (
+        not isinstance(allowed_regions, np.ndarray)
+        or allowed_regions.dtype != np.bool_
+        or allowed_regions.shape != (count + 1,)
+        or not allowed_regions.flags.c_contiguous
+    ):
+        raise TypeError("allowed_regions must be a C-contiguous bool region lookup")
     native = _require_native()
-    members, offsets = native.build_index(region_ids, count, include)
+    members, offsets = native.build_index(region_ids, count, include, allowed_regions)
     members.setflags(write=False)
     offsets.setflags(write=False)
     return ImplicitRegionKdIndex(height, width, count, members, offsets)
@@ -189,6 +197,125 @@ def query_native_geometry_batch(
     finally:
         budget.consumed = int(budget_state[0])
     return _freeze_batch(samples, distances, visits)
+
+
+def query_native_local_geometry_batch(
+    region_ids: np.ndarray,
+    include: np.ndarray,
+    query_regions: np.ndarray,
+    target_y: np.ndarray,
+    target_x: np.ndarray,
+    *,
+    radius_px: int,
+    budget: VisitBudget,
+) -> NativeBatchQueryResult:
+    """Resolve only grid-near geometry queries whose optimum is proven."""
+
+    if (
+        not isinstance(region_ids, np.ndarray)
+        or region_ids.dtype != np.uint32
+        or region_ids.ndim != 2
+        or not region_ids.shape[0]
+        or not region_ids.shape[1]
+        or not region_ids.flags.c_contiguous
+    ):
+        raise TypeError("region_ids must be a non-empty C-contiguous uint32 raster")
+    if (
+        not isinstance(include, np.ndarray)
+        or include.dtype != np.bool_
+        or include.shape != region_ids.shape
+        or not include.flags.c_contiguous
+    ):
+        raise TypeError("include must be a matching C-contiguous bool raster")
+    query_count = _validate_query_vector("query_regions", query_regions, np.uint32)
+    _validate_query_vector("target_y", target_y, np.float64, query_count)
+    _validate_query_vector("target_x", target_x, np.float64, query_count)
+    radius = _validate_nonnegative_integer("radius_px", radius_px)
+    if not isinstance(budget, VisitBudget):
+        raise TypeError("budget must be VisitBudget")
+    budget_state = np.asarray([budget.consumed, budget.limit], dtype=np.uint64)
+    native = _require_native()
+    try:
+        samples, distances, visits = native.query_local_geometry_batch(
+            region_ids,
+            include,
+            query_regions,
+            target_y,
+            target_x,
+            radius,
+            budget_state,
+        )
+    except RuntimeError as error:
+        if "quality geometry visit cap exceeded" in str(error):
+            raise QualityGeometryQueryBudgetError(
+                f"quality geometry visit cap {budget.limit} exceeded"
+            ) from error
+        raise
+    finally:
+        budget.consumed = int(budget_state[0])
+    return _freeze_batch(samples, distances, visits)
+
+
+def update_native_relative_total_inside_band(
+    total_disparity_fraction: np.ndarray,
+    near_score: np.ndarray,
+    edge_band: np.ndarray,
+    *,
+    strength: np.float64,
+    convergence: np.float64,
+) -> int:
+    """Update exact relative disparity only on the final edge band."""
+
+    shape = near_score.shape if isinstance(near_score, np.ndarray) else None
+    if (
+        not isinstance(near_score, np.ndarray)
+        or near_score.dtype != np.float32
+        or near_score.ndim != 2
+        or not near_score.shape[0]
+        or not near_score.shape[1]
+        or not near_score.flags.c_contiguous
+    ):
+        raise TypeError("near_score must be a non-empty C-contiguous float32 raster")
+    if (
+        not isinstance(total_disparity_fraction, np.ndarray)
+        or total_disparity_fraction.dtype != np.float64
+        or total_disparity_fraction.shape != shape
+        or not total_disparity_fraction.flags.c_contiguous
+        or not total_disparity_fraction.flags.writeable
+    ):
+        raise TypeError("total_disparity_fraction must be a writable matching float64 raster")
+    if (
+        not isinstance(edge_band, np.ndarray)
+        or edge_band.dtype != np.bool_
+        or edge_band.shape != shape
+        or not edge_band.flags.c_contiguous
+    ):
+        raise TypeError("edge_band must be a matching C-contiguous bool raster")
+    native = _require_native()
+    return int(
+        native.update_relative_total_inside_band(
+            total_disparity_fraction,
+            near_score,
+            edge_band,
+            strength,
+            convergence,
+        )
+    )
+
+
+def max_native_four_neighbour_jump(displacement: np.ndarray) -> float:
+    """Return the exact maximum horizontal or vertical binary64 jump."""
+
+    if (
+        not isinstance(displacement, np.ndarray)
+        or displacement.dtype != np.float64
+        or displacement.ndim != 2
+        or not displacement.shape[0]
+        or not displacement.shape[1]
+        or not displacement.flags.c_contiguous
+    ):
+        raise TypeError("displacement must be a non-empty C-contiguous float64 raster")
+    return float(_require_native().max_four_neighbour_jump(displacement))
 
 
 def _validate_index_and_budget(index: object, budget: object) -> None:

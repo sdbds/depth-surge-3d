@@ -1,4 +1,4 @@
-"""Canonical input evidence for assembled PNG frames sent through image2pipe."""
+"""Canonical input evidence for assembled PNG or raw RGB24 frames."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Literal
 
 from ...io.durable_publish import OwnedSiblingTemporary
 from ...io.file_identity import PersistedFileIdentityV1
@@ -25,6 +25,7 @@ from .encoding_provider import (
 from .streamed_vr_evidence import (
     StreamedVrInvocationV1,
     StreamedVrOutputEvidenceV1,
+    validate_raw_rgb24_input_v1,
 )
 
 
@@ -35,7 +36,7 @@ class CompletedStreamedVrInputManifestV1:
 
 
 class StreamedVrInputManifestV1:
-    """Write one bounded manifest while exact PNG payloads are piped to FFmpeg."""
+    """Write one bounded manifest while exact frame payloads are piped to FFmpeg."""
 
     def __init__(
         self,
@@ -43,6 +44,7 @@ class StreamedVrInputManifestV1:
         job_root: Path,
         provider: EncodingSequenceProvider,
         expected_shape: tuple[int, int],
+        input_format: Literal["png", "rgb24"] = "png",
         reservation_transaction: ReservedArtifactTransaction | None = None,
         invocation: StreamedVrInvocationV1 | None = None,
         owned_target_path: Path | None = None,
@@ -61,9 +63,23 @@ class StreamedVrInputManifestV1:
             or height <= 0
         ):
             raise ValueError("streamed VR manifest shape must be positive integers")
+        if input_format not in {"png", "rgb24"}:
+            raise ValueError("streamed VR input format is unsupported")
+        if input_format == "rgb24":
+            if invocation is None:
+                raise ValueError("raw RGB24 streaming requires invocation evidence")
+            if (
+                validate_raw_rgb24_input_v1(invocation.resolved_arguments_template)
+                != expected_shape
+                or invocation.expected_shape != expected_shape
+                or invocation.frame_count != provider.frame_count
+                or invocation.first_index != provider.first_index
+            ):
+                raise ValueError("raw RGB24 invocation differs from its frame sequence")
 
         self.provider = provider
         self.expected_shape = expected_shape
+        self.input_format = input_format
         self.invocation = invocation
         self.provider_audit = audit_encoding_provider(provider)
         root = Path(job_root).resolve()
@@ -136,11 +152,14 @@ class StreamedVrInputManifestV1:
 
     def _write_header(self) -> None:
         placeholder = b"0" * 64
-        algorithm = (
-            b"encoding-input-sequence-v3"
-            if self.invocation is not None
-            else b"encoding-input-sequence-v2"
-        )
+        if self.input_format == "rgb24":
+            algorithm = b"encoding-input-sequence-v4"
+        else:
+            algorithm = (
+                b"encoding-input-sequence-v3"
+                if self.invocation is not None
+                else b"encoding-input-sequence-v2"
+            )
         prefix = b'{"algorithm_version":"' + algorithm + b'","fingerprint":"'
         self._write(
             prefix + placeholder + b'"',
@@ -165,37 +184,48 @@ class StreamedVrInputManifestV1:
             handle.flush()
             os.fsync(handle.fileno())
 
-    def append(self, frame_name: str, png_payload: bytes) -> None:
+    def append(self, frame_name: str, frame_payload: bytes) -> None:
         if self._finished or self._handle is None:
             raise ValueError("streamed VR manifest is already closed")
         item = self._next_item
         if item is None or frame_name != item.frame_name:
             raise ValueError("streamed VR frames are not in source order")
-        if not isinstance(png_payload, bytes):
-            raise TypeError("streamed VR PNG payload must be immutable bytes")
+        if not isinstance(frame_payload, bytes):
+            raise TypeError("streamed VR frame payload must be immutable bytes")
         relative_path = item.frame_relative_path
         assert relative_path is not None
-        header = _parse_png_header(png_payload[:33], Path(relative_path.as_posix()))
-        if (header.width, header.height) != self.expected_shape:
-            raise ValueError("streamed VR PNG shape changed")
-        identity = {
-            "relative_path": relative_path.as_posix(),
-            "sha256": hashlib.sha256(png_payload).hexdigest(),
-            "byte_count": len(png_payload),
-            "png_header": {
-                "width": header.width,
-                "height": header.height,
-                "bit_depth": header.bit_depth,
-                "color_type": header.color_type,
-            },
-        }
+        if self.input_format == "rgb24":
+            width, height = self.expected_shape
+            if len(frame_payload) != 3 * width * height:
+                raise ValueError("streamed RGB24 byte count differs from the frame shape")
+            identity = {
+                "relative_path": relative_path.with_suffix(".rgb").as_posix(),
+                "sha256": hashlib.sha256(frame_payload).hexdigest(),
+                "byte_count": len(frame_payload),
+                "raw_frame": {"width": width, "height": height, "pixel_format": "rgb24"},
+            }
+        else:
+            header = _parse_png_header(frame_payload[:33], Path(relative_path.as_posix()))
+            if (header.width, header.height) != self.expected_shape:
+                raise ValueError("streamed VR PNG shape changed")
+            identity = {
+                "relative_path": relative_path.as_posix(),
+                "sha256": hashlib.sha256(frame_payload).hexdigest(),
+                "byte_count": len(frame_payload),
+                "png_header": {
+                    "width": header.width,
+                    "height": header.height,
+                    "bit_depth": header.bit_depth,
+                    "color_type": header.color_type,
+                },
+            }
         if self._count:
             self._write(b",")
         self._write(canonical_json_bytes(identity))
         self._trace.maximum_live_identities = 1
         self._trace.maximum_stream_bytes = max(
             self._trace.maximum_stream_bytes,
-            len(png_payload),
+            len(frame_payload),
         )
         self._count += 1
         self._next_item = next(self._items, None)
@@ -223,9 +253,12 @@ class StreamedVrInputManifestV1:
             else:
                 if output_evidence is None:
                     raise ValueError("recoverable streamed manifest lacks output evidence")
+                schema = b"3" if self.input_format == "rgb24" else b"2"
                 footer = (
                     b'],"left":null,"mode":"assembled_vr","right":null,'
-                    b'"schema_version":2,"streamed_output":'
+                    b'"schema_version":'
+                    + schema
+                    + b',"streamed_output":'
                     + canonical_json_bytes(output_evidence.to_object())
                     + b"}"
                 )

@@ -33,6 +33,8 @@ def validate_unicode_scalars(value: object) -> None:
     """Reject isolated UTF-16 surrogate code points recursively."""
 
     if isinstance(value, str):
+        if type(value) is str and value.isascii():
+            return
         if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
             raise CanonicalJsonError("JSON string contains an isolated surrogate")
         return
@@ -50,6 +52,10 @@ def canonical_json_bytes(value: object) -> bytes:
     """Encode one object using the project's exact canonical JSON spelling."""
 
     validate_unicode_scalars(value)
+    return _encode_validated_json(value)
+
+
+def _encode_validated_json(value: object) -> bytes:
     try:
         return json.dumps(
             value,
@@ -83,7 +89,9 @@ def strict_json_loads(raw: bytes, *, max_bytes: int | None = None) -> object:
         raise
     except (json.JSONDecodeError, UnicodeError, ValueError) as error:
         raise CanonicalJsonError("malformed JSON payload") from error
-    validate_unicode_scalars(value)
+    # Only Unicode escapes can introduce non-ASCII characters from ASCII JSON.
+    if type(raw) is not bytes or b"\\u" in raw:
+        validate_unicode_scalars(value)
     return value
 
 
@@ -91,6 +99,7 @@ def strict_canonical_json_loads(raw: bytes, *, max_bytes: int | None = None) -> 
     """Parse JSON and require its bytes to equal the canonical re-encoding."""
 
     value = strict_json_loads(raw, max_bytes=max_bytes)
-    if canonical_json_bytes(value) != raw:
+    # The fresh parsed tree has already passed scalar validation.
+    if _encode_validated_json(value) != raw:
         raise CanonicalJsonError("JSON payload is not in canonical byte form")
     return value
