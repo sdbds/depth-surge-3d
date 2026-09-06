@@ -1672,7 +1672,7 @@ def _max_four_neighbour_jump(displacement: np.ndarray) -> float:
 
 
 def _array_sha256(values: np.ndarray) -> str:
-    return hashlib.sha256(np.ascontiguousarray(values).tobytes()).hexdigest()
+    return hashlib.sha256(np.ascontiguousarray(values).data).hexdigest()
 
 
 def _validate_geometry_inputs(

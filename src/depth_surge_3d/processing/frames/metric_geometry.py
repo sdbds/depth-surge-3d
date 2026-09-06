@@ -18,6 +18,7 @@ from ...io.durable_publish import OwnedSiblingTemporary
 from ...core.depth_contract import canonical_json_hash
 from ...inference.depth.types import DepthRepresentation
 from .depth_storage import RawDepthStore
+from .scene_analyzer import select_scene_frame_indexes
 
 
 METRIC_GEOMETRY_SCHEMA_VERSION = 1
@@ -219,6 +220,13 @@ def select_convergence_frame_indexes(scene_ids: Sequence[int]) -> tuple[int, ...
 
     selected: list[int] = []
     scene_array = np.asarray(scene_ids)
+    if scene_array.ndim == 1 and scene_array.dtype.kind in "biu":
+        selected_mask = np.zeros(len(scene_array), dtype=np.bool_)
+        for indexes in select_scene_frame_indexes(scene_array).values():
+            selected_mask[indexes] = True
+        return tuple(int(value) for value in np.flatnonzero(selected_mask))
+
+    # Keep NumPy's original matching semantics for noninteger inputs.
     for scene_id in dict.fromkeys(int(value) for value in scene_ids):
         source_indexes = np.flatnonzero(scene_array == scene_id)
         if len(source_indexes) > 32:

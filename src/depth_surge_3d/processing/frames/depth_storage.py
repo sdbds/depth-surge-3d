@@ -170,7 +170,13 @@ def _atomic_save_npz(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
     temporary = path.with_name(f"{path.name}.tmp")
     try:
         with temporary.open("wb") as handle:
-            np.savez_compressed(handle, **arrays)
+            # Keep standard NPY members and ZIP64; spend less CPU on raw checkpoints.
+            with zipfile.ZipFile(
+                handle, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1
+            ) as archive:
+                for name, values in arrays.items():
+                    with archive.open(f"{name}.npy", "w", force_zip64=True) as member:
+                        np.lib.format.write_array(member, np.asanyarray(values))
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)

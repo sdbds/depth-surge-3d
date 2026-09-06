@@ -515,11 +515,11 @@ def test_failed_npz_write_leaves_neither_commit_nor_temporary(
         first_batch=batch,
     )
 
-    def fail_save(handle, **_arrays) -> None:
+    def fail_save(handle, _array, **_kwargs) -> None:
         handle.write(b"partial")
         raise OSError("simulated interrupted write")
 
-    monkeypatch.setattr(depth_storage_module.np, "savez_compressed", fail_save)
+    monkeypatch.setattr(depth_storage_module.np.lib.format, "write_array", fail_save)
     with pytest.raises(OSError, match="interrupted"):
         store.write_batch(["frame_000001.png"], batch)
 

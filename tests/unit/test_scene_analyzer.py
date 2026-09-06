@@ -123,6 +123,48 @@ def test_scene_sampling_uses_representation_score_and_ignores_invalid_values(
     np.testing.assert_allclose(samples[0], [0.0, -0.5, -1.0, -0.2, -0.4, -0.6, -0.8])
 
 
+@pytest.mark.parametrize("representation", list(DepthRepresentation))
+def test_scene_sampling_preserves_interleaved_sample32_arrays(tmp_path: Path, representation):
+    scene_ids = [8, 3] * 34 + [99]
+    raw_files = []
+    for index in range(len(scene_ids)):
+        values = np.array([[index + 1, np.nan], [0, index + 2]], dtype=np.float32)
+        path = tmp_path / f"frame_{index:06d}.npz"
+        np.savez_compressed(path, values=values)
+        raw_files.append(path)
+
+    expected = {}
+    for scene_id in [8, 3, 99]:
+        indexes = [index for index, value in enumerate(scene_ids) if value == scene_id]
+        positions = np.unique(
+            np.rint(np.linspace(0, len(indexes) - 1, min(len(indexes), 32))).astype(np.int64)
+        )
+        pieces = []
+        for position in positions:
+            index = indexes[int(position)]
+            if representation is DepthRepresentation.METRIC_DEPTH:
+                piece = np.array([1 / (index + 1), 1 / (index + 2)], dtype=np.float32)
+            elif representation is DepthRepresentation.RELATIVE_DEPTH:
+                piece = np.array([-index - 1, 0, -index - 2], dtype=np.float32)
+            else:
+                piece = np.array([index + 1, 0, index + 2], dtype=np.float32)
+            pieces.append(piece)
+        expected[scene_id] = np.concatenate(pieces)
+
+    samples = sample_scene_depths(raw_files, _candidate_manifest(scene_ids), representation)
+
+    assert list(samples) == [8, 3, 99]
+    for scene_id in expected:
+        assert samples[scene_id].dtype == np.float32
+        np.testing.assert_array_equal(samples[scene_id], expected[scene_id])
+
+
+def test_scene_sampling_empty_candidate_keeps_empty_result():
+    assert (
+        sample_scene_depths([], _candidate_manifest([]), DepthRepresentation.RELATIVE_DEPTH) == {}
+    )
+
+
 def test_finalization_merges_left_to_right_from_pooled_sample_unions() -> None:
     manifest = _candidate_manifest([0, 0, 1, 1, 2, 2])
     samples = {

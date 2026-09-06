@@ -38,10 +38,10 @@ def depth_to_score(
         np.divide(np.float32(1.0), source, out=score, where=valid)
     elif representation is DepthRepresentation.INVERSE_DEPTH:
         valid = finite
-        score[valid] = source[valid]
+        np.copyto(score, source, where=valid)
     elif representation is DepthRepresentation.RELATIVE_DEPTH:
         valid = finite
-        score[valid] = -source[valid]
+        np.negative(source, out=score, where=valid)
     else:
         raise TypeError(f"Unsupported depth representation: {representation!r}")
 
@@ -56,13 +56,15 @@ def canonicalize_depth(
     """Map raw values through immutable scene bounds to `0=far, 1=near`."""
 
     score, valid = depth_to_score(values, representation)
-    canonical = np.full(score.shape, np.float32(0.5), dtype=np.float32)
     if bounds.low == bounds.high:
-        return canonical
+        score.fill(np.float32(0.5))
+        return score
 
+    # Keep the gathered arithmetic unchanged; only reuse the private output buffer.
     scaled = (score[valid] - np.float32(bounds.low)) / np.float32(bounds.high - bounds.low)
-    canonical[valid] = np.clip(scaled, 0.0, 1.0).astype(np.float32, copy=False)
-    return canonical
+    score[valid] = np.clip(scaled, 0.0, 1.0).astype(np.float32, copy=False)
+    score[~valid] = np.float32(0.5)
+    return score
 
 
 def canonicalize_single_scene(batch: DepthBatch) -> np.ndarray:
@@ -88,7 +90,13 @@ def encode_canonical_png(values: np.ndarray) -> np.ndarray:
     canonical = np.asarray(values, dtype=np.float32)
     if not np.isfinite(canonical).all():
         raise ValueError("Canonical disparity must be finite before encoding")
-    return np.rint(np.clip(canonical, 0.0, 1.0) * np.float32(65535.0)).astype(np.uint16)
+    # NumPy's zero-dimensional clip result has distinct scalar promotion rules.
+    if canonical.ndim == 0:
+        return np.rint(np.clip(canonical, 0.0, 1.0) * np.float32(65535.0)).astype(np.uint16)
+    scratch = np.clip(canonical, 0.0, 1.0)
+    np.multiply(scratch, np.float32(65535.0), out=scratch)
+    np.rint(scratch, out=scratch)
+    return scratch.astype(np.uint16)
 
 
 def decode_canonical_png(values: np.ndarray) -> np.ndarray:

@@ -123,7 +123,8 @@ class ProcessingOrchestrator:
             raise ValueError("preselected render source must be base or stabilized")
         self._depth_model_released = False
         self._settings_file: Path | None = None  # Track settings file for error handling
-        self._start_time: float = 0.0  # Track processing start time
+        self._start_time: float = 0.0  # Monotonic processing start time
+        self.process_elapsed_seconds: float | None = None
         self._metric_clamp_summary: dict[str, Any] | None = None
         if hasattr(self.video_encoder, "defer_final_reservation_retirement"):
             self.video_encoder.defer_final_reservation_retirement = True
@@ -285,16 +286,23 @@ class ProcessingOrchestrator:
         Returns:
             True if successful, False otherwise
 
+        Timing:
+            process_elapsed_seconds measures this invocation, including final audit
+            and model/owned-lock teardown, on success or failure. It excludes caller
+            preparation (including upstream model loading) and prior resume attempts.
+            The completion banner ends at successful finalization, before teardown.
+
         Side effects:
             - Console output
             - Filesystem state management
             - Delegates to all processor modules
         """
         self._depth_model_released = False
+        self.process_elapsed_seconds = None
         owns_job_lock = job_lock is None
         try:
             # Start timer
-            self._start_time = time.time()
+            self._start_time = time.perf_counter()
 
             if job_lock is None:
                 output_dir.mkdir(parents=True, exist_ok=True)
@@ -353,8 +361,11 @@ class ProcessingOrchestrator:
             try:
                 self._release_depth_model()
             finally:
-                if owns_job_lock and job_lock is not None:
-                    job_lock.release()
+                try:
+                    if owns_job_lock and job_lock is not None:
+                        job_lock.release()
+                finally:
+                    self.process_elapsed_seconds = time.perf_counter() - self._start_time
 
     def _execute_legacy_fast_adoption(
         self,
@@ -1130,9 +1141,9 @@ class ProcessingOrchestrator:
             - Console output
         """
         if success:
-            # Calculate processing time
-            elapsed_time = time.time() - self._start_time
-            formatted_time = self._format_processing_time(elapsed_time)
+            # Preserve the legacy pre-finalization snapshot. Schema 5 ignores this
+            # field and freezes its duration from terminal_at in the terminal artifact.
+            elapsed_time = time.perf_counter() - self._start_time
 
             # Generate output filename
             output_filename = self._expected_output_filename(video_path, settings)
@@ -1231,7 +1242,9 @@ class ProcessingOrchestrator:
 
             completion_banner(
                 output_file=output_file_path,
-                processing_time=formatted_time,
+                processing_time=self._format_processing_time(
+                    time.perf_counter() - self._start_time
+                ),
                 num_frames=num_frames,
                 vr_format=settings["vr_format"],
             )

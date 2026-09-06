@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import cv2
 import numpy as np
@@ -124,6 +124,18 @@ def _even_indexes(length: int, limit: int) -> np.ndarray:
     return np.unique(np.rint(np.linspace(0, length - 1, count)).astype(np.int64))
 
 
+def select_scene_frame_indexes(scene_ids: Iterable[int], limit: int = 32) -> dict[int, list[int]]:
+    """Group integer scene IDs once and select source-ordered frames per scene."""
+
+    grouped: dict[int, list[int]] = {}
+    for index, scene_id in enumerate(scene_ids):
+        grouped.setdefault(int(scene_id), []).append(index)
+    return {
+        scene_id: [indexes[int(position)] for position in _even_indexes(len(indexes), limit)]
+        for scene_id, indexes in grouped.items()
+    }
+
+
 def _load_raw_map(path: Path) -> np.ndarray:
     with np.load(path, allow_pickle=False) as payload:
         if "values" not in payload:
@@ -148,12 +160,10 @@ def sample_scene_depths(
         raise ValueError("Raw file count must match scene manifest frame count")
 
     samples: dict[int, np.ndarray] = {}
-    for scene_id in dict.fromkeys(scene_ids):
-        frame_indexes = [index for index, value in enumerate(scene_ids) if value == scene_id]
-        selected = _even_indexes(len(frame_indexes), 32)
+    for scene_id, frame_indexes in select_scene_frame_indexes(scene_ids).items():
         pieces: list[np.ndarray] = []
-        for local_index in selected:
-            values = _load_raw_map(raw_files[frame_indexes[int(local_index)]])
+        for frame_index in frame_indexes:
+            values = _load_raw_map(raw_files[frame_index])
             score, valid = depth_to_score(values, representation)
             y_indexes = _even_indexes(values.shape[0], 64)
             x_indexes = _even_indexes(values.shape[1], 64)

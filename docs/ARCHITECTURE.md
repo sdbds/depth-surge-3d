@@ -71,6 +71,145 @@ a full batch. Encountering an already completed chunk during resume clears this
 transient state. This keeps model batch context and stored values unchanged
 while avoiding repeated inference for consecutive holds or duplicated frames.
 
+### See-Through Inference Overhead
+
+The opaque CUDA runner keeps scheduler timestep indices on the CPU and copies
+the timestep vector once for the UNet. DDIM coefficient tables live on the CPU;
+passing CUDA indices to them caused 22 scalar device-to-host reads per four-step
+batch. The regression test now observes zero such reads without changing the
+scheduler, timestep values, noise seed, precision, or denoising step count.
+
+For uint8 video frames, resize runs on BGR first, then RGB channels are copied
+directly into one preallocated inference-size batch. This avoids full-source
+RGB copies and the final stack allocation. Non-uint8 inputs retain the original
+RGB-before-resize and stack path, preserving both SIMD rounding and OpenCV's
+returned dtype/byte order rather than assuming it matches the input array.
+The preprocessing fingerprint is unchanged: this is an exact-output
+optimization, not a new depth algorithm.
+
+The September 4, 2026 local comparison against `a19e973` used RTX 4090,
+PyTorch 2.13.0+cu130, BF16, four steps, batch four, and the pinned See-Through
+snapshot `aa7a892f83ff68d7b09186a405ba08d5d33f770f`. It sampled 48 real frames
+across four parts of the 473-frame source, from 1920x1080 to native 1080x608.
+Three alternating A/B pairs measured estimator calls after loading and warmup:
+
+| Measurement | Baseline | Candidate |
+| --- | ---: | ---: |
+| Median depth estimation for 48 frames | 17.113 s | 16.199 s |
+| Preprocessing peak allocation, four 1080p frames | 21,982,480 bytes | 11,820,024 bytes |
+
+Estimator latency fell 5.34%; every measured float32 depth array had identical
+SHA-256 `4be99653bb79ff427f9cd94bbc89b8337f3d8383183e72ebcb80ec8bf2a04b93`.
+Independent tail batches of one, two, and three frames also matched exactly.
+All 473 source frames produced identical resized RGB pixels. These measurements
+exclude extraction, model loading, storage, stereo rendering, and final video
+encoding; they do not establish a 5.34% reduction in complete-task time.
+The local harness and reports are retained under
+`build/see-through-depth-profile-20260904/` (`compare.py`, `comparison.json`).
+
+Two acceleration probes were deliberately not enabled. Capturing UNet and VAE
+calls with CUDA Graphs preserved exact output but reduced warm estimator time
+only about 4%, with additional startup and state-management cost. Compiling only
+the UNet with `torch.compile` also saved about 4% warm, but the first 16-frame
+call took 284.365 seconds and depth differences reached 0.19921875 on a [0,1]
+scale. Neither result justifies a default backend switch. TensorRT was not part
+of those probes. CUDA-event samples put UNet near 44% and combined
+VAE encode/decode near 44% of warm batch wall time, so UNet-only acceleration
+must not be presented as acceleration of the entire depth stage.
+
+The subsequent RGB-upload change keeps video bytes as uint8 until they reach
+CUDA, then normalizes on-device for FP16/BF16 VAE inputs. All 256 byte values
+round exactly as the old CPU-FP32-then-cast path in both dtypes. FP32, CPU,
+and non-uint8 inputs retain the original normalization order. Negative-stride
+inputs are materialized as contiguous bytes before upload. No model precision,
+depth fingerprint, scheduler setting, or retention policy changes.
+
+For a four-frame 1080x608 RGB batch, 32 alternating microbenchmark samples
+(first four discarded) measured BF16 normalization/upload at 34.763 ms versus
+1.751 ms; FP16 measured 34.665 ms versus 1.802 ms. This is only the input step.
+Four full 48-frame A/B pairs all preserved exact depth output, but concurrent
+external GPU graphics/compute load invalidated the latency comparison. The
+owned benchmark was stopped before remaining validation completed; no complete-
+task or additional estimator speedup is claimed from those interrupted runs.
+Observations and a rerunnable
+harness are retained as `rgb-transfer-observations.json` and `compare_rgb.py`
+in the same local profile directory. The earlier 5.34% comparison above covers
+only the earlier resize/scheduler changes, not this RGB-upload addition.
+
+A later replay after the interfering process had exited completed four
+alternating A/B pairs on the same 48 real frames. Both paths included the
+resize/scheduler changes; only RGB normalization/upload differed. Median
+estimator latency was 16.136950 seconds for CPU float32 staging and 15.676624
+seconds for uint8 GPU upload, a 2.85% reduction in this comparison. All eight
+measured float32 depth arrays, both warmups, and independent tail batches of
+one, two, and three frames matched exactly. The 48-frame SHA-256 remained
+`4be99653bb79ff427f9cd94bbc89b8337f3d8383183e72ebcb80ec8bf2a04b93`.
+`rgb-transfer-comparison.json` and `rgb-transfer-idle-comparison.log` contain
+the completed run. This is an additional isolated estimator measurement,
+not a complete-task improvement or an additive claim with the earlier 5.34%.
+
+A VAE channels-last probe was also rejected: 16-frame eager calls measured
+5.260/5.265 seconds, versus 6.007/6.063 seconds with the changed layout. It was
+slower and failed exact equivalence (maximum depth difference 0.234375). This
+does not establish behavior on every device, but provides no reason to change
+the default on the measured RTX 4090.
+
+Before source prefetch was implemented, `_infer_raw_chunk` loaded and stacked
+PNGs, invoked the estimator, then completed `RawDepthStore.write_batch` before
+any next batch started. Historical CPU-only 48-frame probes under shared system
+load measured PNG load/stack at
+1.855/2.949/3.558 seconds and float16 NPZ compression to memory at
+2.097/3.050/3.158 seconds (4,303,366 encoded bytes). These are not idle-machine
+end-to-end timings and exclude NPZ disk writes. That observation motivated the
+current bounded prefetch: `_load_raw_chunk_array` can decode the next batch
+while `_infer_raw_chunk` performs inference and ordered raw writes on the caller.
+The current limits and failure behavior are documented under Memory And I/O.
+
+### TensorRT Feasibility Probe
+
+A subsequent September 4 probe installed Torch-TensorRT 2.13.0 and TensorRT
+11.0.0.114 into `build/tensorrt-probe-20260904/packages`, not the application's
+environment. It used the same checkpoint, BF16, four denoising steps, batch
+four, and native 1080x608 resolution. No quantization or model-setting change
+was made. TF32 was disabled in the TensorRT builder.
+
+The initial JIT dry run reported full converter coverage: UNet 3222/3222 ops,
+VAE encoder 206/206, and VAE decoder 254/254. Separate AOT runs then built and
+executed actual full-component engines, followed by a combined run of all
+three engines. All tested engine outputs were finite and repeatable. Saved
+UNet, encoder, and decoder artifacts each reproduced their pre-save component
+output exactly after reload; this is not equivalence to native PyTorch.
+
+The combined 16-frame sample covered four positions in the real video. Native
+estimator calls bracketing the experiment took 5.455 and 5.383 seconds; four
+warm TensorRT calls took 3.459, 3.401, 3.410, and 3.420 seconds. These are
+feasibility observations, not a controlled sustained A/B or complete-task
+benchmark. Report files retain `latency_claim_valid=false`. PyTorch allocator
+peaks also exclude TensorRT allocations and must not be reported as total VRAM
+savings. The first observed component builds took 217.134 seconds for UNet,
+65.825 seconds for the encoder, and 43.342 seconds for the decoder. In the
+combined run, reloading the saved UNet alone took 23.209 seconds; startup and
+artifact handling therefore need separate measurement from warm inference.
+
+Native outputs matched before and after every experiment, but the combined
+TensorRT depth output did not: maximum absolute difference 0.453125, mean
+0.001117783, and p99 0.01171875 on the [0,1] depth scale. These are differences,
+not percentages of lost quality. A downstream diagnostic used the original
+scene bounds, unchanged float16 raw storage and uint16 canonical encoding,
+and the production Fast offset functions at 1920x1080. On those 16 frames,
+the largest left-eye sample-offset change was 6.875 pixels; the largest
+per-frame p99 was 0.3125 pixels. This diagnostic holds scene bounds fixed and
+does not test recalibration, final rendered images, Quality geometry, or
+temporal stability. It neither proves a visible regression nor certifies
+quality preservation.
+
+TensorRT remains an isolated experiment, not an application backend. The
+throwaway harness, per-component and combined JSON reports, saved sample
+depths, and geometry diagnostics are retained under
+`build/tensorrt-probe-20260904/`. A backend change requires representative final
+stereo/temporal quality validation and an end-to-end timing comparison; the
+current results do not satisfy that gate.
+
 ## Relative And Metric Geometry
 
 Relative mode remains the default and derives `03_disparity_maps`. Experimental
@@ -213,6 +352,14 @@ and stable-surface filters before leaving native code, avoiding a writable
 full-frame copy and NumPy lookup raster. Geometry also takes mutable ownership
 of the native geodesic owner raster and freezes it with the other final outputs,
 rather than copying that raster between the geodesic and matte stages.
+
+Geometry integrity checks hash the C-contiguous region buffer directly rather
+than materializing an additional Python `bytes` object. Both before/after
+checks remain in place and retain the same C-order byte digest, including for
+non-contiguous input after normalization. This removes an 8,294,400-byte copy
+per check for a 1920x1080 uint32 raster without changing the memory admission
+budget or renderer identity. The buffer must not be mutated concurrently with
+hashing; current geometry construction owns these region maps.
 
 Relative Quality updates the final edge-band disparity in one native raster
 pass rather than issuing one NumPy gather and scatter per output row. The final
@@ -911,6 +1058,94 @@ error types, messages, loaded bytes, read requests and both digest boundaries.
 
 The legacy in-memory depth API rejects projected outputs over 512 MiB. The main
 video pipeline remains file-backed.
+
+Framewise raw-depth generation prefetches at most one subsequent input batch
+on a single decoder thread. PNG headers bound the additional decoded BGR arrays
+and their contiguous stack to 256 MiB; unknown headers or oversized batches use
+the serial path. This is a source-buffer budget, not a process-RSS or decoder
+scratch-space guarantee. A background `MemoryError` retries on the caller
+and disables further prefetch for that raw stage. Decoded per-frame arrays are
+released before inference rather than being retained alongside the stack.
+
+Inference, native-output validation, dtype promotion, raw writes, and metadata
+commits remain ordered on the caller. Complete resume chunks are not decoded
+and still reset consecutive-batch reuse. The loader is joined on every exit,
+including interruption; a later decode failure cannot hide an earlier inference
+or write failure. No raw-to-Stage-3 barrier, batch grouping, precision, model
+setting, or VDA temporal-window rule changes. VDA continues to use its existing
+sequence path without this framewise prefetch.
+
+Scene sampling groups integer scene IDs once instead of scanning the entire
+clip for each scene. First-seen scene order, source-frame order, the exact
+linspace/rint/unique sample-32 rule, and persisted frame-index arrays are
+unchanged. Metric convergence uses a linear selection mask to restore global
+source order, while noninteger inputs retain the previous NumPy matching path.
+Depth conversion, spatial sampling, percentile arithmetic and artifact versions
+are unchanged. The grouping trades O(N) temporary indexes for O(N) traversal
+instead of O(N * scene_count) repeated scans.
+
+Runtime timing uses a monotonic clock. The completion banner is sampled after
+successful terminal media audit, rather than before finalization. The
+orchestrator's in-memory `process_elapsed_seconds` measures its current
+`process()` invocation through model release and owned-lock teardown, on success
+or failure; callers must interpret it alongside the outcome. It excludes
+upstream model loading, caller preparation, and earlier resume attempts. The
+banner precedes teardown and therefore has a narrower boundary. Persisted
+timing contracts are unchanged: schema 5 freezes duration from `terminal_at`,
+and legacy metadata retains its pre-finalization snapshot. Neither persisted
+field is a substitute for the new invocation measurement.
+
+A local 48-frame, 1920x1080 See-Through comparison held the existing estimator,
+model artifact, batch grouping, resolution, precision and retention settings
+fixed. After complete warmups of both paths, three alternating measured pairs
+reduced the `generate_depth_map_files` median from 22.815 s to 19.691 s
+(13.69 percent less); raw-stage medians were 21.378 s and 18.380 s. All 101
+generated artifacts matched by SHA-256 in every warmup and measured run,
+including raw NPZs, canonical PNGs, scene samples and metadata. This scope
+excludes source extraction, model loading, stereo rendering, encoding and final
+audit. Unrelated GPU activity was present on the shared workstation; these are
+local warmed observations, not a whole-video performance guarantee. The
+isolated harness and JSON results are retained under
+`build/raw-prefetch-profile-20260905/`.
+
+A separate five-round CPU-only index microbenchmark used 60,000 integer frame
+IDs across 600 scenes of 100 frames. Median selection fell from 2.975 s to
+0.083 s for contiguous scenes and from 2.634 s to 0.059 s for interleaved IDs;
+ordered index lists matched exactly on every execution. These numbers cover
+only scene-index selection, not depth loading, sampling arithmetic or GPU work,
+and do not measure peak memory.
+
+Raw NPZ writes use standard lossless DEFLATE level 1 with the same NPY member
+bytes, ZIP64 support and atomic replacement/temporary-file cleanup contract.
+Existing higher-compression files remain readable and can coexist with new
+files during resume. The `npz_deflate` compression family and artifact schema
+are unchanged; compressed container bytes may differ, but stored precision,
+camera values and metadata identities do not. Lower compression trades disk
+space for less CPU work; disk preflight continues to use uncompressed bounds.
+
+Depth normalization reuses private score and quantization buffers without
+mutating caller arrays. Gathered subtraction/division, clipping, percentile
+sampling and rounding order remain unchanged. Scalar quantization retains its
+original NumPy expression to preserve scalar promotion behavior. Differential
+tests compare float bytes and encoded uint16 values, including special values,
+strided/read-only inputs and quantization boundaries. For 1,048,576 float32
+elements, traced peak allocations fell from 17,826,792 to 13,632,392 bytes for
+canonicalization and from 8,389,044 to 6,291,768 bytes for encoding. These are
+local operation allocations, not whole-process memory bounds.
+
+A second local 48-frame See-Through comparison retained the previous prefetch
+and scene-index optimizations in both arms. Complete warmups followed by three
+alternating measured pairs reduced the depth-generation median from 19.410 s
+to 18.717 s (3.57 percent less). Raw NPZ storage increased from 2,972,303 to
+3,985,256 bytes (34.08 percent); all stage artifacts together increased from
+6,932,204 to 7,945,157 bytes (14.61 percent), excluding source frames. Every
+raw NPY member matched byte-for-byte and every other artifact, including all
+48 canonical PNGs and scene/metadata files, matched by SHA-256 in all runs.
+This measures `generate_depth_map_files`, not extraction, model loading, stereo
+rendering, encoding or final audit. Shared GPU activity and observed per-run
+variation limit extrapolation; this is not a whole-video speed guarantee or
+an additive claim with the earlier benchmark. The harness and JSON results
+are retained under `build/raw-lossless-profile-20260905/`.
 
 Metric-camera disk preflight covers both missing raw payloads and the complete
 metric store. The native output estimate is checked before inference and the

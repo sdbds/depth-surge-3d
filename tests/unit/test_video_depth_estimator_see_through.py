@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import tracemalloc
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -31,6 +32,67 @@ def _make_vendor_tree(root: Path) -> Path:
     marker.parent.mkdir(parents=True)
     marker.write_text("# test marker\n", encoding="utf-8")
     return root
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA RGB transfer regression")
+def test_rgb_upload_preserves_all_byte_values_without_host_float_expansion(dtype, reverse):
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    module = _module()
+    values = np.arange(256, dtype=np.uint8).reshape(1, 16, 16, 1).repeat(3, axis=-1)
+    if reverse:
+        values = values[:, :, ::-1]
+    original = values.copy()
+    expected = torch.from_numpy(values.astype(np.float32) / np.float32(255.0))
+    expected = expected.permute(0, 3, 1, 2).to(device="cuda", dtype=dtype) * 2.0 - 1.0
+    uploads = []
+
+    class Uploads(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if (
+                func == torch.ops.aten._to_copy.default
+                and args[0].device.type == "cpu"
+                and args[0].ndim == 4
+                and torch.device(kwargs.get("device", "cpu")).type == "cuda"
+            ):
+                uploads.append((args[0].dtype, args[0].numel()))
+            return func(*args, **kwargs)
+
+    with Uploads():
+        actual = module._prepare_rgb_tensor(values, device="cuda", dtype=dtype)
+
+    assert torch.equal(actual, expected)
+    assert actual.stride() == expected.stride()
+    np.testing.assert_array_equal(values, original)
+    assert uploads == [(torch.uint8, values.size)]
+
+
+@pytest.mark.parametrize("input_dtype", [np.uint8, np.float32, np.float64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_rgb_preparation_preserves_cpu_and_non_byte_numerics(input_dtype, dtype):
+    module = _module()
+    values = np.linspace(0, 255, 96).reshape(2, 4, 4, 3).astype(input_dtype)
+    expected = torch.from_numpy(values.astype(np.float32) / np.float32(255.0))
+    expected = expected.permute(0, 3, 1, 2).to(dtype=dtype) * 2.0 - 1.0
+
+    actual = module._prepare_rgb_tensor(values, device="cpu", dtype=dtype)
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA FP32 compatibility")
+def test_rgb_preparation_keeps_cpu_rounding_for_cuda_fp32():
+    module = _module()
+    values = np.arange(256, dtype=np.uint8).reshape(1, 16, 16, 1).repeat(3, axis=-1)
+    expected = torch.from_numpy(values.astype(np.float32) / np.float32(255.0))
+    expected = expected.permute(0, 3, 1, 2).to(device="cuda") * 2.0 - 1.0
+
+    actual = module._prepare_rgb_tensor(values, device="cuda", dtype=torch.float32)
+
+    assert torch.equal(actual, expected)
 
 
 class TestSeeThroughDepthEstimator:
@@ -89,6 +151,74 @@ class TestSeeThroughDepthEstimator:
         assert estimator.estimate_output_shape(3840, 2160, 512) == (288, 512)
         assert estimator.estimate_output_shape(1920, 1080, 1080) == (608, 1080)
         assert estimator.estimate_output_shape(1080, 1920, 1080) == (1080, 608)
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            np.uint8,
+            np.uint16,
+            np.float32,
+            np.float64,
+            np.dtype(np.uint16).newbyteorder("S"),
+            np.dtype(np.float32).newbyteorder("S"),
+            np.dtype(np.float64).newbyteorder("S"),
+        ],
+    )
+    @pytest.mark.parametrize("output_shape", [(16, 24), (80, 96), (48, 48)])
+    @pytest.mark.parametrize("readonly", [False, True])
+    def test_rgb_resize_preserves_pixels_dtype_and_noncontiguous_inputs(
+        self, dtype, output_shape, readonly
+    ):
+        import cv2
+
+        module = _module()
+        rng = np.random.default_rng(42)
+        frames = rng.integers(0, 256, size=(3, 37, 122, 3), dtype=np.uint8).astype(dtype)
+        frames = frames[:, :, ::2]
+        if readonly:
+            frames.setflags(write=False)
+        original = frames.copy()
+        height, width = output_shape
+        interpolation = (
+            cv2.INTER_AREA if max(frames.shape[1:3]) > max(output_shape) else cv2.INTER_LINEAR
+        )
+        expected = np.stack(
+            [
+                cv2.resize(
+                    np.ascontiguousarray(frame[..., ::-1]),
+                    (width, height),
+                    interpolation=interpolation,
+                )
+                for frame in frames
+            ]
+        )
+
+        actual = module.SeeThroughDepthEstimator._resize_rgb_frames(frames, height, width)
+
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(frames, original)
+        assert actual.dtype == expected.dtype
+        assert actual.flags.c_contiguous
+
+    def test_rgb_downsize_bounds_temporary_memory_by_output_not_source_resolution(self):
+        import cv2  # noqa: F401
+
+        module = _module()
+        frames = np.zeros((4, 640, 1080, 3), dtype=np.uint8)
+        tracing = tracemalloc.is_tracing()
+        if not tracing:
+            tracemalloc.start()
+        try:
+            baseline, _ = tracemalloc.get_traced_memory()
+            tracemalloc.reset_peak()
+            result = module.SeeThroughDepthEstimator._resize_rgb_frames(frames, 160, 272)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            if not tracing:
+                tracemalloc.stop()
+
+        # One result batch and small resized scratch frames, not a full-size RGB copy.
+        assert peak - baseline < 3 * result.nbytes
 
     def test_resolve_source_root_prefers_explicit_path(self, tmp_path):
         module = _module()
@@ -320,3 +450,50 @@ def test_depth_processor_honors_estimator_batch_limit():
 
     assert input_size == 1080
     assert chunk_size == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA synchronization regression")
+def test_opaque_denoising_does_not_read_cuda_scalars_for_cpu_scheduler_indices():
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    diffusers = pytest.importorskip("diffusers")
+    module = _module()
+    unet_timesteps = []
+
+    class ScalarReads(TorchDispatchMode):
+        cuda_reads = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func == torch.ops.aten._local_scalar_dense.default and args[0].is_cuda:
+                self.cuda_reads += 1
+            return func(*args, **(kwargs or {}))
+
+    class TinyUNet:
+        device = torch.device("cuda")
+        dtype = torch.float32
+
+        def __call__(self, sample, timestep, encoder_hidden_states):
+            assert timestep.is_cuda
+            unet_timesteps.append(timestep.clone())
+            return SimpleNamespace(sample=sample[:, :, -4:] * 0.1)
+
+    pipeline = SimpleNamespace(
+        vae=SimpleNamespace(device=torch.device("cuda"), dtype=torch.float32),
+        unet=TinyUNet(),
+        scheduler=diffusers.DDIMScheduler(num_train_timesteps=16),
+        empty_text_embed=torch.zeros((1, 2, 3), device="cuda"),
+        encode_rgb=lambda values: torch.cat((values, values[:, :1]), dim=1),
+        decode_depth=lambda values: values.mean(dim=1, keepdim=True),
+    )
+    with ScalarReads() as reads:
+        result = module._run_opaque_marigold_batch(
+            pipeline=pipeline,
+            rgb_frames=np.zeros((2, 8, 8, 3), dtype=np.uint8),
+            denoising_steps=4,
+            seed=1026,
+        )
+
+    assert result.shape == (2, 8, 8)
+    np.testing.assert_array_equal(result[0], result[1])
+    assert torch.stack(unet_timesteps).cpu().tolist() == [12, 8, 4, 0]
+    assert reads.cuda_reads == 0

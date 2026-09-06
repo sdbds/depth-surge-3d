@@ -27,6 +27,25 @@ PipelineLoader = Callable[..., Any]
 BatchRunner = Callable[..., np.ndarray]
 
 
+def _prepare_rgb_tensor(
+    rgb_frames: np.ndarray, *, device: str | torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Prepare VAE inputs without changing normalization and rounding."""
+    if (
+        rgb_frames.dtype == np.uint8
+        and torch.device(device).type == "cuda"
+        and dtype in (torch.float16, torch.bfloat16)
+    ):
+        # Every byte normalizes identically in FP16/BF16; avoid host FP32 staging.
+        rgb_tensor = torch.from_numpy(np.ascontiguousarray(rgb_frames)).permute(0, 3, 1, 2)
+        rgb_tensor = rgb_tensor.to(device=device).to(dtype=dtype).div_(255.0)
+    else:
+        rgb_values = np.asarray(rgb_frames, dtype=np.float32) / np.float32(255.0)
+        rgb_tensor = torch.from_numpy(rgb_values).permute(0, 3, 1, 2)
+        rgb_tensor = rgb_tensor.to(device=device, dtype=dtype)
+    return rgb_tensor * 2.0 - 1.0
+
+
 def _run_opaque_marigold_batch(
     *,
     pipeline: Any,
@@ -39,10 +58,10 @@ def _run_opaque_marigold_batch(
         raise ValueError("rgb_frames must have shape [N, H, W, 3]")
 
     with torch.no_grad():
-        rgb_values = np.asarray(rgb_frames, dtype=np.float32) / np.float32(255.0)
-        rgb_tensor = torch.from_numpy(rgb_values).permute(0, 3, 1, 2)
-        rgb_tensor = rgb_tensor.to(device=pipeline.vae.device, dtype=pipeline.vae.dtype)
-        rgb_latent = pipeline.encode_rgb(rgb_tensor * 2.0 - 1.0)
+        rgb_tensor = _prepare_rgb_tensor(
+            rgb_frames, device=pipeline.vae.device, dtype=pipeline.vae.dtype
+        )
+        rgb_latent = pipeline.encode_rgb(rgb_tensor)
 
         # The sole opaque layer and full-page condition are the same image.
         condition_latent = torch.cat((rgb_latent, rgb_latent), dim=1)
@@ -57,7 +76,9 @@ def _run_opaque_marigold_batch(
         )
         target_latent = initial_noise.expand(batch_size, -1, -1, -1).clone()
 
-        pipeline.scheduler.set_timesteps(denoising_steps, device=device)
+        # The scheduler indexes CPU coefficient tables; only the UNet needs CUDA times.
+        pipeline.scheduler.set_timesteps(denoising_steps, device="cpu")
+        unet_timesteps = pipeline.scheduler.timesteps.to(device=device)
         if pipeline.empty_text_embed is None:
             pipeline.encode_empty_text()
         text_embedding = pipeline.empty_text_embed.repeat((batch_size, 1, 1)).to(
@@ -65,11 +86,11 @@ def _run_opaque_marigold_batch(
             dtype=target_latent.dtype,
         )
 
-        for timestep in pipeline.scheduler.timesteps:
+        for timestep, unet_timestep in zip(pipeline.scheduler.timesteps, unet_timesteps):
             unet_input = torch.cat((condition_latent, target_latent), dim=1).unsqueeze(1)
             noise_prediction = pipeline.unet(
                 unet_input,
-                timestep,
+                unet_timestep,
                 encoder_hidden_states=text_embedding,
             ).sample[:, 0]
             target_latent = pipeline.scheduler.step(
@@ -320,22 +341,37 @@ class SeeThroughDepthEstimator:
     ) -> np.ndarray:
         import cv2
 
-        resized_frames = []
-        for frame in frames:
-            rgb_frame = np.ascontiguousarray(frame[..., ::-1])
-            interpolation = (
-                cv2.INTER_AREA
-                if max(frame.shape[:2]) > max(processing_height, processing_width)
-                else cv2.INTER_LINEAR
+        if len(frames) == 0:
+            raise ValueError("frames must not be empty")
+        interpolation = (
+            cv2.INTER_AREA
+            if max(frames.shape[1:3]) > max(processing_height, processing_width)
+            else cv2.INTER_LINEAR
+        )
+        if frames.dtype != np.uint8:
+            # Preserve RGB-first rounding and OpenCV's returned dtype/byte order.
+            return np.stack(
+                [
+                    cv2.resize(
+                        np.ascontiguousarray(frame[..., ::-1]),
+                        (processing_width, processing_height),
+                        interpolation=interpolation,
+                    )
+                    for frame in frames
+                ]
             )
-            resized_frames.append(
-                cv2.resize(
-                    rgb_frame,
-                    (processing_width, processing_height),
-                    interpolation=interpolation,
-                )
+        resized_frames = np.empty(
+            (len(frames), processing_height, processing_width, 3), dtype=frames.dtype
+        )
+        for index, frame in enumerate(frames):
+            resized_bgr = cv2.resize(
+                frame,
+                (processing_width, processing_height),
+                interpolation=interpolation,
             )
-        return np.stack(resized_frames)
+            # Channel-independent resize lets the RGB copy stay at inference resolution.
+            cv2.mixChannels([resized_bgr], [resized_frames[index]], [0, 2, 1, 1, 2, 0])
+        return resized_frames
 
     def _estimate_cuda_batches(
         self,

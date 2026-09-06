@@ -264,6 +264,75 @@ class TestSetupProcessing:
 class TestFinalizeProcessing:
     """Test _finalize_processing method."""
 
+    @pytest.mark.parametrize("audit_result", [True, False, "error"])
+    def test_completion_time_includes_cleanup_and_terminal_audit(
+        self, tmp_path, monkeypatch, capsys, audit_result
+    ):
+        from src.depth_surge_3d.processing.orchestration import pipeline_orchestrator as module
+
+        clock = SimpleNamespace(now=1010.0)
+
+        def advance(seconds, result=None):
+            clock.now += seconds
+            return result
+
+        reservation = SimpleNamespace(
+            recover_publication_prefix=lambda: SimpleNamespace(phase="publication_authenticated"),
+            validate_authenticated_publication=lambda: advance(1),
+        )
+        encoder = SimpleNamespace(
+            pending_final_encoding_reservation=reservation,
+            retire_final_encoding_reservation=lambda **_kwargs: advance(1),
+        )
+        orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), encoder)
+        orchestrator._start_time = 1000.0
+        orchestrator._settings_file = tmp_path / "processing-settings-v5.json"
+        terminal_updates = []
+
+        def commit_terminal(*args):
+            terminal_updates.append(args)
+            return advance(1, True)
+
+        def audit(*_args):
+            advance(2)
+            if audit_result == "error":
+                raise ValueError("audit failed")
+            return SimpleNamespace(final_video_authenticated=audit_result)
+
+        monkeypatch.setattr(module.time, "time", lambda: 1010.0)
+        monkeypatch.setattr(module.time, "perf_counter", lambda: clock.now)
+        monkeypatch.setattr(module, "load_processing_settings", lambda _path: None)
+        monkeypatch.setattr(module, "commit_payload_pruned", lambda *_args, **_kwargs: {})
+        monkeypatch.setattr(module, "commit_cleanup_pending_status", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            module, "run_authorized_cleanup", lambda *_args, **_kwargs: advance(5, 3)
+        )
+        monkeypatch.setattr(module, "update_processing_status", commit_terminal)
+        monkeypatch.setattr(module, "recover_processing_settings_artifact", lambda _path: object())
+        monkeypatch.setattr(module, "audit_final_media_v1", audit)
+
+        result = orchestrator._finalize_processing(
+            True,
+            tmp_path,
+            "source.mp4",
+            {
+                "vr_format": "side_by_side",
+                "vr_resolution": "16x9-1080p",
+                "keep_intermediates": False,
+            },
+            3,
+        )
+
+        output = capsys.readouterr().out
+        assert result is (audit_result is True)
+        assert len(terminal_updates) == 1
+        if audit_result is True:
+            assert "PROCESSING COMPLETE" in output
+            # 10 pipeline + 1 validation + 5 cleanup + 1 commit + 1 retire + 2 audit.
+            assert "20s" in output
+        else:
+            assert "PROCESSING COMPLETE" not in output
+
     @patch("src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.completion_banner")
     @patch(
         "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.update_processing_status"
@@ -271,7 +340,7 @@ class TestFinalizeProcessing:
     @patch(
         "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.generate_output_filename"
     )
-    @patch("src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time")
+    @patch("src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.perf_counter")
     def test_finalize_processing_success(
         self, mock_time, mock_gen_filename, mock_update_status, mock_banner
     ):
@@ -346,7 +415,7 @@ class TestFinalizeProcessing:
         orchestrator._settings_file = Path("/output/settings.json")
 
         with patch(
-            "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.time",
+            "src.depth_surge_3d.processing.orchestration.pipeline_orchestrator.time.perf_counter",
             return_value=1.0,
         ):
             orchestrator._finalize_processing(
@@ -579,6 +648,91 @@ class TestFinalizeProcessing:
 
 
 class TestCleanupOnlyResume:
+    @pytest.mark.parametrize("failure_stage", ["model", "lock"])
+    def test_process_records_elapsed_time_when_owned_teardown_raises(
+        self, tmp_path, monkeypatch, failure_stage
+    ):
+        from src.depth_surge_3d.processing.orchestration import pipeline_orchestrator as module
+
+        clock = SimpleNamespace(now=1000.0)
+        events = []
+
+        def release_model():
+            events.append("model")
+            clock.now += 2
+            if failure_stage == "model":
+                raise RuntimeError("model teardown failed")
+
+        class TimedJobLock(JobWriterLock):
+            def release(self):
+                events.append("lock")
+                super().release()
+                clock.now += 3
+                if failure_stage == "lock":
+                    raise RuntimeError("lock teardown failed")
+
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), release_depth_model=release_model
+        )
+
+        def resume(_output_dir):
+            events.append("resume")
+            clock.now += 10
+            return True
+
+        monkeypatch.setattr(module.time, "perf_counter", lambda: clock.now)
+        monkeypatch.setattr(module, "JobWriterLock", TimedJobLock)
+        monkeypatch.setattr(orchestrator, "_resume_cleanup_only", resume)
+
+        with pytest.raises(RuntimeError, match=f"{failure_stage} teardown failed"):
+            orchestrator.process(tmp_path / "source.mp4", tmp_path, {}, {})
+
+        assert events == ["resume", "model", "lock"]
+        assert orchestrator.process_elapsed_seconds == 15.0
+        with JobWriterLock(tmp_path):
+            pass
+
+    @pytest.mark.parametrize("resume_result", [True, False, "interrupted"])
+    def test_process_elapsed_time_includes_owned_teardown_on_cleanup_only_resume(
+        self, tmp_path, monkeypatch, resume_result
+    ):
+        from src.depth_surge_3d.processing.orchestration import pipeline_orchestrator as module
+
+        clock = SimpleNamespace(now=1000.0)
+
+        def release_model():
+            clock.now += 2
+
+        class TimedJobLock(JobWriterLock):
+            def release(self):
+                super().release()
+                clock.now += 3
+
+        orchestrator = ProcessingOrchestrator(
+            Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), release_depth_model=release_model
+        )
+
+        def resume(_output_dir):
+            clock.now += 10
+            if resume_result == "interrupted":
+                raise InterruptedError("cancelled")
+            return resume_result
+
+        monkeypatch.setattr(module.time, "time", lambda: -500.0)
+        monkeypatch.setattr(module.time, "perf_counter", lambda: clock.now)
+        monkeypatch.setattr(module, "JobWriterLock", TimedJobLock)
+        monkeypatch.setattr(orchestrator, "_resume_cleanup_only", resume)
+
+        if resume_result == "interrupted":
+            with pytest.raises(InterruptedError, match="cancelled"):
+                orchestrator.process(tmp_path / "source.mp4", tmp_path, {}, {})
+        else:
+            assert orchestrator.process(tmp_path / "source.mp4", tmp_path, {}, {}) is resume_result
+
+        assert orchestrator.process_elapsed_seconds == 15.0
+        with JobWriterLock(tmp_path):
+            pass
+
     def test_process_returns_after_cleanup_only_resume(self, tmp_path):
         encoder = Mock()
         orchestrator = ProcessingOrchestrator(Mock(), Mock(), Mock(), Mock(), Mock(), encoder)

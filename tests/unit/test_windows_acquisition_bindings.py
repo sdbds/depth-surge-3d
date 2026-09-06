@@ -5,6 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import ctypes
 import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -219,6 +222,40 @@ def test_shared_bindings_keep_concurrent_error_codes_separate(tmp_path, kind):
 
 @pytest.mark.parametrize("kind", ["control", "root"])
 def test_failed_acquisitions_release_all_native_handles(tmp_path, kind):
+    result = _run_handle_probe(tmp_path, kind)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("kind", ["control", "root"])
+def test_native_handle_probe_detects_a_real_leaked_acquisition(tmp_path, kind):
+    result = _run_handle_probe(tmp_path, kind, leak_one_handle=True)
+    assert result.returncode != 0
+    assert "native handle count changed: delta=1" in result.stderr, result.stdout + result.stderr
+
+
+def _run_handle_probe(tmp_path, kind, *, leak_one_handle=False):
+    # Earlier exception/thread cycles can close unrelated handles during GC.
+    # Measure in a fresh process, not in pytest's shared process-wide handle set.
+    command = [
+        sys.executable,
+        "-m",
+        "tests.unit.test_windows_acquisition_bindings",
+        str(tmp_path),
+        kind,
+    ]
+    if leak_one_handle:
+        command.append("--leak-one-handle")
+    return subprocess.run(
+        command,
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def _assert_failed_acquisitions_release_handles(tmp_path, kind, *, leak_one_handle=False):
     from ctypes import wintypes
 
     count_handles = ctypes.WinDLL("kernel32", use_last_error=True).GetProcessHandleCount
@@ -234,11 +271,37 @@ def test_failed_acquisitions_release_all_native_handles(tmp_path, kind):
     error_type = OSError if kind == "control" else nofollow.NoFollowPathError
     with pytest.raises(error_type):
         read_acquired(kind, missing)
-    before = current_handles()
-    for _ in range(32):
-        with pytest.raises(error_type):
-            read_acquired(kind, missing)
-    assert current_handles() == before
+
+    leaked_handles = []
+    with pytest.MonkeyPatch.context() as patch:
+        if leak_one_handle:
+            module, name, close_index = (
+                (reservation, "_windows_relative_file_bindings", 4)
+                if kind == "control"
+                else (nofollow, "_windows_root_bindings", 2)
+            )
+            bindings = list(getattr(module, name)())
+            close_handle = bindings[close_index]
+
+            def omit_first_close(handle):
+                if not leaked_handles:
+                    leaked_handles.append(handle)
+                    return True
+                return close_handle(handle)
+
+            bindings[close_index] = omit_first_close
+            patch.setattr(module, name, lambda: tuple(bindings))
+
+        before = current_handles()
+        try:
+            for _ in range(32):
+                with pytest.raises(error_type):
+                    read_acquired(kind, missing)
+            after = current_handles()
+            assert after == before, f"native handle count changed: delta={after - before}"
+        finally:
+            for handle in leaked_handles:
+                assert close_handle(handle)
 
 
 def test_control_bindings_revalidate_the_current_parent(tmp_path):
@@ -307,3 +370,11 @@ def test_control_bindings_retain_exclusive_creation(tmp_path):
             pytest.fail("exclusive creation must not replace an existing control file")
     assert captured.value.winerror in {80, 183}
     assert path.read_bytes() == b"do not replace"
+
+
+if __name__ == "__main__":
+    _assert_failed_acquisitions_release_handles(
+        Path(sys.argv[1]),
+        sys.argv[2],
+        leak_one_handle="--leak-one-handle" in sys.argv[3:],
+    )
