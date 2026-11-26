@@ -8,7 +8,7 @@ import os
 import numpy as np
 import pytest
 
-from scripts.quality_task0 import region_solver as oracle
+from src.depth_surge_3d.rendering.quality import region_solver as oracle
 from src.depth_surge_3d.rendering.quality import native_region_solver
 
 

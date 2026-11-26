@@ -180,8 +180,3 @@ def _install_flash_attention(module_names: tuple[str, ...]) -> int:
 def install_da3_flash_attention() -> int:
     """Install the adapter into DA3 modules and return the enabled module count."""
     return _install_flash_attention(DA3_ATTENTION_MODULES)
-
-
-def install_diffusers_flash_attention() -> int:
-    """Prefer FlashAttention 2 in Diffusers processors with transparent SDPA fallback."""
-    return _install_flash_attention(DIFFUSERS_ATTENTION_MODULES)

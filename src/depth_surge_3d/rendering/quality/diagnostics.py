@@ -12,12 +12,12 @@ import numpy as np
 from ...io.streamed_canonical_json import ReplayableJsonArray
 
 from ..forward_splat import HORIZONTAL_SUBPIXELS
-from .planner import QualityRepairPlan, QualityRepairPlanSummary
 from .types import (
     CompactStereoRenderResult,
     DenseHistogramPairs,
     FastEyeDiagnostics,
     HoleRunDiagnostics,
+    QualityRepairPlanSummary,
 )
 
 
@@ -161,10 +161,11 @@ def _linear_percentile_from_histogram(histogram: np.ndarray, percentile: float) 
 
 
 def _prefill_run_histograms(
-    plan: QualityRepairPlan | QualityRepairPlanSummary | None,
+    plan: QualityRepairPlanSummary | None,
     width: int,
     streamed: HoleRunDiagnostics | None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    del plan
     lane_histogram = np.zeros(16 * (width + 1), dtype=np.uint64)
     span_histogram = np.zeros(width + 1, dtype=np.uint64)
     if streamed is not None:
@@ -175,58 +176,6 @@ def _prefill_run_histograms(
             raise ValueError("streamed hole-run histogram width changed")
         lane_histogram[:] = streamed.lane_count_histogram
         span_histogram[:] = streamed.touched_pixel_span_histogram
-        return lane_histogram, span_histogram
-    if plan is None or isinstance(plan, QualityRepairPlanSummary):
-        return lane_histogram, span_histogram
-    if plan.records.size == 0:
-        return lane_histogram, span_histogram
-    active_row = -1
-    active_start = -1
-    active_end = -1
-    for record in plan.records:
-        pixel = int(record["pixel_index"])
-        row, column = divmod(pixel, width)
-        mask = int(record["lane_mask"])
-        start = column * 16 + (mask & -mask).bit_length() - 1
-        end = column * 16 + mask.bit_length() - 1
-        if row == active_row and start == active_end + 1:
-            active_end = end
-            continue
-        if active_row >= 0:
-            length = active_end - active_start + 1
-            lane_histogram[length] = np.uint64(
-                checked_u64_add(
-                    "lane_count_histogram",
-                    int(lane_histogram[length]),
-                    1,
-                )
-            )
-            span_index = active_end // 16 - active_start // 16 + 1
-            span_histogram[span_index] = np.uint64(
-                checked_u64_add(
-                    "touched_pixel_span_histogram",
-                    int(span_histogram[span_index]),
-                    1,
-                )
-            )
-        active_row, active_start, active_end = row, start, end
-    if active_row >= 0:
-        length = active_end - active_start + 1
-        lane_histogram[length] = np.uint64(
-            checked_u64_add(
-                "lane_count_histogram",
-                int(lane_histogram[length]),
-                1,
-            )
-        )
-        span_index = active_end // 16 - active_start // 16 + 1
-        span_histogram[span_index] = np.uint64(
-            checked_u64_add(
-                "touched_pixel_span_histogram",
-                int(span_histogram[span_index]),
-                1,
-            )
-        )
     return lane_histogram, span_histogram
 
 
@@ -235,14 +184,10 @@ def _histogram_pairs(histogram: np.ndarray) -> DenseHistogramPairs:
 
 
 def _backend_counts(
-    plan: QualityRepairPlan | QualityRepairPlanSummary | None,
+    plan: QualityRepairPlanSummary | None,
 ) -> tuple[dict[str, int], dict[str, int], dict[str, Any]]:
-    names = {1: "local", 2: "exemplar", 3: "fallback"}
-    lane_counts = {name: 0 for name in names.values()}
-    pixels: dict[str, set[int]] = {name: set() for name in names.values()}
-    components: dict[str, set[int]] = {name: set() for name in names.values()}
+    ordered = ("local", "exemplar", "fallback")
     if isinstance(plan, QualityRepairPlanSummary):
-        ordered = ("local", "exemplar", "fallback")
         lane_counts = dict(zip(ordered, plan.backend_lane_counts, strict=True))
         pixel_counts = dict(zip(ordered, plan.backend_pixel_counts, strict=True))
         component_count_payload: dict[str, Any] = {
@@ -250,28 +195,15 @@ def _backend_counts(
             **dict(zip(ordered, plan.backend_component_counts, strict=True)),
         }
         return lane_counts, pixel_counts, component_count_payload
-    if plan is not None:
-        for index, record in enumerate(plan.records):
-            backend = names[int(record["backend"])]
-            lane_counts[backend] += int(record["lane_mask"]).bit_count()
-            pixels[backend].add(int(record["pixel_index"]))
-            components[backend].add(int(plan.record_component_ids[index]))
-        component_count_payload = {
-            "availability": "quality_segment_graph",
-            **{name: len(values) for name, values in components.items()},
-        }
-    else:
-        component_count_payload = {
-            "availability": "unavailable_quality_none_no_repair_graph",
-            "local": None,
-            "exemplar": None,
-            "fallback": None,
-        }
-    return (
-        lane_counts,
-        {name: len(values) for name, values in pixels.items()},
-        component_count_payload,
-    )
+    lane_counts = {name: 0 for name in ordered}
+    pixel_counts = {name: 0 for name in ordered}
+    component_count_payload = {
+        "availability": "unavailable_quality_none_no_repair_graph",
+        "local": None,
+        "exemplar": None,
+        "fallback": None,
+    }
+    return lane_counts, pixel_counts, component_count_payload
 
 
 def _repair_state_counts(repair_bits: np.ndarray) -> dict[str, int]:
@@ -298,7 +230,7 @@ def _repair_state_counts(repair_bits: np.ndarray) -> dict[str, int]:
 def _eye_stats(
     coverage: np.ndarray,
     repair_bits: np.ndarray,
-    plan: QualityRepairPlan | QualityRepairPlanSummary | None,
+    plan: QualityRepairPlanSummary | None,
     *,
     quality_limits: dict[str, int | float] | None,
     streamed_hole_runs: HoleRunDiagnostics | None,
@@ -362,12 +294,8 @@ def _eye_stats(
         }
     elif render_mode == "quality":
         assert plan is not None
-        if isinstance(plan, QualityRepairPlanSummary):
-            segment_record_count = plan.segment_record_count
-            segment_table_bytes = plan.segment_table_bytes
-        else:
-            segment_record_count = int(plan.records.size)
-            segment_table_bytes = int(plan.records.nbytes)
+        segment_record_count = plan.segment_record_count
+        segment_table_bytes = plan.segment_table_bytes
         quality_budgets = {
             "availability": "quality_repair_plan",
             "segment_record_count": segment_record_count,

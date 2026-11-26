@@ -889,67 +889,6 @@ def test_native_background_proxy_state_fuses_bits_mask_and_counts() -> None:
     assert missing_pixels == 3
 
 
-def test_quality_background_avoids_legacy_global_planner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
-    frame = np.full((9, 48, 3), 100, dtype=np.uint8)
-    canonical = np.tile(
-        np.concatenate(
-            [
-                np.full(12, 0.15, dtype=np.float32),
-                np.full(12, 0.9, dtype=np.float32),
-                np.full(24, 0.2, dtype=np.float32),
-            ]
-        ),
-        (9, 1),
-    )
-    real_splat = quality._quality_splat
-    splat_count = 0
-
-    def count_splat(*args, **kwargs):
-        nonlocal splat_count
-        splat_count += 1
-        return real_splat(*args, **kwargs)
-
-    monkeypatch.setattr(quality, "_quality_splat", count_splat)
-    monkeypatch.setattr(
-        quality.QualityFixedArenas,
-        "allocate",
-        lambda: (_ for _ in ()).throw(AssertionError("allocated legacy repair arenas")),
-    )
-    monkeypatch.setattr(
-        quality,
-        "plan_quality_repairs",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("entered legacy global repair planner")
-        ),
-    )
-    monkeypatch.setattr(
-        quality,
-        "_replay_background_eye_once",
-        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("replayed a second splat")),
-    )
-
-    result = quality.render_relative_quality_compact(
-        renderer=StereoRenderer(device="cpu"),
-        frame=frame,
-        canonical=canonical,
-        settings=_quality_settings(stereo_strength=5.0, convergence=0.45),
-    )
-
-    assert splat_count == 2
-    for coverage, bits, plan in (
-        (result.left_coverage_count, result.left_repair_bits, result.left_plan),
-        (result.right_coverage_count, result.right_repair_bits, result.right_plan),
-    ):
-        assert plan is not None
-        missing_lanes = int(np.sum(16 - coverage, dtype=np.uint64))
-        assert plan.backend_lane_counts == (0, 0, missing_lanes)
-        assert plan.fallback_indexed_donor_count == 0
-        assert not np.any(bits & np.uint8(0x40))
-
-
 def test_quality_background_avoids_intermediate_none_repair_bits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1438,56 +1377,11 @@ def test_quality_renderer_uses_the_frame_level_value_validation_boundary(
     assert result.left_image.shape == frame.shape
 
 
-def test_native_background_diagnostics_match_canonical_record_semantics() -> None:
-    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
-    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
-    native = native_kd._require_native()
-    records = np.zeros(3, dtype=repair_records.REPAIR_RECORD_DTYPE)
-    records["pixel_index"] = (1, 1, 2)
-    records["lane_mask"] = (0x0003, 0x000C, 0x00F0)
-    records["backend"] = (1, 2, 3)
-    raw_records = records.view(np.uint8).reshape(3, 16)
-    coverage = np.asarray([[16, 8, 0, 16]], dtype=np.uint8)
-    repair_bits = np.empty_like(coverage)
-    backend_lane_counts = np.empty(3, dtype=np.uint64)
-    lane_histogram = np.empty(16 * (coverage.shape[1] + 1), dtype=np.uint64)
-    span_histogram = np.empty(coverage.shape[1] + 1, dtype=np.uint64)
-
-    repair_lane_count = native.build_background_repair_bits_into(
-        raw_records,
-        coverage,
-        repair_bits,
-        backend_lane_counts,
-    )
-    histogram_lane_count = native.build_hole_run_histograms_into(
-        raw_records,
-        coverage.shape[1],
-        lane_histogram,
-        span_histogram,
-    )
-
-    assert repair_lane_count == histogram_lane_count == 8
-    assert backend_lane_counts.tolist() == [2, 2, 4]
-    assert repair_bits.tolist() == [[0, 0x01 | 0x04 | 0x18, 0x02 | 0x28, 0]]
-    assert np.flatnonzero(lane_histogram).tolist() == [4]
-    assert int(lane_histogram[4]) == 2
-    assert np.flatnonzero(span_histogram).tolist() == [1]
-    assert int(span_histogram[1]) == 2
-
-
-def test_quality_background_proxy_never_expands_compact_records_to_host_lane_indexes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_quality_background_proxy_never_expands_compact_records_to_host_lane_indexes() -> None:
     native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
     quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
     native = native_kd._require_native()
-    monkeypatch.setattr(
-        native,
-        "expand_repair_scatter",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("Pass B expanded compact records into per-lane host arrays")
-        ),
-    )
+    assert not hasattr(native, "expand_repair_scatter")
     generator = np.random.default_rng(29)
     frame = generator.integers(0, 256, size=(9, 48, 3), dtype=np.uint8)
     canonical = np.tile(
@@ -1516,102 +1410,6 @@ def test_quality_controls_reject_boolean_limit() -> None:
 
     with pytest.raises(ValueError, match="non-boolean integer"):
         types.QualityStereoControls("background", True)
-
-
-def test_native_analysis_band_matches_the_existing_scalar_boundary() -> None:
-    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
-    forward_splat = importlib.import_module("src.depth_surge_3d.rendering.forward_splat")
-    local_strip = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
-    native_repair = importlib.import_module("src.depth_surge_3d.rendering.quality.native_repair")
-    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
-    visibility = importlib.import_module("src.depth_surge_3d.rendering.quality.visibility")
-    height, width = 2, 3
-    fine_width = width * 16
-    valid = np.ones((height, fine_width), dtype=np.bool_)
-    valid[0, 5:9] = False
-    valid[0, 22:25] = False
-    valid[1, :2] = False
-    winner_sources = np.empty((height, fine_width), dtype=np.int64)
-    for column in range(width):
-        winner_sources[:, column * 16 : (column + 1) * 16] = (0, 2, 1)[column]
-    winner_sources[0, 43] = 2
-    winner_sources[~valid] = 0xFFFFFFFF
-    source_regions = np.array([[1, 1, 2], [1, 2, 2]], dtype=np.uint32)
-    near_score = np.zeros((height, fine_width), dtype=np.float32)
-    colour = np.zeros((height, fine_width, 3), dtype=np.float32)
-    source_near = np.array([0.25, 0.5, 0.75, 0.3, 0.7, 0.8], dtype=np.float32)
-    source_bgr = np.array(
-        [
-            [10, 20, 30],
-            [40, 50, 60],
-            [70, 80, 90],
-            [15, 25, 35],
-            [45, 55, 65],
-            [75, 85, 95],
-        ],
-        dtype=np.float32,
-    )
-    for sample in np.flatnonzero(valid):
-        source_index = int(winner_sources.flat[int(sample)])
-        near_score.flat[int(sample)] = source_near[source_index]
-        colour.reshape(-1, 3)[int(sample)] = source_bgr[source_index]
-    band = visibility.QualitySplatBand(
-        splat=forward_splat.SubpixelSplatResult(
-            colour=torch.from_numpy(colour),
-            disparity=torch.from_numpy(near_score),
-            valid=torch.from_numpy(valid),
-        ),
-        winner_source_index=torch.from_numpy(winner_sources),
-    )
-
-    def empty_analysis():
-        return local_strip.QualityVisibilityAnalysis(
-            np.empty((height, width), dtype=np.uint8),
-            np.empty((height, width), dtype=np.uint32),
-            tuple(np.empty((height, width), dtype=np.uint8) for _ in range(3)),
-            anchor_fallbacks_seeded=True,
-        )
-
-    expected_analysis = empty_analysis()
-    expected_inputs = quality._write_analysis_band(
-        expected_analysis,
-        band,
-        source_regions,
-        0,
-        height,
-    )
-    expected_records = native_repair.build_native_repair_records(
-        expected_inputs[0],
-        expected_inputs[1],
-        expected_inputs[2],
-        winner_bgr=expected_inputs[3],
-    ).records
-
-    actual_analysis = empty_analysis()
-    record_output = np.empty(
-        height * fine_width,
-        dtype=repair_records.REPAIR_RECORD_DTYPE,
-    )
-    actual_records = quality._write_analysis_band_native(
-        actual_analysis,
-        band,
-        source_bgr.astype(np.uint8).reshape(height, width, 3),
-        source_near.reshape(source_regions.shape),
-        source_regions,
-        0,
-        height,
-        record_output,
-    ).records
-
-    assert np.array_equal(actual_analysis.coverage_count, expected_analysis.coverage_count)
-    assert np.array_equal(actual_analysis.pure_region_id, expected_analysis.pure_region_id)
-    for actual, expected in zip(
-        actual_analysis.pure_bgr,
-        expected_analysis.pure_bgr,
-        strict=True,
-    ):
-        assert np.array_equal(actual, expected)
-    assert actual_records.tobytes() == expected_records.tobytes()
 
 
 def test_metric_quality_renders_native_primitives_and_returns_final_stats() -> None:

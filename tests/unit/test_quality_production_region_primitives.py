@@ -10,7 +10,7 @@ import numpy as np
 
 def test_native_low_resolution_regions_match_the_scalar_oracle(monkeypatch) -> None:
     production = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
-    prototype = importlib.import_module("scripts.quality_task0.region_solver")
+    prototype = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
     rng = np.random.default_rng(9281)
     displacement = np.ascontiguousarray(
         rng.integers(-12, 13, size=(31, 37)).astype(np.float64) / 3.0
@@ -45,7 +45,7 @@ def test_native_low_resolution_regions_match_the_scalar_oracle(monkeypatch) -> N
 
 def test_native_mapping_and_edge_band_match_the_scalar_oracle(monkeypatch) -> None:
     production = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
-    prototype = importlib.import_module("scripts.quality_task0.region_solver")
+    prototype = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
     labels = np.arange(1, 8 * 11 + 1, dtype=np.uint32).reshape(8, 11)
     labels[:, 3:7] = np.uint32(7)
     expected_map = prototype.nearest_label_upsample(
@@ -82,7 +82,7 @@ def test_native_mapping_and_edge_band_match_the_scalar_oracle(monkeypatch) -> No
 
 def test_native_nearest_label_upsample_is_exact_under_concurrent_calls() -> None:
     production = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
-    prototype = importlib.import_module("scripts.quality_task0.region_solver")
+    prototype = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
     rng = np.random.default_rng(20260831)
     labels = np.ascontiguousarray(rng.integers(1, 5000, size=(37, 53), dtype=np.uint32))
     expected = prototype.nearest_label_upsample(
@@ -109,7 +109,7 @@ def test_native_nearest_label_upsample_is_exact_under_concurrent_calls() -> None
 
 def test_native_region_fragment_labels_match_the_scalar_oracle() -> None:
     native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
-    prototype = importlib.import_module("scripts.quality_task0.region_solver")
+    prototype = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
     regions = np.array(
         [
             [1, 1, 2, 2, 2, 3],
@@ -141,7 +141,7 @@ def test_native_region_fragment_labels_match_the_scalar_oracle() -> None:
 
 def test_native_sparse_region_seeds_match_the_scalar_oracle() -> None:
     native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
-    prototype = importlib.import_module("scripts.quality_task0.region_solver")
+    prototype = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
     rng = np.random.default_rng(20260828)
     regions = np.ascontiguousarray(rng.integers(1, 8, size=(37, 53), dtype=np.uint32))
     regions[2:8, 3:11] = np.uint32(0)
@@ -165,7 +165,7 @@ def test_native_sparse_region_seeds_match_the_scalar_oracle() -> None:
 
 def test_production_sparse_region_seeds_bypass_scalar_morphology(monkeypatch) -> None:
     production = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
-    prototype = importlib.import_module("scripts.quality_task0.region_solver")
+    prototype = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
     regions = np.ones((11, 16), dtype=np.uint32)
     regions[:, 8:] = np.uint32(2)
     band = np.zeros(regions.shape, dtype=np.bool_)
@@ -187,7 +187,7 @@ def test_production_sparse_region_seeds_bypass_scalar_morphology(monkeypatch) ->
 
 def test_native_stable_sparse_region_seeds_match_the_composed_scalar_oracle() -> None:
     production = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
-    prototype = importlib.import_module("scripts.quality_task0.region_solver")
+    prototype = importlib.import_module("src.depth_surge_3d.rendering.quality.region_solver")
     rng = np.random.default_rng(2026083101)
     regions = np.ascontiguousarray(rng.integers(1, 8, size=(37, 53), dtype=np.uint32))
     band = np.ascontiguousarray(rng.random(regions.shape) < 0.37, dtype=np.bool_)
@@ -220,7 +220,7 @@ def test_native_stable_sparse_region_seeds_match_the_composed_scalar_oracle() ->
 
 def test_native_one_sided_collection_matches_the_scalar_oracle() -> None:
     native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
-    prototype = importlib.import_module("scripts.quality_task0.quality_geometry")
+    prototype = importlib.import_module("src.depth_surge_3d.rendering.quality.geometry")
     source_regions = np.array(
         [
             [1, 1, 2, 2],
@@ -272,6 +272,8 @@ def test_native_one_sided_collection_matches_the_scalar_oracle() -> None:
     expected_state = prototype._RegionState(
         source_region_map=source_regions,
         final_region_map=final_regions,
+        edge_band=np.zeros(render_shape, dtype=np.bool_),
+        stable_sample_include=np.ones(source_regions.shape, dtype=np.bool_),
         region_count=3,
         radius=radius,
         edge_band_pixel_count=edge_count,

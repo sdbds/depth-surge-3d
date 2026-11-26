@@ -197,10 +197,7 @@ class TestEntryPointImports:
             VideoEncoder,
         )
         from depth_surge_3d.rendering import create_stereo_projector
-        from depth_surge_3d.utils import (  # noqa: F401
-            batch_analysis,
-            path_utils,
-        )
+        from depth_surge_3d.utils import path_utils  # noqa: F401
         from depth_surge_3d.utils.domain import (  # noqa: F401
             depth_cache,
             resolution,

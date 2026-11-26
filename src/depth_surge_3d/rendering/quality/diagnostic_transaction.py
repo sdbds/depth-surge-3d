@@ -44,13 +44,14 @@ from .diagnostics import (
     validate_diagnostics_cardinality_dimensions,
 )
 from .geometry import QUALITY_GEOMETRY_NEAREST_VISIT_CAP
-from .local_strip import (
+from .types import (
     QUALITY_EXEMPLAR_EYE_EVALUATION_CAP,
     QUALITY_LOCAL_NEIGHBOR_SAMPLE_CAP,
     QUALITY_LOCAL_SLOT_CAP,
     QUALITY_REPAIR_FALLBACK_VISIT_CAP,
+    CompactStereoRenderResult,
+    DenseHistogramPairs,
 )
-from .types import CompactStereoRenderResult, DenseHistogramPairs
 
 
 FaultHook = Callable[[str], None]

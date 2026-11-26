@@ -4,8 +4,7 @@ import numpy as np
 import pytest
 
 from src.depth_surge_3d.rendering import stereo_geometry
-from src.depth_surge_3d.rendering.quality import geometry, implicit_kd, local_strip, native_kd
-from src.depth_surge_3d.rendering.quality.repair_records import QualityRepairBudgetError
+from src.depth_surge_3d.rendering.quality import geometry, implicit_kd, native_kd
 from src.depth_surge_3d.rendering.quality import renderer, types
 from src.depth_surge_3d.rendering.stereo_renderer import StereoRenderer, StereoRenderSettings
 
@@ -166,22 +165,6 @@ def test_native_geometry_batch_refuses_mismatched_vectors_without_consuming_budg
     with pytest.raises((TypeError, ValueError), match=message):
         native_kd.query_native_geometry_batch(**args)
     assert budget.consumed == 0
-
-
-def test_local_reservation_is_atomic_even_at_the_uint64_ceiling():
-    maximum = 2**64 - 1
-    budgets = local_strip.QualityRepairBudgets(local_slot_cap=maximum, local_neighbor_sample_cap=20)
-    assert budgets.reserve_local(maximum - 1, 10)
-    assert not budgets.reserve_local(1, 11)
-    assert budgets.local_budget_skipped_run_count == 1
-    assert (budgets.local_slots_consumed, budgets.local_neighbor_samples_consumed) == (
-        maximum - 1,
-        10,
-    )
-    with pytest.raises(QualityRepairBudgetError, match="uint64"):
-        budgets.reserve_local(2, 0)
-    assert budgets.reserve_local(1, 10)
-    assert (budgets.local_slots_consumed, budgets.local_neighbor_samples_consumed) == (maximum, 20)
 
 
 @pytest.mark.parametrize(

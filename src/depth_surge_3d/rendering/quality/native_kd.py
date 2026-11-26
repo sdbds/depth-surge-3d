@@ -15,7 +15,6 @@ from .implicit_kd import (
     UINT32_MAX,
     ImplicitRegionKdIndex,
     QualityGeometryQueryBudgetError,
-    QualityRepairFallbackQueryBudgetError,
     VisitBudget,
     _validate_inputs,
     _validate_nonnegative_integer,
@@ -118,47 +117,6 @@ class NativeBatchQueryResult:
     sample_index: np.ndarray
     distance2: np.ndarray
     visited_nodes: np.ndarray
-
-
-def query_native_repair_batch(
-    index: ImplicitRegionKdIndex,
-    query_regions: np.ndarray,
-    target_y: np.ndarray,
-    target_x: np.ndarray,
-    *,
-    radius_px: int,
-    budget: VisitBudget,
-) -> NativeBatchQueryResult:
-    """Execute exact integer-radius repair lookups in one native call."""
-
-    _validate_index_and_budget(index, budget)
-    query_count = _validate_query_vector("query_regions", query_regions, np.uint32)
-    _validate_query_vector("target_y", target_y, np.uint32, query_count)
-    _validate_query_vector("target_x", target_x, np.uint32, query_count)
-    radius = _validate_nonnegative_integer("radius_px", radius_px)
-    budget_state = np.asarray([budget.consumed, budget.limit], dtype=np.uint64)
-    native = _require_native()
-    try:
-        samples, distances, visits = native.query_repair_batch(
-            index.member_index,
-            index.region_offsets,
-            index.height,
-            index.width,
-            query_regions,
-            target_y,
-            target_x,
-            radius,
-            budget_state,
-        )
-    except RuntimeError as error:
-        if "quality repair fallback visit cap exceeded" in str(error):
-            raise QualityRepairFallbackQueryBudgetError(
-                f"implicit k-d visit cap {budget.limit} exceeded"
-            ) from error
-        raise
-    finally:
-        budget.consumed = int(budget_state[0])
-    return _freeze_batch(samples, distances, visits)
 
 
 def query_native_geometry_batch(

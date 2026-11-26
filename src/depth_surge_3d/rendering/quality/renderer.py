@@ -6,9 +6,8 @@ import gc
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Iterator, Literal
+from typing import Callable, Literal
 
 import cv2
 import numpy as np
@@ -24,7 +23,6 @@ from ..stereo_renderer import (
     _downsample_subpixel_band,
 )
 from . import native_kd
-from .arena import QualityFixedArenas
 from .geometry import (
     QualityGeometryResult,
     build_geometry_eye_offsets_into,
@@ -32,21 +30,12 @@ from .geometry import (
     build_relative_eye_offsets_into,
     build_relative_quality_geometry,
 )
-from .local_strip import QualityVisibilityAnalysis
-from .planner import plan_quality_repairs  # noqa: F401 - retained as the v9 test seam.
-from .planner import QualityRepairPlanSummary
-from .repair_records import (
-    NO_REGION,
-    QUALITY_REPAIR_RECORD_CAP,
-    REPAIR_RECORD_DTYPE,
-    RepairRecordBuildResult,
-    QualityRepairBudgetError,
-    validate_record_coverage,
-)
 from .types import (
+    REPAIR_RECORD_ITEMSIZE,
     CompactStereoRenderResult,
     HoleRunDiagnostics,
     MetricStereoPrimitiveInput,
+    QualityRepairPlanSummary,
     QualityStereoControls,
 )
 from .visibility import QualitySplatBand, _quality_splat_band_prevalidated
@@ -66,8 +55,6 @@ QUALITY_AUXILIARY_THREAD_BYTES = (
 QUALITY_SPLAT_BYTES_PER_PIXEL = 1536
 QUALITY_CUDA_BUDGET_CAP_BYTES = 512 * 1024 * 1024
 QUALITY_CUDA_FREE_BUDGET_DIVISOR = 8
-QUALITY_SCATTER_WORKSPACE_BYTES = 12 * 1024 * 1024
-QUALITY_SCATTER_CHUNK_PIXELS = QUALITY_SCATTER_WORKSPACE_BYTES // (HORIZONTAL_SUBPIXELS * 4)
 QUALITY_INPAINT_ROI_AREA_NUMERATOR = 9
 QUALITY_INPAINT_ROI_AREA_DENOMINATOR = 10
 
@@ -190,12 +177,6 @@ def _quality_public_memory_preflight(
             QUALITY_HOST_BUDGET_BYTES,
         )
     return phases
-
-
-@dataclass(frozen=True)
-class _EyeAnalysisResult:
-    analysis: QualityVisibilityAnalysis
-    records: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -411,162 +392,6 @@ def _quality_compact_cuda_splat(
     )
     del winners
     return compact
-
-
-def _write_analysis_band(
-    analysis: QualityVisibilityAnalysis,
-    band: QualitySplatBand,
-    source_regions: np.ndarray,
-    start_row: int,
-    end_row: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    row_count = end_row - start_row
-    width = analysis.coverage_count.shape[1]
-    valid = np.ascontiguousarray(band.splat.valid.detach().cpu().numpy())
-    winners = np.ascontiguousarray(
-        band.winner_source_index.detach().cpu().numpy().astype(np.uint32, copy=False)
-    )
-    safe_winners = np.where(valid, winners, np.uint32(0))
-    winner_regions = source_regions.reshape(-1)[safe_winners]
-    winner_regions = np.where(valid, winner_regions, NO_REGION).astype(np.uint32, copy=False)
-    lane_valid = valid.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
-    lane_regions = winner_regions.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
-    coverage = np.sum(lane_valid, axis=2, dtype=np.uint16).astype(np.uint8)
-    first_lane = np.argmax(lane_valid, axis=2)
-    first_region = np.take_along_axis(
-        lane_regions,
-        first_lane[..., None],
-        axis=2,
-    )[..., 0]
-    pure = (coverage > 0) & np.all(
-        (~lane_valid) | (lane_regions == first_region[..., None]),
-        axis=2,
-    )
-    analysis.coverage_count[start_row:end_row] = coverage
-    region_output = analysis.pure_region_id[start_row:end_row]
-    region_output.fill(NO_REGION)
-    region_output[pure] = first_region[pure]
-
-    colours = band.splat.colour.detach().cpu().numpy()
-    lane_colours = colours.reshape(row_count, width, HORIZONTAL_SUBPIXELS, 3)
-    sums = np.sum(lane_colours, axis=2, dtype=np.int32)
-    nonzero = coverage > 0
-    rounded = np.zeros((row_count, width, 3), dtype=np.uint8)
-    if nonzero.any():
-        means = sums[nonzero].astype(np.float64)
-        means /= coverage[nonzero, None].astype(np.float64)
-        rounded[nonzero] = np.rint(means).astype(np.uint8)
-    for channel, plane in enumerate(analysis.pure_bgr):
-        output = plane[start_row:end_row]
-        output.fill(0)
-        output[pure] = rounded[..., channel][pure]
-    near_score = np.ascontiguousarray(band.splat.disparity.detach().cpu().numpy())
-    return (
-        valid,
-        near_score,
-        np.ascontiguousarray(winner_regions),
-        np.ascontiguousarray(
-            lane_colours.reshape(row_count, width * HORIZONTAL_SUBPIXELS, 3),
-            dtype=np.float32,
-        ),
-    )
-
-
-def _write_analysis_band_native(
-    analysis: QualityVisibilityAnalysis,
-    band: QualitySplatBand,
-    source_bgr: np.ndarray,
-    source_near_score: np.ndarray,
-    source_regions: np.ndarray,
-    start_row: int,
-    end_row: int,
-    record_output: np.ndarray,
-) -> RepairRecordBuildResult:
-    winner_sources_i32 = np.ascontiguousarray(
-        band.winner_source_index.to(dtype=torch.int32).detach().cpu().numpy()
-    )
-    winner_sources = winner_sources_i32.view(np.uint32)
-    native = native_kd._require_native()
-    raw_output = record_output.view(np.uint8).reshape(
-        record_output.size,
-        REPAIR_RECORD_DTYPE.itemsize,
-    )
-    try:
-        record_count, statistics = native.analyze_splat_band(
-            winner_sources,
-            source_bgr,
-            source_near_score,
-            source_regions,
-            analysis.coverage_count[start_row:end_row],
-            analysis.pure_region_id[start_row:end_row],
-            analysis.pure_bgr[0][start_row:end_row],
-            analysis.pure_bgr[1][start_row:end_row],
-            analysis.pure_bgr[2][start_row:end_row],
-            raw_output,
-        )
-    except native.QualityBudgetError as error:
-        raise QualityRepairBudgetError("64 MiB repair record arena exceeded") from error
-    records = record_output[: int(record_count)]
-    records.setflags(write=False)
-    return RepairRecordBuildResult(
-        records=records,
-        prefill_run_count=int(statistics["prefill_run_count"]),
-        repair_run_count=int(statistics["repair_run_count"]),
-        invalid_lane_count=int(statistics["invalid_lane_count"]),
-    )
-
-
-def _analyze_eye_once(
-    *,
-    renderer: StereoRenderer,
-    source: np.ndarray,
-    geometry: QualityGeometryResult,
-    offsets: np.ndarray,
-    arenas: QualityFixedArenas,
-    band_height: int,
-) -> _EyeAnalysisResult:
-    height = int(source.shape[0])
-    width = int(source.shape[1])
-    coverage = np.empty((height, width), dtype=np.uint8)
-    pure_regions = np.empty((height, width), dtype=np.uint32)
-    pure_bgr = (
-        np.empty((height, width), dtype=np.uint8),
-        np.empty((height, width), dtype=np.uint8),
-        np.empty((height, width), dtype=np.uint8),
-    )
-    analysis = QualityVisibilityAnalysis(
-        coverage,
-        pure_regions,
-        pure_bgr,
-        anchor_fallbacks_seeded=True,
-    )
-    record_arena = arenas.records()
-    record_count = 0
-    for start_row in range(0, height, band_height):
-        end_row = min(height, start_row + band_height)
-        band = _quality_splat(renderer, source, geometry, offsets, start_row, end_row)
-        built = _write_analysis_band_native(
-            analysis,
-            band,
-            source,
-            geometry.near_score,
-            geometry.final_region_map,
-            start_row,
-            end_row,
-            record_arena[record_count:],
-        )
-        if built.records.size:
-            next_count = record_count + int(built.records.size)
-            if next_count > QUALITY_REPAIR_RECORD_CAP:
-                raise QualityRepairBudgetError("64 MiB repair record arena exceeded")
-            built.records.setflags(write=True)
-            built.records["pixel_index"] += np.uint32(start_row * width)
-            built.records.setflags(write=False)
-            record_count = next_count
-        del band, built
-    records = record_arena[:record_count]
-    records.setflags(write=False)
-    return _EyeAnalysisResult(analysis=analysis, records=records)
 
 
 def _none_repair_bits(coverage: np.ndarray) -> np.ndarray:
@@ -915,7 +740,7 @@ def _background_proxy_summary(
 ) -> QualityRepairPlanSummary:
     return QualityRepairPlanSummary(
         segment_record_count=component_count,
-        segment_table_bytes=component_count * REPAIR_RECORD_DTYPE.itemsize,
+        segment_table_bytes=component_count * REPAIR_RECORD_ITEMSIZE,
         backend_lane_counts=(0, 0, missing_lanes),
         backend_pixel_counts=(0, 0, missing_pixels),
         backend_component_counts=(0, 0, component_count),
@@ -930,180 +755,6 @@ def _background_proxy_summary(
         fallback_visited_nodes_p95=0.0,
         exemplar_donor_evaluation_count=0,
     )
-
-
-def _background_repair_bits(
-    coverage: np.ndarray,
-    records: np.ndarray,
-    *,
-    out: np.ndarray,
-    backend_lane_counts_out: np.ndarray | None = None,
-) -> np.ndarray:
-    if (
-        not isinstance(out, np.ndarray)
-        or out.dtype != np.uint8
-        or out.shape != coverage.shape
-        or not out.flags.c_contiguous
-    ):
-        raise TypeError("repair-bit output must be the contiguous Pass A B plane")
-    if backend_lane_counts_out is None:
-        backend_lane_counts_out = np.empty(3, dtype=np.uint64)
-    if (
-        not isinstance(backend_lane_counts_out, np.ndarray)
-        or backend_lane_counts_out.dtype != np.uint64
-        or backend_lane_counts_out.shape != (3,)
-        or not backend_lane_counts_out.flags.c_contiguous
-        or not backend_lane_counts_out.flags.writeable
-    ):
-        raise TypeError("backend lane counts must be a writable uint64[3] vector")
-    raw_records = records.view(np.uint8).reshape(records.size, REPAIR_RECORD_DTYPE.itemsize)
-    native_kd._require_native().build_background_repair_bits_into(
-        raw_records,
-        coverage,
-        out,
-        backend_lane_counts_out,
-    )
-    return out
-
-
-def _plan_hole_runs(records: np.ndarray, width: int) -> HoleRunDiagnostics:
-    lane_histogram = np.zeros(16 * (width + 1), dtype=np.uint64)
-    span_histogram = np.zeros(width + 1, dtype=np.uint64)
-    raw_records = records.view(np.uint8).reshape(records.size, REPAIR_RECORD_DTYPE.itemsize)
-    native_kd._require_native().build_hole_run_histograms_into(
-        raw_records,
-        width,
-        lane_histogram,
-        span_histogram,
-    )
-    return HoleRunDiagnostics(
-        lane_count_histogram=lane_histogram,
-        touched_pixel_span_histogram=span_histogram,
-    )
-
-
-@contextmanager
-def _relative_band_records(
-    records: np.ndarray,
-    *,
-    start_pixel: int,
-    end_pixel: int,
-) -> Iterator[np.ndarray]:
-    pixels = records["pixel_index"]
-    start = int(np.searchsorted(pixels, np.uint32(start_pixel), side="left"))
-    end = int(np.searchsorted(pixels, np.uint32(end_pixel), side="left"))
-    selected = records[start:end]
-    selected.setflags(write=True)
-    selected["pixel_index"] -= np.uint32(start_pixel)
-    try:
-        yield selected
-    finally:
-        selected["pixel_index"] += np.uint32(start_pixel)
-        selected.setflags(write=False)
-
-
-def _scatter_repair_records(
-    colour: torch.Tensor,
-    records: np.ndarray,
-    *,
-    width: int,
-    host_colours: np.ndarray | None,
-    host_mask: np.ndarray | None,
-) -> int:
-    if records.size == 0:
-        return 0
-    raw_records = records.view(np.uint8).reshape(records.size, REPAIR_RECORD_DTYPE.itemsize)
-    native = native_kd._require_native()
-    if colour.device.type == "cpu":
-        if host_colours is not None or host_mask is not None:
-            raise AssertionError("CPU compact scatter received a host staging workspace")
-        output = colour.detach().numpy().reshape(-1, 3)
-        return int(native.scatter_repair_records_float_into(raw_records, 0, output))
-    if host_colours is None or host_mask is None:
-        raise AssertionError("CUDA compact scatter has no bounded host workspace")
-    total_pixels = int(colour.shape[0]) * width
-    flat_colour = colour.reshape(-1, 3)
-    record_pixels = records["pixel_index"]
-    scattered = 0
-    for pixel_start in range(0, total_pixels, QUALITY_SCATTER_CHUNK_PIXELS):
-        pixel_end = min(total_pixels, pixel_start + QUALITY_SCATTER_CHUNK_PIXELS)
-        record_start = int(np.searchsorted(record_pixels, np.uint32(pixel_start), side="left"))
-        record_end = int(np.searchsorted(record_pixels, np.uint32(pixel_end), side="left"))
-        if record_start == record_end:
-            continue
-        lane_capacity = (pixel_end - pixel_start) * HORIZONTAL_SUBPIXELS
-        colour_staging = host_colours[:lane_capacity]
-        mask_staging = host_mask[:lane_capacity]
-        chunk_raw = raw_records[record_start:record_end]
-        scattered += int(
-            native.materialize_repair_scatter_u8_into(
-                chunk_raw,
-                pixel_start,
-                colour_staging,
-                mask_staging,
-            )
-        )
-        device_colours = torch.from_numpy(colour_staging).to(
-            device=colour.device,
-            dtype=colour.dtype,
-        )
-        device_mask = torch.from_numpy(mask_staging).to(
-            device=colour.device,
-            dtype=torch.bool,
-        )
-        target = flat_colour[pixel_start * HORIZONTAL_SUBPIXELS : pixel_end * HORIZONTAL_SUBPIXELS]
-        target.copy_(torch.where(device_mask[:, None], device_colours, target))
-        del device_colours, device_mask, target
-    return scattered
-
-
-def _replay_background_eye_once(
-    *,
-    renderer: StereoRenderer,
-    source: np.ndarray,
-    geometry: QualityGeometryResult,
-    offsets: np.ndarray,
-    records: np.ndarray,
-    band_height: int,
-    planned_lane_count: int,
-) -> np.ndarray:
-    height, width = source.shape[:2]
-    output = np.empty_like(source)
-    scattered = 0
-    if renderer.device.type == "cpu":
-        host_colours = None
-        host_mask = None
-    else:
-        staging_pixels = min(
-            band_height * width,
-            QUALITY_SCATTER_CHUNK_PIXELS,
-        )
-        staging_lanes = staging_pixels * HORIZONTAL_SUBPIXELS
-        host_colours = np.empty((staging_lanes, 3), dtype=np.uint8)
-        host_mask = np.empty(staging_lanes, dtype=np.bool_)
-    for start_row in range(0, height, band_height):
-        end_row = min(height, start_row + band_height)
-        band = _quality_splat(renderer, source, geometry, offsets, start_row, end_row)
-        valid = np.ascontiguousarray(band.splat.valid.detach().cpu().numpy())
-        with _relative_band_records(
-            records,
-            start_pixel=start_row * width,
-            end_pixel=end_row * width,
-        ) as band_records:
-            validate_record_coverage(band_records, ~valid)
-            scattered += _scatter_repair_records(
-                band.splat.colour,
-                band_records,
-                width=width,
-                host_colours=host_colours,
-                host_mask=host_mask,
-            )
-        downsampled = _downsample_subpixel_band(band.splat.colour)
-        output[start_row:end_row] = _convert_image_band(downsampled, source.dtype)
-        del band, valid, downsampled
-    if scattered != planned_lane_count:
-        raise RuntimeError("Quality Pass B scatter total does not match the repair plan")
-    return output
 
 
 def _render_background_eye(

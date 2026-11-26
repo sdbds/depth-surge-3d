@@ -13,24 +13,10 @@ def cli_module(monkeypatch):
     return import_module("depth_surge_3d.cli")
 
 
-@pytest.fixture(
-    scope="module",
-    params=["scripts.quality_task0", "src.depth_surge_3d.rendering.quality"],
-    ids=["prototype", "production"],
-)
-def quality_contract_package(request):
-    return request.param
-
-
-def _quality_module(name, *, prototype_name=None):
+def _quality_module(name: str):
     @pytest.fixture(scope="module")
-    def module(quality_contract_package):
-        basename = (
-            prototype_name
-            if prototype_name and quality_contract_package.startswith("scripts.")
-            else name
-        )
-        return import_module(f"{quality_contract_package}.{basename}")
+    def module():
+        return import_module(f"src.depth_surge_3d.rendering.quality.{name}")
 
     return module
 
@@ -38,10 +24,5 @@ def _quality_module(name, *, prototype_name=None):
 kd = _quality_module("implicit_kd")
 indexed_heap = _quality_module("indexed_heap")
 region_solver = _quality_module("region_solver")
-quality_geometry = _quality_module("geometry", prototype_name="quality_geometry")
-repair_records = _quality_module("repair_records")
-local_strip = _quality_module("local_strip")
-native_repair = _quality_module("native_repair")
+quality_geometry = _quality_module("geometry")
 native_kd = _quality_module("native_kd")
-fallback = _quality_module("fallback")
-exemplar = _quality_module("exemplar")

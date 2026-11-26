@@ -10,6 +10,34 @@ from typing import Any, Literal
 import numpy as np
 
 
+QUALITY_LOCAL_SLOT_CAP = 16_777_216
+QUALITY_LOCAL_NEIGHBOR_SAMPLE_CAP = 268_435_456
+QUALITY_REPAIR_FALLBACK_VISIT_CAP = 268_435_456
+QUALITY_EXEMPLAR_EYE_EVALUATION_CAP = 32_000_000
+REPAIR_RECORD_ITEMSIZE = 16
+
+
+@dataclass(frozen=True)
+class QualityRepairPlanSummary:
+    """Fixed-size diagnostics summary retained per eye."""
+
+    segment_record_count: int
+    segment_table_bytes: int
+    backend_lane_counts: tuple[int, int, int]
+    backend_pixel_counts: tuple[int, int, int]
+    backend_component_counts: tuple[int, int, int]
+    local_evaluated_slot_count: int
+    local_physical_sample_read_count: int
+    local_budget_skipped_run_count: int
+    fallback_indexed_donor_count: int
+    fallback_query_count: int
+    fallback_anchor_count: int
+    fallback_visited_nodes_total: int
+    fallback_visited_nodes_max: int
+    fallback_visited_nodes_p95: float
+    exemplar_donor_evaluation_count: int
+
+
 @dataclass(frozen=True)
 class QualityStereoControls:
     """Geometry-independent Quality reconstruction controls."""

@@ -19,7 +19,7 @@ from src.depth_surge_3d.rendering.stereo_renderer import (
 
 
 def _compact() -> CompactStereoRenderResult:
-    from src.depth_surge_3d.rendering.quality.planner import QualityRepairPlanSummary
+    from src.depth_surge_3d.rendering.quality.types import QualityRepairPlanSummary
 
     left = np.full((2, 3, 3), 10, dtype=np.uint8)
     right = np.full((2, 3, 3), 20, dtype=np.uint8)
