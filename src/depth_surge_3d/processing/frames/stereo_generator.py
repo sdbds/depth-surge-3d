@@ -329,7 +329,7 @@ class StereoPairGenerator:
 
             # Prepare rendering settings
             if not is_metric:
-                encoding_scale = np.float32(stereo_input.relative_encoding_scale or 1.0)
+                encoding_scale = np.float32(stereo_input.relative_encoding_scale or 65535.0)
                 relative_settings = StereoRenderSettings(
                     stereo_strength=float(settings.get("stereo_strength", 2.0)),
                     convergence=float(settings.get("convergence", 0.5)),
@@ -407,7 +407,7 @@ class StereoPairGenerator:
                             f"Failed to decode 16-bit disparity PNG: {record.geometry_path}"
                         )
                     canonical = np.ascontiguousarray(
-                        raw_disp.astype(np.float32) * (np.float32(1.0 / 65535.0) * encoding_scale),
+                        raw_disp.astype(np.float32) / encoding_scale,
                         dtype=np.float32,
                     )
                     return frame, canonical

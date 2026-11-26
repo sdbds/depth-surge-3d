@@ -372,7 +372,7 @@ def _expand_foreground_matte_one_pixel(  # noqa: C901 - validates and mutates on
         or not near_score.flags.c_contiguous
     ):
         raise TypeError("near_score must be a nonempty C-contiguous float32 raster")
-    shape = near_score.shape
+    shape: tuple[int, int] = (int(near_score.shape[0]), int(near_score.shape[1]))
     if not near_score.flags.writeable:
         raise ValueError("near_score must be writeable")
     _validate_matching_writeable_raster(
@@ -851,7 +851,9 @@ def _solve_final_regions(
     recorder: _LifetimeRecorder,
 ) -> _RegionState:
     initial_region_map = low_regions.region_map
-    area_threshold = _stable_region_area_threshold(initial_region_map.shape)
+    area_threshold = _stable_region_area_threshold(
+        (int(initial_region_map.shape[0]), int(initial_region_map.shape[1]))
+    )
     initial_region_count = int(low_regions.region_rank_bits.size) - 1
     stable_regions = region_solver.select_stable_region_support(
         initial_region_map,

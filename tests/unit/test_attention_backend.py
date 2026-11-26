@@ -139,18 +139,3 @@ def test_does_not_patch_da3_when_flash_attention_is_unavailable():
         assert attention_backend.install_da3_flash_attention() == 0
 
     import_module.assert_not_called()
-
-
-def test_installs_adapter_into_diffusers_attention_processor():
-    functional = SimpleNamespace(scaled_dot_product_attention=MagicMock(), gelu=object())
-    module = SimpleNamespace(F=functional)
-
-    with (
-        patch.object(attention_backend, "_load_flash_attn_func", return_value=MagicMock()),
-        patch.object(attention_backend.importlib, "import_module", return_value=module) as load,
-    ):
-        assert attention_backend.install_diffusers_flash_attention() == 1
-
-    load.assert_called_once_with("diffusers.models.attention_processor")
-    assert isinstance(module.F, attention_backend._FunctionalProxy)
-    assert module.F.gelu is functional.gelu

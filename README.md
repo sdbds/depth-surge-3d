@@ -16,16 +16,14 @@ Depth Surge 3D transforms flat videos into stereoscopic 3D for VR headsets using
 - **Optional MoGe-2 Backend**: Pinned Small, Base, and Large variants with metric
   depth and focal output. Relative geometry remains the default.
 - **AI Upscaling**: Optional Real-ESRGAN enhancement (2x/4x) for higher output resolution
-- **CUDA Hardware Acceleration**: NVENC H.265 encoding and GPU-accelerated frame decoding
+- **CUDA & Software Video Encoding**: NVENC H.265 (`hevc_nvenc`), software H.265 (`libx265`), and H.264 (`libx264`) with zero-copy streamed piping
 - **Configurable Depth Quality**: Adjustable depth map resolution (518px to 4K) for quality vs. speed
-- **Two Stereo Renderers**: Offline `quality` mode reconstructs depth edges and
-  repairs only authenticated disocclusions; `fast` retains the legacy renderer
-  for byte-compatible output and faster iteration
+- **Two Stereo Renderers**: Offline `quality` mode reconstructs depth edges and repairs disocclusions via a compiled C++17 native extension (supporting up to 4K); `fast` uses GPU Triton kernels for rapid iteration
 - **Optional VDPP Stabilization**: Experimental depth-only temporal post-processing for any video depth backend using relative geometry
 - **Multiple VR Formats**: Side-by-side and over-under stereoscopic formats
 - **Flexible Resolutions**: Square (VR-optimized), 16:9 (standard), cinema, and custom resolutions up to 8K
 - **Resume Capability**: Intelligent step-level resume for interrupted processing
-- **Audio Preservation**: Maintains original audio synchronization with lossless FLAC extraction
+- **Audio Preservation**: Fast metadata-only `ffprobe` inspection with sample-accurate audio synchronization
 - **Web Interface**: Modern browser-based UI with real-time progress tracking and live previews
 - **Wide Format Support**: Cinema, ultra-wide, and standard aspect ratios
 
@@ -114,11 +112,12 @@ output/
 └── timestamp_videoname_timestamp/
     ├── original_video.mp4      # Source video
     ├── original_audio.flac     # Pre-extracted audio
-    ├── 00_original_frames/    # Extracted frames
-    ├── 03_disparity_maps/     # Canonical relative disparity
-    ├── 03_disparity_stabilized/ # Optional VDPP artifact
-    ├── 04_stereo_diagnostics/ # Quality coverage/repair diagnostics and summary
-    ├── 99_vr_frames/          # Final VR frames
+    ├── 00_original_frames/       # Extracted frames
+    ├── 03_disparity_maps/        # Canonical relative disparity
+    ├── 03_disparity_stabilized/  # Optional VDPP artifact
+    ├── 04_stereo_diagnostics/    # Aggregated coverage/repair summary.json
+    ├── 99_vr_frames/             # Final VR frames (when keep_intermediates=true)
+    ├── processing-settings-v5.json
     └── videoname_3D_side_by_side.mp4  # Final 3D video
 ```
 

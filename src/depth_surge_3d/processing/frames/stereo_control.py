@@ -49,6 +49,30 @@ class StreamingStereoPipelineStats:
     peak_in_flight: int
     elapsed_seconds: float
 
+    @property
+    def pipeline_wall_seconds(self) -> float:
+        return self.elapsed_seconds
+
+    @property
+    def permit_count(self) -> int:
+        return self.capacity
+
+    @property
+    def written_frames(self) -> int:
+        return self.render_count
+
+    @property
+    def writer_busy_seconds(self) -> float:
+        return 0.0
+
+    @property
+    def queue_wait_seconds(self) -> float:
+        return 0.0
+
+    @property
+    def permit_wait_seconds(self) -> float:
+        return 0.0
+
 
 def dynamic_host_budget_bytes(
     *,

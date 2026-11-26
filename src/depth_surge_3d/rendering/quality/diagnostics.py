@@ -177,8 +177,9 @@ def _prefill_run_histograms(
     return lane_histogram, span_histogram
 
 
-def _histogram_pairs(histogram: np.ndarray) -> DenseHistogramPairs:
-    return DenseHistogramPairs(histogram)
+def _histogram_pairs(histogram: np.ndarray) -> list[list[int]]:
+    nonzero = np.flatnonzero(histogram)
+    return [[int(index), int(histogram[index])] for index in nonzero]
 
 
 def _backend_counts(

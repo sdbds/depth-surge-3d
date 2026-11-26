@@ -432,10 +432,10 @@ def _downsample_masks(
 
 def _convert_image_band(image: torch.Tensor, dtype: np.dtype) -> np.ndarray:
     if image.device.type == "cuda" and np.dtype(dtype) == np.dtype(np.uint8):
-        values = torch.round(image.detach())
-        values.clamp_(0, 255)
-        return values.to(dtype=torch.uint8).cpu().numpy()
-    values = image.detach().cpu().numpy()
+        gpu_values = torch.round(image.detach())
+        gpu_values.clamp_(0, 255)
+        return gpu_values.to(dtype=torch.uint8).cpu().numpy()
+    values: np.ndarray = image.detach().cpu().numpy()
     if np.issubdtype(dtype, np.integer):
         integer_limits = np.iinfo(dtype)
         values = np.clip(np.rint(values), integer_limits.min, integer_limits.max)
@@ -1436,6 +1436,7 @@ class StereoRenderer:
             if preload_device_frame
             else None
         )
+        host_offsets: tuple[np.ndarray | None, np.ndarray | None]
         if preloaded is None:
             device_frame = None
             device_offsets: tuple[torch.Tensor | None, torch.Tensor | None] = (

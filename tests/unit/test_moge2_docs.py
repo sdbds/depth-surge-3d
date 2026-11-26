@@ -350,6 +350,12 @@ def test_packaged_cli_module_and_script_target_exist(tmp_path: Path) -> None:
 
 def test_packaged_cli_help_succeeds(tmp_path: Path) -> None:
     executable = shutil.which("depth-surge-3d")
+    if executable is None:
+        candidate = Path(sys.executable).parent / (
+            "depth-surge-3d.exe" if sys.platform == "win32" else "depth-surge-3d"
+        )
+        if candidate.is_file():
+            executable = str(candidate)
     assert executable is not None
     result = subprocess.run(
         [executable, "--help"],

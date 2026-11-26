@@ -427,7 +427,7 @@ def _validate_raw_stage(
             )
     try:
         store = RawDepthStore(raw_dir, metadata)
-        completed = len(store.completed_frame_names())
+        completed = len(store.complete_files)
     except Exception:
         completed = 0
     if completed == len(frame_files) and metadata.get("status") == "complete":

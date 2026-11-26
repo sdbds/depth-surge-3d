@@ -30,11 +30,11 @@ jobs:
 
       - name: Check formatting with black
         run: |
-          black --check src/ tests/
+          black --check src/ tests/ app.py
 
       - name: Lint with flake8
         run: |
-          flake8 src/ tests/ --count --show-source --statistics
+          flake8 src/ tests/ app.py --count --show-source --statistics
 
       - name: Run type checking
         run: mypy src/depth_surge_3d --ignore-missing-imports

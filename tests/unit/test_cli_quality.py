@@ -29,12 +29,15 @@ def test_completed_resume_requires_positive_media_audit(
     monkeypatch.setattr(
         cli_module,
         "recover_processing_settings_artifact",
-        lambda _: SimpleNamespace(status="completed"),
+        lambda _: SimpleNamespace(
+            status="completed",
+            to_object=lambda: {"output_info": {"expected_final_relative_path": "final.mp4"}},
+        ),
     )
     monkeypatch.setattr(
         cli_module,
-        "audit_final_media_v1",
-        lambda *_: SimpleNamespace(final_video_authenticated=authenticated),
+        "verify_existing_final_video",
+        lambda *_: authenticated,
     )
     assert cli_module._finish_saved_publication(tmp_path, info) is authenticated
 

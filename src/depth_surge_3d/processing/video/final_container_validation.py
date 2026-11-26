@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
-from typing import Literal
+from typing import Any, Literal
 
 
 FINAL_PROBE_TIMEOUT_SECONDS = 30.0
@@ -46,7 +46,7 @@ def probe_final_container_streams(  # noqa: C901
     *,
     ffprobe: str = "ffprobe",
     timeout_seconds: float = FINAL_PROBE_TIMEOUT_SECONDS,
-) -> list[dict[str, object]]:
+) -> list[dict[str, Any]]:
     """Run one lightweight metadata-only FFprobe (no frame decoding)."""
 
     candidate = Path(path)

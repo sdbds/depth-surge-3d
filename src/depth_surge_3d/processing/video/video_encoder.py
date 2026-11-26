@@ -150,7 +150,7 @@ class StreamedVrEncodingSession:
             raise RuntimeError("FFmpeg stdin pipe is unavailable")
         contiguous = np.ascontiguousarray(vr_frame)
         try:
-            stdin.write(memoryview(contiguous))
+            stdin.write(contiguous.data)
         except BrokenPipeError as error:
             self._wait_process()
             diagnostics = tuple(self._stderr_lines)

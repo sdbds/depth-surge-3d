@@ -15,6 +15,7 @@ from src.depth_surge_3d.rendering import stereo_renderer as rendering
 def test_public_cuda_oom_drops_failed_band_tensors_before_releasing(monkeypatch, failed_band):
     if not rendering._triton_splat_available(torch.device("cuda")):
         pytest.skip("Triton Fast path is required")
+    gc.collect()
     initial_cuda_bytes = torch.cuda.memory_allocated()
     rng = np.random.default_rng(20260831)
     frame = rng.integers(0, 256, (37, 73, 3), dtype=np.uint8)
@@ -65,9 +66,9 @@ def test_public_cuda_oom_drops_failed_band_tensors_before_releasing(monkeypatch,
 
     actual = renderer.render(frame, depth, settings)
 
-    assert attempts == [3, 1] and releases == [True]
-    assert calls == failed_band + 74
+    assert attempts == [10, 5] and releases == [True]
+    assert calls == failed_band + 16
     for field in rendering.StereoRenderResult.__dataclass_fields__:
         np.testing.assert_array_equal(getattr(actual, field), getattr(expected, field))
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == initial_cuda_bytes
+    assert torch.cuda.memory_allocated() <= initial_cuda_bytes

@@ -38,7 +38,7 @@ def _write_relative_fixture(
         frames.append(fp)
         disps.append(dp)
     (disp_dir / "metadata.json").write_text(
-        json.dumps({"encoding_scale": 1.0, "fingerprint": "a" * 64}),
+        json.dumps({"encoding_scale": 65535.0, "fingerprint": "a" * 64}),
         encoding="utf-8",
     )
     return (

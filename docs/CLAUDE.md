@@ -1,13 +1,13 @@
 # Depth Surge 3D - Development Guide
 
 **Version**: 0.9.0
-**Purpose**: 2D to 3D VR video converter using AI depth estimation (Depth-Anything V3/V2)
+**Purpose**: 2D to 3D VR video converter using AI depth estimation (Depth Anything V3, Video-Depth-Anything V2, See-Through, MoGe-2)
 
 ---
 
 ## Quick Start
 
-Install the project using the [installation guide](INSTALLATION.md), then activate that environment before running the following from the checkout:
+Install the project using the [installation guide](INSTALLATION.md), then activate `.venv`:
 
 ```bash
 ./test.sh           # Verify installation (CUDA, dependencies, models)
@@ -20,178 +20,75 @@ python depth_surge_3d.py input.mp4 --vr-resolution 16x9-1080p -s 1:00 -e 2:00
 
 ---
 
-## Code Quality (CRITICAL - ALWAYS DO THIS BEFORE COMMIT)
-
-**MANDATORY pre-commit quality gate:**
+## Code Quality (Pre-Commit Gate)
 
 ```bash
-# Run ALL checks at once (RECOMMENDED - mirrors CI exactly)
+# Run all checks at once (mirrors CI)
 ./scripts/pre-commit-checks.sh          # Linux/macOS
-# OR
 .\scripts\pre-commit-checks.ps1         # Windows
 
-# This runs:
-# 1. Black formatting check (--check mode)
-# 2. Flake8 linting (must have 0 errors)
-# 3. Unit tests with coverage (must be ≥ 85%)
-```
-
-**Alternative: Run checks individually**
-
-```bash
-# 1. Format code (required, no exceptions)
+# Or run individually
 black src/ tests/ app.py
-
-# 2. Lint code (must pass with 0 errors)
 flake8 src/ tests/ app.py --count --show-source --statistics
-
-# 3. Run unit tests (MUST pass, no exceptions)
-./scripts/run-unit-tests.sh              # Linux/macOS (includes coverage)
-# OR
-.\scripts\run-unit-tests.ps1             # Windows (includes coverage)
+mypy src/depth_surge_3d --ignore-missing-imports
+pytest tests/unit -q
 ```
 
-**DO NOT commit if pre-commit checks fail. No exceptions.**
+Rebuild and install the native Quality C++17 extension after modifying `native/quality_kd_native.cpp`:
 
-**Complete coding standards**: See [CODING_GUIDE.md](CODING_GUIDE.md)
-- Functional programming patterns
-- Type hints (modern Python 3.10+ syntax: `dict`, `list`, `X | None`)
-- Max complexity: 10 (enforced by flake8)
-- Pure functions, immutability, composition
-- Current coverage: 92% (minimum: 85% enforced, goal: 90%+)
-
-**Git Commit Format:**
+```powershell
+uv run --no-project --python .venv\Scripts\python.exe --with pybind11==3.0.4 --with "setuptools>=84" python scripts/build_quality_task0_native.py
 ```
-type: brief description
 
-Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
-```
+Coding standards ([CODING_GUIDE.md](CODING_GUIDE.md)):
+- Modern Python 3.10+ type hints (`dict`, `list`, `X | None`); `mypy src/depth_surge_3d --ignore-missing-imports` must report 0 errors.
+- Max McCabe complexity: 10 (enforced by `flake8`).
+- `black` formatting and `flake8` 0 errors across `src/`, `tests/`, and `app.py`.
 
 ---
 
 ## Tech Stack
 
-- **Backend**: Flask + SocketIO (threading)
-- **AI Models**: Depth-Anything V3 (default, lower VRAM) / Video-Depth-Anything V2 (temporal consistency)
-- **Video**: FFmpeg with CUDA acceleration (NVENC encoding, hardware decoding)
-- **UI**: Bootstrap 5 dark theme with real-time progress
+- **Backend**: Flask + Socket.IO (threading)
+- **AI Models**: Depth Anything V3 (Web UI default), Video-Depth-Anything V2 (CLI default, 32-frame shot windows), See-Through Marigold, optional MoGe-2 (metric depth + focal)
+- **Temporal Stabilization**: Optional VDPP post-processor (`03_disparity_stabilized/`)
+- **Stereo Rendering**: Torch/Triton Fast renderer + compiled C++17 Quality renderer (`_quality_kd_native`)
+- **Video**: FFmpeg with `hevc_nvenc`, `libx265`, or `libx264` and zero-copy streamed `bgr24` piping
 
 ---
 
 ## Architecture Essentials
 
 ### Processing Pipeline
-1. Frame Extraction -> 2. Scene Analysis -> 3. Native Raw Depth -> 4. Canonical Disparity -> 5. DIBR Stereo Pairs -> 6. Optional Projection/Crop/Upscale -> 7. VR Assembly -> 8. Audio Integration
-
-Each step has resume capability and reuses intermediates only after its
-fingerprint and payload contract validate.
+1. Frame Extraction → 2. Scene Analysis → 3. Native Raw Depth → 4. Canonical Disparity (+ optional VDPP) or Metric Geometry → 5. DIBR Stereo Pairs (`fast` or `quality`) → 6. Optional Projection/Crop/Upscale → 7. VR Assembly / Streamed `bgr24` Encoding → 8. Audio Integration & Lightweight `ffprobe` Validation
 
 ### Output Structure
-```
-output/videoname_timestamp/
+```text
+output/<batch>/
 ├── 00_original_frames/metadata.json
 ├── 01_scene_data/
 ├── 02_depth_raw/
-├── 03_disparity_maps/
+├── 03_disparity_maps/            # or 03_metric_geometry/
+├── 03_disparity_stabilized/      # optional VDPP
 ├── 04_left_frames/ + 04_right_frames/
-├── 99_vr_frames/
-├── <batch>-settings.json
-└── videoname_3D_side_by_side.mp4
+├── 04_stereo_diagnostics/summary.json
+├── 99_vr_frames/                 # only when keep_intermediates=true
+├── processing-settings-v5.json
+└── <videoname>_3D_<format>.mp4
 ```
 
-### Depth Models
-- **V3** (default): Lower VRAM (~50%), faster, frame-by-frame
-- **V2**: Better temporal consistency, 32-frame windows, higher VRAM
-
-### Memory Management
-- Smart VRAM-based chunk sizing (auto-adjusts based on available GPU memory)
-- V3: 4-24 frames/chunk based on resolution
-- V2: 32-frame sliding windows with 10-frame overlap
+### Memory & Performance
+- Host memory budgets (`core/host_memory.py`) scale dynamically to available RAM (2–4 GiB for Quality host preflight, unblocking 4K Quality; 512 MiB–2 GiB for raw depth prefetch).
+- Default CUDA stereo splat band budgets scale up to 1.5 GiB (`free_vram // 4`).
+- Native C++ Quality kernels share a persistent 7-worker thread pool and use a parallel O(H·W) L1 distance transform for edge bands.
 
 ---
 
-## Important Rules
+## Documentation Map
 
-1. **Depth resolution**: NEVER exceed source frame resolution
-2. **Type hints**: Use modern syntax (`dict` not `Dict`, `X | None` not `Optional[X]`)
-3. **Complexity**: All functions ≤ 10 McCabe complexity (enforced)
-4. **Black + Flake8**: ALWAYS run before commit (no exceptions)
-5. **Testing**: Write unit tests for all pure functions in `utils/`
-
----
-
-## Common Commands
-
-```bash
-# Pre-commit quality gate (RECOMMENDED - run before every commit)
-./scripts/pre-commit-checks.sh            # Linux/macOS (all checks at once)
-.\scripts\pre-commit-checks.ps1           # Windows (all checks at once)
-
-# Development
-black src/ tests/ app.py                   # Format code
-flake8 src/ tests/ app.py                  # Lint code
-./scripts/run-unit-tests.sh               # Unit tests with coverage (Linux/macOS)
-.\scripts\run-unit-tests.ps1              # Unit tests with coverage (Windows)
-pytest tests/integration -v -m integration # Integration tests (requires GPU)
-
-# CI checks (what runs in GitHub Actions)
-black --check src/ tests/ app.py           # Check formatting
-flake8 src/ tests/ app.py --count --show-source --statistics
-pytest tests/unit -v --cov=src/depth_surge_3d --cov-report=xml --cov-fail-under=85
-
-# Debugging
-radon cc src/depth_surge_3d/ -a -nc        # Find complex functions (>10)
-vulture src/depth_surge_3d/                # Find dead code
-mypy src/depth_surge_3d/ --ignore-missing-imports
-```
-
----
-
-## Documentation Structure
-
-- **README.md**: Quick start, features overview
-- **CODING_GUIDE.md**: Coding standards and refactoring guide (comprehensive)
-- **CLAUDE.md**: Development guide (this file - keep concise!)
-- **docs/INSTALLATION.md**: Detailed setup instructions
-- **docs/USAGE.md**: CLI and web UI examples
-- **docs/PARAMETERS.md**: All options explained
-- **docs/TROUBLESHOOTING.md**: Common issues and solutions
-- **docs/ARCHITECTURE.md**: Technical deep dive
-- **docs/CONTRIBUTING.md**: Contribution workflow
-
----
-
-## Experimental Branches
-
-### ⚠️ `experimental/optical-flow-parked` - DO NOT MERGE
-Complete optical flow implementation (2000+ lines, 35 passing tests) that is **intentionally parked** due to fundamental theoretical limitations. V2 already provides temporal consistency. Kept for reference only.
-
----
-
-## Performance Benchmarks (RTX 4070 Ti SUPER)
-
-- **V3**: ~2-3 seconds/frame
-- **V2**: ~3-4 seconds/frame
-- **1-minute 1080p @ 30fps**: ~2-3 hours with V3
-
----
-
-## CI/CD
-
-- **Platform**: Ubuntu (GitHub Actions)
-- **Python**: 3.11
-- **Jobs**: Code Quality (black, flake8), Tests (unit + integration), Coverage (Codecov)
-- **Required**: All flake8 checks must pass (0 errors)
-
----
-
-## Keeping This File Compact
-
-**IMPORTANT**: Keep CLAUDE.md concise (100-150 lines target).
-
-- Remove historical information (use git history instead)
-- Focus on essential commands and current architecture
-- Point to comprehensive docs (CODING_GUIDE.md, etc.) instead of duplicating
-- Update when architecture/workflow changes
-- Delete outdated sections immediately
-- Keep code quality reminders prominent
+- `README.md` / `README.zh-CN.md`: Quick start and overview
+- `docs/INSTALLATION.md`: Platform setup and model weights
+- `docs/USAGE.md` & `docs/PARAMETERS.md`: CLI/UI workflows and flags
+- `docs/ARCHITECTURE.md`: Technical pipeline and module architecture
+- `docs/CODING_GUIDE.md` & `docs/CONTRIBUTING.md`: Standards and CI/CD
+- `docs/TROUBLESHOOTING.md`: Common issues and tips
