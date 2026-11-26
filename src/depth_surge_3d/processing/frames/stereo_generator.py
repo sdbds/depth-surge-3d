@@ -490,7 +490,7 @@ class StereoPairGenerator:
                         f"Generated stereo pair {done}/{total_frames}",
                         phase="stereo_generation",
                         frame_num=done,
-                        step_name="Stereo Pair Generation",
+                        step_name="Stereo Pair Creation",
                         step_progress=done,
                         step_total=total_frames,
                     )

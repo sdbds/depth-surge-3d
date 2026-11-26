@@ -904,6 +904,7 @@ class ProgressCallback:
         enable_live_preview: bool = True,
         preview_update_interval: float = PREVIEW_UPDATE_INTERVAL,
         temporal_postprocessor: str = "off",
+        settings: dict[str, Any] | None = None,
     ) -> None:
         self.session_id = session_id
         with _PROCESSING_LOCK:
@@ -917,6 +918,7 @@ class ProgressCallback:
         self.start_time = time.time()  # For ETA calculation
         self.step_frame_times = []  # Track recent frame times for current step
         self.step_start_progress = 0  # Track progress when step started
+        self._max_progress = 0.0
 
         # Preview tracking
         self.enable_live_preview = enable_live_preview
@@ -941,19 +943,63 @@ class ProgressCallback:
         elif temporal_postprocessor != "off":
             raise ValueError("temporal_postprocessor must be off or vdpp")
         self.step_aliases = {
+            "Stereo Pair Generation": "Stereo Pair Creation",
             "Direct VR Encoding": "Video Creation",
             "Frame Cropping": "Crop Frames",
         }
-        # Weighted progress based on actual timing measurements
-        # [2%, 35%, 20%, 8%, 2%, 18%, 8%, 7%] = 100%
-        self.step_weights = (
+        base_weights = list(
             VDPP_PROGRESS_STEP_WEIGHTS
             if temporal_postprocessor == "vdpp"
             else PROGRESS_STEP_WEIGHTS
         )
+        self.step_weights = (
+            self._build_dynamic_weights(base_weights, settings)
+            if settings is not None
+            else base_weights
+        )
         self.current_step_index = 0
         self.step_progress = 0
         self.step_total = 0
+
+    def _build_dynamic_weights(
+        self,
+        base_weights: list[float],
+        settings: dict[str, Any],
+    ) -> list[float]:
+        """Zero out disabled stages and scale Stereo weight when streaming directly to FFmpeg."""
+        weights = dict(zip(self.steps, base_weights, strict=True))
+        apply_distortion = bool(settings.get("apply_distortion", True))
+        try:
+            crop_factor = float(settings.get("crop_factor", 1.0))
+        except (TypeError, ValueError):
+            crop_factor = 1.0
+        upscale_model = str(settings.get("upscale_model") or "none")
+        keep_intermediates = bool(settings.get("keep_intermediates", False))
+        direct_vr_encode = bool(settings.get("direct_vr_encode", True))
+        streamed_stereo = (
+            direct_vr_encode
+            and not keep_intermediates
+            and upscale_model == "none"
+            and (apply_distortion or crop_factor == 1.0)
+        )
+        if settings.get("stereo_render_mode") == "quality":
+            weights["Stereo Pair Creation"] = max(weights["Stereo Pair Creation"], 0.40)
+        if not apply_distortion or streamed_stereo:
+            weights["Fisheye Distortion"] = 0.0
+        if (not apply_distortion and crop_factor == 1.0) or streamed_stereo:
+            weights["Crop Frames"] = 0.0
+        if upscale_model == "none":
+            weights["AI Upscaling"] = 0.0
+        if direct_vr_encode and not keep_intermediates:
+            weights["VR Assembly"] = 0.0
+        if streamed_stereo:
+            # In streamed mode FFmpeg encodes concurrently with Stereo Pair Creation;
+            # only container flush/ffprobe/cleanup remain after the last stereo frame.
+            weights["Video Creation"] = 0.01
+        total = sum(weights.values())
+        if total <= 0.0:
+            return base_weights
+        return [weights[name] / total for name in self.steps]
 
     def is_cancelled(self) -> bool:
         """Return the shared user-stop state without emitting progress."""
@@ -1073,38 +1119,38 @@ class ProgressCallback:
         if elapsed < 3:
             return None
 
-        # Strategy: Estimate remaining time for current step + remaining steps
-        remaining_time = 0
+        # Strategy: Estimate remaining time for current step + active remaining steps
+        remaining_time = 0.0
+        has_step_estimate = False
 
-        # 1. Estimate remaining time for current step
+        # 1. Estimate remaining time for current step from frames completed since step start
         if self.step_total > 0 and self.step_progress > 0:
-            # Use actual measured rate for current step
             step_start_time = self.step_start_times.get(self.current_step_name, self.start_time)
             step_elapsed = current_time - step_start_time
+            frames_completed = self.step_progress - self.step_start_progress
+            frames_remaining = max(0, self.step_total - self.step_progress)
+            if frames_remaining == 0:
+                has_step_estimate = True
+            elif step_elapsed >= 1.5 and frames_completed > 0:
+                time_per_frame = step_elapsed / frames_completed
+                remaining_time += time_per_frame * frames_remaining
+                has_step_estimate = True
 
-            # Need at least 2 seconds into current step for accurate measurement
-            if step_elapsed >= 2:
-                frames_completed = self.step_progress
-                frames_remaining = self.step_total - self.step_progress
-
-                # Calculate time per frame for this step
-                time_per_frame = step_elapsed / max(frames_completed, 1)
-
-                # Estimate remaining time for this step
-                step_remaining_time = time_per_frame * frames_remaining
-                remaining_time += step_remaining_time
-
-        # 2. Add estimated time for future steps using overall progress rate
-        if self.current_step_index < len(self.steps) - 1 and current_progress > 5:
-            future_weight = sum(self.step_weights[self.current_step_index + 1 :]) * 100.0
+        # 2. Add estimated time for active future steps only (disabled steps have weight 0)
+        future_weight = (
+            sum(self.step_weights[self.current_step_index + 1 :]) * 100.0
+            if self.current_step_index < len(self.steps) - 1
+            else 0.0
+        )
+        if future_weight > 0.0 and current_progress > 5:
             avg_time_per_percent = elapsed / current_progress
-            if remaining_time > 0:
+            if has_step_estimate:
                 remaining_time += avg_time_per_percent * future_weight
             else:
                 remaining_time = avg_time_per_percent * (100.0 - current_progress)
 
-        # Fallback: use simple overall progress rate if we don't have step data
-        if remaining_time <= 0 and current_progress > 0:
+        # Fallback: use overall progress rate if current step has no rate sample yet
+        if not has_step_estimate and remaining_time <= 0 and current_progress > 0:
             progress_ratio = current_progress / 100.0
             estimated_total_time = elapsed / progress_ratio
             remaining_time = estimated_total_time - elapsed
@@ -1169,7 +1215,9 @@ class ProgressCallback:
             self.current_step_name = step_name
             self.step_start_times[step_name] = current_time
             self.step_frame_times = []  # Reset frame times for new step
-            self.step_start_progress = 0  # Reset progress for new step
+            self.step_start_progress = (
+                step_progress if (step_progress is not None and step_progress > 0) else 0
+            )
 
             # Update step index
             weighted_step_name = self.step_aliases.get(step_name, step_name)
@@ -1197,7 +1245,8 @@ class ProgressCallback:
         if self.current_step_index < len(self.step_weights):
             cumulative_weight += step_progress_ratio * self.step_weights[self.current_step_index]
 
-        progress = round(cumulative_weight * 100, PROGRESS_DECIMAL_PLACES)
+        progress = max(self._max_progress, round(cumulative_weight * 100, PROGRESS_DECIMAL_PLACES))
+        self._max_progress = progress
 
         # Calculate ETA
         eta_str = self._calculate_eta(progress)
@@ -1443,6 +1492,7 @@ def process_video_async(  # noqa: C901
             enable_live_preview,
             preview_update_interval,
             temporal_postprocessor=settings.get("temporal_postprocessor", "off"),
+            settings=settings,
         )
 
         # Give client time to join the session room before starting processing
