@@ -100,10 +100,16 @@ def _run_opaque_marigold_batch(
                 generator=generator,
             ).prev_sample
 
-        depth = torch.cat(
-            [pipeline.decode_depth(value.unsqueeze(0)) for value in target_latent],
-            dim=0,
-        )
+        if batch_size == 1:
+            depth = pipeline.decode_depth(target_latent)
+        else:
+            try:
+                depth = pipeline.decode_depth(target_latent)
+            except Exception:
+                depth = torch.cat(
+                    [pipeline.decode_depth(value.unsqueeze(0)) for value in target_latent],
+                    dim=0,
+                )
         depth = ((torch.clip(depth, -1.0, 1.0) + 1.0) / 2.0).squeeze(1)
         return depth.to(device="cpu", dtype=torch.float32).numpy()
 

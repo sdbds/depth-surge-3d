@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import atexit
 import gc
 import math
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 from dataclasses import dataclass
 from typing import Callable, Literal
 
@@ -13,6 +15,7 @@ import cv2
 import numpy as np
 import torch
 
+from ...core.host_memory import dynamic_host_budget_bytes
 from ...core.resource_errors import QualityHostBudgetError
 from ..forward_splat import HORIZONTAL_SUBPIXELS
 from ..stereo_renderer import (
@@ -41,7 +44,11 @@ from .types import (
 from .visibility import QualitySplatBand, _quality_splat_band_prevalidated
 
 
-QUALITY_HOST_BUDGET_BYTES = 512 * 1024 * 1024
+QUALITY_HOST_BUDGET_BYTES = dynamic_host_budget_bytes(
+    fraction=0.45,
+    minimum=2 * 1024 * 1024 * 1024,
+    maximum=4 * 1024 * 1024 * 1024,
+)
 QUALITY_RUNTIME_OVERHEAD_BYTES = 16 * 1024 * 1024
 QUALITY_NATIVE_SPAWNED_WORKER_CAP = 7
 QUALITY_PYTHON_REPAIR_WORKER_COUNT = 1
@@ -53,10 +60,34 @@ QUALITY_AUXILIARY_THREAD_BYTES = (
     QUALITY_AUXILIARY_THREAD_COUNT * QUALITY_AUXILIARY_THREAD_STACK_BYTES
 )
 QUALITY_SPLAT_BYTES_PER_PIXEL = 1536
-QUALITY_CUDA_BUDGET_CAP_BYTES = 512 * 1024 * 1024
-QUALITY_CUDA_FREE_BUDGET_DIVISOR = 8
+QUALITY_CUDA_BUDGET_CAP_BYTES = 1536 * 1024 * 1024
+QUALITY_CUDA_FREE_BUDGET_DIVISOR = 4
 QUALITY_INPAINT_ROI_AREA_NUMERATOR = 9
 QUALITY_INPAINT_ROI_AREA_DENOMINATOR = 10
+
+_LEFT_REPAIR_EXECUTOR_LOCK = threading.Lock()
+_LEFT_REPAIR_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def _get_left_repair_executor() -> ThreadPoolExecutor:
+    global _LEFT_REPAIR_EXECUTOR
+    with _LEFT_REPAIR_EXECUTOR_LOCK:
+        if _LEFT_REPAIR_EXECUTOR is None:
+            _LEFT_REPAIR_EXECUTOR = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="quality-left-repair",
+            )
+            atexit.register(_shutdown_left_repair_executor)
+        return _LEFT_REPAIR_EXECUTOR
+
+
+def _shutdown_left_repair_executor() -> None:
+    global _LEFT_REPAIR_EXECUTOR
+    with _LEFT_REPAIR_EXECUTOR_LOCK:
+        executor = _LEFT_REPAIR_EXECUTOR
+        _LEFT_REPAIR_EXECUTOR = None
+    if executor is not None:
+        executor.shutdown(wait=False)
 
 
 def _calculate_quality_band_height(
@@ -929,14 +960,15 @@ def _render_quality_eyes(
         return result, time.perf_counter() - started
 
     left_pre_repair, left_prefix_seconds = render_unrepaired("left")
-    with ThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix="quality-left-repair",
-    ) as executor:
-        left_future = executor.submit(finish, left_pre_repair, "left")
+    executor = _get_left_repair_executor()
+    left_future = executor.submit(finish, left_pre_repair, "left")
+    try:
         right_pre_repair, right_prefix_seconds = render_unrepaired("right")
         right, right_finish_seconds = finish(right_pre_repair, "right")
         left, left_finish_seconds = left_future.result()
+    except BaseException:
+        wait_futures([left_future])
+        raise
     return (
         left,
         right,

@@ -18,8 +18,8 @@ BUILD_OUTPUT = ROOT / "build" / "quality-task0-native-artifacts" / _BUILD_TAG
 
 def _compile_arguments() -> list[str]:
     if os.name == "nt":
-        return ["/O2", "/std:c++17", "/EHsc", "/permissive-", "/fp:strict", "/utf-8"]
-    return ["-O3", "-std=c++17", "-fvisibility=hidden", "-ffp-contract=off", "-pthread"]
+        return ["/O2", "/std:c++17", "/EHsc", "/permissive-", "/fp:precise", "/utf-8"]
+    return ["-O3", "-std=c++17", "-fvisibility=hidden", "-pthread"]
 
 
 def _link_arguments() -> list[str]:

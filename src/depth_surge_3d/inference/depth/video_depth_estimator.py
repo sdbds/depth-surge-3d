@@ -577,14 +577,23 @@ class VideoDepthEstimator:
             current_input[:, :VDA_OVERLAP].copy_(carried_input)
             write_index = VDA_OVERLAP
 
-        for frame_index, frame in enumerate(frames):
-            transformed = (
-                first_transformed
-                if frame_index == 0 and first_transformed is not None
-                else self._transform_vda_frame(frame, transform)
+        if len(frames):
+            transformed_frames = [
+                (
+                    first_transformed
+                    if first_transformed is not None
+                    else self._transform_vda_frame(frames[0], transform)
+                )
+            ]
+            for frame in frames[1:]:
+                transformed_frames.append(self._transform_vda_frame(frame, transform))
+            batch_cpu = torch.cat(transformed_frames, dim=1)
+            batch_end = write_index + len(frames)
+            current_input[:, write_index:batch_end].copy_(
+                batch_cpu,
+                non_blocking=str(self.device).startswith("cuda"),
             )
-            current_input[:, write_index].copy_(transformed[:, 0])
-            write_index += 1
+            write_index = batch_end
 
         if write_index == VDA_INFER_LEN:
             return current_input

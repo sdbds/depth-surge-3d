@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
-import ctypes
 from dataclasses import dataclass
-import os
 import queue
 import threading
 import time
 from typing import TypeVar
+
+from ...core.host_memory import available_host_memory_bytes
 
 
 MIN_STEREO_HOST_BUDGET_BYTES = 1024 * 1024 * 1024  # 1 GiB
@@ -48,53 +48,6 @@ class StreamingStereoPipelineStats:
     write_workers: int
     peak_in_flight: int
     elapsed_seconds: float
-
-
-def available_host_memory_bytes() -> int | None:  # noqa: C901
-    """Query currently available host RAM across Windows, Linux, and macOS."""
-
-    if os.name == "nt":
-        try:
-
-            class _MemoryStatusEx(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-
-            status = _MemoryStatusEx()
-            status.dwLength = ctypes.sizeof(_MemoryStatusEx)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-                avail = int(status.ullAvailPhys)
-                return avail if avail > 0 else None
-        except Exception:
-            return None
-        return None
-
-    try:
-        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
-            for line in handle:
-                if line.startswith("MemAvailable:"):
-                    kb = int(line.split()[1])
-                    return kb * 1024 if kb > 0 else None
-    except OSError:
-        pass
-
-    try:
-        page_size = int(os.sysconf("SC_PAGE_SIZE"))
-        avail_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
-        if page_size > 0 and avail_pages > 0:
-            return page_size * avail_pages
-    except (AttributeError, OSError, ValueError):
-        pass
-    return None
 
 
 def dynamic_host_budget_bytes(

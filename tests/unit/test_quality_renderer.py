@@ -976,6 +976,17 @@ def test_quality_public_budget_rejects_before_materializing_broadcast_input(
         )
 
 
+def test_quality_public_preflight_allows_4k_background_render() -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    phases = quality._quality_public_memory_preflight(
+        render_shape=(2160, 3840),
+        native_shape=(1080, 1920),
+        occlusion_fill="background",
+        materialize_public_masks=False,
+    )
+    assert max(phases.values()) <= quality.QUALITY_HOST_BUDGET_BYTES
+
+
 @pytest.mark.parametrize("occlusion_fill", ["none", "background"])
 @pytest.mark.parametrize("materialize_public_masks", [False, True])
 def test_quality_geodesic_preflight_charges_cached_priorities_without_raising_peak(
@@ -1091,14 +1102,14 @@ def test_quality_cuda_budget_uses_only_a_bounded_share_of_live_free_memory(
         "mem_get_info",
         lambda _device: (8 * 1024**3, 24 * 1024**3),
     )
-    assert quality._quality_temporary_budget_bytes(renderer) == 512 * 1024 * 1024
+    assert quality._quality_temporary_budget_bytes(renderer) == 1536 * 1024 * 1024
 
     monkeypatch.setattr(
         torch.cuda,
         "mem_get_info",
         lambda _device: (2 * 1024**3, 24 * 1024**3),
     )
-    assert quality._quality_temporary_budget_bytes(renderer) == 256 * 1024 * 1024
+    assert quality._quality_temporary_budget_bytes(renderer) == 512 * 1024 * 1024
 
     explicitly_smaller = StereoRenderer(
         device="cpu",

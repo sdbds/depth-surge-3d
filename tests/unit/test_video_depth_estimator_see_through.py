@@ -296,15 +296,9 @@ class TestSeeThroughDepthEstimator:
             pipeline_loader=loader,
         )
 
-        with patch(
-            "src.depth_surge_3d.inference.depth.attention_backend."
-            "install_diffusers_flash_attention",
-            return_value=1,
-        ) as install:
-            assert estimator.load_model() is True
+        assert estimator.load_model() is True
 
         assert estimator.model is pipeline
-        install.assert_not_called()
         loader.assert_called_once_with(
             repo_id="24yearsold/seethroughv0.0.1_marigold",
             source_root=source_root.resolve(),

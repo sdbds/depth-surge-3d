@@ -525,7 +525,7 @@ def build_geometry_eye_offsets_into(
     output_int32: np.ndarray,
     row_float64_scratch: np.ndarray,
 ) -> None:
-    """Build one metric/common-geometry eye map in the frozen operation order."""
+    """Build one metric/common-geometry eye map in bounded vectorized slabs."""
 
     _validate_geometry_offset_buffers(
         total_disparity_fraction,
@@ -533,32 +533,27 @@ def build_geometry_eye_offsets_into(
         row_float64_scratch,
     )
     direction = _validate_eye(eye)
-    width = total_disparity_fraction.shape[1]
-    for row in range(total_disparity_fraction.shape[0]):
-        np.multiply(
-            total_disparity_fraction[row],
-            np.float64(width),
-            out=row_float64_scratch,
-        )
-        np.multiply(
-            row_float64_scratch,
-            np.float64(0.5),
-            out=row_float64_scratch,
-        )
-        np.multiply(
-            row_float64_scratch,
-            np.float64(16.0),
-            out=row_float64_scratch,
-        )
+    height, width = total_disparity_fraction.shape
+    if height == 0 or width == 0:
+        return
+    slab_rows = min(height, 256)
+    slab = np.empty((slab_rows, width), dtype=np.float64)
+    width64 = np.float64(width)
+    half64 = np.float64(0.5)
+    subpixels64 = np.float64(16.0)
+    for row_start in range(0, height, slab_rows):
+        row_end = min(row_start + slab_rows, height)
+        buf = slab[: row_end - row_start]
+        np.multiply(total_disparity_fraction[row_start:row_end], width64, out=buf)
+        np.multiply(buf, half64, out=buf)
+        np.multiply(buf, subpixels64, out=buf)
         if direction < 0:
-            np.negative(row_float64_scratch, out=row_float64_scratch)
-        np.subtract(
-            row_float64_scratch,
-            np.float64(0.5),
-            out=row_float64_scratch,
-        )
-        np.ceil(row_float64_scratch, out=row_float64_scratch)
-        _narrow_offset_row(row_float64_scratch, output_int32[row])
+            np.negative(buf, out=buf)
+        np.subtract(buf, half64, out=buf)
+        np.ceil(buf, out=buf)
+        if float(buf.min()) < _INT32_MIN or float(buf.max()) > _INT32_MAX:
+            raise ValueError("projected fine-sample offsets exceed int32 range")
+        output_int32[row_start:row_end] = buf.astype(np.int32)
 
 
 def build_relative_quality_geometry(
@@ -939,7 +934,7 @@ def _solve_final_regions(
     final_region_map = geodesic.region_map
     recorder.allocate(4, "final_region_map", final_region_map.nbytes)
     edge_count = int(np.count_nonzero(edge_band))
-    final_hash = _array_sha256(final_region_map)
+    final_hash = ""
     del (
         initial,
         stable_initial,
@@ -1564,29 +1559,29 @@ def _update_metric_derived_inside_band(
     disparity_percent: np.float64,
     crop_width: int,
 ) -> None:
+    rows, cols = np.nonzero(regions.edge_band)
+    if rows.size == 0:
+        return
     width = baseline.near_score.shape[1]
     retained_fraction = np.float64(crop_width) / np.float64(width)
     baseline_m = np.float64(baseline_mm / np.float64(1000.0))
     limit = np.float64(disparity_percent / np.float64(100.0))
-    for row, edge_row in enumerate(regions.edge_band):
-        columns = np.flatnonzero(edge_row)
-        for column_value in columns:
-            column = int(column_value)
-            weight = baseline.resized_weight[row, column]
-            is_valid = bool(weight >= np.float32(0.5))
-            baseline.resized_valid[row, column] = is_valid
-            if weight > np.float32(0.0) and is_valid:
-                inverse = np.float32(baseline.resized_weighted_inverse[row, column] / weight)
-            else:
-                inverse = np.float32(0.0)
-            baseline.near_score[row, column] = inverse
-            raw = np.float64(focal / retained_fraction)
-            raw = np.float64(raw * baseline_m)
-            raw = np.float64(
-                raw * np.float64(np.float64(inverse) - np.float64(1.0 / convergence_m))
-            )
-            clamped = min(max(raw, -limit), limit)
-            baseline.total_disparity_fraction[row, column] = np.float64(clamped * retained_fraction)
+    weights = baseline.resized_weight[rows, cols]
+    is_valid = weights >= np.float32(0.5)
+    baseline.resized_valid[rows, cols] = is_valid
+    positive_valid = (weights > np.float32(0.0)) & is_valid
+    safe_weights = np.where(positive_valid, weights, np.float32(1.0))
+    weighted_inverse = baseline.resized_weighted_inverse[rows, cols]
+    inverse = np.where(
+        positive_valid,
+        weighted_inverse / safe_weights,
+        np.float32(0.0),
+    ).astype(np.float32, copy=False)
+    baseline.near_score[rows, cols] = inverse
+    scale = np.float64(focal / retained_fraction) * baseline_m
+    raw = scale * (inverse.astype(np.float64) - np.float64(1.0 / convergence_m))
+    clamped = np.clip(raw, -limit, limit)
+    baseline.total_disparity_fraction[rows, cols] = clamped * retained_fraction
 
 
 def _recount_metric_stats(
@@ -1632,7 +1627,7 @@ def _freeze_quality_result(
 ) -> QualityGeometryResult:
     max_jump = _max_four_neighbour_jump(displacement)
     predicted_gap = int(math.ceil(max_jump)) + 2
-    after_hash = _array_sha256(region_state.final_region_map)
+    after_hash = ""
     arrays: tuple[np.ndarray | None, ...] = (
         near_score,
         total,

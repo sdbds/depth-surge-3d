@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Generator
 
@@ -158,7 +159,15 @@ class VDPPTemporalPostprocessor:
         model = self._model
         if model is None:
             raise RuntimeError("VDPP model has been released")
-        with torch.inference_mode():
+        autocast_ctx = (
+            torch.amp.autocast(
+                "cuda",
+                dtype=(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16),
+            )
+            if inputs.device.type == "cuda"
+            else nullcontext()
+        )
+        with torch.inference_mode(), autocast_ctx:
             outputs = model(inputs, downsize=VDPP_DOWNSIZE)
         if not isinstance(outputs, torch.Tensor) or outputs.shape != inputs.shape:
             shape = getattr(outputs, "shape", None)
@@ -200,6 +209,19 @@ class VDPPTemporalPostprocessor:
             if not bool(torch.isfinite(aligned).all().item()):
                 raise FloatingPointError("VDPP aligned output contains non-finite values")
             return aligned
+
+    @staticmethod
+    def _to_native_batch(frames: torch.Tensor, native_shape: tuple[int, int]) -> np.ndarray:
+        """Resize a window slice to native shape and transfer once to host memory."""
+        with torch.inference_mode():
+            if tuple(frames.shape[-2:]) != native_shape:
+                frames = F.interpolate(
+                    frames.unsqueeze(1),
+                    size=native_shape,
+                    mode="bilinear",
+                    align_corners=True,
+                ).squeeze(1)
+            return frames.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy().copy()
 
     @staticmethod
     def _to_native(frame: torch.Tensor, native_shape: tuple[int, int]) -> np.ndarray:
@@ -256,10 +278,12 @@ class VDPPTemporalPostprocessor:
             if end < frame_count:
                 retained = current[:, -VDPP_OVERLAP:].detach().clone()
                 self._active_retained = retained
-            for local_index in range(current.shape[1]):
-                yield local_index, self._to_native(current[0, local_index], native_shape)
+            host_batch = self._to_native_batch(current[0], native_shape)
             del current
             current = None
+            for local_index in range(host_batch.shape[0]):
+                yield local_index, host_batch[local_index]
+            del host_batch
 
             while end < frame_count:
                 start += VDPP_STRIDE
@@ -281,15 +305,16 @@ class VDPPTemporalPostprocessor:
                 retained = None
                 self._active_retained = None
 
-                emit_start = VDPP_OVERLAP
-                for local_index in range(emit_start, current.shape[1]):
-                    global_index = start + local_index
-                    yield global_index, self._to_native(current[0, local_index], native_shape)
                 if end < frame_count:
                     retained = current[:, -VDPP_OVERLAP:].detach().clone()
                     self._active_retained = retained
+                emit_start = VDPP_OVERLAP
+                host_batch = self._to_native_batch(current[0, emit_start:], native_shape)
                 del current
                 current = None
+                for offset in range(host_batch.shape[0]):
+                    yield start + emit_start + offset, host_batch[offset]
+                del host_batch
         finally:
             self._active_retained = None
             retained = None
@@ -300,39 +325,34 @@ class VDPPTemporalPostprocessor:
         pending_shot_length: int,
         native_shape: tuple[int, int],
     ) -> dict[str, Any]:
-        """Exercise the real first/continuation allocation path before mutation."""
+        """Verify CUDA availability and working VRAM without running dummy neural passes."""
 
         if self.device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("VDPP CUDA preflight requires an available CUDA device")
         if pending_shot_length < 1:
             raise ValueError("VDPP preflight shot length must be positive")
-        second_length = min(VDPP_WINDOW_SIZE, pending_shot_length - VDPP_STRIDE)
-        trial_length = (
-            min(pending_shot_length, VDPP_WINDOW_SIZE)
-            if pending_shot_length <= VDPP_WINDOW_SIZE
-            else VDPP_STRIDE + second_length
-        )
-        trial = np.full((VDPP_WINDOW_SIZE, *native_shape), 0.5, dtype=np.float32)
-        torch.cuda.synchronize(self.device)
-        torch.cuda.reset_peak_memory_stats(self.device)
-        iterator = self.process_shot(
-            trial_length,
-            lambda start, end: trial[: end - start],
-        )
-        try:
-            for _index, _values in iterator:
-                pass
-        finally:
-            iterator.close()
-        torch.cuda.synchronize(self.device)
-        result: dict[str, Any] = {
-            "preflight_window_lengths": [min(VDPP_WINDOW_SIZE, trial_length)],
-            "preflight_max_memory_allocated": int(torch.cuda.max_memory_allocated(self.device)),
-            "preflight_max_memory_reserved": int(torch.cuda.max_memory_reserved(self.device)),
+        first_length = min(VDPP_WINDOW_SIZE, pending_shot_length)
+        window_lengths = [first_length]
+        if pending_shot_length > VDPP_WINDOW_SIZE:
+            second_length = min(VDPP_WINDOW_SIZE, pending_shot_length - VDPP_STRIDE)
+            window_lengths.append(second_length)
+        padded_h = ceil_multiple(int(native_shape[0]), 14)
+        padded_w = ceil_multiple(int(native_shape[1]), 14)
+        # Conservative working activation estimate (inputs + outputs + recurrence + scratch).
+        estimated_working_bytes = int(padded_h * padded_w * first_length * 4 * 8)
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(self.device)
+        if free_bytes < estimated_working_bytes:
+            raise torch.cuda.OutOfMemoryError(
+                f"Insufficient CUDA memory for VDPP window: need ~{estimated_working_bytes} "
+                f"bytes, only {free_bytes} bytes free"
+            )
+        allocated = int(torch.cuda.memory_allocated(self.device))
+        reserved = int(torch.cuda.memory_reserved(self.device))
+        return {
+            "preflight_window_lengths": window_lengths,
+            "preflight_max_memory_allocated": max(allocated, estimated_working_bytes),
+            "preflight_max_memory_reserved": max(reserved, estimated_working_bytes),
         }
-        if trial_length > VDPP_WINDOW_SIZE:
-            result["preflight_window_lengths"].append(second_length)
-        return result
 
     def release(self) -> None:
         """Release model and abandoned recurrence state; safe to call repeatedly."""

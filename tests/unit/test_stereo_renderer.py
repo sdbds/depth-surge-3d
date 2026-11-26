@@ -105,7 +105,7 @@ def test_band_height_uses_measured_sixteen_sample_bound() -> None:
     assert calculate_band_height(16, 3) == 3
 
 
-def test_fast_default_cuda_budget_limits_4k_to_seventeen_bands(
+def test_fast_default_cuda_budget_scales_4k_up_to_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     renderer = StereoRenderer(device="cuda")
@@ -122,10 +122,10 @@ def test_fast_default_cuda_budget_limits_4k_to_seventeen_bands(
         bytes_per_pixel=1088,
     )
 
-    assert actual == 534_773_760
+    assert actual == 1536 * 1024 * 1024
 
 
-def test_fast_default_cuda_budget_does_not_grow_1080p(
+def test_fast_default_cuda_budget_grows_1080p_for_fewer_bands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     renderer = StereoRenderer(device="cuda")
@@ -142,7 +142,7 @@ def test_fast_default_cuda_budget_does_not_grow_1080p(
         bytes_per_pixel=1088,
     )
 
-    assert actual == 268_435_456
+    assert actual == 1920 * 270 * 1088
 
 
 def test_fast_cuda_budget_preserves_explicit_configuration(
@@ -300,7 +300,7 @@ def test_fast_compact_default_cuda_path_uses_adaptive_4k_band_height(
     )
 
     assert result is marker
-    assert attempted_heights == [128]
+    assert attempted_heights == [385]
 
 
 def test_public_fast_default_cuda_path_uses_adaptive_4k_band_height(
@@ -341,7 +341,7 @@ def test_public_fast_default_cuda_path_uses_adaptive_4k_band_height(
     )
 
     assert result is marker
-    assert attempted_heights == [128]
+    assert attempted_heights == [385]
 
 
 def test_renderer_rejects_full_frame_source_indexes_that_do_not_fit_uint32() -> None:

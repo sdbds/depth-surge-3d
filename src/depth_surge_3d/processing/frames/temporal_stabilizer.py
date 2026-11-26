@@ -322,6 +322,25 @@ class TemporalDepthStabilizer:
             shot_pixels=length * native_shape[0] * native_shape[1],
         )
 
+    _SHOT_SOURCE_CACHE_BUDGET_BYTES = 512 * 1024 * 1024
+
+    @classmethod
+    def _read_source_cached(
+        cls,
+        base_files: list[Path],
+        frame_index: int,
+        native_shape: tuple[int, int],
+        source_cache: dict[int, np.ndarray] | None,
+    ) -> np.ndarray:
+        if source_cache is not None:
+            cached = source_cache.get(frame_index)
+            if cached is not None:
+                return cached
+        decoded = cls._read_source(base_files[frame_index], native_shape)
+        if source_cache is not None:
+            source_cache[frame_index] = decoded
+        return decoded
+
     @classmethod
     def _window_loader(
         cls,
@@ -330,6 +349,7 @@ class TemporalDepthStabilizer:
         shot_start: int,
         shot_length: int,
         native_shape: tuple[int, int],
+        source_cache: dict[int, np.ndarray] | None = None,
     ) -> Callable[[int, int], np.ndarray]:
         def load_window(start: int, end: int) -> np.ndarray:
             if (
@@ -346,9 +366,11 @@ class TemporalDepthStabilizer:
                 )
             output = np.empty((end - start, *native_shape), dtype=np.float32)
             for output_index, local_index in enumerate(range(start, end)):
-                source = cls._read_source(
-                    base_files[shot_start + local_index],
+                source = cls._read_source_cached(
+                    base_files,
+                    shot_start + local_index,
                     native_shape,
+                    source_cache,
                 )
                 normalize_vdpp_input_frame(source, output[output_index])
             return output
@@ -388,16 +410,19 @@ class TemporalDepthStabilizer:
             "fallback_reason": fallback_reason,
         }
 
-    @staticmethod
+    @classmethod
     def _copy_outputs(
+        cls,
         base_files: list[Path],
         scan: _ShotPreScan,
         native_shape: tuple[int, int],
+        *,
+        source_cache: dict[int, np.ndarray] | None = None,
     ) -> Iterable[tuple[int, np.ndarray]]:
         for local_index, frame_index in enumerate(range(scan.start, scan.end)):
             yield (
                 local_index,
-                TemporalDepthStabilizer._read_source(base_files[frame_index], native_shape),
+                cls._read_source_cached(base_files, frame_index, native_shape, source_cache),
             )
 
     @staticmethod
@@ -417,13 +442,14 @@ class TemporalDepthStabilizer:
         shift: float,
         pair_count: int,
         tile_count: int,
+        source_cache: dict[int, np.ndarray] | None = None,
     ) -> dict[str, float]:
         state = ScalarTileState.empty()
         preclip_low_count = 0
         preclip_high_count = 0
         pixel_count = native_shape[0] * native_shape[1]
         for local_index, frame_index in enumerate(range(scan.start, scan.end)):
-            source = cls._read_source(base_files[frame_index], native_shape)
+            source = cls._read_source_cached(base_files, frame_index, native_shape, source_cache)
             if not cls._has_non_midpoint_range(source):
                 continue
             source_flat = source.reshape(-1)
@@ -489,10 +515,11 @@ class TemporalDepthStabilizer:
         *,
         scale: float,
         shift: float,
+        source_cache: dict[int, np.ndarray] | None = None,
     ) -> Iterable[tuple[int, np.ndarray]]:
         pixel_count = native_shape[0] * native_shape[1]
         for local_index, frame_index in enumerate(range(scan.start, scan.end)):
-            source = cls._read_source(base_files[frame_index], native_shape)
+            source = cls._read_source_cached(base_files, frame_index, native_shape, source_cache)
             if not cls._has_non_midpoint_range(source):
                 yield local_index, source
                 continue
@@ -541,6 +568,7 @@ class TemporalDepthStabilizer:
         pair_count: int,
         *,
         statistics_failed: bool,
+        source_cache: dict[int, np.ndarray] | None = None,
     ) -> tuple[dict[str, Any], float | None, float | None]:
         tile_count = planned_tile_count(scan.length, native_shape)
         if pair_count < MIN_PAIR_COUNT:
@@ -650,6 +678,7 @@ class TemporalDepthStabilizer:
                 shift=shift,
                 pair_count=pair_count,
                 tile_count=tile_count,
+                source_cache=source_cache,
             )
         except NumericalContractError:
             raise
@@ -711,6 +740,10 @@ class TemporalDepthStabilizer:
         raw_memmap: np.memmap | None = None
         iterator = None
         output_iterator = None
+        shot_bytes = scan.length * native_shape[0] * native_shape[1] * 2
+        source_cache: dict[int, np.ndarray] | None = (
+            {} if shot_bytes <= cls._SHOT_SOURCE_CACHE_BUDGET_BYTES else None
+        )
         try:
             work_dir.mkdir(parents=True, exist_ok=True)
             raw_memmap = np.memmap(
@@ -724,6 +757,7 @@ class TemporalDepthStabilizer:
                 shot_start=scan.start,
                 shot_length=scan.length,
                 native_shape=native_shape,
+                source_cache=source_cache,
             )
             iterator = postprocessor.process_shot(scan.length, loader)
             pair_state = PairTileState.empty()
@@ -751,9 +785,11 @@ class TemporalDepthStabilizer:
                 if not np.isfinite(raw_output).all():
                     raise FloatingPointError("VDPP model output contains non-finite values")
                 raw_memmap[local_index] = raw_output
-                source = cls._read_source(
-                    base_files[scan.start + local_index],
+                source = cls._read_source_cached(
+                    base_files,
+                    scan.start + local_index,
                     native_shape,
+                    source_cache,
                 )
                 if cls._has_non_midpoint_range(source):
                     raw_flat = raw_output.reshape(-1)
@@ -790,6 +826,7 @@ class TemporalDepthStabilizer:
                 pair_state,
                 pair_count,
                 statistics_failed=statistics_failed,
+                source_cache=source_cache,
             )
             if calibration["mode"] == "ols":
                 assert scale is not None and shift is not None
@@ -800,9 +837,15 @@ class TemporalDepthStabilizer:
                     native_shape,
                     scale=scale,
                     shift=shift,
+                    source_cache=source_cache,
                 )
             else:
-                output_iterator = cls._copy_outputs(base_files, scan, native_shape)
+                output_iterator = cls._copy_outputs(
+                    base_files,
+                    scan,
+                    native_shape,
+                    source_cache=source_cache,
+                )
             store.commit_shot(
                 scan.shot_id,
                 output_iterator,

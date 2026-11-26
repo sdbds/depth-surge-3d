@@ -17,7 +17,6 @@ DA3_ATTENTION_MODULES = (
     "depth_anything_3.model.utils.attention",
     "depth_anything_3.model.dinov2.layers.attention",
 )
-DIFFUSERS_ATTENTION_MODULES = ("diffusers.models.attention_processor",)
 
 FlashAttentionFunction = Callable[..., torch.Tensor]
 _flash_failure_reported = False

@@ -7,14 +7,18 @@
 #include <atomic>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -85,6 +89,173 @@ public:
 private:
     std::size_t claimed_ = 0;
 };
+
+class PersistentParallelPool {
+public:
+    using Invoker = void (*)(const void*, std::size_t);
+
+    static PersistentParallelPool& instance() {
+        // Heap-allocated singleton avoids joining threads under the Windows
+        // DLL_PROCESS_DETACH loader lock; Python atexit calls shutdown().
+        static auto* pool = new PersistentParallelPool();
+        return *pool;
+    }
+
+    template <typename Fn>
+    void run(std::size_t worker_count, Fn&& fn) {
+        if (worker_count <= 1) {
+            fn(0);
+            return;
+        }
+        using FnType = std::remove_reference_t<Fn>;
+        Invoker invoke = [](const void* raw, std::size_t index) {
+            (*static_cast<FnType*>(const_cast<void*>(raw)))(index);
+        };
+        const std::size_t helper_count = worker_count - 1;
+        BatchState batch;
+        batch.pending = helper_count;
+        bool ran_inline = false;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (stopped_) {
+                ran_inline = true;
+            } else {
+                const std::size_t target_threads = std::min<std::size_t>(
+                    kNativeSpawnedWorkerCap,
+                    in_flight_tasks_ + helper_count
+                );
+                try {
+                    ensure_threads_locked(target_threads);
+                } catch (...) {
+                    // Fall back gracefully if OS thread creation fails.
+                }
+                if (threads_.empty()) {
+                    ran_inline = true;
+                } else {
+                    in_flight_tasks_ += helper_count;
+                    for (std::size_t worker = 1; worker < worker_count; ++worker) {
+                        queue_.push_back(Task{invoke, &fn, worker, &batch});
+                    }
+                }
+            }
+        }
+        if (ran_inline) {
+            for (std::size_t worker = 0; worker < worker_count; ++worker) {
+                fn(worker);
+            }
+            return;
+        }
+        queue_cv_.notify_all();
+        std::exception_ptr local_error;
+        try {
+            fn(0);
+        } catch (...) {
+            local_error = std::current_exception();
+        }
+        {
+            std::unique_lock<std::mutex> lock(batch.mutex);
+            batch.cv.wait(lock, [&]() { return batch.pending == 0; });
+        }
+        if (local_error) {
+            std::rethrow_exception(local_error);
+        }
+        if (batch.error) {
+            std::rethrow_exception(batch.error);
+        }
+    }
+
+    void shutdown() {
+        std::vector<std::thread> to_join;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (stopped_) {
+                return;
+            }
+            stopped_ = true;
+            to_join.swap(threads_);
+        }
+        queue_cv_.notify_all();
+        for (auto& thread : to_join) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    }
+
+private:
+    struct BatchState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::size_t pending = 0;
+        std::exception_ptr error;
+    };
+
+    struct Task {
+        Invoker invoke;
+        const void* context;
+        std::size_t worker_index;
+        BatchState* batch;
+    };
+
+    void ensure_threads_locked(std::size_t needed) {
+        while (threads_.size() < needed) {
+            threads_.emplace_back([this]() { worker_loop(); });
+        }
+    }
+
+    void worker_loop() {
+        bool completed_one = false;
+        while (true) {
+            Task task;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                if (completed_one) {
+                    --in_flight_tasks_;
+                    completed_one = false;
+                }
+                queue_cv_.wait(lock, [this]() {
+                    return stopped_ || !queue_.empty();
+                });
+                if (queue_.empty()) {
+                    if (stopped_) {
+                        return;
+                    }
+                    continue;
+                }
+                task = queue_.front();
+                queue_.pop_front();
+            }
+            std::exception_ptr caught;
+            try {
+                task.invoke(task.context, task.worker_index);
+            } catch (...) {
+                caught = std::current_exception();
+            }
+            {
+                std::lock_guard<std::mutex> lock(task.batch->mutex);
+                if (caught && !task.batch->error) {
+                    task.batch->error = caught;
+                }
+                if (--task.batch->pending == 0) {
+                    task.batch->cv.notify_one();
+                }
+            }
+            completed_one = true;
+        }
+    }
+
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::deque<Task> queue_;
+    std::vector<std::thread> threads_;
+    std::size_t in_flight_tasks_ = 0;
+    bool stopped_ = false;
+};
+
+template <typename Fn>
+void run_native_parallel(std::size_t worker_count, Fn&& fn) {
+    PersistentParallelPool::instance().run(worker_count, std::forward<Fn>(fn));
+}
 
 class QualityNativeBudgetError : public std::runtime_error {
 public:
@@ -587,22 +758,7 @@ py::tuple query_geometry_batch(
                 }
             };
 
-            std::vector<std::thread> workers;
-            workers.reserve(worker_count - 1);
-            try {
-                for (std::size_t index = 1; index < worker_count; ++index) {
-                    workers.emplace_back(worker);
-                }
-            } catch (...) {
-                for (auto& thread : workers) {
-                    thread.join();
-                }
-                throw;
-            }
-            worker();
-            for (auto& thread : workers) {
-                thread.join();
-            }
+            run_native_parallel(worker_count, [&](std::size_t) { worker(); });
 
             std::uint64_t consumed = budget_values[0];
             const std::uint64_t limit = budget_values[1];
@@ -883,22 +1039,7 @@ py::tuple query_local_geometry_batch(
                     errors[worker_index] = std::current_exception();
                 }
             };
-            std::vector<std::thread> workers;
-            workers.reserve(worker_count - 1);
-            try {
-                for (std::size_t index = 1; index < worker_count; ++index) {
-                    workers.emplace_back(worker, index);
-                }
-            } catch (...) {
-                for (auto& thread : workers) {
-                    thread.join();
-                }
-                throw;
-            }
-            worker(0);
-            for (auto& thread : workers) {
-                thread.join();
-            }
+            run_native_parallel(worker_count, worker);
             for (const auto& error : errors) {
                 if (error) {
                     std::rethrow_exception(error);
@@ -1609,22 +1750,7 @@ py::tuple build_index(
                     errors[worker_index] = std::current_exception();
                 }
             };
-            std::vector<std::thread> workers;
-            workers.reserve(worker_count - 1);
-            try {
-                for (std::size_t index = 1; index < worker_count; ++index) {
-                    workers.emplace_back(worker, index);
-                }
-            } catch (...) {
-                for (auto& thread : workers) {
-                    thread.join();
-                }
-                throw;
-            }
-            worker(0);
-            for (auto& thread : workers) {
-                thread.join();
-            }
+            run_native_parallel(worker_count, worker);
             for (const auto& error : errors) {
                 if (error) {
                     std::rethrow_exception(error);
@@ -2176,22 +2302,7 @@ double max_four_neighbour_jump_native(const py::array& displacement) {
                 errors[worker_index] = std::current_exception();
             }
         };
-        std::vector<std::thread> workers;
-        workers.reserve(worker_count - 1);
-        try {
-            for (std::size_t index = 1; index < worker_count; ++index) {
-                workers.emplace_back(worker, index);
-            }
-        } catch (...) {
-            for (auto& thread : workers) {
-                thread.join();
-            }
-            throw;
-        }
-        worker(0);
-        for (auto& thread : workers) {
-            thread.join();
-        }
+        run_native_parallel(worker_count, worker);
         for (const auto& error : errors) {
             if (error) {
                 std::rethrow_exception(error);
@@ -2783,24 +2894,150 @@ py::array nearest_label_upsample_native(
                 }
             }
         };
-        std::vector<std::thread> workers;
-        workers.reserve(worker_count - 1);
-        try {
-            for (std::size_t worker = 1; worker < worker_count; ++worker) {
-                workers.emplace_back(run_worker, worker);
-            }
-        } catch (...) {
-            for (auto& thread : workers) {
-                thread.join();
-            }
-            throw;
-        }
-        run_worker(0);
-        for (auto& thread : workers) {
-            thread.join();
-        }
+        run_native_parallel(worker_count, run_worker);
     }
     return output;
+}
+
+template <typename DistT>
+void build_edge_band_l1_impl(
+    const std::uint32_t* regions,
+    bool* result,
+    std::uint32_t height,
+    std::uint32_t width,
+    std::uint32_t effective_radius,
+    std::size_t hardware_workers
+) {
+    const auto is_region = [](std::uint32_t value) {
+        return value != 0 && value != std::numeric_limits<std::uint32_t>::max();
+    };
+    const DistT inf_dist = static_cast<DistT>(effective_radius + 1);
+    const std::uint64_t sample_count = static_cast<std::uint64_t>(height) * width;
+    std::vector<DistT> dist(sample_count);
+
+    // Pass 1: parallel per-row seed detection + 1D horizontal L1 distance sweep.
+    const std::size_t useful_row_workers = std::max<std::size_t>(
+        1,
+        (height + kEdgeBandRowsPerWorker - 1) / kEdgeBandRowsPerWorker
+    );
+    const std::size_t desired_row_workers = std::min(
+        {kEdgeBandWorkerCap, hardware_workers, useful_row_workers}
+    );
+    {
+        NativeWorkerLease row_lease(
+            desired_row_workers > 1 ? desired_row_workers - 1 : 0
+        );
+        const std::size_t worker_count = row_lease.worker_count();
+        run_native_parallel(worker_count, [&](std::size_t worker) {
+            const auto start_row = static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(height) * worker / worker_count
+            );
+            const auto stop_row = static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(height) * (worker + 1) / worker_count
+            );
+            for (std::uint32_t row = start_row; row < stop_row; ++row) {
+                const std::uint64_t row_offset = static_cast<std::uint64_t>(row) * width;
+                DistT left_dist = inf_dist;
+                for (std::uint32_t col = 0; col < width; ++col) {
+                    const std::uint64_t pixel = row_offset + col;
+                    const std::uint32_t region = regions[pixel];
+                    const bool is_seed = is_region(region) && (
+                        (row != 0 && is_region(regions[pixel - width]) &&
+                         region != regions[pixel - width]) ||
+                        (row + 1 < height && is_region(regions[pixel + width]) &&
+                         region != regions[pixel + width]) ||
+                        (col != 0 && is_region(regions[pixel - 1]) &&
+                         region != regions[pixel - 1]) ||
+                        (col + 1 < width && is_region(regions[pixel + 1]) &&
+                         region != regions[pixel + 1])
+                    );
+                    if (is_seed) {
+                        left_dist = 0;
+                    } else if (left_dist < inf_dist) {
+                        ++left_dist;
+                    }
+                    dist[pixel] = left_dist;
+                }
+                if (width > 1) {
+                    DistT right_dist = dist[row_offset + width - 1];
+                    for (std::uint32_t col = width - 1; col > 0; --col) {
+                        const std::uint64_t pixel = row_offset + (col - 1);
+                        if (right_dist < inf_dist) {
+                            ++right_dist;
+                        }
+                        if (right_dist < dist[pixel]) {
+                            dist[pixel] = right_dist;
+                        } else {
+                            right_dist = dist[pixel];
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Pass 2: parallel column-strip vertical L1 distance sweep (linear inner loops).
+    constexpr std::uint32_t kColsPerWorker = 128;
+    const std::size_t useful_col_workers = std::max<std::size_t>(
+        1,
+        (width + kColsPerWorker - 1) / kColsPerWorker
+    );
+    const std::size_t desired_col_workers = std::min(
+        {kEdgeBandWorkerCap, hardware_workers, useful_col_workers}
+    );
+    {
+        NativeWorkerLease col_lease(
+            desired_col_workers > 1 ? desired_col_workers - 1 : 0
+        );
+        const std::size_t worker_count = col_lease.worker_count();
+        run_native_parallel(worker_count, [&](std::size_t worker) {
+            const auto col_start = static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(width) * worker / worker_count
+            );
+            const auto col_stop = static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(width) * (worker + 1) / worker_count
+            );
+            for (std::uint32_t row = 1; row < height; ++row) {
+                const DistT* prev_row =
+                    dist.data() + static_cast<std::uint64_t>(row - 1) * width;
+                DistT* curr_row =
+                    dist.data() + static_cast<std::uint64_t>(row) * width;
+                for (std::uint32_t col = col_start; col < col_stop; ++col) {
+                    const DistT cand = static_cast<DistT>(prev_row[col] + 1);
+                    if (cand < curr_row[col]) {
+                        curr_row[col] = cand;
+                    }
+                }
+            }
+            {
+                const std::uint64_t last_offset =
+                    static_cast<std::uint64_t>(height - 1) * width;
+                const DistT* last_row = dist.data() + last_offset;
+                bool* out_row = result + last_offset;
+                for (std::uint32_t col = col_start; col < col_stop; ++col) {
+                    out_row[col] = (last_row[col] <= effective_radius);
+                }
+            }
+            for (std::uint32_t row = height - 1; row > 0; --row) {
+                const std::uint64_t next_offset =
+                    static_cast<std::uint64_t>(row) * width;
+                const std::uint64_t curr_offset =
+                    static_cast<std::uint64_t>(row - 1) * width;
+                const DistT* next_row = dist.data() + next_offset;
+                DistT* curr_row = dist.data() + curr_offset;
+                bool* out_row = result + curr_offset;
+                for (std::uint32_t col = col_start; col < col_stop; ++col) {
+                    DistT value = curr_row[col];
+                    const DistT cand = static_cast<DistT>(next_row[col] + 1);
+                    if (cand < value) {
+                        value = cand;
+                        curr_row[col] = value;
+                    }
+                    out_row[col] = (value <= effective_radius);
+                }
+            }
+        });
+    }
 }
 
 py::array build_four_connected_edge_band_native(
@@ -2810,101 +3047,73 @@ py::array build_four_connected_edge_band_native(
     validate_array(labels, py::dtype::of<std::uint32_t>(), "mapped_regions");
     const auto height = static_cast<std::uint32_t>(labels.shape(0));
     const auto width = static_cast<std::uint32_t>(labels.shape(1));
-    const auto sample_count = static_cast<std::uint64_t>(height) * width;
     const auto* regions = static_cast<const std::uint32_t*>(labels.data());
-    std::vector<std::uint8_t> current(sample_count, 0);
-    std::vector<std::uint8_t> next(sample_count, 0);
+    py::array_t<bool> output({height, width});
+    if (height == 0 || width == 0) {
+        return output;
+    }
+    auto* result = output.mutable_data();
+    const std::size_t hardware_workers = std::max(
+        1U,
+        std::thread::hardware_concurrency()
+    );
     const auto is_region = [](std::uint32_t value) {
         return value != 0 && value != std::numeric_limits<std::uint32_t>::max();
     };
-    const auto parallel_rows = [&](auto callback) {
-        const std::size_t hardware_workers = std::max(
-            1U,
-            std::thread::hardware_concurrency()
-        );
-        const std::size_t useful_workers = std::max<std::size_t>(
-            1,
-            (height + kEdgeBandRowsPerWorker - 1) / kEdgeBandRowsPerWorker
-        );
-        const std::size_t desired_worker_count = std::min(
-            {kEdgeBandWorkerCap, hardware_workers, useful_workers}
-        );
-        NativeWorkerLease worker_lease(
-            desired_worker_count > 1 ? desired_worker_count - 1 : 0
-        );
-        const std::size_t worker_count = worker_lease.worker_count();
-        if (worker_count == 1) {
-            callback(0, height);
-            return;
-        }
-        std::vector<std::thread> workers;
-        workers.reserve(worker_count - 1);
-        const auto run_worker = [&](std::size_t worker) {
-            const auto start = static_cast<std::uint32_t>(
-                static_cast<std::uint64_t>(height) * worker / worker_count
-            );
-            const auto stop = static_cast<std::uint32_t>(
-                static_cast<std::uint64_t>(height) * (worker + 1) / worker_count
-            );
-            callback(start, stop);
-        };
-        try {
-            for (std::size_t worker = 1; worker < worker_count; ++worker) {
-                workers.emplace_back(run_worker, worker);
-            }
-        } catch (...) {
-            for (auto& thread : workers) {
-                thread.join();
-            }
-            throw;
-        }
-        run_worker(0);
-        for (auto& thread : workers) {
-            thread.join();
-        }
-    };
     {
         py::gil_scoped_release release;
-        parallel_rows([&](std::uint32_t start_row, std::uint32_t stop_row) {
-            for (std::uint32_t row = start_row; row < stop_row; ++row) {
-                for (std::uint32_t column = 0; column < width; ++column) {
-                    const std::uint64_t pixel =
-                        static_cast<std::uint64_t>(row) * width + column;
-                    const std::uint32_t region = regions[pixel];
-                    current[pixel] = is_region(region) && (
-                        (row != 0 && is_region(regions[pixel - width]) &&
-                         region != regions[pixel - width]) ||
-                        (row + 1 < height && is_region(regions[pixel + width]) &&
-                         region != regions[pixel + width]) ||
-                        (column != 0 && is_region(regions[pixel - 1]) &&
-                         region != regions[pixel - 1]) ||
-                        (column + 1 < width && is_region(regions[pixel + 1]) &&
-                         region != regions[pixel + 1])
-                    );
-                }
-            }
-        });
-        for (std::uint32_t iteration = 0; iteration < radius; ++iteration) {
-            parallel_rows([&](std::uint32_t start_row, std::uint32_t stop_row) {
+        if (radius == 0) {
+            const std::size_t useful_workers = std::max<std::size_t>(
+                1,
+                (height + kEdgeBandRowsPerWorker - 1) / kEdgeBandRowsPerWorker
+            );
+            const std::size_t desired_workers = std::min(
+                {kEdgeBandWorkerCap, hardware_workers, useful_workers}
+            );
+            NativeWorkerLease lease(desired_workers > 1 ? desired_workers - 1 : 0);
+            const std::size_t worker_count = lease.worker_count();
+            run_native_parallel(worker_count, [&](std::size_t worker) {
+                const auto start_row = static_cast<std::uint32_t>(
+                    static_cast<std::uint64_t>(height) * worker / worker_count
+                );
+                const auto stop_row = static_cast<std::uint32_t>(
+                    static_cast<std::uint64_t>(height) * (worker + 1) / worker_count
+                );
                 for (std::uint32_t row = start_row; row < stop_row; ++row) {
-                    for (std::uint32_t column = 0; column < width; ++column) {
-                        const std::uint64_t pixel =
-                            static_cast<std::uint64_t>(row) * width + column;
-                        next[pixel] = current[pixel] ||
-                            (row > 0 && current[pixel - width]) ||
-                            (column > 0 && current[pixel - 1]) ||
-                            (column + 1 < width && current[pixel + 1]) ||
-                            (row + 1 < height && current[pixel + width]);
+                    const std::uint64_t row_offset = static_cast<std::uint64_t>(row) * width;
+                    for (std::uint32_t col = 0; col < width; ++col) {
+                        const std::uint64_t pixel = row_offset + col;
+                        const std::uint32_t region = regions[pixel];
+                        result[pixel] = is_region(region) && (
+                            (row != 0 && is_region(regions[pixel - width]) &&
+                             region != regions[pixel - width]) ||
+                            (row + 1 < height && is_region(regions[pixel + width]) &&
+                             region != regions[pixel + width]) ||
+                            (col != 0 && is_region(regions[pixel - 1]) &&
+                             region != regions[pixel - 1]) ||
+                            (col + 1 < width && is_region(regions[pixel + 1]) &&
+                             region != regions[pixel + 1])
+                        );
                     }
                 }
             });
-            current.swap(next);
+        } else {
+            const auto effective_radius = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(
+                    radius,
+                    static_cast<std::uint64_t>(height) + width
+                )
+            );
+            if (effective_radius < 65534U) {
+                build_edge_band_l1_impl<std::uint16_t>(
+                    regions, result, height, width, effective_radius, hardware_workers
+                );
+            } else {
+                build_edge_band_l1_impl<std::uint32_t>(
+                    regions, result, height, width, effective_radius, hardware_workers
+                );
+            }
         }
-    }
-    py::array_t<bool> output({height, width});
-    auto* result = output.mutable_data();
-    for (std::uint64_t pixel = 0; pixel < sample_count; ++pixel) {
-        result[pixel] = current[pixel] != 0;
     }
     return output;
 }
@@ -4420,4 +4629,9 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("query_x")
     );
     module.def("build_info", &build_info);
+    py::module_::import("atexit").attr("register")(
+        py::cpp_function([]() {
+            PersistentParallelPool::instance().shutdown();
+        })
+    );
 }

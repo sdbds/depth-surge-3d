@@ -90,10 +90,16 @@ from .metric_geometry import (
 )
 
 
+from ...core.host_memory import dynamic_host_budget_bytes
+
 DEPTH_BOUNDS_SCHEMA_VERSION = 2
 DEPTH_SAMPLES_SCHEMA_VERSION = 2
 # Additional decoded frames plus their contiguous batch, not model/process memory.
-RAW_DEPTH_PREFETCH_BUDGET_BYTES = 256 * 1024 * 1024
+RAW_DEPTH_PREFETCH_BUDGET_BYTES = dynamic_host_budget_bytes(
+    fraction=0.15,
+    minimum=512 * 1024 * 1024,
+    maximum=2 * 1024 * 1024 * 1024,
+)
 _V2_SEQUENCE_END = object()
 
 
@@ -1652,7 +1658,14 @@ class DepthMapProcessor:
         )
         require_metric_geometry_disk_space(context.metric_dir, required)
         store = self._open_or_reset_metric_store(context, native_shape, required)
-        for index, (name, raw_path) in enumerate(zip(context.frame_names, context.raw_files)):
+        estimated_item_bytes = int(native_shape[0]) * int(native_shape[1]) * 32
+        worker_count = calculate_frame_stage_workers(
+            len(context.frame_names),
+            estimated_item_bytes,
+        )
+
+        def process_metric_frame(item: tuple[str, Path]) -> MetricGeometryFrame:
+            name, raw_path = item
             output = store.path_for(name)
             if output.is_file():
                 frame = store.load(output)
@@ -1665,10 +1678,16 @@ class DepthMapProcessor:
                     raise ValueError(
                         "metric_camera requires metric raw depth with pinhole focal data"
                     )
-                frame = metric_frame_from_depth(batch.values[0], batch.camera.focal_x_normalized[0])
+                frame = metric_frame_from_depth(
+                    batch.values[0],
+                    batch.camera.focal_x_normalized[0],
+                )
                 store.write_frame(name, frame)
             if keep_intermediates:
                 self._ensure_metric_depth_preview(store, output, frame)
+            return frame
+
+        def report_metric_frame(index: int, frame: MetricGeometryFrame) -> None:
             self._report_metric_progress(
                 progress_tracker,
                 index,
@@ -1676,6 +1695,13 @@ class DepthMapProcessor:
                 frame.inverse_depth,
                 frame.valid,
             )
+
+        run_ordered_frame_tasks(
+            zip(context.frame_names, context.raw_files),
+            process_metric_frame,
+            worker_count=worker_count,
+            on_ordered_result=report_metric_frame,
+        )
         convergence = sample_clip_convergence(
             context.raw_store,
             context.raw_files,
