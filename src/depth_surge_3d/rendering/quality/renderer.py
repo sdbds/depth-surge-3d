@@ -228,11 +228,53 @@ class PreparedRelativeQualityFrame:
     prepare_seconds: float
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedMetricQualityFrame:
+    source: np.ndarray
+    geometry: QualityGeometryResult
+    controls: QualityStereoControls
+    indexed_sample_count: int
+    prepare_seconds: float
+
+
 @dataclass(frozen=True)
 class _UnrepairedEyeResult:
     image: np.ndarray
     coverage_count: np.ndarray
     hole_runs: HoleRunDiagnostics
+
+
+@dataclass(frozen=True)
+class _DeferredUnrepairedEyeResult:
+    """Single-copy CUDA splat payload whose CPU coverage/hole-run unpack runs in Stage 3."""
+
+    image: np.ndarray
+    packed_missing: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class SplattedQualityFrame:
+    """GPU-splatted Quality stereo frame awaiting CPU background proxy repair."""
+
+    source: np.ndarray
+    occlusion_fill: Literal["none", "background"]
+    controls_limit_px: int
+    predicted_gap_px: int
+    max_neighbour_abs_q_jump_px: float
+    indexed_sample_count: int
+    geometry_query_count: int
+    geometry_visited_nodes_total: int
+    geometry_visited_nodes_max: int
+    metric_stats: object | None
+    geometry_performance_seconds: dict[str, float]
+    prepare_seconds: float
+    splat_seconds: float
+    left_prefix_seconds: float
+    right_prefix_seconds: float
+    left_pre_repair: _UnrepairedEyeResult | _DeferredUnrepairedEyeResult | None = None
+    right_pre_repair: _UnrepairedEyeResult | _DeferredUnrepairedEyeResult | None = None
+    left_none: _CompactEyeResult | None = None
+    right_none: _CompactEyeResult | None = None
 
 
 @dataclass(frozen=True)
@@ -878,6 +920,185 @@ def _finish_background_eye(
     )
 
 
+def _splat_unrepaired_eye_deferred_once(
+    *,
+    renderer: StereoRenderer,
+    source: np.ndarray,
+    geometry: QualityGeometryResult,
+    offsets: np.ndarray | torch.Tensor,
+    band_height: int,
+    device_frame: _QualityDeviceFrame | None = None,
+) -> _UnrepairedEyeResult | _DeferredUnrepairedEyeResult:
+    """Fast single-band CUDA splat with one packed D2H copy and deferred CPU histogram unpack."""
+
+    height, width = source.shape[:2]
+    if renderer.device.type == "cuda" and source.dtype == np.uint8 and band_height >= height:
+        device_offsets = offsets if isinstance(offsets, torch.Tensor) else None
+        if device_frame is not None and isinstance(offsets, np.ndarray):
+            try:
+                device_offsets = renderer._transfer_offset_band(offsets)
+            except torch.cuda.OutOfMemoryError:
+                _release_after_oom(renderer)
+        compact_cuda = _quality_compact_cuda_splat(
+            renderer,
+            source,
+            geometry,
+            offsets,
+            0,
+            height,
+            device_frame=device_frame,
+            device_offsets=device_offsets,
+        )
+        if compact_cuda is not None:
+            downsampled, packed_missing_device = compact_cuda
+            rgb_gpu = torch.round(downsampled.detach())
+            rgb_gpu.clamp_(0, 255)
+            rgb_bytes = rgb_gpu.to(dtype=torch.uint8).reshape(-1)
+            missing_bytes = packed_missing_device.contiguous().view(torch.uint8).reshape(-1)
+            rgb_nbytes = int(rgb_bytes.numel())
+            payload = torch.cat((rgb_bytes, missing_bytes), dim=0).cpu().numpy()
+            del compact_cuda, downsampled, packed_missing_device, rgb_gpu, rgb_bytes, missing_bytes
+            image = np.ascontiguousarray(payload[:rgb_nbytes].reshape(height, width, 3))
+            packed_missing = np.ascontiguousarray(
+                payload[rgb_nbytes:].view(np.uint16).reshape(height, width)
+            )
+            return _DeferredUnrepairedEyeResult(image=image, packed_missing=packed_missing)
+    return _render_unrepaired_eye_once(
+        renderer=renderer,
+        source=source,
+        geometry=geometry,
+        offsets=offsets,
+        band_height=band_height,
+        device_frame=device_frame,
+    )
+
+
+def _unpack_unrepaired_eye(
+    pre_repair: _UnrepairedEyeResult | _DeferredUnrepairedEyeResult,
+) -> _UnrepairedEyeResult:
+    if isinstance(pre_repair, _UnrepairedEyeResult):
+        return pre_repair
+    height, width = pre_repair.image.shape[:2]
+    coverage = np.empty((height, width), dtype=np.uint8)
+    lane_histogram = np.zeros(16 * (width + 1), dtype=np.uint64)
+    span_histogram = np.zeros(width + 1, dtype=np.uint64)
+    native_kd._require_native().accumulate_packed_lane_hole_run_histograms_into(
+        pre_repair.packed_missing,
+        lane_histogram,
+        span_histogram,
+        coverage,
+    )
+    return _UnrepairedEyeResult(
+        pre_repair.image,
+        coverage,
+        HoleRunDiagnostics(lane_histogram, span_histogram),
+    )
+
+
+def _splat_quality_eyes_only(
+    *,
+    renderer: StereoRenderer,
+    source: np.ndarray,
+    geometry: QualityGeometryResult,
+    offset_builder: Callable[
+        [Literal["left", "right"], _QualityDeviceFrame | None], np.ndarray | torch.Tensor
+    ],
+    occlusion_fill: Literal["none", "background"],
+) -> tuple[
+    _UnrepairedEyeResult | _DeferredUnrepairedEyeResult | None,
+    _UnrepairedEyeResult | _DeferredUnrepairedEyeResult | None,
+    _CompactEyeResult | None,
+    _CompactEyeResult | None,
+    float,
+    float,
+]:
+    """Run only GPU/CPU forward splat for both eyes without CPU background repair."""
+
+    height, width = source.shape[:2]
+    initial_height = _calculate_quality_band_height(
+        width,
+        height,
+        _quality_temporary_budget_bytes(renderer),
+    )
+    device_frame = _preload_quality_device_frame(renderer, source, geometry)
+    band_state = _FrameBandState(
+        initial_height=initial_height,
+        retry_height=max(1, initial_height // 2),
+        current_height=initial_height,
+    )
+
+    def build_offsets(eye: Literal["left", "right"]):
+        try:
+            return offset_builder(eye, device_frame)
+        except torch.cuda.OutOfMemoryError:
+            pass
+        _release_after_oom(renderer)
+        return offset_builder(eye, None)
+
+    if occlusion_fill == "none":
+        left_started = time.perf_counter()
+        left_offsets = build_offsets("left")
+        left_none = _retry_after_oom(
+            renderer,
+            band_state,
+            _render_none_eye_once,
+            renderer=renderer,
+            source=source,
+            geometry=geometry,
+            offsets=left_offsets,
+            device_frame=device_frame,
+        )
+        del left_offsets
+        left_seconds = time.perf_counter() - left_started
+
+        right_started = time.perf_counter()
+        right_offsets = build_offsets("right")
+        right_none = _retry_after_oom(
+            renderer,
+            band_state,
+            _render_none_eye_once,
+            renderer=renderer,
+            source=source,
+            geometry=geometry,
+            offsets=right_offsets,
+            device_frame=device_frame,
+        )
+        del right_offsets
+        right_seconds = time.perf_counter() - right_started
+        return None, None, left_none, right_none, left_seconds, right_seconds
+
+    left_started = time.perf_counter()
+    left_offsets = build_offsets("left")
+    left_pre = _retry_after_oom(
+        renderer,
+        band_state,
+        _splat_unrepaired_eye_deferred_once,
+        renderer=renderer,
+        source=source,
+        geometry=geometry,
+        offsets=left_offsets,
+        device_frame=device_frame,
+    )
+    del left_offsets
+    left_seconds = time.perf_counter() - left_started
+
+    right_started = time.perf_counter()
+    right_offsets = build_offsets("right")
+    right_pre = _retry_after_oom(
+        renderer,
+        band_state,
+        _splat_unrepaired_eye_deferred_once,
+        renderer=renderer,
+        source=source,
+        geometry=geometry,
+        offsets=right_offsets,
+        device_frame=device_frame,
+    )
+    del right_offsets
+    right_seconds = time.perf_counter() - right_started
+    return left_pre, right_pre, None, None, left_seconds, right_seconds
+
+
 def _render_quality_eyes(
     *,
     renderer: StereoRenderer,
@@ -1180,6 +1401,244 @@ def render_prepared_relative_quality_compact(
         },
     )
     return result
+
+
+def splat_prepared_relative_quality_frame(
+    *,
+    renderer: StereoRenderer,
+    prepared: PreparedRelativeQualityFrame,
+) -> SplattedQualityFrame:
+    """Execute only the GPU/splat stage for a prepared relative Quality frame."""
+
+    splat_started = time.perf_counter()
+    if not isinstance(renderer, StereoRenderer):
+        raise TypeError("renderer must be StereoRenderer")
+    if not isinstance(prepared, PreparedRelativeQualityFrame):
+        raise TypeError("prepared must be PreparedRelativeQualityFrame")
+    geometry = prepared.geometry
+    settings = prepared.settings
+    (
+        left_pre,
+        right_pre,
+        left_none,
+        right_none,
+        left_sec,
+        right_sec,
+    ) = _splat_quality_eyes_only(
+        renderer=renderer,
+        source=prepared.source,
+        geometry=geometry,
+        offset_builder=lambda eye, device_frame: _build_eye_offsets(
+            geometry, settings, eye, device_frame
+        ),
+        occlusion_fill=settings.occlusion_fill,
+    )
+    return SplattedQualityFrame(
+        source=prepared.source,
+        occlusion_fill=settings.occlusion_fill,
+        controls_limit_px=settings.occlusion_fill_max_px,
+        predicted_gap_px=int(geometry.predicted_gap_px),
+        max_neighbour_abs_q_jump_px=float(geometry.max_neighbour_abs_q_jump_px),
+        indexed_sample_count=prepared.indexed_sample_count,
+        geometry_query_count=int(geometry.geometry_query_count),
+        geometry_visited_nodes_total=int(geometry.geometry_visited_nodes_total),
+        geometry_visited_nodes_max=int(geometry.geometry_visited_nodes_max),
+        metric_stats=None,
+        geometry_performance_seconds=dict(geometry.performance_seconds),
+        prepare_seconds=prepared.prepare_seconds,
+        splat_seconds=time.perf_counter() - splat_started,
+        left_prefix_seconds=left_sec,
+        right_prefix_seconds=right_sec,
+        left_pre_repair=left_pre,
+        right_pre_repair=right_pre,
+        left_none=left_none,
+        right_none=right_none,
+    )
+
+
+def prepare_metric_quality_frame(
+    *,
+    frame: np.ndarray,
+    primitives: MetricStereoPrimitiveInput,
+    controls: QualityStereoControls,
+) -> PreparedMetricQualityFrame:
+    """Build deterministic CPU metric geometry before the GPU eye stage."""
+
+    prepare_started = time.perf_counter()
+    if not isinstance(primitives, MetricStereoPrimitiveInput):
+        raise TypeError("primitives must be MetricStereoPrimitiveInput")
+    if not isinstance(controls, QualityStereoControls):
+        raise TypeError("controls must be QualityStereoControls")
+    frame_values = np.asarray(frame)
+    if frame_values.ndim != 3 or frame_values.shape[2] != 3:
+        raise TypeError("Quality rendering requires uint8 BGR input")
+    metric = primitives.metric
+    for name in ("inverse_depth", "valid", "focal_x_normalized"):
+        if not hasattr(metric, name):
+            raise TypeError("metric primitive is missing native geometry fields")
+    metric_shape = np.asarray(metric.inverse_depth).shape
+    if len(metric_shape) != 2:
+        raise TypeError("metric inverse depth must be two-dimensional")
+    _quality_public_memory_preflight(
+        render_shape=(int(frame_values.shape[0]), int(frame_values.shape[1])),
+        native_shape=(int(metric_shape[0]), int(metric_shape[1])),
+        occlusion_fill=controls.occlusion_fill,
+        materialize_public_masks=False,
+        geometry_mode="metric",
+    )
+    source = np.ascontiguousarray(frame_values)
+    if source.dtype != np.uint8 or source.ndim != 3 or source.shape[2] != 3:
+        raise TypeError("Quality rendering requires uint8 BGR input")
+    height, width = source.shape[:2]
+    geometry = build_metric_quality_geometry(
+        source,
+        metric.inverse_depth,
+        metric.valid,
+        metric.focal_x_normalized,
+        render_shape=(height, width),
+        virtual_baseline_mm=float(primitives.virtual_baseline_mm),
+        convergence_distance_m=float(primitives.convergence_distance_m),
+        max_disparity_percent=float(primitives.max_disparity_percent),
+        retained_crop_width=primitives.retained_crop_width,
+    )
+    if geometry.metric_stats is None:
+        raise RuntimeError("Metric Quality geometry did not produce projection statistics")
+    return PreparedMetricQualityFrame(
+        source=source,
+        geometry=geometry,
+        controls=controls,
+        indexed_sample_count=int(metric.inverse_depth.size),
+        prepare_seconds=time.perf_counter() - prepare_started,
+    )
+
+
+def splat_prepared_metric_quality_frame(
+    *,
+    renderer: StereoRenderer,
+    prepared: PreparedMetricQualityFrame,
+) -> SplattedQualityFrame:
+    """Execute only the GPU/splat stage for a prepared metric Quality frame."""
+
+    splat_started = time.perf_counter()
+    if not isinstance(renderer, StereoRenderer):
+        raise TypeError("renderer must be StereoRenderer")
+    if not isinstance(prepared, PreparedMetricQualityFrame):
+        raise TypeError("prepared must be PreparedMetricQualityFrame")
+    geometry = prepared.geometry
+    controls = prepared.controls
+    (
+        left_pre,
+        right_pre,
+        left_none,
+        right_none,
+        left_sec,
+        right_sec,
+    ) = _splat_quality_eyes_only(
+        renderer=renderer,
+        source=prepared.source,
+        geometry=geometry,
+        offset_builder=lambda eye, _device_frame: _build_metric_eye_offsets(geometry, eye),
+        occlusion_fill=controls.occlusion_fill,
+    )
+    return SplattedQualityFrame(
+        source=prepared.source,
+        occlusion_fill=controls.occlusion_fill,
+        controls_limit_px=controls.occlusion_fill_max_px,
+        predicted_gap_px=int(geometry.predicted_gap_px),
+        max_neighbour_abs_q_jump_px=float(geometry.max_neighbour_abs_q_jump_px),
+        indexed_sample_count=prepared.indexed_sample_count,
+        geometry_query_count=int(geometry.geometry_query_count),
+        geometry_visited_nodes_total=int(geometry.geometry_visited_nodes_total),
+        geometry_visited_nodes_max=int(geometry.geometry_visited_nodes_max),
+        metric_stats=geometry.metric_stats,
+        geometry_performance_seconds=dict(geometry.performance_seconds),
+        prepare_seconds=prepared.prepare_seconds,
+        splat_seconds=time.perf_counter() - splat_started,
+        left_prefix_seconds=left_sec,
+        right_prefix_seconds=right_sec,
+        left_pre_repair=left_pre,
+        right_pre_repair=right_pre,
+        left_none=left_none,
+        right_none=right_none,
+    )
+
+
+def finish_splatted_quality_frame(splatted: SplattedQualityFrame) -> CompactStereoRenderResult:
+    """Complete pure-CPU background proxy repair and assemble CompactStereoRenderResult."""
+
+    finish_started = time.perf_counter()
+    if splatted.occlusion_fill == "none":
+        assert splatted.left_none is not None and splatted.right_none is not None
+        left = splatted.left_none
+        right = splatted.right_none
+        left_finish_sec = 0.0
+        right_finish_sec = 0.0
+        quality_limits = None
+    else:
+        assert splatted.left_pre_repair is not None and splatted.right_pre_repair is not None
+        l_start = time.perf_counter()
+        left_unpacked = _unpack_unrepaired_eye(splatted.left_pre_repair)
+        left = _finish_background_eye(
+            pre_repair=left_unpacked,
+            source=splatted.source,
+            eye="left",
+            controls_limit_px=splatted.controls_limit_px,
+            predicted_gap_px=splatted.predicted_gap_px,
+        )
+        left_finish_sec = time.perf_counter() - l_start
+
+        r_start = time.perf_counter()
+        right_unpacked = _unpack_unrepaired_eye(splatted.right_pre_repair)
+        right = _finish_background_eye(
+            pre_repair=right_unpacked,
+            source=splatted.source,
+            eye="right",
+            controls_limit_px=splatted.controls_limit_px,
+            predicted_gap_px=splatted.predicted_gap_px,
+        )
+        right_finish_sec = time.perf_counter() - r_start
+
+        height = int(splatted.source.shape[0])
+        safe_limit = max(1, math.floor(splatted.controls_limit_px * height / 1080.0 + 0.5))
+        local_limit = min(safe_limit, splatted.predicted_gap_px)
+        quality_limits = {
+            eye: {
+                "max_neighbour_abs_q_jump_px": splatted.max_neighbour_abs_q_jump_px,
+                "predicted_gap_px": splatted.predicted_gap_px,
+                "local_limit_px": int(local_limit),
+            }
+            for eye in ("left", "right")
+        }
+    return CompactStereoRenderResult(
+        left_image=left.image,
+        right_image=right.image,
+        left_coverage_count=left.coverage_count,
+        right_coverage_count=right.coverage_count,
+        left_repair_bits=left.repair_bits,
+        right_repair_bits=right.repair_bits,
+        left_plan=left.plan,
+        right_plan=right.plan,
+        metric_stats=splatted.metric_stats,  # type: ignore[arg-type]
+        geometry_nearest={
+            "indexed_sample_count": splatted.indexed_sample_count,
+            "query_count": splatted.geometry_query_count,
+            "visited_nodes_total": splatted.geometry_visited_nodes_total,
+            "visited_nodes_max": splatted.geometry_visited_nodes_max,
+        },
+        quality_limits=quality_limits,
+        left_hole_runs=left.hole_runs,
+        right_hole_runs=right.hole_runs,
+        performance_seconds={
+            **splatted.geometry_performance_seconds,
+            "left_eye": splatted.left_prefix_seconds + left_finish_sec,
+            "right_eye": splatted.right_prefix_seconds + right_finish_sec,
+            "total": (
+                splatted.prepare_seconds
+                + splatted.splat_seconds
+                + (time.perf_counter() - finish_started)
+            ),
+        },
+    )
 
 
 def render_relative_quality_compact(

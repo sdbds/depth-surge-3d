@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import threading
 import time
 import traceback
 from typing import Any, Callable, Literal, cast
@@ -21,8 +22,11 @@ from ...rendering.quality.diagnostic_transaction import (
     StreamingDiagnosticsStageContext,
 )
 from ...rendering.quality.renderer import (
-    render_metric_primitives_compact,
-    render_relative_quality_compact,
+    finish_splatted_quality_frame,
+    prepare_metric_quality_frame,
+    prepare_relative_quality_frame,
+    splat_prepared_metric_quality_frame,
+    splat_prepared_relative_quality_frame,
 )
 from ...rendering.quality.types import (
     CompactStereoRenderResult,
@@ -377,7 +381,14 @@ class StereoPairGenerator:
                     render_shape,
                     extra_per_frame_bytes=frame_consumer_memory_bytes,
                 )
-            decode_workers = min(io_workers, capacity)
+            is_quality = render_mode == "quality"
+            if is_quality and io_workers_opt is None:
+                cpu_count = os.cpu_count() or 4
+                decode_workers = min(capacity, max(4, min(10, cpu_count // 3)))
+                postprocess_workers: int | None = min(capacity, max(2, min(8, cpu_count // 4)))
+            else:
+                decode_workers = min(io_workers, capacity)
+                postprocess_workers = min(io_workers, capacity) if is_quality else None
             write_workers = 1 if is_streamed else min(io_workers, capacity)
 
             diag_context = StreamingDiagnosticsStageContext(
@@ -392,11 +403,12 @@ class StereoPairGenerator:
                 rgb_stage_fingerprint=expected_meta["fingerprint"],
             )
             diagnostics = StreamingDiagnosticsAccumulator(diag_context)
+            diag_lock = threading.Lock()
             renderer = self.renderer
             cancelled = self._cancellation_predicate(progress_tracker)
             total_frames = stereo_input.frame_count
 
-            def decode_record(record: StereoInputRecord) -> tuple[np.ndarray, Any]:
+            def decode_record(record: StereoInputRecord) -> Any:
                 frame = cv2.imread(str(record.guide_path), cv2.IMREAD_COLOR)
                 if frame is None or frame.shape[:2] != render_shape:
                     raise ValueError(f"Failed to decode guide frame: {record.guide_path}")
@@ -410,6 +422,12 @@ class StereoPairGenerator:
                         raw_disp.astype(np.float32) / encoding_scale,
                         dtype=np.float32,
                     )
+                    if is_quality:
+                        return prepare_relative_quality_frame(
+                            frame=frame,
+                            canonical=canonical,
+                            settings=relative_settings,
+                        )
                     return frame, canonical
                 inv, valid, focal = metric_npz.read_metric_npz(
                     record.geometry_path,
@@ -423,42 +441,50 @@ class StereoPairGenerator:
                     max_disparity_percent=np.float64(max_disparity_percent),
                     retained_crop_width=retained_crop_width,
                 )
+                if is_quality:
+                    return prepare_metric_quality_frame(
+                        frame=frame,
+                        primitives=primitive,
+                        controls=metric_controls,
+                    )
                 return frame, primitive
 
-            def render_record(
-                record: StereoInputRecord, decoded: tuple[np.ndarray, Any]
-            ) -> CompactStereoRenderResult:
+            def render_record(record: StereoInputRecord, decoded: Any) -> Any:
                 _ = record
+                if is_quality:
+                    if not is_metric:
+                        return splat_prepared_relative_quality_frame(
+                            renderer=renderer,
+                            prepared=decoded,
+                        )
+                    return splat_prepared_metric_quality_frame(
+                        renderer=renderer,
+                        prepared=decoded,
+                    )
                 frame, geom_payload = decoded
                 if not is_metric:
-                    if render_mode == "quality":
-                        compact = render_relative_quality_compact(
-                            renderer=renderer,
-                            frame=frame,
-                            canonical=geom_payload,
-                            settings=relative_settings,
-                        )
-                    else:
-                        compact = renderer.render_relative_fast_compact(
-                            frame,
-                            geom_payload,
-                            relative_settings,
-                        )
+                    compact = renderer.render_relative_fast_compact(
+                        frame,
+                        geom_payload,
+                        relative_settings,
+                    )
                 else:
-                    if render_mode == "quality":
-                        compact = render_metric_primitives_compact(
-                            renderer=renderer,
-                            frame=frame,
-                            primitives=geom_payload,
-                            controls=metric_controls,
-                        )
-                    else:
-                        compact = renderer.render_metric_primitives_fast_compact(
-                            frame,
-                            geom_payload,
-                            metric_splat_settings,
-                        )
-                diagnostics.record_compact(compact, metric_stats=compact.metric_stats)
+                    compact = renderer.render_metric_primitives_fast_compact(
+                        frame,
+                        geom_payload,
+                        metric_splat_settings,
+                    )
+                with diag_lock:
+                    diagnostics.record_compact(compact, metric_stats=compact.metric_stats)
+                return compact
+
+            def postprocess_quality_record(
+                record: StereoInputRecord, splatted: Any
+            ) -> CompactStereoRenderResult:
+                _ = record
+                compact = finish_splatted_quality_frame(splatted)
+                with diag_lock:
+                    diagnostics.record_compact(compact, metric_stats=compact.metric_stats)
                 return compact
 
             def write_record(record: StereoInputRecord, compact: CompactStereoRenderResult) -> None:
@@ -519,18 +545,27 @@ class StereoPairGenerator:
                     pass
 
             started = time.perf_counter()
-            stats = run_streaming_stereo_pipeline(
-                records_to_render,
-                decode_fn=decode_record,
-                render_fn=render_record,
-                write_fn=write_record,
-                capacity=capacity,
-                decode_workers=decode_workers,
-                write_workers=write_workers,
-                ordered_writes=is_streamed,
-                on_completed=on_completed,
-                is_cancelled=cancelled,
-            )
+            prev_cv_threads = cv2.getNumThreads() if (is_quality and capacity > 1) else None
+            if prev_cv_threads is not None and prev_cv_threads != 1:
+                cv2.setNumThreads(1)
+            try:
+                stats = run_streaming_stereo_pipeline(
+                    records_to_render,
+                    decode_fn=decode_record,
+                    render_fn=render_record,
+                    postprocess_fn=postprocess_quality_record if is_quality else None,
+                    postprocess_workers=postprocess_workers,
+                    write_fn=write_record,
+                    capacity=capacity,
+                    decode_workers=decode_workers,
+                    write_workers=write_workers,
+                    ordered_writes=is_streamed,
+                    on_completed=on_completed,
+                    is_cancelled=cancelled,
+                )
+            finally:
+                if prev_cv_threads is not None and prev_cv_threads != 1:
+                    cv2.setNumThreads(prev_cv_threads)
             self.last_pipeline_stats = StreamingStereoPipelineStats(
                 frame_count=total_frames,
                 render_count=stats.render_count,

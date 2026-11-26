@@ -72,3 +72,52 @@ def test_streaming_pipeline_propagates_cancellation_and_errors() -> None:
             decode_workers=2,
             write_workers=2,
         )
+
+
+def test_four_stage_pipeline_preserves_order_and_propagates_postprocess_errors() -> None:
+    import time
+
+    written: list[int] = []
+    completed: list[int] = []
+
+    def slow_post(item: int, rendered: int) -> int:
+        # Earlier items sleep slightly longer to verify post_to_write restores exact order.
+        time.sleep(0.01 if item % 2 == 0 else 0.001)
+        return rendered * 2
+
+    stats = run_streaming_stereo_pipeline(
+        range(10),
+        decode_fn=lambda i: i + 1,
+        render_fn=lambda i, d: d * 10,
+        postprocess_fn=slow_post,
+        postprocess_workers=4,
+        write_fn=lambda i, fin: written.append(fin),
+        capacity=6,
+        decode_workers=4,
+        write_workers=1,
+        ordered_writes=True,
+        on_completed=lambda _item, n: completed.append(n),
+    )
+
+    assert written == [(i + 1) * 20 for i in range(10)]
+    assert completed == list(range(1, 11))
+    assert stats.peak_in_flight <= 6
+
+    def failing_post(i: int, r: int) -> int:
+        if i == 3:
+            raise ValueError("repair failed")
+        return r
+
+    with pytest.raises(ValueError, match="repair failed"):
+        run_streaming_stereo_pipeline(
+            range(8),
+            decode_fn=lambda i: i,
+            render_fn=lambda i, d: d,
+            postprocess_fn=failing_post,
+            postprocess_workers=3,
+            write_fn=lambda i, f: None,
+            capacity=4,
+            decode_workers=2,
+            write_workers=1,
+            ordered_writes=True,
+        )

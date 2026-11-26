@@ -148,3 +148,56 @@ def test_metric_stereo_generation_populates_clamp_summary(tmp_path: Path, render
     assert gen.create_stereo_pairs_from_files(frames, geoms, dirs, settings) is True
     assert gen.last_metric_clamp_summary is not None
     assert gen.last_metric_clamp_summary["valid_pixel_count"] > 0
+
+
+def test_quality_three_stage_streamed_pipeline_is_bit_exact_with_direct_renderer(
+    tmp_path: Path,
+) -> None:
+    from src.depth_surge_3d.rendering.quality.renderer import render_relative_quality_compact
+    from src.depth_surge_3d.rendering.stereo_renderer import StereoRenderSettings
+
+    frames, disps, dirs = _write_relative_fixture(tmp_path, count=4)
+    manifest = publish_validated_stereo_input_manifest_v1(
+        job_root=tmp_path, guide_files=frames, geometry_files=disps, geometry_mode="relative"
+    )
+    renderer = StereoRenderer(device="cpu")
+    gen = StereoPairGenerator(renderer=renderer)
+    captured: list[tuple[str, np.ndarray, np.ndarray]] = []
+    settings = {
+        "stereo_geometry_mode": "relative",
+        "stereo_render_mode": "quality",
+        "stereo_strength": 2.0,
+        "convergence": 0.5,
+        "occlusion_fill": "background",
+        "occlusion_fill_max_px": 8,
+        "stereo_io_workers": 4,
+    }
+    ok = gen.create_stereo_pairs_from_manifest(
+        manifest,
+        dirs,
+        settings,
+        frame_consumer=lambda name, l_img, r_img: captured.append(
+            (name, l_img.copy(), r_img.copy())
+        ),
+    )
+    assert ok is True
+    assert [name for name, _, _ in captured] == [f"frame_{i:06d}" for i in range(1, 5)]
+
+    ref_settings = StereoRenderSettings(
+        stereo_strength=2.0,
+        convergence=0.5,
+        occlusion_fill="background",
+        stereo_render_mode="quality",
+        occlusion_fill_max_px=8,
+    )
+    for (name, left, right), fp, dp in zip(captured, frames, disps, strict=True):
+        frame = cv2.imread(str(fp), cv2.IMREAD_COLOR)
+        canonical = np.ascontiguousarray(
+            cv2.imread(str(dp), cv2.IMREAD_UNCHANGED).astype(np.float32) / np.float32(65535.0),
+            dtype=np.float32,
+        )
+        direct = render_relative_quality_compact(
+            renderer=renderer, frame=frame, canonical=canonical, settings=ref_settings
+        )
+        assert np.array_equal(left, direct.left_image), f"left mismatch on {name}"
+        assert np.array_equal(right, direct.right_image), f"right mismatch on {name}"
