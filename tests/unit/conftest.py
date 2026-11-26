@@ -22,7 +22,6 @@ def _quality_module(name: str):
 
 
 kd = _quality_module("implicit_kd")
-indexed_heap = _quality_module("indexed_heap")
 region_solver = _quality_module("region_solver")
 quality_geometry = _quality_module("geometry")
 native_kd = _quality_module("native_kd")

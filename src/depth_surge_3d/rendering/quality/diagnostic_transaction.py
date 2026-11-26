@@ -14,17 +14,7 @@ from ...io.canonical_json import canonical_json_bytes
 from ...io.durable_publish import atomic_write_bytes, atomic_write_json
 from ...rendering.stereo_geometry import MetricProjectionStats
 from .diagnostics import build_quality_frame_stats
-from .types import CompactStereoRenderResult, DenseHistogramPairs
-
-
-def _json_compatible(value: Any) -> Any:
-    if isinstance(value, DenseHistogramPairs):
-        return [[int(idx), int(count)] for idx, count in enumerate(value.bins) if int(count) > 0]
-    if isinstance(value, dict):
-        return {k: _json_compatible(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_compatible(v) for v in value]
-    return value
+from .types import CompactStereoRenderResult
 
 
 DIAGNOSTICS_DIR_NAME = "04_stereo_diagnostics"
@@ -128,7 +118,7 @@ def publish_quality_frame(prepared: PreparedQualityFramePublication) -> dict[str
                 "byte_count": len(png_bytes),
                 "sha256": hashlib.sha256(png_bytes).hexdigest(),
             }
-        stats_bytes = canonical_json_bytes(_json_compatible(prepared.stats))
+        stats_bytes = canonical_json_bytes(prepared.stats)
         atomic_write_bytes(frame_dir / "stats.json", stats_bytes, sync=False)
         payloads["stats"] = {
             "path": str(frame_dir / "stats.json"),

@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import native_kd, region_solver
-from .indexed_heap import QualityRegionQueueBudgetError
+from .region_solver import QualityRegionQueueBudgetError
 
 
 def solve_native_geodesic_regions(

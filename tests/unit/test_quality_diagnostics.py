@@ -138,3 +138,28 @@ def test_streaming_diagnostics_accumulator_writes_single_summary(tmp_path: Path)
     pruned = mark_diagnostics_pruned(tmp_path)
     assert pruned["status"] == "payload_pruned"
     assert json.loads(summary_path.read_text(encoding="utf-8"))["status"] == "payload_pruned"
+
+
+def test_frame_stats_require_attested_fast_counters_and_matching_streamed_width() -> None:
+    from dataclasses import replace
+    import pytest
+    from src.depth_surge_3d.rendering.quality import types
+
+    compact = _sample_compact()
+    args = dict(frame_name="frame", geometry_mode="relative", occlusion_fill="background")
+    with pytest.raises(ValueError, match="producer-attested"):
+        build_quality_frame_stats(compact, **args, render_mode="fast")
+    with pytest.raises(ValueError, match="render_mode"):
+        build_quality_frame_stats(compact, **args, render_mode="codec")
+    with pytest.raises(ValueError, match="geometry_mode"):
+        build_quality_frame_stats(compact, **{**args, "geometry_mode": "camera"})
+    incompatible = types.HoleRunDiagnostics(np.zeros(64, np.uint64), np.zeros(4, np.uint64))
+    with pytest.raises(ValueError, match="histogram width"):
+        build_quality_frame_stats(replace(compact, right_hole_runs=incompatible), **args)
+    stats = build_quality_frame_stats(replace(compact, geometry_nearest=None), **args)
+    assert stats["geometry_nearest"] == {
+        "indexed_sample_count": 0,
+        "query_count": 0,
+        "visited_nodes_total": 0,
+        "visited_nodes_max": 0,
+    }
