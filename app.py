@@ -966,13 +966,11 @@ class ProgressCallback:
         base_weights: list[float],
         settings: dict[str, Any],
     ) -> list[float]:
-        """Zero out disabled stages and scale Stereo weight when streaming directly to FFmpeg."""
+        """Zero out disabled stages and scale active weights to measured runtime shares."""
         weights = dict(zip(self.steps, base_weights, strict=True))
         apply_distortion = bool(settings.get("apply_distortion", True))
-        try:
-            crop_factor = float(settings.get("crop_factor", 1.0))
-        except (TypeError, ValueError):
-            crop_factor = 1.0
+        raw_crop = settings.get("crop_factor", 1.0)
+        crop_factor = float(raw_crop) if isinstance(raw_crop, (int, float)) else 1.0
         upscale_model = str(settings.get("upscale_model") or "none")
         keep_intermediates = bool(settings.get("keep_intermediates", False))
         direct_vr_encode = bool(settings.get("direct_vr_encode", True))
@@ -982,24 +980,25 @@ class ProgressCallback:
             and upscale_model == "none"
             and (apply_distortion or crop_factor == 1.0)
         )
-        if settings.get("stereo_render_mode") == "quality":
-            weights["Stereo Pair Creation"] = max(weights["Stereo Pair Creation"], 0.40)
-        if not apply_distortion or streamed_stereo:
-            weights["Fisheye Distortion"] = 0.0
-        if (not apply_distortion and crop_factor == 1.0) or streamed_stereo:
-            weights["Crop Frames"] = 0.0
-        if upscale_model == "none":
-            weights["AI Upscaling"] = 0.0
-        if direct_vr_encode and not keep_intermediates:
-            weights["VR Assembly"] = 0.0
+        is_quality = settings.get("stereo_render_mode") == "quality"
+        if str(settings.get("depth_model_version") or "v2") == "see_through":
+            weights["Depth Map Generation"] = 0.65
+            weights["Stereo Pair Creation"] = 0.22 if is_quality else 0.10
+        elif is_quality:
+            weights["Stereo Pair Creation"] = max(weights["Stereo Pair Creation"], 0.30)
+        disabled = {
+            "Fisheye Distortion": not apply_distortion or streamed_stereo,
+            "Crop Frames": (not apply_distortion and crop_factor == 1.0) or streamed_stereo,
+            "AI Upscaling": upscale_model == "none",
+            "VR Assembly": direct_vr_encode and not keep_intermediates,
+        }
+        for name, is_disabled in disabled.items():
+            if is_disabled:
+                weights[name] = 0.0
         if streamed_stereo:
-            # In streamed mode FFmpeg encodes concurrently with Stereo Pair Creation;
-            # only container flush/ffprobe/cleanup remain after the last stereo frame.
             weights["Video Creation"] = 0.01
         total = sum(weights.values())
-        if total <= 0.0:
-            return base_weights
-        return [weights[name] / total for name in self.steps]
+        return [weights[name] / total for name in self.steps] if total > 0.0 else base_weights
 
     def is_cancelled(self) -> bool:
         """Return the shared user-stop state without emitting progress."""
@@ -1131,10 +1130,14 @@ class ProgressCallback:
             frames_remaining = max(0, self.step_total - self.step_progress)
             if frames_remaining == 0:
                 has_step_estimate = True
-            elif step_elapsed >= 1.5 and frames_completed > 0:
+            elif frames_completed >= 2 and step_elapsed >= 0.5:
                 time_per_frame = step_elapsed / frames_completed
                 remaining_time += time_per_frame * frames_remaining
                 has_step_estimate = True
+            else:
+                # Never extrapolate a brand-new counted step from a prior step's speed
+                # (e.g. slow diffusion depth -> fast parallel stereo); wait ~0.5s for real rate.
+                return None
 
         # 2. Add estimated time for active future steps only (disabled steps have weight 0)
         future_weight = (

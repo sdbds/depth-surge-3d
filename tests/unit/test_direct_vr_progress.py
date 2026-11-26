@@ -132,6 +132,60 @@ def test_resumed_step_eta_uses_frames_completed_since_step_start(monkeypatch):
         assert eta is not None and eta.startswith("3m ")
 
 
+def test_new_step_does_not_spike_eta_from_prior_slow_stage(monkeypatch):
+    clock = [3000.0]
+    monkeypatch.setattr(web_app.time, "time", lambda: clock[0])
+    settings = {
+        "depth_model_version": "see_through",
+        "apply_distortion": False,
+        "crop_factor": 1.0,
+        "upscale_model": "none",
+        "direct_vr_encode": True,
+        "keep_intermediates": False,
+        "stereo_render_mode": "quality",
+    }
+    callback = web_app.ProgressCallback("cold-eta", total_frames=473, settings=settings)
+    web_app.current_processing["stop_requested"] = False
+
+    with (
+        patch.object(web_app.socketio, "emit"),
+        patch.object(web_app.socketio, "sleep"),
+    ):
+        # Depth finishes after 228s -> progress reflects realistic ~75% share for See-Through
+        clock[0] = 3228.0
+        callback.update_progress(
+            "Depth map 473/473",
+            step_name="Depth Map Generation",
+            step_progress=473,
+            step_total=473,
+        )
+        assert 70.0 <= web_app.current_processing["progress"] <= 80.0
+
+        # Frame 1 & early frames (<0.5s) of Stereo must NOT extrapolate 4m+ from Depth's speed
+        clock[0] = 3228.1
+        callback.update_progress(
+            "Generated stereo pair 1/473",
+            step_name="Stereo Pair Creation",
+            step_progress=1,
+            step_total=473,
+        )
+        assert web_app.current_processing["eta"] is None
+
+        # After ~0.6s and 5 completed frames (~114ms/frame), ETA immediately locks to ~55-60s
+        clock[0] = 3228.67
+        callback.last_update_time = 0
+        callback.update_progress(
+            "Generated stereo pair 6/473",
+            step_name="Stereo Pair Creation",
+            step_progress=6,
+            step_total=473,
+        )
+        eta = web_app.current_processing["eta"]
+        assert eta is not None
+        assert eta.endswith("s") and "m" not in eta
+        assert 45 <= int(eta[:-1]) <= 65
+
+
 def test_vdpp_progress_inserts_stabilization_without_changing_off_layout():
     off = web_app.ProgressCallback("off-session", total_frames=2)
     vdpp = web_app.ProgressCallback(
