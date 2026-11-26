@@ -284,6 +284,73 @@ class _QualityDeviceFrame:
     source_valid: torch.Tensor
 
 
+class _PinnedTransferCache:
+    """Reusable pinned host buffers for fast CUDA H2D/D2H without per-frame VirtualAlloc."""
+
+    def __init__(self) -> None:
+        self.shape: tuple[int, int] | None = None
+        self.h2d_source: torch.Tensor | None = None
+        self.h2d_near: torch.Tensor | None = None
+        self.h2d_valid: torch.Tensor | None = None
+        self.d2h_rgb: torch.Tensor | None = None
+        self.d2h_packed: torch.Tensor | None = None
+
+    def ensure_h2d(
+        self, height: int, width: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if self.shape != (height, width) or self.h2d_source is None:
+            self.shape = (height, width)
+            self.h2d_source = None
+            self.h2d_near = None
+            self.h2d_valid = None
+            self.d2h_rgb = None
+            self.d2h_packed = None
+            try:
+                self.h2d_source = torch.empty(
+                    (height, width, 3), dtype=torch.uint8, pin_memory=True
+                )
+                self.h2d_near = torch.empty((height, width), dtype=torch.float32, pin_memory=True)
+                self.h2d_valid = torch.empty((height, width), dtype=torch.bool, pin_memory=True)
+            except RuntimeError:
+                self.h2d_source = None
+                self.h2d_near = None
+                self.h2d_valid = None
+                return None
+        assert (
+            self.h2d_source is not None and self.h2d_near is not None and self.h2d_valid is not None
+        )
+        return self.h2d_source, self.h2d_near, self.h2d_valid
+
+    def ensure_d2h(self, height: int, width: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self.shape != (height, width):
+            self.shape = (height, width)
+            self.h2d_source = None
+            self.h2d_near = None
+            self.h2d_valid = None
+            self.d2h_rgb = None
+            self.d2h_packed = None
+        if self.d2h_rgb is None or self.d2h_packed is None:
+            try:
+                self.d2h_rgb = torch.empty((height, width, 3), dtype=torch.uint8, pin_memory=True)
+                self.d2h_packed = torch.empty((height, width), dtype=torch.int16, pin_memory=True)
+            except RuntimeError:
+                self.d2h_rgb = None
+                self.d2h_packed = None
+                return None
+        return self.d2h_rgb, self.d2h_packed
+
+
+_PINNED_TRANSFER_TLS = threading.local()
+
+
+def _get_pinned_transfer_cache() -> _PinnedTransferCache:
+    cache = getattr(_PINNED_TRANSFER_TLS, "cache", None)
+    if cache is None:
+        cache = _PinnedTransferCache()
+        _PINNED_TRANSFER_TLS.cache = cache
+    return cache
+
+
 @dataclass
 class _FrameBandState:
     initial_height: int
@@ -331,13 +398,28 @@ def _preload_quality_device_frame(
     device_near_score = None
     device_source_valid = None
     try:
-        device_source = torch.from_numpy(source).to(renderer.device)
-        device_near_score = torch.from_numpy(
-            np.array(geometry.near_score, copy=True, order="C")
-        ).to(renderer.device)
-        device_source_valid = torch.from_numpy(
-            np.array(geometry.source_valid, copy=True, order="C")
-        ).to(renderer.device)
+        height, width = int(source.shape[0]), int(source.shape[1])
+        pinned = (
+            _get_pinned_transfer_cache().ensure_h2d(height, width)
+            if source.dtype == np.uint8 and geometry.near_score.dtype == np.float32
+            else None
+        )
+        if pinned is not None:
+            pin_src, pin_near, pin_valid = pinned
+            pin_src.numpy()[...] = source
+            pin_near.numpy()[...] = geometry.near_score
+            pin_valid.numpy()[...] = geometry.source_valid
+            device_source = pin_src.to(renderer.device, non_blocking=True)
+            device_near_score = pin_near.to(renderer.device, non_blocking=True)
+            device_source_valid = pin_valid.to(renderer.device, non_blocking=True)
+        else:
+            device_source = torch.from_numpy(source).to(renderer.device)
+            device_near_score = torch.from_numpy(
+                np.array(geometry.near_score, copy=True, order="C")
+            ).to(renderer.device)
+            device_source_valid = torch.from_numpy(
+                np.array(geometry.source_valid, copy=True, order="C")
+            ).to(renderer.device)
     except torch.cuda.OutOfMemoryError:
         device_source = None
         device_near_score = None
@@ -773,11 +855,13 @@ def _composite_background_proxy(  # noqa: C901 - validation stays at this bounda
     else:
         mask_u8 = np.ascontiguousarray(mask, dtype=np.uint8) * np.uint8(255)
         x, y, width, height = cv2.boundingRect(mask_u8)
-        proxy = _inpaint_background_proxy(
+        proxy = native.inpaint_background_proxy_wavefront(
             proxy_source,
             mask_u8,
-            radius_px=radius,
-            mask_bounds=(y, y + height, x, x + width),
+            int(y),
+            int(y + height),
+            int(x),
+            int(x + width),
         )
 
     return native.composite_background_proxy(pre_repair, coverage, proxy)
@@ -865,6 +949,7 @@ def _finish_background_eye(
     eye: Literal["left", "right"],
     controls_limit_px: int,
     predicted_gap_px: int,
+    compute_component_count: bool = True,
 ) -> _CompactEyeResult:
     safe_limit = max(1, math.floor(controls_limit_px * source.shape[0] / 1080.0 + 0.5))
     local_limit = min(safe_limit, predicted_gap_px)
@@ -892,20 +977,25 @@ def _finish_background_eye(
         if int(masked_pixels) == int(mask.size):
             proxy = np.array(source, copy=True, order="C")
         else:
-            radius = min(3, max(1, local_limit))
             first_row, end_row, first_col, end_col = mask_bounds
-            proxy = _inpaint_background_proxy(
+            proxy = native.inpaint_background_proxy_wavefront(
                 proxy_source,
                 mask,
-                radius_px=radius,
-                mask_bounds=(int(first_row), int(end_row), int(first_col), int(end_col)),
+                int(first_row),
+                int(end_row),
+                int(first_col),
+                int(end_col),
             )
         image = native.composite_background_proxy(
             pre_repair.image,
             pre_repair.coverage_count,
             proxy,
         )
-        component_count = int(cv2.connectedComponents(missing, connectivity=4)[0]) - 1
+        component_count = (
+            int(cv2.connectedComponents(missing, connectivity=4)[0]) - 1
+            if compute_component_count
+            else 0
+        )
     summary = _background_proxy_summary(
         missing_lanes=int(missing_lanes),
         missing_pixels=missing_pixels,
@@ -929,40 +1019,48 @@ def _splat_unrepaired_eye_deferred_once(
     band_height: int,
     device_frame: _QualityDeviceFrame | None = None,
 ) -> _UnrepairedEyeResult | _DeferredUnrepairedEyeResult:
-    """Fast single-band CUDA splat with one packed D2H copy and deferred CPU histogram unpack."""
+    """Banded CUDA splat with GPU uint8 conversion, pinned D2H, and deferred CPU histogram."""
 
     height, width = source.shape[:2]
-    if renderer.device.type == "cuda" and source.dtype == np.uint8 and band_height >= height:
+    if renderer.device.type == "cuda" and source.dtype == np.uint8:
         device_offsets = offsets if isinstance(offsets, torch.Tensor) else None
         if device_frame is not None and isinstance(offsets, np.ndarray):
             try:
                 device_offsets = renderer._transfer_offset_band(offsets)
             except torch.cuda.OutOfMemoryError:
                 _release_after_oom(renderer)
-        compact_cuda = _quality_compact_cuda_splat(
-            renderer,
-            source,
-            geometry,
-            offsets,
-            0,
-            height,
-            device_frame=device_frame,
-            device_offsets=device_offsets,
-        )
-        if compact_cuda is not None:
-            downsampled, packed_missing_device = compact_cuda
-            rgb_gpu = torch.round(downsampled.detach())
-            rgb_gpu.clamp_(0, 255)
-            rgb_bytes = rgb_gpu.to(dtype=torch.uint8).reshape(-1)
-            missing_bytes = packed_missing_device.contiguous().view(torch.uint8).reshape(-1)
-            rgb_nbytes = int(rgb_bytes.numel())
-            payload = torch.cat((rgb_bytes, missing_bytes), dim=0).cpu().numpy()
-            del compact_cuda, downsampled, packed_missing_device, rgb_gpu, rgb_bytes, missing_bytes
-            image = np.ascontiguousarray(payload[:rgb_nbytes].reshape(height, width, 3))
-            packed_missing = np.ascontiguousarray(
-                payload[rgb_nbytes:].view(np.uint16).reshape(height, width)
-            )
-            return _DeferredUnrepairedEyeResult(image=image, packed_missing=packed_missing)
+        pinned = _get_pinned_transfer_cache().ensure_d2h(height, width)
+        if pinned is not None:
+            pin_rgb, pin_packed = pinned
+            used_compact = True
+            for start_row in range(0, height, band_height):
+                end_row = min(height, start_row + band_height)
+                compact_cuda = _quality_compact_cuda_splat(
+                    renderer,
+                    source,
+                    geometry,
+                    offsets,
+                    start_row,
+                    end_row,
+                    device_frame=device_frame,
+                    device_offsets=device_offsets,
+                )
+                if compact_cuda is None:
+                    used_compact = False
+                    break
+                downsampled, packed_missing_device = compact_cuda
+                rgb_gpu = torch.round(downsampled.detach())
+                rgb_gpu.clamp_(0, 255)
+                pin_rgb[start_row:end_row].copy_(rgb_gpu.to(dtype=torch.uint8), non_blocking=True)
+                pin_packed[start_row:end_row].copy_(
+                    packed_missing_device.contiguous(), non_blocking=True
+                )
+                del compact_cuda, downsampled, packed_missing_device, rgb_gpu
+            if used_compact:
+                torch.cuda.current_stream(renderer.device).synchronize()
+                image = np.array(pin_rgb.numpy(), copy=True, order="C")
+                packed_missing = np.array(pin_packed.numpy().view(np.uint16), copy=True, order="C")
+                return _DeferredUnrepairedEyeResult(image=image, packed_missing=packed_missing)
     return _render_unrepaired_eye_once(
         renderer=renderer,
         source=source,
@@ -1563,7 +1661,11 @@ def splat_prepared_metric_quality_frame(
     )
 
 
-def finish_splatted_quality_frame(splatted: SplattedQualityFrame) -> CompactStereoRenderResult:
+def finish_splatted_quality_frame(
+    splatted: SplattedQualityFrame,
+    *,
+    compute_component_count: bool = True,
+) -> CompactStereoRenderResult:
     """Complete pure-CPU background proxy repair and assemble CompactStereoRenderResult."""
 
     finish_started = time.perf_counter()
@@ -1584,6 +1686,7 @@ def finish_splatted_quality_frame(splatted: SplattedQualityFrame) -> CompactSter
             eye="left",
             controls_limit_px=splatted.controls_limit_px,
             predicted_gap_px=splatted.predicted_gap_px,
+            compute_component_count=compute_component_count,
         )
         left_finish_sec = time.perf_counter() - l_start
 
@@ -1595,6 +1698,7 @@ def finish_splatted_quality_frame(splatted: SplattedQualityFrame) -> CompactSter
             eye="right",
             controls_limit_px=splatted.controls_limit_px,
             predicted_gap_px=splatted.predicted_gap_px,
+            compute_component_count=compute_component_count,
         )
         right_finish_sec = time.perf_counter() - r_start
 

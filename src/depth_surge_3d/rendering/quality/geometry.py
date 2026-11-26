@@ -360,6 +360,7 @@ def _expand_foreground_matte_one_pixel(  # noqa: C901 - validates and mutates on
     *,
     metric_valid: np.ndarray | None,
     candidate_mask: np.ndarray | None = None,
+    update_displacement: bool = False,
 ) -> np.ndarray:
     """Move the outer antialiasing pixel with the nearer stable surface."""
 
@@ -426,6 +427,7 @@ def _expand_foreground_matte_one_pixel(  # noqa: C901 - validates and mutates on
         one_eye_displacement_px,
         metric_valid,
         candidate_mask,
+        bool(update_displacement),
     )
 
 
@@ -649,12 +651,7 @@ def build_relative_quality_geometry(
         displacement,
         metric_valid=None,
         candidate_mask=regions.edge_band,
-    )
-    displacement = _relative_displacement(
-        near_score,
-        destination_shape[1],
-        strength,
-        convergence64,
+        update_displacement=True,
     )
     recorder.checkpoint(10, "derived_geometry_complete")
     finalize_seconds = time.perf_counter() - finalize_started
@@ -806,6 +803,7 @@ def build_metric_quality_geometry(
         displacement,
         metric_valid=baseline.resized_valid,
         candidate_mask=regions.edge_band,
+        update_displacement=True,
     )
     baseline.stats = _recount_metric_stats(
         baseline.near_score,
@@ -815,10 +813,6 @@ def build_metric_quality_geometry(
         convergence_m,
         disparity_percent,
         crop_width,
-    )
-    displacement = _geometry_displacement(
-        baseline.total_disparity_fraction,
-        destination_shape[1],
     )
     recorder.checkpoint(10, "derived_geometry_complete")
     finalize_seconds = time.perf_counter() - finalize_started
@@ -891,16 +885,11 @@ def _solve_final_regions(
         render_width=render_shape[1],
     )
     stable_initial = np.ascontiguousarray(surface_map != np.uint32(0))
-    edge_band = np.array(
-        region_solver.build_four_connected_edge_band(surface_map, radius=radius),
-        copy=True,
-        order="C",
+    edge_band = region_solver.build_four_connected_edge_band(
+        surface_map,
+        radius=radius,
+        include_zero=True,
     )
-    uncertainty = ~stable_initial
-    for _ in range(radius):
-        uncertainty = _cross_dilate_mask(uncertainty)
-    edge_band |= uncertainty
-    edge_band.setflags(write=False)
     seeds = region_solver.build_sparse_stable_region_seeds(
         initial,
         edge_band,
@@ -927,9 +916,10 @@ def _solve_final_regions(
         movement_base_cost=_EDGE_LOCKED_MOVEMENT_BASE_COST,
         movement_edge_scale=_EDGE_LOCKED_MOVEMENT_EDGE_SCALE,
         mutable_region_map=True,
+        owner_only=True,
     )
     solver_bytes = (
-        geodesic.distance.nbytes + geodesic.heap_position.nbytes + geodesic.heap_pixel_bytes
+        geodesic.distance_bytes + geodesic.heap_position_bytes + geodesic.heap_pixel_bytes
     )
     recorder.allocate(4, "geodesic_solver_scratch", solver_bytes)
     recorder.checkpoint(4, "final_geodesic_region_map_complete")

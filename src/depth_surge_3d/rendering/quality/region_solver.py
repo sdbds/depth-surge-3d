@@ -190,6 +190,7 @@ def build_four_connected_edge_band(
     mapped_regions: np.ndarray,
     *,
     radius: int,
+    include_zero: bool = False,
 ) -> np.ndarray:
     """Mark every valid two-sided label boundary and cross-dilate it."""
 
@@ -198,6 +199,7 @@ def build_four_connected_edge_band(
     boundary = native_kd._require_native().build_four_connected_edge_band(
         mapped_regions,
         dilation_radius,
+        bool(include_zero),
     )
     boundary.setflags(write=False)
     return boundary

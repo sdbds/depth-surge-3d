@@ -245,3 +245,32 @@ def test_native_queue_workspaces_remain_independent_under_concurrent_solves() ->
 
     for observed, reference in zip(actual, expected, strict=True):
         _assert_same_solve(observed, reference)
+
+
+@pytest.mark.parametrize("ties", [False, True])
+def test_native_dial_owner_only_matches_indexed_heap_bit_exact(ties: bool) -> None:
+    fixtures = [_fixture((23, 37), 500 + seed, ties=ties) for seed in range(4)]
+
+    def solve_pair(inputs):
+        ref = native_region_solver.solve_native_geodesic_regions(
+            *inputs,
+            movement_base_cost=4,
+            movement_edge_scale=8,
+            owner_only=False,
+        )
+        fast = native_region_solver.solve_native_geodesic_regions(
+            *inputs,
+            movement_base_cost=4,
+            movement_edge_scale=8,
+            owner_only=True,
+        )
+        return ref, fast
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        pairs = list(executor.map(solve_pair, fixtures))
+
+    for ref, fast in pairs:
+        np.testing.assert_array_equal(fast.region_map, ref.region_map)
+        assert fast.settled_count == ref.settled_count
+        assert fast.distance_bytes == ref.distance_bytes
+        assert fast.heap_position_bytes == ref.heap_position_bytes

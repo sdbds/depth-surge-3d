@@ -482,7 +482,10 @@ class StereoPairGenerator:
                 record: StereoInputRecord, splatted: Any
             ) -> CompactStereoRenderResult:
                 _ = record
-                compact = finish_splatted_quality_frame(splatted)
+                compact = finish_splatted_quality_frame(
+                    splatted,
+                    compute_component_count=save_masks,
+                )
                 with diag_lock:
                     diagnostics.record_compact(compact, metric_stats=compact.metric_stats)
                 return compact

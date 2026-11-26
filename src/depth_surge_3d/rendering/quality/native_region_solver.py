@@ -17,8 +17,9 @@ def solve_native_geodesic_regions(
     movement_base_cost: int = 256,
     movement_edge_scale: int = 8,
     mutable_region_map: bool = False,
+    owner_only: bool = False,
 ) -> region_solver.GeodesicSolveResult:
-    """Assign a full render band using the build-time native indexed heap."""
+    """Assign a full render band using the build-time native solver."""
 
     region_solver._validate_solver_inputs(
         guide,
@@ -36,16 +37,35 @@ def solve_native_geodesic_regions(
     )
     if not isinstance(mutable_region_map, bool):
         raise TypeError("mutable_region_map must be a bool")
+    if not isinstance(owner_only, bool):
+        raise TypeError("owner_only must be a bool")
     native = native_kd._require_native()
     try:
-        owner, distance, position, statistics = native.solve_geodesic_regions(
-            guide,
-            band_mask,
-            seed_region_map,
-            region_rank_bits,
-            base_cost,
-            edge_scale,
-        )
+        if owner_only:
+            owner, statistics = native.solve_geodesic_regions_owner_only(
+                guide,
+                band_mask,
+                seed_region_map,
+                region_rank_bits,
+                base_cost,
+                edge_scale,
+            )
+            distance = np.empty((0, 0), dtype=np.uint64)
+            position = np.empty((0, 0), dtype=np.int32)
+            sample_count = int(band_mask.size)
+            distance_bytes = sample_count * 8
+            position_bytes = sample_count * 4
+        else:
+            owner, distance, position, statistics = native.solve_geodesic_regions(
+                guide,
+                band_mask,
+                seed_region_map,
+                region_rank_bits,
+                base_cost,
+                edge_scale,
+            )
+            distance_bytes = int(distance.nbytes)
+            position_bytes = int(position.nbytes)
     except RuntimeError as error:
         if "quality region queue" in str(error):
             raise QualityRegionQueueBudgetError(str(error)) from error
@@ -63,6 +83,6 @@ def solve_native_geodesic_regions(
         queue_decrease_keys=int(statistics["queue_decrease_keys"]),
         queue_pops=int(statistics["queue_pops"]),
         heap_pixel_bytes=int(statistics["heap_pixel_bytes"]),
-        heap_position_bytes=int(position.nbytes),
-        distance_bytes=int(distance.nbytes),
+        heap_position_bytes=position_bytes,
+        distance_bytes=distance_bytes,
     )

@@ -862,6 +862,7 @@ def test_relative_geometry_foreground_matte_uses_a_boundary_covering_edge_band(
         *,
         metric_valid,
         candidate_mask=None,
+        update_displacement=False,
     ):
         assert candidate_mask is not None
         boundary = np.zeros(final_region_map.shape, dtype=np.bool_)
@@ -881,6 +882,7 @@ def test_relative_geometry_foreground_matte_uses_a_boundary_covering_edge_band(
             one_eye_displacement_px,
             metric_valid=metric_valid,
             candidate_mask=candidate_mask,
+            update_displacement=update_displacement,
         )
 
     monkeypatch.setattr(production, "_expand_foreground_matte_one_pixel", capture)

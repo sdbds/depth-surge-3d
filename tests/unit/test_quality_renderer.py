@@ -730,6 +730,22 @@ def test_background_proxy_roi_inpaint_skips_empty_mask(
     assert actual is proxy_source
 
 
+def test_wavefront_background_proxy_inpaint_fills_masked_roi_only() -> None:
+    native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
+    native = native_kd._require_native()
+    proxy = np.full((32, 48, 3), [20, 140, 210], dtype=np.uint8)
+    mask = np.zeros((32, 48), dtype=np.uint8)
+    mask[10:20, 14:24] = np.uint8(255)
+    proxy[10:20, 14:24] = np.uint8(0)
+    before_unmasked = proxy[mask == 0].copy()
+
+    out = native.inpaint_background_proxy_wavefront(proxy, mask, 10, 20, 14, 24)
+
+    assert out is proxy
+    np.testing.assert_array_equal(out[mask == 0], before_unmasked)
+    np.testing.assert_array_equal(out[10:20, 14:24], np.full((10, 10, 3), [20, 140, 210]))
+
+
 def test_native_lane_analysis_fuses_coverage_and_row_bounded_histograms() -> None:
     native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
     lane_valid = np.ones((2, 2, 16), dtype=np.bool_)

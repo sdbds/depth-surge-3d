@@ -25,10 +25,30 @@
 #if defined(_M_X64) || defined(__x86_64__)
 #include <emmintrin.h>
 #endif
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace py = pybind11;
 
 namespace {
+
+inline std::uint32_t ctz64(std::uint64_t value) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+    unsigned long index = 0;
+    _BitScanForward64(&index, value);
+    return static_cast<std::uint32_t>(index);
+#elif defined(__GNUC__) || defined(__clang__)
+    return static_cast<std::uint32_t>(__builtin_ctzll(value));
+#else
+    std::uint32_t index = 0;
+    while ((value & 1ULL) == 0ULL) {
+        value >>= 1U;
+        ++index;
+    }
+    return index;
+#endif
+}
 
 constexpr std::size_t kStackCapacity = 64;
 constexpr std::uint64_t kUint32Max = std::numeric_limits<std::uint32_t>::max();
@@ -1573,6 +1593,326 @@ py::tuple solve_geodesic_regions(
     );
 }
 
+py::tuple solve_geodesic_regions_owner_only(
+    const py::array& guide,
+    const py::array& band_mask,
+    const py::array& seed_region_map,
+    const py::array& region_rank_bits,
+    std::uint32_t movement_base_cost,
+    std::uint32_t movement_edge_scale
+) {
+    if (movement_base_cost == 0 || movement_edge_scale == 0) {
+        throw py::value_error("region movement costs must be positive");
+    }
+    if (
+        !guide.dtype().is(py::dtype::of<std::uint8_t>()) ||
+        guide.ndim() != 3 ||
+        guide.shape(0) <= 0 ||
+        guide.shape(1) <= 0 ||
+        guide.shape(2) != 3 ||
+        (guide.flags() & py::array::c_style) == 0
+    ) {
+        throw py::type_error("guide must be a C-contiguous uint8 BGR raster");
+    }
+    validate_array(band_mask, py::dtype::of<bool>(), "band_mask");
+    validate_array(
+        seed_region_map,
+        py::dtype::of<std::uint32_t>(),
+        "seed_region_map"
+    );
+    validate_vector(
+        region_rank_bits,
+        py::dtype::of<std::uint32_t>(),
+        "region_rank_bits"
+    );
+    if (region_rank_bits.shape(0) < 2) {
+        throw py::value_error("region_rank_bits must contain a positive region");
+    }
+    if (
+        band_mask.shape(0) != guide.shape(0) ||
+        band_mask.shape(1) != guide.shape(1) ||
+        seed_region_map.shape(0) != guide.shape(0) ||
+        seed_region_map.shape(1) != guide.shape(1)
+    ) {
+        throw py::value_error("region solver rasters must have matching shapes");
+    }
+    const std::uint64_t sample_count64 =
+        static_cast<std::uint64_t>(guide.shape(0)) *
+        static_cast<std::uint64_t>(guide.shape(1));
+    if (sample_count64 > kUint32Max) {
+        throw py::value_error("region solver raster exceeds uint32 capacity");
+    }
+    const std::uint64_t maximum_movement =
+        static_cast<std::uint64_t>(movement_base_cost) +
+        static_cast<std::uint64_t>(movement_edge_scale) * 255ULL;
+    constexpr std::uint32_t kDialBuckets = 4096U;
+    constexpr std::uint32_t kDialMask = kDialBuckets - 1U;
+    if (maximum_movement >= kDialBuckets) {
+        py::tuple full = solve_geodesic_regions(
+            guide,
+            band_mask,
+            seed_region_map,
+            region_rank_bits,
+            movement_base_cost,
+            movement_edge_scale
+        );
+        return py::make_tuple(full[0], full[3]);
+    }
+
+    const auto height = static_cast<std::uint32_t>(guide.shape(0));
+    const auto width = static_cast<std::uint32_t>(guide.shape(1));
+    const auto sample_count = static_cast<std::uint32_t>(sample_count64);
+    const auto rank_count = static_cast<std::uint32_t>(region_rank_bits.shape(0));
+    const auto* guide_values = static_cast<const std::uint8_t*>(guide.data());
+    const auto* band_values = static_cast<const std::uint8_t*>(band_mask.data());
+    const auto* seed_values =
+        static_cast<const std::uint32_t*>(seed_region_map.data());
+    const auto* rank_values =
+        static_cast<const std::uint32_t*>(region_rank_bits.data());
+
+    py::array_t<std::uint32_t> owner({guide.shape(0), guide.shape(1)});
+    auto* owner_values = owner.mutable_data();
+    std::uint32_t band_count = 0;
+    std::uint64_t heap_storage_bytes = 0;
+    {
+        py::gil_scoped_release release;
+        constexpr std::uint32_t kThreadLocalSlotCap = 2500000U;
+        thread_local std::vector<std::uint32_t> tl_band_slot;
+        std::vector<std::uint32_t> local_band_slot;
+        std::uint32_t* band_slot = nullptr;
+        if (sample_count <= kThreadLocalSlotCap) {
+            if (tl_band_slot.size() < sample_count) {
+                tl_band_slot.assign(sample_count, kUint32Max);
+            }
+            band_slot = tl_band_slot.data();
+        } else {
+            local_band_slot.assign(sample_count, kUint32Max);
+            band_slot = local_band_slot.data();
+        }
+
+        std::memcpy(
+            owner_values,
+            seed_values,
+            static_cast<std::size_t>(sample_count) * sizeof(std::uint32_t)
+        );
+        std::vector<std::uint32_t> band_pixels;
+        band_pixels.reserve(sample_count / 16U + 64U);
+        for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
+            if (seed_values[pixel] >= rank_count) {
+                throw std::invalid_argument(
+                    "seed region exceeds region_rank_bits"
+                );
+            }
+            if (band_values[pixel] != 0) {
+                band_slot[pixel] = static_cast<std::uint32_t>(band_pixels.size());
+                band_pixels.push_back(pixel);
+            }
+        }
+        band_count = static_cast<std::uint32_t>(band_pixels.size());
+        heap_storage_bytes = static_cast<std::uint64_t>(band_count) * 20ULL;
+
+        struct SlotCleaner {
+            std::uint32_t* slots;
+            const std::vector<std::uint32_t>& pixels;
+            bool active;
+            ~SlotCleaner() {
+                if (active) {
+                    for (const std::uint32_t p : pixels) {
+                        slots[p] = kUint32Max;
+                    }
+                }
+            }
+        } slot_cleaner{band_slot, band_pixels, sample_count <= kThreadLocalSlotCap};
+
+        if (band_count > 0) {
+            std::vector<std::uint64_t> band_dist(
+                band_count,
+                std::numeric_limits<std::uint64_t>::max()
+            );
+            std::vector<std::uint32_t> band_owner(band_count, 0);
+            std::vector<std::uint8_t> band_settled(band_count, 0);
+
+            thread_local std::array<std::vector<std::uint32_t>, kDialBuckets> tl_buckets;
+            thread_local std::vector<std::uint32_t> tl_active_bucket;
+            std::array<std::uint64_t, kDialBuckets / 64U> non_empty_mask{};
+
+            struct BucketCleaner {
+                std::array<std::vector<std::uint32_t>, kDialBuckets>& buckets;
+                std::array<std::uint64_t, kDialBuckets / 64U>& mask;
+                ~BucketCleaner() {
+                    for (std::uint32_t w = 0; w < kDialBuckets / 64U; ++w) {
+                        std::uint64_t bits = mask[w];
+                        while (bits != 0) {
+                            const std::uint32_t bit = ctz64(bits);
+                            buckets[(w << 6U) | bit].clear();
+                            bits &= bits - 1ULL;
+                        }
+                    }
+                }
+            } bucket_cleaner{tl_buckets, non_empty_mask};
+
+            const auto push_bucket = [&](std::uint64_t dist, std::uint32_t slot) {
+                const std::uint32_t b = static_cast<std::uint32_t>(dist & kDialMask);
+                tl_buckets[b].push_back(slot);
+                non_empty_mask[b >> 6U] |= (1ULL << (b & 63U));
+            };
+
+            for (std::uint32_t slot = 0; slot < band_count; ++slot) {
+                const std::uint32_t pixel = band_pixels[slot];
+                const std::uint32_t seed_owner = owner_values[pixel];
+                if (seed_owner != 0) {
+                    band_dist[slot] = 0;
+                    band_owner[slot] = seed_owner;
+                    push_bucket(0, slot);
+                    continue;
+                }
+                std::uint64_t best_dist = std::numeric_limits<std::uint64_t>::max();
+                std::uint32_t best_owner = 0;
+                visit_four_neighbours(pixel, height, width, [&](std::uint32_t neighbour) {
+                    if (band_slot[neighbour] != kUint32Max) {
+                        return;
+                    }
+                    const std::uint32_t region = owner_values[neighbour];
+                    if (region == 0) {
+                        return;
+                    }
+                    const std::uint64_t cand_dist = bgr_movement_cost(
+                        guide_values,
+                        neighbour,
+                        pixel,
+                        movement_base_cost,
+                        movement_edge_scale
+                    );
+                    if (region_candidate_is_better(
+                        cand_dist,
+                        region,
+                        best_dist,
+                        best_owner,
+                        rank_values
+                    )) {
+                        best_dist = cand_dist;
+                        best_owner = region;
+                    }
+                });
+                if (best_owner != 0) {
+                    band_dist[slot] = best_dist;
+                    band_owner[slot] = best_owner;
+                    push_bucket(best_dist, slot);
+                }
+            }
+
+            const std::uint64_t maximum_prunable_source =
+                std::numeric_limits<std::uint64_t>::max() - maximum_movement;
+            std::uint64_t cur_dist = 0;
+            std::uint32_t settled = 0;
+            while (settled < band_count) {
+                const std::uint32_t b = static_cast<std::uint32_t>(cur_dist & kDialMask);
+                const std::uint32_t w0 = b >> 6U;
+                const std::uint32_t bit0 = b & 63U;
+                std::uint32_t next_b = kDialBuckets;
+                const std::uint64_t first_masked = non_empty_mask[w0] & (~0ULL << bit0);
+                if (first_masked != 0) {
+                    next_b = (w0 << 6U) | ctz64(first_masked);
+                } else {
+                    for (std::uint32_t step = 1; step < kDialBuckets / 64U; ++step) {
+                        const std::uint32_t w = (w0 + step) & ((kDialBuckets / 64U) - 1U);
+                        const std::uint64_t word = non_empty_mask[w];
+                        if (word != 0) {
+                            next_b = (w << 6U) | ctz64(word);
+                            break;
+                        }
+                    }
+                }
+                if (next_b == kDialBuckets) {
+                    break;
+                }
+                const std::uint32_t delta = (next_b - b) & kDialMask;
+                if (cur_dist > std::numeric_limits<std::uint64_t>::max() - delta) {
+                    throw std::runtime_error("quality region queue distance overflow");
+                }
+                cur_dist += delta;
+                non_empty_mask[next_b >> 6U] &= ~(1ULL << (next_b & 63U));
+                tl_active_bucket.clear();
+                tl_active_bucket.swap(tl_buckets[next_b]);
+
+                const std::uint64_t candidate_lower_bound =
+                    cur_dist <= maximum_prunable_source
+                        ? cur_dist + movement_base_cost
+                        : 0;
+                for (const std::uint32_t slot : tl_active_bucket) {
+                    if (band_settled[slot] != 0 || band_dist[slot] != cur_dist) {
+                        continue;
+                    }
+                    band_settled[slot] = 1;
+                    ++settled;
+                    const std::uint32_t pixel = band_pixels[slot];
+                    const std::uint32_t source_owner = band_owner[slot];
+                    owner_values[pixel] = source_owner;
+
+                    const std::uint32_t y = pixel / width;
+                    const std::uint32_t x = pixel - y * width;
+                    const auto relax_nb = [&](std::uint32_t nb) {
+                        const std::uint32_t nb_slot = band_slot[nb];
+                        if (nb_slot == kUint32Max || band_settled[nb_slot] != 0) {
+                            return;
+                        }
+                        const std::uint64_t nb_dist = band_dist[nb_slot];
+                        if (nb_dist < candidate_lower_bound) {
+                            return;
+                        }
+                        const std::uint64_t movement = bgr_movement_cost(
+                            guide_values,
+                            pixel,
+                            nb,
+                            movement_base_cost,
+                            movement_edge_scale
+                        );
+                        if (cur_dist > std::numeric_limits<std::uint64_t>::max() - movement) {
+                            throw std::runtime_error("quality region queue distance overflow");
+                        }
+                        const std::uint64_t cand_dist = cur_dist + movement;
+                        if (region_candidate_is_better(
+                            cand_dist,
+                            source_owner,
+                            nb_dist,
+                            band_owner[nb_slot],
+                            rank_values
+                        )) {
+                            band_dist[nb_slot] = cand_dist;
+                            band_owner[nb_slot] = source_owner;
+                            push_bucket(cand_dist, nb_slot);
+                        }
+                    };
+                    if (y != 0) {
+                        relax_nb(pixel - width);
+                    }
+                    if (x != 0) {
+                        relax_nb(pixel - 1);
+                    }
+                    if (x + 1 < width) {
+                        relax_nb(pixel + 1);
+                    }
+                    if (y + 1 < height) {
+                        relax_nb(pixel + width);
+                    }
+                }
+            }
+            if (settled != band_count) {
+                throw std::invalid_argument("edge-band component has no seed");
+            }
+        }
+    }
+
+    py::dict statistics;
+    statistics["max_live_entries"] = band_count;
+    statistics["settled_count"] = band_count;
+    statistics["queue_insertions"] = static_cast<std::uint64_t>(band_count);
+    statistics["queue_decrease_keys"] = static_cast<std::uint64_t>(0);
+    statistics["queue_pops"] = static_cast<std::uint64_t>(band_count);
+    statistics["heap_pixel_bytes"] = heap_storage_bytes;
+    return py::make_tuple(std::move(owner), std::move(statistics));
+}
+
 py::tuple build_index(
     const py::array& region_ids,
     std::uint64_t region_count_value,
@@ -2906,7 +3246,8 @@ void build_edge_band_l1_impl(
     std::uint32_t height,
     std::uint32_t width,
     std::uint32_t effective_radius,
-    std::size_t hardware_workers
+    std::size_t hardware_workers,
+    bool include_zero
 ) {
     const auto is_region = [](std::uint32_t value) {
         return value != 0 && value != std::numeric_limits<std::uint32_t>::max();
@@ -2941,15 +3282,17 @@ void build_edge_band_l1_impl(
                 for (std::uint32_t col = 0; col < width; ++col) {
                     const std::uint64_t pixel = row_offset + col;
                     const std::uint32_t region = regions[pixel];
-                    const bool is_seed = is_region(region) && (
-                        (row != 0 && is_region(regions[pixel - width]) &&
-                         region != regions[pixel - width]) ||
-                        (row + 1 < height && is_region(regions[pixel + width]) &&
-                         region != regions[pixel + width]) ||
-                        (col != 0 && is_region(regions[pixel - 1]) &&
-                         region != regions[pixel - 1]) ||
-                        (col + 1 < width && is_region(regions[pixel + 1]) &&
-                         region != regions[pixel + 1])
+                    const bool is_seed = (include_zero && region == 0) || (
+                        is_region(region) && (
+                            (row != 0 && is_region(regions[pixel - width]) &&
+                             region != regions[pixel - width]) ||
+                            (row + 1 < height && is_region(regions[pixel + width]) &&
+                             region != regions[pixel + width]) ||
+                            (col != 0 && is_region(regions[pixel - 1]) &&
+                             region != regions[pixel - 1]) ||
+                            (col + 1 < width && is_region(regions[pixel + 1]) &&
+                             region != regions[pixel + 1])
+                        )
                     );
                     if (is_seed) {
                         left_dist = 0;
@@ -3042,7 +3385,8 @@ void build_edge_band_l1_impl(
 
 py::array build_four_connected_edge_band_native(
     const py::array& labels,
-    std::uint32_t radius
+    std::uint32_t radius,
+    bool include_zero = false
 ) {
     validate_array(labels, py::dtype::of<std::uint32_t>(), "mapped_regions");
     const auto height = static_cast<std::uint32_t>(labels.shape(0));
@@ -3084,15 +3428,17 @@ py::array build_four_connected_edge_band_native(
                     for (std::uint32_t col = 0; col < width; ++col) {
                         const std::uint64_t pixel = row_offset + col;
                         const std::uint32_t region = regions[pixel];
-                        result[pixel] = is_region(region) && (
-                            (row != 0 && is_region(regions[pixel - width]) &&
-                             region != regions[pixel - width]) ||
-                            (row + 1 < height && is_region(regions[pixel + width]) &&
-                             region != regions[pixel + width]) ||
-                            (col != 0 && is_region(regions[pixel - 1]) &&
-                             region != regions[pixel - 1]) ||
-                            (col + 1 < width && is_region(regions[pixel + 1]) &&
-                             region != regions[pixel + 1])
+                        result[pixel] = (include_zero && region == 0) || (
+                            is_region(region) && (
+                                (row != 0 && is_region(regions[pixel - width]) &&
+                                 region != regions[pixel - width]) ||
+                                (row + 1 < height && is_region(regions[pixel + width]) &&
+                                 region != regions[pixel + width]) ||
+                                (col != 0 && is_region(regions[pixel - 1]) &&
+                                 region != regions[pixel - 1]) ||
+                                (col + 1 < width && is_region(regions[pixel + 1]) &&
+                                 region != regions[pixel + 1])
+                            )
                         );
                     }
                 }
@@ -3106,11 +3452,11 @@ py::array build_four_connected_edge_band_native(
             );
             if (effective_radius < 65534U) {
                 build_edge_band_l1_impl<std::uint16_t>(
-                    regions, result, height, width, effective_radius, hardware_workers
+                    regions, result, height, width, effective_radius, hardware_workers, include_zero
                 );
             } else {
                 build_edge_band_l1_impl<std::uint32_t>(
-                    regions, result, height, width, effective_radius, hardware_workers
+                    regions, result, height, width, effective_radius, hardware_workers, include_zero
                 );
             }
         }
@@ -3272,10 +3618,13 @@ bool cross_dilate_contains_pixel(
         (column + 1 < width && input[pixel + 1] != 0);
 }
 
-py::array build_sparse_region_seeds_native(
+py::array build_sparse_region_seeds_impl(
     const py::array& region_map,
     const py::array& band_mask,
-    std::uint32_t radius
+    std::uint32_t radius,
+    const std::uint8_t* stable_initial_values,
+    const std::uint8_t* stable_surface_values,
+    std::uint64_t stable_surface_count
 ) {
     validate_array(region_map, py::dtype::of<std::uint32_t>(), "mapped_regions");
     validate_array(band_mask, py::dtype::of<bool>(), "edge_band");
@@ -3298,19 +3647,33 @@ py::array build_sparse_region_seeds_native(
     const auto* band = static_cast<const std::uint8_t*>(band_mask.data());
     py::array_t<std::uint32_t> output({height, width});
     auto* seeds = output.mutable_data();
-    std::vector<std::uint8_t> visited(sample_count, 0);
-    std::uint32_t band_count = 0;
-    for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
-        band_count += band[pixel] != 0;
-    }
-    std::vector<std::uint32_t> queue(band_count);
-    std::vector<std::uint8_t> current(sample_count, 0);
-    std::vector<std::uint8_t> eroded(sample_count, 0);
+    const bool filter_stable = stable_surface_values != nullptr;
     {
         py::gil_scoped_release release;
+        std::vector<std::uint8_t> visited(sample_count, 0);
+        std::uint32_t band_count = 0;
         for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
-            seeds[pixel] = band[pixel] != 0 ? 0 : regions[pixel];
+            const std::uint32_t reg = regions[pixel];
+            if (band[pixel] != 0) {
+                ++band_count;
+                seeds[pixel] = 0;
+            } else if (filter_stable) {
+                if (static_cast<std::uint64_t>(reg) >= stable_surface_count) {
+                    throw std::invalid_argument(
+                        "sparse seed region exceeds stable_surfaces"
+                    );
+                }
+                seeds[pixel] =
+                    (stable_initial_values[pixel] != 0 && stable_surface_values[reg] != 0)
+                        ? reg
+                        : 0U;
+            } else {
+                seeds[pixel] = reg;
+            }
         }
+        std::vector<std::uint32_t> queue(band_count);
+        std::vector<std::uint8_t> current(sample_count, 0);
+        std::vector<std::uint8_t> eroded(sample_count, 0);
         const auto is_region = [](std::uint32_t value) {
             return value != 0 && value != kUint32Max;
         };
@@ -3319,6 +3682,17 @@ py::array build_sparse_region_seeds_native(
             if (band[start] == 0 || visited[start] != 0 || !is_region(region)) {
                 continue;
             }
+            if (filter_stable) {
+                if (static_cast<std::uint64_t>(region) >= stable_surface_count) {
+                    throw std::invalid_argument(
+                        "sparse seed region exceeds stable_surfaces"
+                    );
+                }
+                if (stable_surface_values[region] == 0) {
+                    visited[start] = 1;
+                    continue;
+                }
+            }
             std::uint32_t head = 0;
             std::uint32_t tail = 1;
             queue[0] = start;
@@ -3326,7 +3700,7 @@ py::array build_sparse_region_seeds_native(
             while (head < tail) {
                 const std::uint32_t pixel = queue[head++];
                 const std::uint32_t row = pixel / width;
-                const std::uint32_t column = pixel % width;
+                const std::uint32_t column = pixel - row * width;
                 const auto enqueue = [&](std::uint32_t neighbour) {
                     if (
                         band[neighbour] == 0 ||
@@ -3376,7 +3750,9 @@ py::array build_sparse_region_seeds_native(
                     if (current[pixel] == 0) {
                         continue;
                     }
-                    seeds[pixel] = region;
+                    seeds[pixel] = (!filter_stable || stable_initial_values[pixel] != 0)
+                        ? region
+                        : 0U;
                     selected_any = true;
                 }
             } else {
@@ -3406,7 +3782,9 @@ py::array build_sparse_region_seeds_native(
                                 width
                             )
                         ) {
-                            seeds[pixel] = region;
+                            seeds[pixel] = (!filter_stable || stable_initial_values[pixel] != 0)
+                                ? region
+                                : 0U;
                             selected_any = true;
                         }
                     }
@@ -3416,7 +3794,9 @@ py::array build_sparse_region_seeds_native(
             }
 
             if (!selected_any) {
-                seeds[start] = region;
+                seeds[start] = (!filter_stable || stable_initial_values[start] != 0)
+                    ? region
+                    : 0U;
             }
             for (std::uint32_t index = 0; index < tail; ++index) {
                 const std::uint32_t pixel = queue[index];
@@ -3426,6 +3806,14 @@ py::array build_sparse_region_seeds_native(
         }
     }
     return output;
+}
+
+py::array build_sparse_region_seeds_native(
+    const py::array& region_map,
+    const py::array& band_mask,
+    std::uint32_t radius
+) {
+    return build_sparse_region_seeds_impl(region_map, band_mask, radius, nullptr, nullptr, 0);
 }
 
 py::array build_sparse_stable_region_seeds_native(
@@ -3446,37 +3834,14 @@ py::array build_sparse_stable_region_seeds_native(
     if (stable_surfaces.shape(0) == 0) {
         throw py::value_error("stable_surfaces must contain the zero region");
     }
-    py::array output = build_sparse_region_seeds_native(
+    return build_sparse_region_seeds_impl(
         region_map,
         band_mask,
-        radius
+        radius,
+        static_cast<const std::uint8_t*>(stable_initial.data()),
+        static_cast<const std::uint8_t*>(stable_surfaces.data()),
+        static_cast<std::uint64_t>(stable_surfaces.shape(0))
     );
-    auto* seeds = static_cast<std::uint32_t*>(output.mutable_data());
-    const auto* stable_initial_values =
-        static_cast<const std::uint8_t*>(stable_initial.data());
-    const auto* stable_surface_values =
-        static_cast<const std::uint8_t*>(stable_surfaces.data());
-    const auto stable_surface_count =
-        static_cast<std::uint64_t>(stable_surfaces.shape(0));
-    const auto sample_count = static_cast<std::uint64_t>(region_map.size());
-    {
-        py::gil_scoped_release release;
-        for (std::uint64_t pixel = 0; pixel < sample_count; ++pixel) {
-            const std::uint32_t region = seeds[pixel];
-            if (static_cast<std::uint64_t>(region) >= stable_surface_count) {
-                throw std::invalid_argument(
-                    "sparse seed region exceeds stable_surfaces"
-                );
-            }
-            if (
-                stable_initial_values[pixel] == 0 ||
-                stable_surface_values[region] == 0
-            ) {
-                seeds[pixel] = 0;
-            }
-        }
-    }
-    return output;
 }
 
 std::pair<std::uint32_t, std::uint32_t> validate_background_proxy_layout(
@@ -3805,9 +4170,188 @@ py::array composite_background_proxy_native(
     return output;
 }
 
+py::array inpaint_background_proxy_wavefront_native(
+    py::array proxy_source,
+    const py::array& mask,
+    std::uint32_t first_row,
+    std::uint32_t end_row,
+    std::uint32_t first_col,
+    std::uint32_t end_col
+) {
+    const auto [height, width] = validate_background_proxy_layout(proxy_source, mask);
+    if (!proxy_source.writeable()) {
+        throw py::value_error("proxy_source must be writeable");
+    }
+    if (end_row <= first_row || end_col <= first_col) {
+        return proxy_source;
+    }
+    first_row = std::min(first_row, height);
+    end_row = std::min(end_row, height);
+    first_col = std::min(first_col, width);
+    end_col = std::min(end_col, width);
+    if (end_row <= first_row || end_col <= first_col) {
+        return proxy_source;
+    }
+
+    auto* img = static_cast<std::uint8_t*>(proxy_source.mutable_data());
+    const auto* msk = static_cast<const std::uint8_t*>(mask.data());
+    {
+        py::gil_scoped_release release;
+        const std::uint32_t y0 = first_row > 0U ? first_row - 1U : 0U;
+        const std::uint32_t y1 = std::min(height, end_row + 1U);
+        const std::uint32_t x0 = first_col > 0U ? first_col - 1U : 0U;
+        const std::uint32_t x1 = std::min(width, end_col + 1U);
+        const std::uint32_t rh = y1 - y0;
+        const std::uint32_t rw = x1 - x0;
+        const std::size_t roi_size = static_cast<std::size_t>(rh) * rw;
+
+        // 0 = unknown masked, 1 = queued in frontier, 2 = known valid/filled
+        constexpr std::size_t kThreadLocalRoiCap = 2500000U;
+        thread_local std::vector<std::uint8_t> tl_state;
+        std::vector<std::uint8_t> local_state;
+        std::uint8_t* state = nullptr;
+        if (roi_size <= kThreadLocalRoiCap) {
+            if (tl_state.size() < roi_size) {
+                tl_state.resize(roi_size);
+            }
+            state = tl_state.data();
+        } else {
+            local_state.resize(roi_size);
+            state = local_state.data();
+        }
+
+        thread_local std::vector<std::uint32_t> tl_frontier;
+        thread_local std::vector<std::uint32_t> tl_next_frontier;
+        thread_local std::vector<std::uint8_t> tl_layer_rgb;
+        tl_frontier.clear();
+        tl_next_frontier.clear();
+
+        // Populate state for ROI and detect initial 4-connected boundary frontier.
+        for (std::uint32_t r = 0; r < rh; ++r) {
+            const std::uint64_t g_row = static_cast<std::uint64_t>(y0 + r) * width + x0;
+            std::uint8_t* s_row = state + static_cast<std::size_t>(r) * rw;
+            const std::uint8_t* m_row = msk + g_row;
+            for (std::uint32_t c = 0; c < rw; ++c) {
+                s_row[c] = (m_row[c] == 0U) ? 2U : 0U;
+            }
+        }
+        const std::uint32_t r_begin = first_row - y0;
+        const std::uint32_t r_end = end_row - y0;
+        const std::uint32_t c_begin = first_col - x0;
+        const std::uint32_t c_end = end_col - x0;
+        for (std::uint32_t r = r_begin; r < r_end; ++r) {
+            const std::size_t ro = static_cast<std::size_t>(r) * rw;
+            for (std::uint32_t c = c_begin; c < c_end; ++c) {
+                const std::size_t idx = ro + c;
+                if (state[idx] != 0U) {
+                    continue;
+                }
+                const bool has_known_nb =
+                    (r > 0 && state[idx - rw] == 2U) ||
+                    (r + 1 < rh && state[idx + rw] == 2U) ||
+                    (c > 0 && state[idx - 1] == 2U) ||
+                    (c + 1 < rw && state[idx + 1] == 2U);
+                if (has_known_nb) {
+                    state[idx] = 1U;
+                    tl_frontier.push_back(static_cast<std::uint32_t>(idx));
+                }
+            }
+        }
+
+        // Exact isotropic octagonal wavefront BFS (alternating 4/8 expansion + 3x3 weighted avg).
+        std::uint32_t step = 0;
+        while (!tl_frontier.empty()) {
+            const std::size_t fcount = tl_frontier.size();
+            tl_layer_rgb.resize(fcount * 3U);
+            const bool expand_diag = (step & 1U) != 0U;
+            tl_next_frontier.clear();
+
+            for (std::size_t i = 0; i < fcount; ++i) {
+                const std::uint32_t idx = tl_frontier[i];
+                const std::uint32_t r = idx / rw;
+                const std::uint32_t c = idx - r * rw;
+                const std::uint32_t gy = y0 + r;
+                const std::uint32_t gx = x0 + c;
+                const std::uint64_t gp = static_cast<std::uint64_t>(gy) * width + gx;
+                std::uint32_t s0 = 0, s1 = 0, s2 = 0, wsum = 0;
+
+                const auto accum = [&](std::size_t nb_idx, std::uint64_t nb_gp, std::uint32_t w) {
+                    if (state[nb_idx] == 2U) {
+                        const std::uint8_t* p = img + nb_gp * 3ULL;
+                        s0 += p[0] * w;
+                        s1 += p[1] * w;
+                        s2 += p[2] * w;
+                        wsum += w;
+                    }
+                };
+                const bool has_up = r > 0;
+                const bool has_dn = r + 1 < rh;
+                const bool has_lt = c > 0;
+                const bool has_rt = c + 1 < rw;
+
+                if (has_up) accum(idx - rw, gp - width, 2U);
+                if (has_dn) accum(idx + rw, gp + width, 2U);
+                if (has_lt) accum(idx - 1, gp - 1, 2U);
+                if (has_rt) accum(idx + 1, gp + 1, 2U);
+                if (has_up && has_lt) accum(idx - rw - 1, gp - width - 1, 1U);
+                if (has_up && has_rt) accum(idx - rw + 1, gp - width + 1, 1U);
+                if (has_dn && has_lt) accum(idx + rw - 1, gp + width - 1, 1U);
+                if (has_dn && has_rt) accum(idx + rw + 1, gp + width + 1, 1U);
+
+                if (wsum != 0U) {
+                    const std::uint32_t half = wsum >> 1U;
+                    tl_layer_rgb[i * 3U] = static_cast<std::uint8_t>((s0 + half) / wsum);
+                    tl_layer_rgb[i * 3U + 1U] = static_cast<std::uint8_t>((s1 + half) / wsum);
+                    tl_layer_rgb[i * 3U + 2U] = static_cast<std::uint8_t>((s2 + half) / wsum);
+                } else {
+                    const std::uint8_t* p = img + gp * 3ULL;
+                    tl_layer_rgb[i * 3U] = p[0];
+                    tl_layer_rgb[i * 3U + 1U] = p[1];
+                    tl_layer_rgb[i * 3U + 2U] = p[2];
+                }
+
+                const auto try_push = [&](std::size_t nb_idx) {
+                    if (state[nb_idx] == 0U) {
+                        state[nb_idx] = 1U;
+                        tl_next_frontier.push_back(static_cast<std::uint32_t>(nb_idx));
+                    }
+                };
+                if (has_up) try_push(idx - rw);
+                if (has_dn) try_push(idx + rw);
+                if (has_lt) try_push(idx - 1);
+                if (has_rt) try_push(idx + 1);
+                if (expand_diag) {
+                    if (has_up && has_lt) try_push(idx - rw - 1);
+                    if (has_up && has_rt) try_push(idx - rw + 1);
+                    if (has_dn && has_lt) try_push(idx + rw - 1);
+                    if (has_dn && has_rt) try_push(idx + rw + 1);
+                }
+            }
+
+            // Commit entire wavefront simultaneously so propagation is strictly isotropic.
+            for (std::size_t i = 0; i < fcount; ++i) {
+                const std::uint32_t idx = tl_frontier[i];
+                const std::uint32_t r = idx / rw;
+                const std::uint32_t c = idx - r * rw;
+                const std::uint64_t gp =
+                    static_cast<std::uint64_t>(y0 + r) * width + (x0 + c);
+                std::uint8_t* dst = img + gp * 3ULL;
+                dst[0] = tl_layer_rgb[i * 3U];
+                dst[1] = tl_layer_rgb[i * 3U + 1U];
+                dst[2] = tl_layer_rgb[i * 3U + 2U];
+                state[idx] = 2U;
+            }
+            tl_frontier.swap(tl_next_frontier);
+            ++step;
+        }
+    }
+    return proxy_source;
+}
+
 struct ForegroundMatteWinner {
     std::uint64_t destination;
     double total_disparity_fraction;
+    double displacement;
     float near_score;
     std::uint32_t region;
     bool source_valid;
@@ -3855,7 +4399,8 @@ py::array expand_foreground_matte_one_pixel_native(
     py::array final_region_map,
     py::array one_eye_displacement_px,
     const py::object& metric_valid_object,
-    const py::object& candidate_mask_object
+    const py::object& candidate_mask_object,
+    bool update_displacement = false
 ) {
     validate_array(near_score, py::dtype::of<float>(), "near_score");
     validate_array(
@@ -4022,6 +4567,7 @@ py::array expand_foreground_matte_one_pixel_native(
                 winners.push_back(ForegroundMatteWinner{
                     pixel,
                     total_values[source],
+                    displacement_values[source],
                     near_values[source],
                     region_values[source],
                     source_valid_values[source],
@@ -4033,6 +4579,9 @@ py::array expand_foreground_matte_one_pixel_native(
             for (const ForegroundMatteWinner& value : winners) {
                 near_values[value.destination] = value.near_score;
                 total_values[value.destination] = value.total_disparity_fraction;
+                if (update_displacement) {
+                    displacement_values[value.destination] = value.displacement;
+                }
                 source_valid_values[value.destination] = value.source_valid;
                 region_values[value.destination] = value.region;
                 if (metric_valid_values != nullptr) {
@@ -4054,6 +4603,15 @@ py::array expand_foreground_matte_one_pixel_native(
                 sample_count,
                 width
             );
+            if (update_displacement) {
+                copy_foreground_matte_winners(
+                    displacement_values,
+                    expanded,
+                    winner.data(),
+                    sample_count,
+                    width
+                );
+            }
             copy_foreground_matte_winners(
                 source_valid_values,
                 expanded,
@@ -4475,6 +5033,16 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("movement_edge_scale") = 8
     );
     module.def(
+        "solve_geodesic_regions_owner_only",
+        &solve_geodesic_regions_owner_only,
+        py::arg("guide"),
+        py::arg("band_mask"),
+        py::arg("seed_region_map"),
+        py::arg("region_rank_bits"),
+        py::arg("movement_base_cost") = 256,
+        py::arg("movement_edge_scale") = 8
+    );
+    module.def(
         "accumulate_lane_hole_run_histograms_into",
         &accumulate_lane_hole_run_histograms_into_native,
         py::arg("lane_valid"),
@@ -4559,7 +5127,8 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         "build_four_connected_edge_band",
         &build_four_connected_edge_band_native,
         py::arg("mapped_regions"),
-        py::arg("radius")
+        py::arg("radius"),
+        py::arg("include_zero") = false
     );
     module.def(
         "label_region_fragments",
@@ -4605,6 +5174,16 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("proxy")
     );
     module.def(
+        "inpaint_background_proxy_wavefront",
+        &inpaint_background_proxy_wavefront_native,
+        py::arg("proxy_source"),
+        py::arg("mask"),
+        py::arg("first_row"),
+        py::arg("end_row"),
+        py::arg("first_col"),
+        py::arg("end_col")
+    );
+    module.def(
         "expand_foreground_matte_one_pixel",
         &expand_foreground_matte_one_pixel_native,
         py::arg("near_score"),
@@ -4613,7 +5192,8 @@ PYBIND11_MODULE(_quality_kd_native, module) {
         py::arg("final_region_map"),
         py::arg("one_eye_displacement_px"),
         py::arg("metric_valid") = py::none(),
-        py::arg("candidate_mask") = py::none()
+        py::arg("candidate_mask") = py::none(),
+        py::arg("update_displacement") = false
     );
     module.def(
         "collect_one_sided_queries",
