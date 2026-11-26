@@ -956,7 +956,7 @@ def test_quality_public_budget_rejects_before_materializing_broadcast_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
-    content_manifest = importlib.import_module("src.depth_surge_3d.io.content_manifest")
+    resource_errors = importlib.import_module("src.depth_surge_3d.core.resource_errors")
     frame = np.broadcast_to(np.zeros((1, 1, 3), dtype=np.uint8), (10_000, 10_000, 3))
     canonical = np.zeros((1, 1), dtype=np.float32)
     monkeypatch.setattr(
@@ -967,7 +967,7 @@ def test_quality_public_budget_rejects_before_materializing_broadcast_input(
         ),
     )
 
-    with pytest.raises(content_manifest.QualityHostBudgetError, match="quality-public"):
+    with pytest.raises(resource_errors.QualityHostBudgetError, match="quality-public"):
         quality.render_relative_quality_public(
             renderer=StereoRenderer(device="cpu"),
             frame=frame,

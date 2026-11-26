@@ -1,47 +1,26 @@
 """
 Video processor with temporal consistency.
 
-This module implements video processing using Video-Depth-Anything
-for temporal consistency across video frames.
-
-REFACTORED: This is now a thin orchestrator that delegates to specialized
-processor modules for improved maintainability and testability.
+Thin orchestrator that delegates to specialized processor modules.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import Any, Callable
 
 from ...io.job_lock import JobWriterLock
 from ..frames.depth_processor import DepthMapProcessor
-from ..frames.stereo_generator import StereoPairGenerator
 from ..frames.distortion_processor import DistortionProcessor
 from ..frames.frame_upscaler import FrameUpscalerProcessor
+from ..frames.stereo_generator import StereoPairGenerator
 from ..frames.vr_assembler import VRFrameAssembler
 from ..video.video_encoder import VideoEncoder
 from .pipeline_orchestrator import ProcessingOrchestrator
 
-if TYPE_CHECKING:
-    from ...io.resume import LegacyFastAdoptionV1
-
 
 class VideoProcessor:
-    """
-    Handles video processing with temporal consistency.
-
-    Uses Video-Depth-Anything model to process entire videos with
-    temporal consistency for superior depth estimation quality.
-
-    This is a thin orchestrator that delegates to specialized processors:
-    - DepthMapProcessor: Depth map generation with caching
-    - StereoPairGenerator: Stereo pair creation
-    - DistortionProcessor: Fisheye distortion and cropping
-    - FrameUpscalerProcessor: AI upscaling
-    - VRFrameAssembler: VR frame assembly
-    - VideoEncoder: Video encoding with FFmpeg
-    - ProcessingOrchestrator: Pipeline coordination
-    """
+    """Thin orchestrator delegating to specialized video processing stages."""
 
     def __init__(
         self,
@@ -51,23 +30,13 @@ class VideoProcessor:
         temporal_stabilizer: Any | None = None,
         preselected_depth_files: list[Path] | None = None,
         preselected_render_source: str | None = None,
-        legacy_fast_adoption: LegacyFastAdoptionV1 | None = None,
-    ):
-        """
-        Initialize video processor with specialized modules.
-
-        Args:
-            depth_estimator: Depth estimation model instance (VideoDepthEstimator or VideoDepthEstimatorDA3)
-            verbose: Enable verbose output
-            release_depth_model: Callback that unloads the owning depth model
-            temporal_stabilizer: Optional file-backed VDPP stage coordinator
-        """
+        **_ignored: object,
+    ) -> None:
         self.depth_estimator = depth_estimator
         self.verbose = verbose
         if release_depth_model is None and depth_estimator is not None:
             release_depth_model = depth_estimator.unload_model
 
-        # Initialize specialized processor modules
         self.depth_processor = (
             DepthMapProcessor(depth_estimator, verbose=verbose)
             if depth_estimator is not None
@@ -79,7 +48,6 @@ class VideoProcessor:
         self.vr_assembler = VRFrameAssembler(verbose=verbose)
         self.video_encoder = VideoEncoder(verbose=verbose)
 
-        # Initialize pipeline orchestrator with all processors
         self.orchestrator = ProcessingOrchestrator(
             depth_processor=self.depth_processor,
             stereo_generator=self.stereo_generator,
@@ -92,7 +60,6 @@ class VideoProcessor:
             temporal_stabilizer=temporal_stabilizer,
             preselected_depth_files=preselected_depth_files,
             preselected_render_source=preselected_render_source,
-            legacy_fast_adoption=legacy_fast_adoption,
         )
 
     def process(
@@ -101,27 +68,9 @@ class VideoProcessor:
         output_dir: str,
         video_properties: dict[str, Any],
         settings: dict[str, Any],
-        progress_callback=None,
+        progress_callback: Any = None,
         job_lock: JobWriterLock | None = None,
     ) -> bool:
-        """
-        Process video in batch mode with temporal consistency.
-
-        Args:
-            video_path: Path to input video
-            output_dir: Output directory path
-            video_properties: Video metadata (frame_count, fps, etc.)
-            settings: Processing settings
-            progress_callback: Optional progress callback for web UI
-
-        Returns:
-            True if processing completed successfully
-
-        Side effects:
-            - Delegates to ProcessingOrchestrator which executes full pipeline
-            - Creates output directory structure
-            - Generates intermediate and final output files
-        """
         return self.orchestrator.process(
             Path(video_path),
             Path(output_dir),

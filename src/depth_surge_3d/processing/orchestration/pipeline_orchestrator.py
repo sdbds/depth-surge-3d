@@ -8,98 +8,61 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, cast
+from typing import Any, Callable, cast
 
+from ...core.render_disparity import validate_render_disparity_input
+from ...io.job_lock import JobWriterLock
 from ...io.operations import (
     cleanup_intermediate_files,
     commit_cleanup_pending_status,
     create_output_directories,
-    save_processing_settings,
+    load_processing_settings,
     prepare_processing_settings_artifact,
     recover_processing_control_prefix_v1,
     recover_processing_settings_artifact,
-    load_processing_settings,
+    save_processing_settings,
     update_processing_status,
 )
-from ...io.job_lock import JobWriterLock
-from ...io.reservation_protocol import ReservationIncompleteError
-from ...vdpp_work import cleanup_vdpp_private_work
-from ...core.render_disparity import validate_render_disparity_input
-from ..frames.stereo_input_manifest import (
-    StereoInputManifestV1,
-    publish_validated_stereo_input_manifest_v1,
-)
-from ..frames.stereo_control import StereoPipelineCapacityError
 from ...rendering.quality.cleanup_transaction import (
     cleanup_status_for_error,
     commit_payload_pruned,
     run_authorized_cleanup,
 )
-from ...rendering.quality.diagnostic_transaction import (
-    StreamingDiagnosticsStageContext,
-    project_diagnostics_metadata,
-    publish_legacy_fast_unavailable,
-)
-from ..video.final_publication import (
-    FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
-    FinalEncodingReservationCapabilityV1,
-    audit_final_media_v1,
-    load_final_encoding_reservation_v1,
+from ...utils import (
+    completion_banner,
+    create_vr_frame,
+    saved_to,
+    step_complete,
+    title_bar,
 )
 from ...utils.path_utils import generate_output_filename
-from ...utils import (
-    create_vr_frame,
-    step_complete,
-    saved_to,
-    title_bar,
-    completion_banner,
+from ...vdpp_work import cleanup_vdpp_private_work
+from ..frames.stereo_control import StereoPipelineCapacityError
+from ..frames.stereo_input_manifest import (
+    StereoInputManifestV1,
+    publish_validated_stereo_input_manifest_v1,
 )
-
-if TYPE_CHECKING:
-    from ...io.resume import LegacyFastAdoptionV1
+from ..video.final_container_validation import verify_existing_final_video
 
 
 class ProcessingOrchestrator:
-    """
-    High-level pipeline control and step sequencing.
-
-    Responsibilities:
-    - Pipeline execution flow
-    - Step sequencing
-    - Progress tracking coordination
-    - Error handling
-    - Settings management
-    - Console output formatting
-    """
+    """High-level pipeline control and step sequencing."""
 
     def __init__(
         self,
-        depth_processor,
-        stereo_generator,
-        distortion_processor,
-        upscaler,
-        vr_assembler,
-        video_encoder,
+        depth_processor: Any,
+        stereo_generator: Any,
+        distortion_processor: Any,
+        upscaler: Any,
+        vr_assembler: Any,
+        video_encoder: Any,
         verbose: bool = False,
         release_depth_model: Callable[[], None] | None = None,
-        temporal_stabilizer=None,
+        temporal_stabilizer: Any = None,
         preselected_depth_files: list[Path] | None = None,
         preselected_render_source: str | None = None,
-        legacy_fast_adoption: LegacyFastAdoptionV1 | None = None,
-    ):
-        """
-        Initialize processing orchestrator.
-
-        Args:
-            depth_processor: DepthMapProcessor instance
-            stereo_generator: StereoPairGenerator instance
-            distortion_processor: DistortionProcessor instance
-            upscaler: FrameUpscalerProcessor instance
-            vr_assembler: VRFrameAssembler instance
-            video_encoder: VideoEncoder instance
-            verbose: Enable verbose output
-            release_depth_model: Callback that unloads the depth model
-        """
+        **_ignored: object,
+    ) -> None:
         self.depth_processor = depth_processor
         self.stereo_generator = stereo_generator
         self.distortion_processor = distortion_processor
@@ -109,11 +72,8 @@ class ProcessingOrchestrator:
         self.verbose = verbose
         self._release_depth_model_callback = release_depth_model
         self.temporal_stabilizer = temporal_stabilizer
-        # Ownership is transferred by the caller.  Do not retain a second O(N)
-        # path graph across the schema-5 stereo phase boundary.
         self.preselected_depth_files = preselected_depth_files
         self.preselected_render_source = preselected_render_source
-        self.legacy_fast_adoption = legacy_fast_adoption
         if (self.preselected_depth_files is None) != (preselected_render_source is None):
             raise ValueError("preselected files and render source must be supplied together")
         if preselected_render_source is not None and preselected_render_source not in {
@@ -122,39 +82,20 @@ class ProcessingOrchestrator:
         }:
             raise ValueError("preselected render source must be base or stabilized")
         self._depth_model_released = False
-        self._settings_file: Path | None = None  # Track settings file for error handling
-        self._start_time: float = 0.0  # Monotonic processing start time
+        self._settings_file: Path | None = None
+        self._start_time: float = 0.0
         self.process_elapsed_seconds: float | None = None
         self._metric_clamp_summary: dict[str, Any] | None = None
-        if hasattr(self.video_encoder, "defer_final_reservation_retirement"):
-            self.video_encoder.defer_final_reservation_retirement = True
-
-    def _retire_final_encoding_reservation(self, *, success: bool) -> bool:
-        return self._retire_encoder_reservation(self.video_encoder, success=success)
 
     @staticmethod
-    def _retire_encoder_reservation(video_encoder, *, success: bool) -> bool:
-        retire = getattr(video_encoder, "retire_final_encoding_reservation", None)
-        if not callable(retire):
-            return True
-        try:
-            retire(success=success)
-            return True
-        except Exception as error:
-            print(f"Error: Could not retire final encoding reservation: {error}")
-            return False
+    def finish_publication_only(  # noqa: C901
+        output_dir: Path, video_encoder: Any = None
+    ) -> bool | None:
+        """Finish cleanup if a previous run already published a valid final video."""
 
-    def _resume_cleanup_only(self, output_dir: Path) -> bool | None:
-        outcome = self.finish_publication_only(output_dir, self.video_encoder)
-        if outcome is not None:
-            self._settings_file = Path(output_dir) / "processing-settings-v5.json"
-        return outcome
-
-    @staticmethod
-    def finish_publication_only(output_dir: Path, video_encoder) -> bool | None:  # noqa: C901
-        """Under the job writer lock, finish proven media without starting a model or encoder."""
-
-        settings_file = Path(output_dir) / "processing-settings-v5.json"
+        _ = video_encoder
+        root = Path(output_dir)
+        settings_file = root / "processing-settings-v5.json"
         if not settings_file.is_file():
             return None
         try:
@@ -165,128 +106,33 @@ class ProcessingOrchestrator:
         if artifact.status != "in_progress":
             return None
         value = artifact.to_object()
-        cleanup_pending = value["metadata"]["cleanup_status"] == "pending"
-        keep_intermediates = bool(value["processing_settings"]["keep_intermediates"])
-        frame_count = artifact.selected_frame_count
-        metric_summary_value = value["runtime_info"].get("metric_clamp_summary")
-        metric_summary = (
-            dict(metric_summary_value) if isinstance(metric_summary_value, dict) else None
-        )
-        del metric_summary_value, value, artifact
-        reservation: FinalEncodingReservationCapabilityV1 | None = None
-        publication_authenticated = False
-        active_index = Path(output_dir) / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
-        if active_index.is_file():
-            try:
-                phase_artifact = recover_processing_settings_artifact(settings_file)
-                prepared = load_final_encoding_reservation_v1(output_dir, phase_artifact)
-                if prepared.requires_explicit_streamed_recovery():
-                    resume_stream = getattr(video_encoder, "resume_streamed_publication", None)
-                    if not callable(resume_stream):
-                        return None
-                    recovered = resume_stream(output_dir, phase_artifact)
-                    if recovered is not True:
-                        return recovered
-                    phase_artifact = recover_processing_settings_artifact(settings_file)
-                    prepared = load_final_encoding_reservation_v1(output_dir, phase_artifact)
-                reservation = FinalEncodingReservationCapabilityV1.from_prepared(prepared)
-                recovery = prepared.recover_publication_prefix()
-                recovery_phase = recovery.phase
-                if recovery.action == "require-durable-output-evidence":
-                    print(
-                        "Published video has no durable output evidence; leaving it untouched without re-encoding."
-                    )
-                    return False
-                del recovery, prepared, phase_artifact
-            except Exception as error:
-                print(f"Error: Could not recover active final publication: {error}")
-                return False
-            publication_authenticated = recovery_phase == "publication_authenticated"
-            if publication_authenticated:
-                try:
-                    reservation.validate_authenticated_publication()
-                except Exception as error:
-                    print(f"Error: Active final publication is invalid: {error}")
-                    return False
-                adopt = getattr(video_encoder, "adopt_final_encoding_reservation", None)
-                if not callable(adopt):
-                    print("Error: Video encoder cannot adopt active final publication")
-                    return False
-                adopt(reservation)
-        metadata_path = Path(output_dir) / "04_stereo_diagnostics" / "metadata.json"
-        payload_pruned = False
-        try:
-            diagnostics_projection = project_diagnostics_metadata(
-                metadata_path
-            ).validate_state_contract()
-            payload_pruned = diagnostics_projection.status == "payload_pruned"
-        except (OSError, ValueError):
-            payload_pruned = False
-        if (cleanup_pending or payload_pruned) and reservation is None:
-            print("Error: Cleanup-only recovery requires the active final encoding reservation")
-            return False
-        if not cleanup_pending and not payload_pruned and not publication_authenticated:
+        if value["metadata"].get("cleanup_status") != "pending":
             return None
-        if not publication_authenticated:
-            print("Error: Cleanup-only recovery lacks an authenticated active publication")
-            return False
-        if keep_intermediates:
-            cleanup_status = "not_requested"
-        else:
-            if not payload_pruned:
-                try:
-                    commit_payload_pruned(output_dir, reservation=reservation)
-                except Exception as error:
-                    print(f"Error: Could not commit payload-pruned diagnostics: {error}")
-                    return False
-            if not cleanup_pending:
-                try:
-                    commit_cleanup_pending_status(
-                        settings_file,
-                        reservation=reservation,
-                    )
-                except Exception as error:
-                    print(f"Error: Could not commit cleanup-pending settings: {error}")
-                    return False
+        rel_final = value["output_info"].get("expected_final_relative_path")
+        if not isinstance(rel_final, str) or not verify_existing_final_video(root / rel_final):
+            return None
+
+        keep_intermediates = bool(value["processing_settings"]["keep_intermediates"])
+        cleanup_status = "not_requested"
+        if not keep_intermediates:
             try:
-                removed_count = run_authorized_cleanup(output_dir)
-            except Exception as error:
-                cleanup_status = cleanup_status_for_error(error)
-                print(
-                    "Warning: Intermediate cleanup remains pending " f"({cleanup_status}): {error}"
-                )
-                return False
-            else:
+                commit_payload_pruned(root)
+                removed_count = run_authorized_cleanup(root)
                 cleanup_status = "complete"
                 print(f"Removed {removed_count} temporary processing files")
+            except Exception as error:
+                cleanup_status = cleanup_status_for_error(error)
+                print(f"Warning: Intermediate cleanup remains pending ({cleanup_status}): {error}")
+                return False
+
         info: dict[str, Any] = {
-            "frames_processed": frame_count,
+            "frames_processed": artifact.selected_frame_count,
             "cleanup_status": cleanup_status,
         }
-        if metric_summary is not None:
-            info["metric_clamp_summary"] = metric_summary
-        if not update_processing_status(settings_file, "completed", info):
-            print("Error: Could not commit terminal settings after cleanup")
-            return False
-        try:
-            recover_processing_settings_artifact(settings_file)
-        except Exception as error:
-            print(f"Error: Could not retire cleanup reservation: {error}")
-            return False
-        if reservation is not None and not ProcessingOrchestrator._retire_encoder_reservation(
-            video_encoder, success=True
-        ):
-            return False
-        try:
-            completed = recover_processing_settings_artifact(settings_file)
-            audit = audit_final_media_v1(output_dir, completed)
-        except Exception as error:
-            print(f"Error: Completed final-media audit failed: {error}")
-            return False
-        if not audit.final_video_authenticated:
-            print("Error: Completed final media is not authenticated")
-            return False
-        return True
+        metric_summary = value.get("runtime_info", {}).get("metric_clamp_summary")
+        if isinstance(metric_summary, dict):
+            info["metric_clamp_summary"] = dict(metric_summary)
+        return update_processing_status(settings_file, "completed", info)
 
     def process(
         self,
@@ -294,87 +140,43 @@ class ProcessingOrchestrator:
         output_dir: Path,
         video_properties: dict[str, Any],
         settings: dict[str, Any],
-        progress_tracker=None,
+        progress_tracker: Any = None,
         job_lock: JobWriterLock | None = None,
     ) -> bool:
-        """
-        Main processing pipeline entry point.
+        """Execute the full processing pipeline under the job writer lock."""
 
-        Args:
-            video_path: Input video path
-            output_dir: Output directory
-            video_properties: Video metadata (frame_count, fps, etc.)
-            settings: Processing settings
-            progress_tracker: Optional progress tracker
-
-        Returns:
-            True if successful, False otherwise
-
-        Timing:
-            process_elapsed_seconds measures this invocation, including final audit
-            and model/owned-lock teardown, on success or failure. It excludes caller
-            preparation (including upstream model loading) and prior resume attempts.
-            The completion banner ends at successful finalization, before teardown.
-
-        Side effects:
-            - Console output
-            - Filesystem state management
-            - Delegates to all processor modules
-        """
         self._depth_model_released = False
         self.process_elapsed_seconds = None
         owns_job_lock = job_lock is None
         try:
-            # Start timer
             self._start_time = time.perf_counter()
-
             job_lock = self._acquire_job_lock(output_dir, job_lock)
             recover_processing_control_prefix_v1(output_dir)
             cleanup_vdpp_private_work(output_dir, job_lock)
 
-            cleanup_resume = self._resume_cleanup_only(output_dir)
+            cleanup_resume = self.finish_publication_only(output_dir, self.video_encoder)
             if cleanup_resume is not None:
+                self._settings_file = Path(output_dir) / "processing-settings-v5.json"
                 return cleanup_resume
 
-            # Setup processing environment
             video_properties = dict(video_properties)
             output_path, directories, self._settings_file = self._setup_processing(
                 str(video_path), str(output_dir), settings, video_properties
             )
-
-            if self.legacy_fast_adoption is None:
-                success = self._execute_pipeline(
-                    str(video_path),
-                    output_path,
-                    directories,
-                    video_properties,
-                    settings,
-                    progress_tracker,
-                )
-            else:
-                success = self._execute_legacy_fast_adoption(
-                    str(video_path),
-                    output_path,
-                    directories,
-                    settings,
-                    progress_tracker,
-                )
-
-            return success
-
+            return self._execute_pipeline(
+                str(video_path),
+                output_path,
+                directories,
+                video_properties,
+                settings,
+                progress_tracker,
+            )
         except InterruptedError:
             raise
-        except ReservationIncompleteError as error:
-            print(f"Finalization reservation remains retryable: {error}")
-            return False
-        except Exception as e:
-            print(f"Error in video processing: {e}")
+        except Exception as error:
+            print(f"Error in video processing: {error}")
             if self._settings_file:
-                terminal = update_processing_status(
-                    self._settings_file, "failed", {"error": str(e)}
-                )
-                if terminal:
-                    self._retire_final_encoding_reservation(success=False)
+                update_processing_status(self._settings_file, "failed", {"error": str(error)})
             return False
         finally:
             try:
@@ -397,79 +199,6 @@ class ProcessingOrchestrator:
             raise ValueError("The supplied job writer lock belongs to another output directory")
         return job_lock
 
-    def _execute_legacy_fast_adoption(
-        self,
-        video_path: str,
-        output_path: Path,
-        directories: dict[str, Path],
-        settings: dict[str, Any],
-        progress_tracker=None,
-    ) -> bool:
-        """Authenticate a pre-schema-5 Fast stage and continue after stereo."""
-
-        from ...io.resume import (
-            iter_legacy_fast_frame_names,
-            legacy_fast_metric_projection,
-            revalidate_legacy_fast_adoption_v1,
-        )
-
-        if self._settings_file is None:
-            raise ValueError("legacy Fast adoption requires fixed processing settings")
-        artifact = recover_processing_settings_artifact(self._settings_file)
-        assert self.legacy_fast_adoption is not None
-        adoption = revalidate_legacy_fast_adoption_v1(
-            self.legacy_fast_adoption,
-            artifact,
-            allow_diagnostics_prefix=True,
-        )
-        context = StreamingDiagnosticsStageContext(
-            job_root=adoption.job_root,
-            frame_count=adoption.frame_count,
-            frame_names=lambda: iter_legacy_fast_frame_names(adoption),
-            render_shape=adoption.render_shape,
-            render_mode="fast",
-            geometry_mode=adoption.geometry_mode,
-            occlusion_fill=adoption.occlusion_fill,
-            mask_payloads_enabled=False,
-            rgb_stage_fingerprint=adoption.rgb_stage_fingerprint,
-            source_guide_fingerprint=adoption.source_guide_fingerprint,
-            native_geometry_fingerprint=None,
-            quality_input_manifest_sha256=None,
-            left_rgb_parent=directories.get("left_frames"),
-            right_rgb_parent=directories.get("right_frames"),
-        )
-        metric_projection = legacy_fast_metric_projection(adoption)
-        if metric_projection is not None:
-            self._metric_clamp_summary = {
-                key: metric_projection[key]
-                for key in (
-                    "valid_pixel_count",
-                    "clamped_pixel_count",
-                    "clamped_fraction",
-                    "affected_frame_count",
-                    "mean_clamped_fraction",
-                    "max_clamped_fraction",
-                )
-            }
-        else:
-            self._metric_clamp_summary = None
-        publish_legacy_fast_unavailable(
-            context,
-            adoption,
-            metric_projection=metric_projection,
-            metric_clamp_summary_sha256=adoption.metric_clamp_summary_sha256,
-        )
-        self._release_depth_model()
-        self.preselected_depth_files = None
-        return self._execute_post_stereo_steps(
-            directories,
-            settings,
-            adoption.frame_count,
-            video_path,
-            output_path,
-            progress_tracker,
-        )
-
     def _execute_pipeline(  # noqa: C901
         self,
         video_path: str,
@@ -477,28 +206,8 @@ class ProcessingOrchestrator:
         directories: dict[str, Path],
         video_properties: dict[str, Any],
         settings: dict[str, Any],
-        progress_tracker=None,
+        progress_tracker: Any = None,
     ) -> bool:
-        """
-        Execute complete 8-step pipeline.
-
-        Args:
-            video_path: Input video path
-            output_path: Output directory path
-            directories: Dictionary of processing directories
-            video_properties: Video metadata (frame_count, fps, etc.)
-            settings: Processing settings
-            progress_tracker: Optional progress tracker
-
-        Returns:
-            True if all steps successful, False otherwise
-
-        Side effects:
-            - Executes all pipeline steps
-            - Progress updates
-            - Console output
-        """
-        # Step 1: Extract frames (delegated to video_encoder)
         frame_files = self.video_encoder.extract_frames(
             video_path, directories, video_properties, settings
         )
@@ -506,7 +215,7 @@ class ProcessingOrchestrator:
             return False
         print(step_complete(f"Step 1: Extracted {len(frame_files)} frames"))
         self._print_saved_to(directories.get("frames"), "Extracted frames")
-        print()  # Blank line after step
+        print()
 
         metric_mode = settings.get("stereo_geometry_mode", "relative") == "metric_camera"
         selected_is_stabilized = self.preselected_render_source == "stabilized"
@@ -515,12 +224,8 @@ class ProcessingOrchestrator:
         if metric_mode and settings.get("temporal_postprocessor", "off") != "off":
             raise ValueError("VDPP is available only with relative stereo geometry")
 
-        artifact = None
         if self.preselected_depth_files is not None:
-            artifact = validate_render_disparity_input(
-                self.preselected_depth_files,
-                frame_files,
-            )
+            artifact = validate_render_disparity_input(self.preselected_depth_files, frame_files)
             if artifact.producer != self.preselected_render_source:
                 raise ValueError("Preselected render-disparity producer changed")
             geometry_files = list(self.preselected_depth_files)
@@ -529,7 +234,6 @@ class ProcessingOrchestrator:
         else:
             if self.depth_processor is None:
                 raise RuntimeError("Depth generation requires a configured estimator")
-            # Step 2: Generate the selected geometry (delegated to depth_processor).
             try:
                 geometry_files = self.depth_processor.generate_depth_map_files(
                     frame_files, settings, directories, progress_tracker
@@ -543,7 +247,7 @@ class ProcessingOrchestrator:
             geometry_dir = directories.get("metric_geometry" if metric_mode else "disparity_maps")
             print(step_complete(f"Step 2: Prepared {len(geometry_files)} {geometry_label}"))
             self._print_saved_to(geometry_dir, saved_label)
-        print()  # Blank line after step
+        print()
 
         effective_geometry_files = geometry_files
         if settings.get("temporal_postprocessor", "off") == "vdpp" and not selected_is_stabilized:
@@ -576,13 +280,8 @@ class ProcessingOrchestrator:
             geometry_files=effective_geometry_files,
             geometry_mode=("metric_camera" if metric_mode else "relative"),
         )
-        del effective_geometry_files
-        del geometry_files
-        del frame_files
-        del artifact
         self.preselected_depth_files = None
 
-        # Execute steps 3-8
         return self._execute_remaining_steps(
             directories,
             settings,
@@ -593,7 +292,6 @@ class ProcessingOrchestrator:
         )
 
     def _release_depth_model(self) -> None:
-        """Release the depth model once per pipeline run."""
         if self._depth_model_released or self._release_depth_model_callback is None:
             return
         self._release_depth_model_callback()
@@ -603,16 +301,9 @@ class ProcessingOrchestrator:
     def _streamed_stereo_settings_eligible(
         settings: dict[str, Any],
         stereo_input: StereoInputManifestV1,
-        *,
-        schema5_settings: bool,
-        active_reservation: bool,
     ) -> bool:
-        """Decide whether the no-retention stereo stream preserves current output."""
-
         if (
-            not schema5_settings
-            or active_reservation
-            or settings.get("stereo_render_mode", "fast") not in ("fast", "quality")
+            settings.get("stereo_render_mode", "fast") not in ("fast", "quality")
             or settings.get("stereo_geometry_mode", "relative") != "relative"
             or getattr(stereo_input, "geometry_mode", None) != "relative"
             or settings.get("direct_vr_encode") is not True
@@ -644,13 +335,13 @@ class ProcessingOrchestrator:
             return False
 
         eye_width, eye_height, output_width, output_height = cast(
-            tuple[int, int, int, int],
-            dimensions,
+            tuple[int, int, int, int], dimensions
         )
-        if settings["vr_format"] == "side_by_side":
-            expected_output = (eye_width * 2, eye_height)
-        else:
-            expected_output = (eye_width, eye_height * 2)
+        expected_output = (
+            (eye_width * 2, eye_height)
+            if settings["vr_format"] == "side_by_side"
+            else (eye_width, eye_height * 2)
+        )
         if (output_width, output_height) != expected_output:
             return False
 
@@ -669,94 +360,10 @@ class ProcessingOrchestrator:
         self,
         settings: dict[str, Any],
         stereo_input: StereoInputManifestV1,
-        output_path: Path,
     ) -> bool:
-        schema5_settings = bool(
-            self._settings_file is not None
-            and self._settings_file.name == "processing-settings-v5.json"
+        return self._streamed_stereo_settings_eligible(settings, stereo_input) and callable(
+            getattr(self.video_encoder, "open_streamed_vr_session", None)
         )
-        active_index = Path(output_path) / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
-        pending_reservation = getattr(
-            self.video_encoder,
-            "pending_final_encoding_reservation",
-            None,
-        )
-        return self._streamed_stereo_settings_eligible(
-            settings,
-            stereo_input,
-            schema5_settings=schema5_settings,
-            active_reservation=(
-                active_index.exists()
-                or active_index.is_symlink()
-                or pending_reservation is not None
-            ),
-        ) and callable(getattr(self.video_encoder, "open_streamed_vr_session", None))
-
-    @staticmethod
-    def _streamed_stereo_consumer_memory_bound(
-        source_shape: tuple[int, int],
-        settings: dict[str, Any],
-    ) -> int:
-        """Bound transforms plus assembled BGR, converted RGB, and immutable pipe bytes."""
-
-        if (
-            not isinstance(source_shape, tuple)
-            or len(source_shape) != 2
-            or any(
-                isinstance(value, bool) or not isinstance(value, int) or value <= 0
-                for value in source_shape
-            )
-        ):
-            raise ValueError("streamed consumer source shape is invalid")
-        dimensions = (
-            settings.get("per_eye_width"),
-            settings.get("per_eye_height"),
-            settings.get("vr_output_width"),
-            settings.get("vr_output_height"),
-        )
-        if any(
-            isinstance(value, bool) or not isinstance(value, int) or value <= 0
-            for value in dimensions
-        ):
-            raise ValueError("streamed consumer output shape is invalid")
-        eye_width, eye_height, output_width, output_height = cast(
-            tuple[int, int, int, int],
-            dimensions,
-        )
-        source_pixels = source_shape[0] * source_shape[1]
-        target_pixels = eye_width * eye_height
-        final_pixels = output_width * output_height
-        distortion_maps = 8 * source_pixels if settings.get("apply_distortion") is True else 0
-        transform_peak = (
-            3 * source_pixels + 6 * target_pixels if settings.get("apply_distortion") is True else 0
-        )
-        held_transform_outputs = (
-            6 * target_pixels if settings.get("apply_distortion") is True else 0
-        )
-        pipe_peak = held_transform_outputs + 9 * final_pixels
-        return distortion_maps + max(transform_peak, pipe_peak)
-
-    @staticmethod
-    def _streamed_first_frame_index(stereo_input: StereoInputManifestV1) -> int:
-        records = stereo_input.replay_declared_records()
-        try:
-            record = next(records)
-        except StopIteration as error:
-            raise ValueError("streamed stereo input has no frames") from error
-        finally:
-            close = getattr(records, "close", None)
-            if callable(close):
-                close()
-        frame_name = record.frame_name
-        if not isinstance(frame_name, str) or not frame_name.startswith("frame_"):
-            raise ValueError("streamed stereo input frame name is noncanonical")
-        decimal = frame_name[6:]
-        if not decimal or not decimal.isascii() or not decimal.isdecimal():
-            raise ValueError("streamed stereo input frame name is noncanonical")
-        frame_index = int(decimal)
-        if decimal != str(frame_index).zfill(max(6, len(str(frame_index)))):
-            raise ValueError("streamed stereo input frame name is noncanonical")
-        return frame_index
 
     def _execute_streamed_stereo_steps(  # noqa: C901
         self,
@@ -765,10 +372,8 @@ class ProcessingOrchestrator:
         stereo_input: StereoInputManifestV1,
         video_path: str,
         output_path: Path,
-        progress_tracker=None,
+        progress_tracker: Any = None,
     ) -> bool | None:
-        """Run transient stereo rendering, or return None before render to fall back."""
-
         try:
             transform_pair = self.distortion_processor.prepare_stream_transform(
                 source_shape=stereo_input.render_shape,
@@ -776,20 +381,15 @@ class ProcessingOrchestrator:
             )
             if not callable(transform_pair):
                 raise TypeError("stream transform is not callable")
-            consumer_memory_bytes = self._streamed_stereo_consumer_memory_bound(
-                stereo_input.render_shape,
-                settings,
-            )
-            first_index = self._streamed_first_frame_index(stereo_input)
             session = self.video_encoder.open_streamed_vr_session(
                 output_dir=directories["base"],
                 original_video=video_path,
                 settings=settings,
                 frame_count=stereo_input.frame_count,
-                first_index=first_index,
+                first_index=stereo_input.first_index,
                 progress_tracker=progress_tracker,
             )
-        except (InterruptedError, ReservationIncompleteError):
+        except InterruptedError:
             raise
         except Exception as error:
             if self.verbose:
@@ -799,7 +399,7 @@ class ProcessingOrchestrator:
         session_needs_abort = True
         try:
 
-            def consume_frame(frame_name, left_frame, right_frame) -> None:
+            def consume_frame(frame_name: str, left_frame: Any, right_frame: Any) -> None:
                 left_final, right_final = transform_pair(left_frame, right_frame)
                 session.write(
                     frame_name,
@@ -812,10 +412,7 @@ class ProcessingOrchestrator:
                 settings,
                 progress_tracker,
                 frame_consumer=consume_frame,
-                frame_consumer_memory_bytes=consumer_memory_bytes,
             ):
-                # Retire the durable stream authority before a terminal status
-                # makes that authority impossible to authenticate.
                 session_needs_abort = False
                 session.abort()
                 return self._handle_step_error("Stereo pair creation failed")
@@ -845,17 +442,10 @@ class ProcessingOrchestrator:
             if success:
                 output_filename = self._expected_output_filename(video_path, settings)
                 print(step_complete("Step 8: Created final video"))
-                self._print_saved_to(
-                    directories["base"],
-                    f"Final output: {output_filename}",
-                )
+                self._print_saved_to(directories["base"], f"Final output: {output_filename}")
 
             finalized = self._finalize_processing(
-                success,
-                output_path,
-                video_path,
-                settings,
-                num_frames,
+                success, output_path, video_path, settings, num_frames
             )
             completed = success and finalized is not False
             if completed and progress_tracker and hasattr(progress_tracker, "finish"):
@@ -874,37 +464,19 @@ class ProcessingOrchestrator:
             if session_needs_abort:
                 session.abort()
 
-    def _execute_remaining_steps(  # noqa: C901
+    def _execute_remaining_steps(
         self,
         directories: dict[str, Path],
         settings: dict[str, Any],
         stereo_input: StereoInputManifestV1,
         video_path: str,
         output_path: Path,
-        progress_tracker=None,
+        progress_tracker: Any = None,
     ) -> bool:
-        """
-        Execute remaining pipeline steps after depth map generation.
-
-        Args:
-            directories: Dictionary of processing directories
-            settings: Processing settings
-            stereo_input: Durable scalar descriptor for the upstream sequence
-            video_path: Input video path
-            output_path: Output directory path
-            progress_tracker: Optional progress tracker
-
-        Returns:
-            True if successful, False otherwise
-
-        Side effects:
-            - Executes steps 3-8 of pipeline
-            - Progress updates
-        """
         num_frames = stereo_input.frame_count
         self._metric_clamp_summary = None
 
-        if self._streamed_stereo_path_enabled(settings, stereo_input, output_path):
+        if self._streamed_stereo_path_enabled(settings, stereo_input):
             streamed = self._execute_streamed_stereo_steps(
                 directories,
                 settings,
@@ -916,7 +488,6 @@ class ProcessingOrchestrator:
             if streamed is not None:
                 return streamed
 
-        # Step 3: Create stereo pairs (delegated to stereo_generator)
         if not self.stereo_generator.create_stereo_pairs_from_manifest(
             stereo_input,
             directories,
@@ -927,7 +498,7 @@ class ProcessingOrchestrator:
         print(step_complete(f"Step 3: Created {num_frames} stereo pairs"))
         self._print_saved_to(directories.get("left_frames"), "Left frames")
         self._print_saved_to(directories.get("right_frames"), "Right frames")
-        print()  # Blank line after left/right pair
+        print()
         if settings.get("stereo_geometry_mode", "relative") == "metric_camera":
             summary = self.stereo_generator.last_metric_clamp_summary
             if isinstance(summary, dict):
@@ -955,11 +526,8 @@ class ProcessingOrchestrator:
         num_frames: int,
         video_path: str,
         output_path: Path,
-        progress_tracker=None,
+        progress_tracker: Any = None,
     ) -> bool:
-        """Execute distortion through finalization for an authenticated RGB stage."""
-
-        # Step 4: Apply fisheye distortion (optional - delegated to distortion_processor)
         if settings.get("apply_distortion", True):
             left_dir = directories.get("left_frames")
             right_dir = directories.get("right_frames")
@@ -982,23 +550,22 @@ class ProcessingOrchestrator:
                     f"Step 4: Applied {settings['fisheye_projection']} fisheye distortion"
                 )
             )
-            print()  # Blank line after left/right pair
+            print()
         else:
-            # Step 5: Crop rectilinear frames when distortion is disabled.
             if not self.distortion_processor.crop_frames(
                 directories, settings, progress_tracker, num_frames
             ):
                 return self._handle_step_error("Frame cropping failed")
         print(
             step_complete(
-                f"Step 5: Cropped {num_frames} frames to {settings['per_eye_width']}x{settings['per_eye_height']}"
+                f"Step 5: Cropped {num_frames} frames to "
+                f"{settings['per_eye_width']}x{settings['per_eye_height']}"
             )
         )
         self._print_saved_to(directories.get("left_cropped"), "Cropped left frames")
         self._print_saved_to(directories.get("right_cropped"), "Cropped right frames")
-        print()  # Blank line after left/right pair
+        print()
 
-        # Step 6: Apply AI upscaling (optional - delegated to upscaler)
         if settings.get("upscale_model", "none") != "none":
             if not self.upscaler.apply_upscaling(directories, settings, progress_tracker):
                 return self._handle_step_error("Upscaling failed")
@@ -1009,7 +576,7 @@ class ProcessingOrchestrator:
             )
             self._print_saved_to(directories.get("left_upscaled"), "Upscaled left frames")
             self._print_saved_to(directories.get("right_upscaled"), "Upscaled right frames")
-            print()  # Blank line after left/right pair
+            print()
 
         if settings.get("direct_vr_encode", False):
             direct_source = self.vr_assembler.resolve_direct_vr_source(
@@ -1027,24 +594,21 @@ class ProcessingOrchestrator:
                 progress_tracker=progress_tracker,
             )
         else:
-            # Step 7: Assemble VR frames (delegated to vr_assembler)
             if not self.vr_assembler.assemble_vr_frames(
                 directories, settings, progress_tracker, num_frames
             ):
                 return self._handle_step_error("VR frame assembly failed")
             print(
                 step_complete(
-                    f"Step 7: Assembled {num_frames} {settings['vr_format']} VR frames at {settings['vr_output_width']}x{settings['vr_output_height']}"
+                    f"Step 7: Assembled {num_frames} {settings['vr_format']} VR frames at "
+                    f"{settings['vr_output_width']}x{settings['vr_output_height']}"
                 )
             )
             self._print_saved_to(directories.get("vr_frames"), "VR frames")
-            print()  # Blank line after step
-
-            # Step 8: Create final video (delegated to video_encoder)
+            print()
             vr_frames_dir = directories.get("vr_frames")
             if not vr_frames_dir:
                 return self._handle_step_error("VR frames directory not found")
-
             success = self.video_encoder.create_video(
                 vr_frames_dir,
                 directories["base"],
@@ -1058,7 +622,6 @@ class ProcessingOrchestrator:
             print(step_complete("Step 8: Created final video"))
             self._print_saved_to(directories["base"], f"Final output: {output_filename}")
 
-        # Finalize and cleanup
         finalized = self._finalize_processing(
             success, output_path, video_path, settings, num_frames
         )
@@ -1074,23 +637,6 @@ class ProcessingOrchestrator:
         settings: dict[str, Any],
         video_properties: dict[str, Any],
     ) -> tuple[Path, dict[str, Path], Path | None]:
-        """
-        Setup processing directories and settings file.
-
-        Args:
-            video_path: Input video path
-            output_dir: Output directory
-            settings: Processing settings
-            video_properties: Video metadata
-
-        Returns:
-            Tuple of (output_path, directories, settings_file)
-
-        Side effects:
-            - Creates directories
-            - Writes settings file
-            - Console output
-        """
         output_path = Path(output_dir)
         omitted_intermediates: set[str] = set()
         if settings.get("temporal_postprocessor", "off") != "vdpp":
@@ -1108,7 +654,6 @@ class ProcessingOrchestrator:
                 video_properties=video_properties,
                 source_video_path=video_path,
             )
-            # A newer probe must not move the clip in a job created with only binary64 FPS.
             if "frame_rate" not in prepared.to_object()["video_properties"]:
                 video_properties.pop("frame_rate", None)
             settings_file = fixed_settings
@@ -1121,28 +666,22 @@ class ProcessingOrchestrator:
                 video_path,
                 transactional_v5=True,
             )
-        if omitted_intermediates:
-            directories = create_output_directories(
-                output_path,
-                settings["keep_intermediates"],
-                omitted_intermediates=omitted_intermediates,
-            )
-        else:
-            directories = create_output_directories(output_path, settings["keep_intermediates"])
+        directories = create_output_directories(
+            output_path,
+            settings["keep_intermediates"],
+            omitted_intermediates=omitted_intermediates or None,
+        )
 
         print(f"\n{title_bar('=== Depth Surge 3D Video Processing ===')}")
         print(f"Input: {video_path}")
         print(f"Output: {output_path}")
         if settings.get("depth_model_version") == "v2":
-            print(
-                "Using Video-Depth-Anything V2 for temporal consistency " "within detected shots\n"
-            )
+            print("Using Video-Depth-Anything V2 for temporal consistency within detected shots\n")
         else:
             print(f"Using depth backend: {settings.get('depth_model_version', 'v3')}\n")
-
         return output_path, directories, settings_file
 
-    def _finalize_processing(  # noqa: C901
+    def _finalize_processing(
         self,
         success: bool,
         output_path: Path,
@@ -1150,145 +689,70 @@ class ProcessingOrchestrator:
         settings: dict[str, Any],
         num_frames: int,
     ) -> bool:
-        """
-        Finalize processing and update settings file.
-
-        Args:
-            success: Whether processing succeeded
-            output_path: Output directory path
-            video_path: Input video path
-            settings: Processing settings
-            num_frames: Number of frames processed
-
-        Side effects:
-            - Updates settings file with completion status
-            - Console output
-        """
-        if success:
-            # Preserve the legacy pre-finalization snapshot. Schema 5 ignores this
-            # field and freezes its duration from terminal_at in the terminal artifact.
-            elapsed_time = time.perf_counter() - self._start_time
-
-            # Generate output filename
-            output_filename = self._expected_output_filename(video_path, settings)
-            output_file_path = str(output_path / output_filename)
-
-            active_reservation = None
-            schema5_settings = bool(
-                self._settings_file is not None
-                and self._settings_file.name == "processing-settings-v5.json"
-            )
-            if schema5_settings:
-                active_reservation = getattr(
-                    self.video_encoder,
-                    "pending_final_encoding_reservation",
-                    None,
+        if not success:
+            if self._settings_file:
+                return update_processing_status(
+                    self._settings_file, "failed", {"error": "Video creation failed"}
                 )
-                if active_reservation is None:
-                    print("Error: Final publication lacks its active reservation")
-                    return False
-                try:
-                    recovery = active_reservation.recover_publication_prefix()
-                    if recovery.phase != "publication_authenticated":
-                        raise ValueError("final publication did not reach its authenticated phase")
-                    active_reservation.validate_authenticated_publication()
-                except Exception as error:
-                    print(f"Error: Final publication validation failed: {error}")
-                    return False
+            return False
 
-            cleanup_status = "not_requested"
-            if not settings.get("keep_intermediates", True):
-                if (
-                    self._settings_file is not None
-                    and self._settings_file.name == "processing-settings-v5.json"
-                ):
-                    try:
-                        pruned = commit_payload_pruned(
-                            output_path,
-                            reservation=active_reservation,
-                        )
-                        commit_cleanup_pending_status(
-                            self._settings_file,
-                            reservation=active_reservation,
-                        )
-                    except Exception as error:
-                        print(f"Error: Could not commit cleanup authorization: {error}")
-                        return False
-                    try:
-                        removed_count = run_authorized_cleanup(
-                            output_path,
-                            metadata=pruned,
-                        )
-                    except Exception as error:
-                        cleanup_status = cleanup_status_for_error(error)
-                        print(
-                            "Warning: Intermediate cleanup remains pending "
-                            f"({cleanup_status}): {error}"
-                        )
-                        return False
-                    else:
-                        cleanup_status = "complete"
-                        print(f"Removed {removed_count} temporary processing files")
-                else:
-                    removed_count = cleanup_intermediate_files(output_path)
+        elapsed_time = time.perf_counter() - self._start_time
+        output_filename = self._expected_output_filename(video_path, settings)
+        output_file_path = str(output_path / output_filename)
+        schema5_settings = bool(
+            self._settings_file is not None
+            and self._settings_file.name == "processing-settings-v5.json"
+        )
+
+        cleanup_status = "not_requested"
+        if not settings.get("keep_intermediates", True):
+            if schema5_settings and self._settings_file is not None:
+                try:
+                    commit_payload_pruned(output_path)
+                    commit_cleanup_pending_status(self._settings_file)
+                    removed_count = run_authorized_cleanup(output_path)
                     cleanup_status = "complete"
                     print(f"Removed {removed_count} temporary processing files")
-
-            # Update settings file
-            if self._settings_file:
-                runtime_info = {
-                    "final_output": output_file_path,
-                    "frames_processed": num_frames,
-                    "processing_time_seconds": elapsed_time,
-                    "cleanup_status": cleanup_status,
-                }
-                if self._metric_clamp_summary is not None:
-                    runtime_info["metric_clamp_summary"] = dict(self._metric_clamp_summary)
-                if not update_processing_status(
-                    self._settings_file,
-                    "completed",
-                    runtime_info,
-                ):
-                    print("Error: Could not commit terminal processing settings")
+                except Exception as error:
+                    cleanup_status = cleanup_status_for_error(error)
+                    print(
+                        f"Warning: Intermediate cleanup remains pending ({cleanup_status}): {error}"
+                    )
                     return False
-                if not self._retire_final_encoding_reservation(success=True):
-                    return False
-                if schema5_settings:
-                    try:
-                        completed = recover_processing_settings_artifact(self._settings_file)
-                        audit = audit_final_media_v1(output_path, completed)
-                    except Exception as error:
-                        print(f"Error: Completed final-media audit failed: {error}")
-                        return False
-                    if not audit.final_video_authenticated:
-                        print("Error: Completed final media is not authenticated")
-                        return False
+            else:
+                removed_count = cleanup_intermediate_files(output_path)
+                cleanup_status = "complete"
+                print(f"Removed {removed_count} temporary processing files")
 
-            completion_banner(
-                output_file=output_file_path,
-                processing_time=self._format_processing_time(
-                    time.perf_counter() - self._start_time
-                ),
-                num_frames=num_frames,
-                vr_format=settings["vr_format"],
-            )
-            return True
-        elif self._settings_file:
-            terminal = update_processing_status(
-                self._settings_file, "failed", {"error": "Video creation failed"}
-            )
-            if terminal and not self._retire_final_encoding_reservation(success=False):
+        if self._settings_file:
+            runtime_info: dict[str, Any] = {
+                "final_output": output_file_path,
+                "frames_processed": num_frames,
+                "processing_time_seconds": elapsed_time,
+                "cleanup_status": cleanup_status,
+            }
+            if self._metric_clamp_summary is not None:
+                runtime_info["metric_clamp_summary"] = dict(self._metric_clamp_summary)
+            if not update_processing_status(self._settings_file, "completed", runtime_info):
+                print("Error: Could not commit terminal processing settings")
                 return False
-            return terminal
-        return not success
+
+        completion_banner(
+            output_file=output_file_path,
+            processing_time=self._format_processing_time(time.perf_counter() - self._start_time),
+            num_frames=num_frames,
+            vr_format=settings["vr_format"],
+        )
+        return True
 
     def _expected_output_filename(
         self,
         video_path: str,
         settings: dict[str, Any],
     ) -> str:
-        if self._settings_file is not None and self._settings_file.name == (
-            "processing-settings-v5.json"
+        if (
+            self._settings_file is not None
+            and self._settings_file.name == "processing-settings-v5.json"
         ):
             saved = load_processing_settings(self._settings_file)
             if saved is not None:
@@ -1305,50 +769,26 @@ class ProcessingOrchestrator:
 
     @staticmethod
     def _format_processing_time(seconds: float) -> str:
-        """
-        PURE: Format processing time as human-readable string.
-
-        Args:
-            seconds: Processing time in seconds
-
-        Returns:
-            Formatted time string (e.g., "1h 23m 45s", "5m 30s", "45s")
-        """
         hours = int(seconds // 3600)
         minutes = int((seconds % 3600) // 60)
         secs = int(seconds % 60)
-
         parts = []
         if hours > 0:
             parts.append(f"{hours}h")
         if minutes > 0:
             parts.append(f"{minutes}m")
-        if secs > 0 or not parts:  # Always show seconds if no other parts
+        if secs > 0 or not parts:
             parts.append(f"{secs}s")
-
         return " ".join(parts)
 
     def _update_step_progress(
         self,
-        progress_tracker,
+        progress_tracker: Any,
         message: str,
         step_name: str,
         progress: int,
         total: int,
     ) -> None:
-        """
-        Update progress for a processing step.
-
-        Args:
-            progress_tracker: Progress tracker instance
-            message: Progress message
-            step_name: Name of current step
-            progress: Current progress value
-            total: Total progress value
-
-        Side effects:
-            - Updates progress tracker state
-        """
         if progress_tracker:
             progress_tracker.update_progress(
                 message,
@@ -1360,33 +800,10 @@ class ProcessingOrchestrator:
             )
 
     def _print_saved_to(self, directory: Path | None, message_prefix: str = "Saved to") -> None:
-        """
-        Print save location message.
-
-        Args:
-            directory: Directory path or None
-            message_prefix: Message prefix text
-
-        Side effects:
-            - Console output
-        """
         if directory:
             print(saved_to(f"{message_prefix}: {directory}"))
 
     def _handle_step_error(self, error_msg: str) -> bool:
-        """
-        Handle step failure and update settings file.
-
-        Args:
-            error_msg: Error message
-
-        Returns:
-            False (always returns False to indicate failure)
-
-        Side effects:
-            - Console output
-            - Updates settings file with error status
-        """
         print(f"Error: {error_msg}")
         if self._settings_file:
             update_processing_status(self._settings_file, "failed", {"error": error_msg})

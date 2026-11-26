@@ -2,78 +2,34 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
-import math
-import os
-import secrets
-import shutil
-import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Literal, cast
+import secrets
+import shutil
+from typing import Any, Literal
+import warnings
 
-from ..core.settings import (
-    parse_saved_processing_settings,
-    validate_settings,
+from ..core.depth_contract import (
+    CANONICAL_DEPTH_ALGORITHM_VERSION,
+    CANONICAL_DEPTH_SCHEMA_VERSION,
 )
 from ..core.file_identity import (
     FILE_IDENTITY_ALGORITHM_VERSION,
     file_sample_fingerprint,
 )
-from ..core.depth_contract import (
-    CANONICAL_DEPTH_ALGORITHM_VERSION,
-    CANONICAL_DEPTH_SCHEMA_VERSION,
-    canonical_json_hash,
-)
 from ..core.render_disparity import (
     STABILIZED_DEPTH_ALGORITHM_VERSION,
     STABILIZED_DEPTH_SCHEMA_VERSION,
-    audit_stabilized_shot_records,
-    validate_render_disparity_input,
 )
-from ..inference.depth.v2_temporal_contract import (
-    VDA_INFERENCE_ALGORITHM,
-    build_v2_execution_plan,
-    is_compatible_v2_execution_plan,
+from ..core.settings import (
+    parse_saved_processing_settings,
+    validate_settings,
 )
-from ..inference.depth.vdpp_contract import (
-    build_vdpp_execution_plan,
-    vdpp_model_identity,
-)
-from ..processing.frames.depth_processor import (
-    DEPTH_BOUNDS_SCHEMA_VERSION,
-)
-from ..processing.frames.depth_resolution import resolve_depth_input_size
-from ..processing.frames.depth_storage import (
-    RAW_DEPTH_READABLE_SCHEMA_VERSIONS,
-    RawDepthFingerprintError,
-    RawDepthStore,
-    depth_preprocessing_algorithm,
-    select_depth_model_settings,
-)
-from .reservation_protocol import (
-    JOB_CONTROL_RELATIVE_PATH,
-    SETTINGS_ARTIFACT_RELATIVE_PATH,
-    allocation_unit_for_path,
-    bootstrap_settings_job_v1,
-    platform_allocation_adapter,
-    platform_allocation_counter,
-    recover_settings_job_v1,
-    publish_write_ahead_intent,
-    recover_control_artifact_pair_v1,
-    _read_bounded_regular_file,
-    _unlink_exact_control_artifact,
-)
-from .canonical_json import canonical_json_bytes, strict_canonical_json_loads
-from .nofollow_io import AcquiredRoot, NoFollowPathError
-from .settings_artifact import (
-    ProcessingSettingsArtifactV5,
-    SETTINGS_ARTIFACT_MAX_RAW_BYTES,
-    materialize_processing_settings_v5,
-    migrate_processing_settings_artifact_v5,
-)
+from ..core.video_timing import selected_frame_range
+from ..processing.frames.depth_processor import DEPTH_BOUNDS_SCHEMA_VERSION
+from ..processing.frames.depth_storage import RAW_DEPTH_READABLE_SCHEMA_VERSIONS, RawDepthStore
 from ..processing.frames.metric_geometry import MetricGeometryStore
 from ..processing.frames.scene_analyzer import (
     SCENE_ALGORITHM_VERSION,
@@ -83,55 +39,30 @@ from ..processing.frames.source_frame_manifest import (
     read_source_frame_manifest,
     source_frame_manifest_mismatch_reason,
 )
-from ..processing.frames.stage_manifest import FRAME_STAGE_SCHEMA_VERSION
-from ..utils.imaging.png_header import (
-    png_header_bytes_match,
-    png_header_matches,
-    read_png_header,
-)
 from ..processing.frames.stereo_generator import (
-    METRIC_PROJECTION_ALGORITHM_VERSION,
+    QUALITY_STEREO_ALGORITHM_VERSION,
     STEREO_STAGE_ALGORITHM_VERSION,
-    STEREO_STAGE_SCHEMA_VERSION,
 )
-from .operations import get_video_properties, parse_sample_aspect_ratio
-from ..utils.imaging.image_processing import (
-    CENTER_CROP_ALGORITHM_VERSION,
-    calculate_center_crop_dimensions,
+from ..processing.video.final_container_validation import verify_existing_final_video
+from ..utils.imaging.png_header import read_png_header
+from .durable_publish import atomic_write_bytes
+from .operations import SETTINGS_ARTIFACT_RELATIVE_PATH
+from .settings_artifact import (
+    ProcessingSettingsArtifactV5,
+    SETTINGS_ARTIFACT_MAX_RAW_BYTES,
+    migrate_processing_settings_artifact_v5,
 )
-from ..rendering.stereo_geometry import MetricProjectionStats
-from ..core.video_timing import selected_frame_range
 
 
 Disposition = Literal["preserve", "resume", "invalidate", "missing"]
 MigrationMode = Literal["archive", "delete"]
 
-LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH = Path(".depth-surge-legacy-fast-adoption-v1.json")
-LEGACY_FAST_ADOPTION_INTENT_MAX_RAW_BYTES = 4096
-_HEX64 = frozenset("0123456789abcdef")
-
-_STEREO_SETTING_KEYS = ("stereo_strength", "convergence", "occlusion_fill")
-_DISTORTION_SETTING_KEYS = (
-    "apply_distortion",
-    "fisheye_projection",
-    "fisheye_fov",
-)
-_CROP_SETTING_KEYS = (
-    "crop_factor",
-    "fisheye_crop_factor",
-    "per_eye_width",
-    "per_eye_height",
-)
-_UPSCALE_SETTING_KEYS = ("upscale_model",)
-_VR_SETTING_KEYS = (
-    "vr_format",
-    "vr_resolution",
-    "target_fps",
-    "vr_output_width",
-    "vr_output_height",
-)
 _DEPTH_MODEL_VERSIONS = frozenset({"v2", "v3", "see_through", "moge2"})
 _SEE_THROUGH_MARKERS = ("see_through", "seethrough")
+_DISTORTION_KEYS = ("apply_distortion", "fisheye_projection", "fisheye_fov")
+_CROP_KEYS = ("crop_factor", "fisheye_crop_factor", "per_eye_width", "per_eye_height")
+_UPSCALE_KEYS = ("upscale_model",)
+_VR_KEYS = ("vr_format", "vr_resolution", "target_fps", "vr_output_width", "vr_output_height")
 
 
 @dataclass(frozen=True)
@@ -154,228 +85,6 @@ class ResumeStage:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class LegacyFastAdoptionV1:
-    """Read-only proof for adopting one intact pre-schema-5 Fast RGB stage."""
-
-    job_root: Path
-    source_settings_schema_version: int
-    settings_fingerprint: str
-    frame_count: int
-    render_shape: tuple[int, int]
-    geometry_mode: Literal["relative", "metric"]
-    occlusion_fill: Literal["none", "background"]
-    rgb_stage_fingerprint: str
-    source_guide_fingerprint: str
-    stage_metadata_sha256: str
-    payload_sequence_sha256: str
-    metric_clamp_summary_sha256: str | None
-    metric_clamp_evidence_sha256: str | None
-    metric_valid_pixel_count: int | None
-    metric_clamped_pixel_count: int | None
-    metric_affected_frame_count: int | None
-    metric_mean_clamped_fraction: float | None
-    metric_max_clamped_fraction: float | None
-
-
-_LEGACY_FAST_ADOPTION_INTENT_KEYS = frozenset(
-    {
-        "frame_count",
-        "geometry_mode",
-        "metric_affected_frame_count",
-        "metric_clamp_evidence_sha256",
-        "metric_clamp_summary_sha256",
-        "metric_clamped_pixel_count",
-        "metric_max_clamped_fraction",
-        "metric_mean_clamped_fraction",
-        "metric_valid_pixel_count",
-        "occlusion_fill",
-        "payload_sequence_sha256",
-        "render_shape",
-        "rgb_stage_fingerprint",
-        "schema_version",
-        "settings_fingerprint",
-        "source_guide_fingerprint",
-        "source_settings_schema_version",
-        "stage_metadata_sha256",
-    }
-)
-
-
-def _legacy_fast_adoption_payload(adoption: LegacyFastAdoptionV1) -> dict[str, Any]:
-    return {
-        "frame_count": adoption.frame_count,
-        "geometry_mode": adoption.geometry_mode,
-        "metric_affected_frame_count": adoption.metric_affected_frame_count,
-        "metric_clamp_evidence_sha256": adoption.metric_clamp_evidence_sha256,
-        "metric_clamp_summary_sha256": adoption.metric_clamp_summary_sha256,
-        "metric_clamped_pixel_count": adoption.metric_clamped_pixel_count,
-        "metric_max_clamped_fraction": adoption.metric_max_clamped_fraction,
-        "metric_mean_clamped_fraction": adoption.metric_mean_clamped_fraction,
-        "metric_valid_pixel_count": adoption.metric_valid_pixel_count,
-        "occlusion_fill": adoption.occlusion_fill,
-        "payload_sequence_sha256": adoption.payload_sequence_sha256,
-        "render_shape": [adoption.render_shape[0], adoption.render_shape[1]],
-        "rgb_stage_fingerprint": adoption.rgb_stage_fingerprint,
-        "schema_version": 1,
-        "settings_fingerprint": adoption.settings_fingerprint,
-        "source_guide_fingerprint": adoption.source_guide_fingerprint,
-        "source_settings_schema_version": adoption.source_settings_schema_version,
-        "stage_metadata_sha256": adoption.stage_metadata_sha256,
-    }
-
-
-def _validate_adoption_hashes(value: dict, keys: Iterable[str]) -> None:
-    for key in keys:
-        field = value[key]
-        if not isinstance(field, str) or len(field) != 64 or set(field) - _HEX64:
-            raise ValueError(f"legacy Fast adoption {key} is invalid")
-
-
-def _validate_adoption_metric_evidence(value: dict, geometry: str, frame_count: int) -> None:
-    metric_keys = (
-        "metric_clamp_summary_sha256",
-        "metric_clamp_evidence_sha256",
-        "metric_valid_pixel_count",
-        "metric_clamped_pixel_count",
-        "metric_affected_frame_count",
-        "metric_mean_clamped_fraction",
-        "metric_max_clamped_fraction",
-    )
-    if geometry == "relative":
-        if any(value[key] is not None for key in metric_keys):
-            raise ValueError("relative legacy Fast intent carries metric evidence")
-    else:
-        _validate_adoption_hashes(value, metric_keys[:2])
-        for key in metric_keys[2:5]:
-            field = value[key]
-            if type(field) is not int or field < 0:
-                raise ValueError(f"legacy Fast adoption {key} is invalid")
-        for key in metric_keys[5:]:
-            field = value[key]
-            if type(field) is not float or not math.isfinite(field) or not 0.0 <= field <= 1.0:
-                raise ValueError(f"legacy Fast adoption {key} is invalid")
-        if value["metric_clamped_pixel_count"] > value["metric_valid_pixel_count"]:
-            raise ValueError("legacy Fast adoption clamp counts are inconsistent")
-        if value["metric_affected_frame_count"] > frame_count:
-            raise ValueError("legacy Fast adoption affected-frame count is inconsistent")
-
-
-def _parse_legacy_fast_adoption_intent(
-    raw: bytes,
-    job_root: Path,
-) -> LegacyFastAdoptionV1:
-    value = strict_canonical_json_loads(
-        raw,
-        max_bytes=LEGACY_FAST_ADOPTION_INTENT_MAX_RAW_BYTES,
-    )
-    if not isinstance(value, dict) or set(value) != _LEGACY_FAST_ADOPTION_INTENT_KEYS:
-        raise ValueError("legacy Fast adoption intent has the wrong schema")
-    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
-        raise ValueError("legacy Fast adoption intent schema version is invalid")
-    source_version = value["source_settings_schema_version"]
-    frame_count = value["frame_count"]
-    shape = value["render_shape"]
-    if type(source_version) is not int or not 1 <= source_version <= 4:
-        raise ValueError("legacy Fast adoption source schema is invalid")
-    if type(frame_count) is not int or frame_count <= 0:
-        raise ValueError("legacy Fast adoption frame count is invalid")
-    if (
-        not isinstance(shape, list)
-        or len(shape) != 2
-        or any(type(item) is not int or item <= 0 for item in shape)
-    ):
-        raise ValueError("legacy Fast adoption render shape is invalid")
-    geometry = value["geometry_mode"]
-    occlusion = value["occlusion_fill"]
-    if geometry not in {"relative", "metric"} or occlusion not in {
-        "none",
-        "background",
-    }:
-        raise ValueError("legacy Fast adoption mode is invalid")
-    _validate_adoption_hashes(
-        value,
-        (
-            "settings_fingerprint",
-            "rgb_stage_fingerprint",
-            "source_guide_fingerprint",
-            "stage_metadata_sha256",
-            "payload_sequence_sha256",
-        ),
-    )
-    _validate_adoption_metric_evidence(value, geometry, frame_count)
-    return LegacyFastAdoptionV1(
-        job_root=job_root.resolve(),
-        source_settings_schema_version=source_version,
-        settings_fingerprint=value["settings_fingerprint"],
-        frame_count=frame_count,
-        render_shape=(shape[0], shape[1]),
-        geometry_mode=cast(Literal["relative", "metric"], geometry),
-        occlusion_fill=cast(Literal["none", "background"], occlusion),
-        rgb_stage_fingerprint=value["rgb_stage_fingerprint"],
-        source_guide_fingerprint=value["source_guide_fingerprint"],
-        stage_metadata_sha256=value["stage_metadata_sha256"],
-        payload_sequence_sha256=value["payload_sequence_sha256"],
-        metric_clamp_summary_sha256=value["metric_clamp_summary_sha256"],
-        metric_clamp_evidence_sha256=value["metric_clamp_evidence_sha256"],
-        metric_valid_pixel_count=value["metric_valid_pixel_count"],
-        metric_clamped_pixel_count=value["metric_clamped_pixel_count"],
-        metric_affected_frame_count=value["metric_affected_frame_count"],
-        metric_mean_clamped_fraction=value["metric_mean_clamped_fraction"],
-        metric_max_clamped_fraction=value["metric_max_clamped_fraction"],
-    )
-
-
-def publish_legacy_fast_adoption_intent_v1(adoption: LegacyFastAdoptionV1) -> None:
-    """Durably publish the bounded authority for aggregate-only legacy adoption."""
-
-    publish_write_ahead_intent(
-        adoption.job_root / LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH,
-        _legacy_fast_adoption_payload(adoption),
-    )
-
-
-def recover_legacy_fast_adoption_intent_v1(
-    job_root: Path | str,
-) -> LegacyFastAdoptionV1 | None:
-    """Recover the deterministic intent pair before diagnostics mutation."""
-
-    root = Path(job_root).resolve()
-    result = recover_control_artifact_pair_v1(
-        root / LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH,
-        max_bytes=LEGACY_FAST_ADOPTION_INTENT_MAX_RAW_BYTES,
-        parser=lambda raw: _parse_legacy_fast_adoption_intent(raw, root),
-    )
-    return cast(LegacyFastAdoptionV1 | None, result)
-
-
-def load_legacy_fast_adoption_intent_v1(
-    job_root: Path | str,
-) -> LegacyFastAdoptionV1 | None:
-    """Read the final intent without repairing or mutating its namespace."""
-
-    root = Path(job_root).resolve()
-    path = root / LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH
-    if not (path.exists() or path.is_symlink()):
-        return None
-    return _parse_legacy_fast_adoption_intent(
-        _read_bounded_regular_file(
-            path,
-            max_bytes=LEGACY_FAST_ADOPTION_INTENT_MAX_RAW_BYTES,
-        ),
-        root,
-    )
-
-
-def retire_legacy_fast_adoption_intent_v1(adoption: LegacyFastAdoptionV1) -> None:
-    """Retire only the exact authority that enabled a complete publication."""
-
-    _unlink_exact_control_artifact(
-        adoption.job_root / LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH,
-        canonical_json_bytes(_legacy_fast_adoption_payload(adoption)),
-    )
-
-
 @dataclass(frozen=True)
 class ResumeReport:
     """Read-only resume decision plus the data required for migration."""
@@ -387,10 +96,7 @@ class ResumeReport:
     original_settings_data: dict[str, Any] | None
     migrated_settings: dict[str, Any]
     settings_backup_required: bool
-    legacy_fast_adoption: LegacyFastAdoptionV1 | None = None
-    final_media_audit: object | None = None
-    historical_diagnostics_valid: bool | None = None
-    stereo_payload_reusable: bool | None = None
+    final_video_valid: bool | None = None
 
     def stage(self, name: str) -> ResumeStage:
         for stage in self.stages:
@@ -428,7 +134,7 @@ class ResumeReport:
             "removed_settings": list(self.removed_settings),
             "preserved_stages": list(self.preserved_stage_names),
             "invalidated_stages": list(self.invalidated_stage_names),
-            "legacy_fast_adoptable": self.legacy_fast_adoption is not None,
+            "final_video_valid": self.final_video_valid,
         }
 
 
@@ -481,7 +187,6 @@ def _raw_depth_uses_see_through(output_dir: Path) -> bool:
     semantic = metadata.get("semantic_fingerprint") if metadata else None
     if not isinstance(semantic, dict):
         return False
-
     values: list[object] = [semantic.get("backend"), semantic.get("source")]
     for section_name in ("model_info", "depth_settings"):
         section = semantic.get(section_name)
@@ -506,13 +211,12 @@ def resolve_resume_depth_model_version(
     default: str,
 ) -> str:
     """Recover the depth backend for a job whose legacy settings lack it."""
+
     if default not in _DEPTH_MODEL_VERSIONS:
         raise ValueError(f"Unsupported resume depth model default: {default}")
-
     explicit = settings.get("depth_model_version")
     if explicit in _DEPTH_MODEL_VERSIONS:
-        return explicit
-
+        return str(explicit)
     if output_dir is not None and _raw_depth_uses_see_through(Path(output_dir)):
         return "see_through"
     if _contains_see_through_marker(settings.get("model_path")):
@@ -535,1999 +239,408 @@ def _find_settings_file(output_dir: Path) -> Path | None:
 def _resolve_settings_file(output_dir: Path, settings_file: Path | str | None) -> Path | None:
     if settings_file is None:
         return _find_settings_file(output_dir)
-    candidate = Path(settings_file).resolve()
-    if (
-        candidate.parent != output_dir
-        or (
-            candidate.name != SETTINGS_ARTIFACT_RELATIVE_PATH.name
-            and not candidate.name.endswith("-settings.json")
-        )
-        or not candidate.is_file()
-    ):
-        raise ValueError("Resume settings file must be a job settings file in the output directory")
-    return candidate
+    candidate = Path(settings_file)
+    return candidate if candidate.is_file() else None
 
 
-def _expected_frame_range(
-    settings_data: dict[str, Any] | None,
-    current_settings: dict[str, Any],
-) -> tuple[int, int] | None:
-    properties = (settings_data or {}).get("video_properties", {})
-    if not isinstance(properties, dict):
+def _current_source_fingerprint(metadata: dict[str, Any]) -> str | None:
+    if metadata.get("source_video_fingerprint_algorithm") != FILE_IDENTITY_ALGORITHM_VERSION:
         return None
-    try:
-        total = int(properties["frame_count"])
-        fps = float(properties["fps"])
-    except (KeyError, TypeError, ValueError, OverflowError):
-        return None
-    if total <= 0 or not math.isfinite(fps) or fps <= 0:
-        return None
-    try:
-        return selected_frame_range(properties, current_settings)
-    except (ValueError, ZeroDivisionError, TypeError):
-        return None
+    fp = metadata.get("source_video_fingerprint")
+    return fp if isinstance(fp, str) and fp else None
+
+
+def _resume_source_candidates(root: Path, metadata: dict[str, Any]) -> list[Path]:
+    candidates: list[Path] = []
+    source_video = metadata.get("source_video")
+    if isinstance(source_video, str) and source_video:
+        candidates.append(Path(source_video))
+    source_name = metadata.get("source_video_name")
+    if isinstance(source_name, str) and source_name:
+        candidates.append(root / source_name)
+    return candidates
+
+
+def resolve_resume_source_video(
+    output_dir: Path | str, *, settings_file: Path | str | None = None
+) -> Path:
+    """Resolve the source video recorded by one job, checking its sample fingerprint."""
+
+    root = Path(output_dir).resolve()
+    selected = _resolve_settings_file(root, settings_file)
+    if selected is None:
+        raise ValueError("Resume source video metadata is missing")
+    settings_data = _read_json(selected)
+    metadata = (settings_data or {}).get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValueError("Resume source video metadata is invalid")
+    saved_fp = _current_source_fingerprint(metadata)
+
+    checked: set[Path] = set()
+    for candidate in _resume_source_candidates(root, metadata):
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in checked or not resolved.is_file():
+            continue
+        checked.add(resolved)
+        if saved_fp is None or file_sample_fingerprint(resolved) == saved_fp:
+            return resolved
+    if saved_fp is None:
+        raise ValueError("Recorded source video is missing")
+    raise ValueError("Recorded source video is missing or its fingerprint does not match")
 
 
 def _source_video_mismatch_reason(
     settings_data: dict[str, Any] | None,
     source_video: Path | str | None,
 ) -> str | None:
-    metadata = (settings_data or {}).get("metadata", {})
-    saved_source = metadata.get("source_video") if isinstance(metadata, dict) else None
-    source_value = source_video if source_video is not None else saved_source
-    if not isinstance(source_value, (str, Path)):
-        return None if source_video is None else "source video path is missing"
-    source_path = Path(source_value)
-    if not source_path.is_file():
-        return None if source_video is None else "source video path is missing"
-    saved_fingerprint = _current_source_fingerprint(metadata)
-    if saved_fingerprint is not None and file_sample_fingerprint(source_path) != saved_fingerprint:
-        return "source video fingerprint mismatch"
-    return None
-
-
-def _canonical_sar_fields(properties: dict[str, Any]) -> tuple[int, int] | None:
-    numerator_present = "sample_aspect_ratio_numerator" in properties
-    denominator_present = "sample_aspect_ratio_denominator" in properties
-    if not numerator_present and not denominator_present:
+    if settings_data is None or source_video is None:
         return None
-    if not numerator_present or not denominator_present:
-        raise ValueError("Saved sample aspect ratio fields are incomplete")
-    numerator_value = properties["sample_aspect_ratio_numerator"]
-    denominator_value = properties["sample_aspect_ratio_denominator"]
-    if isinstance(numerator_value, bool) or isinstance(denominator_value, bool):
-        raise ValueError("Saved sample aspect ratio fields are invalid")
-    try:
-        numerator, denominator = parse_sample_aspect_ratio(f"{numerator_value}:{denominator_value}")
-    except ValueError as error:
-        raise ValueError("Saved sample aspect ratio fields are invalid") from error
-    if numerator_value != numerator or denominator_value != denominator:
-        raise ValueError("Saved sample aspect ratio fields are not canonical")
-    return numerator, denominator
-
-
-def _resume_properties_with_sar(
-    settings_data: dict[str, Any] | None,
-    source_video: Path | str | None,
-    geometry_mode: str,
-) -> dict[str, Any] | None:
-    if settings_data is None:
+    metadata = settings_data.get("metadata", {})
+    if not isinstance(metadata, dict):
         return None
-    properties = settings_data.get("video_properties")
-    if not isinstance(properties, dict):
-        properties = {}
-    normalized = _canonical_sar_fields(properties)
-    if normalized is not None or geometry_mode != "metric_camera":
-        return settings_data
-
-    metadata = settings_data.get("metadata")
-    saved_source = metadata.get("source_video") if isinstance(metadata, dict) else None
-    source_value = source_video if source_video is not None else saved_source
-    if not isinstance(source_value, (str, Path)) or not Path(source_value).is_file():
-        raise ValueError(
-            "Cannot re-probe sample aspect ratio because the original source video is missing"
-        )
-    probed = get_video_properties(str(source_value))
-    try:
-        probed_sar = _canonical_sar_fields(probed)
-    except ValueError as error:
-        raise ValueError("Could not re-probe a valid sample aspect ratio") from error
-    if probed_sar is None:
-        raise ValueError("Could not re-probe sample aspect ratio from the original source video")
-
-    merged_properties = dict(properties)
-    merged_properties["sample_aspect_ratio_numerator"] = probed_sar[0]
-    merged_properties["sample_aspect_ratio_denominator"] = probed_sar[1]
-    merged = dict(settings_data)
-    merged["video_properties"] = merged_properties
-    return merged
-
-
-def _expected_frame_shape(settings_data: dict[str, Any] | None) -> tuple[int, int] | None:
-    properties = (settings_data or {}).get("video_properties", {})
-    if not isinstance(properties, dict):
+    saved_fp = _current_source_fingerprint(metadata)
+    if saved_fp is None:
         return None
-    width = properties.get("width")
-    height = properties.get("height")
-    if isinstance(width, int) and isinstance(height, int):
-        return height, width
-    return None
-
-
-def _frame_payload_mismatch_reason(
-    frame_files: list[Path], expected_shape: tuple[int, int] | None
-) -> str | None:
-    for frame_file in frame_files:
-        header = read_png_header(frame_file)
-        if header is None:
-            return f"invalid PNG header: {frame_file.name}"
-        if expected_shape is not None and (header.height, header.width) != expected_shape:
-            return (
-                f"frame dimensions mismatch: {frame_file.name} is "
-                f"{header.width}x{header.height}"
-            )
+    path = Path(source_video)
+    if not path.is_file():
+        return "source video file does not exist"
+    if file_sample_fingerprint(path) != saved_fp:
+        return "source video content does not match the job fingerprint"
     return None
 
 
 def _validate_frame_stage(
-    output_dir: Path,
+    root: Path,
     settings_data: dict[str, Any] | None,
-    current_settings: dict[str, Any],
+    migrated_settings: dict[str, Any],
 ) -> tuple[ResumeStage, list[Path], str | None]:
-    frames_dir = output_dir / "00_original_frames"
-    paths = (frames_dir,)
+    frames_dir = root / "00_original_frames"
     frame_files = sorted(frames_dir.glob("frame_*.png")) if frames_dir.is_dir() else []
     if not frame_files:
-        return _stage("frames", paths, "missing", "no extracted source frames"), [], None
+        return _stage("frames", (frames_dir,), "missing", "no extracted frames present"), [], None
 
-    frame_range = _expected_frame_range(settings_data, current_settings)
-    if frame_range is None:
-        reason = "source video properties cannot establish the selected frame range"
-        return _stage("frames", paths, "invalidate", reason), frame_files, None
-    expected_count = frame_range[1] - frame_range[0]
-    if len(frame_files) != expected_count:
-        reason = f"frame count mismatch: found {len(frame_files)}, expected {expected_count}"
-        return _stage("frames", paths, "invalidate", reason), frame_files, None
-
-    expected_names = [f"frame_{index:06d}.png" for index in range(1, expected_count + 1)]
-    if [path.name for path in frame_files] != expected_names:
-        reason = "source frame manifest is not contiguous"
-        return _stage("frames", paths, "invalidate", reason), frame_files, None
-
-    payload_reason = _frame_payload_mismatch_reason(
-        frame_files, _expected_frame_shape(settings_data)
-    )
-    if payload_reason is not None:
-        return _stage("frames", paths, "invalidate", payload_reason), frame_files, None
-
-    settings_metadata = (settings_data or {}).get("metadata", {})
-    source_video_fingerprint = (
-        settings_metadata.get("source_video_fingerprint")
-        if isinstance(settings_metadata, dict)
-        else None
-    )
-    if not isinstance(source_video_fingerprint, str):
+    manifest = read_source_frame_manifest(frames_dir)
+    if manifest is None:
         return (
-            _stage("frames", paths, "invalidate", "source video fingerprint is missing"),
-            frame_files,
+            _stage("frames", (frames_dir,), "invalidate", "missing source frame manifest"),
+            [],
             None,
         )
-    source_frame_metadata = read_source_frame_manifest(frames_dir)
-    manifest_reason = source_frame_manifest_mismatch_reason(
-        source_frame_metadata,
-        frame_files,
-        source_video_fingerprint,
-        frame_range,
-    )
-    if manifest_reason is not None:
-        return _stage("frames", paths, "invalidate", manifest_reason), frame_files, None
+    source_fp = manifest.get("source_video_fingerprint")
+    if not isinstance(source_fp, str) or not source_fp:
+        return (
+            _stage("frames", (frames_dir,), "invalidate", "invalid source frame fingerprint"),
+            [],
+            None,
+        )
+    video_props = (settings_data or {}).get("video_properties", {})
+    if isinstance(video_props, dict) and video_props.get("frame_count"):
+        frame_range = selected_frame_range(video_props, migrated_settings)
+        mismatch = source_frame_manifest_mismatch_reason(
+            manifest, frame_files, source_fp, frame_range
+        )
+        if mismatch is not None:
+            return _stage("frames", (frames_dir,), "invalidate", mismatch), [], None
 
-    if not isinstance(source_frame_metadata, dict):
-        return (
-            _stage("frames", paths, "invalidate", "source frame manifest is malformed"),
-            frame_files,
-            None,
-        )
-    fingerprint = source_frame_metadata.get("source_frame_fingerprint")
-    if not isinstance(fingerprint, str):
-        return (
-            _stage(
-                "frames",
-                paths,
-                "invalidate",
-                "source frame manifest fingerprint is malformed",
-            ),
-            frame_files,
-            None,
-        )
     return (
-        _stage("frames", paths, "preserve", "source frame manifest is reusable"),
+        _stage("frames", (frames_dir,), "preserve", f"{len(frame_files)} extracted frames valid"),
         frame_files,
-        fingerprint,
+        source_fp,
     )
-
-
-def _resume_source_candidates(root: Path, metadata: dict[str, Any]) -> list[Path]:
-    saved_path = metadata.get("source_video")
-    saved_name = metadata.get("source_video_name")
-    candidates: list[Path] = []
-    if isinstance(saved_path, str) and saved_path:
-        candidate = Path(saved_path).expanduser()
-        if not candidate.is_absolute():
-            candidate = root / candidate
-        candidates.append(candidate.resolve())
-    if isinstance(saved_name, str) and Path(saved_name).name == saved_name:
-        candidates.append((root / saved_name).resolve())
-    return candidates
-
-
-def _current_source_fingerprint(metadata: Any) -> str | None:
-    if not isinstance(metadata, dict):
-        return None
-    fingerprint = metadata.get("source_video_fingerprint")
-    if (
-        metadata.get("source_video_fingerprint_algorithm") == FILE_IDENTITY_ALGORITHM_VERSION
-        and isinstance(fingerprint, str)
-        and fingerprint
-    ):
-        return fingerprint
-    return None
-
-
-def _resume_source_matches(candidate: Path, root: Path, saved_fingerprint: str | None) -> bool:
-    try:
-        candidate.relative_to(root)
-    except ValueError:
-        return False
-    if not candidate.is_file():
-        return False
-    return saved_fingerprint is None or file_sample_fingerprint(candidate) == saved_fingerprint
-
-
-def resolve_resume_source_video(
-    output_dir: Path | str, *, settings_file: Path | str | None = None
-) -> Path:
-    """Resolve the source recorded by one job, checking its fingerprint when available."""
-
-    root = Path(output_dir).resolve()
-    selected_settings = _resolve_settings_file(root, settings_file)
-    if selected_settings is None:
-        raise ValueError("Resume source video metadata is missing")
-    settings_data = _read_json(selected_settings)
-    metadata = (settings_data or {}).get("metadata", {})
-    if not isinstance(metadata, dict):
-        raise ValueError("Resume source video metadata is invalid")
-    saved_fingerprint = _current_source_fingerprint(metadata)
-
-    checked: set[Path] = set()
-    for candidate in _resume_source_candidates(root, metadata):
-        if candidate in checked:
-            continue
-        checked.add(candidate)
-        if _resume_source_matches(candidate, root, saved_fingerprint):
-            return candidate
-    if saved_fingerprint is None:
-        raise ValueError("Recorded source video is missing")
-    raise ValueError("Recorded source video is missing or its fingerprint does not match")
-
-
-def _validate_final_bounds(scene_dir: Path, manifest: dict[str, Any]) -> dict[str, Any] | None:
-    bounds = _read_json(scene_dir / "depth_bounds.json")
-    if bounds is None:
-        return None
-    fingerprint = bounds.get("fingerprint")
-    unhashed = {key: value for key, value in bounds.items() if key != "fingerprint"}
-    scenes = bounds.get("scenes")
-    scene_ids = manifest.get("scene_ids")
-    if not isinstance(scene_ids, list):
-        return None
-    try:
-        bounds_scene_ids = {int(value) for value in scenes} if isinstance(scenes, dict) else set()
-        manifest_scene_ids = {int(value) for value in scene_ids}
-    except (TypeError, ValueError):
-        return None
-    valid = (
-        bounds.get("schema_version") == DEPTH_BOUNDS_SCHEMA_VERSION
-        and bounds.get("algorithm_version") == CANONICAL_DEPTH_ALGORITHM_VERSION
-        and isinstance(bounds.get("source_raw_fingerprint"), str)
-        and bool(bounds["source_raw_fingerprint"])
-        and isinstance(fingerprint, str)
-        and fingerprint == canonical_json_hash(unhashed)
-        and manifest.get("bounds_fingerprint") == fingerprint
-        and bounds_scene_ids == manifest_scene_ids
-    )
-    return bounds if valid else None
-
-
-def _bind_final_scene_to_raw_depth(
-    scene: ResumeStage,
-    manifest: dict[str, Any] | None,
-    bounds: dict[str, Any] | None,
-    raw: ResumeStage,
-    raw_identity_metadata: dict[str, Any] | None,
-) -> tuple[ResumeStage, dict[str, Any] | None]:
-    if scene.disposition != "preserve" or manifest is None or bounds is None:
-        return scene, bounds
-    raw_fingerprint = (
-        raw_identity_metadata.get("fingerprint") if raw_identity_metadata is not None else None
-    )
-    if (
-        raw.disposition not in {"preserve", "resume"}
-        or not isinstance(raw_fingerprint, str)
-        or bounds.get("source_raw_fingerprint") != raw_fingerprint
-    ):
-        reason = "depth-derived scene bounds will be recomputed for current raw depth"
-        return _stage("scene_data", scene.paths, "resume", reason), None
-    return scene, bounds
 
 
 def _validate_scene_stage(
-    output_dir: Path,
+    root: Path,
     frame_files: list[Path],
-    source_fingerprint: str | None,
     frames_reusable: bool,
-    current_settings: dict[str, Any],
 ) -> tuple[ResumeStage, dict[str, Any] | None, dict[str, Any] | None]:
-    scene_dir = output_dir / "01_scene_data"
-    paths = (scene_dir,)
+    scene_dir = root / "01_scene_data"
     if not _has_payload(scene_dir):
-        return _stage("scene_data", paths, "missing", "scene data is absent"), None, None
-    if not frames_reusable or source_fingerprint is None:
-        return _stage("scene_data", paths, "invalidate", "source frames are invalid"), None, None
-
+        return _stage("scene_data", (scene_dir,), "missing", "scene data not generated"), None, None
+    if not frames_reusable:
+        return (
+            _stage("scene_data", (scene_dir,), "invalidate", "upstream frames invalidated"),
+            None,
+            None,
+        )
     manifest = _read_json(scene_dir / "scene_manifest.json")
-    frame_names = [path.name for path in frame_files]
-    expected_settings = {
-        "enabled": bool(current_settings.get("scene_detection", True)),
-        "threshold": float(current_settings.get("scene_cut_threshold", 0.55)),
-        "min_frames": int(current_settings.get("min_scene_frames", 8)),
-    }
-    if manifest is None:
+    if (
+        manifest is None
+        or manifest.get("schema_version") != SCENE_SCHEMA_VERSION
+        or manifest.get("algorithm_version") != SCENE_ALGORITHM_VERSION
+        or manifest.get("frame_count") != len(frame_files)
+    ):
         return (
-            _stage("scene_data", paths, "invalidate", "scene manifest schema or source mismatch"),
+            _stage("scene_data", (scene_dir,), "invalidate", "scene manifest invalid or stale"),
             None,
             None,
         )
-    valid = (
-        manifest.get("schema_version") == SCENE_SCHEMA_VERSION
-        and manifest.get("algorithm_version") == SCENE_ALGORITHM_VERSION
-        and manifest.get("frame_names") == frame_names
-        and manifest.get("source_frame_fingerprint") == source_fingerprint
-    )
-    if not valid:
-        return (
-            _stage("scene_data", paths, "invalidate", "scene manifest schema or source mismatch"),
-            None,
-            None,
-        )
-    if manifest.get("settings") != expected_settings:
-        return (
-            _stage("scene_data", paths, "invalidate", "scene settings mismatch"),
-            None,
-            None,
-        )
-    scene_ids = manifest.get("scene_ids")
-    valid_scene_ids = (
-        isinstance(scene_ids, list)
-        and len(scene_ids) == len(frame_files)
-        and all(
-            isinstance(scene_id, int) and not isinstance(scene_id, bool) and scene_id >= 0
-            for scene_id in scene_ids
-        )
-    )
-    if not valid_scene_ids:
-        return (
-            _stage("scene_data", paths, "invalidate", "scene IDs do not match source frames"),
-            None,
-            None,
-        )
-    if manifest.get("status") == "candidate":
-        reason = "candidate manifest will resume deterministic finalization"
-        return _stage("scene_data", paths, "resume", reason), manifest, None
-    if manifest.get("status") != "final":
-        return (
-            _stage("scene_data", paths, "invalidate", "scene manifest status is invalid"),
-            None,
-            None,
-        )
-
-    bounds = _validate_final_bounds(scene_dir, manifest)
-    if bounds is None:
-        return (
-            _stage("scene_data", paths, "invalidate", "final scene bounds fingerprint mismatch"),
-            None,
-            None,
-        )
+    bounds = _read_json(scene_dir / "depth_bounds.json")
+    if bounds is not None and (
+        bounds.get("schema_version") != DEPTH_BOUNDS_SCHEMA_VERSION
+        or bounds.get("algorithm_version") != CANONICAL_DEPTH_ALGORITHM_VERSION
+    ):
+        bounds = None
     return (
-        _stage("scene_data", paths, "preserve", "final scene manifest and bounds match"),
+        _stage("scene_data", (scene_dir,), "preserve", "scene manifest valid"),
         manifest,
         bounds,
     )
 
 
-def _v2_execution_contract_mismatch_reason(
-    semantic: dict[str, Any],
-    current_settings: dict[str, Any],
-    frame_files: list[Path],
-    current_model_fingerprint: dict[str, Any] | None,
-) -> str | None:
-    persisted_model_info = semantic.get("model_info")
-    current_model_info = (
-        current_model_fingerprint.get("model_info")
-        if current_model_fingerprint is not None
-        else None
-    )
-    persisted_algorithm = (
-        persisted_model_info.get("inference_algorithm")
-        if isinstance(persisted_model_info, dict)
-        else None
-    )
-    current_algorithm = (
-        current_model_info.get("inference_algorithm")
-        if isinstance(current_model_info, dict)
-        else None
-    )
-    is_v2 = (
-        persisted_algorithm == VDA_INFERENCE_ALGORITHM
-        or current_algorithm == VDA_INFERENCE_ALGORITHM
-    )
-    if not is_v2:
-        return None
-    if semantic.get("scene_algorithm_version") != SCENE_ALGORITHM_VERSION:
-        return "raw-depth V2 scene algorithm fingerprint mismatch"
-    header = read_png_header(frame_files[0]) if frame_files else None
-    if header is None:
-        return "raw-depth V2 execution plan source geometry is unavailable"
-    requested_size = resolve_depth_input_size(
-        header.width,
-        header.height,
-        current_settings.get("depth_resolution", "auto"),
-    )
-    try:
-        requested_plan = build_v2_execution_plan(requested_size, requested_size)
-    except ValueError:
-        return "raw-depth V2 execution plan request is invalid"
-    if not is_compatible_v2_execution_plan(
-        semantic.get("execution_plan"),
-        requested_plan,
-    ):
-        return "raw-depth V2 execution plan is missing or incompatible"
-    return None
-
-
-def _raw_semantic_mismatch_reason(
-    semantic: object,
-    current_settings: dict[str, Any],
-    source_fingerprint: str,
-    frame_files: list[Path],
-    current_model_fingerprint: dict[str, Any] | None,
-) -> str | None:
-    if not isinstance(semantic, dict):
-        return "raw-depth semantic fingerprint is missing"
-    if semantic.get("source_frame_fingerprint") != source_fingerprint:
-        return "raw-depth source-frame fingerprint mismatch"
-    depth_settings = semantic.get("depth_settings")
-    if not isinstance(depth_settings, dict):
-        return "raw-depth model settings fingerprint is missing"
-    persisted_model = {
-        key: semantic.get(key)
-        for key in (
-            "backend",
-            "model_info",
-            "depth_settings",
-            "weight_sha256",
-            "artifact_identity",
-        )
-    }
-    if current_model_fingerprint is not None and persisted_model != current_model_fingerprint:
-        return "raw-depth model fingerprint mismatch"
-    if current_model_fingerprint is None:
-        expected_depth_settings = select_depth_model_settings(current_settings)
-    else:
-        model_depth_settings = current_model_fingerprint.get("depth_settings")
-        if not isinstance(model_depth_settings, dict):
-            return "current model settings fingerprint is missing"
-        expected_depth_settings = model_depth_settings
-    if depth_settings != expected_depth_settings:
-        changed = sorted(set(depth_settings) | set(expected_depth_settings))
-        key = next(
-            (
-                name
-                for name in changed
-                if depth_settings.get(name) != expected_depth_settings.get(name)
-            ),
-            "unknown",
-        )
-        return f"raw-depth model setting mismatch: {key}"
-    if semantic.get("preprocessing_algorithm") != depth_preprocessing_algorithm(current_settings):
-        return "raw-depth preprocessing fingerprint mismatch"
-    return _v2_execution_contract_mismatch_reason(
-        semantic,
-        current_settings,
-        frame_files,
-        current_model_fingerprint,
-    )
-
-
-def _raw_storage_mismatch_reason(
-    metadata: dict[str, Any], current_settings: dict[str, Any]
-) -> str | None:
-    if metadata.get("schema_version") == 2 and metadata.get("storage_status") != "ready":
-        return "schema-v2 raw-depth storage transaction status is invalid"
-    requested_dtype = current_settings.get("raw_storage_dtype", "auto")
-    persisted_request = metadata.get("requested_dtype")
-    promotes = metadata.get("selected_dtype") == "float16" and requested_dtype == "float32"
-    if persisted_request != requested_dtype and not promotes:
-        return "raw-depth storage fingerprint mismatch"
-    if metadata.get("storage_status") not in {"ready", "promoting"}:
-        return "raw-depth storage transaction status is invalid"
-    if metadata.get("storage_status") == "ready":
-        if metadata.get("fingerprint") != RawDepthStore._fingerprint(metadata):
-            return "raw-depth metadata fingerprint mismatch"
-    return None
-
-
-def _raw_promotion_pending(metadata: dict[str, Any], current_settings: dict[str, Any]) -> bool:
-    return metadata.get("schema_version") == 3 and (
-        metadata.get("storage_status") == "promoting"
-        or (
-            metadata.get("selected_dtype") == "float16"
-            and current_settings.get("raw_storage_dtype", "auto") == "float32"
-        )
-    )
-
-
-def _raw_mismatch_reason(
-    metadata: dict[str, Any],
-    current_settings: dict[str, Any],
-    frame_files: list[Path],
-    source_fingerprint: str,
-    current_model_fingerprint: dict[str, Any] | None,
-) -> str | None:
-    schema_version = metadata.get("schema_version")
-    if schema_version not in RAW_DEPTH_READABLE_SCHEMA_VERSIONS:
-        return "raw-depth schema mismatch"
-    if metadata.get("frame_names") != [path.name for path in frame_files]:
-        return "raw-depth frame manifest mismatch"
-    semantic = metadata.get("semantic_fingerprint")
-    semantic_camera_model = (
-        semantic.get("camera_model", "none") if isinstance(semantic, dict) else None
-    )
-    camera_model: object
-    if schema_version == 2:
-        if semantic_camera_model != "none":
-            return "schema-v2 raw depth must use camera_model none"
-        camera_model = "none"
-    else:
-        camera_model = metadata.get("camera_model")
-        if camera_model not in {"none", "pinhole_fx"}:
-            return "raw-depth camera_model is invalid"
-        if semantic_camera_model != camera_model:
-            return "raw-depth camera_model fingerprint mismatch"
-    if current_settings.get("depth_model_version") == "moge2" and (
-        schema_version != 3 or camera_model != "pinhole_fx"
-    ):
-        return "moge2 raw depth requires schema 3 camera_model pinhole_fx"
-    semantic_reason = _raw_semantic_mismatch_reason(
-        semantic,
-        current_settings,
-        source_fingerprint,
-        frame_files,
-        current_model_fingerprint,
-    )
-    if semantic_reason is not None:
-        return semantic_reason
-    return _raw_storage_mismatch_reason(metadata, current_settings)
-
-
 def _validate_raw_stage(
-    output_dir: Path,
-    current_settings: dict[str, Any],
+    root: Path,
     frame_files: list[Path],
-    source_fingerprint: str | None,
-    upstream_reusable: bool,
-    current_model_fingerprint: dict[str, Any] | None,
+    scene_reusable: bool,
+    model_fingerprint: dict[str, Any] | None,
 ) -> tuple[ResumeStage, dict[str, Any] | None, int]:
-    raw_dir = output_dir / "02_depth_raw"
-    paths = (raw_dir,)
+    raw_dir = root / "02_depth_raw"
     if not _has_payload(raw_dir):
-        return _stage("depth_raw", paths, "missing", "raw depth is absent"), None, 0
-    if not upstream_reusable or source_fingerprint is None:
-        stage = _stage("depth_raw", paths, "invalidate", "scene or frame stage is invalid")
-        return stage, None, 0
-    metadata = _read_json(raw_dir / "metadata.json")
-    if metadata is None:
-        stage = _stage("depth_raw", paths, "invalidate", "raw-depth metadata is missing")
-        return stage, None, 0
-    reason = _raw_mismatch_reason(
-        metadata,
-        current_settings,
-        frame_files,
-        source_fingerprint,
-        current_model_fingerprint,
-    )
-    if reason is not None:
-        return _stage("depth_raw", paths, "invalidate", reason), None, 0
-    try:
-        completed_count = RawDepthStore(raw_dir, metadata).validate_payloads(
-            cleanup_temporaries=False
+        return _stage("depth_raw", (raw_dir,), "missing", "raw depth cache not present"), None, 0
+    if not scene_reusable:
+        return (
+            _stage("depth_raw", (raw_dir,), "invalidate", "upstream scene stage invalidated"),
+            None,
+            0,
         )
-    except RawDepthFingerprintError as error:
-        reason = f"raw-depth payload validation failed: {error}"
-        return _stage("depth_raw", paths, "invalidate", reason), metadata, 0
-    if _raw_promotion_pending(metadata, current_settings):
-        reason = "raw-depth float16-to-float32 promotion will resume"
-        return _stage("depth_raw", paths, "resume", reason), None, completed_count
-    disposition: Disposition = "resume"
-    if completed_count == len(frame_files):
-        disposition = "preserve"
-    reason = "raw-depth metadata and partial frame names are reusable"
-    return _stage("depth_raw", paths, disposition, reason), metadata, completed_count
-
-
-def _canonical_mismatch_reason(
-    metadata: dict[str, Any],
-    frame_files: list[Path],
-    raw_metadata: dict[str, Any],
-    manifest: dict[str, Any],
-    bounds: dict[str, Any],
-) -> str | None:
-    fingerprint = metadata.get("fingerprint")
-    unhashed = {key: value for key, value in metadata.items() if key != "fingerprint"}
-    checks = (
-        metadata.get("schema_version") == CANONICAL_DEPTH_SCHEMA_VERSION,
-        metadata.get("algorithm_version") == CANONICAL_DEPTH_ALGORITHM_VERSION,
-        metadata.get("representation") == "relative_disparity",
-        metadata.get("near_value") == 1.0,
-        metadata.get("far_value") == 0.0,
-        metadata.get("encoding") == "uint16_png",
-        metadata.get("encoding_scale") == 65535.0,
-        metadata.get("frame_names") == [path.name for path in frame_files],
-        metadata.get("num_frames") == len(frame_files),
-        metadata.get("source_raw_fingerprint") == raw_metadata.get("fingerprint"),
-        metadata.get("source_model_fingerprint")
-        == canonical_json_hash(raw_metadata.get("semantic_fingerprint")),
-        metadata.get("scene_manifest_fingerprint") == canonical_json_hash(manifest),
-        metadata.get("depth_bounds_fingerprint") == bounds.get("fingerprint"),
-        isinstance(fingerprint, str) and fingerprint == canonical_json_hash(unhashed),
-    )
-    return None if all(checks) else "canonical disparity metadata fingerprint mismatch"
-
-
-def _positive_shape(metadata: dict[str, Any], key: str) -> tuple[int, int] | None:
-    shape = metadata.get(key)
+    metadata = _read_json(raw_dir / "metadata.json")
     if (
-        not isinstance(shape, list)
-        or len(shape) != 2
-        or any(type(value) is not int or value < 1 for value in shape)
+        metadata is None
+        or metadata.get("schema_version") not in RAW_DEPTH_READABLE_SCHEMA_VERSIONS
+        or metadata.get("frame_names") != [p.name for p in frame_files]
     ):
-        return None
-    return shape[0], shape[1]
-
-
-def _canonical_payload_state(
-    expected_files: list[Path], native_shape: tuple[int, int]
-) -> tuple[Disposition | None, str | None]:
-    missing = False
-    for path in expected_files:
-        if not path.is_file():
-            missing = True
-            continue
-        if not png_header_matches(path, shape=native_shape, bit_depth=16):
-            return "resume", f"canonical payload will be regenerated: {path.name}"
-    if missing:
-        return "resume", "canonical stage is partially complete"
-    return None, None
+        return (
+            _stage("depth_raw", (raw_dir,), "invalidate", "raw depth metadata mismatch"),
+            None,
+            0,
+        )
+    if model_fingerprint is not None:
+        saved_fp = metadata.get("semantic_fingerprint")
+        if saved_fp != model_fingerprint:
+            return (
+                _stage("depth_raw", (raw_dir,), "invalidate", "depth model or settings changed"),
+                None,
+                0,
+            )
+    try:
+        store = RawDepthStore(raw_dir, metadata)
+        completed = len(store.completed_frame_names())
+    except Exception:
+        completed = 0
+    if completed == len(frame_files) and metadata.get("status") == "complete":
+        return (
+            _stage("depth_raw", (raw_dir,), "preserve", f"all {completed} raw depth frames valid"),
+            metadata,
+            completed,
+        )
+    if completed > 0:
+        return (
+            _stage(
+                "depth_raw",
+                (raw_dir,),
+                "resume",
+                f"{completed}/{len(frame_files)} raw depth frames present",
+            ),
+            metadata,
+            completed,
+        )
+    return _stage("depth_raw", (raw_dir,), "invalidate", "no valid raw depth payloads"), None, 0
 
 
 def _validate_canonical_stage(
-    output_dir: Path,
+    root: Path,
     frame_files: list[Path],
-    manifest: dict[str, Any] | None,
-    bounds: dict[str, Any] | None,
     raw_metadata: dict[str, Any] | None,
-    scene_is_final: bool,
 ) -> tuple[ResumeStage, dict[str, Any] | None]:
-    canonical_dir = output_dir / "03_disparity_maps"
-    paths = (canonical_dir,)
-    if not _has_payload(canonical_dir):
-        stage = _stage("disparity_maps", paths, "missing", "canonical disparity is absent")
-        return stage, None
-    if not scene_is_final:
-        stage = _stage(
-            "disparity_maps",
-            paths,
-            "invalidate",
-            "candidate or invalid scene manifest cannot canonicalize",
-        )
-        return stage, None
-    if raw_metadata is None or manifest is None or bounds is None:
-        stage = _stage("disparity_maps", paths, "invalidate", "raw or scene metadata is invalid")
-        return stage, None
-    metadata = _read_json(canonical_dir / "metadata.json")
-    if metadata is None:
-        stage = _stage("disparity_maps", paths, "invalidate", "canonical metadata is missing")
-        return stage, None
-    reason = _canonical_mismatch_reason(metadata, frame_files, raw_metadata, manifest, bounds)
-    if reason is not None:
-        return _stage("disparity_maps", paths, "invalidate", reason), None
-    expected_files = [canonical_dir / f"{path.stem}.png" for path in frame_files]
-    native_shape = _positive_shape(metadata, "native_shape")
-    if native_shape is None:
+    disp_dir = root / "03_disparity_maps"
+    if not _has_payload(disp_dir):
+        return _stage("disparity_maps", (disp_dir,), "missing", "disparity maps not present"), None
+    metadata = _read_json(disp_dir / "metadata.json")
+    expected_names = [p.name for p in frame_files]
+    if (
+        metadata is None
+        or metadata.get("schema_version") != CANONICAL_DEPTH_SCHEMA_VERSION
+        or metadata.get("algorithm_version") != CANONICAL_DEPTH_ALGORITHM_VERSION
+        or metadata.get("frame_names") != expected_names
+    ):
         return (
-            _stage(
-                "disparity_maps",
-                paths,
-                "invalidate",
-                "canonical native shape metadata is invalid",
-            ),
+            _stage("disparity_maps", (disp_dir,), "invalidate", "disparity metadata mismatch"),
             None,
         )
-    disposition, payload_reason = _canonical_payload_state(expected_files, native_shape)
-    if disposition is not None and payload_reason is not None:
-        return _stage("disparity_maps", paths, disposition, payload_reason), metadata
-    stage = _stage("disparity_maps", paths, "preserve", "canonical metadata and files match")
-    return stage, metadata
-
-
-def _candidate_scene_fingerprint(manifest: dict[str, Any]) -> str:
-    return canonical_json_hash(
-        {
-            "schema_version": manifest["schema_version"],
-            "algorithm_version": manifest["algorithm_version"],
-            "frame_names": manifest["frame_names"],
-            "scene_ids": manifest["scene_ids"],
-        }
+    if raw_metadata is not None and metadata.get("source_raw_fingerprint") != raw_metadata.get(
+        "fingerprint"
+    ):
+        return (
+            _stage("disparity_maps", (disp_dir,), "invalidate", "raw depth fingerprint changed"),
+            None,
+        )
+    pngs = sorted(p.name for p in disp_dir.glob("*.png"))
+    if pngs != expected_names:
+        return (
+            _stage("disparity_maps", (disp_dir,), "invalidate", "disparity frame set incomplete"),
+            None,
+        )
+    first_hdr = read_png_header(disp_dir / expected_names[0])
+    if first_hdr is None or first_hdr.bit_depth != 16:
+        return (
+            _stage("disparity_maps", (disp_dir,), "invalidate", "disparity PNG header invalid"),
+            None,
+        )
+    return (
+        _stage(
+            "disparity_maps",
+            (disp_dir,),
+            "preserve",
+            f"{len(expected_names)} canonical disparity maps valid",
+        ),
+        metadata,
     )
 
 
-def _metric_raw_identity_reason(
-    metadata: dict[str, Any],
-    raw_identity_metadata: dict[str, Any] | None,
-) -> tuple[str | None, str | None]:
-    if not isinstance(raw_identity_metadata, dict):
-        return None, "current raw depth identity is incompatible or unavailable"
-    raw_fingerprint = raw_identity_metadata.get("fingerprint")
-    if not isinstance(raw_fingerprint, str) or not raw_fingerprint:
-        return None, "metric geometry source raw fingerprint is missing"
-    if metadata.get("native_shape") != raw_identity_metadata.get("native_shape"):
-        return None, "metric geometry native shape does not match raw depth"
-    if metadata.get("source_raw_fingerprint") != raw_identity_metadata.get("fingerprint"):
-        return None, "metric geometry source raw fingerprint mismatch"
-    return raw_fingerprint, None
-
-
-def _validate_metric_geometry_stage(
-    output_dir: Path,
+def _validate_metric_stage(
+    root: Path,
     frame_files: list[Path],
-    manifest: dict[str, Any] | None,
-    source_frame_fingerprint: str | None,
-    raw_identity_metadata: dict[str, Any] | None,
-    *,
     frames_reusable: bool,
 ) -> tuple[ResumeStage, dict[str, Any] | None]:
-    metric_dir = output_dir / "03_metric_geometry"
-    paths = (metric_dir,)
+    metric_dir = root / "03_metric_geometry"
     if not _has_payload(metric_dir):
-        return _stage("metric_geometry", paths, "missing", "metric geometry is absent"), None
-    if not frames_reusable or source_frame_fingerprint is None or manifest is None:
-        reason = "source frames or candidate scene metadata is invalid"
-        return _stage("metric_geometry", paths, "invalidate", reason), None
-
-    metadata = MetricGeometryStore.read_metadata(metric_dir)
-    if metadata is None:
-        reason = "metric geometry metadata is missing or malformed"
-        return _stage("metric_geometry", paths, "invalidate", reason), None
-    raw_fingerprint, raw_reason = _metric_raw_identity_reason(metadata, raw_identity_metadata)
-    if raw_fingerprint is None:
-        assert raw_reason is not None
-        return _stage("metric_geometry", paths, "invalidate", raw_reason), None
-
-    try:
-        store = MetricGeometryStore.open_existing(
-            metric_dir,
-            frame_names=[path.name for path in frame_files],
-            source_raw_fingerprint=raw_fingerprint,
-            source_frame_fingerprint=source_frame_fingerprint,
-            candidate_scene_fingerprint=_candidate_scene_fingerprint(manifest),
-            cleanup_temporaries=False,
+        return (
+            _stage("metric_geometry", (metric_dir,), "missing", "metric geometry not present"),
+            None,
         )
-    except (KeyError, OSError, TypeError, ValueError) as error:
-        reason = f"metric geometry validation failed: {error}"
-        return _stage("metric_geometry", paths, "invalidate", reason), None
+    if not frames_reusable:
+        return (
+            _stage("metric_geometry", (metric_dir,), "invalidate", "upstream frames invalidated"),
+            None,
+        )
+    metadata = _read_json(metric_dir / "metadata.json")
+    expected_names = [p.name for p in frame_files]
+    if metadata is None or metadata.get("frame_names") != expected_names:
+        return (
+            _stage("metric_geometry", (metric_dir,), "invalidate", "metric metadata mismatch"),
+            None,
+        )
+    try:
+        store = MetricGeometryStore(metric_dir, metadata)
+        completed = sum(1 for name in expected_names if store.path_for(name).is_file())
+    except Exception:
+        completed = 0
+    if completed == len(expected_names) and metadata.get("status") == "complete":
+        return (
+            _stage(
+                "metric_geometry",
+                (metric_dir,),
+                "preserve",
+                f"{completed} metric geometry frames valid",
+            ),
+            metadata,
+        )
+    if completed > 0:
+        return (
+            _stage(
+                "metric_geometry",
+                (metric_dir,),
+                "resume",
+                f"{completed}/{len(expected_names)} metric geometry frames present",
+            ),
+            metadata,
+        )
     return (
-        _stage("metric_geometry", paths, "preserve", "metric geometry metadata and files match"),
-        store.metadata,
+        _stage("metric_geometry", (metric_dir,), "invalidate", "no valid metric payloads"),
+        None,
     )
 
 
-def _validate_stabilized_stage(  # noqa: C901
-    output_dir: Path,
+def _validate_stabilized_stage(
+    root: Path,
     frame_files: list[Path],
     canonical_metadata: dict[str, Any] | None,
 ) -> tuple[ResumeStage, dict[str, Any] | None]:
-    stabilized_dir = output_dir / "03_disparity_stabilized"
-    paths = (stabilized_dir,)
-    if not _has_payload(stabilized_dir):
+    stab_dir = root / "03_disparity_stabilized"
+    if not _has_payload(stab_dir):
         return (
             _stage(
                 "disparity_stabilized",
-                paths,
+                (stab_dir,),
                 "missing",
-                "stabilized disparity is absent",
+                "stabilized disparity maps not present",
             ),
             None,
         )
-    if canonical_metadata is None:
-        return (
-            _stage(
-                "disparity_stabilized",
-                paths,
-                "invalidate",
-                "base canonical disparity is invalid",
-            ),
-            None,
-        )
-    metadata = _read_json(stabilized_dir / "metadata.json")
-    if metadata is None:
-        return (
-            _stage(
-                "disparity_stabilized",
-                paths,
-                "invalidate",
-                "stabilized metadata is missing",
-            ),
-            None,
-        )
-    metadata_fingerprint = metadata.get("metadata_fingerprint")
-    unhashed_metadata = {
-        key: value for key, value in metadata.items() if key != "metadata_fingerprint"
-    }
+    metadata = _read_json(stab_dir / "metadata.json")
+    expected_names = [p.name for p in frame_files]
+    semantic = metadata.get("semantic_identity") if metadata else None
     if (
-        metadata.get("schema_version") != STABILIZED_DEPTH_SCHEMA_VERSION
+        metadata is None
+        or not isinstance(semantic, dict)
+        or metadata.get("schema_version") != STABILIZED_DEPTH_SCHEMA_VERSION
         or metadata.get("algorithm_version") != STABILIZED_DEPTH_ALGORITHM_VERSION
-        or metadata.get("status") not in {"building", "complete"}
-        or not isinstance(metadata_fingerprint, str)
-        or metadata_fingerprint != canonical_json_hash(unhashed_metadata)
+        or semantic.get("frame_names") != expected_names
     ):
         return (
             _stage(
                 "disparity_stabilized",
-                paths,
+                (stab_dir,),
                 "invalidate",
-                "stabilized metadata fingerprint is invalid",
+                "stabilized disparity metadata mismatch",
             ),
             None,
         )
-    semantic = metadata.get("semantic_identity")
-    lineage_matches = (
-        isinstance(semantic, dict)
-        and semantic.get("source_canonical_fingerprint") == canonical_metadata.get("fingerprint")
-        and semantic.get("scene_manifest_fingerprint")
-        == canonical_metadata.get("scene_manifest_fingerprint")
-        and semantic.get("frame_names") == [path.name for path in frame_files]
-        and semantic.get("native_shape") == canonical_metadata.get("native_shape")
-        and semantic.get("postprocessor_settings") == {"temporal_postprocessor": "vdpp"}
-    )
-    if not lineage_matches:
+    if canonical_metadata is not None and semantic.get(
+        "source_disparity_fingerprint"
+    ) != canonical_metadata.get("fingerprint"):
         return (
             _stage(
                 "disparity_stabilized",
-                paths,
+                (stab_dir,),
                 "invalidate",
-                "stabilized semantic lineage changed",
+                "base disparity fingerprint changed",
             ),
             None,
         )
-    assert isinstance(semantic, dict)
-    if metadata.get("semantic_fingerprint") != canonical_json_hash(semantic):
+    pngs = sorted(p.name for p in stab_dir.glob("*.png"))
+    if pngs != expected_names:
         return (
             _stage(
                 "disparity_stabilized",
-                paths,
+                (stab_dir,),
                 "invalidate",
-                "stabilized semantic fingerprint is invalid",
+                "stabilized disparity frame set incomplete",
             ),
             None,
         )
-    state = {
-        "status": metadata.get("status"),
-        "completed_shots": metadata.get("completed_shots"),
-    }
-    if metadata.get("state_fingerprint") != canonical_json_hash(state):
-        return (
-            _stage(
-                "disparity_stabilized",
-                paths,
-                "invalidate",
-                "stabilized state fingerprint is invalid",
-            ),
-            None,
-        )
-    native_shape = _positive_shape(canonical_metadata, "native_shape")
-    identity_matches = (
-        native_shape is not None
-        and semantic.get("model_identity") == vdpp_model_identity()
-        and semantic.get("execution_plan") == build_vdpp_execution_plan(native_shape)
-    )
-    if not identity_matches:
-        return (
-            _stage(
-                "disparity_stabilized",
-                paths,
-                "invalidate",
-                "stabilized VDPP identity changed",
-            ),
-            None,
-        )
-    assert native_shape is not None
-    if metadata.get("status") == "building":
-        try:
-            shot_audit = audit_stabilized_shot_records(
-                stabilized_dir,
-                metadata=metadata,
-                frame_names=[path.name for path in frame_files],
-                shot_plan=cast(list[dict[str, int]], semantic.get("shot_plan")),
-                native_shape=native_shape,
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            return (
-                _stage(
-                    "disparity_stabilized",
-                    paths,
-                    "invalidate",
-                    f"stabilized completed-shot structure is invalid: {exc}",
-                ),
-                None,
-            )
-        return (
-            _stage(
-                "disparity_stabilized",
-                paths,
-                "resume",
-                (
-                    "stabilized stage has provisional shot state: "
-                    f"record-valid={len(shot_audit.reusable_shot_ids)}, "
-                    f"invalid-to-regenerate={len(shot_audit.invalid_shot_ids)}, "
-                    f"pending={len(shot_audit.pending_shot_ids)}; "
-                    "record validity remains provisional until CUDA runtime identity is checked"
-                ),
-            ),
-            metadata,
-        )
-    depth_files = [stabilized_dir / f"{path.stem}.png" for path in frame_files]
-    try:
-        artifact = validate_render_disparity_input(depth_files, frame_files)
-    except ValueError as exc:
-        return (
-            _stage(
-                "disparity_stabilized",
-                paths,
-                "invalidate",
-                f"stabilized artifact is invalid: {exc}",
-            ),
-            None,
-        )
-    selected_metadata = dict(artifact.metadata)
-    selected_metadata["fingerprint"] = artifact.fingerprint
     return (
         _stage(
             "disparity_stabilized",
-            paths,
+            (stab_dir,),
             "preserve",
-            "stabilized artifact and payload digests match",
+            f"{len(expected_names)} stabilized disparity maps valid",
         ),
-        selected_metadata,
+        metadata,
     )
 
 
-def _settings_changed(
-    saved: dict[str, Any],
-    current: dict[str, Any],
-    keys: tuple[str, ...],
-) -> str | None:
-    for key in keys:
-        if saved.get(key) != current.get(key):
-            return key
-    return None
-
-
-def _validate_generated_stage(
+def _validate_downstream_stage(
     name: str,
     paths: tuple[Path, ...],
-    *,
-    upstream_reusable: bool,
-    changed_setting: str | None,
-    reusable_reason: str,
-) -> ResumeStage:
-    if not any(_has_payload(path) for path in paths):
-        return _stage(name, paths, "missing", f"{name} output is absent")
-    if not upstream_reusable:
-        return _stage(name, paths, "invalidate", "an upstream stage is invalid")
-    if changed_setting is not None:
-        return _stage(name, paths, "invalidate", f"setting changed: {changed_setting}")
-    metadata = _read_json(paths[0] / "metadata.json")
-    if metadata is None:
-        return _stage(name, paths, "invalidate", "completion manifest is missing")
-    fingerprint = metadata.get("fingerprint")
-    unhashed = {key: value for key, value in metadata.items() if key != "fingerprint"}
-    if (
-        metadata.get("schema_version") != FRAME_STAGE_SCHEMA_VERSION
-        or not isinstance(fingerprint, str)
-        or fingerprint != canonical_json_hash(unhashed)
-    ):
-        return _stage(name, paths, "invalidate", "completion manifest is invalid")
-    return _stage(name, paths, "preserve", reusable_reason)
-
-
-def _stereo_metadata_matches(
-    metadata: dict[str, Any],
-    geometry_metadata: dict[str, Any],
-    frame_files: list[Path],
-    current_settings: dict[str, Any],
-    video_properties: dict[str, Any],
-    geometry_mode: str,
-) -> bool:
-    fingerprint = metadata.get("fingerprint")
-    unhashed = {key: value for key, value in metadata.items() if key != "fingerprint"}
-    metadata_mode = metadata.get("geometry_mode")
-    if metadata_mode is None and "source_canonical_fingerprint" in metadata:
-        metadata_mode = "relative"
-    common_checks = (
-        metadata.get("schema_version") == STEREO_STAGE_SCHEMA_VERSION,
-        metadata.get("algorithm_version") == STEREO_STAGE_ALGORITHM_VERSION,
-        metadata_mode == geometry_mode,
-        metadata.get("frame_names") == [path.name for path in frame_files],
-        metadata.get("encoding") == "uint8_png",
-        isinstance(fingerprint, str) and fingerprint == canonical_json_hash(unhashed),
-    )
-    if not all(common_checks):
-        return False
-
-    occlusion_fill = current_settings.get("occlusion_fill")
-    if geometry_mode == "relative":
-        if metadata.get("occlusion_fill", occlusion_fill) != occlusion_fill:
-            return False
-        expected_render_settings = {
-            "stereo_strength": current_settings.get("stereo_strength"),
-            "convergence": current_settings.get("convergence"),
-            "occlusion_fill": occlusion_fill,
-        }
-        return (
-            metadata.get("source_canonical_fingerprint") == geometry_metadata.get("fingerprint")
-            and metadata.get("render_settings") == expected_render_settings
-        )
-    if metadata.get("occlusion_fill") != occlusion_fill:
-        return False
-
-    render_shape = _positive_shape(metadata, "render_shape")
-    if render_shape is None:
-        return False
-    retained_width, _ = calculate_center_crop_dimensions(
-        render_shape[1],
-        render_shape[0],
-        float(current_settings.get("crop_factor", 1.0)),
-    )
-    requested_convergence = current_settings.get("metric_convergence_distance", "auto")
-    convergence = geometry_metadata.get("convergence")
-    if requested_convergence == "auto":
-        if not isinstance(convergence, dict):
-            return False
-        effective_convergence = convergence.get("resolved_auto_distance_m")
-    else:
-        effective_convergence = float(requested_convergence)
-    sar = _canonical_sar_fields(video_properties)
-    if sar is None:
-        return False
-    checks = (
-        metadata.get("source_metric_fingerprint") == geometry_metadata.get("fingerprint"),
-        metadata.get("projection_algorithm_version") == METRIC_PROJECTION_ALGORITHM_VERSION,
-        metadata.get("source_width") == render_shape[1],
-        metadata.get("retained_crop_width") == retained_width,
-        metadata.get("center_crop_algorithm_version") == CENTER_CROP_ALGORITHM_VERSION,
-        metadata.get("sample_aspect_ratio") == f"{sar[0]}:{sar[1]}",
-        metadata.get("virtual_baseline_mm")
-        == float(current_settings.get("virtual_baseline_mm", 63.0)),
-        metadata.get("requested_convergence_distance")
-        == ("auto" if requested_convergence == "auto" else float(requested_convergence)),
-        metadata.get("effective_convergence_distance_m") == effective_convergence,
-        metadata.get("max_disparity_percent")
-        == float(current_settings.get("max_disparity_percent", 2.0)),
-    )
-    return all(checks)
-
-
-def _stereo_payload_state(
-    paths: tuple[Path, ...],
-    frame_files: list[Path],
-    render_shape: tuple[int, int],
-) -> tuple[Disposition | None, str | None]:
-    missing = False
-    for frame in frame_files:
-        for directory in paths:
-            path = directory / f"{frame.stem}.png"
-            if not path.is_file():
-                missing = True
-                continue
-            if not png_header_matches(path, shape=(*render_shape, 3), bit_depth=8):
-                return "resume", f"stereo payload will be regenerated: {path.name}"
-    if missing:
-        return "resume", "stereo stage is partially complete"
-    return None, None
-
-
-def _hash_regular_file_into(
-    digest: Any,
-    acquired: AcquiredRoot,
-    path: Path,
-    *,
-    png_shape: tuple[int, int, int] | None = None,
-) -> str:
-    file_digest = hashlib.sha256()
-    byte_count = 0
-    try:
-        with acquired.open_regular(path) as handle:
-            if png_shape is not None:
-                header = handle.read(33)
-                if not png_header_bytes_match(header, shape=png_shape, bit_depth=8):
-                    raise ValueError(f"legacy Fast RGB payload is invalid: {path.name}")
-                handle.seek(0)
-            while True:
-                chunk = handle.read(1024 * 1024)
-                if not chunk:
-                    break
-                file_digest.update(chunk)
-                byte_count += len(chunk)
-    except NoFollowPathError as error:
-        raise ValueError(f"legacy Fast payload is not a regular file: {path}") from error
-    relative = path.name.encode("utf-8")
-    digest.update(len(relative).to_bytes(8, "big"))
-    digest.update(relative)
-    digest.update(byte_count.to_bytes(8, "big"))
-    digest.update(file_digest.digest())
-    return file_digest.hexdigest()
-
-
-def _legacy_fast_rgb_payload_fingerprint(
-    acquired: AcquiredRoot,
-    paths: tuple[Path, Path],
-    frame_names: Callable[[], Iterable[str]],
-    frame_count: int,
-    render_shape: tuple[int, int],
-) -> str:
-    digest = hashlib.sha256(b"legacy-fast-rgb-payload-sequence-v1\0")
-    for eye, directory in zip((b"left", b"right"), paths, strict=True):
-        try:
-            actual_count = sum(
-                1 for entry in acquired.iter_directory(directory) if entry.name.endswith(".png")
-            )
-        except NoFollowPathError as error:
-            raise ValueError("legacy Fast RGB directory is not a regular directory") from error
-        if actual_count != frame_count:
-            raise ValueError("legacy Fast RGB payload set differs from its frame sequence")
-        digest.update(eye)
-        replayed_count = 0
-        for frame_name in frame_names():
-            if replayed_count >= frame_count:
-                raise ValueError("legacy Fast frame-name replay exceeds its count")
-            path = directory / f"{frame_name}.png"
-            _hash_regular_file_into(
-                digest,
-                acquired,
-                path,
-                png_shape=(*render_shape, 3),
-            )
-            replayed_count += 1
-        if replayed_count != frame_count:
-            raise ValueError("legacy Fast frame-name replay ended early")
-    return digest.hexdigest()
-
-
-def _streaming_file_sha256(acquired: AcquiredRoot, path: Path) -> str:
-    digest = hashlib.sha256()
-    try:
-        with acquired.open_regular(path) as handle:
-            while True:
-                chunk = handle.read(1024 * 1024)
-                if not chunk:
-                    return digest.hexdigest()
-                digest.update(chunk)
-    except NoFollowPathError as error:
-        raise ValueError(f"legacy evidence is not a regular file: {path}") from error
-
-
-def _iter_bounded_legacy_lines(
-    handle: Any,
-    *,
-    maximum_line_bytes: int = 64 * 1024,
-) -> Iterator[bytes]:
-    pending = bytearray()
-    while True:
-        chunk = handle.read(64 * 1024)
-        if not chunk:
-            if pending:
-                yield bytes(pending)
-            return
-        start = 0
-        while True:
-            newline = chunk.find(b"\n", start)
-            if newline < 0:
-                pending.extend(chunk[start:])
-                if len(pending) > maximum_line_bytes:
-                    raise ValueError("legacy JSON line exceeds 64 KiB")
-                break
-            pending.extend(chunk[start : newline + 1])
-            if len(pending) > maximum_line_bytes:
-                raise ValueError("legacy JSON line exceeds 64 KiB")
-            yield bytes(pending)
-            pending.clear()
-            start = newline + 1
-
-
-def _decode_legacy_json_token(token: bytes, error_message: str) -> Any:
-    try:
-        return json.loads(token.removesuffix(b",").decode("ascii"))
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError(error_message) from error
-
-
-def _iter_pretty_top_level_array(
-    acquired: AcquiredRoot,
-    path: Path,
-    key: str,
-) -> Iterator[Any]:
-    marker = f'  "{key}": ['.encode("ascii")
-    found = False
-    try:
-        handle_context = acquired.open_regular(path)
-    except NoFollowPathError as error:
-        raise ValueError("legacy JSON evidence is not a regular file") from error
-    with handle_context as handle:
-        for raw_line in _iter_bounded_legacy_lines(handle):
-            line = raw_line.rstrip(b"\r\n")
-            if not found:
-                if line == marker:
-                    found = True
-                continue
-            if line in {b"  ],", b"  ]"}:
-                return
-            if not line.startswith(b"    "):
-                raise ValueError(f"legacy JSON array {key} is malformed")
-            yield _decode_legacy_json_token(line.strip(), f"legacy JSON array {key} is malformed")
-    if not found:
-        raise ValueError(f"legacy JSON array {key} is missing")
-    raise ValueError(f"legacy JSON array {key} is unterminated")
-
-
-def _iter_legacy_stage_frame_names_from_path(
-    acquired: AcquiredRoot,
-    metadata_path: Path,
-    frame_count: int,
-) -> Iterator[str]:
-    count = 0
-    for value in _iter_pretty_top_level_array(acquired, metadata_path, "frame_names"):
-        if (
-            count >= frame_count
-            or not isinstance(value, str)
-            or not value.endswith(".png")
-            or Path(value).name != value
-        ):
-            raise ValueError("legacy Fast frame name is invalid")
-        count += 1
-        yield Path(value).stem
-    if count != frame_count:
-        raise ValueError("legacy Fast frame-name count changed")
-
-
-def iter_legacy_fast_frame_names(adoption: LegacyFastAdoptionV1) -> Iterator[str]:
-    """Replay legacy Fast stems without retaining the metadata array."""
-
-    with AcquiredRoot(adoption.job_root) as acquired:
-        yield from _iter_legacy_stage_frame_names_from_path(
-            acquired,
-            adoption.job_root / "04_left_frames" / "metadata.json",
-            adoption.frame_count,
-        )
-
-
-def _read_legacy_metric_stat(
-    acquired: AcquiredRoot,
-    path: Path,
-    frame_name: str,
-) -> MetricProjectionStats:
-    try:
-        with acquired.open_regular(path) as handle:
-            raw = handle.read(64 * 1024 + 1)
-    except NoFollowPathError as error:
-        raise ValueError("legacy metric clamp sidecar is unsafe") from error
-    if len(raw) > 64 * 1024:
-        raise ValueError("legacy metric clamp sidecar exceeds 64 KiB")
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError("legacy metric clamp sidecar is invalid") from error
-    if not isinstance(payload, dict) or set(payload) != {
-        "schema_version",
-        "frame_name",
-        "valid_pixel_count",
-        "clamped_pixel_count",
-        "clamped_fraction",
-    }:
-        raise ValueError("legacy metric clamp sidecar has the wrong schema")
-    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
-        raise ValueError("legacy metric clamp sidecar schema version is invalid")
-    if payload["frame_name"] != frame_name:
-        raise ValueError("legacy metric clamp sidecar frame identity changed")
-    return MetricProjectionStats(
-        payload["valid_pixel_count"],
-        payload["clamped_pixel_count"],
-        payload["clamped_fraction"],
-    )
-
-
-def _iter_legacy_metric_fractions_from_paths(
-    acquired: AcquiredRoot,
-    left_dir: Path,
-    frame_names: Callable[[], Iterable[str]],
-) -> Iterator[float]:
-    for frame_name in frame_names():
-        yield _read_legacy_metric_stat(
-            acquired,
-            left_dir / "clamp_stats" / f"{frame_name}.json",
-            frame_name,
-        ).clamped_fraction
-
-
-def iter_legacy_metric_clamped_fractions(
-    adoption: LegacyFastAdoptionV1,
-) -> Iterator[float]:
-    """Replay validated legacy metric fractions in source order."""
-
-    if adoption.geometry_mode != "metric":
-        raise ValueError("relative legacy Fast adoption has no clamp fractions")
-    with AcquiredRoot(adoption.job_root) as acquired:
-        yield from _iter_legacy_metric_fractions_from_paths(
-            acquired,
-            adoption.job_root / "04_left_frames",
-            lambda: _iter_legacy_stage_frame_names_from_path(
-                acquired,
-                adoption.job_root / "04_left_frames" / "metadata.json",
-                adoption.frame_count,
-            ),
-        )
-
-
-def legacy_fast_metric_projection(
-    adoption: LegacyFastAdoptionV1,
-) -> dict[str, Any] | None:
-    """Build the replayable aggregate required by the legacy diagnostics marker."""
-
-    if adoption.geometry_mode == "relative":
-        return None
-    from .streamed_canonical_json import ReplayableJsonArray
-
-    valid = adoption.metric_valid_pixel_count
-    clamped = adoption.metric_clamped_pixel_count
-    affected = adoption.metric_affected_frame_count
-    mean = adoption.metric_mean_clamped_fraction
-    maximum = adoption.metric_max_clamped_fraction
-    if (
-        type(valid) is not int
-        or type(clamped) is not int
-        or type(affected) is not int
-        or type(mean) is not float
-        or type(maximum) is not float
-    ):
-        raise ValueError("legacy metric adoption omits clamp evidence")
-    return {
-        "valid_pixel_count": valid,
-        "clamped_pixel_count": clamped,
-        "clamped_fraction": float(clamped) / float(valid) if valid else 0.0,
-        "clamped_fractions": ReplayableJsonArray(
-            lambda: iter_legacy_metric_clamped_fractions(adoption)
-        ),
-        "affected_frame_count": affected,
-        "mean_clamped_fraction": mean,
-        "max_clamped_fraction": maximum,
-    }
-
-
-def _legacy_fast_diagnostics_complete(adoption: LegacyFastAdoptionV1) -> bool:
-    from ..rendering.quality.diagnostic_transaction import (
-        StreamingDiagnosticsStageContext,
-        legacy_fast_unavailable_aggregates_match,
-    )
-
-    context = StreamingDiagnosticsStageContext(
-        job_root=adoption.job_root,
-        frame_count=adoption.frame_count,
-        frame_names=lambda: iter_legacy_fast_frame_names(adoption),
-        render_shape=adoption.render_shape,
-        render_mode="fast",
-        geometry_mode=adoption.geometry_mode,
-        occlusion_fill=adoption.occlusion_fill,
-        mask_payloads_enabled=False,
-        rgb_stage_fingerprint=adoption.rgb_stage_fingerprint,
-        source_guide_fingerprint=adoption.source_guide_fingerprint,
-        native_geometry_fingerprint=None,
-        quality_input_manifest_sha256=None,
-        left_rgb_parent=adoption.job_root / "04_left_frames",
-        right_rgb_parent=adoption.job_root / "04_right_frames",
-    )
-    return legacy_fast_unavailable_aggregates_match(
-        context,
-        metric_projection=legacy_fast_metric_projection(adoption),
-        metric_clamp_summary_sha256=adoption.metric_clamp_summary_sha256,
-    )
-
-
-def _legacy_summary_scalars(acquired: AcquiredRoot, path: Path) -> dict[str, Any]:
-    expected_keys = {
-        "affected_frame_count",
-        "clamped_fractions",
-        "frame_names",
-        "max_clamped_fraction",
-        "mean_clamped_fraction",
-        "schema_version",
-    }
-    keys: set[str] = set()
-    scalars: dict[str, Any] = {}
-    try:
-        handle_context = acquired.open_regular(path)
-    except NoFollowPathError as error:
-        raise ValueError("legacy metric clamp summary is unsafe") from error
-    with handle_context as handle:
-        for raw_line in _iter_bounded_legacy_lines(handle):
-            line = raw_line.rstrip(b"\r\n")
-            if not line.startswith(b'  "'):
-                continue
-            separator = line.find(b'": ')
-            if separator < 0:
-                raise ValueError("legacy metric clamp summary is malformed")
-            key = line[3:separator].decode("ascii")
-            if key in keys:
-                raise ValueError("legacy metric clamp summary repeats a key")
-            keys.add(key)
-            token = line[separator + 3 :]
-            if token == b"[":
-                continue
-            scalars[key] = _decode_legacy_json_token(
-                token, "legacy metric clamp summary is malformed"
-            )
-    if keys != expected_keys:
-        raise ValueError("legacy metric clamp summary has the wrong schema")
-    return scalars
-
-
-def _verify_legacy_summary_frames(
-    acquired: AcquiredRoot,
-    summary_path: Path,
-    left_dir: Path,
-    frame_names: Callable[[], Iterable[str]],
-) -> None:
-    summary_names = _iter_pretty_top_level_array(acquired, summary_path, "frame_names")
-    if any(
-        summary_name != frame_name
-        for summary_name, frame_name in zip(summary_names, frame_names(), strict=True)
-    ):
-        raise ValueError("legacy metric clamp summary frame order changed")
-    summary_fractions = _iter_pretty_top_level_array(
-        acquired,
-        summary_path,
-        "clamped_fractions",
-    )
-    expected_fractions = _iter_legacy_metric_fractions_from_paths(
-        acquired,
-        left_dir,
-        frame_names,
-    )
-    for actual, expected in zip(summary_fractions, expected_fractions, strict=True):
-        if type(actual) is not float or actual != expected:
-            raise ValueError("legacy metric clamp summary fractions changed")
-
-
-def _legacy_metric_clamp_evidence(
-    acquired: AcquiredRoot,
-    left_dir: Path,
-    frame_names: Callable[[], Iterable[str]],
-    frame_count: int,
-) -> tuple[str, str, int, int, int, float, float]:
-    stat_dir = left_dir / "clamp_stats"
-    try:
-        actual_count = sum(
-            1 for entry in acquired.iter_directory(stat_dir) if entry.name.endswith(".json")
-        )
-    except NoFollowPathError as error:
-        raise ValueError("legacy metric clamp sidecar directory is invalid") from error
-    if actual_count != frame_count:
-        raise ValueError("legacy metric clamp sidecar set is incomplete")
-
-    evidence_digest = hashlib.sha256(b"legacy-metric-clamp-evidence-v1\0")
-    valid_total = 0
-    clamped_total = 0
-    affected = 0
-    fraction_sum = 0.0
-    maximum = 0.0
-    count = 0
-    for frame_name in frame_names():
-        if count >= frame_count:
-            raise ValueError("legacy metric clamp replay exceeds its frame count")
-        path = stat_dir / f"{frame_name}.json"
-        stats = _read_legacy_metric_stat(acquired, path, frame_name)
-        _hash_regular_file_into(evidence_digest, acquired, path)
-        valid_total += stats.valid_pixel_count
-        clamped_total += stats.clamped_pixel_count
-        affected += int(stats.clamped_fraction > 0.0)
-        fraction_sum += stats.clamped_fraction
-        maximum = max(maximum, stats.clamped_fraction)
-        count += 1
-    if count != frame_count:
-        raise ValueError("legacy metric clamp replay ended early")
-    mean = fraction_sum / frame_count
-
-    summary_path = left_dir / "clamp_summary.json"
-    summary_sha256 = _streaming_file_sha256(acquired, summary_path)
-    _hash_regular_file_into(evidence_digest, acquired, summary_path)
-    scalars = _legacy_summary_scalars(acquired, summary_path)
-    if (
-        type(scalars.get("schema_version")) is not int
-        or scalars["schema_version"] != 1
-        or type(scalars.get("affected_frame_count")) is not int
-        or scalars["affected_frame_count"] != affected
-        or type(scalars.get("mean_clamped_fraction")) is not float
-        or not math.isfinite(scalars["mean_clamped_fraction"])
-        or scalars["mean_clamped_fraction"] != mean
-        or type(scalars.get("max_clamped_fraction")) is not float
-        or not math.isfinite(scalars["max_clamped_fraction"])
-        or scalars["max_clamped_fraction"] != maximum
-    ):
-        raise ValueError("legacy metric clamp summary scalar values changed")
-    _verify_legacy_summary_frames(acquired, summary_path, left_dir, frame_names)
-    return (
-        summary_sha256,
-        evidence_digest.hexdigest(),
-        valid_total,
-        clamped_total,
-        affected,
-        mean,
-        maximum,
-    )
-
-
-def _build_legacy_fast_adoption(
-    output_dir: Path,
-    frame_files: list[Path],
-    current_settings: dict[str, Any],
-    metadata: dict[str, Any],
-    render_shape: tuple[int, int],
-    geometry_mode: str,
-    *,
-    source_settings_schema_version: int,
-) -> LegacyFastAdoptionV1:
-    with AcquiredRoot(output_dir) as acquired:
-        return _build_legacy_fast_adoption_from_acquired_root(
-            acquired,
-            output_dir,
-            frame_files,
-            current_settings,
-            metadata,
-            render_shape,
-            geometry_mode,
-            source_settings_schema_version=source_settings_schema_version,
-        )
-
-
-def _build_legacy_fast_adoption_from_acquired_root(
-    acquired: AcquiredRoot,
-    output_dir: Path,
-    frame_files: list[Path],
-    current_settings: dict[str, Any],
-    metadata: dict[str, Any],
-    render_shape: tuple[int, int],
-    geometry_mode: str,
-    *,
-    source_settings_schema_version: int,
-) -> LegacyFastAdoptionV1:
-    left_dir = output_dir / "04_left_frames"
-    right_dir = output_dir / "04_right_frames"
-    metadata_path = left_dir / "metadata.json"
-    metadata_max = 64 * 1024 + len(frame_files) * 256
-    try:
-        with acquired.open_regular(metadata_path) as handle:
-            metadata_raw = handle.read(metadata_max + 1)
-    except NoFollowPathError as error:
-        raise ValueError("legacy Fast RGB metadata is unsafe") from error
-    if len(metadata_raw) > metadata_max:
-        raise ValueError("legacy Fast RGB metadata exceeds its bound")
-    writer_text = json.dumps(metadata, indent=2, sort_keys=True)
-    if os.linesep != "\n":
-        writer_text = writer_text.replace("\n", os.linesep)
-    if metadata_raw != writer_text.encode("utf-8"):
-        raise ValueError("legacy Fast RGB metadata bytes are not from the v3 writer")
-    frame_count = len(frame_files)
-
-    def replay_frame_names() -> Iterator[str]:
-        for frame in frame_files:
-            yield frame.stem
-
-    payload_fingerprint = _legacy_fast_rgb_payload_fingerprint(
-        acquired,
-        (left_dir, right_dir),
-        replay_frame_names,
-        frame_count,
-        render_shape,
-    )
-    normalized_geometry = cast(
-        Literal["relative", "metric"],
-        "metric" if geometry_mode == "metric_camera" else "relative",
-    )
-    clamp_sha256 = None
-    clamp_evidence_sha256 = None
-    metric_valid = None
-    metric_clamped = None
-    metric_affected = None
-    metric_mean = None
-    metric_maximum = None
-    if normalized_geometry == "metric":
-        (
-            clamp_sha256,
-            clamp_evidence_sha256,
-            metric_valid,
-            metric_clamped,
-            metric_affected,
-            metric_mean,
-            metric_maximum,
-        ) = _legacy_metric_clamp_evidence(
-            acquired,
-            left_dir,
-            replay_frame_names,
-            frame_count,
-        )
-    source_provenance = metadata.get(
-        "source_canonical_fingerprint",
-        metadata.get("source_metric_fingerprint"),
-    )
-    if not isinstance(source_provenance, str) or len(source_provenance) != 64:
-        raise ValueError("legacy Fast source provenance is invalid")
-    return LegacyFastAdoptionV1(
-        job_root=output_dir.resolve(),
-        source_settings_schema_version=source_settings_schema_version,
-        settings_fingerprint=canonical_json_hash(
-            materialize_processing_settings_v5(current_settings)
-        ),
-        frame_count=frame_count,
-        render_shape=render_shape,
-        geometry_mode=normalized_geometry,
-        occlusion_fill=cast(
-            Literal["none", "background"],
-            current_settings.get("occlusion_fill", "background"),
-        ),
-        rgb_stage_fingerprint=str(metadata["fingerprint"]),
-        source_guide_fingerprint=source_provenance,
-        stage_metadata_sha256=hashlib.sha256(metadata_raw).hexdigest(),
-        payload_sequence_sha256=payload_fingerprint,
-        metric_clamp_summary_sha256=clamp_sha256,
-        metric_clamp_evidence_sha256=clamp_evidence_sha256,
-        metric_valid_pixel_count=metric_valid,
-        metric_clamped_pixel_count=metric_clamped,
-        metric_affected_frame_count=metric_affected,
-        metric_mean_clamped_fraction=metric_mean,
-        metric_max_clamped_fraction=metric_maximum,
-    )
-
-
-def revalidate_legacy_fast_adoption_v1(
-    adoption: LegacyFastAdoptionV1,
-    settings_artifact: ProcessingSettingsArtifactV5,
-    *,
-    allow_diagnostics_prefix: bool = False,
-) -> LegacyFastAdoptionV1:
-    """Replay every frozen legacy fact immediately before diagnostics publication."""
-
-    if not isinstance(adoption, LegacyFastAdoptionV1):
-        raise TypeError("legacy Fast adoption proof has the wrong type")
-    if not isinstance(settings_artifact, ProcessingSettingsArtifactV5):
-        raise TypeError("legacy Fast adoption requires a schema-5 settings artifact")
-    root = Path(os.path.abspath(os.fspath(adoption.job_root)))
-    if root != adoption.job_root:
-        raise ValueError("legacy Fast adoption job root changed")
-    try:
-        with AcquiredRoot(root) as acquired:
-            return _revalidate_legacy_fast_adoption_from_acquired_root(
-                acquired,
-                adoption,
-                settings_artifact,
-                allow_diagnostics_prefix=allow_diagnostics_prefix,
-            )
-    except NoFollowPathError as error:
-        raise ValueError("legacy Fast adoption contains an unsafe path") from error
-
-
-def _revalidate_legacy_fast_adoption_from_acquired_root(
-    acquired: AcquiredRoot,
-    adoption: LegacyFastAdoptionV1,
-    settings_artifact: ProcessingSettingsArtifactV5,
-    *,
-    allow_diagnostics_prefix: bool,
-) -> LegacyFastAdoptionV1:
-    root = adoption.job_root
-    settings_value = settings_artifact.to_object()
-    metadata_fields = settings_value["metadata"]
-    source_version = metadata_fields["source_settings_schema_version"]
-    settings = settings_value["processing_settings"]
-    if (
-        source_version != adoption.source_settings_schema_version
-        or not 1 <= source_version <= 4
-        or canonical_json_hash(settings) != adoption.settings_fingerprint
-        or settings.get("stereo_render_mode") != "fast"
-        or settings.get("keep_intermediates") is not False
-        or (
-            not allow_diagnostics_prefix
-            and not acquired.directory_absent(root / "04_stereo_diagnostics")
-        )
-    ):
-        raise ValueError("legacy Fast adoption settings or diagnostics state changed")
-
-    metadata_path = root / "04_left_frames" / "metadata.json"
-    if _streaming_file_sha256(acquired, metadata_path) != adoption.stage_metadata_sha256:
-        raise ValueError("legacy Fast RGB metadata changed")
-    payload_fingerprint = _legacy_fast_rgb_payload_fingerprint(
-        acquired,
-        (root / "04_left_frames", root / "04_right_frames"),
-        lambda: _iter_legacy_stage_frame_names_from_path(
-            acquired,
-            metadata_path,
-            adoption.frame_count,
-        ),
-        adoption.frame_count,
-        adoption.render_shape,
-    )
-    if payload_fingerprint != adoption.payload_sequence_sha256:
-        raise ValueError("legacy Fast RGB payload sequence changed")
-    if adoption.geometry_mode == "metric":
-        replayed_metric = _legacy_metric_clamp_evidence(
-            acquired,
-            root / "04_left_frames",
-            lambda: _iter_legacy_stage_frame_names_from_path(
-                acquired,
-                metadata_path,
-                adoption.frame_count,
-            ),
-            adoption.frame_count,
-        )
-        expected_metric = (
-            adoption.metric_clamp_summary_sha256,
-            adoption.metric_clamp_evidence_sha256,
-            adoption.metric_valid_pixel_count,
-            adoption.metric_clamped_pixel_count,
-            adoption.metric_affected_frame_count,
-            adoption.metric_mean_clamped_fraction,
-            adoption.metric_max_clamped_fraction,
-        )
-        if replayed_metric != expected_metric:
-            raise ValueError("legacy metric clamp evidence changed")
-    elif any(
-        value is not None
-        for value in (
-            adoption.metric_clamp_summary_sha256,
-            adoption.metric_clamp_evidence_sha256,
-            adoption.metric_valid_pixel_count,
-            adoption.metric_clamped_pixel_count,
-            adoption.metric_affected_frame_count,
-            adoption.metric_mean_clamped_fraction,
-            adoption.metric_max_clamped_fraction,
-        )
-    ):
-        raise ValueError("relative legacy Fast adoption carries metric evidence")
-    return adoption
-
-
-def _assess_legacy_stereo(
-    output_dir: Path,
-    frame_files: list[Path],
-    current_settings: dict[str, Any],
-    metadata: dict,
-    render_shape: tuple[int, int],
-    geometry_mode: str,
-    source_settings_schema_version: int,
-    paths: tuple[Path, Path],
-) -> tuple[ResumeStage, LegacyFastAdoptionV1 | None]:
-    intent = load_legacy_fast_adoption_intent_v1(output_dir)
-    diagnostics_present = (output_dir / "04_stereo_diagnostics").exists()
-    eligible = (
-        1 <= source_settings_schema_version <= 4
-        and current_settings.get("stereo_render_mode") == "fast"
-        and current_settings.get("keep_intermediates") is False
-    )
-    if not eligible:
-        return _stage("stereo", paths, "invalidate", "legacy renderer schema"), None
-    try:
-        adoption = _build_legacy_fast_adoption(
-            output_dir,
-            frame_files,
-            current_settings,
-            metadata,
-            render_shape,
-            geometry_mode,
-            source_settings_schema_version=source_settings_schema_version,
-        )
-    except (OSError, TypeError, ValueError):
-        return (
-            _stage(
-                "stereo",
-                paths,
-                "invalidate",
-                "legacy Fast whole-stage validation failed",
-            ),
-            None,
-        )
-    if intent is not None and intent != adoption:
-        return (
-            _stage(
-                "stereo",
-                paths,
-                "invalidate",
-                "legacy Fast adoption intent differs from the RGB stage",
-            ),
-            None,
-        )
-    if diagnostics_present and intent is None:
-        if not _legacy_fast_diagnostics_complete(adoption):
-            return (
-                _stage(
-                    "stereo",
-                    paths,
-                    "invalidate",
-                    "legacy Fast diagnostics completion is invalid",
-                ),
-                None,
-            )
-        return (
-            _stage(
-                "stereo",
-                paths,
-                "preserve",
-                "legacy Fast aggregate-only diagnostics are complete",
-            ),
-            adoption,
-        )
-    return (
-        _stage(
-            "stereo",
-            paths,
-            "preserve",
-            "legacy Fast v3 whole stage is adoptable",
-        ),
-        adoption,
-    )
-
-
-def _validate_stereo_stage(
-    output_dir: Path,
-    frame_files: list[Path],
-    current_settings: dict[str, Any],
-    geometry_metadata: dict[str, Any] | None,
-    video_properties: dict[str, Any],
-    geometry_mode: str,
-    *,
-    current_settings_schema: bool,
-    source_settings_schema_version: int,
-    geometry_reusable: bool,
-) -> tuple[ResumeStage, LegacyFastAdoptionV1 | None]:
-    paths = (output_dir / "04_left_frames", output_dir / "04_right_frames")
-    if not any(_has_payload(path) for path in paths):
-        return _stage("stereo", paths, "missing", "stereo output is absent"), None
-    if not geometry_reusable or geometry_metadata is None:
-        return (
-            _stage("stereo", paths, "invalidate", "selected geometry stage is invalid"),
-            None,
-        )
-
-    metadata = _read_json(paths[0] / "metadata.json")
-    if metadata is None:
-        return _stage("stereo", paths, "invalidate", "stereo metadata is missing"), None
-    if not _stereo_metadata_matches(
-        metadata,
-        geometry_metadata,
-        frame_files,
-        current_settings,
-        video_properties,
-        geometry_mode,
-    ):
-        return (
-            _stage("stereo", paths, "invalidate", "stereo stage fingerprint mismatch"),
-            None,
-        )
-    render_shape = _positive_shape(metadata, "render_shape")
-    if render_shape is None:
-        return _stage("stereo", paths, "invalidate", "stereo render shape is invalid"), None
-    disposition, reason = _stereo_payload_state(paths, frame_files, render_shape)
-    if disposition is not None and reason is not None:
-        if source_settings_schema_version <= 4:
-            return (
-                _stage(
-                    "stereo",
-                    paths,
-                    "invalidate",
-                    "legacy Fast RGB stage is not whole-stage complete",
-                ),
-                None,
-            )
-        return _stage("stereo", paths, disposition, reason), None
-    if source_settings_schema_version <= 4:
-        return _assess_legacy_stereo(
-            output_dir,
-            frame_files,
-            current_settings,
-            metadata,
-            render_shape,
-            geometry_mode,
-            source_settings_schema_version,
-            paths,
-        )
-    return _stage("stereo", paths, "preserve", "stereo stage fingerprint matches"), None
-
-
-def _build_generated_stages(
-    output_dir: Path,
-    frame_files: list[Path],
+    expected_names: list[str],
+    upstream_ok: bool,
     saved_settings: dict[str, Any],
-    current_settings: dict[str, Any],
-    geometry_metadata: dict[str, Any] | None,
-    video_properties: dict[str, Any],
-    geometry_mode: str,
-    *,
-    current_settings_schema: bool,
-    source_settings_schema_version: int,
-    geometry_reusable: bool,
-) -> tuple[list[ResumeStage], LegacyFastAdoptionV1 | None]:
-    stereo, legacy_fast_adoption = _validate_stereo_stage(
-        output_dir,
-        frame_files,
-        current_settings,
-        geometry_metadata,
-        video_properties,
-        geometry_mode,
-        current_settings_schema=current_settings_schema,
-        source_settings_schema_version=source_settings_schema_version,
-        geometry_reusable=geometry_reusable,
-    )
-    distortion = _validate_generated_stage(
-        "distortion",
-        (output_dir / "05_left_distorted", output_dir / "05_right_distorted"),
-        upstream_reusable=stereo.disposition in {"preserve", "resume"},
-        changed_setting=_settings_changed(
-            saved_settings, current_settings, _DISTORTION_SETTING_KEYS
-        ),
-        reusable_reason="distortion settings match",
-    )
-    crop_inputs_reusable = stereo.disposition in {"preserve", "resume"} and (
-        distortion.disposition in {"preserve", "missing"}
-    )
-    crop = _validate_generated_stage(
-        "crop",
-        (output_dir / "06_left_cropped", output_dir / "06_right_cropped"),
-        upstream_reusable=crop_inputs_reusable,
-        changed_setting=_settings_changed(saved_settings, current_settings, _CROP_SETTING_KEYS),
-        reusable_reason="crop settings match",
-    )
-    upscale_inputs_reusable = crop_inputs_reusable and crop.disposition in {"preserve", "missing"}
-    upscale = _validate_generated_stage(
-        "upscale",
-        (output_dir / "07_left_upscaled", output_dir / "07_right_upscaled"),
-        upstream_reusable=upscale_inputs_reusable,
-        changed_setting=_settings_changed(saved_settings, current_settings, _UPSCALE_SETTING_KEYS),
-        reusable_reason="upscale settings match",
-    )
-    vr = _validate_generated_stage(
-        "vr_frames",
-        (output_dir / "99_vr_frames",),
-        upstream_reusable=upscale_inputs_reusable
-        and upscale.disposition in {"preserve", "missing"},
-        changed_setting=_settings_changed(saved_settings, current_settings, _VR_SETTING_KEYS),
-        reusable_reason="VR assembly settings match",
-    )
-    return [stereo, distortion, crop, upscale, vr], legacy_fast_adoption
+    migrated_settings: dict[str, Any],
+    keys: tuple[str, ...],
+) -> tuple[ResumeStage, bool]:
+    if not any(_has_payload(p) for p in paths):
+        return _stage(name, paths, "missing", f"{name} not generated"), False
+    if not upstream_ok:
+        return _stage(name, paths, "invalidate", "upstream stage invalidated"), False
+    if any(saved_settings.get(k) != migrated_settings.get(k) for k in keys):
+        return _stage(name, paths, "invalidate", f"{name} settings changed"), False
+    if all(p.is_dir() and sorted(x.name for x in p.glob("*.png")) == expected_names for p in paths):
+        return _stage(name, paths, "preserve", f"{name} outputs valid"), True
+    return _stage(name, paths, "invalidate", f"{name} outputs incomplete"), False
 
 
 def build_resume_report(  # noqa: C901
@@ -2546,15 +659,14 @@ def build_resume_report(  # noqa: C901
     if selected_settings_file is None:
         settings_data = None
     elif selected_settings_file.name == SETTINGS_ARTIFACT_RELATIVE_PATH.name:
-        settings_artifact = ProcessingSettingsArtifactV5.parse(
-            _read_bounded_regular_file(
-                selected_settings_file,
-                max_bytes=SETTINGS_ARTIFACT_MAX_RAW_BYTES,
-            )
-        )
+        raw_bytes = selected_settings_file.read_bytes()
+        if len(raw_bytes) > SETTINGS_ARTIFACT_MAX_RAW_BYTES:
+            raise ValueError("settings artifact exceeds maximum size")
+        settings_artifact = ProcessingSettingsArtifactV5.parse(raw_bytes)
         settings_data = settings_artifact.to_object()
     else:
         settings_data = _read_json(selected_settings_file)
+
     raw_saved = (settings_data or {}).get("processing_settings", {})
     if not isinstance(raw_saved, dict):
         raw_saved = {}
@@ -2564,17 +676,7 @@ def build_resume_report(  # noqa: C901
         if isinstance(settings_metadata, dict)
         else None
     )
-    saved_result = parse_saved_processing_settings(
-        raw_saved,
-        saved_version=saved_version,
-    )
-    source_settings_schema_version = saved_result.source_version
-    if (
-        saved_result.source_version == 5
-        and isinstance(settings_metadata, dict)
-        and type(settings_metadata.get("source_settings_schema_version")) is int
-    ):
-        source_settings_schema_version = settings_metadata["source_settings_schema_version"]
+    saved_result = parse_saved_processing_settings(raw_saved, saved_version=saved_version)
     removed = saved_result.removed_settings
     saved_settings = saved_result.settings
     migrated_settings = validate_settings(current_settings, source="explicit")
@@ -2585,163 +687,141 @@ def build_resume_report(  # noqa: C901
         and migrated_settings.get("temporal_postprocessor") != "off"
     ):
         raise ValueError("VDPP is available only with relative stereo geometry")
-    report_settings_data = _resume_properties_with_sar(
-        settings_data,
-        source_video,
-        geometry_mode,
-    )
-    source_reason = _source_video_mismatch_reason(report_settings_data, source_video)
+
+    source_reason = _source_video_mismatch_reason(settings_data, source_video)
     if source_reason is not None:
         raise ValueError(f"Cannot resume: {source_reason}")
 
-    frames, frame_files, source_fingerprint = _validate_frame_stage(
-        root, report_settings_data, migrated_settings
-    )
+    frames, frame_files, _source_fp = _validate_frame_stage(root, settings_data, migrated_settings)
     frames_reusable = frames.disposition == "preserve"
-
-    scene, manifest, bounds = _validate_scene_stage(
-        root,
-        frame_files,
-        source_fingerprint,
-        frames_reusable,
-        migrated_settings,
-    )
+    scene, _manifest, _bounds = _validate_scene_stage(root, frame_files, frames_reusable)
     scene_reusable = scene.disposition in {"preserve", "resume"}
-    raw, raw_identity_metadata, raw_completed_count = _validate_raw_stage(
-        root,
-        migrated_settings,
-        frame_files,
-        source_fingerprint,
-        scene_reusable,
-        model_fingerprint,
+    raw, raw_metadata, _raw_completed = _validate_raw_stage(
+        root, frame_files, scene_reusable, model_fingerprint
     )
-    scene, bounds = _bind_final_scene_to_raw_depth(
-        scene,
-        manifest,
-        bounds,
-        raw,
-        raw_identity_metadata,
-    )
+    canonical, canonical_metadata = _validate_canonical_stage(root, frame_files, raw_metadata)
+    metric, metric_metadata = _validate_metric_stage(root, frame_files, frames_reusable)
 
-    stages: list[ResumeStage] = [frames, scene, raw]
-
-    canonical, canonical_metadata = _validate_canonical_stage(
-        root,
-        frame_files,
-        manifest,
-        bounds,
-        raw_identity_metadata,
-        scene.disposition == "preserve",
-    )
-    stages.append(canonical)
-    metric, metric_metadata = _validate_metric_geometry_stage(
-        root,
-        frame_files,
-        manifest,
-        source_fingerprint,
-        raw_identity_metadata,
-        frames_reusable=frames_reusable,
-    )
-    stages.append(metric)
-
+    stages: list[ResumeStage] = [frames, scene, raw, canonical, metric]
     selected_stage = canonical if geometry_mode == "relative" else metric
-    if selected_stage.disposition == "missing" and raw_completed_count == 0:
-        selected_stage = _stage(
-            selected_stage.name,
-            selected_stage.paths,
-            selected_stage.disposition,
-            "MoGe inference is required to build the selected geometry stage",
-        )
-        stages[-2 if geometry_mode == "relative" else -1] = selected_stage
-
     render_metadata = canonical_metadata if geometry_mode == "relative" else metric_metadata
     render_reusable = selected_stage.disposition in {"preserve", "resume"}
+
     if geometry_mode == "relative" and migrated_settings.get("temporal_postprocessor") == "vdpp":
         stabilized, stabilized_metadata = _validate_stabilized_stage(
-            root,
-            frame_files,
-            canonical_metadata,
+            root, frame_files, canonical_metadata
         )
         stages.append(stabilized)
         render_metadata = stabilized_metadata
         render_reusable = stabilized.disposition == "preserve"
 
-    legacy_supersampled = root / "01_supersampled_frames"
-    if _has_payload(legacy_supersampled):
-        stages.append(
-            _stage(
-                "legacy_supersampled",
-                (legacy_supersampled,),
-                "invalidate",
-                "legacy supersampled frames are outside the current pipeline",
-            )
-        )
-    legacy_depth = root / "02_depth_maps"
-    if _has_payload(legacy_depth):
-        stages.append(
-            _stage(
-                "legacy_depth_maps",
-                (legacy_depth,),
-                "invalidate",
-                "legacy depth PNG semantics are unknown and cannot be migrated",
-            )
-        )
-    legacy_final_paths = (root / "08_left_final", root / "08_right_final")
-    if any(_has_payload(path) for path in legacy_final_paths):
-        stages.append(
-            _stage(
-                "legacy_final",
-                legacy_final_paths,
-                "invalidate",
-                "legacy final-eye directories are outside the current pipeline",
-            )
-        )
+    # Flag legacy directories if present
+    for legacy_name, legacy_paths, legacy_reason in (
+        ("legacy_supersampled", (root / "01_supersampled_frames",), "legacy supersampled frames"),
+        ("legacy_depth_maps", (root / "02_depth_maps",), "legacy depth PNGs cannot be migrated"),
+        (
+            "legacy_final",
+            (root / "08_left_final", root / "08_right_final"),
+            "legacy final-eye directories",
+        ),
+    ):
+        if any(_has_payload(p) for p in legacy_paths):
+            stages.append(_stage(legacy_name, legacy_paths, "invalidate", legacy_reason))
 
-    video_properties = (report_settings_data or {}).get("video_properties", {})
-    if not isinstance(video_properties, dict):
-        video_properties = {}
-    generated_stages, legacy_fast_adoption = _build_generated_stages(
-        root,
-        frame_files,
+    # Validate stereo & downstream stages quickly via metadata + filenames
+    expected_names = [p.name for p in frame_files]
+    stereo_paths = (root / "04_left_frames", root / "04_right_frames")
+    stereo_meta = _read_json(stereo_paths[0] / "metadata.json")
+    stereo_mode = str(migrated_settings.get("stereo_render_mode", "fast"))
+    expected_algo = (
+        QUALITY_STEREO_ALGORITHM_VERSION
+        if stereo_mode == "quality"
+        else STEREO_STAGE_ALGORITHM_VERSION
+    )
+    stereo_ok = False
+    if not any(_has_payload(p) for p in stereo_paths):
+        stereo_stage = _stage("stereo", stereo_paths, "missing", "stereo pairs not generated")
+    elif not render_reusable or stereo_meta is None:
+        stereo_stage = _stage(
+            "stereo", stereo_paths, "invalidate", "stereo stage stale or missing metadata"
+        )
+    elif (
+        stereo_meta.get("algorithm_version") != expected_algo
+        or stereo_meta.get("source_fingerprint") != (render_metadata or {}).get("fingerprint")
+        or stereo_meta.get("occlusion_fill") != migrated_settings.get("occlusion_fill")
+    ):
+        stereo_stage = _stage(
+            "stereo", stereo_paths, "invalidate", "stereo parameters or upstream changed"
+        )
+    else:
+        left_count = sum(1 for _ in stereo_paths[0].glob("*.png"))
+        right_count = sum(1 for _ in stereo_paths[1].glob("*.png"))
+        if left_count == len(expected_names) and right_count == len(expected_names):
+            stereo_stage = _stage(
+                "stereo", stereo_paths, "preserve", f"{left_count} stereo pairs valid"
+            )
+            stereo_ok = True
+        elif left_count > 0 and right_count > 0:
+            stereo_stage = _stage(
+                "stereo",
+                stereo_paths,
+                "resume",
+                f"{min(left_count, right_count)}/{len(expected_names)} stereo pairs present",
+            )
+        else:
+            stereo_stage = _stage("stereo", stereo_paths, "invalidate", "stereo outputs incomplete")
+
+    dist_stage, dist_ok = _validate_downstream_stage(
+        "distortion",
+        (root / "05_left_distorted", root / "05_right_distorted"),
+        expected_names,
+        stereo_ok,
         saved_settings,
         migrated_settings,
-        render_metadata,
-        video_properties,
-        geometry_mode,
-        current_settings_schema=settings_schema_current,
-        source_settings_schema_version=source_settings_schema_version,
-        geometry_reusable=render_reusable,
+        _DISTORTION_KEYS,
     )
-    stages.extend(generated_stages)
+    crop_stage, crop_ok = _validate_downstream_stage(
+        "crop",
+        (root / "06_left_cropped", root / "06_right_cropped"),
+        expected_names,
+        dist_ok or stereo_ok,
+        saved_settings,
+        migrated_settings,
+        _CROP_KEYS,
+    )
+    upscale_stage, upscale_ok = _validate_downstream_stage(
+        "upscale",
+        (root / "07_left_upscaled", root / "07_right_upscaled"),
+        expected_names,
+        crop_ok,
+        saved_settings,
+        migrated_settings,
+        _UPSCALE_KEYS,
+    )
+    vr_stage, _vr_ok = _validate_downstream_stage(
+        "vr_frames",
+        (root / "99_vr_frames",),
+        expected_names,
+        upscale_ok or crop_ok,
+        saved_settings,
+        migrated_settings,
+        _VR_KEYS,
+    )
+    stages.extend([stereo_stage, dist_stage, crop_stage, upscale_stage, vr_stage])
+
     backup_required = selected_settings_file is not None and (
         bool(removed) or not settings_schema_current
     )
-    final_media_audit: object | None = None
-    historical_diagnostics_valid: bool | None = None
-    stereo_payload_reusable: bool | None = None
+    final_video_valid: bool | None = None
     if (
         settings_artifact is not None
         and settings_data is not None
         and settings_data["metadata"]["processing_status"] == "completed"
     ):
-        from ..processing.video.final_publication import audit_final_media_v1
-        from ..rendering.quality.cleanup_transaction import (
-            audit_payload_pruned_historical_diagnostics_v1,
-        )
-        from ..rendering.quality.diagnostic_transaction import (
-            project_diagnostics_metadata,
-        )
+        rel = settings_data["output_info"].get("expected_final_relative_path")
+        if isinstance(rel, str) and rel:
+            final_video_valid = verify_existing_final_video(root / rel)
 
-        final_media_audit = audit_final_media_v1(root, settings_artifact)
-        try:
-            diagnostics = project_diagnostics_metadata(
-                root / "04_stereo_diagnostics" / "metadata.json"
-            ).validate_state_contract()
-        except (OSError, ValueError, NoFollowPathError):
-            diagnostics = None
-        if diagnostics is not None and diagnostics.status == "payload_pruned":
-            historical_diagnostics_valid = audit_payload_pruned_historical_diagnostics_v1(root)
-            stereo_payload_reusable = False
     return ResumeReport(
         output_dir=root,
         stages=tuple(stages),
@@ -2750,22 +830,8 @@ def build_resume_report(  # noqa: C901
         original_settings_data=settings_data,
         migrated_settings=migrated_settings,
         settings_backup_required=backup_required,
-        legacy_fast_adoption=legacy_fast_adoption,
-        final_media_audit=final_media_audit,
-        historical_diagnostics_valid=historical_diagnostics_valid,
-        stereo_payload_reusable=stereo_payload_reusable,
+        final_video_valid=final_video_valid,
     )
-
-
-def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    temporary = path.with_name(f"{path.name}.tmp")
-    temporary.write_bytes(payload)
-    temporary.replace(path)
-
-
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    encoded = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    _atomic_write_bytes(path, encoded)
 
 
 def _preflight_migration(report: ResumeReport, mode: MigrationMode) -> dict[Path, Path]:
@@ -2797,22 +863,17 @@ def _preflight_migration(report: ResumeReport, mode: MigrationMode) -> dict[Path
 
 
 def _migrate_settings(report: ResumeReport) -> None:
-    if report.settings_file is None or report.original_settings_data is None:
+    if (
+        report.settings_file is None
+        or report.original_settings_data is None
+        or not report.settings_backup_required
+    ):
         return
-    if not report.settings_backup_required:
-        return
-    if report.settings_backup_required:
-        backup = report.output_dir / "settings.legacy.json"
-        if not backup.exists():
-            _atomic_write_bytes(backup, report.settings_file.read_bytes())
+    backup = report.output_dir / "settings.legacy.json"
+    if not backup.exists():
+        atomic_write_bytes(backup, report.settings_file.read_bytes(), sync=True)
     fixed = report.output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH
-    control = report.output_dir / JOB_CONTROL_RELATIVE_PATH
-    if fixed.is_file() and control.is_file():
-        recover_settings_job_v1(
-            report.output_dir,
-            allocation_adapter=platform_allocation_adapter,
-            allocation_counter=platform_allocation_counter,
-        )
+    if fixed.is_file():
         return
     migration_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     artifact = migrate_processing_settings_artifact_v5(
@@ -2823,50 +884,10 @@ def _migrate_settings(report: ResumeReport) -> None:
         job_reservation_generation=secrets.token_hex(16),
         job_terminal_reservation_id=secrets.token_hex(16),
     )
-    bootstrap_settings_job_v1(
-        job_root=report.output_dir,
-        artifact=artifact,
-        initial_settings_reservation_id=secrets.token_hex(16),
-        allocation_adapter=platform_allocation_adapter,
-        allocation_counter=platform_allocation_counter,
-        allocation_unit=allocation_unit_for_path(report.output_dir),
-        legacy_settings_artifact_relative_path=report.settings_file.name,
-    )
+    atomic_write_bytes(fixed, artifact.encode(), sync=True)
 
 
-def _rollback_migration(
-    report: ResumeReport,
-    moved: list[tuple[Path, Path]],
-    original_settings: bytes | None,
-) -> None:
-    for source, destination in reversed(moved):
-        if destination.exists() and not source.exists():
-            source.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(destination), str(source))
-    if original_settings is not None and report.settings_file is not None:
-        _atomic_write_bytes(report.settings_file, original_settings)
-
-
-def _remove_empty_migration_directories(output_dir: Path) -> None:
-    for directory in (
-        output_dir / ".resume_delete_staging",
-        output_dir / "legacy_v1",
-    ):
-        if directory.is_dir() and next(directory.iterdir(), None) is None:
-            directory.rmdir()
-
-
-def _move_migration_inputs(
-    report: ResumeReport, destinations: dict[Path, Path], moved: list[tuple[Path, Path]]
-) -> None:
-    for source in report.migration_paths:
-        destination = destinations[source]
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(source), str(destination))
-        moved.append((source, destination))
-
-
-def apply_legacy_migration(report: ResumeReport, mode: MigrationMode) -> None:
+def apply_legacy_migration(report: ResumeReport, mode: MigrationMode) -> None:  # noqa: C901
     """Apply a precomputed report; archive by default and delete only explicitly."""
 
     if mode not in {"archive", "delete"}:
@@ -2878,21 +899,20 @@ def apply_legacy_migration(report: ResumeReport, mode: MigrationMode) -> None:
         else None
     )
     moved: list[tuple[Path, Path]] = []
-    existing_intent = recover_legacy_fast_adoption_intent_v1(report.output_dir)
-    if existing_intent is not None and existing_intent != report.legacy_fast_adoption:
-        raise ValueError("legacy Fast adoption intent differs from the resume report")
-    published_new_intent = False
     try:
         _migrate_settings(report)
-        if report.legacy_fast_adoption is not None and existing_intent is None:
-            publish_legacy_fast_adoption_intent_v1(report.legacy_fast_adoption)
-            published_new_intent = True
-        _move_migration_inputs(report, destinations, moved)
+        for source in report.migration_paths:
+            destination = destinations[source]
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            moved.append((source, destination))
     except Exception:
-        if published_new_intent and report.legacy_fast_adoption is not None:
-            retire_legacy_fast_adoption_intent_v1(report.legacy_fast_adoption)
-        _rollback_migration(report, moved, original_settings)
-        _remove_empty_migration_directories(report.output_dir)
+        for source, destination in reversed(moved):
+            if destination.exists() and not source.exists():
+                source.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(destination), str(source))
+        if original_settings is not None and report.settings_file is not None:
+            atomic_write_bytes(report.settings_file, original_settings, sync=True)
         raise
 
     if mode == "delete" and moved:
@@ -2900,7 +920,7 @@ def apply_legacy_migration(report: ResumeReport, mode: MigrationMode) -> None:
             shutil.rmtree(report.output_dir / ".resume_delete_staging")
         except OSError as error:
             warnings.warn(
-                "Legacy migration committed; delete-staging cleanup remains pending: " f"{error}",
+                f"Legacy migration committed; delete-staging cleanup remains pending: {error}",
                 RuntimeWarning,
                 stacklevel=2,
             )

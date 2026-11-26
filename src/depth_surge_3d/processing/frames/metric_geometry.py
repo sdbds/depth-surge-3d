@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from ...io import _win32
-
-import ctypes
 from dataclasses import dataclass
 import errno
 import json
@@ -316,55 +313,18 @@ def estimate_metric_geometry_disk_bytes(
     return _ceil_five_quarters(payload_bound) + metadata_bound + atomic_overlap
 
 
-def _windows_allocation_unit(directory: Path) -> int | None:
-    """Query the Windows cluster size, or report that the query is unavailable."""
-
-    try:
-        kernel32 = _win32.load_library("kernel32", use_last_error=True)
-        get_volume_path = kernel32.GetVolumePathNameW
-        get_disk_free_space = kernel32.GetDiskFreeSpaceW
-        resolved = str(Path(directory).resolve())
-        volume_path = ctypes.create_unicode_buffer(32_768)
-        found_volume = get_volume_path(
-            ctypes.c_wchar_p(resolved),
-            volume_path,
-            ctypes.c_ulong(len(volume_path)),
-        )
-        if not found_volume or not volume_path.value:
-            return None
-        sectors_per_cluster = ctypes.c_ulong()
-        bytes_per_sector = ctypes.c_ulong()
-        free_clusters = ctypes.c_ulong()
-        total_clusters = ctypes.c_ulong()
-        succeeded = get_disk_free_space(
-            ctypes.c_wchar_p(volume_path.value),
-            ctypes.byref(sectors_per_cluster),
-            ctypes.byref(bytes_per_sector),
-            ctypes.byref(free_clusters),
-            ctypes.byref(total_clusters),
-        )
-        if not succeeded:
-            return None
-        allocation = int(sectors_per_cluster.value) * int(bytes_per_sector.value)
-        return allocation if allocation > 0 else None
-    except (AttributeError, OSError, TypeError, ValueError):
-        return None
-
-
 def filesystem_allocation_unit(directory: Path) -> int:
     """Return the platform filesystem allocation unit with a 64 KiB fallback."""
 
-    allocation: int | None = None
-    if os.name == "nt":
-        allocation = _windows_allocation_unit(Path(directory))
-    else:
+    if os.name != "nt":
         try:
             statvfs = getattr(os, "statvfs")
-            queried = statvfs(Path(directory)).f_frsize
-            allocation = int(queried) if int(queried) > 0 else None
+            queried = int(statvfs(Path(directory)).f_frsize)
+            if queried > 0:
+                return queried
         except (AttributeError, OSError, TypeError, ValueError):
-            allocation = None
-    return allocation if allocation is not None and allocation > 0 else _FALLBACK_ALLOCATION_UNIT
+            pass
+    return _FALLBACK_ALLOCATION_UNIT
 
 
 def _current_free_bytes(path: Path) -> int:

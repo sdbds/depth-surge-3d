@@ -124,7 +124,6 @@ from socketio.exceptions import (  # type: ignore[import-untyped]  # noqa: E402
 
 from depth_surge_3d.processing import VideoProcessor  # noqa: E402
 from depth_surge_3d.io.resume import (  # noqa: E402
-    LegacyFastAdoptionV1,
     apply_legacy_migration,
     build_resume_report,
     resolve_resume_depth_model_version,
@@ -1418,14 +1417,10 @@ def process_video_async(  # noqa: C901
                     settings_file=resume_context.get("settings_file"),
                 )
 
-        legacy_fast_adoption: LegacyFastAdoptionV1 | None = None
         if resume_context is not None:
             assert resume_report is not None
             migration_mode = resume_context.get("migration_mode", "archive")
             apply_legacy_migration(resume_report, migration_mode)
-            candidate_adoption = resume_report.legacy_fast_adoption
-            if isinstance(candidate_adoption, LegacyFastAdoptionV1):
-                legacy_fast_adoption = candidate_adoption
             resolved_temporal = settings.get("temporal_postprocessor", "off")
             settings = dict(resume_report.migrated_settings)
             settings.setdefault("temporal_postprocessor", resolved_temporal)
@@ -1466,8 +1461,6 @@ def process_video_async(  # noqa: C901
         processor_kwargs: dict[str, Any] = {
             "temporal_stabilizer": temporal_stabilizer,
         }
-        if legacy_fast_adoption is not None:
-            processor_kwargs["legacy_fast_adoption"] = legacy_fast_adoption
         if selected_artifact is not None:
             selected_files, selected_source = selected_artifact
             processor = VideoProcessor(

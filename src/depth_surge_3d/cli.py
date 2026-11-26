@@ -38,17 +38,14 @@ from depth_surge_3d.io.operations import (
 from depth_surge_3d.io.job_lock import JobWriterLock
 from depth_surge_3d.vdpp_work import cleanup_vdpp_private_work
 from depth_surge_3d.io.resume import (
-    LegacyFastAdoptionV1,
     apply_legacy_migration,
     build_resume_report,
-    recover_legacy_fast_adoption_intent_v1,
     resolve_resume_depth_model_version,
 )
 from depth_surge_3d.processing.frames.depth_storage import build_current_model_fingerprint
 from depth_surge_3d.processing.orchestration.execution_plan import build_artifact_execution_plan
-from depth_surge_3d.processing.video.final_publication import (
-    FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
-    audit_final_media_v1,
+from depth_surge_3d.processing.video.final_container_validation import (
+    verify_existing_final_video,
 )
 from depth_surge_3d.utils import (
     get_available_resolutions,
@@ -67,33 +64,34 @@ def create_stereo_projector(*args, **kwargs):
 
 
 def _finish_saved_publication(root: Path, info: dict) -> bool | None:
-    """Try the saved transaction before planning inference or looking for source frames."""
+    """Verify completed final video or finish pending cleanup before re-running inference."""
     settings_file = info.get("settings_file")
-    active = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
     if not isinstance(settings_file, Path) or settings_file.name != "processing-settings-v5.json":
-        return None
-    if info.get("status") != "completed" and not active.is_file():
         return None
     try:
         with JobWriterLock(root):
             artifact = recover_processing_settings_artifact(settings_file)
+            value = artifact.to_object()
             if artifact.status == "completed":
-                if not audit_final_media_v1(root, artifact).final_video_authenticated:
+                rel = value["output_info"].get("expected_final_relative_path")
+                if not isinstance(rel, str) or not verify_existing_final_video(root / rel):
                     print("The existing final video could not be verified; it was left untouched.")
                     return False
                 print("The existing final video is verified; nothing was re-encoded.")
                 return True
-            if artifact.status != "in_progress" or not active.is_file():
-                return None
-            from depth_surge_3d.processing.orchestration.pipeline_orchestrator import (
-                ProcessingOrchestrator,
-            )
-            from depth_surge_3d.processing.video.video_encoder import VideoEncoder
+            if (
+                artifact.status == "in_progress"
+                and value["metadata"].get("cleanup_status") == "pending"
+            ):
+                from depth_surge_3d.processing.orchestration.pipeline_orchestrator import (
+                    ProcessingOrchestrator,
+                )
 
-            finished = ProcessingOrchestrator.finish_publication_only(root, VideoEncoder())
-            if finished:
-                print("Recovered the already encoded final video using its saved settings.")
-            return finished
+                finished = ProcessingOrchestrator.finish_publication_only(root)
+                if finished:
+                    print("Finished pending cleanup for the already encoded final video.")
+                return finished
+            return None
     except (OSError, ValueError, RuntimeError) as error:
         print(f"Cannot recover the existing final video: {error}")
         return False
@@ -838,7 +836,6 @@ def main():  # noqa: C901
             output_dir = Path(args.resume).resolve()
             job_lock = JobWriterLock(output_dir).acquire()
             cleanup_vdpp_private_work(output_dir, job_lock)
-            recover_legacy_fast_adoption_intent_v1(output_dir)
             preflight = None
             execution_preflight = None
             audit_settings = processing_settings
@@ -926,9 +923,6 @@ def main():  # noqa: C901
                 if execution_preflight is None:
                     return 1
             apply_legacy_migration(resume_report, args.migrate_legacy)
-            legacy_fast_adoption = resume_report.legacy_fast_adoption
-            if not isinstance(legacy_fast_adoption, LegacyFastAdoptionV1):
-                legacy_fast_adoption = None
 
             print("Resuming processing...")
             print(f"Input: {video_path}")
@@ -961,8 +955,6 @@ def main():  # noqa: C901
                     "preselected_depth_files": selected_files,
                     "preselected_render_source": selected_source,
                 }
-                if legacy_fast_adoption is not None:
-                    processor_kwargs["legacy_fast_adoption"] = legacy_fast_adoption
                 processor = VideoProcessor(
                     None,
                     **processor_kwargs,
@@ -979,14 +971,7 @@ def main():  # noqa: C901
                 )
             else:
                 assert projector is not None and execution_preflight is not None
-                if legacy_fast_adoption is None:
-                    success = projector.execute_video(execution_preflight, job_lock=job_lock)
-                else:
-                    success = projector.execute_video(
-                        execution_preflight,
-                        job_lock=job_lock,
-                        legacy_fast_adoption=legacy_fast_adoption,
-                    )
+                success = projector.execute_video(execution_preflight, job_lock=job_lock)
 
             if success:
                 print("Resume processing completed successfully!")

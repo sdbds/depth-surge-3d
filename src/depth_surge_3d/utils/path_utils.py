@@ -185,7 +185,7 @@ def generate_output_filename(
     parts = [safe_base, "3D", safe_format]
 
     if resolution:
-        parts.append(resolution)
+        parts.append(sanitize_filename(resolution.replace(":", "_")))
 
     filename = "_".join(parts) + ".mp4"
     return filename

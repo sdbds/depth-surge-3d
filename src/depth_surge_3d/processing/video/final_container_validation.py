@@ -1,293 +1,166 @@
-"""Strict bounded validation for a generated final MP4 candidate."""
+"""Lightweight FFprobe container validation for published final MP4 outputs."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from contextvars import ContextVar
+from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import stat
-from typing import BinaryIO
-
-from .bounded_process import (
-    BoundedProcessCaptureV1,
-    BoundedProcessResult,
-    ProcessOutputBudgetError,
-    ProcessTimeoutError,
-    ProgressProcessResult,
-    run_ffmpeg_progress_v1,
-)
-from .encoding_provider import (
-    FINAL_DECODE_DIAGNOSTIC_BYTES,
-    FINAL_ENCODING_LINE_BYTES,
-    FINAL_PROBE_STDERR_BYTES,
-    FINAL_PROBE_STDOUT_BYTES,
-    FinalContainerValidationError,
-    FinalDecodeProgressParser,
-    FfprobeJsonBudgetError,
-    FinalContainerExpectation,
-    parse_final_ffprobe_json,
-    validate_final_probe_streams,
-)
+import subprocess
+from typing import Literal
 
 
-FINAL_PROBE_TIMEOUT_BASE_SECONDS = 30
-FINAL_PROBE_TIMEOUT_PER_1000_WORK_UNITS_SECONDS = 2
-FINAL_PROBE_TIMEOUT_MAX_SECONDS = 21_600
-FINAL_PROBE_BYTES_PER_WORK_UNIT = 64 * 1024
-FINAL_PROBE_VIDEO_THREADS_MAX = 8
-FINAL_DECODE_STALL_SECONDS = 120.0
-_U64_MAX = 0xFFFFFFFFFFFFFFFF
+FINAL_PROBE_TIMEOUT_SECONDS = 30.0
+
+
+class FinalContainerValidationError(ValueError):
+    """The final MP4 container does not match expected video/audio properties."""
 
 
 class FinalContainerProcessError(RuntimeError):
-    """FFprobe or the complete decode returned an invalid process result."""
+    """FFprobe failed or timed out while checking the final MP4."""
 
 
-class FinalContainerProbeTimeoutError(FinalContainerProcessError):
-    """The bounded final-container metadata probe exceeded its deadline."""
+@dataclass(frozen=True)
+class FinalContainerExpectation:
+    """Expected scalar container properties checked after FFmpeg completes."""
+
+    width: int
+    height: int
+    fps: str
+    frame_count: int
+    resolved_encoder: Literal["libx264", "libx265", "hevc_nvenc"]
+    audio_expected: bool = False
 
 
-class FinalContainerProbeBudgetError(FinalContainerProcessError):
-    """The final-container probe exceeded its output or parser-state budget."""
+_EXPECTED_CODEC = {
+    "libx264": "h264",
+    "libx265": "hevc",
+    "hevc_nvenc": "hevc",
+}
 
 
-class FinalContainerDecodeTimeoutError(FinalContainerProcessError):
-    """The final full decode stopped making semantic progress."""
-
-
-class FinalContainerDecodeBudgetError(FinalContainerProcessError):
-    """The final full decode exceeded its bounded diagnostic state."""
-
-
-FiniteRunner = Callable[..., BoundedProcessResult]
-ProgressRunner = Callable[..., ProgressProcessResult]
-_bound_container: ContextVar[tuple[Path, BinaryIO] | None] = ContextVar(
-    "bound_container", default=None
-)
-
-
-def validate_open_linux_container(handle: BinaryIO, validator: Callable[[Path], bool]) -> bool:
-    """Give FFmpeg a path to this open file, not to a replaceable directory entry."""
-
-    path = Path(f"/proc/{os.getpid()}/fd/{handle.fileno()}")
-    token = _bound_container.set((path, handle))
-    try:
-        return validator(path)
-    finally:
-        _bound_container.reset(token)
-
-
-def _checked_u64(value: int, label: str) -> int:
-    if type(value) is not int or not 0 <= value <= _U64_MAX:
-        raise FinalContainerValidationError(f"{label} exceeds u64")
-    return value
-
-
-def _checked_u64_add(left: int, right: int, label: str) -> int:
-    _checked_u64(left, label)
-    _checked_u64(right, label)
-    if left > _U64_MAX - right:
-        raise FinalContainerValidationError(f"{label} exceeds u64")
-    return left + right
-
-
-def _checked_u64_mul(left: int, right: int, label: str) -> int:
-    _checked_u64(left, label)
-    _checked_u64(right, label)
-    if left and right > _U64_MAX // left:
-        raise FinalContainerValidationError(f"{label} exceeds u64")
-    return left * right
-
-
-def _ceil_div_u64(value: int, divisor: int, label: str) -> int:
-    _checked_u64(value, label)
-    if divisor <= 0:
-        raise ValueError("ceil divisor must be positive")
-    quotient, remainder = divmod(value, divisor)
-    return _checked_u64_add(quotient, int(bool(remainder)), label)
-
-
-def derive_final_probe_timeout_seconds(
-    candidate_byte_count: int,
-    expectation: FinalContainerExpectation,
-) -> int:
-    """Derive the bounded count-frames deadline from frozen work units."""
-
-    byte_count = _checked_u64(candidate_byte_count, "final candidate byte count")
-    stream_units = _checked_u64_add(
-        expectation.frame_count,
-        expectation.audio_packet_upper_bound,
-        "final probe stream work units",
-    )
-    byte_units = _ceil_div_u64(
-        byte_count,
-        FINAL_PROBE_BYTES_PER_WORK_UNIT,
-        "final probe byte work units",
-    )
-    work_units = max(1, stream_units, byte_units)
-    work_batches = _ceil_div_u64(work_units, 1000, "final probe work batches")
-    increment = _checked_u64_mul(
-        work_batches,
-        FINAL_PROBE_TIMEOUT_PER_1000_WORK_UNITS_SECONDS,
-        "final probe timeout increment",
-    )
-    timeout = _checked_u64_add(
-        FINAL_PROBE_TIMEOUT_BASE_SECONDS,
-        increment,
-        "final probe timeout",
-    )
-    return min(FINAL_PROBE_TIMEOUT_MAX_SECONDS, timeout)
-
-
-def _run_finite(
-    arguments: Sequence[str],
+def probe_final_container_streams(  # noqa: C901
+    path: Path | str,
     *,
-    stdout_cap: int,
-    stderr_cap: int,
-    timeout_seconds: float,
-    cancelled: Callable[[], bool] | None = None,
-) -> BoundedProcessResult:
-    return BoundedProcessCaptureV1(
-        stdout_cap=stdout_cap,
-        stderr_cap=stderr_cap,
-        timeout_seconds=timeout_seconds,
-        cancelled=cancelled,
-    ).run(arguments)
+    ffprobe: str = "ffprobe",
+    timeout_seconds: float = FINAL_PROBE_TIMEOUT_SECONDS,
+) -> list[dict[str, object]]:
+    """Run one lightweight metadata-only FFprobe (no frame decoding)."""
 
-
-def _container_size(candidate: Path) -> int:
-    bound = _bound_container.get()
+    candidate = Path(path)
     try:
-        if bound is not None and candidate == bound[0]:
-            metadata = os.fstat(bound[1].fileno())
-        else:
-            metadata = candidate.lstat()
+        meta = candidate.lstat()
     except OSError as error:
-        raise FinalContainerProcessError("final video candidate is unavailable") from error
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0:
-        raise FinalContainerProcessError("final video candidate is not an ordinary file")
-    return metadata.st_size
+        raise FinalContainerProcessError(
+            f"final video candidate is unavailable: {candidate}"
+        ) from error
+    if not stat.S_ISREG(meta.st_mode) or meta.st_size <= 0:
+        raise FinalContainerProcessError(
+            f"final video candidate is empty or non-regular: {candidate}"
+        )
 
-
-def _probe_final_container(
-    candidate: Path,
-    size: int,
-    expectation: FinalContainerExpectation,
-    ffprobe: str,
-    finite_runner: FiniteRunner,
-    cancelled: Callable[[], bool] | None,
-) -> None:
-    probe_timeout_seconds = derive_final_probe_timeout_seconds(
-        size,
-        expectation,
-    )
-
-    # FFprobe defaults to one decoder thread; cap parallelism instead of using auto.
-    probe_video_threads = min(
-        FINAL_PROBE_VIDEO_THREADS_MAX, os.cpu_count() or 1, expectation.frame_count
-    )
-    probe_arguments = (
+    cmd = [
         ffprobe,
         "-v",
         "error",
-        "-threads:v",
-        str(probe_video_threads),
-        "-count_frames",
         "-show_entries",
-        "stream=codec_type,codec_name,width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate,nb_read_frames",
+        "stream=codec_type,codec_name,width,height,pix_fmt,avg_frame_rate,nb_frames",
         "-of",
         "json",
         str(candidate),
-    )
+    ]
     try:
-        finite_limits: dict[str, object] = {
-            "stdout_cap": FINAL_PROBE_STDOUT_BYTES,
-            "stderr_cap": FINAL_PROBE_STDERR_BYTES,
-            "timeout_seconds": probe_timeout_seconds,
-        }
-        if cancelled is not None:
-            finite_limits["cancelled"] = cancelled
-        probe = finite_runner(probe_arguments, **finite_limits)
-    except ProcessTimeoutError as error:
-        raise FinalContainerProbeTimeoutError("final FFprobe exceeded its deadline") from error
-    except ProcessOutputBudgetError as error:
-        raise FinalContainerProbeBudgetError("final FFprobe exceeded its output budget") from error
-    if probe.returncode != 0 or probe.stderr:
-        raise FinalContainerProcessError("final FFprobe emitted diagnostics or failed")
-    try:
-        streams = parse_final_ffprobe_json(probe.stdout)
-    except FfprobeJsonBudgetError as error:
-        raise FinalContainerProbeBudgetError(
-            "final FFprobe JSON exceeded its parser-state budget"
-        ) from error
-    validate_final_probe_streams(streams, expectation)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise FinalContainerProcessError("final FFprobe timed out") from error
+    except OSError as error:
+        raise FinalContainerProcessError(f"failed to execute ffprobe: {error}") from error
 
-
-def _decode_final_container(
-    candidate: Path,
-    ffmpeg: str,
-    progress_runner: ProgressRunner,
-    cancelled: Callable[[], bool] | None,
-) -> None:
-    decode_arguments = (
-        ffmpeg,
-        "-v",
-        "error",
-        "-xerror",
-        "-nostats",
-        "-progress",
-        "pipe:1",
-        "-i",
-        str(candidate),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-f",
-        "null",
-        "-",
-    )
-    progress = FinalDecodeProgressParser()
+    if result.returncode != 0:
+        raise FinalContainerProcessError(
+            f"final FFprobe failed (rc={result.returncode}): {result.stderr.strip()}"
+        )
     try:
-        progress_limits: dict[str, object] = {
-            "parser": progress,
-            "diagnostic_cap": FINAL_DECODE_DIAGNOSTIC_BYTES,
-            "line_cap": FINAL_ENCODING_LINE_BYTES,
-            "stall_seconds": FINAL_DECODE_STALL_SECONDS,
-        }
-        if cancelled is not None:
-            progress_limits["cancelled"] = cancelled
-        decoded = progress_runner(decode_arguments, **progress_limits)
-    except ProcessTimeoutError as error:
-        raise FinalContainerDecodeTimeoutError(
-            "final full decode stopped making progress"
-        ) from error
-    except ProcessOutputBudgetError as error:
-        raise FinalContainerDecodeBudgetError(
-            "final full decode exceeded its diagnostic budget"
-        ) from error
-    if decoded.returncode != 0 or decoded.stderr:
-        raise FinalContainerProcessError("final full decode emitted diagnostics or failed")
-    if not progress.ended:
-        raise FinalContainerProcessError("final full decode has no terminal progress state")
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise FinalContainerValidationError("final FFprobe returned invalid JSON") from error
+
+    streams = payload.get("streams")
+    if not isinstance(streams, list) or not streams:
+        raise FinalContainerValidationError("final MP4 contains no streams")
+    return [stream for stream in streams if isinstance(stream, dict)]
 
 
 def validate_final_container_v4(
-    path: Path,
+    path: Path | str,
     expectation: FinalContainerExpectation,
     *,
     ffprobe: str = "ffprobe",
-    ffmpeg: str = "ffmpeg",
-    finite_runner: FiniteRunner = _run_finite,
-    progress_runner: ProgressRunner = run_ffmpeg_progress_v1,
-    cancelled: Callable[[], bool] | None = None,
+    timeout_seconds: float = FINAL_PROBE_TIMEOUT_SECONDS,
+    **_ignored: object,
 ) -> bool:
-    """Probe scalar media facts, then decode every accepted stream to null."""
+    """Validate final MP4 streams with one fast metadata-only FFprobe call."""
+
+    streams = probe_final_container_streams(
+        path,
+        ffprobe=ffprobe,
+        timeout_seconds=timeout_seconds,
+    )
+    video_streams = [s for s in streams if s.get("codec_type") == "video"]
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    if len(video_streams) != 1:
+        raise FinalContainerValidationError(f"expected 1 video stream, found {len(video_streams)}")
+    video = video_streams[0]
+    expected_codec = _EXPECTED_CODEC.get(expectation.resolved_encoder)
+    actual_codec = video.get("codec_name")
+    if expected_codec and actual_codec != expected_codec:
+        raise FinalContainerValidationError(
+            f"unexpected video codec {actual_codec!r}, expected {expected_codec!r}"
+        )
+    if (
+        int(video.get("width") or 0) != expectation.width
+        or int(video.get("height") or 0) != expectation.height
+    ):
+        raise FinalContainerValidationError(
+            f"unexpected video dimensions {video.get('width')}x{video.get('height')}, "
+            f"expected {expectation.width}x{expectation.height}"
+        )
+    if expectation.audio_expected and not audio_streams:
+        raise FinalContainerValidationError("expected audio stream is missing from final MP4")
+    return True
+
+
+def verify_existing_final_video(
+    path: Path | str,
+    *,
+    expected_width: int | None = None,
+    expected_height: int | None = None,
+    ffprobe: str = "ffprobe",
+) -> bool:
+    """Quickly verify that an already-published final MP4 is readable and non-empty."""
 
     candidate = Path(path)
-    _probe_final_container(
-        candidate, _container_size(candidate), expectation, ffprobe, finite_runner, cancelled
-    )
-    _decode_final_container(candidate, ffmpeg, progress_runner, cancelled)
+    if not candidate.is_file() or candidate.is_symlink():
+        return False
+    try:
+        if os.stat(candidate).st_size <= 0:
+            return False
+        streams = probe_final_container_streams(candidate, ffprobe=ffprobe)
+    except (OSError, FinalContainerProcessError, FinalContainerValidationError):
+        return False
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if video is None:
+        return False
+    if expected_width is not None and int(video.get("width") or 0) != expected_width:
+        return False
+    if expected_height is not None and int(video.get("height") or 0) != expected_height:
+        return False
     return True

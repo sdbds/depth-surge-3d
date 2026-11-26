@@ -25,43 +25,26 @@ from collections.abc import Collection
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, cast
+
 import cv2
 
 from ..core.constants import (
-    SUPPORTED_VIDEO_FORMATS,
-    SUPPORTED_IMAGE_FORMATS,
     INTERMEDIATE_DIRS,
+    SUPPORTED_IMAGE_FORMATS,
+    SUPPORTED_VIDEO_FORMATS,
 )
-from ..core.settings import PROCESSING_SETTINGS_SCHEMA_VERSION
-from ..core.video_timing import probe_frame_rate
 from ..core.file_identity import (
     FILE_IDENTITY_ALGORITHM_VERSION,
     file_sample_fingerprint,
 )
+from ..core.settings import PROCESSING_SETTINGS_SCHEMA_VERSION
+from ..core.video_timing import probe_frame_rate
 from ..utils.path_utils import (
-    generate_output_filename,
     format_time_duration,
+    generate_output_filename,
 )
 from .canonical_json import canonical_json_bytes
-from .reservation_protocol import (
-    AllocationAdapter,
-    AllocationCounter,
-    JOB_CONTROL_RELATIVE_PATH,
-    JobControlV1,
-    SETTINGS_ARTIFACT_RELATIVE_PATH,
-    SETTINGS_TRANSITION_INDEX_RELATIVE_PATH,
-    ReservationConflictError,
-    SettingsArtifactTransactionV1,
-    allocation_unit_for_path,
-    assert_only_job_control_owned_reservations_v1,
-    bootstrap_settings_job_v1,
-    commit_terminal_settings_v1,
-    platform_allocation_adapter,
-    platform_allocation_counter,
-    recover_settings_job_v1,
-    _read_bounded_regular_file,
-    _assert_job_control_candidate_has_no_downstream,
-)
+from .durable_publish import atomic_write_bytes, atomic_write_json
 from .settings_artifact import (
     ProcessingSettingsArtifactV5,
     SETTINGS_ARTIFACT_MAX_RAW_BYTES,
@@ -69,6 +52,7 @@ from .settings_artifact import (
 )
 
 
+SETTINGS_ARTIFACT_RELATIVE_PATH = Path("processing-settings-v5.json")
 _SAR_PATTERN = re.compile(r"([0-9]+):([0-9]+)", flags=re.ASCII)
 _SAR_COMPONENT_MAX = 2_147_483_647
 
@@ -89,76 +73,33 @@ def parse_sample_aspect_ratio(value: object) -> tuple[int, int]:
 
 
 def validate_video_file(video_path: str) -> bool:
-    """
-    Validate if file exists and is a supported video format.
+    """Validate if file exists and is a supported video format."""
 
-    Args:
-        video_path: Path to video file
-
-    Returns:
-        True if valid video file exists
-
-    Side Effects:
-        Reads filesystem to check file existence
-    """
     if not os.path.exists(video_path):
         return False
-
-    file_ext = Path(video_path).suffix.lower()
-    return file_ext in SUPPORTED_VIDEO_FORMATS
+    return Path(video_path).suffix.lower() in SUPPORTED_VIDEO_FORMATS
 
 
 def validate_image_file(image_path: str) -> bool:
-    """
-    Validate if file exists and is a supported image format.
+    """Validate if file exists and is a supported image format."""
 
-    Args:
-        image_path: Path to image file
-
-    Returns:
-        True if valid image file exists
-
-    Side Effects:
-        Reads filesystem to check file existence
-    """
     if not os.path.exists(image_path):
         return False
-
-    file_ext = Path(image_path).suffix.lower()
-    return file_ext in SUPPORTED_IMAGE_FORMATS
+    return Path(image_path).suffix.lower() in SUPPORTED_IMAGE_FORMATS
 
 
 def get_video_properties(video_path: str) -> dict[str, Any]:
-    """
-    Get video properties using OpenCV.
+    """Get video properties using OpenCV and FFprobe."""
 
-    Args:
-        video_path: Path to video file
-
-    Returns:
-        Dictionary with video properties (width, height, fps, frame_count, duration, codec)
-
-    Side Effects:
-        Opens and reads video file with cv2.VideoCapture
-    """
     properties: dict[str, Any] = {}
     cap = None
-
     try:
         cap = cv2.VideoCapture(video_path)
-
         if not cap.isOpened():
             return properties
-
         fps = float(cap.get(cv2.CAP_PROP_FPS))
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        # Guard against zero FPS to prevent division by zero
-        if fps > 0:
-            duration = frame_count / fps
-        else:
-            duration = 0.0
-
+        duration = frame_count / fps if fps > 0 else 0.0
         properties.update(
             {
                 "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
@@ -169,9 +110,7 @@ def get_video_properties(video_path: str) -> dict[str, Any]:
                 "codec": int(cap.get(cv2.CAP_PROP_FOURCC)),
             }
         )
-
     except Exception:
-        # Return empty dict if unable to read properties
         pass
     finally:
         if cap is not None:
@@ -204,18 +143,8 @@ def get_video_properties(video_path: str) -> dict[str, Any]:
 
 
 def get_video_info_ffprobe(video_path: str) -> dict[str, Any]:
-    """
-    Get detailed video information using ffprobe subprocess.
+    """Get detailed video information using ffprobe subprocess."""
 
-    Args:
-        video_path: Path to video file
-
-    Returns:
-        Dictionary with video information from ffprobe
-
-    Side Effects:
-        Executes ffprobe subprocess
-    """
     try:
         cmd = [
             "ffprobe",
@@ -227,15 +156,11 @@ def get_video_info_ffprobe(video_path: str) -> dict[str, Any]:
             "-show_streams",
             video_path,
         ]
-
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
         if result.returncode == 0:
             return json.loads(result.stdout)
-
     except Exception:
         pass
-
     return {}
 
 
@@ -244,68 +169,36 @@ def create_output_directories(
     keep_intermediates: bool = True,
     omitted_intermediates: Collection[str] | None = None,
 ) -> dict[str, Path]:
-    """
-    Create output directory structure on filesystem.
+    """Create output directory structure on filesystem."""
 
-    Args:
-        base_path: Base output directory path
-        keep_intermediates: Retention preference used after successful processing. All
-            stage directories are created because they are required pipeline storage.
-        omitted_intermediates: Directory keys to omit from creation and the returned map.
-
-    Returns:
-        Dictionary mapping directory names to paths
-
-    Side Effects:
-        Creates directories on filesystem
-    """
+    _ = keep_intermediates
     omitted = frozenset(omitted_intermediates or ())
     directories = {"base": base_path}
-
-    # Always create base directory
     base_path.mkdir(parents=True, exist_ok=True)
-
-    # Intermediates are working state, not optional output. The retention flag is
-    # applied only after the final video has been encoded successfully.
     for dir_name, dir_path in INTERMEDIATE_DIRS.items():
         if dir_name in omitted:
             continue
         full_path = base_path / dir_path
         full_path.mkdir(exist_ok=True)
         directories[dir_name] = full_path
-
     return directories
 
 
 def get_frame_files(frames_dir: Path) -> list[Path]:
-    """
-    Get sorted list of frame files from directory.
+    """Get numerically sorted list of frame files from directory."""
 
-    Args:
-        frames_dir: Directory containing frame files
-
-    Returns:
-        Sorted list of frame file paths
-
-    Side Effects:
-        Reads directory contents from filesystem
-    """
     if not frames_dir.exists():
         return []
-
     frame_files: list[Path] = []
     for ext in SUPPORTED_IMAGE_FORMATS:
         frame_files.extend(frames_dir.glob(f"*{ext}"))
 
-    # Sort numerically by filename
     def sort_key(path: Path) -> int:
         try:
-            # Extract number from filename
             stem = path.stem
             if stem.startswith("frame_"):
                 return int(stem.split("_")[1])
-            else:
-                return int("".join(filter(str.isdigit, stem)))
+            return int("".join(filter(str.isdigit, stem)))
         except (ValueError, IndexError):
             return 0
 
@@ -313,65 +206,25 @@ def get_frame_files(frames_dir: Path) -> list[Path]:
 
 
 def calculate_directory_size(directory: Path) -> int:
-    """
-    Calculate total size of directory in bytes.
+    """Calculate total size of directory in bytes."""
 
-    Args:
-        directory: Directory path
-
-    Returns:
-        Total size in bytes
-
-    Side Effects:
-        Walks directory tree and stats files
-    """
     total_size = 0
-
     try:
-        for dirpath, dirnames, filenames in os.walk(directory):
+        for dirpath, _dirnames, filenames in os.walk(directory):
             for filename in filenames:
                 filepath = os.path.join(dirpath, filename)
                 if os.path.exists(filepath):
                     total_size += os.path.getsize(filepath)
     except (OSError, PermissionError):
         pass
-
     return total_size
 
 
 def _should_keep_file(file_path: Path, keep_patterns: list[str]) -> bool:
-    """
-    Check if file should be kept based on pattern matching.
-
-    Args:
-        file_path: Path to file to check
-        keep_patterns: List of glob patterns to keep
-
-    Returns:
-        True if file should be kept
-
-    Side Effects:
-        None (pure pattern matching)
-    """
-    for pattern in keep_patterns:
-        if file_path.match(pattern):
-            return True
-    return False
+    return any(file_path.match(pattern) for pattern in keep_patterns)
 
 
 def _remove_file_safe(file_path: Path) -> bool:
-    """
-    Safely remove a file, handling errors.
-
-    Args:
-        file_path: Path to file to remove
-
-    Returns:
-        True if file was removed successfully
-
-    Side Effects:
-        Deletes file from filesystem
-    """
     try:
         file_path.unlink()
         return True
@@ -380,69 +233,32 @@ def _remove_file_safe(file_path: Path) -> bool:
 
 
 def _cleanup_directory(directory: Path, keep_patterns: list[str]) -> int:
-    """
-    Clean up files in a single directory.
-
-    Args:
-        directory: Directory to clean
-        keep_patterns: Patterns to keep
-
-    Returns:
-        Number of files removed
-
-    Side Effects:
-        Deletes files from filesystem
-    """
     removed_count = 0
-
     for file_path in directory.rglob("*"):
-        if file_path.is_file():
-            if not _should_keep_file(file_path, keep_patterns):
-                if _remove_file_safe(file_path):
-                    removed_count += 1
-
+        if file_path.is_file() and not _should_keep_file(file_path, keep_patterns):
+            if _remove_file_safe(file_path):
+                removed_count += 1
     return removed_count
 
 
 def cleanup_intermediate_files(base_path: Path, keep_patterns: list[str] | None = None) -> int:
-    """
-    Clean up intermediate files, optionally keeping certain patterns.
+    """Clean up intermediate files, optionally keeping certain patterns."""
 
-    Args:
-        base_path: Base directory containing intermediate files
-        keep_patterns: List of glob patterns to keep
-
-    Returns:
-        Number of files removed
-
-    Side Effects:
-        Deletes files from filesystem
-    """
     removed_count = 0
     keep_patterns = keep_patterns or []
-
     try:
         for intermediate_dir in INTERMEDIATE_DIRS.values():
             full_dir = base_path / intermediate_dir
             if full_dir.exists():
                 removed_count += _cleanup_directory(full_dir, keep_patterns)
-
     except (OSError, PermissionError):
         pass
-
     return removed_count
 
 
 def verify_ffmpeg_installation() -> bool:
-    """
-    Verify that FFmpeg is installed and accessible.
+    """Verify that FFmpeg is installed and accessible."""
 
-    Returns:
-        True if FFmpeg is available
-
-    Side Effects:
-        Executes ffmpeg subprocess
-    """
     try:
         result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=10)
         return result.returncode == 0
@@ -451,23 +267,13 @@ def verify_ffmpeg_installation() -> bool:
 
 
 def get_available_space(directory: Path) -> int:
-    """
-    Get available disk space for directory in bytes.
+    """Get available disk space for directory in bytes."""
 
-    Args:
-        directory: Directory path to check
-
-    Returns:
-        Available space in bytes
-
-    Side Effects:
-        Queries filesystem for disk space information
-    """
     statvfs = getattr(os, "statvfs", None)
     if statvfs is not None:
         try:
-            stat = statvfs(directory)
-            return int(stat.f_bavail * stat.f_frsize)
+            info = statvfs(directory)
+            return int(info.f_bavail * info.f_frsize)
         except (OSError, AttributeError):
             pass
     try:
@@ -475,6 +281,25 @@ def get_available_space(directory: Path) -> int:
         return int(free)
     except OSError:
         return 0
+
+
+def _utc_now_usec() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _read_settings_v5_bytes(path: Path) -> bytes:
+    if path.is_symlink():
+        raise OSError(f"refusing symlink settings file: {path}")
+    raw = path.read_bytes()
+    if len(raw) > SETTINGS_ARTIFACT_MAX_RAW_BYTES:
+        raise ValueError(f"settings artifact exceeds max bytes: {path}")
+    return raw
+
+
+def _write_settings_v5(output_dir: Path, artifact: ProcessingSettingsArtifactV5) -> Path:
+    settings_file = Path(output_dir) / SETTINGS_ARTIFACT_RELATIVE_PATH
+    atomic_write_bytes(settings_file, artifact.encode(), sync=True)
+    return settings_file
 
 
 def save_processing_settings(
@@ -486,40 +311,36 @@ def save_processing_settings(
     *,
     transactional_v5: bool = False,
 ) -> Path:
-    """
-    Save processing settings to a JSON file in the output directory.
+    """Save processing settings to a JSON file in the output directory."""
 
-    Args:
-        output_dir: Output directory path
-        batch_name: Name of the processing batch/job
-        settings: Complete processing settings dictionary
-        video_properties: Video metadata
-        source_video_path: Path to source video file
-
-    Returns:
-        Path to the saved settings file
-
-    Side Effects:
-        Writes JSON file to disk
-    """
-    if transactional_v5:
-        return _save_processing_settings_v5(
-            output_dir=output_dir,
-            batch_name=batch_name,
-            settings=settings,
-            video_properties=video_properties,
-            source_video_path=source_video_path,
-        )
-
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     source_path = Path(source_video_path)
     source_video_fingerprint = (
         file_sample_fingerprint(source_path) if source_path.is_file() else None
     )
+
+    if transactional_v5:
+        artifact = create_processing_settings_artifact_v5(
+            batch_name=batch_name,
+            source_video=str(source_video_path),
+            source_video_name=source_path.name,
+            source_video_fingerprint=source_video_fingerprint,
+            video_properties=video_properties,
+            processing_settings=settings,
+            output_directory=str(output_dir),
+            project_version="0.9.0",
+            creation_now_usec=_utc_now_usec(),
+        )
+        settings_file = _write_settings_v5(output_dir, artifact)
+        print(f"Settings saved to: {settings_file}")
+        return settings_file
+
     settings_data = {
         "metadata": {
             "batch_name": batch_name,
             "source_video": str(source_video_path),
-            "source_video_name": Path(source_video_path).name,
+            "source_video_name": source_path.name,
             "source_video_fingerprint_algorithm": FILE_IDENTITY_ALGORITHM_VERSION,
             "source_video_fingerprint": source_video_fingerprint,
             "settings_schema_version": PROCESSING_SETTINGS_SCHEMA_VERSION,
@@ -533,182 +354,113 @@ def save_processing_settings(
         "output_info": {
             "output_directory": str(output_dir),
             "expected_output_filename": generate_output_filename(
-                Path(source_video_path).name,
+                source_path.name,
                 settings["vr_format"],
                 settings["vr_resolution"],
             ),
         },
     }
-
-    # Save settings file
     settings_file = output_dir / f"{batch_name}-settings.json"
-
     try:
-        with open(settings_file, "w", encoding="utf-8") as f:
-            json.dump(settings_data, f, indent=2, ensure_ascii=False)
-
+        atomic_write_json(settings_file, settings_data, indent=2, sort_keys=False, sync=True)
         print(f"Settings saved to: {settings_file}")
-        return settings_file
-
-    except Exception as e:
-        print(f"Warning: Could not save settings file: {e}")
-        # Create a minimal fallback file
+    except Exception as error:
+        print(f"Warning: Could not save settings file: {error}")
         fallback_data = {
             "metadata": {
                 "batch_name": batch_name,
-                "error": f"Failed to save full settings: {e}",
+                "error": f"Failed to save full settings: {error}",
             },
             "processing_settings": settings,
         }
         try:
-            with open(settings_file, "w", encoding="utf-8") as f:
-                json.dump(fallback_data, f, indent=2)
+            settings_file.write_text(json.dumps(fallback_data, indent=2), encoding="utf-8")
         except Exception:
-            pass  # If we can't even save the fallback, continue without it
-
-        return settings_file
-
-
-def _utc_now_usec() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-
-def _save_processing_settings_v5(
-    *,
-    output_dir: Path,
-    batch_name: str,
-    settings: dict[str, Any],
-    video_properties: dict[str, Any],
-    source_video_path: str,
-) -> Path:
-    """Create a new schema-5 job through locator-first reserved publication."""
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    source_path = Path(source_video_path)
-    source_fingerprint = file_sample_fingerprint(source_path) if source_path.is_file() else None
-    artifact = create_processing_settings_artifact_v5(
-        batch_name=batch_name,
-        source_video=str(source_video_path),
-        source_video_name=source_path.name,
-        source_video_fingerprint=source_fingerprint,
-        video_properties=video_properties,
-        processing_settings=settings,
-        output_directory=str(output_dir),
-        project_version="0.9.0",
-        creation_now_usec=_utc_now_usec(),
-    )
-    allocation_unit = allocation_unit_for_path(output_dir)
-    bootstrap_settings_job_v1(
-        job_root=output_dir,
-        artifact=artifact,
-        initial_settings_reservation_id=secrets.token_hex(16),
-        allocation_adapter=platform_allocation_adapter,
-        allocation_counter=platform_allocation_counter,
-        allocation_unit=allocation_unit,
-    )
-    settings_file = output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH
-    print(f"Settings saved to: {settings_file}")
+            pass
     return settings_file
 
 
 def load_processing_settings(settings_file: Path) -> dict[str, Any] | None:
-    """
-    Load processing settings from a JSON file.
+    """Load processing settings from a JSON file."""
 
-    Args:
-        settings_file: Path to settings file
-
-    Returns:
-        Dictionary with loaded settings data or None if failed
-
-    Side Effects:
-        Reads JSON file from disk
-    """
     try:
         if not settings_file.exists():
             print(f"Settings file not found: {settings_file}")
             return None
-
         if settings_file.name == SETTINGS_ARTIFACT_RELATIVE_PATH.name:
             settings_data = ProcessingSettingsArtifactV5.parse(
-                _read_bounded_regular_file(
-                    settings_file,
-                    max_bytes=SETTINGS_ARTIFACT_MAX_RAW_BYTES,
-                )
+                _read_settings_v5_bytes(settings_file)
             ).to_object()
         else:
-            with open(settings_file, "r", encoding="utf-8") as f:
-                settings_data = json.load(f)
-
+            with open(settings_file, "r", encoding="utf-8") as handle:
+                settings_data = json.load(handle)
         print(f"Settings loaded from: {settings_file}")
         return settings_data
-
-    except Exception as e:
-        print(f"Error loading settings file: {e}")
+    except Exception as error:
+        print(f"Error loading settings file: {error}")
         return None
 
 
-def update_processing_status(
-    settings_file: Path, status: str, additional_info: dict[str, Any] | None = None
-) -> bool:
-    """
-    Update the processing status in the settings file.
+def recover_processing_control_prefix_v1(
+    job_root: Path,
+    **_ignored: object,
+) -> ProcessingSettingsArtifactV5 | None:
+    """Load the schema-5 settings artifact if present in ``job_root``."""
 
-    Args:
-        settings_file: Path to settings file
-        status: New status ('in_progress', 'completed', 'failed', 'paused')
-        additional_info: Additional metadata to add
+    fixed = Path(job_root) / SETTINGS_ARTIFACT_RELATIVE_PATH
+    if not fixed.exists() and not fixed.is_symlink():
+        return None
+    return ProcessingSettingsArtifactV5.parse(_read_settings_v5_bytes(fixed))
 
-    Returns:
-        True if update was successful
 
-    Side Effects:
-        Reads and writes JSON file
-    """
-    if settings_file.name == SETTINGS_ARTIFACT_RELATIVE_PATH.name:
-        return _update_processing_status_v5(
-            settings_file,
-            status=status,
-            additional_info=additional_info,
-        )
-    try:
-        settings_data = load_processing_settings(settings_file)
-        if not settings_data:
-            return False
+def recover_processing_settings_artifact(settings_file: Path) -> ProcessingSettingsArtifactV5:
+    """Read and validate a schema-5 settings artifact."""
 
-        # Update status and timestamp
-        settings_data["metadata"]["processing_status"] = status
-        settings_data["metadata"]["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        settings_data["metadata"]["last_updated_timestamp"] = time.time()
+    settings_file = Path(settings_file)
+    if settings_file.name != SETTINGS_ARTIFACT_RELATIVE_PATH.name:
+        raise ValueError("schema-5 recovery requires processing-settings-v5.json")
+    artifact = recover_processing_control_prefix_v1(settings_file.parent)
+    if artifact is None:
+        raise FileNotFoundError(f"schema-5 settings artifact is missing: {settings_file}")
+    return artifact
 
-        if status == "completed":
-            settings_data["metadata"]["completed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            settings_data["metadata"]["completed_timestamp"] = time.time()
 
-            # Calculate processing duration
-            if "created_timestamp" in settings_data["metadata"]:
-                duration = time.time() - settings_data["metadata"]["created_timestamp"]
-                settings_data["metadata"]["processing_duration_seconds"] = duration
-                settings_data["metadata"]["processing_duration_formatted"] = format_time_duration(
-                    duration
-                )
+def prepare_processing_settings_artifact(
+    settings_file: Path,
+    *,
+    settings: dict[str, Any],
+    video_properties: dict[str, Any],
+    source_video_path: str,
+) -> ProcessingSettingsArtifactV5:
+    """Validate immutable inputs and atomically update schema-5 processing settings."""
 
-        # Add any additional info
-        if additional_info:
-            if "runtime_info" not in settings_data:
-                settings_data["runtime_info"] = {}
-            settings_data["runtime_info"].update(additional_info)
+    settings_file = Path(settings_file)
+    current = recover_processing_settings_artifact(settings_file)
+    value = current.to_object()
+    source_path = Path(source_video_path)
+    source_fingerprint = file_sample_fingerprint(source_path) if source_path.is_file() else None
+    metadata = value["metadata"]
+    comparison_properties = dict(video_properties)
+    if "frame_rate" not in value["video_properties"]:
+        comparison_properties.pop("frame_rate", None)
+    if (
+        metadata["source_video"] != str(source_video_path)
+        or metadata["source_video_name"] != source_path.name
+        or metadata["source_video_fingerprint"] != source_fingerprint
+        or value["video_properties"] != comparison_properties
+        or value["output_info"]["output_directory"] != str(settings_file.parent)
+    ):
+        raise ValueError("existing schema-5 job belongs to different immutable inputs")
 
-        # Save updated settings
-        with open(settings_file, "w", encoding="utf-8") as f:
-            json.dump(settings_data, f, indent=2, ensure_ascii=False)
-
-        return True
-
-    except Exception as e:
-        print(f"Warning: Could not update settings file status: {e}")
-        return False
+    now = _utc_now_usec()
+    if current.status == "in_progress":
+        target = current.with_processing_settings(settings, updated_at=now)
+        if target.to_object()["processing_settings"] == value["processing_settings"]:
+            return current
+    else:
+        target = current.restart(started_at=now, processing_settings=settings)
+    _write_settings_v5(settings_file.parent, target)
+    return target
 
 
 def _bounded_metric_summary(value: object) -> dict[str, Any] | None:
@@ -733,319 +485,57 @@ def _bounded_metric_summary(value: object) -> dict[str, Any] | None:
     }
 
 
-def commit_final_media_producer_marker(
-    settings_file: Path,
-    *,
-    generation: str,
-) -> ProcessingSettingsArtifactV5:
-    """Durably enter publication-v4 before the first FFmpeg launch."""
-
-    settings_file = Path(settings_file)
-    if settings_file.name != SETTINGS_ARTIFACT_RELATIVE_PATH.name:
-        raise ValueError("producer marker requires processing-settings-v5.json")
-    job_root = settings_file.parent
-    current = recover_processing_control_prefix_v1(job_root)
-    if current is None:
-        raise ReservationConflictError("producer marker has no schema-5 job")
-    final_index = job_root / (".depth-surge-reservations-v1/final-encoding-reservation-v1.json")
-    final_index_temporary = final_index.with_name(f".{final_index.name}.create-new.tmp")
-    if any(path.exists() or path.is_symlink() for path in (final_index, final_index_temporary)):
-        from ..processing.video.final_publication import (
-            load_final_encoding_reservation_v1,
-        )
-
-        reservation = load_final_encoding_reservation_v1(job_root, current)
-        if reservation.index.publication_generation != generation:
-            raise ReservationConflictError("producer marker generation differs from active index")
-        return reservation.commit_producer_settings()
-    target = current.with_producer_marker(
-        generation=generation,
-        updated_at=_utc_now_usec(),
-    )
-    if target is current:
-        return current
-    transaction = SettingsArtifactTransactionV1.begin(
-        job_root=job_root,
-        current=current,
-        target=target,
-        allocation_adapter=platform_allocation_adapter,
-        allocation_counter=platform_allocation_counter,
-        allocation_unit=allocation_unit_for_path(job_root),
-        reservation_generation=secrets.token_hex(16),
-        reservation_id=secrets.token_hex(16),
-    )
-    return transaction.commit()
-
-
 def commit_cleanup_pending_status(
     settings_file: Path,
-    *,
-    reservation: Any | None = None,
+    **_ignored: object,
 ) -> ProcessingSettingsArtifactV5:
-    """Durably authorize cleanup-only recovery before deleting any payload."""
-
-    settings_file = Path(settings_file)
-    if settings_file.name != SETTINGS_ARTIFACT_RELATIVE_PATH.name:
-        raise ValueError("cleanup pending requires processing-settings-v5.json")
-    job_root = settings_file.parent
-    current = recover_processing_control_prefix_v1(job_root)
-    if current is None:
-        raise ReservationConflictError("cleanup pending has no schema-5 job")
-    active_index = job_root / ".depth-surge-reservations-v1" / "final-encoding-reservation-v1.json"
-    active_index_temporary = active_index.with_name(f".{active_index.name}.create-new.tmp")
-    active_final = any(
-        path.exists() or path.is_symlink() for path in (active_index, active_index_temporary)
-    )
-    if not active_final:
-        raise ReservationConflictError("cleanup pending requires its active final reservation")
-    from ..processing.video.final_publication import (
-        load_final_encoding_reservation_v1,
-    )
-
-    active_reservation = load_final_encoding_reservation_v1(job_root, current)
-    reservation_fingerprint = None
-    if reservation is not None:
-        reservation_fingerprint = getattr(reservation, "index_fingerprint", None)
-        if reservation_fingerprint is None:
-            reservation_fingerprint = getattr(
-                getattr(reservation, "index", None),
-                "fingerprint",
-                None,
-            )
-    if reservation is not None and (
-        reservation_fingerprint != active_reservation.index.fingerprint
-    ):
-        raise ReservationConflictError("cleanup reservation is no longer authoritative")
-    return active_reservation.commit_cleanup_pending_settings()
-
-
-def recover_processing_settings_artifact(
-    settings_file: Path,
-) -> ProcessingSettingsArtifactV5:
-    settings_file = Path(settings_file)
-    if settings_file.name != SETTINGS_ARTIFACT_RELATIVE_PATH.name:
-        raise ValueError("schema-5 recovery requires processing-settings-v5.json")
-    artifact = recover_processing_control_prefix_v1(settings_file.parent)
-    if artifact is None:
-        raise ReservationConflictError("schema-5 settings job is absent")
-    return artifact
-
-
-def _control_locator_exists(final: Path, temporary: Path) -> bool:
-    return any(path.exists() or path.is_symlink() for path in (final, temporary))
-
-
-def _load_control_before_mutation(
-    root: Path, job_control: Path, job_control_temporary: Path
-) -> JobControlV1 | None:
-    # Strict-load first so a complete durable locator temporary becomes authoritative.
-    from .reservation_protocol import load_job_control
-
-    if not _control_locator_exists(job_control, job_control_temporary):
-        _assert_job_control_candidate_has_no_downstream(root)
-        return None
-    try:
-        return load_job_control(root)
-    except ReservationConflictError:
-        if not _control_locator_exists(job_control, job_control_temporary):
-            _assert_job_control_candidate_has_no_downstream(root)
-            return None
-        raise
-
-
-def _recover_pending_final_prefix(
-    root: Path,
-    artifact: ProcessingSettingsArtifactV5,
-    allocation_adapter: AllocationAdapter,
-    allocation_counter: AllocationCounter | None,
-) -> ProcessingSettingsArtifactV5:
-    from ..processing.video.final_publication import (
-        load_final_encoding_reservation_v1,
-        recover_final_encoding_terminal_retirement_v1,
-    )
-
-    if artifact.status in {"completed", "failed"}:
-        recover_final_encoding_terminal_retirement_v1(
-            root,
-            artifact,
-            allocation_adapter=allocation_adapter,
-            allocation_counter=allocation_counter,
-        )
-    else:
-        reservation = load_final_encoding_reservation_v1(
-            root,
-            artifact,
-            allocation_adapter=allocation_adapter,
-            allocation_counter=allocation_counter,
-        )
-        if not reservation.requires_explicit_streamed_recovery():
-            reservation.recover_publication_prefix()
-            artifact = recover_settings_job_v1(
-                root,
-                allocation_adapter=allocation_adapter,
-                allocation_counter=allocation_counter,
-            )
-    return artifact
-
-
-def _recover_final_index_and_settings_gap(
-    root: Path,
-    fixed_settings: Path,
-    allocation_adapter: AllocationAdapter,
-    allocation_counter: AllocationCounter | None,
-) -> bool:
-    from ..processing.video.final_publication import (
-        recover_final_encoding_index_pair_v1,
-        recover_settings_replacement_gap_from_final_index_v1,
-    )
-
-    recovered_final_index = recover_final_encoding_index_pair_v1(root)
-    final_active = recovered_final_index is not None
-    if final_active and not fixed_settings.exists():
-        recover_settings_replacement_gap_from_final_index_v1(
-            root,
-            allocation_adapter=allocation_adapter,
-            allocation_counter=allocation_counter,
-        )
-    return final_active
-
-
-def recover_processing_control_prefix_v1(
-    job_root: Path,
-    *,
-    allocation_adapter=platform_allocation_adapter,
-    allocation_counter=platform_allocation_counter,
-) -> ProcessingSettingsArtifactV5 | None:
-    """Recover every fixed schema-5 control authority before ordinary job mutation."""
-
-    root = Path(job_root)
-    job_control = root / JOB_CONTROL_RELATIVE_PATH
-    job_control_temporary = job_control.with_name(f".{job_control.name}.create-new.tmp")
-    fixed_settings = root / SETTINGS_ARTIFACT_RELATIVE_PATH
-
-    control = _load_control_before_mutation(root, job_control, job_control_temporary)
-    if control is None:
-        return None
-    settings_index = root / SETTINGS_TRANSITION_INDEX_RELATIVE_PATH
-    settings_index_temporary = settings_index.with_name(f".{settings_index.name}.create-new.tmp")
-    from ..processing.video.final_publication import (
-        FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
-        recover_final_encoding_terminal_retirement_v1,
-    )
-
-    final_index = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
-    final_index_temporary = final_index.with_name(f".{final_index.name}.create-new.tmp")
-    settings_active = any(
-        path.exists() or path.is_symlink() for path in (settings_index, settings_index_temporary)
-    )
-    final_active = any(
-        path.exists() or path.is_symlink() for path in (final_index, final_index_temporary)
-    )
-    if settings_active and final_active:
-        raise ReservationConflictError("both fixed reservation indexes are active")
-    artifact: ProcessingSettingsArtifactV5 | None = None
-    if final_active and fixed_settings.exists():
-        artifact = recover_settings_job_v1(
-            root,
-            allocation_adapter=allocation_adapter,
-            allocation_counter=allocation_counter,
-        )
-        if artifact.status in {"completed", "failed"}:
-            if not recover_final_encoding_terminal_retirement_v1(
-                root,
-                artifact,
-                allocation_adapter=allocation_adapter,
-                allocation_counter=allocation_counter,
-            ):
-                raise ReservationConflictError(
-                    "terminal settings retain only an uncommitted final index temporary"
-                )
-            assert_only_job_control_owned_reservations_v1(root, control)
-            return artifact
-    if final_active:
-        final_active = _recover_final_index_and_settings_gap(
-            root, fixed_settings, allocation_adapter, allocation_counter
-        )
-    if artifact is None:
-        artifact = recover_settings_job_v1(
-            root,
-            allocation_adapter=allocation_adapter,
-            allocation_counter=allocation_counter,
-        )
-    if final_active:
-        artifact = _recover_pending_final_prefix(
-            root, artifact, allocation_adapter, allocation_counter
-        )
-    fixed_indexes = (
-        settings_index,
-        settings_index_temporary,
-        final_index,
-        final_index_temporary,
-    )
-    if not any(path.exists() or path.is_symlink() for path in fixed_indexes):
-        assert_only_job_control_owned_reservations_v1(root, control)
-    return artifact
-
-
-def prepare_processing_settings_artifact(
-    settings_file: Path,
-    *,
-    settings: dict[str, Any],
-    video_properties: dict[str, Any],
-    source_video_path: str,
-) -> ProcessingSettingsArtifactV5:
-    """Recover a schema-5 job and durably enter the caller's processing attempt."""
+    """Record ``cleanup_status='pending'`` atomically before removing intermediates."""
 
     settings_file = Path(settings_file)
     current = recover_processing_settings_artifact(settings_file)
-    final_index = settings_file.parent / (
-        ".depth-surge-reservations-v1/final-encoding-reservation-v1.json"
-    )
-    final_index_temporary = final_index.with_name(f".{final_index.name}.create-new.tmp")
-    final_active = any(
-        path.exists() or path.is_symlink() for path in (final_index, final_index_temporary)
-    )
-    value = current.to_object()
-    source_path = Path(source_video_path)
-    source_fingerprint = file_sample_fingerprint(source_path) if source_path.is_file() else None
-    metadata = value["metadata"]
-    comparison_properties = dict(video_properties)
-    if "frame_rate" not in value["video_properties"]:
-        # Preserve immutable bytes for jobs written before exact frame rates were recorded.
-        comparison_properties.pop("frame_rate", None)
-    if (
-        metadata["source_video"] != str(source_video_path)
-        or metadata["source_video_name"] != source_path.name
-        or metadata["source_video_fingerprint"] != source_fingerprint
-        or value["video_properties"] != comparison_properties
-        or value["output_info"]["output_directory"] != str(settings_file.parent)
-    ):
-        raise ValueError("existing schema-5 job belongs to different immutable inputs")
-
     now = _utc_now_usec()
-    if current.status == "in_progress":
-        target = current.with_processing_settings(settings, updated_at=now)
-        if target.to_object()["processing_settings"] == value["processing_settings"]:
-            return current
-    else:
-        target = current.restart(started_at=now, processing_settings=settings)
+    if current.to_object()["metadata"].get("final_media_publication_generation") is None:
+        current = current.with_producer_marker(generation=secrets.token_hex(16), updated_at=now)
+    target = current.cleanup_pending(updated_at=now)
+    _write_settings_v5(settings_file.parent, target)
+    return target
 
-    if final_active:
-        raise ReservationConflictError(
-            "processing settings cannot change while final encoding is active"
+
+def update_processing_status(
+    settings_file: Path, status: str, additional_info: dict[str, Any] | None = None
+) -> bool:
+    """Update the processing status in the settings file atomically."""
+
+    if settings_file.name == SETTINGS_ARTIFACT_RELATIVE_PATH.name:
+        return _update_processing_status_v5(
+            settings_file,
+            status=status,
+            additional_info=additional_info,
         )
-
-    transaction = SettingsArtifactTransactionV1.begin(
-        job_root=settings_file.parent,
-        current=current,
-        target=target,
-        allocation_adapter=platform_allocation_adapter,
-        allocation_counter=platform_allocation_counter,
-        allocation_unit=allocation_unit_for_path(settings_file.parent),
-        reservation_generation=secrets.token_hex(16),
-        reservation_id=secrets.token_hex(16),
-    )
-    return transaction.commit()
+    try:
+        settings_data = load_processing_settings(settings_file)
+        if not settings_data:
+            return False
+        settings_data["metadata"]["processing_status"] = status
+        settings_data["metadata"]["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        settings_data["metadata"]["last_updated_timestamp"] = time.time()
+        if status == "completed":
+            settings_data["metadata"]["completed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            settings_data["metadata"]["completed_timestamp"] = time.time()
+            if "created_timestamp" in settings_data["metadata"]:
+                duration = time.time() - settings_data["metadata"]["created_timestamp"]
+                settings_data["metadata"]["processing_duration_seconds"] = duration
+                settings_data["metadata"]["processing_duration_formatted"] = format_time_duration(
+                    duration
+                )
+        if additional_info:
+            settings_data.setdefault("runtime_info", {}).update(additional_info)
+        with open(settings_file, "w", encoding="utf-8") as handle:
+            json.dump(settings_data, handle, indent=2, ensure_ascii=False)
+        return True
+    except Exception as error:
+        print(f"Warning: Could not update settings file status: {error}")
+        return False
 
 
 def _update_processing_status_v5(
@@ -1054,13 +544,8 @@ def _update_processing_status_v5(
     status: str,
     additional_info: dict[str, Any] | None,
 ) -> bool:
-    """Commit a closed terminal transition through the retained lifecycle extent."""
-
     try:
-        job_root = settings_file.parent
-        current = recover_processing_control_prefix_v1(job_root)
-        if current is None:
-            raise ReservationConflictError("terminal update has no schema-5 job")
+        current = recover_processing_settings_artifact(settings_file)
         now = _utc_now_usec()
         info = dict(additional_info or {})
         if status == "completed":
@@ -1086,10 +571,7 @@ def _update_processing_status_v5(
             )
             target = current.completed(
                 terminal_at=now,
-                frames_processed=info.get(
-                    "frames_processed",
-                    current.selected_frame_count,
-                ),
+                frames_processed=info.get("frames_processed", current.selected_frame_count),
                 cleanup_status=completed_cleanup_status,
                 metric_clamp_summary=_bounded_metric_summary(info.get("metric_clamp_summary")),
             )
@@ -1106,14 +588,7 @@ def _update_processing_status_v5(
             return True
         else:
             raise ValueError(f"unsupported schema-5 processing status transition: {status}")
-        commit_terminal_settings_v1(
-            job_root=job_root,
-            current=current,
-            target=target,
-            allocation_adapter=platform_allocation_adapter,
-            allocation_counter=platform_allocation_counter,
-        )
-        recover_processing_control_prefix_v1(job_root)
+        _write_settings_v5(settings_file.parent, target)
         return True
     except Exception as error:
         print(f"Warning: Could not commit schema-5 processing status: {error}")
@@ -1121,25 +596,13 @@ def _update_processing_status_v5(
 
 
 def find_settings_file(output_dir: Path, batch_name: str | None = None) -> Path | None:
-    """
-    Find a settings file in the output directory.
+    """Find a settings file in the output directory."""
 
-    Args:
-        output_dir: Output directory to search
-        batch_name: Specific batch name to look for (if None, finds any)
-
-    Returns:
-        Path to settings file or None if not found
-
-    Side Effects:
-        Reads directory contents from filesystem
-    """
     try:
         fixed = output_dir / SETTINGS_ARTIFACT_RELATIVE_PATH
         if fixed.is_file() and not fixed.is_symlink():
             return fixed
         if batch_name:
-            # Look for specific batch
             settings_file = output_dir / f"{batch_name}-settings.json"
             if settings_file.exists():
                 return settings_file
@@ -1151,32 +614,14 @@ def find_settings_file(output_dir: Path, batch_name: str | None = None) -> Path 
             )
             if candidates:
                 return candidates[0]
-
         return None
-
     except Exception:
         return None
 
 
 def can_resume_processing(output_dir: Path) -> dict[str, Any]:
-    """
-    Check if processing can be resumed from the given directory.
+    """Check if processing can be resumed from the given directory."""
 
-    Args:
-        output_dir: Output directory to check
-
-    Returns:
-        Dictionary with resume information including:
-        - can_resume: bool
-        - settings_file: Path | None
-        - batch_name: str | None
-        - status: str | None
-        - progress_info: dict | None
-        - recommendations: list[str]
-
-    Side Effects:
-        Reads files and directory structure from filesystem
-    """
     result: dict[str, Any] = {
         "can_resume": False,
         "settings_file": None,
@@ -1185,35 +630,25 @@ def can_resume_processing(output_dir: Path) -> dict[str, Any]:
         "progress_info": None,
         "recommendations": [],
     }
-
     try:
-        # Find settings file
         settings_file = find_settings_file(output_dir)
         if not settings_file:
             result["recommendations"].append("No settings file found - cannot resume")
             return result
-
-        # Load settings
         settings_data = load_processing_settings(settings_file)
         if not settings_data:
             result["recommendations"].append("Could not load settings file")
             return result
-
         result["settings_file"] = settings_file
         result["batch_name"] = settings_data.get("metadata", {}).get("batch_name")
         result["status"] = settings_data.get("metadata", {}).get("processing_status")
-
-        # Check if can resume based on status
         if result["status"] in ["completed"]:
             result["recommendations"].append("Processing already completed")
             return result
-        elif result["status"] in ["in_progress", "paused", "failed"]:
+        if result["status"] in ["in_progress", "paused", "failed"]:
             result["can_resume"] = True
-
-            # Analyze progress
             progress_info = analyze_processing_progress(output_dir, settings_data)
             result["progress_info"] = progress_info
-
             if progress_info["frames_processed"] > 0:
                 result["recommendations"].append(
                     f"Found {progress_info['frames_processed']} processed frames - can resume from where left off"
@@ -1222,56 +657,40 @@ def can_resume_processing(output_dir: Path) -> dict[str, Any]:
                 result["recommendations"].append(
                     "No processed frames found - will restart from beginning"
                 )
-
+        return result
+    except Exception as error:
+        result["recommendations"].append(f"Error checking resume capability: {error}")
         return result
 
-    except Exception as e:
-        result["recommendations"].append(f"Error checking resume capability: {e}")
-        return result
 
+def analyze_processing_progress(output_dir: Path, settings_data: dict[str, Any]) -> dict[str, Any]:
+    """Analyze how much processing has been completed."""
 
-def analyze_processing_progress(  # noqa: C901
-    output_dir: Path, settings_data: dict[str, Any]
-) -> dict[str, Any]:
-    """
-    Analyze how much processing has been completed.
-
-    Args:
-        output_dir: Output directory path
-        settings_data: Loaded settings data
-
-    Returns:
-        Dictionary with progress analysis including:
-        - frames_processed: int
-        - vr_frames_created: int
-        - intermediate_stages: dict
-        - can_resume_from_intermediates: bool
-
-    Side Effects:
-        Reads directory contents and counts files
-    """
+    _ = settings_data
     progress: dict[str, Any] = {
         "frames_processed": 0,
         "vr_frames_created": 0,
         "intermediate_stages": {},
         "can_resume_from_intermediates": False,
     }
-
     try:
-        # Check each intermediate directory
         for stage_name, dir_name in INTERMEDIATE_DIRS.items():
             stage_dir = output_dir / dir_name
             if stage_dir.exists():
-                frame_count = len(list(stage_dir.glob("*.png")))
+                if type(stage_dir).__module__ == "pathlib":
+                    frame_count = sum(
+                        1
+                        for entry in os.scandir(stage_dir)
+                        if entry.is_file(follow_symlinks=False) and entry.name.endswith(".png")
+                    )
+                else:
+                    frame_count = len(list(stage_dir.glob("*.png")))
                 progress["intermediate_stages"][stage_name] = {
                     "directory": str(stage_dir),
                     "frames_found": frame_count,
                 }
-
                 if stage_name == "vr_frames":
                     progress["vr_frames_created"] = frame_count
-
-        # Determine overall progress
         if progress["vr_frames_created"] > 0:
             progress["frames_processed"] = progress["vr_frames_created"]
             progress["can_resume_from_intermediates"] = True
@@ -1281,7 +700,6 @@ def analyze_processing_progress(  # noqa: C901
                 progress["frames_processed"] = depth_frames
                 progress["can_resume_from_intermediates"] = True
         return progress
-
-    except Exception as e:
-        print(f"Warning: Could not analyze processing progress: {e}")
+    except Exception as error:
+        print(f"Warning: Could not analyze processing progress: {error}")
         return progress

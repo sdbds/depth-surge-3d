@@ -476,75 +476,6 @@ def test_allocation_unit_falls_back_to_64_kib(
         lambda _path: (_ for _ in ()).throw(OSError("no statvfs")),
         raising=False,
     )
-    monkeypatch.setattr(metric_geometry, "_windows_allocation_unit", lambda _path: None)
-    assert filesystem_allocation_unit(tmp_path) == 65_536
-
-
-def test_windows_allocation_unit_queries_folder_mounted_volume(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    calls: dict[str, str] = {}
-
-    class Kernel32:
-        def GetVolumePathNameW(self, source, volume_path, _length) -> int:
-            calls["source"] = source.value
-            volume_path.value = "C:\\mounted-volume\\"
-            return 1
-
-        def GetDiskFreeSpaceW(
-            self, volume_path, sectors, bytes_per_sector, free_clusters, total_clusters
-        ) -> int:
-            calls["volume_path"] = volume_path.value
-            sectors._obj.value = 8
-            bytes_per_sector._obj.value = 4096
-            free_clusters._obj.value = 10
-            total_clusters._obj.value = 20
-            return 1
-
-    monkeypatch.setattr(
-        metric_geometry._win32, "load_library", lambda *_args, **_kwargs: Kernel32()
-    )
-
-    assert metric_geometry._windows_allocation_unit(tmp_path / "folder") == 32_768
-    assert calls["source"] == str((tmp_path / "folder").resolve())
-    assert calls["volume_path"] == "C:\\mounted-volume\\"
-
-
-@pytest.mark.parametrize("failure_point", ["volume", "disk", "invalid", "exception"])
-def test_windows_allocation_query_failure_or_invalid_value_uses_fallback(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_point: str
-) -> None:
-    queries = []
-
-    class Kernel32:
-        def GetVolumePathNameW(self, _source, volume_path, _length) -> int:
-            queries.append("volume")
-            if failure_point == "exception":
-                raise TypeError("unavailable Windows API")
-            volume_path.value = "C:\\mounted-volume\\"
-            return int(failure_point != "volume")
-
-        def GetDiskFreeSpaceW(
-            self, _volume_path, sectors, bytes_per_sector, _free_clusters, _total_clusters
-        ) -> int:
-            queries.append("disk")
-            sectors._obj.value = 0 if failure_point == "invalid" else 8
-            bytes_per_sector._obj.value = 4096
-            return int(failure_point != "disk")
-
-    monkeypatch.setattr(
-        metric_geometry._win32, "load_library", lambda *_args, **_kwargs: Kernel32()
-    )
-    assert metric_geometry._windows_allocation_unit(tmp_path) is None
-    assert queries == (
-        ["volume"] if failure_point in {"volume", "exception"} else ["volume", "disk"]
-    )
-    monkeypatch.setattr(metric_geometry, "_windows_allocation_unit", lambda _path: None)
-    monkeypatch.setattr(
-        "os.statvfs",
-        lambda _path: (_ for _ in ()).throw(OSError("no statvfs")),
-        raising=False,
-    )
     assert filesystem_allocation_unit(tmp_path) == 65_536
 
 
@@ -735,7 +666,7 @@ def test_corrupt_npz_archive_is_reported_as_value_error(
     partial_metric_store: MetricGeometryStore,
 ) -> None:
     partial_metric_store.path_for(FRAME_NAMES[0]).write_bytes(b"not a zip archive")
-    with pytest.raises(ValueError, match="short local header"):
+    with pytest.raises(ValueError, match="corrupt metric NPZ"):
         partial_metric_store.validate_payloads()
 
 

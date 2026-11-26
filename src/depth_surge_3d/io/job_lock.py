@@ -90,10 +90,15 @@ class JobWriterLock:
         if not self.output_dir.is_dir():
             raise FileNotFoundError(f"Job output directory does not exist: {self.output_dir}")
 
-        handle = self.path.open("a+b", buffering=0)
-        if self.path.stat().st_size == 0:
-            handle.write(b"\n")
-            handle.flush()
+        # Open without writing first; acquire the OS lock before mutating the lock file.
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
+        fd = os.open(self.path, flags, 0o600)
+        try:
+            handle: BinaryIO = os.fdopen(fd, "r+b", buffering=0)
+        except Exception:
+            os.close(fd)
+            raise
+
         try:
             self._try_lock(handle)
         except BlockingIOError as exc:
@@ -110,7 +115,7 @@ class JobWriterLock:
         try:
             payload = b"\n" + json.dumps(owner, sort_keys=True).encode("utf-8")
             handle.seek(0)
-            handle.truncate()
+            handle.truncate(0)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())

@@ -1,19 +1,12 @@
-"""Bounded stereo generation over canonical disparity maps."""
+"""Unified streaming stereo generator over relative disparity and metric geometry."""
 
 from __future__ import annotations
 
-from concurrent.futures import Executor
-import hashlib
 import json
-import math
 import os
-import queue
-import shutil
-import threading
+from pathlib import Path
 import time
 import traceback
-from dataclasses import asdict, dataclass, field, replace
-from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
 import cv2
@@ -21,112 +14,45 @@ import numpy as np
 
 from ...core.constants import PREVIEW_FRAME_SAMPLE_RATE
 from ...core.depth_contract import canonical_json_hash
-from ...core.resource_errors import QualityHostBudgetError
-from ...core.render_disparity import validate_render_disparity_input
 from ...io import metric_npz
-from ...io.durable_publish import OwnedSiblingTemporary, publication_temporary_path
-from ...io.nofollow_io import (
-    AcquiredRoot,
-    SafeTreeMutation,
-    open_regular_beneath,
-)
-from ...io.stereo_contract import StereoControlBudgetError
-from ...io.content_manifest import (
-    StreamedQualityInputManifest,
-    build_streamed_quality_input_manifest,
-)
-from ...io.streamed_canonical_json import (
-    ReplayableJsonArray,
-    StreamedCanonicalObject,
-    StreamedPrettyJsonValue,
-    build_streamed_canonical_object,
-    build_streamed_pretty_json_value,
-)
-from ...utils.imaging.png_header import png_header_matches, read_png_header
-from ...utils.imaging.image_processing import (
-    CENTER_CROP_ALGORITHM_VERSION,
-    calculate_center_crop_dimensions,
-)
-from ...rendering.stereo_geometry import (
-    MetricProjectionStats,
-    build_metric_geometry,
-)
-from ...rendering.stereo_renderer import (
-    StereoRenderer,
-    StereoRenderSettings,
-    StereoSplatSettings,
-)
+from ...io.durable_publish import atomic_write_bytes, atomic_write_json
 from ...rendering.quality.diagnostic_transaction import (
-    DiagnosticsStageContext,
-    PreparedQualityFramePublication,
-    QualityFramePublication,
-    SharedQualityPngPayloads,
-    audit_diagnostics_stage,
-    begin_diagnostics_stage,
-    canonical_json_bytes,
-    complete_diagnostics_stage,
-    migrate_frame_manifests_sync,
-    prepare_quality_frame,
-    publish_quality_frame,
+    StreamingDiagnosticsAccumulator,
     StreamingDiagnosticsStageContext,
-    TransientDiagnosticsSpool,
-    begin_streaming_diagnostics_stage,
-    classify_streaming_diagnostics_root,
-    classify_streaming_diagnostics_frame,
-    complete_streaming_diagnostics_stage,
-    migrate_streaming_frame_manifest,
-    prune_streaming_unreferenced_masks,
-    streaming_diagnostics_aggregates_match,
 )
 from ...rendering.quality.renderer import (
-    QUALITY_HOST_BUDGET_BYTES,
-    QUALITY_RUNTIME_OVERHEAD_BYTES,
-    PreparedRelativeQualityFrame,
-    _quality_public_memory_preflight,
-    prepare_relative_quality_frame,
     render_metric_primitives_compact,
-    render_prepared_relative_quality_compact,
     render_relative_quality_compact,
 )
 from ...rendering.quality.types import (
     CompactStereoRenderResult,
     MetricStereoPrimitiveInput,
     QualityStereoControls,
-    RelativeStereoPrimitiveInput,
 )
-from .metric_geometry import MetricGeometryFrame, MetricGeometryStore
+from ...rendering.stereo_renderer import (
+    StereoRenderer,
+    StereoRenderSettings,
+    StereoSplatSettings,
+)
+from ...utils.imaging.image_processing import (
+    CENTER_CROP_ALGORITHM_VERSION,
+    calculate_center_crop_dimensions,
+)
+from ...utils.imaging.png_header import read_png_header
+from .metric_geometry import MetricGeometryFrame
 from .stereo_control import (
-    QUALITY_PNG_ENCODER_THREAD_BYTES,
-    STEREO_CONTROL_OVERHEAD,
-    StereoAction,
-    StereoControlError,
-    StereoControlStateError,
-    StereoInputIdentityMismatch,
-    StereoProviderChangedError,
-    StereoProviderItem,
-    StereoControlAuditPlan,
-    StereoStageInputChangedError,
+    StereoPipelineCapacityError,
     StreamingStereoPipelineStats,
-    audit_stereo_provider,
-    create_attested_stereo_executor,
-    current_process_committed_bytes,
-    iter_stereo_action,
     run_streaming_stereo_pipeline,
     select_fast_pipeline_capacity,
     select_quality_pipeline_capacity,
-    validate_stereo_action_replay,
-    validate_stereo_provider_replay,
-    PackedStereoActions,
 )
 from .stereo_input_manifest import (
     StereoInputManifestV1,
-    load_stereo_input_manifest_v1,
+    StereoInputRecord,
+    publish_validated_stereo_input_manifest_v1,
 )
-from .stereo_disk import (
-    StereoStageDiskPlan,
-    StereoStageDiskPlanBuilder,
-    admit_stereo_stage_disk,
-)
+
 
 STEREO_STAGE_SCHEMA_VERSION = 1
 STEREO_STAGE_ALGORITHM_VERSION = "torch-horizontal-16x-zbuffer-v3"
@@ -134,1308 +60,54 @@ QUALITY_STEREO_ALGORITHM_VERSION = "torch-horizontal-16x-rgb-geodesic-repair-v10
 METRIC_PROJECTION_ALGORITHM_VERSION = "crop-aware-metric-pinhole-v2"
 METRIC_CLAMP_STATS_SCHEMA_VERSION = 1
 METRIC_STEREO_COMPLETION_ERROR = "metric stereo requires completed clip-global convergence metadata"
-STEREO_HOST_BUDGET = 512 * 1024 * 1024
-HOST_STEREO_BYTES_PER_PIXEL = 24
-HOST_SLOT_OVERHEAD = 1024 * 1024
 MIN_STEREO_IO_WORKERS = 1
 MAX_STEREO_IO_WORKERS = 16
-STEREO_READ_ONLY_RESTART_LIMIT = 8
-QUALITY_CONTENT_STREAM_BYTES = 1024 * 1024
-QUALITY_JSON_STREAM_BYTES = 1024 * 1024
-QUALITY_IO_THREAD_BYTES = 6 * 1024 * 1024
 
 
-def _quality_stage_memory_phases(
-    *,
-    control: StereoControlAuditPlan,
-    render_shape: tuple[int, int],
-    native_shape: tuple[int, int],
-    geometry_mode: Literal["relative", "metric"],
-    occlusion_fill: Literal["none", "background"],
-    consolidation_planned: bool,
-) -> dict[str, int]:
-    """Calculate every mutually exclusive Quality file-stage host phase."""
-
-    output_pixels = int(render_shape[0]) * int(render_shape[1])
-    histogram_bytes = 272 * (int(render_shape[1]) + 1)
-    runtime = QUALITY_RUNTIME_OVERHEAD_BYTES
-    phases: dict[str, int] = {}
-    content_payload = 5 * control.maximum_source_native_pixels if geometry_mode == "metric" else 0
-    content_peak = (
-        content_payload + QUALITY_CONTENT_STREAM_BYTES + runtime + STEREO_CONTROL_OVERHEAD
-    )
-    phases["quality-input-content-audit"] = content_peak
-    if consolidation_planned:
-        phases["quality-input-content-revalidation"] = content_peak
-
-    if control.render_count:
-        render_phases = _quality_public_memory_preflight(
-            render_shape=render_shape,
-            native_shape=native_shape,
-            occlusion_fill=occlusion_fill,
-            materialize_public_masks=False,
-        )
-        if geometry_mode == "metric":
-            decode_peak = (
-                3 * output_pixels
-                + 5 * control.maximum_native_pixels
-                + control.maximum_compressed_payload_bytes
-                + runtime
-            )
-        else:
-            decode_peak = (
-                3 * output_pixels
-                + 2 * control.maximum_native_pixels
-                + control.maximum_compressed_payload_bytes
-                + runtime
-            )
-        writer_peak = (
-            23 * output_pixels + histogram_bytes + control.maximum_frame_json_bound + runtime
-        )
-        lifecycle_peak = max(decode_peak, writer_peak, *render_phases.values())
-        phases["quality-file-pipeline"] = (
-            lifecycle_peak + QUALITY_IO_THREAD_BYTES + STEREO_CONTROL_OVERHEAD
-        )
-
-    if consolidation_planned:
-        metric_fraction_bound = (
-            33 * control.generation.frame_count + 2 if geometry_mode == "metric" else 0
-        )
-        root_json_bound = (
-            control.maximum_frame_json_bound
-            + control.frame_name_json_array_bytes
-            + metric_fraction_bound
-        )
-        phases["quality-consolidation"] = (
-            histogram_bytes
-            + control.maximum_frame_json_bound
-            + root_json_bound
-            + QUALITY_JSON_STREAM_BYTES
-            + runtime
-            + STEREO_CONTROL_OVERHEAD
-        )
-
-    if control.migrate_count:
-        phases["quality-manifest-migration"] = (
-            STEREO_CONTROL_OVERHEAD
-            + 2 * control.maximum_frame_json_bound
-            + QUALITY_JSON_STREAM_BYTES
-        )
-    return phases
-
-
-def _quality_stage_memory_preflight(**kwargs: Any) -> dict[str, int]:
-    phases = _quality_stage_memory_phases(**kwargs)
-    phase, required = max(phases.items(), key=lambda item: item[1])
-    if required > QUALITY_HOST_BUDGET_BYTES:
-        raise QualityHostBudgetError.for_limit(
-            phase,
-            required,
-            QUALITY_HOST_BUDGET_BYTES,
-        )
-    return phases
-
-
-def _build_stereo_stage_disk_plan(
-    *,
-    provider: Any,
-    control: StereoControlAuditPlan,
-    job_root: Path,
-    render_shape: tuple[int, int],
-    render_mode: Literal["fast", "quality"],
-    geometry_mode: Literal["relative", "metric"],
-    keep_masks: bool,
-    left_dir: Path,
-    stage_document: StreamedCanonicalObject | StreamedPrettyJsonValue,
-    quality_content: StreamedQualityInputManifest | None,
-) -> StereoStageDiskPlan:
-    """Derive all pending frame/root/atomic charges without retaining item paths."""
-
-    builder = StereoStageDiskPlanBuilder()
-    height, width = render_shape
-    rgb_bound = math.ceil(1.25 * height * width * 3)
-    mask_bound = math.ceil(1.25 * height * width)
-    diagnostics_root = job_root / "04_stereo_diagnostics"
-
-    for item in iter_stereo_action(
-        provider,
-        control,
-        StereoAction.RENDER,
-        mutation_started=False,
-    ):
-        frame_root = diagnostics_root / "frames" / item.frame_name
-        transaction_entries = [
-            (item.left_path, rgb_bound),
-            (item.right_path, rgb_bound),
-            (frame_root / "stats.json", item.frame_json_bound),
-            (frame_root / "manifest.json", item.frame_json_bound),
-        ]
-        if keep_masks:
-            transaction_entries.extend(
-                (frame_root / name, mask_bound)
-                for name in (
-                    "left_coverage.png",
-                    "left_repair.png",
-                    "right_coverage.png",
-                    "right_repair.png",
-                )
-            )
-        for path, logical_bytes in transaction_entries:
-            builder.add_payload(path, logical_bytes)
-            builder.add_directory_entries(path, 1)
-        builder.add_transaction(transaction_entries)
-
-    for item in iter_stereo_action(
-        provider,
-        control,
-        StereoAction.MIGRATE,
-        mutation_started=False,
-    ):
-        path = diagnostics_root / "frames" / item.frame_name / "manifest.json"
-        builder.add_payload(path, item.frame_json_bound)
-        builder.add_directory_entries(path, 1)
-        builder.add_transaction(((path, item.frame_json_bound),))
-
-    frame_bound = control.maximum_frame_json_bound
-    metric_fraction_bound = (
-        33 * control.generation.frame_count + 2 if geometry_mode == "metric" else 0
-    )
-    root_json_bound = frame_bound + control.frame_name_json_array_bytes + metric_fraction_bound
-    jsonl_bound = control.generation.frame_count * (frame_bound + 1)
-    clamp_bound = control.frame_name_json_array_bytes + metric_fraction_bound + 1024 * 1024
-    root_artifacts: list[tuple[Path, int]] = [
-        (left_dir / "metadata.json", stage_document.raw_byte_count),
-        (diagnostics_root / "metadata.json", root_json_bound),
-        (diagnostics_root / "stereo_coverage_frames.jsonl", jsonl_bound),
-        (diagnostics_root / "stereo_coverage_summary.json", root_json_bound),
-    ]
-    if geometry_mode == "metric":
-        root_artifacts.append((left_dir / "clamp_summary.json", clamp_bound))
-    if render_mode == "quality":
-        if quality_content is None:
-            raise ValueError("Quality disk planning requires its content identity")
-        root_artifacts.append(
-            (diagnostics_root / "quality_input_manifest.json", quality_content.raw_byte_count)
-        )
-    for path, logical_bytes in root_artifacts:
-        builder.add_payload(path, int(logical_bytes), count=2)
-        builder.add_directory_entries(path, 1)
-
-    builder.add_first_mutation_transaction(
-        diagnostics_root / "metadata.json",
-        root_json_bound,
-    )
-    builder.add_first_mutation_transaction(
-        left_dir / "metadata.json",
-        stage_document.raw_byte_count,
-    )
-    if quality_content is not None:
-        builder.add_first_mutation_transaction(
-            diagnostics_root / "quality_input_manifest.json",
-            quality_content.raw_byte_count,
-        )
-
-    return builder.build()
-
-
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    raw = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
-    owned = OwnedSiblingTemporary.create(path)
-    try:
-        if owned.handle.write(raw) != len(raw):
-            raise OSError("short stereo JSON write")
-        owned.sync()
-        owned.replace()
-    finally:
-        owned.cleanup()
-
-
-def _atomic_write_canonical_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    raw = canonical_json_bytes(payload)
-    owned = OwnedSiblingTemporary.create(path)
-    try:
-        if owned.handle.write(raw) != len(raw):
-            raise OSError("short canonical stereo JSON write")
-        owned.sync()
-        owned.replace()
-    finally:
-        owned.cleanup()
-
-
-def validate_stereo_io_workers(workers: int) -> int:
-    """Validate the bounded decode/write worker count."""
-
-    if isinstance(workers, bool) or not isinstance(workers, (int, np.integer)):
-        raise ValueError("stereo_io_workers must be an integer in 1..16")
-    value = int(workers)
+def validate_stereo_io_workers(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("stereo_io_workers must be an integer or None")
     if not MIN_STEREO_IO_WORKERS <= value <= MAX_STEREO_IO_WORKERS:
-        raise ValueError("stereo_io_workers must be an integer in 1..16")
+        raise ValueError(
+            f"stereo_io_workers must be between {MIN_STEREO_IO_WORKERS} and {MAX_STEREO_IO_WORKERS}"
+        )
     return value
 
 
 def _default_stereo_io_workers() -> int:
-    cpu_count = os.cpu_count() or 1
-    return min(4, max(1, cpu_count - 2))
+    return max(2, min(8, (os.cpu_count() or 4) // 2))
 
 
-def calculate_stereo_pipeline_capacity(
-    render_width: int,
-    render_height: int,
-    stereo_io_workers: int,
-) -> int:
-    """Derive queue and lifecycle-permit capacity from the fixed host budget."""
-
-    workers = validate_stereo_io_workers(stereo_io_workers)
-    if render_width <= 0 or render_height <= 0:
-        raise ValueError("Render width and height must be positive")
-    slot_bytes = render_width * render_height * HOST_STEREO_BYTES_PER_PIXEL + HOST_SLOT_OVERHEAD
-    memory_slots = STEREO_HOST_BUDGET // slot_bytes
-    capacity = min(2 * workers, memory_slots)
-    if capacity < 1:
-        raise MemoryError(
-            f"Stereo frame {render_width}x{render_height} cannot fit one lifecycle "
-            f"slot: required {slot_bytes} host bytes; budget is "
-            f"{STEREO_HOST_BUDGET} bytes"
-        )
-    return capacity
-
-
-@dataclass(frozen=True)
-class StereoPipelineStats:
-    """Observable host-memory and I/O backpressure accounting."""
-
-    permit_count: int
-    queue_capacity: int
-    permits_acquired: int
-    permits_released: int
-    active_permits: int
-    max_active_permits: int
-    permit_wait_seconds: float
-    queue_wait_seconds: float
-    pipeline_wall_seconds: float
-    writer_busy_seconds: float
-    decoded_frames: int
-    rendered_frames: int
-    written_frames: int
-
-
-class _PipelineMetrics:
-    def __init__(self, capacity: int) -> None:
-        self.capacity = capacity
-        self.lock = threading.Lock()
-        self.permits_acquired = 0
-        self.permits_released = 0
-        self.active_permits = 0
-        self.max_active_permits = 0
-        self.permit_wait_seconds = 0.0
-        self.queue_wait_seconds = 0.0
-        self.pipeline_wall_seconds = 0.0
-        self.writer_busy_seconds = 0.0
-        self.decoded_frames = 0
-        self.rendered_frames = 0
-        self.written_frames = 0
-
-    def permit_acquired(self, waited: float) -> None:
-        with self.lock:
-            self.permits_acquired += 1
-            self.active_permits += 1
-            self.max_active_permits = max(
-                self.max_active_permits,
-                self.active_permits,
-            )
-            self.permit_wait_seconds += waited
-
-    def permit_released(self) -> None:
-        with self.lock:
-            self.permits_released += 1
-            self.active_permits -= 1
-
-    def queue_waited(self, waited: float) -> None:
-        with self.lock:
-            self.queue_wait_seconds += waited
-
-    def writer_busy(self, elapsed: float) -> None:
-        with self.lock:
-            self.writer_busy_seconds += elapsed
-
-    def pipeline_finished(self, elapsed: float) -> None:
-        with self.lock:
-            self.pipeline_wall_seconds = elapsed
-
-    def increment(self, field: str) -> None:
-        with self.lock:
-            setattr(self, field, getattr(self, field) + 1)
-
-    def snapshot(self) -> StereoPipelineStats:
-        with self.lock:
-            return StereoPipelineStats(
-                permit_count=self.capacity,
-                queue_capacity=self.capacity,
-                permits_acquired=self.permits_acquired,
-                permits_released=self.permits_released,
-                active_permits=self.active_permits,
-                max_active_permits=self.max_active_permits,
-                permit_wait_seconds=self.permit_wait_seconds,
-                queue_wait_seconds=self.queue_wait_seconds,
-                pipeline_wall_seconds=self.pipeline_wall_seconds,
-                writer_busy_seconds=self.writer_busy_seconds,
-                decoded_frames=self.decoded_frames,
-                rendered_frames=self.rendered_frames,
-                written_frames=self.written_frames,
-            )
-
-
-class _LifecyclePermits:
-    def __init__(self, capacity: int, metrics: _PipelineMetrics) -> None:
-        self._semaphore = threading.BoundedSemaphore(capacity)
-        self._metrics = metrics
-
-    def acquire(self) -> _LifecyclePermitLease:
-        started = time.perf_counter()
-        self._semaphore.acquire()
-        self._metrics.permit_acquired(time.perf_counter() - started)
-        return _LifecyclePermitLease(self)
-
-    def release(self) -> None:
-        self._semaphore.release()
-        self._metrics.permit_released()
-
-
-class _LifecyclePermitLease:
-    """Linear ownership token for one provider-to-publication lifecycle."""
-
-    __slots__ = ("_owner",)
-
-    def __init__(self, owner: _LifecyclePermits) -> None:
-        self._owner: _LifecyclePermits | None = owner
-
-    def release(self) -> None:
-        owner = self._owner
-        if owner is None:
-            raise RuntimeError("lifecycle permit was already released")
-        self._owner = None
-        owner.release()
-
-
-@dataclass(frozen=True)
-class _FileWorkItem:
-    index: int
-    frame_path: Path
-    depth_path: Path
-    frame_name: str
-    left_path: Path
-    right_path: Path
-    stat_path: Path | None = None
-
-
-@dataclass(slots=True)
-class _PermittedWork:
-    work: _FileWorkItem
-    permit: _LifecyclePermitLease | None
-
-    def take_permit(self) -> _LifecyclePermitLease:
-        permit = self.permit
-        if permit is None:
-            raise RuntimeError("work permit ownership was already transferred")
-        self.permit = None
-        return permit
-
-
-@dataclass(frozen=True)
-class _FileWorkPlan:
-    """Packed source-order actions plus a replayable O(1)-item work stream."""
-
-    frame_files: list[Path]
-    depth_files: list[Path]
-    left_dir: Path
-    right_dir: Path
-    actions: PackedStereoActions
-    render_count: int
-    reuse_count: int
-    migrate_count: int
-    repaired_outputs: bool
-    metric_mode: bool
-
-    def iter_render(self):
-        stat_dir = self.left_dir / "clamp_stats"
-        for index, (frame_file, depth_file) in enumerate(zip(self.frame_files, self.depth_files)):
-            if self.actions.get(index) is not StereoAction.RENDER:
-                continue
-            frame_name = frame_file.stem
-            yield _FileWorkItem(
-                index=index,
-                frame_path=frame_file,
-                depth_path=depth_file,
-                frame_name=frame_name,
-                left_path=self.left_dir / f"{frame_name}.png",
-                right_path=self.right_dir / f"{frame_name}.png",
-                stat_path=(stat_dir / f"{frame_name}.json" if self.metric_mode else None),
-            )
-
-    def iter_frame_names(self, action: StereoAction):
-        for index, frame_file in enumerate(self.frame_files):
-            if self.actions.get(index) is action:
-                yield frame_file.stem
-
-
-_DecodeFrame = Callable[
-    [_FileWorkItem],
-    tuple[
-        np.ndarray,
-        RelativeStereoPrimitiveInput | MetricStereoPrimitiveInput,
-        None,
-    ],
-]
-
-
-@dataclass(frozen=True)
-class _FastRelativePlan:
-    source_metadata: dict[str, Any]
-    decode: _DecodeFrame
-    settings: StereoRenderSettings
-    kind: Literal["fast_relative"] = field(init=False, default="fast_relative")
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.settings, StereoRenderSettings):
-            raise TypeError("Fast relative plan requires StereoRenderSettings")
-        if self.settings.stereo_render_mode != "fast":
-            raise ValueError("Fast relative plan requires fast settings")
-
-    geometry_mode = "relative"
-    render_mode: Literal["fast"] = "fast"
-    retained_crop_width = None
-    effective_convergence = None
-
-    @property
-    def render_settings(self) -> StereoRenderSettings:
-        return self.settings
-
-
-@dataclass(frozen=True)
-class _QualityRelativePlan:
-    source_metadata: dict[str, Any]
-    decode: _DecodeFrame
-    settings: StereoRenderSettings
-    kind: Literal["quality_relative"] = field(init=False, default="quality_relative")
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.settings, StereoRenderSettings):
-            raise TypeError("Quality relative plan requires StereoRenderSettings")
-        if self.settings.stereo_render_mode != "quality":
-            raise ValueError("Quality relative plan requires quality settings")
-
-    geometry_mode = "relative"
-    render_mode: Literal["quality"] = "quality"
-    retained_crop_width = None
-    effective_convergence = None
-
-    @property
-    def render_settings(self) -> StereoRenderSettings:
-        return self.settings
-
-
-@dataclass(frozen=True)
-class _FastMetricPlan:
-    source_metadata: dict[str, Any]
-    decode: _DecodeFrame
-    settings: StereoSplatSettings
-    retained_crop_width: int
-    effective_convergence: float
-    kind: Literal["fast_metric"] = field(init=False, default="fast_metric")
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.settings, StereoSplatSettings):
-            raise TypeError("Fast metric plan requires StereoSplatSettings")
-
-    geometry_mode = "metric_camera"
-    render_mode: Literal["fast"] = "fast"
-
-    @property
-    def render_settings(self) -> StereoSplatSettings:
-        return self.settings
-
-
-@dataclass(frozen=True)
-class _QualityMetricPlan:
-    source_metadata: dict[str, Any]
-    decode: _DecodeFrame
-    settings: QualityStereoControls
-    retained_crop_width: int
-    effective_convergence: float
-    kind: Literal["quality_metric"] = field(init=False, default="quality_metric")
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.settings, QualityStereoControls):
-            raise TypeError("Quality metric plan requires QualityStereoControls")
-
-    geometry_mode = "metric_camera"
-    render_mode: Literal["quality"] = "quality"
-
-    @property
-    def render_settings(self) -> QualityStereoControls:
-        return self.settings
-
-
-_StereoStagePlan = _FastRelativePlan | _QualityRelativePlan | _FastMetricPlan | _QualityMetricPlan
-
-
-@dataclass(slots=True)
-class _DecodedMessage:
-    work: _FileWorkItem
-    permit: _LifecyclePermitLease | None = None
-    frame: np.ndarray | None = None
-    render_input: RelativeStereoPrimitiveInput | MetricStereoPrimitiveInput | None = None
-    projection_stats: MetricProjectionStats | None = None
-    error: Exception | None = None
-
-    def take_payload(
-        self,
-    ) -> tuple[
-        _LifecyclePermitLease,
-        np.ndarray,
-        RelativeStereoPrimitiveInput | MetricStereoPrimitiveInput,
-        MetricProjectionStats | None,
-    ]:
-        permit = self.permit
-        frame = self.frame
-        render_input = self.render_input
-        if permit is None or frame is None or render_input is None:
-            raise RuntimeError("decoded payload ownership was already transferred")
-        self.permit = None
-        self.frame = None
-        self.render_input = None
-        projection_stats = self.projection_stats
-        self.projection_stats = None
-        return permit, frame, render_input, projection_stats
-
-
-@dataclass(frozen=True, slots=True)
-class _ReusableQualityFrame:
-    compact: CompactStereoRenderResult
-    png_payloads: SharedQualityPngPayloads
-
-
-def _exact_quality_input_key(item: StereoProviderItem) -> tuple[object, ...]:
-    return (
-        item.guide_sha256,
-        item.guide_byte_count,
-        item.guide_shape,
-        item.geometry_sha256,
-        item.geometry_byte_count,
-        item.geometry_shape,
-    )
-
-
-@dataclass(slots=True)
-class _ManifestDecodedFrame:
-    work: StereoProviderItem
-    frame: np.ndarray | None
-    primitive: RelativeStereoPrimitiveInput | MetricStereoPrimitiveInput | None
-    prepared_quality: PreparedRelativeQualityFrame | None = None
-    reused_quality: _ReusableQualityFrame | None = None
-
-    def take_frame(self) -> np.ndarray:
-        frame = self.frame
-        if frame is None:
-            raise RuntimeError("manifest decoded frame ownership was already transferred")
-        self.frame = None
-        return frame
-
-    def take_primitive(self) -> RelativeStereoPrimitiveInput | MetricStereoPrimitiveInput:
-        primitive = self.primitive
-        if primitive is None:
-            raise RuntimeError("manifest primitive ownership was already transferred")
-        self.primitive = None
-        return primitive
-
-    def take_prepared_quality(self) -> PreparedRelativeQualityFrame:
-        prepared = self.prepared_quality
-        if prepared is None:
-            raise RuntimeError("prepared Quality frame ownership was already transferred")
-        self.prepared_quality = None
-        return prepared
-
-    def take_reused_quality(self) -> _ReusableQualityFrame:
-        reusable = self.reused_quality
-        if reusable is None:
-            raise RuntimeError("reused Quality frame ownership was already transferred")
-        self.reused_quality = None
-        return reusable
-
-
-def _take_relative_canonical(payload: _ManifestDecodedFrame) -> np.ndarray:
-    primitive = payload.take_primitive()
-    if not isinstance(primitive, RelativeStereoPrimitiveInput):
-        raise TypeError("relative manifest payload contains metric primitives")
-    encoded = primitive.encoded_canonical
-    reciprocal_scale = np.float32(1.0 / primitive.encoding_scale)
-    del primitive
-    canonical = encoded.astype(np.float32)
-    canonical *= reciprocal_scale
-    del encoded
-    return canonical
-
-
-def _take_metric_primitive(payload: _ManifestDecodedFrame) -> MetricStereoPrimitiveInput:
-    primitive = payload.take_primitive()
-    if not isinstance(primitive, MetricStereoPrimitiveInput):
-        raise TypeError("metric manifest payload contains relative primitives")
-    return primitive
-
-
-@dataclass(slots=True)
-class _WriteItem:
-    work: _FileWorkItem | StereoProviderItem
-    left_image: np.ndarray | None
-    right_image: np.ndarray | None
-    permit: _LifecyclePermitLease | None = None
-    projection_stats: MetricProjectionStats | None = None
-    quality_publication: PreparedQualityFramePublication | None = None
-    geometry_mode: str = "relative"
-    occlusion_fill: Literal["none", "background"] = "background"
-    rgb_stage_fingerprint: str = ""
-    keep_masks: bool = False
-    render_mode: Literal["fast", "quality"] = "fast"
-
-    def release_payload_and_permit(self) -> None:
-        self.left_image = None
-        self.right_image = None
-        self.projection_stats = None
-        self.quality_publication = None
-        permit = self.permit
-        if permit is None:
-            raise RuntimeError("write permit ownership was already transferred")
-        self.permit = None
-        permit.release()
-
-
-@dataclass(frozen=True)
-class _WriteCompletion:
-    work: _FileWorkItem | StereoProviderItem
-    error: Exception | None = None
-
-
-_QUEUE_SENTINEL = object()
-
-
-def _timed_put(
-    target: queue.Queue[object],
-    item: object,
-    metrics: _PipelineMetrics,
-) -> None:
-    started = time.perf_counter()
-    target.put(item)
-    metrics.queue_waited(time.perf_counter() - started)
+def _encode_png_bytes(image: np.ndarray) -> bytes:
+    ok, encoded = cv2.imencode(".png", image)
+    if not ok:
+        raise RuntimeError("cv2.imencode('.png') failed")
+    return encoded.tobytes()
 
 
 def _atomic_write_png(path: Path, image: np.ndarray) -> None:
-    """Encode a PNG and atomically replace its destination from the same directory."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    encoded, payload = cv2.imencode(".png", image)
-    if not encoded:
-        raise OSError(f"Could not encode PNG: {path}")
-    raw = payload.tobytes()
-    owned = OwnedSiblingTemporary.create(path)
-    try:
-        if owned.handle.write(raw) != len(raw):
-            raise OSError(f"Short PNG write: {path}")
-        owned.sync()
-        owned.replace()
-    finally:
-        owned.cleanup()
+    atomic_write_bytes(path, _encode_png_bytes(image), sync=False)
 
 
-def _read_verified_stereo_input(
-    path: Path,
-    *,
-    job_root: Path,
-    expected_sha256: str,
-    expected_byte_count: int,
-) -> bytearray:
-    """Read only the exact regular-file bytes bound by the provider item."""
-
-    if expected_byte_count <= 0:
-        raise ValueError("verified stereo input byte count must be positive")
-    try:
-        handle = open_regular_beneath(job_root, path)
-    except (OSError, ValueError) as error:
-        raise StereoInputIdentityMismatch(
-            f"could not reopen frozen stereo input: {path}"
-        ) from error
-    with handle:
-        raw = bytearray(expected_byte_count)
-        view = memoryview(raw)
-        offset = 0
-        while offset < expected_byte_count:
-            count = handle.readinto(view[offset:])
-            if not count:
-                raise StereoInputIdentityMismatch(f"stereo input ended early: {path}")
-            offset += count
-        tail = bytearray(1)
-        if handle.readinto(tail):
-            raise StereoInputIdentityMismatch(f"stereo input grew during decode: {path}")
-    if hashlib.sha256(raw).hexdigest() != expected_sha256:
-        raise StereoInputIdentityMismatch(f"stereo input content changed before decode: {path}")
-    return raw
-
-
-def _decode_verified_png(
-    path: Path,
-    *,
-    job_root: Path,
-    expected_sha256: str,
-    expected_byte_count: int,
-    flags: int,
-) -> np.ndarray:
-    """Decode only the exact regular-file bytes bound by the provider item."""
-
-    raw = _read_verified_stereo_input(
-        path,
-        job_root=job_root,
-        expected_sha256=expected_sha256,
-        expected_byte_count=expected_byte_count,
-    )
-    decoded = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), flags)
-    if decoded is None:
-        raise StereoInputIdentityMismatch(f"Could not decode frozen PNG: {path}")
-    return decoded
-
-
-def _stereo_creation_failed(error: Exception) -> bool:
-    if isinstance(error, ValueError) and str(error) == METRIC_STEREO_COMPLETION_ERROR:
-        raise error
-    print(f"Error creating stereo pairs: {error}")
-    traceback.print_exc()
-    return False
-
-
-def _write_pair(item: _WriteItem, *, png_executor: Executor | None = None) -> None:
-    if item.quality_publication is not None:
-        if png_executor is None:
-            publish_quality_frame(item.quality_publication)
-        else:
-            publish_quality_frame(item.quality_publication, png_executor=png_executor)
-    else:
-        _atomic_write_png(item.work.left_path, item.left_image)
-        _atomic_write_png(item.work.right_path, item.right_image)
-    if item.work.stat_path is not None:
-        if item.projection_stats is None:
-            raise ValueError("Metric stereo writes require projection statistics")
-        stats = item.projection_stats
-        _atomic_write_json(
-            item.work.stat_path,
-            {
-                "schema_version": METRIC_CLAMP_STATS_SCHEMA_VERSION,
-                "frame_name": item.work.frame_name,
-                "valid_pixel_count": stats.valid_pixel_count,
-                "clamped_pixel_count": stats.clamped_pixel_count,
-                "clamped_fraction": stats.clamped_fraction,
-            },
-        )
-
-
-def _decode_relative_work_item(
-    work: _FileWorkItem,
-    *,
-    encoding_scale: float,
-    render_shape: tuple[int, int],
-) -> tuple[np.ndarray, RelativeStereoPrimitiveInput, None]:
-    frame = cv2.imread(str(work.frame_path), cv2.IMREAD_COLOR)
-    encoded = cv2.imread(str(work.depth_path), cv2.IMREAD_UNCHANGED)
-    if frame is None:
-        raise OSError(f"Could not load frame: {work.frame_path}")
-    if encoded is None:
-        raise OSError(f"Could not load canonical disparity: {work.depth_path}")
-    if frame.shape[:2] != render_shape:
-        raise ValueError(
-            f"Frame shape changed at {work.frame_path}: "
-            f"expected {render_shape}, got {frame.shape[:2]}"
-        )
-    if encoded.dtype != np.uint16 or encoded.ndim != 2:
-        raise TypeError(f"Canonical disparity must be uint16: {work.depth_path}")
-    primitive = RelativeStereoPrimitiveInput(
-        encoded_canonical=np.ascontiguousarray(encoded),
-        encoding_scale=np.float32(encoding_scale),
-    )
-    return frame, primitive, None
-
-
-def _decode_metric_work_item(
-    work: _FileWorkItem,
-    *,
-    store: MetricGeometryStore,
-    render_shape: tuple[int, int],
-    virtual_baseline_mm: float,
-    convergence_distance_m: float,
-    max_disparity_percent: float,
-    retained_crop_width: int,
-) -> tuple[np.ndarray, MetricStereoPrimitiveInput, None]:
-    frame = cv2.imread(str(work.frame_path), cv2.IMREAD_COLOR)
-    if frame is None:
-        raise OSError(f"Could not load frame: {work.frame_path}")
-    if frame.shape[:2] != render_shape:
-        raise ValueError(
-            f"Frame shape changed at {work.frame_path}: "
-            f"expected {render_shape}, got {frame.shape[:2]}"
-        )
-    primitive = MetricStereoPrimitiveInput(
-        metric=store.load(work.depth_path),
-        virtual_baseline_mm=np.float64(virtual_baseline_mm),
-        convergence_distance_m=np.float64(convergence_distance_m),
-        max_disparity_percent=np.float64(max_disparity_percent),
-        retained_crop_width=retained_crop_width,
-    )
-    return frame, primitive, None
-
-
-class _StereoFilePipeline:
-    """Own the bounded queues, lifecycle permits, and I/O worker threads."""
-
-    def __init__(
-        self,
-        *,
-        renderer: StereoRenderer,
-        work_factory: Callable[[], Any],
-        work_count: int,
-        decode: _DecodeFrame,
-        render_settings: StereoRenderSettings | StereoSplatSettings | QualityStereoControls,
-        render_mode: Literal["fast", "quality"],
-        geometry_mode: str,
-        occlusion_fill: Literal["none", "background"],
-        rgb_stage_fingerprint: str,
-        keep_masks: bool,
-        workers: int,
-        capacity: int,
-        completed: int,
-        total_frames: int,
-        report_progress: Callable[..., None],
-    ) -> None:
-        self.renderer = renderer
-        self.work_factory = work_factory
-        self.work_count = work_count
-        self.decode = decode
-        self.render_settings = render_settings
-        self.render_mode = render_mode
-        self.geometry_mode = geometry_mode
-        self.occlusion_fill = occlusion_fill
-        self.rgb_stage_fingerprint = rgb_stage_fingerprint
-        self.keep_masks = keep_masks
-        self.workers = workers
-        self.completed = completed
-        self.total_frames = total_frames
-        self.report_progress = report_progress
-        self.metrics = _PipelineMetrics(capacity)
-        self.permits = _LifecyclePermits(capacity, self.metrics)
-        self.decode_requests: queue.Queue[object] = queue.Queue(maxsize=capacity)
-        self.decoded_frames: queue.Queue[object] = queue.Queue(maxsize=capacity)
-        self.write_requests: queue.Queue[object] = queue.Queue(maxsize=capacity)
-        self.write_completions: queue.Queue[object] = queue.Queue(maxsize=capacity)
-        self.first_error: tuple[str, _FileWorkItem | StereoProviderItem, Exception] | None = None
-        self.feeder_error: BaseException | None = None
-        self.feed_done = threading.Event()
-        self.work_items_enqueued = 0
-        self.writes_enqueued = 0
-        self.completions_seen = 0
-        self.successful_completions = 0
-        self.feeder = threading.Thread(
-            target=self._feed_decoder,
-            name="stereo-decode-feeder",
-            daemon=True,
-        )
-        self.decoder_threads = [
-            threading.Thread(
-                target=self._decode_worker,
-                name=f"stereo-decode-{index}",
-                daemon=True,
-            )
-            for index in range(workers)
-        ]
-        self.writer_threads = [
-            threading.Thread(
-                target=self._write_worker,
-                name=f"stereo-write-{index}",
-                daemon=True,
-            )
-            for index in range(workers)
-        ]
-
-    def run(self) -> StereoPipelineStats:
-        started = time.perf_counter()
-        for thread in self.decoder_threads + self.writer_threads:
-            thread.start()
-        self.feeder.start()
-
-        self._render_until_feed_drained()
-
-        self._wait_for_writes()
-        for _ in range(self.workers):
-            _timed_put(self.write_requests, _QUEUE_SENTINEL, self.metrics)
-        self.feeder.join()
-        for thread in self.decoder_threads + self.writer_threads:
-            thread.join()
-
-        self.metrics.pipeline_finished(time.perf_counter() - started)
-        stats = self.metrics.snapshot()
-        if self.feeder_error is not None:
-            raise RuntimeError(
-                f"Stereo provider replay failed: {self.feeder_error}"
-            ) from self.feeder_error
-        if self.first_error is not None:
-            stage, work, error = self.first_error
-            raise RuntimeError(f"Stereo {stage} failed for {work.frame_name}: {error}") from error
-        return stats
-
-    def _render_until_feed_drained(self) -> None:
-        decoded_seen = 0
-        while True:
-            try:
-                message = self.decoded_frames.get(timeout=0.05)
-            except queue.Empty:
-                if self.feed_done.is_set() and decoded_seen >= self.work_items_enqueued:
-                    break
-                continue
-            try:
-                assert isinstance(message, _DecodedMessage)
-                write_item = self._render_decoded(message)
-                decoded_seen += 1
-                del message
-                if write_item is not None:
-                    try:
-                        _timed_put(self.write_requests, write_item, self.metrics)
-                    except BaseException:
-                        write_item.release_payload_and_permit()
-                        raise
-                    self.writes_enqueued += 1
-                    del write_item
-                self._drain_ready_completions()
-            finally:
-                self.decoded_frames.task_done()
-
-    def _feed_decoder(self) -> None:
-        try:
-            work_iterator = iter(self.work_factory())
-            for _ in range(self.work_count):
-                permit = self.permits.acquire()
-                try:
-                    work = next(work_iterator)
-                except BaseException:
-                    permit.release()
-                    raise
-                request = _PermittedWork(work=work, permit=permit)
-                try:
-                    _timed_put(self.decode_requests, request, self.metrics)
-                except BaseException:
-                    remaining = request.permit
-                    request.permit = None
-                    if remaining is not None:
-                        remaining.release()
-                    raise
-                self.work_items_enqueued += 1
-                del request, work, permit
-        except BaseException as error:
-            self.feeder_error = error.with_traceback(None)
-        finally:
-            for _ in range(self.workers):
-                _timed_put(self.decode_requests, _QUEUE_SENTINEL, self.metrics)
-            self.feed_done.set()
-
-    def _decode_worker(self) -> None:
-        while True:
-            request = self.decode_requests.get()
-            try:
-                if request is _QUEUE_SENTINEL:
-                    return
-                assert isinstance(request, _PermittedWork)
-                work = request.work
-                permit = request.take_permit()
-                message = self._decode(work, permit)
-                _timed_put(self.decoded_frames, message, self.metrics)
-                del message, permit, work
-            finally:
-                self.decode_requests.task_done()
-
-    def _decode(
-        self,
-        work: _FileWorkItem,
-        permit: _LifecyclePermitLease,
-    ) -> _DecodedMessage:
-        try:
-            frame, render_input, projection_stats = self.decode(work)
-        except Exception as error:
-            error = error.with_traceback(None)
-            permit.release()
-            return _DecodedMessage(work=work, error=error)
-        self.metrics.increment("decoded_frames")
-        return _DecodedMessage(
-            work=work,
-            permit=permit,
-            frame=frame,
-            render_input=render_input,
-            projection_stats=projection_stats,
-        )
-
-    def _render_decoded(self, message: _DecodedMessage) -> _WriteItem | None:  # noqa: C901
-        if message.error is not None:
-            self._record_error("decode", message.work, message.error)
-            return None
-        render_input: RelativeStereoPrimitiveInput | MetricStereoPrimitiveInput | None
-        permit, frame, render_input, projection_stats = message.take_payload()
-        work = message.work
-        if self.first_error is not None:
-            frame = None
-            render_input = None
-            projection_stats = None
-            permit.release()
-            return None
-        canonical = None
-        compact = None
-        result = None
-        geometry = None
-        primitive = None
-        metric = None
-        quality_publication = None
-        left_image = None
-        right_image = None
-        try:
-            if isinstance(render_input, RelativeStereoPrimitiveInput):
-                if not isinstance(self.render_settings, StereoRenderSettings):
-                    raise TypeError("Relative stereo requires StereoRenderSettings")
-                canonical = render_input.encoded_canonical.astype(np.float32)
-                canonical *= np.float32(1.0 / render_input.encoding_scale)
-                if self.render_settings.stereo_render_mode == "quality":
-                    compact = render_relative_quality_compact(
-                        renderer=self.renderer,
-                        frame=frame,
-                        canonical=canonical,
-                        settings=self.render_settings,
-                    )
-                    result = None
-                elif hasattr(self.renderer, "render_relative_fast_compact"):
-                    compact = self.renderer.render_relative_fast_compact(
-                        frame,
-                        canonical,
-                        self.render_settings,
-                    )
-                    result = None
-                else:
-                    result = self.renderer.render(
-                        frame,
-                        canonical,
-                        self.render_settings,
-                    )
-                    compact = None
-            elif isinstance(render_input, MetricStereoPrimitiveInput):
-                primitive = render_input
-                if isinstance(self.render_settings, QualityStereoControls):
-                    compact = render_metric_primitives_compact(
-                        renderer=self.renderer,
-                        frame=frame,
-                        primitives=primitive,
-                        controls=self.render_settings,
-                    )
-                    projection_stats = compact.metric_stats
-                    result = None
-                elif isinstance(self.render_settings, StereoSplatSettings):
-                    metric = primitive.metric
-                    geometry, projection_stats = build_metric_geometry(
-                        metric.inverse_depth,
-                        metric.valid,
-                        metric.focal_x_normalized,
-                        (int(frame.shape[0]), int(frame.shape[1])),
-                        virtual_baseline_mm=float(primitive.virtual_baseline_mm),
-                        convergence_distance_m=float(primitive.convergence_distance_m),
-                        max_disparity_percent=float(primitive.max_disparity_percent),
-                        retained_crop_width=primitive.retained_crop_width,
-                    )
-                    if hasattr(self.renderer, "render_geometry_fast_compact"):
-                        compact = self.renderer.render_geometry_fast_compact(
-                            frame,
-                            geometry,
-                            self.render_settings,
-                            metric_stats=projection_stats,
-                        )
-                        result = None
-                    else:
-                        result = self.renderer.render_geometry(
-                            frame,
-                            geometry,
-                            self.render_settings,
-                        )
-                        compact = None
-                else:
-                    raise TypeError(
-                        "Metric stereo requires StereoSplatSettings or QualityStereoControls"
-                    )
-            else:
-                raise TypeError("Unsupported stereo primitive input")
-        except Exception as error:
-            error = error.with_traceback(None)
-            canonical = None
-            compact = None
-            result = None
-            geometry = None
-            primitive = None
-            metric = None
-            quality_publication = None
-            left_image = None
-            right_image = None
-            frame = None
-            render_input = None
-            projection_stats = None
-            permit.release()
-            self._record_error("render", work, error)
-            return None
-        try:
-            self.metrics.increment("rendered_frames")
-            if compact is not None:
-                left_image = compact.left_image
-                right_image = compact.right_image
-                quality_publication = prepare_quality_frame(
-                    QualityFramePublication(
-                        job_root=work.left_path.parent.parent,
-                        frame_name=work.frame_name,
-                        left_rgb_path=work.left_path,
-                        right_rgb_path=work.right_path,
-                        compact=compact,
-                        geometry_mode=(
-                            "metric" if self.geometry_mode == "metric_camera" else "relative"
-                        ),
-                        occlusion_fill=self.occlusion_fill,
-                        rgb_stage_fingerprint=self.rgb_stage_fingerprint,
-                        keep_masks=self.keep_masks,
-                        render_mode=self.render_mode,
-                    )
-                )
-                del compact
-            else:
-                assert result is not None
-                left_image = result.left_image
-                right_image = result.right_image
-                quality_publication = None
-            return _WriteItem(
-                work=work,
-                left_image=left_image,
-                right_image=right_image,
-                permit=permit,
-                projection_stats=projection_stats,
-                quality_publication=quality_publication,
-                geometry_mode=self.geometry_mode,
-                occlusion_fill=self.occlusion_fill,
-                rgb_stage_fingerprint=self.rgb_stage_fingerprint,
-                keep_masks=self.keep_masks,
-                render_mode=self.render_mode,
-            )
-        except Exception as error:
-            error = error.with_traceback(None)
-            canonical = None
-            compact = None
-            result = None
-            geometry = None
-            primitive = None
-            metric = None
-            quality_publication = None
-            left_image = None
-            right_image = None
-            frame = None
-            render_input = None
-            projection_stats = None
-            permit.release()
-            self._record_error("render", work, error)
-            return None
-
-    def _write_worker(self) -> None:
-        while True:
-            item = self.write_requests.get()
-            try:
-                if item is _QUEUE_SENTINEL:
-                    return
-                assert isinstance(item, _WriteItem)
-                completion = self._write(item)
-                _timed_put(self.write_completions, completion, self.metrics)
-            finally:
-                self.write_requests.task_done()
-
-    def _write(self, item: _WriteItem) -> _WriteCompletion:
-        work = item.work
-        error = None
-        started = time.perf_counter()
-        try:
-            _write_pair(item)
-        except Exception as write_error:
-            error = write_error.with_traceback(None)
-        else:
-            self.metrics.increment("written_frames")
-        finally:
-            self.metrics.writer_busy(time.perf_counter() - started)
-            item.release_payload_and_permit()
-        return _WriteCompletion(work=work, error=error)
-
-    def _drain_ready_completions(self) -> None:
-        while True:
-            try:
-                completion = self.write_completions.get_nowait()
-            except queue.Empty:
-                return
-            try:
-                assert isinstance(completion, _WriteCompletion)
-                self._handle_completion(completion)
-            finally:
-                self.write_completions.task_done()
-
-    def _wait_for_writes(self) -> None:
-        while self.completions_seen < self.writes_enqueued:
-            completion = self.write_completions.get()
-            try:
-                assert isinstance(completion, _WriteCompletion)
-                self._handle_completion(completion)
-            finally:
-                self.write_completions.task_done()
-
-    def _handle_completion(self, completion: _WriteCompletion) -> None:
-        self.completions_seen += 1
-        if completion.error is not None:
-            self._record_error("write", completion.work, completion.error)
-            return
-        self.successful_completions += 1
-        try:
-            self.report_progress(
-                processed=self.completed + self.successful_completions,
-                total=self.total_frames,
-                work_index=completion.work.index,
-                left_path=completion.work.left_path,
-            )
-        except Exception as error:
-            self._record_error("progress", completion.work, error)
-
-    def _record_error(
-        self,
-        stage: str,
-        work: _FileWorkItem | StereoProviderItem,
-        error: Exception,
-    ) -> None:
-        if self.first_error is None:
-            self.first_error = (stage, work, error)
+def _frame_png_valid(path: Path, expected_shape: tuple[int, int]) -> bool:
+    if not path.is_file() or path.is_symlink():
+        return False
+    header = read_png_header(path)
+    if header is None:
+        return False
+    return (header.height, header.width) == expected_shape and header.bit_depth == 8
 
 
 class StereoPairGenerator:
-    """Generate stereo pairs with main-thread rendering and bounded threaded I/O."""
+    """Generates stereo left/right frames in Fast or Quality mode (file-backed or streamed)."""
 
-    def __init__(
-        self,
-        verbose: bool = False,
-        *,
-        renderer: StereoRenderer | None = None,
-    ) -> None:
+    def __init__(self, verbose: bool = False, renderer: StereoRenderer | None = None) -> None:
         self.verbose = verbose
         self._renderer = renderer
-        self.last_pipeline_stats: StereoPipelineStats | StreamingStereoPipelineStats | None = None
+        self.last_pipeline_stats: StreamingStereoPipelineStats | None = None
         self.last_metric_clamp_summary: dict[str, Any] | None = None
-        self.last_render_performance_seconds: dict[str, float] = {}
-        self.last_rendered_frame_count = 0
-        self.last_stage_performance_seconds: dict[str, float] = {}
 
     @property
     def renderer(self) -> StereoRenderer:
@@ -1445,481 +117,117 @@ class StereoPairGenerator:
 
     @staticmethod
     def _occlusion_fill(settings: dict[str, Any]) -> Literal["none", "background"]:
-        return cast(
-            Literal["none", "background"],
-            str(settings.get("occlusion_fill", "background")),
-        )
+        value = str(settings.get("occlusion_fill", "background"))
+        if value not in {"none", "background"}:
+            raise ValueError(f"Unsupported occlusion_fill: {value}")
+        return cast(Literal["none", "background"], value)
 
     @staticmethod
-    def _manifest_frame_names(manifest: StereoInputManifestV1, *, filenames: bool):
-        suffix = ".png" if filenames else ""
-        try:
-            for record in manifest.replay_declared_records():
-                yield f"{record.frame_name}{suffix}"
-        except StereoControlStateError as error:
-            raise StereoInputIdentityMismatch(str(error)) from error
-
-    def _streamed_stage_identity(
-        self,
-        *,
-        manifest: StereoInputManifestV1,
-        provider,
-        settings: dict[str, Any],
-        render_mode: Literal["fast", "quality"],
-        geometry_mode: Literal["relative", "metric"],
-        occlusion_fill: Literal["none", "background"],
-        quality_content: StreamedQualityInputManifest | None,
-        retained_crop_width: int | None,
-        effective_convergence: float | None,
-    ) -> tuple[StreamedCanonicalObject | StreamedPrettyJsonValue, str]:
-        render_shape = manifest.render_shape
-        if render_mode == "quality":
-            if quality_content is None:
-                raise ValueError("Quality RGB identity requires its content manifest")
-            if geometry_mode == "relative":
-                projection: dict[str, Any] = {
-                    "convergence": float(settings.get("convergence", 0.5)),
-                    "kind": "relative",
-                    "stereo_strength": float(settings.get("stereo_strength", 2.0)),
-                }
-            else:
-                if retained_crop_width is None or effective_convergence is None:
-                    raise ValueError("metric Quality projection is incomplete")
-                requested = settings.get("metric_convergence_distance", "auto")
-                projection = {
-                    "center_crop_algorithm_version": CENTER_CROP_ALGORITHM_VERSION,
-                    "effective_convergence_distance_m": float(effective_convergence),
-                    "kind": "metric",
-                    "max_disparity_percent": float(settings.get("max_disparity_percent", 2.0)),
-                    "projection_algorithm_version": METRIC_PROJECTION_ALGORITHM_VERSION,
-                    "requested_convergence_distance": (
-                        "auto" if requested == "auto" else float(requested)
-                    ),
-                    "retained_crop_width": retained_crop_width,
-                    "sample_aspect_ratio": "1:1",
-                    "source_width": render_shape[1],
-                    "virtual_baseline_mm": float(settings.get("virtual_baseline_mm", 63.0)),
-                }
-            if occlusion_fill == "background":
-                configured_limit = int(settings.get("occlusion_fill_max_px", 8))
-                repair_policy: dict[str, Any] = {
-                    "configured_limit_1080p": configured_limit,
-                    "local_limit_formula": "min-scaled-safe-predicted-plus2-v1",
-                    "predicted_gap_policy": "max-four-neighbour-eye-shift-v1",
-                    "scaled_safe_limit_px": max(
-                        1,
-                        math.floor(configured_limit * render_shape[0] / 1080.0 + 0.5),
-                    ),
-                }
-            else:
-                repair_policy = {
-                    "configured_limit_1080p": None,
-                    "local_limit_formula": None,
-                    "predicted_gap_policy": None,
-                    "scaled_safe_limit_px": None,
-                }
-            document = build_streamed_canonical_object(
-                static_fields={
-                    "algorithm_version": QUALITY_STEREO_ALGORITHM_VERSION,
-                    "encoding": "uint8_png",
-                    "geometry_mode": geometry_mode,
-                    "native_geometry_fingerprint": (quality_content.native_geometry_fingerprint),
-                    "occlusion_fill": occlusion_fill,
-                    "projection": projection,
-                    "quality_input_manifest_sha256": quality_content.raw_sha256,
-                    "render_shape": [render_shape[0], render_shape[1]],
-                    "repair_policy": repair_policy,
-                    "schema_version": 2,
-                    "source_guide_fingerprint": quality_content.source_guide_fingerprint,
-                },
-                array_key="frame_names",
-                items=lambda: self._manifest_frame_names(manifest, filenames=False),
-                fingerprint_key="fingerprint",
-            )
-            assert document.fingerprint is not None
-            return document, document.fingerprint
-
-        device = getattr(self.renderer, "device", None)
-        device_type = getattr(device, "type", None) or "custom"
-        static: dict[str, Any] = {
-            "algorithm_version": STEREO_STAGE_ALGORITHM_VERSION,
-            "encoding": "uint8_png",
-            "geometry_mode": "metric_camera" if geometry_mode == "metric" else "relative",
-            "occlusion_fill": occlusion_fill,
-            "render_shape": [render_shape[0], render_shape[1]],
-            "renderer_device_type": str(device_type),
-            "schema_version": STEREO_STAGE_SCHEMA_VERSION,
-        }
-        if geometry_mode == "relative":
-            static.update(
-                {
-                    "render_settings": {
-                        "convergence": float(settings.get("convergence", 0.5)),
-                        "occlusion_fill": occlusion_fill,
-                        "stereo_strength": float(settings.get("stereo_strength", 2.0)),
-                    },
-                    "source_canonical_fingerprint": manifest.source_geometry_fingerprint,
-                }
-            )
-        else:
-            if retained_crop_width is None or effective_convergence is None:
-                raise ValueError("metric Fast projection is incomplete")
-            requested = settings.get("metric_convergence_distance", "auto")
-            static.update(
-                {
-                    "center_crop_algorithm_version": CENTER_CROP_ALGORITHM_VERSION,
-                    "effective_convergence_distance_m": float(effective_convergence),
-                    "max_disparity_percent": float(settings.get("max_disparity_percent", 2.0)),
-                    "projection_algorithm_version": METRIC_PROJECTION_ALGORITHM_VERSION,
-                    "requested_convergence_distance": (
-                        "auto" if requested == "auto" else float(requested)
-                    ),
-                    "retained_crop_width": retained_crop_width,
-                    "sample_aspect_ratio": "1:1",
-                    "source_metric_fingerprint": manifest.source_geometry_fingerprint,
-                    "source_width": render_shape[1],
-                    "virtual_baseline_mm": float(settings.get("virtual_baseline_mm", 63.0)),
-                }
-            )
-        canonical = build_streamed_canonical_object(
-            static_fields=static,
-            array_key="frame_names",
-            items=lambda: self._manifest_frame_names(manifest, filenames=True),
-            fingerprint_key="fingerprint",
-        )
-        assert canonical.fingerprint is not None
-        pretty_value = dict(static)
-        pretty_value["fingerprint"] = canonical.fingerprint
-        pretty_value["frame_names"] = ReplayableJsonArray(
-            lambda: self._manifest_frame_names(manifest, filenames=True)
-        )
-        return build_streamed_pretty_json_value(pretty_value), canonical.fingerprint
+    def _cancellation_predicate(progress_tracker: Any) -> Callable[[], bool] | None:
+        if progress_tracker is None:
+            return None
+        checker = getattr(type(progress_tracker), "is_cancelled", None)
+        if callable(checker):
+            return lambda: bool(progress_tracker.is_cancelled())
+        return None
 
     @staticmethod
-    def _streaming_diagnostics_context(
+    def _stage_metadata_payload(
         *,
         manifest: StereoInputManifestV1,
-        provider,
+        settings: dict[str, Any],
         render_mode: Literal["fast", "quality"],
-        geometry_mode: Literal["relative", "metric"],
         occlusion_fill: Literal["none", "background"],
-        keep_masks: bool,
-        rgb_stage_fingerprint: str,
-        quality_content: StreamedQualityInputManifest | None,
-        left_dir: Path,
-        right_dir: Path,
-    ) -> StreamingDiagnosticsStageContext:
-        if quality_content is None:
-            source_guide_fingerprint = manifest.source_geometry_fingerprint
-            native_geometry_fingerprint = None
-            content_sha = None
-        else:
-            source_guide_fingerprint = quality_content.source_guide_fingerprint
-            native_geometry_fingerprint = quality_content.native_geometry_fingerprint
-            content_sha = quality_content.raw_sha256
-
-        def replay_source_names():
-            count = 0
-            try:
-                # Names authenticate the manifest; stage boundaries audit payload content.
-                for item in manifest.replay_declared_records():
-                    if item.source_index != count:
-                        raise StereoInputIdentityMismatch("diagnostics source replay order changed")
-                    count += 1
-                    yield item.frame_name
-                if count != manifest.frame_count:
-                    raise StereoInputIdentityMismatch(
-                        "diagnostics source replay ended before its frame count"
-                    )
-            except StereoInputIdentityMismatch:
-                raise
-            except (StereoControlError, OSError, TypeError, ValueError) as error:
-                raise StereoInputIdentityMismatch(str(error)) from error
-
-        return StreamingDiagnosticsStageContext(
-            job_root=manifest.job_root,
-            frame_count=manifest.frame_count,
-            frame_names=replay_source_names,
-            render_shape=manifest.render_shape,
-            render_mode=render_mode,
-            geometry_mode=geometry_mode,
-            occlusion_fill=occlusion_fill,
-            mask_payloads_enabled=keep_masks,
-            rgb_stage_fingerprint=rgb_stage_fingerprint,
-            source_guide_fingerprint=source_guide_fingerprint,
-            native_geometry_fingerprint=native_geometry_fingerprint,
-            quality_input_manifest_sha256=content_sha,
-            native_geometry_sample_count=(
-                manifest.native_shape[0] * manifest.native_shape[1]
-                if render_mode == "quality"
-                else None
-            ),
-            left_rgb_parent=left_dir,
-            right_rgb_parent=right_dir,
+    ) -> dict[str, Any]:
+        algorithm = (
+            QUALITY_STEREO_ALGORITHM_VERSION
+            if render_mode == "quality"
+            else STEREO_STAGE_ALGORITHM_VERSION
         )
-
-    def create_stereo_pairs_from_manifest(
-        self,
-        manifest: StereoInputManifestV1,
-        directories: dict[str, Path],
-        settings: dict[str, Any],
-        progress_tracker=None,
-        *,
-        frame_consumer: Callable[[str, np.ndarray, np.ndarray], None] | None = None,
-        frame_consumer_memory_bytes: int = 0,
-    ) -> bool:
-        """Restart transient source changes only while the stage is read-only."""
-
-        manifest_path = manifest.path
-        job_root = manifest.job_root
-        last_change: BaseException | None = None
-        for _attempt in range(STEREO_READ_ONLY_RESTART_LIMIT):
-            current = load_stereo_input_manifest_v1(
-                manifest_path,
-                job_root=job_root,
-                validate_payloads=False,
-            )
-            try:
-                try:
-                    return self._create_stereo_pairs_from_manifest_once(
-                        current,
-                        directories,
-                        settings,
-                        progress_tracker,
-                        frame_consumer=frame_consumer,
-                        frame_consumer_memory_bytes=frame_consumer_memory_bytes,
-                    )
-                except StereoInputIdentityMismatch as error:
-                    raise StereoProviderChangedError(str(error)) from error
-            except StereoProviderChangedError as error:
-                last_change = error
-        assert last_change is not None
-        raise StereoProviderChangedError(
-            "stereo inputs did not stabilize during read-only audit"
-        ) from last_change
-
-    def _create_stereo_pairs_from_manifest_once(
-        self,
-        manifest: StereoInputManifestV1,
-        directories: dict[str, Path],
-        settings: dict[str, Any],
-        progress_tracker=None,
-        *,
-        frame_consumer: Callable[[str, np.ndarray, np.ndarray], None] | None = None,
-        frame_consumer_memory_bytes: int = 0,
-    ) -> bool:
-        """Render one validated durable upstream stereo sequence."""
-
-        return _ManifestStereoStage(
-            self,
-            manifest,
-            directories,
-            settings,
-            progress_tracker,
-            frame_consumer,
-            frame_consumer_memory_bytes,
-        ).run()
-
-    def _publish_performance_report(
-        self,
-        directories: dict[str, Path],
-        settings: dict[str, Any],
-    ) -> None:
-        stats = self.last_pipeline_stats
-        if stats is None:
-            return
         payload: dict[str, Any] = {
-            "schema_version": 1,
-            "render_mode": str(settings.get("stereo_render_mode", "fast")),
-            "geometry_mode": str(settings.get("stereo_geometry_mode", "relative")),
-            "pipeline": asdict(stats),
-            "rendered_frame_count": self.last_rendered_frame_count,
-            "render_seconds": dict(self.last_render_performance_seconds),
-            "stage_seconds": dict(self.last_stage_performance_seconds),
+            "schema_version": STEREO_STAGE_SCHEMA_VERSION,
+            "stage": "stereo",
+            "algorithm_version": algorithm,
+            "render_mode": render_mode,
+            "geometry_mode": manifest.geometry_mode,
+            "frame_names": [f"{name}.png" for name in manifest.frame_names()],
+            "render_shape": list(manifest.render_shape),
+            "source_fingerprint": manifest.source_geometry_fingerprint,
+            "occlusion_fill": occlusion_fill,
         }
-        path = Path(directories["base"]) / "stereo-performance-v1.json"
-        try:
-            _atomic_write_json(path, payload)
-        except OSError as error:
-            print(f"Warning: Could not persist stereo performance metrics: {error}")
-            return
-        pipeline = payload["pipeline"]
-        print(
-            "Stereo performance: "
-            f"wall={float(pipeline.get('pipeline_wall_seconds', 0.0)):.3f}s, "
-            f"decode={float(pipeline.get('decode_busy_seconds', 0.0)):.3f}s, "
-            f"render={float(pipeline.get('render_busy_seconds', 0.0)):.3f}s, "
-            f"write={float(pipeline.get('write_busy_seconds', 0.0)):.3f}s"
-        )
-        stages = payload["stage_seconds"]
-        if stages:
-            print(
-                "Stereo stage timing: "
-                f"preflight={float(stages.get('preflight', 0.0)):.3f}s, "
-                f"pipeline={float(stages.get('pipeline', 0.0)):.3f}s, "
-                f"consolidation={float(stages.get('consolidation', 0.0)):.3f}s, "
-                f"total={float(stages.get('total', 0.0)):.3f}s"
-            )
-        if self.last_render_performance_seconds:
-            render = self.last_render_performance_seconds
-            mode = str(payload["render_mode"]).capitalize()
-            print(
-                f"{mode} render performance: "
-                f"geometry={sum(value for name, value in render.items() if name.startswith('geometry_') or name == 'fast_geometry'):.3f}s, "
-                f"nearest={render.get('geometry_nearest_query', 0.0):.3f}s, "
-                f"eyes={render.get('left_eye', 0.0) + render.get('right_eye', 0.0):.3f}s"
-            )
-
-    def _build_stage_plan(
-        self,
-        depth_files: list[Path],
-        frame_files: list[Path],
-        render_shape: tuple[int, int],
-        settings: dict[str, Any],
-        occlusion_fill: Literal["none", "background"],
-    ) -> _StereoStagePlan:
-        geometry_mode = str(settings.get("stereo_geometry_mode", "relative"))
-        if geometry_mode == "relative":
-            return self._build_relative_plan(
-                depth_files,
-                frame_files,
-                render_shape,
-                settings,
-                occlusion_fill,
-            )
-        if geometry_mode == "metric_camera":
-            return self._build_metric_plan(
-                depth_files,
-                frame_files,
-                render_shape,
-                settings,
-                occlusion_fill,
-            )
-        raise ValueError(f"Unsupported stereo geometry mode: {geometry_mode}")
-
-    def _build_relative_plan(
-        self,
-        depth_files: list[Path],
-        frame_files: list[Path],
-        render_shape: tuple[int, int],
-        settings: dict[str, Any],
-        occlusion_fill: Literal["none", "background"],
-    ) -> _StereoStagePlan:
-        metadata = self._get_canonical_metadata(depth_files, frame_files)
-        stereo_strength = float(settings.get("stereo_strength", 2.0))
-        convergence = float(settings.get("convergence", 0.5))
-
-        def decode(work: _FileWorkItem):
-            return _decode_relative_work_item(
-                work,
-                encoding_scale=float(metadata["encoding_scale"]),
-                render_shape=render_shape,
-            )
-
-        render_settings = StereoRenderSettings(
-            stereo_strength=stereo_strength,
-            convergence=convergence,
-            occlusion_fill=occlusion_fill,
-            stereo_render_mode=cast(
-                Literal["fast", "quality"],
-                str(settings.get("stereo_render_mode", "fast")),
-            ),
-            occlusion_fill_max_px=settings.get("occlusion_fill_max_px", 8),
-        )
-        plan_type = (
-            _QualityRelativePlan
-            if render_settings.stereo_render_mode == "quality"
-            else _FastRelativePlan
-        )
-        return plan_type(
-            source_metadata=metadata,
-            decode=decode,
-            settings=render_settings,
-        )
-
-    def _build_metric_plan(
-        self,
-        depth_files: list[Path],
-        frame_files: list[Path],
-        render_shape: tuple[int, int],
-        settings: dict[str, Any],
-        occlusion_fill: Literal["none", "background"],
-    ) -> _StereoStagePlan:
-        store, metadata = self._get_metric_store(depth_files, frame_files)
-        requested_convergence = settings.get("metric_convergence_distance", "auto")
-        effective_convergence = (
-            float(metadata["convergence"]["resolved_auto_distance_m"])
-            if requested_convergence == "auto"
-            else float(requested_convergence)
-        )
-        retained_crop_width, _retained_crop_height = calculate_center_crop_dimensions(
-            render_shape[1],
-            render_shape[0],
-            float(settings.get("crop_factor", 1.0)),
-        )
-        virtual_baseline_mm = float(settings.get("virtual_baseline_mm", 63.0))
-        max_disparity_percent = float(settings.get("max_disparity_percent", 2.0))
-        render_mode = cast(
-            Literal["fast", "quality"],
-            str(settings.get("stereo_render_mode", "fast")),
-        )
-
-        def decode(work: _FileWorkItem):
-            return _decode_metric_work_item(
-                work,
-                store=store,
-                render_shape=render_shape,
-                virtual_baseline_mm=virtual_baseline_mm,
-                convergence_distance_m=effective_convergence,
-                max_disparity_percent=max_disparity_percent,
-                retained_crop_width=retained_crop_width,
-            )
-
-        render_settings: StereoSplatSettings | QualityStereoControls
         if render_mode == "quality":
-            render_settings = QualityStereoControls(
-                occlusion_fill=occlusion_fill,
-                occlusion_fill_max_px=settings.get("occlusion_fill_max_px", 8),
-            )
+            payload["occlusion_fill_max_px"] = int(settings.get("occlusion_fill_max_px", 8))
+        if manifest.geometry_mode == "relative":
+            payload["stereo_strength"] = float(settings.get("stereo_strength", 2.0))
+            payload["convergence"] = float(settings.get("convergence", 0.5))
+            payload["encoding_scale"] = manifest.relative_encoding_scale
         else:
-            render_settings = StereoSplatSettings(
-                max_eye_shift_fraction=(
-                    max_disparity_percent / 100.0 * (retained_crop_width / render_shape[1]) / 2.0
-                ),
-                occlusion_fill=occlusion_fill,
+            requested = settings.get("metric_convergence_distance", "auto")
+            effective_conv = (
+                manifest.resolved_auto_distance_m if requested == "auto" else float(requested)
             )
+            payload["projection_algorithm"] = METRIC_PROJECTION_ALGORITHM_VERSION
+            payload["crop_algorithm"] = CENTER_CROP_ALGORITHM_VERSION
+            payload["virtual_baseline_mm"] = float(settings.get("virtual_baseline_mm", 63.0))
+            payload["convergence_distance_m"] = effective_conv
+            payload["max_disparity_percent"] = float(settings.get("max_disparity_percent", 2.0))
+            payload["crop_factor"] = float(settings.get("crop_factor", 1.0))
+        payload["fingerprint"] = canonical_json_hash(payload)
+        return payload
 
-        if render_mode == "quality":
-            assert isinstance(render_settings, QualityStereoControls)
-            return _QualityMetricPlan(
-                source_metadata=metadata,
-                decode=decode,
-                settings=render_settings,
-                retained_crop_width=retained_crop_width,
-                effective_convergence=effective_convergence,
-            )
-        assert isinstance(render_settings, StereoSplatSettings)
-        return _FastMetricPlan(
-            source_metadata=metadata,
-            decode=decode,
-            settings=render_settings,
-            retained_crop_width=retained_crop_width,
-            effective_convergence=effective_convergence,
-        )
+    @staticmethod
+    def _read_existing_metadata(left_dir: Path) -> dict[str, Any] | None:
+        meta_path = left_dir / "metadata.json"
+        if not meta_path.is_file():
+            return None
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
 
-    def create_stereo_pairs_from_files(  # noqa: C901
+    @staticmethod
+    def _reset_downstream_stages(directories: dict[str, Path]) -> None:
+        for key in (
+            "left_distorted",
+            "right_distorted",
+            "left_cropped",
+            "right_cropped",
+            "left_upscaled",
+            "right_upscaled",
+            "vr_frames",
+        ):
+            stage_dir = directories.get(key)
+            if stage_dir is None or not stage_dir.is_dir():
+                continue
+            for file_path in stage_dir.glob("*.png"):
+                file_path.unlink(missing_ok=True)
+            (stage_dir / "metadata.json").unlink(missing_ok=True)
+
+    @staticmethod
+    def _clear_stereo_outputs(left_dir: Path, right_dir: Path) -> None:
+        for directory in (left_dir, right_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+            for file_path in directory.glob("*.png"):
+                file_path.unlink(missing_ok=True)
+            for temp_path in directory.glob("*.tmp"):
+                temp_path.unlink(missing_ok=True)
+        (left_dir / "metadata.json").unlink(missing_ok=True)
+
+    def create_stereo_pairs_from_files(
         self,
         frame_files: list[Path],
         depth_files: list[Path],
         directories: dict[str, Path],
         settings: dict[str, Any],
-        progress_tracker=None,
+        progress_tracker: Any = None,
     ) -> bool:
-        """Decode, render, and atomically write file-backed stereo pairs."""
+        """Convenience wrapper building a lightweight manifest and running the unified pipeline."""
 
-        self.last_pipeline_stats = None
-        self.last_metric_clamp_summary = None
-        geometry_mode = str(settings.get("stereo_geometry_mode", "relative"))
+        geometry_mode = cast(
+            Literal["relative", "metric_camera"],
+            str(settings.get("stereo_geometry_mode", "relative")),
+        )
         if geometry_mode == "metric_camera" and (
             not frame_files or len(frame_files) != len(depth_files)
         ):
@@ -1930,1708 +238,326 @@ class StereoPairGenerator:
                 f"{len(depth_files)} depth maps"
             )
             return False
-        try:
-            left_dir = directories["left_frames"]
-            right_dir = directories["right_frames"]
-            left_dir.mkdir(parents=True, exist_ok=True)
-            right_dir.mkdir(parents=True, exist_ok=True)
-            render_shape = self._read_render_shape(frame_files[0])
-            occlusion_fill = self._occlusion_fill(settings)
-            plan = self._build_stage_plan(
-                depth_files,
-                frame_files,
-                render_shape,
-                settings,
-                occlusion_fill,
-            )
-            quality_context: DiagnosticsStageContext | None = None
-            if isinstance(plan, (_QualityRelativePlan, _QualityMetricPlan)):
-                content = self._build_quality_content_manifest(
-                    job_root=left_dir.parent,
-                    frame_files=frame_files,
-                    depth_files=depth_files,
-                    plan=plan,
-                )
-                stage_metadata = self._quality_stereo_stage_metadata(
-                    plan=plan,
-                    content=content,
-                    render_shape=render_shape,
-                    settings=settings,
-                    occlusion_fill=occlusion_fill,
-                )
-                stage_changed = self._prepare_quality_stereo_stage(
-                    left_dir,
-                    right_dir,
-                    stage_metadata,
-                    content,
-                )
-                quality_context = self._quality_diagnostics_context(
-                    job_root=left_dir.parent,
-                    metadata=stage_metadata,
-                    content=content,
-                    plan=plan,
-                    occlusion_fill=occlusion_fill,
-                    keep_masks=bool(settings.get("keep_intermediates", True)),
-                    left_rgb_parent=left_dir,
-                    right_rgb_parent=right_dir,
-                )
-                diagnostic_audit = audit_diagnostics_stage(quality_context)
-                if diagnostic_audit.disposition != "complete":
-                    begin_diagnostics_stage(quality_context)
-                work_plan = self._build_quality_work_items(
-                    frame_files,
-                    depth_files,
-                    left_dir,
-                    right_dir,
-                    diagnostic_audit.reusable_frame_names,
-                    diagnostic_audit.migrate_frame_names,
-                )
-            else:
-                stage_metadata = self._stereo_stage_metadata(
-                    plan.source_metadata,
-                    frame_files,
-                    render_shape,
-                    settings,
-                    geometry_mode=plan.geometry_mode,
-                    occlusion_fill=occlusion_fill,
-                    retained_crop_width=plan.retained_crop_width,
-                    effective_convergence=plan.effective_convergence,
-                )
-                stage_changed = self._prepare_stereo_stage(left_dir, right_dir, stage_metadata)
-                compact_fast = (
-                    plan.geometry_mode == "relative"
-                    and hasattr(self.renderer, "render_relative_fast_compact")
-                ) or (
-                    plan.geometry_mode == "metric_camera"
-                    and hasattr(self.renderer, "render_geometry_fast_compact")
-                )
-                if compact_fast:
-                    if stage_changed:
-                        shutil.rmtree(
-                            left_dir.parent / "04_stereo_diagnostics",
-                            ignore_errors=True,
-                        )
-                    quality_context = self._fast_diagnostics_context(
-                        job_root=left_dir.parent,
-                        metadata=stage_metadata,
-                        frame_files=frame_files,
-                        render_shape=render_shape,
-                        geometry_mode=plan.geometry_mode,
-                        occlusion_fill=occlusion_fill,
-                        keep_masks=bool(settings.get("keep_intermediates", True)),
-                        left_rgb_parent=left_dir,
-                        right_rgb_parent=right_dir,
-                    )
-                    diagnostic_audit = audit_diagnostics_stage(quality_context)
-                    if diagnostic_audit.disposition != "complete":
-                        begin_diagnostics_stage(quality_context)
-                    work_plan = self._build_quality_work_items(
-                        frame_files,
-                        depth_files,
-                        left_dir,
-                        right_dir,
-                        diagnostic_audit.reusable_frame_names,
-                        diagnostic_audit.migrate_frame_names,
-                    )
-                else:
-                    work_plan = self._build_file_work_items(
-                        frame_files,
-                        depth_files,
-                        left_dir,
-                        right_dir,
-                        render_shape,
-                        metric_mode=plan.geometry_mode == "metric_camera",
-                    )
-            if stage_changed:
-                self._reset_downstream_stages(directories)
-            if work_plan.repaired_outputs and not stage_changed:
-                self._reset_downstream_stages(directories)
-            if work_plan.render_count == 0:
-                print(f"  Reusing {work_plan.reuse_count} existing stereo pairs")
-                if quality_context is not None:
-                    if work_plan.migrate_count:
-                        migrate_frame_manifests_sync(
-                            quality_context,
-                            lambda: work_plan.iter_frame_names(StereoAction.MIGRATE),
-                        )
-                    if diagnostic_audit.disposition != "complete":
-                        complete_diagnostics_stage(quality_context)
-                    if plan.geometry_mode == "metric_camera":
-                        self._load_quality_metric_summary(left_dir)
-                elif plan.geometry_mode == "metric_camera":
-                    self._summarize_metric_clamps(frame_files, left_dir)
-                return True
-
-            workers = validate_stereo_io_workers(
-                settings.get("stereo_io_workers", _default_stereo_io_workers())
-            )
-            capacity = calculate_stereo_pipeline_capacity(
-                render_shape[1],
-                render_shape[0],
-                workers,
-            )
-            if plan.render_mode == "quality":
-                capacity = 1
-                workers = 1
-            print(
-                f"  Using {workers} stereo I/O workers with " f"{capacity} bounded frame slots..."
-            )
-            self._run_file_pipeline(
-                work_plan,
-                decode=plan.decode,
-                render_settings=plan.render_settings,
-                render_mode=plan.render_mode,
-                geometry_mode=plan.geometry_mode,
-                occlusion_fill=occlusion_fill,
-                rgb_stage_fingerprint=str(stage_metadata["fingerprint"]),
-                keep_masks=bool(settings.get("keep_intermediates", True)),
-                workers=workers,
-                capacity=capacity,
-                completed=work_plan.reuse_count,
-                total_frames=len(frame_files),
-                progress_tracker=progress_tracker,
-            )
-            if quality_context is not None:
-                if work_plan.migrate_count:
-                    migrate_frame_manifests_sync(
-                        quality_context,
-                        lambda: work_plan.iter_frame_names(StereoAction.MIGRATE),
-                    )
-                complete_diagnostics_stage(quality_context)
-                if plan.geometry_mode == "metric_camera":
-                    self._load_quality_metric_summary(left_dir)
-            elif plan.geometry_mode == "metric_camera":
-                self._summarize_metric_clamps(frame_files, left_dir)
-            return True
-        except Exception as error:
-            return _stereo_creation_failed(error)
-
-    def _stereo_stage_metadata(
-        self,
-        canonical_metadata: dict[str, Any],
-        frame_files: list[Path],
-        render_shape: tuple[int, int],
-        settings: dict[str, Any],
-        *,
-        geometry_mode: str,
-        occlusion_fill: Literal["none", "background"],
-        retained_crop_width: int | None,
-        effective_convergence: float | None,
-    ) -> dict[str, Any]:
-        device = getattr(self.renderer, "device", None)
-        device_type = getattr(device, "type", None) or "custom"
-        metadata = {
-            "schema_version": STEREO_STAGE_SCHEMA_VERSION,
-            "algorithm_version": STEREO_STAGE_ALGORITHM_VERSION,
-            "geometry_mode": geometry_mode,
-            "frame_names": [path.name for path in frame_files],
-            "render_shape": [int(render_shape[0]), int(render_shape[1])],
-            "occlusion_fill": occlusion_fill,
-            "renderer_device_type": str(device_type),
-            "encoding": "uint8_png",
-        }
-        render_mode = str(settings.get("stereo_render_mode", "fast"))
-        if render_mode == "quality":
-            metadata["render_mode"] = "quality"
-            metadata["occlusion_fill_max_px"] = int(settings.get("occlusion_fill_max_px", 8))
-        if geometry_mode == "relative":
-            metadata.update(
-                {
-                    "source_canonical_fingerprint": canonical_metadata["fingerprint"],
-                    "render_settings": {
-                        "stereo_strength": float(settings.get("stereo_strength", 2.0)),
-                        "convergence": float(settings.get("convergence", 0.5)),
-                        "occlusion_fill": occlusion_fill,
-                    },
-                }
-            )
-        else:
-            assert retained_crop_width is not None and effective_convergence is not None
-            requested_convergence = settings.get("metric_convergence_distance", "auto")
-            metadata.update(
-                {
-                    "source_metric_fingerprint": canonical_metadata["fingerprint"],
-                    "projection_algorithm_version": METRIC_PROJECTION_ALGORITHM_VERSION,
-                    "source_width": int(render_shape[1]),
-                    "retained_crop_width": int(retained_crop_width),
-                    "center_crop_algorithm_version": CENTER_CROP_ALGORITHM_VERSION,
-                    "sample_aspect_ratio": "1:1",
-                    "virtual_baseline_mm": float(settings.get("virtual_baseline_mm", 63.0)),
-                    "requested_convergence_distance": (
-                        "auto" if requested_convergence == "auto" else float(requested_convergence)
-                    ),
-                    "effective_convergence_distance_m": float(effective_convergence),
-                    "max_disparity_percent": float(settings.get("max_disparity_percent", 2.0)),
-                }
-            )
-        metadata["fingerprint"] = canonical_json_hash(metadata)
-        return metadata
-
-    @staticmethod
-    def _build_quality_content_manifest(
-        *,
-        job_root: Path,
-        frame_files: list[Path],
-        depth_files: list[Path],
-        plan: _QualityRelativePlan | _QualityMetricPlan,
-    ):
-        from ...io.content_manifest import build_quality_input_manifest
-
-        if isinstance(plan, _QualityRelativePlan):
-            return build_quality_input_manifest(
-                job_root=job_root,
-                frame_files=frame_files,
-                geometry_files=depth_files,
-                geometry_mode="relative",
-                relative_encoding_scale=np.float32(plan.source_metadata["encoding_scale"]),
-                metric_native_shape=None,
-            )
-        return build_quality_input_manifest(
+        job_root = directories.get("base") or directories["left_frames"].parent
+        manifest = publish_validated_stereo_input_manifest_v1(
             job_root=job_root,
-            frame_files=frame_files,
+            guide_files=frame_files,
             geometry_files=depth_files,
-            geometry_mode="metric",
-            relative_encoding_scale=None,
-            metric_native_shape=tuple(plan.source_metadata["native_shape"]),
-        )
-
-    @staticmethod
-    def _quality_stereo_stage_metadata(
-        *,
-        plan: _QualityRelativePlan | _QualityMetricPlan,
-        content: Any,
-        render_shape: tuple[int, int],
-        settings: dict[str, Any],
-        occlusion_fill: Literal["none", "background"],
-    ) -> dict[str, Any]:
-        content_payload = content.payload
-        if isinstance(plan, _QualityRelativePlan):
-            projection: dict[str, Any] = {
-                "kind": "relative",
-                "stereo_strength": float(plan.settings.stereo_strength),
-                "convergence": float(plan.settings.convergence),
-            }
-            geometry_mode = "relative"
-        else:
-            requested = settings.get("metric_convergence_distance", "auto")
-            projection = {
-                "kind": "metric",
-                "projection_algorithm_version": METRIC_PROJECTION_ALGORITHM_VERSION,
-                "source_width": int(render_shape[1]),
-                "retained_crop_width": int(plan.retained_crop_width),
-                "center_crop_algorithm_version": CENTER_CROP_ALGORITHM_VERSION,
-                "sample_aspect_ratio": "1:1",
-                "virtual_baseline_mm": float(settings.get("virtual_baseline_mm", 63.0)),
-                "requested_convergence_distance": (
-                    "auto" if requested == "auto" else float(requested)
-                ),
-                "effective_convergence_distance_m": float(plan.effective_convergence),
-                "max_disparity_percent": float(settings.get("max_disparity_percent", 2.0)),
-            }
-            geometry_mode = "metric"
-        if occlusion_fill == "background":
-            configured_limit = int(settings.get("occlusion_fill_max_px", 8))
-            repair_policy: dict[str, Any] = {
-                "configured_limit_1080p": configured_limit,
-                "scaled_safe_limit_px": max(
-                    1,
-                    math.floor(configured_limit * render_shape[0] / 1080.0 + 0.5),
-                ),
-                "predicted_gap_policy": "max-four-neighbour-eye-shift-v1",
-                "local_limit_formula": "min-scaled-safe-predicted-plus2-v1",
-            }
-        else:
-            repair_policy = {
-                "configured_limit_1080p": None,
-                "scaled_safe_limit_px": None,
-                "predicted_gap_policy": None,
-                "local_limit_formula": None,
-            }
-        metadata: dict[str, Any] = {
-            "schema_version": 2,
-            "algorithm_version": QUALITY_STEREO_ALGORITHM_VERSION,
-            "geometry_mode": geometry_mode,
-            "frame_names": list(content_payload["frame_names"]),
-            "render_shape": [int(render_shape[0]), int(render_shape[1])],
-            "occlusion_fill": occlusion_fill,
-            "encoding": "uint8_png",
-            "source_guide_fingerprint": content_payload["source_guide_fingerprint"],
-            "native_geometry_fingerprint": content_payload["native_geometry_fingerprint"],
-            "quality_input_manifest_sha256": content.raw_sha256,
-            "projection": projection,
-            "repair_policy": repair_policy,
-        }
-        metadata["fingerprint"] = canonical_json_hash(metadata)
-        return metadata
-
-    @staticmethod
-    def _prepare_quality_stereo_stage(
-        left_dir: Path,
-        right_dir: Path,
-        expected_metadata: dict[str, Any],
-        content: Any,
-    ) -> bool:
-        from ...io.content_manifest import publish_quality_input_manifest
-
-        job_root = left_dir.parent
-        diagnostics_root = job_root / "04_stereo_diagnostics"
-        metadata_path = left_dir / "metadata.json"
-        content_path = diagnostics_root / "quality_input_manifest.json"
-        try:
-            existing_metadata_raw = metadata_path.read_bytes()
-            existing_metadata = json.loads(existing_metadata_raw.decode("ascii"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            existing_metadata = None
-            existing_metadata_raw = None
-        try:
-            existing_content_raw = content_path.read_bytes()
-        except OSError:
-            existing_content_raw = None
-        expected_metadata_raw = canonical_json_bytes(expected_metadata)
-        stage_changed = (
-            existing_metadata != expected_metadata
-            or existing_metadata_raw != expected_metadata_raw
-            or existing_content_raw != content.raw
-        )
-        if stage_changed:
-            for directory in (left_dir, right_dir):
-                for path in directory.iterdir():
-                    if path.is_dir():
-                        shutil.rmtree(path)
-                    else:
-                        path.unlink()
-            shutil.rmtree(diagnostics_root, ignore_errors=True)
-        publish_quality_input_manifest(content_path, content)
-        _atomic_write_canonical_json(metadata_path, expected_metadata)
-        return stage_changed
-
-    @staticmethod
-    def _quality_diagnostics_context(
-        *,
-        job_root: Path,
-        metadata: dict[str, Any],
-        content: Any,
-        plan: _QualityRelativePlan | _QualityMetricPlan,
-        occlusion_fill: Literal["none", "background"],
-        keep_masks: bool,
-        left_rgb_parent: Path,
-        right_rgb_parent: Path,
-    ) -> DiagnosticsStageContext:
-        return DiagnosticsStageContext(
-            job_root=job_root,
-            frame_names=tuple(content.payload["frame_names"]),
-            render_shape=tuple(metadata["render_shape"]),
-            render_mode="quality",
-            geometry_mode=("relative" if isinstance(plan, _QualityRelativePlan) else "metric"),
-            occlusion_fill=occlusion_fill,
-            mask_payloads_enabled=keep_masks,
-            rgb_stage_fingerprint=str(metadata["fingerprint"]),
-            source_guide_fingerprint=str(metadata["source_guide_fingerprint"]),
-            native_geometry_fingerprint=str(metadata["native_geometry_fingerprint"]),
-            quality_input_manifest_sha256=content.raw_sha256,
-            native_geometry_sample_count=(
-                int(plan.source_metadata["native_shape"][0])
-                * int(plan.source_metadata["native_shape"][1])
-            ),
-            left_rgb_parent=left_rgb_parent,
-            right_rgb_parent=right_rgb_parent,
-        )
-
-    @staticmethod
-    def _fast_diagnostics_context(
-        *,
-        job_root: Path,
-        metadata: dict[str, Any],
-        frame_files: list[Path],
-        render_shape: tuple[int, int],
-        geometry_mode: str,
-        occlusion_fill: Literal["none", "background"],
-        keep_masks: bool,
-        left_rgb_parent: Path,
-        right_rgb_parent: Path,
-    ) -> DiagnosticsStageContext:
-        source_provenance = metadata.get(
-            "source_canonical_fingerprint",
-            metadata.get("source_metric_fingerprint", metadata["fingerprint"]),
-        )
-        return DiagnosticsStageContext(
-            job_root=job_root,
-            frame_names=tuple(path.stem for path in frame_files),
-            render_shape=render_shape,
-            render_mode="fast",
-            geometry_mode=("metric" if geometry_mode == "metric_camera" else "relative"),
-            occlusion_fill=occlusion_fill,
-            mask_payloads_enabled=keep_masks,
-            rgb_stage_fingerprint=str(metadata["fingerprint"]),
-            source_guide_fingerprint=str(source_provenance),
-            native_geometry_fingerprint=None,
-            quality_input_manifest_sha256=None,
-            left_rgb_parent=left_rgb_parent,
-            right_rgb_parent=right_rgb_parent,
-        )
-
-    @staticmethod
-    def _build_quality_work_items(
-        frame_files: list[Path],
-        depth_files: list[Path],
-        left_dir: Path,
-        right_dir: Path,
-        reusable_frame_names: tuple[str, ...],
-        migrate_frame_names: tuple[str, ...],
-    ) -> _FileWorkPlan:
-        reusable = set(reusable_frame_names)
-        migrate = set(migrate_frame_names)
-        if reusable & migrate:
-            raise ValueError("diagnostics reuse and migration actions overlap")
-        actions = PackedStereoActions(len(frame_files))
-        render_count = 0
-        repaired_outputs = False
-        for index, (frame_file, depth_file) in enumerate(zip(frame_files, depth_files)):
-            frame_name = frame_file.stem
-            if frame_name in reusable:
-                actions.set(index, StereoAction.REUSE)
-                continue
-            if frame_name in migrate:
-                actions.set(index, StereoAction.MIGRATE)
-                continue
-            actions.set(index, StereoAction.RENDER)
-            render_count += 1
-            left_path = left_dir / f"{frame_name}.png"
-            right_path = right_dir / f"{frame_name}.png"
-            diagnostic_dir = left_dir.parent / "04_stereo_diagnostics" / "frames" / frame_name
-            repaired_outputs = repaired_outputs or any(
-                path.exists() for path in (left_path, right_path, diagnostic_dir)
-            )
-            left_path.unlink(missing_ok=True)
-            right_path.unlink(missing_ok=True)
-            shutil.rmtree(diagnostic_dir, ignore_errors=True)
-        if len(reusable) + len(migrate) + render_count != len(frame_files):
-            raise ValueError("diagnostics action cardinality differs from the frame sequence")
-        return _FileWorkPlan(
-            frame_files=frame_files,
-            depth_files=depth_files,
-            left_dir=left_dir,
-            right_dir=right_dir,
-            actions=actions,
-            render_count=render_count,
-            reuse_count=len(reusable),
-            migrate_count=len(migrate),
-            repaired_outputs=repaired_outputs,
-            metric_mode=False,
-        )
-
-    def _load_quality_metric_summary(self, left_dir: Path) -> None:
-        path = left_dir / "clamp_summary.json"
-        payload = json.loads(path.read_text(encoding="ascii"))
-        self.last_metric_clamp_summary = payload
-        fractions = payload["clamped_fractions"]
-        frame_names = payload["frame_names"]
-        for frame_name, fraction in zip(frame_names, fractions):
-            if float(fraction) > 0.05:
-                print(
-                    "Warning: metric disparity was clamped above 5% of valid pixels "
-                    f"starting at source frame {frame_name}"
-                )
-                break
-
-    @staticmethod
-    def _prepare_stereo_stage(
-        left_dir: Path,
-        right_dir: Path,
-        expected_metadata: dict[str, Any],
-    ) -> bool:
-        metadata_path = left_dir / "metadata.json"
-        existing_metadata = None
-        try:
-            existing_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            pass
-
-        has_outputs = any(left_dir.iterdir()) or any(right_dir.iterdir())
-        stage_changed = existing_metadata is not None or has_outputs
-        stage_changed = stage_changed and existing_metadata != expected_metadata
-        if stage_changed:
-            for directory in (left_dir, right_dir):
-                for path in directory.iterdir():
-                    if path.is_dir():
-                        shutil.rmtree(path)
-                    else:
-                        path.unlink()
-            existing_metadata = None
-        if existing_metadata != expected_metadata:
-            _atomic_write_json(metadata_path, expected_metadata)
-        return stage_changed
-
-    @staticmethod
-    def _downstream_stage_directories(directories: dict[str, Path]) -> tuple[Path, ...]:
-        return tuple(
-            Path(directories[name])
-            for name in (
-                "left_distorted",
-                "right_distorted",
-                "left_cropped",
-                "right_cropped",
-                "left_upscaled",
-                "right_upscaled",
-                "vr_frames",
-            )
-            if directories.get(name) is not None
-        )
-
-    @classmethod
-    def _reset_downstream_stages(cls, directories: dict[str, Path]) -> None:
-        downstream = cls._downstream_stage_directories(directories)
-        if not downstream:
-            return
-        job_root = Path(directories.get("base", downstream[0].parent))
-        with SafeTreeMutation(job_root, downstream) as mutation:
-            for directory in downstream:
-                mutation.clear_root(directory)
-
-    def _run_file_pipeline(
-        self,
-        work_plan: _FileWorkPlan,
-        *,
-        decode: _DecodeFrame,
-        render_settings: StereoRenderSettings | StereoSplatSettings | QualityStereoControls,
-        render_mode: Literal["fast", "quality"],
-        geometry_mode: str,
-        occlusion_fill: Literal["none", "background"],
-        rgb_stage_fingerprint: str,
-        keep_masks: bool,
-        workers: int,
-        capacity: int,
-        completed: int,
-        total_frames: int,
-        progress_tracker,
-    ) -> None:
-        pipeline = _StereoFilePipeline(
-            renderer=self.renderer,
-            work_factory=work_plan.iter_render,
-            work_count=work_plan.render_count,
-            decode=decode,
-            render_settings=render_settings,
-            render_mode=render_mode,
             geometry_mode=geometry_mode,
-            occlusion_fill=occlusion_fill,
-            rgb_stage_fingerprint=rgb_stage_fingerprint,
-            keep_masks=keep_masks,
-            workers=workers,
-            capacity=capacity,
-            completed=completed,
-            total_frames=total_frames,
-            report_progress=lambda **values: self._report_progress(
-                progress_tracker,
-                **values,
-            ),
         )
-        try:
-            self.last_pipeline_stats = pipeline.run()
-        finally:
-            self.last_pipeline_stats = pipeline.metrics.snapshot()
-
-    @staticmethod
-    def _report_progress(
-        progress_tracker,
-        *,
-        processed: int,
-        total: int,
-        work_index: int,
-        left_path: Path | None,
-    ) -> None:
-        if progress_tracker and (processed % 5 == 0 or processed == total):
-            progress_tracker.update_progress(
-                "Creating stereo pairs",
-                phase="stereo_generation",
-                frame_num=processed,
-                step_name="Stereo Pair Creation",
-                step_progress=processed,
-                step_total=total,
-            )
-        if (
-            progress_tracker
-            and left_path is not None
-            and hasattr(progress_tracker, "send_preview_frame")
-            and (work_index % PREVIEW_FRAME_SAMPLE_RATE == 0 or processed == total)
-        ):
-            progress_tracker.send_preview_frame(left_path, "stereo_left", processed)
-
-    @staticmethod
-    def _read_render_shape(frame_path: Path) -> tuple[int, int]:
-        header = read_png_header(frame_path)
-        if header is None:
-            raise OSError(f"Could not read PNG header: {frame_path}")
-        return header.height, header.width
-
-    @staticmethod
-    def _build_file_work_items(
-        frame_files: list[Path],
-        depth_files: list[Path],
-        left_dir: Path,
-        right_dir: Path,
-        render_shape: tuple[int, int],
-        *,
-        metric_mode: bool,
-    ) -> _FileWorkPlan:
-        actions = PackedStereoActions(len(frame_files))
-        render_count = 0
-        completed = 0
-        repaired_outputs = False
-        stat_dir = left_dir / "clamp_stats"
-        for directory in (left_dir, right_dir, stat_dir):
-            if directory.is_dir():
-                for temporary in directory.glob("*.tmp"):
-                    temporary.unlink(missing_ok=True)
-        if metric_mode:
-            stat_dir.mkdir(parents=True, exist_ok=True)
-        for index, (frame_file, depth_file) in enumerate(zip(frame_files, depth_files)):
-            frame_name = frame_file.stem
-            left_path = left_dir / f"{frame_name}.png"
-            right_path = right_dir / f"{frame_name}.png"
-            stat_path = stat_dir / f"{frame_name}.json" if metric_mode else None
-            if StereoPairGenerator._stereo_outputs_are_valid(
-                left_path,
-                right_path,
-                stat_path,
-                frame_name,
-                render_shape,
-            ):
-                actions.set(index, StereoAction.REUSE)
-                completed += 1
-                continue
-            actions.set(index, StereoAction.RENDER)
-            render_count += 1
-            output_paths = [left_path, right_path]
-            if stat_path is not None:
-                output_paths.append(stat_path)
-            repaired_outputs = repaired_outputs or any(path.exists() for path in output_paths)
-            for path in output_paths:
-                path.unlink(missing_ok=True)
-        return _FileWorkPlan(
-            frame_files=frame_files,
-            depth_files=depth_files,
-            left_dir=left_dir,
-            right_dir=right_dir,
-            actions=actions,
-            render_count=render_count,
-            reuse_count=completed,
-            migrate_count=0,
-            repaired_outputs=repaired_outputs,
-            metric_mode=metric_mode,
+        return self.create_stereo_pairs_from_manifest(
+            manifest,
+            directories,
+            settings,
+            progress_tracker=progress_tracker,
         )
 
-    @staticmethod
-    def _stereo_outputs_are_valid(
-        left_path: Path,
-        right_path: Path,
-        stat_path: Path | None,
-        frame_name: str,
-        render_shape: tuple[int, int],
-    ) -> bool:
-        for path in (left_path, right_path):
-            if not png_header_matches(path, shape=(*render_shape, 3), bit_depth=8):
-                return False
-        return (
-            stat_path is None
-            or StereoPairGenerator._read_metric_stat_sidecar(
-                stat_path,
-                frame_name,
-            )
-            is not None
-        )
-
-    @staticmethod
-    def _read_metric_stat_sidecar(
-        path: Path,
-        frame_name: str,
-    ) -> MetricProjectionStats | None:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return None
-        if not isinstance(payload, dict) or set(payload) != {
-            "schema_version",
-            "frame_name",
-            "valid_pixel_count",
-            "clamped_pixel_count",
-            "clamped_fraction",
-        }:
-            return None
-        if (
-            payload.get("schema_version") != METRIC_CLAMP_STATS_SCHEMA_VERSION
-            or payload.get("frame_name") != frame_name
-        ):
-            return None
-        try:
-            return MetricProjectionStats(
-                payload["valid_pixel_count"],
-                payload["clamped_pixel_count"],
-                payload["clamped_fraction"],
-            )
-        except (TypeError, ValueError):
-            return None
-
-    def _summarize_metric_clamps(self, frame_files: list[Path], left_dir: Path) -> None:
-        fractions: list[float] = []
-        earliest_warning: str | None = None
-        for frame_file in frame_files:
-            frame_name = frame_file.stem
-            stats = self._read_metric_stat_sidecar(
-                left_dir / "clamp_stats" / f"{frame_name}.json",
-                frame_name,
-            )
-            if stats is None:
-                raise ValueError(f"Metric clamp statistics are invalid for {frame_name}")
-            fractions.append(stats.clamped_fraction)
-            if earliest_warning is None and stats.clamped_fraction > 0.05:
-                earliest_warning = frame_name
-
-        summary: dict[str, Any] = {
-            "schema_version": METRIC_CLAMP_STATS_SCHEMA_VERSION,
-            "frame_names": [path.stem for path in frame_files],
-            "clamped_fractions": fractions,
-            "affected_frame_count": sum(fraction > 0.0 for fraction in fractions),
-            "mean_clamped_fraction": float(np.mean(fractions)) if fractions else 0.0,
-            "max_clamped_fraction": max(fractions, default=0.0),
-        }
-        _atomic_write_json(left_dir / "clamp_summary.json", summary)
-        self.last_metric_clamp_summary = summary
-        if earliest_warning is not None:
-            print(
-                "Warning: metric disparity was clamped above 5% of valid pixels "
-                f"starting at source frame {earliest_warning}"
-            )
-
-    @staticmethod
-    def _get_canonical_metadata(
-        depth_files: list[Path],
-        frame_files: list[Path],
-    ) -> dict[str, Any]:
-        """Load either strict base or stabilized render-disparity metadata."""
-
-        artifact = validate_render_disparity_input(depth_files, frame_files)
-        metadata = dict(artifact.metadata)
-        metadata["fingerprint"] = artifact.fingerprint
-        return metadata
-
-    @staticmethod
-    def _get_metric_store(
-        depth_files: list[Path],
-        frame_files: list[Path],
-    ) -> tuple[MetricGeometryStore, dict[str, Any]]:
-        try:
-            if not depth_files:
-                raise ValueError("Metric geometry files are required")
-            metadata = MetricGeometryStore.read_metadata(depth_files[0].parent)
-            if metadata is None:
-                raise ValueError("Metric geometry metadata is missing or malformed")
-            store = MetricGeometryStore.open_existing(
-                depth_files[0].parent,
-                frame_names=[path.name for path in frame_files],
-                source_raw_fingerprint=cast(str, metadata.get("source_raw_fingerprint")),
-                source_frame_fingerprint=cast(str, metadata.get("source_frame_fingerprint")),
-                candidate_scene_fingerprint=cast(
-                    str,
-                    metadata.get("candidate_scene_fingerprint"),
-                ),
-            )
-            expected_paths = [path.resolve() for path in store.complete_files]
-            if [path.resolve() for path in depth_files] != expected_paths:
-                raise ValueError("Metric geometry files do not match the metadata path manifest")
-            return store, store.metadata
-        except (KeyError, OSError, TypeError, ValueError) as error:
-            raise ValueError(METRIC_STEREO_COMPLETION_ERROR) from error
-
-
-class _ManifestStereoStage:
-    """Own one audited manifest attempt from read-only planning through publication."""
-
-    def __init__(
+    def create_stereo_pairs_from_manifest(  # noqa: C901
         self,
-        generator: StereoPairGenerator,
-        manifest: StereoInputManifestV1,
+        stereo_input: StereoInputManifestV1,
         directories: dict[str, Path],
         settings: dict[str, Any],
-        progress_tracker: Any,
-        frame_consumer: Callable[[str, np.ndarray, np.ndarray], None] | None,
-        frame_consumer_memory_bytes: int,
-    ) -> None:
-        self.stage_started = time.perf_counter()
-        self.generator = generator
-        self.directories = directories
-        self.settings = settings
-        self.progress_tracker = progress_tracker
-        self.frame_consumer = frame_consumer
-        self.transient_diagnostics: TransientDiagnosticsSpool | None = None
-        self.frame_consumer_memory_bytes = frame_consumer_memory_bytes
-        self.generator.last_pipeline_stats = None
-        self.generator.last_metric_clamp_summary = None
-        self.generator.last_render_performance_seconds = {}
-        self.generator.last_rendered_frame_count = 0
-        self.generator.last_stage_performance_seconds = {}
-        self.manifest = load_stereo_input_manifest_v1(
-            manifest.path,
-            job_root=manifest.job_root,
-            validate_payloads=False,
-        )
-        if self.manifest != manifest:
-            raise StereoProviderChangedError("stereo input manifest descriptor changed")
-        if Path(self.directories["base"]).resolve() != self.manifest.job_root:
-            raise ValueError("stereo input manifest belongs to a different job root")
-        geometry_mode = str(self.settings.get("stereo_geometry_mode", "relative"))
-        expected_manifest_mode = "metric" if geometry_mode == "metric_camera" else "relative"
-        if self.manifest.geometry_mode != expected_manifest_mode:
-            raise ValueError("stereo geometry mode differs from its upstream manifest")
-        self.render_mode = cast(
-            Literal["fast", "quality"],
-            str(self.settings.get("stereo_render_mode", "fast")),
-        )
-        if self.render_mode not in {"fast", "quality"}:
-            raise ValueError("stereo render mode must be Fast or Quality")
+        progress_tracker: Any = None,
+        *,
+        frame_consumer: Callable[[str, np.ndarray, np.ndarray], None] | None = None,
+        frame_consumer_memory_bytes: int = 0,
+    ) -> bool:
+        """Decode, render, and write (or stream) all stereo pairs cleanly."""
 
-        self.transient_output = self.frame_consumer is not None
-        if (
-            isinstance(self.frame_consumer_memory_bytes, bool)
-            or not isinstance(self.frame_consumer_memory_bytes, int)
-            or self.frame_consumer_memory_bytes < 0
-        ):
-            raise ValueError("frame consumer memory bound must be a nonnegative integer")
-        if not self.transient_output and self.frame_consumer_memory_bytes:
-            raise ValueError("frame consumer memory bound requires a frame consumer")
-        if self.transient_output and (
-            expected_manifest_mode != "relative"
-            or bool(self.settings.get("keep_intermediates", True))
-        ):
-            raise ValueError(
-                "transient stereo output requires relative geometry without intermediates"
-            )
-
-        self.left_dir = Path(self.directories["left_frames"])
-        self.right_dir = Path(self.directories["right_frames"])
-        self.provider = self.manifest.open_provider(
-            left_dir=self.left_dir, right_dir=self.right_dir
-        )
-        self.render_shape = self.manifest.render_shape
-        self.occlusion_fill = self.generator._occlusion_fill(self.settings)
-        self.geometry_mode = self.manifest.geometry_mode
-        self.keep_masks = bool(self.settings.get("keep_intermediates", True))
-
-        self._configure_projection()
-        self._bind_stage_documents()
-
-    def _configure_projection(self) -> None:
-        self.retained_crop_width: int | None = None
-        self.effective_convergence: float | None = None
-        if self.geometry_mode == "metric":
-            self.retained_crop_width, _height = calculate_center_crop_dimensions(
-                self.render_shape[1],
-                self.render_shape[0],
-                float(self.settings.get("crop_factor", 1.0)),
-            )
-            requested = self.settings.get("metric_convergence_distance", "auto")
-            if requested == "auto":
-                if self.manifest.resolved_auto_distance_m is None:
-                    raise ValueError(METRIC_STEREO_COMPLETION_ERROR)
-                self.effective_convergence = self.manifest.resolved_auto_distance_m
-            else:
-                self.effective_convergence = float(requested)
-
-    def _bind_stage_documents(self) -> None:
-        self.quality_content: StreamedQualityInputManifest | None
-        if self.render_mode == "quality":
-            self.quality_content = build_streamed_quality_input_manifest(
-                self.manifest,
-                validate_payloads=False,
-            )
-        else:
-            self.quality_content = None
-        self.stage_document, self.rgb_fingerprint = self.generator._streamed_stage_identity(
-            manifest=self.manifest,
-            provider=self.provider,
-            settings=self.settings,
-            render_mode=self.render_mode,
-            geometry_mode=self.geometry_mode,
-            occlusion_fill=self.occlusion_fill,
-            quality_content=self.quality_content,
-            retained_crop_width=self.retained_crop_width,
-            effective_convergence=self.effective_convergence,
-        )
-        self.diagnostics = self.generator._streaming_diagnostics_context(
-            manifest=self.manifest,
-            provider=self.provider,
-            render_mode=self.render_mode,
-            geometry_mode=self.geometry_mode,
-            occlusion_fill=self.occlusion_fill,
-            keep_masks=self.keep_masks,
-            rgb_stage_fingerprint=self.rgb_fingerprint,
-            quality_content=self.quality_content,
-            left_dir=self.left_dir,
-            right_dir=self.right_dir,
-        )
-        self.metadata_path = self.left_dir / "metadata.json"
-        self.content_path = (
-            self.manifest.job_root / "04_stereo_diagnostics" / "quality_input_manifest.json"
-        )
-
-    def _retained_stage_changed(self) -> bool:
-        with AcquiredRoot(self.manifest.job_root) as acquired:
-            if not self.stage_document.matches(self.metadata_path, acquired=acquired):
-                return True
-            return self.quality_content is not None and not self.quality_content.matches(
-                self.content_path, acquired=acquired
-            )
-
-    def _audit_outputs(self) -> None:
-        self.stage_changed = self.transient_output or self._retained_stage_changed()
-        self.diagnostics_root_state = (
-            "unclaimed"
-            if self.stage_changed
-            else classify_streaming_diagnostics_root(self.diagnostics)
-        )
-        self.reset_diagnostics_root = (
-            self.stage_changed or self.diagnostics_root_state == "unclaimed"
-        )
-        self.mask_prune_required = (
-            not self.diagnostics.mask_payloads_enabled
-            and not self.reset_diagnostics_root
-            and (
-                self.diagnostics_root_state == "building"
-                or classify_streaming_diagnostics_root(
-                    replace(self.diagnostics, mask_payloads_enabled=True)
-                )
-                != "unclaimed"
-            )
-        )
-
-        self.control = audit_stereo_provider(self.provider, self._classify)
-        self.mutation_required = self._mutation_required()
-
-    def _classify(self, item: StereoProviderItem) -> StereoAction:
-        if self.reset_diagnostics_root:
-            return StereoAction.RENDER
-        action = classify_streaming_diagnostics_frame(self.diagnostics, item.frame_name)
-        return {
-            "reuse": StereoAction.REUSE,
-            "migrate": StereoAction.MIGRATE,
-            "render": StereoAction.RENDER,
-        }[action]
-
-    def _mutation_required(self) -> bool:
-        return (
-            self.stage_changed
-            or self.control.render_count > 0
-            or self.control.migrate_count > 0
-            or self.diagnostics_root_state != "complete"
-            or not streaming_diagnostics_aggregates_match(self.diagnostics)
-        )
-
-    def _revalidate_output_actions(self) -> None:
-        current_stage_changed = self._retained_stage_changed()
-        if current_stage_changed != self.stage_changed:
-            raise StereoProviderChangedError("stereo stage identity changed during read-only audit")
-        current_root_state = (
-            "unclaimed"
-            if current_stage_changed
-            else classify_streaming_diagnostics_root(self.diagnostics)
-        )
-        if current_root_state != self.diagnostics_root_state:
-            raise StereoProviderChangedError(
-                "stereo diagnostics root changed during read-only audit"
-            )
-
-        validate_stereo_action_replay(self.provider, self.control, self._classify)
-        if self._mutation_required() != self.mutation_required:
-            raise StereoProviderChangedError(
-                "stereo retained aggregate action changed during read-only audit"
-            )
-
-    def _build_disk_plan(self) -> StereoStageDiskPlan:
-        return _build_stereo_stage_disk_plan(
-            provider=self.provider,
-            control=self.control,
-            job_root=self.manifest.job_root,
-            render_shape=self.render_shape,
-            render_mode=self.render_mode,
-            geometry_mode=self.geometry_mode,
-            keep_masks=self.keep_masks,
-            left_dir=self.left_dir,
-            stage_document=self.stage_document,
-            quality_content=self.quality_content,
-        )
-
-    def _revalidate_disk_admission(self) -> None:
-        self._revalidate_output_actions()
-        if not self.transient_output:
-            current = self._build_disk_plan()
-            if current != self.disk_plan:
-                raise StereoProviderChangedError(
-                    "stereo disk plan changed before the first mutation"
-                )
-            admit_stereo_stage_disk(current)
-
-    def _select_workers(self, quality_memory_phases: dict[str, int] | None) -> None:
-        self.configured_workers = validate_stereo_io_workers(
-            self.settings.get("stereo_io_workers", _default_stereo_io_workers())
-        )
-        self.reuse_exact_quality_input = False
-        self.png_encoder_workers = 0
-        if self.render_mode == "quality":
-            if self.control.render_count == 0:
-                self.capacity = 0
-                self.effective_workers = 0
-                self.writer_workers = 0
-            else:
-                assert quality_memory_phases is not None
-                self._select_quality_workers(quality_memory_phases)
-        else:
-            maximum_item = (
-                self.control.maximum_fast_metric_item_bytes
-                if self.geometry_mode == "metric"
-                else self.control.maximum_fast_relative_item_bytes
-            )
-            selection = select_fast_pipeline_capacity(
-                configured_workers=self.configured_workers,
-                pending_render_count=self.control.render_count,
-                fast_active_scratch=(
-                    272 * (self.render_shape[1] + 1) + 1024 * 1024 + STEREO_CONTROL_OVERHEAD
-                ),
-                fast_slot_bytes=maximum_item + HOST_SLOT_OVERHEAD,
-                retained_bytes=self.frame_consumer_memory_bytes,
-            )
-            self.capacity = selection.capacity
-            self.effective_workers = selection.effective_workers
-            self.writer_workers = self.effective_workers
-        if self.transient_output and self.writer_workers:
-            self.writer_workers = 1
-
-    def _select_quality_workers(self, quality_memory_phases: dict[str, int]) -> None:
-        output_pixels = self.render_shape[0] * self.render_shape[1]
-        histogram_bytes = 272 * (self.render_shape[1] + 1)
-        if self.geometry_mode == "metric":
-            decode_slot = (
-                3 * output_pixels
-                + 5 * self.control.maximum_native_pixels
-                + self.control.maximum_compressed_payload_bytes
-                + QUALITY_RUNTIME_OVERHEAD_BYTES
-            )
-        else:
-            decode_slot = (
-                3 * output_pixels
-                + 2 * self.control.maximum_native_pixels
-                + self.control.maximum_compressed_payload_bytes
-                + QUALITY_RUNTIME_OVERHEAD_BYTES
-            )
-        writer_slot = (
-            23 * output_pixels
-            + histogram_bytes
-            + self.control.maximum_frame_json_bound
-            + QUALITY_RUNTIME_OVERHEAD_BYTES
-        )
-        quality_active_scratch = (
-            quality_memory_phases["quality-file-pipeline"] - QUALITY_IO_THREAD_BYTES
-        )
-        quality_slot_bytes = max(decode_slot, writer_slot)
-        self.reuse_exact_quality_input = self.control.has_consecutive_render_input
-        retained_cache_bytes = (
-            23 * output_pixels + histogram_bytes + self.control.maximum_frame_json_bound
-        )
-        png_payloads_per_item = 0 if self.transient_output else (6 if self.keep_masks else 2)
+        self.last_pipeline_stats = None
+        self.last_metric_clamp_summary = None
         try:
-            selection = select_quality_pipeline_capacity(
-                configured_workers=self.configured_workers,
-                pending_render_count=self.control.render_count,
-                quality_active_scratch=quality_active_scratch,
-                quality_slot_bytes=quality_slot_bytes,
-                retained_bytes=(
-                    self.frame_consumer_memory_bytes
-                    + (retained_cache_bytes if self.reuse_exact_quality_input else 0)
-                ),
-                png_payloads_per_item=png_payloads_per_item,
+            render_mode = cast(
+                Literal["fast", "quality"],
+                str(settings.get("stereo_render_mode", "fast")),
             )
-        except StereoControlBudgetError:
-            if not self.reuse_exact_quality_input:
-                raise
-            self.reuse_exact_quality_input = False
-            selection = select_quality_pipeline_capacity(
-                configured_workers=self.configured_workers,
-                pending_render_count=self.control.render_count,
-                quality_active_scratch=quality_active_scratch,
-                quality_slot_bytes=quality_slot_bytes,
-                retained_bytes=self.frame_consumer_memory_bytes,
-                png_payloads_per_item=png_payloads_per_item,
-            )
-        self.capacity = selection.capacity
-        self.effective_workers = selection.effective_workers
-        self.writer_workers = selection.writer_workers
-        self.png_encoder_workers = selection.png_encoder_workers
+            occlusion_fill = self._occlusion_fill(settings)
+            render_shape = stereo_input.render_shape
+            height, width = render_shape
+            is_metric = stereo_input.geometry_mode == "metric"
+            is_streamed = frame_consumer is not None
+            save_masks = bool(settings.get("save_quality_masks", False)) and not is_streamed
 
-    def _begin_mutation(self) -> None:
-        if not self.transient_output:
-            self.left_dir.mkdir(parents=True, exist_ok=True)
-            self.right_dir.mkdir(parents=True, exist_ok=True)
-        diagnostics_root = self.manifest.job_root / "04_stereo_diagnostics"
-        diagnostics_frames = diagnostics_root / "frames"
-        downstream = self.generator._downstream_stage_directories(self.directories)
-        authorized_roots = [self.left_dir, self.right_dir, diagnostics_root, *downstream]
-        if not self.reset_diagnostics_root:
-            authorized_roots.append(diagnostics_frames)
-        with SafeTreeMutation(
-            self.manifest.job_root,
-            tuple(authorized_roots),
-        ) as mutation:
-            self.mutation_started = True
-            if self.control.render_count > 0:
-                for directory in downstream:
-                    mutation.clear_root(directory)
-            self._clear_publication_temporaries(mutation, diagnostics_root)
-            if self.stage_changed:
-                mutation.clear_root(self.left_dir)
-                mutation.clear_root(self.right_dir)
-            if self.reset_diagnostics_root:
-                mutation.remove_root(diagnostics_root)
-            else:
-                self._clear_frame_outputs(mutation, diagnostics_frames)
-        if self.quality_content is not None:
-            self.quality_content.publish(self.content_path)
-        if self.transient_output:
-            self.transient_diagnostics = TransientDiagnosticsSpool(self.diagnostics)
-        else:
-            self.stage_document.publish(self.metadata_path)
-            begin_streaming_diagnostics_stage(self.diagnostics)
-
-    def _clear_publication_temporaries(
-        self, mutation: SafeTreeMutation, diagnostics_root: Path
-    ) -> None:
-        root_targets = [
-            self.left_dir / "metadata.json",
-            diagnostics_root / "metadata.json",
-            diagnostics_root / "stereo_coverage_frames.jsonl",
-            diagnostics_root / "stereo_coverage_summary.json",
-        ]
-        if self.geometry_mode == "metric":
-            root_targets.append(self.left_dir / "clamp_summary.json")
-        if self.quality_content is not None:
-            root_targets.append(diagnostics_root / "quality_input_manifest.json")
-        for target in root_targets:
-            temporary = publication_temporary_path(target)
-            evidence = mutation.capture_regular_child(
-                target.parent,
-                temporary,
-            )
-            mutation.unlink_child(
-                target.parent,
-                temporary,
-                evidence=evidence,
-            )
-
-    def _clear_frame_outputs(self, mutation: SafeTreeMutation, diagnostics_frames: Path) -> None:
-        for item in iter_stereo_action(self.provider, self.control, StereoAction.RENDER):
-            for parent, output in (
-                (self.left_dir, item.left_path),
-                (self.right_dir, item.right_path),
-            ):
-                for path in (output, publication_temporary_path(output)):
-                    evidence = mutation.capture_regular_child(parent, path)
-                    mutation.unlink_child(parent, path, evidence=evidence)
-            frame = diagnostics_frames / item.frame_name
-            tree = mutation.capture_child_tree(diagnostics_frames, frame)
-            mutation.remove_child_tree(diagnostics_frames, frame, evidence=tree)
-        for item in iter_stereo_action(self.provider, self.control, StereoAction.MIGRATE):
-            manifest = diagnostics_frames / item.frame_name / "manifest.json"
-            temporary = publication_temporary_path(manifest)
-            evidence = mutation.capture_regular_child(diagnostics_frames, temporary)
-            mutation.unlink_descendant(diagnostics_frames, temporary, evidence=evidence)
-
-    def _report_committed(self, work_index: int, left_path: Path | None) -> None:
-        with self.progress_lock:
-            self.committed += 1
-            self.generator._report_progress(
-                self.progress_tracker,
-                processed=self.committed,
-                total=self.progress_total,
-                work_index=work_index,
-                left_path=left_path,
-            )
-
-    def _write(self, write_item: _WriteItem) -> None:
-        if self.transient_output:
-            publication = write_item.quality_publication
-            if publication is None or self.transient_diagnostics is None:
-                raise RuntimeError("transient stereo writer lacks prepared diagnostics")
-            assert self.frame_consumer is not None
-            self.frame_consumer(
-                write_item.work.frame_name,
-                publication.left_image,
-                publication.right_image,
-            )
-            self.transient_diagnostics.append(
-                write_item.work.frame_name,
-                publication.stats_raw,
-            )
-        else:
-            _write_pair(write_item, png_executor=self.png_executor)
-        self._report_committed(
-            write_item.work.index, None if self.transient_output else write_item.work.left_path
-        )
-
-    def _run_pipeline(self, codec: _ManifestFrameCodec) -> StreamingStereoPipelineStats:
-        self.png_executor: Executor | None = None
-        png_executor_stats = None
-        png_executor_committed_delta = 0
-        try:
-            if self.png_encoder_workers:
-                before_png_executor = current_process_committed_bytes()
-                self.png_executor, png_executor_stats = create_attested_stereo_executor(
-                    worker_count=self.png_encoder_workers,
-                    thread_name_prefix="quality-png",
-                )
-                png_executor_committed_delta = max(
-                    0,
-                    current_process_committed_bytes() - before_png_executor,
-                )
-            pipeline_stats = run_streaming_stereo_pipeline(
-                provider=self.provider,
-                plan=self.control,
-                capacity=self.capacity,
-                effective_workers=self.effective_workers,
-                writer_workers=self.writer_workers,
-                decode=codec.decode,
-                render=codec.render,
-                write=cast(Callable[[object], None], self._write),
-                mutation=self._begin_mutation,
-                pre_mutation=self._revalidate_disk_admission,
-                configured_workers=self.configured_workers,
-                ordered_render=self.transient_output,
-            )
-        except BaseException:
-            if self.transient_diagnostics is not None:
-                self.transient_diagnostics.abort()
-            raise
-        finally:
-            if self.png_executor is not None:
-                self.png_executor.shutdown(wait=True, cancel_futures=True)
-        if png_executor_stats is not None:
-            pipeline_stats = replace(
-                pipeline_stats,
-                actual_thread_count=(pipeline_stats.actual_thread_count + self.png_encoder_workers),
-                parked_committed_delta_bytes=(
-                    pipeline_stats.parked_committed_delta_bytes + png_executor_committed_delta
-                ),
-                calculated_thread_bytes=(
-                    pipeline_stats.calculated_thread_bytes
-                    + self.png_encoder_workers * QUALITY_PNG_ENCODER_THREAD_BYTES
-                ),
-                stack_granularity_bytes=(
-                    pipeline_stats.stack_granularity_bytes
-                    + tuple(
-                        evidence.granularity_bytes for evidence in png_executor_stats.stack_evidence
+            left_dir = directories.get("left_frames")
+            right_dir = directories.get("right_frames")
+            if not is_streamed:
+                if left_dir is None or right_dir is None:
+                    raise ValueError(
+                        "File-backed stereo generation requires left/right directories"
                     )
-                ),
-                reported_stack_reserve_bytes=(
-                    pipeline_stats.reported_stack_reserve_bytes
-                    + tuple(
-                        evidence.reserve_bytes for evidence in png_executor_stats.stack_evidence
-                    )
-                ),
-                png_encoder_thread_count=self.png_encoder_workers,
-            )
-        return pipeline_stats
+                left_dir.mkdir(parents=True, exist_ok=True)
+                right_dir.mkdir(parents=True, exist_ok=True)
 
-    def _migrate_outputs(self) -> None:
-        try:
-            validate_stereo_provider_replay(
-                self.provider,
-                self.control,
-                mutation_started=self.mutation_started,
-            )
-            for item in iter_stereo_action(self.provider, self.control, StereoAction.MIGRATE):
-                migrate_streaming_frame_manifest(
-                    self.diagnostics,
-                    item.frame_name,
-                    source_index=item.source_index,
-                )
-                self._report_committed(item.source_index, item.left_path)
-            if self.mask_prune_required:
-                prune_streaming_unreferenced_masks(self.diagnostics)
-        except StereoInputIdentityMismatch as error:
-            if self.transient_diagnostics is not None:
-                self.transient_diagnostics.abort()
-            raise StereoStageInputChangedError(str(error)) from error
-
-    def _revalidate_quality_content(self) -> None:
-        try:
-            if self.quality_content is not None:
-                revalidated = build_streamed_quality_input_manifest(self.manifest)
-                if (
-                    revalidated.raw_sha256 != self.quality_content.raw_sha256
-                    or revalidated.fingerprint != self.quality_content.fingerprint
-                ):
-                    raise ValueError("Quality input content changed after mutation")
-        except (StereoInputIdentityMismatch, OSError, TypeError, ValueError) as error:
-            if self.transient_diagnostics is not None:
-                self.transient_diagnostics.abort()
-            raise StereoStageInputChangedError(str(error)) from error
-
-    def _complete_diagnostics(self) -> None:
-        try:
-            validate_stereo_provider_replay(
-                self.provider,
-                self.control,
-                mutation_started=True,
-            )
-            if self.transient_output:
-                if self.transient_diagnostics is None:
-                    raise RuntimeError("transient diagnostics were not initialized")
-                completion = self.transient_diagnostics.complete(
-                    before_complete_publish=lambda: validate_stereo_provider_replay(
-                        self.provider,
-                        self.control,
-                        mutation_started=True,
-                    ),
-                )
-            else:
-                completion = complete_streaming_diagnostics_stage(
-                    self.diagnostics,
-                    before_complete_publish=lambda: validate_stereo_provider_replay(
-                        self.provider,
-                        self.control,
-                        mutation_started=True,
-                    ),
-                )
-        except StereoInputIdentityMismatch as error:
-            if self.transient_diagnostics is not None:
-                self.transient_diagnostics.abort()
-            raise StereoStageInputChangedError(str(error)) from error
-        except BaseException:
-            if self.transient_diagnostics is not None:
-                self.transient_diagnostics.abort()
-            raise
-        if self.geometry_mode == "metric":
-            summary = completion.summary.value
-            assert isinstance(summary, dict)
-            metric_summary = summary["metric_projection"]
-            assert isinstance(metric_summary, dict)
-            assert completion.metric_clamp_summary is not None
-            self.generator.last_metric_clamp_summary = {
-                "schema_version": 1,
-                "affected_frame_count": metric_summary["affected_frame_count"],
-                "mean_clamped_fraction": metric_summary["mean_clamped_fraction"],
-                "max_clamped_fraction": metric_summary["max_clamped_fraction"],
-                "compatibility_summary_sha256": (completion.metric_clamp_summary.raw_sha256),
-            }
-
-    def run(self) -> bool:
-        self._audit_outputs()
-        quality_memory_phases: dict[str, int] | None = None
-        if self.render_mode == "quality":
-            quality_memory_phases = _quality_stage_memory_preflight(
-                control=self.control,
-                render_shape=self.render_shape,
-                native_shape=self.manifest.native_shape,
-                geometry_mode=self.geometry_mode,
-                occlusion_fill=self.occlusion_fill,
-                consolidation_planned=self.mutation_required,
-            )
-            self.manifest.audit_payloads()
-        if not self.mutation_required:
-            self._revalidate_output_actions()
-            validate_stereo_provider_replay(
-                self.provider,
-                self.control,
-                mutation_started=False,
-            )
-            return True
-
-        self.disk_plan = None
-        if not self.transient_output:
-            self.disk_plan = self._build_disk_plan()
-            admit_stereo_stage_disk(self.disk_plan)
-        self._select_workers(quality_memory_phases)
-        self.mutation_started = False
-        codec = _ManifestFrameCodec(self)
-        self.committed = 0
-        self.progress_total = self.control.render_count + self.control.migrate_count
-        self.progress_lock = threading.Lock()
-
-        preflight_seconds = time.perf_counter() - self.stage_started
-        pipeline_started = time.perf_counter()
-        self.generator.last_pipeline_stats = self._run_pipeline(codec)
-        pipeline_seconds = time.perf_counter() - pipeline_started
-        consolidation_started = time.perf_counter()
-        codec.release_cache()
-        self._migrate_outputs()
-        self._revalidate_quality_content()
-        self._complete_diagnostics()
-        consolidation_seconds = time.perf_counter() - consolidation_started
-        self.generator.last_stage_performance_seconds = {
-            "preflight": preflight_seconds,
-            "pipeline": pipeline_seconds,
-            "consolidation": consolidation_seconds,
-            "total": preflight_seconds + pipeline_seconds + consolidation_seconds,
-        }
-        self.generator._publish_performance_report(self.directories, self.settings)
-        return True
-
-
-class _ManifestFrameCodec:
-    """Decode and render one pipeline's frames, retaining only its admitted Quality cache."""
-
-    def __init__(self, stage: _ManifestStereoStage) -> None:
-        self.stage = stage
-        self.quality_cache_lock = threading.Lock()
-        self.cached_quality_key: tuple[object, ...] | None = None
-        self.cached_quality_frame: _ReusableQualityFrame | None = None
-
-        if self.stage.geometry_mode == "relative":
-            self.render_settings: (
-                StereoRenderSettings | StereoSplatSettings | QualityStereoControls
-            ) = StereoRenderSettings(
-                stereo_strength=float(self.stage.settings.get("stereo_strength", 2.0)),
-                convergence=float(self.stage.settings.get("convergence", 0.5)),
-                occlusion_fill=self.stage.occlusion_fill,
-                stereo_render_mode=self.stage.render_mode,
-                occlusion_fill_max_px=self.stage.settings.get("occlusion_fill_max_px", 8),
-            )
-        elif self.stage.render_mode == "quality":
-            self.render_settings = QualityStereoControls(
-                occlusion_fill=self.stage.occlusion_fill,
-                occlusion_fill_max_px=self.stage.settings.get("occlusion_fill_max_px", 8),
-            )
-        else:
-            assert self.stage.retained_crop_width is not None
-            self.render_settings = StereoSplatSettings(
-                max_eye_shift_fraction=(
-                    float(self.stage.settings.get("max_disparity_percent", 2.0))
-                    / 100.0
-                    * (self.stage.retained_crop_width / self.stage.render_shape[1])
-                    / 2.0
-                ),
-                occlusion_fill=self.stage.occlusion_fill,
-            )
-
-    def release_cache(self) -> None:
-        """Retire cached image planes before entering the consolidation memory budget."""
-
-        self.cached_quality_key = None
-        self.cached_quality_frame = None
-
-    def decode(self, item: StereoProviderItem) -> _ManifestDecodedFrame:
-        if self.stage.reuse_exact_quality_input:
-            input_key = _exact_quality_input_key(item)
-            with self.quality_cache_lock:
-                reused = self.cached_quality_frame if self.cached_quality_key == input_key else None
-            if reused is not None:
-                _read_verified_stereo_input(
-                    item.guide_path,
-                    job_root=self.stage.manifest.job_root,
-                    expected_sha256=item.guide_sha256,
-                    expected_byte_count=item.guide_byte_count,
-                )
-                _read_verified_stereo_input(
-                    item.geometry_path,
-                    job_root=self.stage.manifest.job_root,
-                    expected_sha256=item.geometry_sha256,
-                    expected_byte_count=item.geometry_byte_count,
-                )
-                return _ManifestDecodedFrame(
-                    item,
-                    None,
-                    None,
-                    reused_quality=reused,
-                )
-        frame = _decode_verified_png(
-            item.guide_path,
-            job_root=self.stage.manifest.job_root,
-            expected_sha256=item.guide_sha256,
-            expected_byte_count=item.guide_byte_count,
-            flags=cv2.IMREAD_COLOR,
-        )
-        if frame.shape != (*item.guide_shape, 3) or frame.dtype != np.uint8:
-            raise StereoInputIdentityMismatch(f"guide PNG shape changed: {item.guide_path}")
-        primitive = (
-            self._relative_primitive(item)
-            if self.stage.geometry_mode == "relative"
-            else self._metric_primitive(item)
-        )
-        decoded = _ManifestDecodedFrame(item, frame, primitive)
-        if (
-            self.stage.geometry_mode == "relative"
-            and self.stage.render_mode == "quality"
-            and self.stage.capacity > 1
-        ):
-            assert isinstance(self.render_settings, StereoRenderSettings)
-            decoded.prepared_quality = prepare_relative_quality_frame(
-                frame=decoded.take_frame(),
-                canonical=_take_relative_canonical(decoded),
-                settings=self.render_settings,
-            )
-        return decoded
-
-    def _relative_primitive(self, item: StereoProviderItem) -> RelativeStereoPrimitiveInput:
-        encoded = _decode_verified_png(
-            item.geometry_path,
-            job_root=self.stage.manifest.job_root,
-            expected_sha256=item.geometry_sha256,
-            expected_byte_count=item.geometry_byte_count,
-            flags=cv2.IMREAD_UNCHANGED,
-        )
-        if encoded.shape != item.geometry_shape or encoded.dtype != np.uint16:
-            raise StereoInputIdentityMismatch(f"geometry PNG shape changed: {item.geometry_path}")
-        encoding_scale = self.stage.manifest.relative_encoding_scale
-        assert encoding_scale is not None
-        return RelativeStereoPrimitiveInput(
-            encoded_canonical=encoded, encoding_scale=encoding_scale
-        )
-
-    def _metric_primitive(self, item: StereoProviderItem) -> MetricStereoPrimitiveInput:
-        try:
-            audited = metric_npz.audit_metric_npz(
-                item.geometry_path,
-                expected_shape=item.geometry_shape,
-                job_root=self.stage.manifest.job_root,
-            )
-        except (OSError, TypeError, ValueError) as error:
-            raise StereoInputIdentityMismatch(
-                f"metric geometry changed before decode: {item.geometry_path}"
-            ) from error
-        if audited.sha256 != item.geometry_sha256 or audited.byte_count != item.geometry_byte_count:
-            raise StereoInputIdentityMismatch(
-                f"metric geometry content changed before decode: {item.geometry_path}"
-            )
-        metric = MetricGeometryFrame._from_owned(
-            audited.inverse_depth,
-            audited.valid,
-            audited.focal_x_normalized,
-        )
-        assert (
-            self.stage.retained_crop_width is not None
-            and self.stage.effective_convergence is not None
-        )
-        return MetricStereoPrimitiveInput(
-            metric=metric,
-            virtual_baseline_mm=np.float64(self.stage.settings.get("virtual_baseline_mm", 63.0)),
-            convergence_distance_m=np.float64(self.stage.effective_convergence),
-            max_disparity_percent=np.float64(self.stage.settings.get("max_disparity_percent", 2.0)),
-            retained_crop_width=self.stage.retained_crop_width,
-        )
-
-    def _render_fresh(self, decoded: _ManifestDecodedFrame) -> CompactStereoRenderResult:
-        settings = self.render_settings
-        if isinstance(settings, StereoRenderSettings):
-            if self.stage.render_mode == "fast":
-                return self.stage.generator.renderer.render_relative_fast_compact(
-                    decoded.take_frame(),
-                    _take_relative_canonical(decoded),
-                    settings,
-                )
-            if decoded.prepared_quality is not None:
-                return render_prepared_relative_quality_compact(
-                    renderer=self.stage.generator.renderer,
-                    prepared=decoded.take_prepared_quality(),
-                )
-            return render_relative_quality_compact(
-                renderer=self.stage.generator.renderer,
-                frame=decoded.take_frame(),
-                canonical=_take_relative_canonical(decoded),
+            expected_meta = self._stage_metadata_payload(
+                manifest=stereo_input,
                 settings=settings,
+                render_mode=render_mode,
+                occlusion_fill=occlusion_fill,
             )
-        if isinstance(settings, QualityStereoControls):
-            return render_metric_primitives_compact(
-                renderer=self.stage.generator.renderer,
-                frame=decoded.take_frame(),
-                primitives=_take_metric_primitive(decoded),
-                controls=settings,
-            )
-        return self.stage.generator.renderer.render_metric_primitives_fast_compact(
-            decoded.take_frame(),
-            _take_metric_primitive(decoded),
-            settings,
-        )
 
-    def _take_cached_result(
-        self,
-        decoded: _ManifestDecodedFrame,
-        input_key: tuple[object, ...] | None,
-    ) -> _ReusableQualityFrame | None:
-        if decoded.reused_quality is not None:
-            return decoded.take_reused_quality()
-        if input_key is None:
-            return None
-        with self.quality_cache_lock:
-            reusable = self.cached_quality_frame if self.cached_quality_key == input_key else None
-            if reusable is None:
-                self.cached_quality_key = None
-                self.cached_quality_frame = None
-        if reusable is not None:
-            if decoded.prepared_quality is not None:
-                decoded.take_prepared_quality()
+            records_to_render: list[StereoInputRecord] = list(stereo_input.records)
+            skipped_count = 0
+            if not is_streamed:
+                assert left_dir is not None and right_dir is not None
+                existing_meta = self._read_existing_metadata(left_dir)
+                meta_matches = (
+                    existing_meta is not None
+                    and existing_meta.get("fingerprint") == expected_meta["fingerprint"]
+                )
+                if meta_matches:
+                    pending: list[StereoInputRecord] = []
+                    for rec in stereo_input.records:
+                        left_path = left_dir / f"{rec.frame_name}.png"
+                        right_path = right_dir / f"{rec.frame_name}.png"
+                        if _frame_png_valid(left_path, render_shape) and _frame_png_valid(
+                            right_path, render_shape
+                        ):
+                            skipped_count += 1
+                        else:
+                            pending.append(rec)
+                    records_to_render = pending
+                    if not records_to_render:
+                        if self.verbose:
+                            print(
+                                f"  Reusing {skipped_count} existing stereo pairs "
+                                f"({render_mode}/{stereo_input.geometry_mode})"
+                            )
+                        return True
+                else:
+                    self._clear_stereo_outputs(left_dir, right_dir)
+                    self._reset_downstream_stages(directories)
+
+            # Prepare rendering settings
+            if not is_metric:
+                encoding_scale = np.float32(stereo_input.relative_encoding_scale or 1.0)
+                relative_settings = StereoRenderSettings(
+                    stereo_strength=float(settings.get("stereo_strength", 2.0)),
+                    convergence=float(settings.get("convergence", 0.5)),
+                    occlusion_fill=occlusion_fill,
+                    stereo_render_mode=render_mode,
+                    occlusion_fill_max_px=int(settings.get("occlusion_fill_max_px", 8)),
+                )
             else:
-                decoded.take_frame()
-                decoded.take_primitive()
-        return reusable
-
-    def render(self, decoded: object) -> _WriteItem:
-        if not isinstance(decoded, _ManifestDecodedFrame):
-            raise TypeError("manifest decoder returned an invalid ownership payload")
-        work = decoded.work
-        input_key = _exact_quality_input_key(work) if self.stage.reuse_exact_quality_input else None
-        reusable_quality = self._take_cached_result(decoded, input_key)
-        performed_render = reusable_quality is None
-        compact = (
-            self._render_fresh(decoded) if reusable_quality is None else reusable_quality.compact
-        )
-        if self.stage.reuse_exact_quality_input:
-            assert input_key is not None
-            if reusable_quality is None:
-                reusable_quality = _ReusableQualityFrame(
-                    compact=compact,
-                    png_payloads=SharedQualityPngPayloads(
-                        compact=compact,
-                        keep_masks=self.stage.keep_masks,
+                requested_conv = settings.get("metric_convergence_distance", "auto")
+                effective_conv = (
+                    float(stereo_input.resolved_auto_distance_m or 2.0)
+                    if requested_conv == "auto"
+                    else float(requested_conv)
+                )
+                retained_crop_width, _ = calculate_center_crop_dimensions(
+                    width,
+                    height,
+                    float(settings.get("crop_factor", 1.0)),
+                )
+                virtual_baseline_mm = float(settings.get("virtual_baseline_mm", 63.0))
+                max_disparity_percent = float(settings.get("max_disparity_percent", 2.0))
+                metric_controls = QualityStereoControls(
+                    occlusion_fill=occlusion_fill,
+                    occlusion_fill_max_px=int(settings.get("occlusion_fill_max_px", 8)),
+                )
+                metric_splat_settings = StereoSplatSettings(
+                    max_eye_shift_fraction=(
+                        max_disparity_percent / 100.0 * (retained_crop_width / width) / 2.0
                     ),
+                    occlusion_fill=occlusion_fill,
                 )
-            with self.quality_cache_lock:
-                self.cached_quality_key = input_key
-                self.cached_quality_frame = reusable_quality
-        if performed_render:
-            self.stage.generator.last_rendered_frame_count += 1
-            for name, elapsed in compact.performance_seconds.items():
-                self.stage.generator.last_render_performance_seconds[name] = (
-                    self.stage.generator.last_render_performance_seconds.get(name, 0.0)
-                    + float(elapsed)
+
+            # Configure workers and dynamic RAM-scaled queue capacity
+            io_workers_opt = validate_stereo_io_workers(settings.get("stereo_io_workers"))
+            io_workers = (
+                io_workers_opt if io_workers_opt is not None else _default_stereo_io_workers()
+            )
+            if render_mode == "quality":
+                capacity = select_quality_pipeline_capacity(
+                    render_shape,
+                    extra_per_frame_bytes=frame_consumer_memory_bytes,
                 )
-        if (
-            decoded.frame is not None
-            or decoded.primitive is not None
-            or decoded.prepared_quality is not None
-            or decoded.reused_quality is not None
-        ):
-            raise RuntimeError("manifest render did not consume decoded ownership")
-        del decoded
-        publication = prepare_quality_frame(
-            QualityFramePublication(
-                job_root=self.stage.manifest.job_root,
-                frame_name=work.frame_name,
-                left_rgb_path=work.left_path,
-                right_rgb_path=work.right_path,
-                compact=compact,
-                geometry_mode=self.stage.geometry_mode,
-                occlusion_fill=self.stage.occlusion_fill,
-                rgb_stage_fingerprint=self.stage.rgb_fingerprint,
-                keep_masks=self.stage.keep_masks,
-                render_mode=self.stage.render_mode,
-            ),
-            png_payloads=(reusable_quality.png_payloads if reusable_quality is not None else None),
-        )
-        return _WriteItem(
-            work=work,
-            left_image=compact.left_image,
-            right_image=compact.right_image,
-            projection_stats=compact.metric_stats,
-            quality_publication=publication,
-            geometry_mode=self.stage.geometry_mode,
-            occlusion_fill=self.stage.occlusion_fill,
-            rgb_stage_fingerprint=self.stage.rgb_fingerprint,
-            keep_masks=self.stage.keep_masks,
-            render_mode=self.stage.render_mode,
-        )
+            else:
+                capacity = select_fast_pipeline_capacity(
+                    render_shape,
+                    extra_per_frame_bytes=frame_consumer_memory_bytes,
+                )
+            decode_workers = min(io_workers, capacity)
+            write_workers = 1 if is_streamed else min(io_workers, capacity)
+
+            diag_context = StreamingDiagnosticsStageContext(
+                job_root=stereo_input.job_root,
+                frame_count=stereo_input.frame_count,
+                frame_names=stereo_input.frame_names,
+                render_shape=render_shape,
+                render_mode=render_mode,
+                geometry_mode=stereo_input.geometry_mode,
+                occlusion_fill=occlusion_fill,
+                mask_payloads_enabled=save_masks,
+                rgb_stage_fingerprint=expected_meta["fingerprint"],
+            )
+            diagnostics = StreamingDiagnosticsAccumulator(diag_context)
+            renderer = self.renderer
+            cancelled = self._cancellation_predicate(progress_tracker)
+            total_frames = stereo_input.frame_count
+
+            def decode_record(record: StereoInputRecord) -> tuple[np.ndarray, Any]:
+                frame = cv2.imread(str(record.guide_path), cv2.IMREAD_COLOR)
+                if frame is None or frame.shape[:2] != render_shape:
+                    raise ValueError(f"Failed to decode guide frame: {record.guide_path}")
+                if not is_metric:
+                    raw_disp = cv2.imread(str(record.geometry_path), cv2.IMREAD_UNCHANGED)
+                    if raw_disp is None or raw_disp.dtype != np.uint16 or raw_disp.ndim != 2:
+                        raise ValueError(
+                            f"Failed to decode 16-bit disparity PNG: {record.geometry_path}"
+                        )
+                    canonical = np.ascontiguousarray(
+                        raw_disp.astype(np.float32) * (np.float32(1.0 / 65535.0) * encoding_scale),
+                        dtype=np.float32,
+                    )
+                    return frame, canonical
+                inv, valid, focal = metric_npz.read_metric_npz(
+                    record.geometry_path,
+                    expected_shape=stereo_input.native_shape,
+                )
+                metric_frame = MetricGeometryFrame._from_owned(inv, valid, focal)
+                primitive = MetricStereoPrimitiveInput(
+                    metric=metric_frame,
+                    virtual_baseline_mm=np.float64(virtual_baseline_mm),
+                    convergence_distance_m=np.float64(effective_conv),
+                    max_disparity_percent=np.float64(max_disparity_percent),
+                    retained_crop_width=retained_crop_width,
+                )
+                return frame, primitive
+
+            def render_record(
+                record: StereoInputRecord, decoded: tuple[np.ndarray, Any]
+            ) -> CompactStereoRenderResult:
+                _ = record
+                frame, geom_payload = decoded
+                if not is_metric:
+                    if render_mode == "quality":
+                        compact = render_relative_quality_compact(
+                            renderer=renderer,
+                            frame=frame,
+                            canonical=geom_payload,
+                            settings=relative_settings,
+                        )
+                    else:
+                        compact = renderer.render_relative_fast_compact(
+                            frame,
+                            geom_payload,
+                            relative_settings,
+                        )
+                else:
+                    if render_mode == "quality":
+                        compact = render_metric_primitives_compact(
+                            renderer=renderer,
+                            frame=frame,
+                            primitives=geom_payload,
+                            controls=metric_controls,
+                        )
+                    else:
+                        compact = renderer.render_metric_primitives_fast_compact(
+                            frame,
+                            geom_payload,
+                            metric_splat_settings,
+                        )
+                diagnostics.record_compact(compact, metric_stats=compact.metric_stats)
+                return compact
+
+            def write_record(record: StereoInputRecord, compact: CompactStereoRenderResult) -> None:
+                if frame_consumer is not None:
+                    frame_consumer(record.frame_name, compact.left_image, compact.right_image)
+                    return
+                assert left_dir is not None and right_dir is not None
+                _atomic_write_png(left_dir / f"{record.frame_name}.png", compact.left_image)
+                _atomic_write_png(right_dir / f"{record.frame_name}.png", compact.right_image)
+                if save_masks:
+                    mask_dir = (
+                        stereo_input.job_root
+                        / "04_stereo_diagnostics"
+                        / "frames"
+                        / record.frame_name
+                    )
+                    mask_dir.mkdir(parents=True, exist_ok=True)
+                    _atomic_write_png(mask_dir / "left_coverage.png", compact.left_coverage_count)
+                    _atomic_write_png(mask_dir / "left_repair.png", compact.left_repair_bits)
+                    _atomic_write_png(mask_dir / "right_coverage.png", compact.right_coverage_count)
+                    _atomic_write_png(mask_dir / "right_repair.png", compact.right_repair_bits)
+
+            def on_completed(record: StereoInputRecord, rendered_so_far: int) -> None:
+                done = skipped_count + rendered_so_far
+                if progress_tracker is None:
+                    return
+                try:
+                    progress_tracker.update_progress(
+                        f"Generated stereo pair {done}/{total_frames}",
+                        phase="stereo_generation",
+                        frame_num=done,
+                        step_name="Stereo Pair Generation",
+                        step_progress=done,
+                        step_total=total_frames,
+                    )
+                    if (
+                        not is_streamed
+                        and left_dir is not None
+                        and right_dir is not None
+                        and (
+                            done == 1
+                            or done == total_frames
+                            or done % PREVIEW_FRAME_SAMPLE_RATE == 0
+                        )
+                        and hasattr(progress_tracker, "send_preview_frame")
+                    ):
+                        left_img = cv2.imread(str(left_dir / f"{record.frame_name}.png"))
+                        right_img = cv2.imread(str(right_dir / f"{record.frame_name}.png"))
+                        if left_img is not None and right_img is not None:
+                            progress_tracker.send_preview_frame(
+                                left_img,
+                                "stereo_left",
+                                frame_num=done,
+                            )
+                except InterruptedError:
+                    raise
+                except Exception:
+                    pass
+
+            started = time.perf_counter()
+            stats = run_streaming_stereo_pipeline(
+                records_to_render,
+                decode_fn=decode_record,
+                render_fn=render_record,
+                write_fn=write_record,
+                capacity=capacity,
+                decode_workers=decode_workers,
+                write_workers=write_workers,
+                ordered_writes=is_streamed,
+                on_completed=on_completed,
+                is_cancelled=cancelled,
+            )
+            self.last_pipeline_stats = StreamingStereoPipelineStats(
+                frame_count=total_frames,
+                render_count=stats.render_count,
+                skip_count=skipped_count,
+                capacity=stats.capacity,
+                decode_workers=stats.decode_workers,
+                write_workers=stats.write_workers,
+                peak_in_flight=stats.peak_in_flight,
+                elapsed_seconds=time.perf_counter() - started,
+            )
+
+            self.last_metric_clamp_summary = diagnostics.metric_clamp_summary()
+            if not is_streamed:
+                assert left_dir is not None
+                atomic_write_json(
+                    left_dir / "metadata.json",
+                    expected_meta,
+                    indent=2,
+                    sort_keys=True,
+                    sync=True,
+                )
+            diagnostics.write_summary()
+            return True
+        except (InterruptedError, StereoPipelineCapacityError):
+            raise
+        except Exception as error:
+            print(f"Error creating stereo pairs: {error}")
+            if self.verbose:
+                traceback.print_exc()
+            return False

@@ -182,13 +182,16 @@ def test_completed_cli_resume_authenticates_without_opening_the_original_media(
         assert path == control
         if outcome == "unreadable":
             raise OSError("storage unavailable")
-        return SimpleNamespace(status="completed")
+        return SimpleNamespace(
+            status="completed",
+            to_object=lambda: {"output_info": {"expected_final_relative_path": movie.name}},
+        )
 
     monkeypatch.setattr(cli_module, "recover_processing_settings_artifact", open_settings)
     monkeypatch.setattr(
         cli_module,
-        "audit_final_media_v1",
-        lambda *_: SimpleNamespace(final_video_authenticated=outcome == "verified"),
+        "verify_existing_final_video",
+        lambda *_: outcome == "verified",
     )
     projector = Mock(side_effect=AssertionError("completed jobs must never render again"))
     monkeypatch.setattr(cli_module, "create_stereo_projector", projector)

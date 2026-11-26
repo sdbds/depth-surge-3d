@@ -9,8 +9,6 @@ from typing import Any, Callable, Iterable
 
 import numpy as np
 
-from ...io.streamed_canonical_json import ReplayableJsonArray
-
 from ..forward_splat import HORIZONTAL_SUBPIXELS
 from .types import (
     CompactStereoRenderResult,
@@ -639,7 +637,7 @@ def build_diagnostics_summary(  # noqa: C901
         if isinstance(frame_count, bool) or not isinstance(frame_count, int) or frame_count <= 0:
             raise ValueError("streamed diagnostics frame count must be positive")
         expected_frame_count = frame_count
-        summary_frame_names = ReplayableJsonArray(frame_name_replay)
+        summary_frame_names = list(frame_name_replay())
     validate_diagnostics_cardinality_dimensions(
         frame_count=expected_frame_count,
         height=render_shape[0],
@@ -935,7 +933,7 @@ def build_diagnostics_summary(  # noqa: C901
         streamed_fractions: object
         if clamped_fractions is None:
             assert clamped_fraction_replay is not None
-            streamed_fractions = ReplayableJsonArray(clamped_fraction_replay)
+            streamed_fractions = list(clamped_fraction_replay())
         else:
             streamed_fractions = clamped_fractions
         metric_projection = {
