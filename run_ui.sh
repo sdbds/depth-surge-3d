@@ -12,8 +12,8 @@ else
     exit 1
 fi
 
-# Create upload and output directories
-mkdir -p uploads output
+# Create output directory
+mkdir -p output
 
 # Start the Flask application
 echo "Starting web server at http://localhost:5000"

@@ -1,6 +1,7 @@
 # Depth Surge 3D - Web UI Launcher for Windows
 # Starts the Flask web interface at http://localhost:5000
 
+Set-Location $PSScriptRoot
 Write-Host "Starting Depth Surge 3D Web UI..." -ForegroundColor Cyan
 
 # Check if virtual environment exists
@@ -18,8 +19,7 @@ if (Test-Path ".venv\Scripts\Activate.ps1") {
 Write-Host "Activating virtual environment..."
 & $venvPath
 
-# Create upload and output directories
-New-Item -ItemType Directory -Force -Path "uploads" | Out-Null
+# Create output directory
 New-Item -ItemType Directory -Force -Path "output" | Out-Null
 
 # Start the Flask application
@@ -29,17 +29,13 @@ Write-Host "Navigate to http://localhost:5000"
 Write-Host "Press Ctrl+C to stop the server and all background processes"
 Write-Host ""
 
-# Open browser automatically
-Start-Sleep -Seconds 2
-Start-Process "http://localhost:5000"
+# Open browser asynchronously after the server starts listening
+Start-Job -ScriptBlock {
+    Start-Sleep -Seconds 2
+    Start-Process "http://localhost:5000"
+} | Out-Null
 
 # Start the Flask app
 $env:DEPTH_SURGE_UI_SCRIPT = "1"
-python app.py $args
-
-# Cleanup function for Ctrl+C
-trap {
-    Write-Host "`nStopping Depth Surge 3D Web UI..." -ForegroundColor Yellow
-    Write-Host "All processes stopped successfully"
-    exit 0
-}
+python app.py @args
+exit $LASTEXITCODE

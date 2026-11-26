@@ -424,6 +424,11 @@ class StereoProjector:
                     Literal["none", "background"],
                     str(settings.get("occlusion_fill", "background")),
                 ),
+                stereo_render_mode=cast(
+                    Literal["fast", "quality"],
+                    str(settings.get("stereo_render_mode", "fast")),
+                ),
+                occlusion_fill_max_px=int(settings.get("occlusion_fill_max_px", 8)),
             )
             stereo = self._get_stereo_renderer().render(
                 image,

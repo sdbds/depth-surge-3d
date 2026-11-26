@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # Simple start script for Depth Surge 3D
 # Usage: ./start.sh START_TIME END_TIME
@@ -26,31 +27,20 @@ END_TIME=$2
 
 echo "Processing $INPUT_VIDEO from $START_TIME to $END_TIME..."
 
-# Check if uv is available and working
-if command -v uv &> /dev/null && uv --version &> /dev/null 2>&1; then
-    echo "Using uv to run Depth Surge 3D..."
-    # Test if uv run works (check for lock file issues)
-    if uv run python --version &> /dev/null; then
-        uv run python depth_surge_3d.py "$INPUT_VIDEO" -s "$START_TIME" -e "$END_TIME"
-    else
-        echo "uv run failed, falling back to virtual environment..."
-        source .venv/bin/activate
-        python depth_surge_3d.py "$INPUT_VIDEO" -s "$START_TIME" -e "$END_TIME"
-    fi
+if [ -d ".venv" ]; then
+    source .venv/bin/activate
+elif [ -d "venv" ]; then
+    source venv/bin/activate
+elif command -v uv &> /dev/null && uv run python --version &> /dev/null; then
+    uv run python depth_surge_3d.py "$INPUT_VIDEO" --start "$START_TIME" --end "$END_TIME"
+    echo "Processing complete!"
+    exit 0
 else
-    echo "Using virtual environment to run Depth Surge 3D..."
-    # Try .venv first (uv style), then venv (traditional)
-    if [ -d ".venv" ]; then
-        source .venv/bin/activate
-    elif [ -d "venv" ]; then
-        source venv/bin/activate
-    else
-        echo "Error: No virtual environment found. Follow docs/INSTALLATION.md first."
-        exit 1
-    fi
-    
-            python depth_surge_3d.py "$INPUT_VIDEO" -s "$START_TIME" -e "$END_TIME"
+    echo "Error: No virtual environment found. Follow docs/INSTALLATION.md first."
+    exit 1
 fi
+
+python depth_surge_3d.py "$INPUT_VIDEO" --start "$START_TIME" --end "$END_TIME"
 
 echo "Processing complete!"
 echo "Output video saved with audio preserved."

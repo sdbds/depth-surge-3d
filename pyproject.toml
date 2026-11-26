@@ -38,7 +38,6 @@ dependencies = [
     "PyYAML>=6.0",
     "flask>=3.0.0",
     "flask-socketio>=5.3.0",
-    "eventlet>=0.35.0",
     "six>=1.16.0",
     "einops>=0.7.0",
     "easydict>=1.9",
@@ -159,18 +158,6 @@ extend-exclude = '''
   | src/depth_surge_3d/_vendor/(vdpp|vdpp_utils)
 )/
 '''
-
-[tool.flake8]
-max-line-length = 127
-max-complexity = 10
-extend-ignore = ["E203", "W503"]
-exclude = [
-    ".git",
-    "__pycache__",
-    ".venv",
-    "build",
-    "dist",
-]
 
 [[tool.mypy.overrides]]
 module = [

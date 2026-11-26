@@ -1,6 +1,5 @@
-# Colors from CSS (exact match with templates/index.html)
-# #39ff14 - accent-lime (RGB: 57, 255, 20)
-# #00d9ff - info/cyan (RGB: 0, 217, 255)
+# Quick smoke-test script to verify Depth Surge 3D environment setup
+Set-Location $PSScriptRoot
 
 function Write-Lime {
     param([string]$Text)
@@ -12,14 +11,12 @@ function Write-Cyan {
     Write-Host $Text -ForegroundColor ([System.ConsoleColor]::Cyan)
 }
 
-# Quick test script to verify setup
 Write-Cyan "Testing Depth Surge 3D setup..."
 
-# Check if virtual environment exists and activate it
-if (Test-Path ".venv") {
+if (Test-Path ".venv\Scripts\Activate.ps1") {
     Write-Lime "Activating virtual environment (.venv)..."
     & .\.venv\Scripts\Activate.ps1
-} elseif (Test-Path "venv") {
+} elseif (Test-Path "venv\Scripts\Activate.ps1") {
     Write-Lime "Activating virtual environment (venv)..."
     & .\venv\Scripts\Activate.ps1
 } else {
@@ -27,64 +24,46 @@ if (Test-Path ".venv") {
     exit 1
 }
 
-# Test basic imports
+$failed = 0
+
 Write-Host ""
-Write-Cyan "Testing Python imports..."
+Write-Cyan "Testing Python imports and native Quality extension..."
 python -c @"
+import sys
 import torch
 import cv2
 import numpy as np
-print('\033[38;2;57;255;20m✓\033[0m PyTorch version:', torch.__version__)
-print('\033[38;2;57;255;20m✓\033[0m OpenCV version:', cv2.__version__)
-print('\033[38;2;57;255;20m✓\033[0m NumPy version:', np.__version__)
-print('\033[38;2;57;255;20m✓\033[0m CUDA available:', torch.cuda.is_available())
+import flask
+import flask_socketio
+import depth_surge_3d
+import _quality_kd_native
+
+print('OK PyTorch:', torch.__version__, 'CUDA:', torch.cuda.is_available())
 if torch.cuda.is_available():
-    print('\033[38;2;57;255;20m✓\033[0m CUDA device:', torch.cuda.get_device_name(0))
+    print('OK CUDA device:', torch.cuda.get_device_name(0))
+print('OK OpenCV:', cv2.__version__, 'NumPy:', np.__version__)
+print('OK depth_surge_3d:', depth_surge_3d.__version__)
+print('OK _quality_kd_native:', _quality_kd_native.__file__)
 "@
+if ($LASTEXITCODE -ne 0) { $failed = 1 }
 
-# Test if video_depth_anything module loads
 Write-Host ""
-Write-Cyan "Testing Video-Depth-Anything module..."
-python -c @"
-import sys
-from pathlib import Path
-
-# Add the vendored Video-Depth-Anything repo to path
-repo_path = Path('vendor/Video-Depth-Anything')
-if repo_path.exists():
-    sys.path.insert(0, str(repo_path))
-
-try:
-    from video_depth_anything import VideoDepthAnything
-    print('\033[38;2;57;255;20m✓\033[0m Video-Depth-Anything module imported successfully')
-except Exception as e:
-    print(f'\033[38;2;255;0;0m✗\033[0m Error importing Video-Depth-Anything: {e}')
-"@
-
-# Test if model file exists
-Write-Host ""
-$modelPath = "models\Video-Depth-Anything-Large\video_depth_anything_vitl.pth"
-if (Test-Path $modelPath) {
-    Write-Lime "✓ Video-Depth-Anything-Large model file found"
-    $modelSize = (Get-Item $modelPath).Length / 1MB
-    Write-Host "  Model size: $([math]::Round($modelSize, 2)) MB"
-} else {
-    Write-Host "✗ Model file not found at expected location" -ForegroundColor Yellow
-    Write-Host "  Run .\scripts\download_models.ps1 large to download"
-}
-
-# Test ffmpeg
-Write-Host ""
-if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
-    Write-Lime "✓ FFmpeg is available"
-    ffmpeg -version 2>$null | Select-Object -First 1
-} else {
-    Write-Host "✗ FFmpeg not found" -ForegroundColor Red
+foreach ($tool in @("ffmpeg", "ffprobe")) {
+    if (Get-Command $tool -ErrorAction SilentlyContinue) {
+        Write-Lime "OK $tool is available"
+    } else {
+        Write-Host "FAIL $tool not found on PATH" -ForegroundColor Red
+        $failed = 1
+    }
 }
 
 Write-Host ""
-Write-Lime "Setup test complete!"
-Write-Host ""
-Write-Host "Next steps:"
-Write-Host "  Web UI:  .\run_ui.ps1"
-Write-Host "  CLI:     python depth_surge_3d.py input_video.mp4"
+if ($failed -eq 0) {
+    Write-Lime "Setup test passed!"
+    Write-Host "Next steps:"
+    Write-Host "  Web UI:  .\run_ui.ps1"
+    Write-Host "  CLI:     .\.venv\Scripts\depth-surge-3d.exe input_video.mp4"
+} else {
+    Write-Host "Setup test failed. Check errors above." -ForegroundColor Red
+}
+exit $failed

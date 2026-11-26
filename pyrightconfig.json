@@ -1,14 +1,21 @@
 {
     "include": [
-        "."
+        "src",
+        "tests",
+        "app.py",
+        "depth_surge_3d.py"
     ],
     "exclude": [
         "**/__pycache__",
-        "**/node_modules"
+        "**/node_modules",
+        ".venv",
+        "build",
+        "dist",
+        ".worktrees"
     ],
     "extraPaths": [
         "./src"
     ],
-    "pythonVersion": "3.8",
+    "pythonVersion": "3.11",
     "typeCheckingMode": "basic"
-} 
+}

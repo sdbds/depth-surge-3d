@@ -289,7 +289,7 @@ def _validate_optional_setting(name: str, value: object) -> Any:
     if name == "device":
         return _validate_optional_mode(name, value)
     if name == "video_encoder":
-        return _choice(name, value, {"auto", "libx264", "nvenc"})
+        return _choice(name, value, {"auto", "libx264", "libx265", "nvenc"})
     raise ValueError(f"unknown setting: {name}")
 
 

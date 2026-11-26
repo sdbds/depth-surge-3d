@@ -34,7 +34,7 @@ if (Test-Path ".venv\Scripts\Activate.ps1") {
 }
 
 # Run Depth Surge 3D
-python depth_surge_3d.py $inputVideo -s $StartTime -e $EndTime
+python depth_surge_3d.py $inputVideo --start $StartTime --end $EndTime
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host ""

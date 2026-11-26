@@ -170,6 +170,7 @@ class DepthMapProcessor:
         execution_plan = None
         requested_plan_fingerprint = None
         v2_source_geometry = None
+        requested_semantic: dict[str, Any] | None = None
         if self._supports_sequence_depth():
             self._warn_ignored_v2_temporal_settings(settings, progress_tracker)
             v2_source_geometry = self._read_source_frame_geometry(frame_files[0])
@@ -204,13 +205,19 @@ class DepthMapProcessor:
                 requested_plan,
                 requested_semantic,
             )
+            if execution_plan != requested_plan:
+                requested_semantic = None
 
         while True:
-            semantic_fingerprint = self._raw_semantic_fingerprint(
-                frame_files,
-                settings,
-                execution_plan,
-            )
+            if requested_semantic is not None:
+                semantic_fingerprint = requested_semantic
+                requested_semantic = None
+            else:
+                semantic_fingerprint = self._raw_semantic_fingerprint(
+                    frame_files,
+                    settings,
+                    execution_plan,
+                )
             model_fingerprint = canonical_json_hash(semantic_fingerprint)
             try:
                 return self._generate_depth_map_files_for_identity(
@@ -1244,6 +1251,18 @@ class DepthMapProcessor:
             raise RuntimeError("V2 sequence iterator produced no raw depth")
         return raw_store, has_successful_window
 
+    def _retry_v2_sequence_item(self, iterator, input_size: int) -> Any:
+        self._clear_cuda_oom_state()
+        try:
+            return next(iterator)
+        except StopIteration:
+            return _V2_SEQUENCE_END
+        except Exception as retry_error:
+            if not self._is_cuda_oom(retry_error):
+                raise
+            self._clear_cuda_oom_state()
+            raise _V2ResolutionFallback(input_size) from retry_error
+
     def _next_v2_sequence_item(
         self,
         iterator,
@@ -1257,18 +1276,11 @@ class DepthMapProcessor:
         except Exception as error:
             if not self._is_cuda_oom(error):
                 raise
-            self._clear_cuda_oom_state()
             if not has_successful_window:
-                raise _V2ResolutionFallback(input_size) from error
-            try:
-                return next(iterator)
-            except StopIteration:
-                return _V2_SEQUENCE_END
-            except Exception as retry_error:
-                if not self._is_cuda_oom(retry_error):
-                    raise
                 self._clear_cuda_oom_state()
-                raise _V2ResolutionFallback(input_size) from retry_error
+                raise _V2ResolutionFallback(input_size) from error
+        # Exit the first except scope so traceback frames release CUDA tensors before retry.
+        return self._retry_v2_sequence_item(iterator, input_size)
 
     @staticmethod
     def _is_cuda_oom(error: Exception) -> bool:
@@ -2219,6 +2231,17 @@ class DepthMapProcessor:
             return "v3", {"vits": "small", "vitb": "base", "vitl": "large"}.get(
                 str(model_size), "base"
             )
+
+        da3_model_name = getattr(self.depth_estimator, "model_name", None)
+        if backend_id == "v3" or isinstance(da3_model_name, str):
+            raw_size = str(metadata.get("model_size", da3_model_name or "base")).lower()
+            if "giant" in raw_size:
+                return "v3", "giant"
+            if "large" in raw_size or raw_size == "vitl":
+                return "v3", "large"
+            if "small" in raw_size or raw_size == "vits":
+                return "v3", "small"
+            return "v3", "base"
 
         model_version = "v3" if hasattr(self.depth_estimator, "model_type") else "v2"
         model_size = (

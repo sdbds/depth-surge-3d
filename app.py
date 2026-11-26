@@ -15,6 +15,7 @@ import argparse
 import sys
 import signal
 import base64
+import shutil
 import stat
 import tempfile
 from dataclasses import asdict
@@ -62,6 +63,7 @@ from depth_surge_3d.core.constants import (  # noqa: E402
     VDPP_PROGRESS_STEP_WEIGHTS,
     PREVIEW_UPDATE_INTERVAL,
     PREVIEW_DOWNSCALE_WIDTH,
+    PREVIEW_JPEG_QUALITY,
     SUPPORTED_VIDEO_FORMATS,
     FFMPEG_CRF_HIGH_QUALITY,
     FFMPEG_CRF_MEDIUM_QUALITY,
@@ -548,18 +550,33 @@ def _desktop_transport(application):
         host = incoming.host.lower()
         allowed_hosts = {name + suffix for name in ("localhost", "127.0.0.1", "[::1]")}
         origin = incoming.headers.get("Origin")
-        cross_site_post = (
-            incoming.method == "POST" and incoming.headers.get("Sec-Fetch-Site") == "cross-site"
+        sec_fetch_site = incoming.headers.get("Sec-Fetch-Site")
+        cross_site_request = sec_fetch_site == "cross-site" and (
+            incoming.method == "POST"
+            or incoming.path in {"/detect_resumable", "/system_info", "/status"}
         )
         if (
             not local_peer
             or host not in allowed_hosts
-            or (origin is not None and origin != f"{scheme}://{host}")
-            or cross_site_post
+            or (origin is not None and origin.lower() != f"{scheme}://{host}")
+            or cross_site_request
         ):
             denied = Response("Only local, same-origin desktop requests are accepted.", status=403)
             return denied(environ, start_response)
-        return application(environ, start_response)
+
+        def start_response_with_headers(status, headers, exc_info=None):
+            existing = {name.lower() for name, _ in headers}
+            extra = [
+                ("X-Frame-Options", "DENY"),
+                ("X-Content-Type-Options", "nosniff"),
+                ("Content-Security-Policy", "frame-ancestors 'none'"),
+            ]
+            merged = list(headers) + [
+                (name, value) for name, value in extra if name.lower() not in existing
+            ]
+            return start_response(status, merged, exc_info)
+
+        return application(environ, start_response_with_headers)
 
     return serve
 
@@ -924,7 +941,10 @@ class ProgressCallback:
             self.steps.insert(2, "Temporal Depth Stabilization")
         elif temporal_postprocessor != "off":
             raise ValueError("temporal_postprocessor must be off or vdpp")
-        self.step_aliases = {"Direct VR Encoding": "Video Creation"}
+        self.step_aliases = {
+            "Direct VR Encoding": "Video Creation",
+            "Frame Cropping": "Crop Frames",
+        }
         # Weighted progress based on actual timing measurements
         # [2%, 35%, 20%, 8%, 2%, 18%, 8%, 7%] = 100%
         self.step_weights = (
@@ -945,93 +965,69 @@ class ProgressCallback:
                 return True
             return owner in (None, self.session_id) and current_processing["stop_requested"]
 
+    def _emit_preview_array(
+        self,
+        frame_array: np.ndarray,
+        frame_type: str,
+        frame_number: int,
+    ) -> None:
+        height, width = frame_array.shape[:2]
+        if width <= 0 or height <= 0:
+            vprint(f"Preview: Invalid dimensions {width}x{height}")
+            return
+        max_input_dim = 8192
+        if width > max_input_dim or height > max_input_dim:
+            vprint(f"Preview: Frame too large ({width}x{height}), exceeds max {max_input_dim}px")
+            return
+        scale = self.preview_downscale_width / width
+        new_width = self.preview_downscale_width
+        new_height = max(1, int(height * scale))
+        frame_small = cv2.resize(
+            frame_array,
+            (new_width, new_height),
+            interpolation=cv2.INTER_AREA,
+        )
+        ok, buffer = cv2.imencode(
+            ".jpg",
+            frame_small,
+            [int(cv2.IMWRITE_JPEG_QUALITY), PREVIEW_JPEG_QUALITY],
+        )
+        if not ok:
+            return
+        img_base64 = base64.b64encode(buffer).decode("utf-8")
+        if len(img_base64) / 1024 > 500:
+            vprint(f"Preview: Payload too large, skipping {frame_type} frame {frame_number}")
+            return
+        preview_data = {
+            "frame_type": frame_type,
+            "frame_number": frame_number,
+            "image_data": f"data:image/jpeg;base64,{img_base64}",
+            "dimensions": {"width": new_width, "height": new_height},
+        }
+        socketio.emit("frame_preview", preview_data, room=self.session_id)
+
     def send_preview_frame(
         self,
         frame_path: Path,
         frame_type: str,
         frame_number: int,
     ) -> None:
-        """
-        Send preview frame via websocket.
-
-        Args:
-            frame_path: Path to the frame image file
-            frame_type: Type of frame ("depth_map", "stereo_left", "stereo_right", "vr_frame")
-            frame_number: Frame number being processed
-        """
-        # Check if preview is enabled
+        """Send preview frame via websocket."""
         if not self.enable_live_preview:
             return
-
         current_time = time.time()
-
-        # Throttle preview updates
         if current_time - self.last_preview_time < self.preview_interval:
             return
-
         try:
-            # Read frame
             frame = cv2.imread(str(frame_path))
             if frame is None:
                 vprint(f"Preview: Failed to read frame {frame_path}")
                 return
-
-            # Validate dimensions
-            height, width = frame.shape[:2]
-            if width <= 0 or height <= 0:
-                vprint(f"Preview: Invalid dimensions {width}x{height} for {frame_path}")
-                return
-
-            # Cap input size to prevent excessive processing
-            MAX_INPUT_DIM = 8192  # Reject frames larger than 8K
-            if width > MAX_INPUT_DIM or height > MAX_INPUT_DIM:
-                vprint(
-                    f"Preview: Frame too large ({width}x{height}), "
-                    f"exceeds max {MAX_INPUT_DIM}px"
-                )
-                return
-
-            # Downscale for transmission
-            scale = self.preview_downscale_width / width
-            new_width = self.preview_downscale_width
-            new_height = int(height * scale)
-            frame_small = cv2.resize(
-                frame,
-                (new_width, new_height),
-                interpolation=cv2.INTER_AREA,
-            )
-
-            # Encode to base64
-            _, buffer = cv2.imencode(".png", frame_small)
-            img_base64 = base64.b64encode(buffer).decode("utf-8")
-
-            # Cap base64 payload size
-            MAX_PAYLOAD_KB = 500
-            payload_size_kb = len(img_base64) / 1024
-            if payload_size_kb > MAX_PAYLOAD_KB:
-                vprint(
-                    f"Preview: Payload too large ({payload_size_kb:.1f}KB), "
-                    f"skipping {frame_type} frame {frame_number}"
-                )
-                return
-
-            # Send via socketio
-            preview_data = {
-                "frame_type": frame_type,
-                "frame_number": frame_number,
-                "image_data": f"data:image/png;base64,{img_base64}",
-                "dimensions": {"width": new_width, "height": new_height},
-            }
-
-            socketio.emit("frame_preview", preview_data, room=self.session_id)
-
+            self._emit_preview_array(frame, frame_type, frame_number)
             self.last_preview_time = current_time
-
         except Exception as e:
-            # Log error but don't interrupt processing
             vprint(
-                f"Preview: Error sending {frame_type} frame {frame_number}: "
-                f"{type(e).__name__}: {e}"
+                f"Preview: Error sending {frame_type} frame {frame_number}: {type(e).__name__}: {e}"
             )
 
     def send_preview_frame_from_array(
@@ -1040,81 +1036,18 @@ class ProgressCallback:
         frame_type: str,
         frame_number: int,
     ) -> None:
-        """
-        Send preview frame directly from numpy array (no disk I/O).
-
-        Args:
-            frame_array: Frame as numpy array (BGR format)
-            frame_type: Type of frame ("depth_map", "stereo_left", "upscaled_left", etc)
-            frame_number: Frame number being processed
-        """
-        # Check if preview is enabled
+        """Send preview frame directly from numpy array (no disk I/O)."""
         if not self.enable_live_preview:
             return
-
         current_time = time.time()
-
-        # Throttle preview updates
         if current_time - self.last_preview_time < self.preview_interval:
             return
-
         try:
-            # Validate dimensions
-            height, width = frame_array.shape[:2]
-            if width <= 0 or height <= 0:
-                vprint(f"Preview: Invalid dimensions {width}x{height}")
-                return
-
-            # Cap input size
-            MAX_INPUT_DIM = 8192
-            if width > MAX_INPUT_DIM or height > MAX_INPUT_DIM:
-                vprint(
-                    f"Preview: Frame too large ({width}x{height}), "
-                    f"exceeds max {MAX_INPUT_DIM}px"
-                )
-                return
-
-            # Downscale for transmission
-            scale = self.preview_downscale_width / width
-            new_width = self.preview_downscale_width
-            new_height = int(height * scale)
-            frame_small = cv2.resize(
-                frame_array,
-                (new_width, new_height),
-                interpolation=cv2.INTER_AREA,
-            )
-
-            # Encode to base64
-            _, buffer = cv2.imencode(".png", frame_small)
-            img_base64 = base64.b64encode(buffer).decode("utf-8")
-
-            # Cap base64 payload size
-            MAX_PAYLOAD_KB = 500
-            payload_size_kb = len(img_base64) / 1024
-            if payload_size_kb > MAX_PAYLOAD_KB:
-                vprint(
-                    f"Preview: Payload too large ({payload_size_kb:.1f}KB), "
-                    f"skipping {frame_type} frame {frame_number}"
-                )
-                return
-
-            # Send via socketio
-            preview_data = {
-                "frame_type": frame_type,
-                "frame_number": frame_number,
-                "image_data": f"data:image/png;base64,{img_base64}",
-                "dimensions": {"width": new_width, "height": new_height},
-            }
-
-            socketio.emit("frame_preview", preview_data, room=self.session_id)
-
+            self._emit_preview_array(frame_array, frame_type, frame_number)
             self.last_preview_time = current_time
-
         except Exception as e:
-            # Log error but don't interrupt processing
             vprint(
-                f"Preview: Error sending {frame_type} frame {frame_number}: "
-                f"{type(e).__name__}: {e}"
+                f"Preview: Error sending {frame_type} frame {frame_number}: {type(e).__name__}: {e}"
             )
 
     def _calculate_eta(self, current_progress: float) -> str | None:
@@ -1162,23 +1095,14 @@ class ProgressCallback:
                 step_remaining_time = time_per_frame * frames_remaining
                 remaining_time += step_remaining_time
 
-        # 2. Estimate time for remaining steps using weight-based projection
-        # Use the overall rate as a fallback for future steps
-        if self.current_step_index < len(self.steps) - 1:
-            # Estimate time based on overall average rate (fallback for steps we haven't measured)
-            if current_progress > 5:  # Need some progress to estimate
-                avg_time_per_percent = elapsed / current_progress
-                remaining_percent = 100 - current_progress
-                fallback_estimate = avg_time_per_percent * remaining_percent
-
-                # Weight between step-based estimate and fallback
-                # Use step-based more heavily when we have good data
-                if remaining_time > 0:
-                    # We have a step-based estimate, use it primarily
-                    remaining_time = remaining_time * 0.8 + fallback_estimate * 0.2
-                else:
-                    # Fall back to overall rate
-                    remaining_time = fallback_estimate
+        # 2. Add estimated time for future steps using overall progress rate
+        if self.current_step_index < len(self.steps) - 1 and current_progress > 5:
+            future_weight = sum(self.step_weights[self.current_step_index + 1 :]) * 100.0
+            avg_time_per_percent = elapsed / current_progress
+            if remaining_time > 0:
+                remaining_time += avg_time_per_percent * future_weight
+            else:
+                remaining_time = avg_time_per_percent * (100.0 - current_progress)
 
         # Fallback: use simple overall progress rate if we don't have step data
         if remaining_time <= 0 and current_progress > 0:
@@ -1219,9 +1143,20 @@ class ProgressCallback:
         if self.is_cancelled():
             raise InterruptedError("Processing stopped by user request")
 
-        # Throttle updates to avoid threading issues
+        # Throttle updates without dropping step transitions or 100% completions
         current_time = time.time()
-        if current_time - self.last_update_time < PROGRESS_UPDATE_INTERVAL:
+        step_changed = bool(step_name and step_name != self.current_step_name)
+        step_finished = (
+            step_progress is not None
+            and step_total is not None
+            and step_total > 0
+            and step_progress >= step_total
+        )
+        if (
+            not step_changed
+            and not step_finished
+            and current_time - self.last_update_time < PROGRESS_UPDATE_INTERVAL
+        ):
             return
         self.last_update_time = current_time
 
@@ -1684,18 +1619,20 @@ def upload_video() -> tuple[dict[str, Any], int] | tuple[Any, int]:
     # Save video to output directory preserving original filename
     video_path = output_dir / original_filename
     vprint(f"Saving video as: {video_path.name}")
-    file.save(video_path)
-    vprint(f"  Video saved: {video_path.exists()}")
-
-    # Get video information
-    video_info = get_video_info(video_path)
-    if not video_info:
-        return jsonify({"error": "Invalid video file"}), 400
-
-    # Extract high-quality audio to FLAC immediately (if video has audio)
-    audio_path = output_dir / "original_audio.flac"
     try:
-        # First check if video has an audio stream
+        file.save(video_path)
+        vprint(f"  Video saved: {video_path.exists()}")
+        video_info = get_video_info(video_path)
+        if not video_info:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            return jsonify({"error": "Invalid video file"}), 400
+    except Exception:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise
+
+    # Detect audio stream presence without blocking upload on a full FLAC transcode
+    has_audio = False
+    try:
         probe_result = _run_web_media(
             [
                 "ffprobe",
@@ -1711,41 +1648,9 @@ def upload_video() -> tuple[dict[str, Any], int] | tuple[Any, int]:
             ],
             timeout=10,
         )
-
-        if probe_result.stdout.strip() == "audio":
-            # Video has audio, extract it
-            print(f"Extracting audio to: {audio_path}")
-            result = _run_web_media(
-                [
-                    "ffmpeg",
-                    "-n",
-                    "-i",
-                    str(video_path),
-                    "-vn",  # No video
-                    "-acodec",
-                    "flac",  # FLAC codec for lossless audio
-                    "-compression_level",
-                    "8",  # Maximum compression (still lossless)
-                    str(audio_path),
-                ],
-                timeout=60,
-            )
-            if result.returncode != 0:
-                print(f"Warning: Audio extraction failed: {result.stderr}")
-                audio_path = None
-            elif audio_path.exists():
-                print(f"Audio successfully extracted: {audio_path}")
-            else:
-                print(
-                    f"Warning: Audio extraction reported success but file not found at: {audio_path}"
-                )
-                audio_path = None
-        else:
-            # No audio stream in video
-            audio_path = None
+        has_audio = probe_result.returncode == 0 and probe_result.stdout.strip() == "audio"
     except Exception as e:
-        print(f"Warning: Audio extraction error: {e}")
-        audio_path = None
+        print(f"Warning: Audio probe error: {e}")
 
     return jsonify(
         {
@@ -1753,7 +1658,7 @@ def upload_video() -> tuple[dict[str, Any], int] | tuple[Any, int]:
             "filename": video_path.name,
             "output_dir": str(output_dir.resolve()),  # Ensure absolute path
             "video_info": video_info,
-            "has_audio": audio_path is not None and audio_path.exists(),
+            "has_audio": has_audio,
         }
     )
 
@@ -1823,16 +1728,16 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:  # noqa:
 
 
 @app.route("/stop", methods=["POST"])
-def stop_processing() -> dict[str, Any]:
+def stop_processing() -> tuple[Any, int] | Any:
     """Stop current processing"""
-    data = request.json
+    data = _json_object()
     session_id = data.get("session_id")
 
     with _PROCESSING_LOCK:
         if not current_processing["active"]:
-            return jsonify({"success": False, "error": "No processing currently active"})
+            return jsonify({"success": False, "error": "No processing currently active"}), 409
         if session_id != current_processing["session_id"]:
-            return jsonify({"success": False, "error": "Invalid session ID"})
+            return jsonify({"success": False, "error": "Invalid session ID"}), 400
         current_processing["stop_requested"] = True
 
     return jsonify({"success": True, "message": "Stop request sent"})
@@ -2045,11 +1950,12 @@ def get_system_info_endpoint():
 def _resumable_job_summary(candidate: Path) -> dict[str, Any] | None:
     try:
         batch_dir = _managed_job_directory(candidate, inspect_contents=False)
-        if not os.path.lexists(batch_dir / INTERMEDIATE_DIRS["frames"]) or any(
-            batch_dir.glob("*_3D_*.mp4")
-        ):
+        frames_dir = batch_dir / INTERMEDIATE_DIRS["frames"]
+        if not os.path.lexists(frames_dir) or any(batch_dir.glob("*_3D_*.mp4")):
             return None
-        _check_job_contents(batch_dir)
+        frames_info = frames_dir.lstat()
+        if stat.S_ISLNK(frames_info.st_mode) or _is_reparse_point(frames_info):
+            return None
     except (_WebRequestError, OSError):
         return None
 
@@ -2095,8 +2001,14 @@ def detect_resumable_jobs():
                 continue
             resumable_jobs.append(job)
 
-        # Sort by modification time (most recent first)
-        resumable_jobs.sort(key=lambda x: Path(x["path"]).stat().st_mtime, reverse=True)
+        # Sort by modification time (most recent first), tolerating concurrent deletions
+        def _safe_mtime(job_entry: dict[str, Any]) -> float:
+            try:
+                return Path(job_entry["path"]).stat().st_mtime
+            except OSError:
+                return 0.0
+
+        resumable_jobs.sort(key=_safe_mtime, reverse=True)
 
         return jsonify({"success": True, "jobs": resumable_jobs})
 
@@ -2115,9 +2027,9 @@ def open_directory():
         if system == "Windows":
             os.startfile(directory_path)
         elif system == "Darwin":  # macOS
-            subprocess.run(["open", directory_path])
+            subprocess.Popen(["open", directory_path])
         else:  # Linux and others
-            subprocess.run(["xdg-open", directory_path])
+            subprocess.Popen(["xdg-open", directory_path])
 
         return jsonify({"success": True})
     except Exception as e:
@@ -2153,8 +2065,14 @@ def analyze_batch_directory(batch_path):  # noqa: C901
     highest_stage_num = 0
     for stage_dir, stage_name in stages.items():
         stage_path = batch_path / stage_dir
-        if stage_path.exists():
-            frame_count = len(list(stage_path.glob("*.png"))) + len(list(stage_path.glob("*.jpg")))
+        if stage_path.is_dir():
+            with os.scandir(stage_path) as entries:
+                frame_count = sum(
+                    1
+                    for entry in entries
+                    if entry.name.lower().endswith((".png", ".jpg"))
+                    and entry.is_file(follow_symlinks=False)
+                )
             if frame_count > 0:
                 stage_num = int(stage_dir.split("_")[0])
                 if stage_num > highest_stage_num:
@@ -2180,14 +2098,21 @@ def analyze_batch_directory(batch_path):  # noqa: C901
             ]
             if (batch_path / d).exists()
         ]
+        from depth_surge_3d.utils.imaging.png_header import read_png_header
+
         for frame_dir in sample_frame_dirs:
             frame_path = batch_path / frame_dir
-            sample_frames = list(frame_path.glob("*.png"))
-            if sample_frames:
+            first_png = None
+            with os.scandir(frame_path) as entries:
+                for entry in entries:
+                    if entry.name.lower().endswith(".png") and entry.is_file(follow_symlinks=False):
+                        first_png = Path(entry.path)
+                        break
+            if first_png is not None:
                 try:
-                    sample_img = cv2.imread(str(sample_frames[0]))
-                    if sample_img is not None:
-                        h, w = sample_img.shape[:2]
+                    header = read_png_header(first_png)
+                    if header is not None:
+                        w, h = header.width, header.height
                         analysis["resolution"] = f"{w}x{h}"
 
                         # Detect format based on aspect ratio
@@ -2452,11 +2377,14 @@ def handle_join_session(data):
                 "current_frame": status.get("current_frame", 0),
                 "total_frames": status.get("total_frames", 0),
                 "phase": status.get("phase", "extraction"),
+                "step_name": status.get("step_name", ""),
                 "step_index": status.get("step_index", 0),
+                "total_steps": status.get("total_steps", 8),
                 "step_progress": status.get("step_progress", 0),
                 "step_total": status.get("step_total", 0),
+                "eta": status.get("eta"),
             }
-            socketio.emit("progress_update", initial_data, room=session_id)
+            socketio.emit("progress_update", initial_data, to=request.sid)
         except Exception as e:
             print(console_warning(f"Error emitting initial progress: {e}"))
     else:

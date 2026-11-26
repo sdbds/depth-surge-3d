@@ -32,13 +32,14 @@
 
         #background-grid {
             position: fixed;
-            top: -50px;
-            left: -10px;
-            width: calc(100vw + 20px);
-            height: calc(100vh + 50px);
+            inset: 0;
             pointer-events: none;
             z-index: 0;
-            opacity: 0.6;
+            opacity: 0.4;
+            background-image:
+                linear-gradient(rgba(255, 255, 255, 0.06) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255, 255, 255, 0.06) 1px, transparent 1px);
+            background-size: 24px 24px;
         }
 
 
@@ -647,26 +648,8 @@
     </style>
 </head>
 <body style="padding-top: 0;">
-    <!-- SVG Grid with gravitational lens distortion -->
-    <svg id="background-grid" xmlns="http://www.w3.org/2000/svg" shape-rendering="geometricPrecision">
-        <defs>
-            <!-- Grid pattern -->
-            <pattern id="grid" width="10" height="10" patternUnits="userSpaceOnUse">
-                <path d="M 10 0 L 0 0 0 10" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="0.8"/>
-            </pattern>
-
-            <!-- Create displacement map using turbulence -->
-            <filter id="gravitational-lens" x="-50%" y="-50%" width="200%" height="200%">
-                <feTurbulence type="fractalNoise" baseFrequency="0.003 0.003" numOctaves="4" result="turbulence" seed="5">
-                    <animate attributeName="baseFrequency" values="0.002 0.002;0.004 0.004;0.002 0.002" dur="100s" repeatCount="indefinite"/>
-                </feTurbulence>
-                <feDisplacementMap in="SourceGraphic" in2="turbulence" scale="80" xChannelSelector="R" yChannelSelector="G"/>
-            </filter>
-        </defs>
-
-        <!-- Apply grid pattern with filter -->
-        <rect width="100%" height="100%" fill="url(#grid)" filter="url(#gravitational-lens)"/>
-    </svg>
+    <!-- Lightweight static CSS grid (zero continuous GPU compositor overhead) -->
+    <div id="background-grid" aria-hidden="true"></div>
 
     <div class="container-fluid" style="margin-top: 0.5rem;">
         <div class="row">
@@ -924,16 +907,7 @@
                             <strong>Source Video:</strong> <span id="step1SourceRes">--</span> @ <span id="step1SourceFps">--</span> fps
                         </div>
 
-                        <div class="mb-3">
-                            <label class="form-label">Frame Rescaling <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Fast FFmpeg rescaling (not AI upscaling). Use to downscale 4K→1080p for speed, or upscale 720p→1080p to compensate for quality loss in side-by-side VR format."></i></label>
-                            <select class="form-select" id="resolution">
-                                <option value="original" selected>Keep Original Resolution</option>
-                                <option value="720p">Rescale to 720p (1280×720)</option>
-                                <option value="1080p">Rescale to 1080p (1920×1080)</option>
-                                <option value="4k">Rescale to 4K (3840×2160)</option>
-                            </select>
-                            <small class="form-text text-muted"><i class="fas fa-tachometer-alt"></i> Uses fast FFmpeg Lanczos scaling (not AI upscaling, won't alter visual style)</small>
-                        </div>
+
                         <div class="mb-3" style="display: none;">
                             <label class="form-label">Super Sampling</label>
                             <select class="form-select" id="superSample">
@@ -1253,11 +1227,7 @@
                             <label class="form-label">VR Format <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Side-by-Side (SBS): Most common. Left and right views placed horizontally. Final output is 2× width (e.g., 1920×1080 per eye → 3840×1080 total). Over-Under: Stacked vertically. Better for ultra-wide/cinema. Final output is 2× height."></i></label>
                             <select class="form-select" id="vrFormat">
                                 <option value="side_by_side" selected>Side by Side (SBS)</option>
-                                <option value="side_by_side_lr">Side by Side LR (Left-Right)</option>
-                                <option value="side_by_side_rl">Side by Side RL (Right-Left)</option>
                                 <option value="over_under">Over Under (Top-Bottom)</option>
-                                <option value="over_under_lr">Over Under LR (Left-Top)</option>
-                                <option value="over_under_rl">Over Under RL (Right-Top)</option>
                             </select>
                             <small class="form-text text-muted">Choose format compatible with your VR headset</small>
                         </div>
@@ -1843,10 +1813,17 @@
 
         // Initialize socket connection
         function initSocket() {
+            if (typeof io !== 'function') {
+                console.warn('Socket.IO client unavailable (offline mode)');
+                return;
+            }
             socket = io();
-            
+
             socket.on('connect', function() {
                 console.log('Connected to server');
+                if (currentSessionId) {
+                    socket.emit('join_session', { session_id: currentSessionId });
+                }
             });
 
             socket.on('disconnect', function() {
@@ -1980,7 +1957,9 @@
                     uploadedOutputDir = data.output_dir;
                     displayVideoInfo(data.video_info, file);
                     document.getElementById('processBtn').disabled = false;
-                    btnText.innerHTML = '<i class="fas fa-check"></i> ' + file.name;
+                    const checkIcon = document.createElement('i');
+                    checkIcon.className = 'fas fa-check';
+                    btnText.replaceChildren(checkIcon, document.createTextNode(' ' + file.name));
                     // Auto-populate resume field with output directory
                     document.getElementById('resumeDirectory').value = data.output_dir;
                 } else {
@@ -2033,7 +2012,7 @@
                 // Set FOV
                 document.getElementById('fisheyeFov').value = settings.fov;
 
-                console.log(`Applied ${preset} preset: ${customRes}, ${settings.fov}° FOV`);
+                console.log(`Applied ${preset} preset: ${settings.width}x${settings.height}, ${settings.fov}° FOV`);
             }
         });
 
@@ -2171,21 +2150,9 @@
             document.getElementById('step1SourceFps').textContent = currentVideoInfo.fps;
             document.getElementById('step1SourceInfo').style.display = 'block';
 
-            // Calculate final resolution
-            const resolutionSelect = document.getElementById('resolution').value;
-            let finalWidth = currentVideoInfo.width;
-            let finalHeight = currentVideoInfo.height;
-
-            if (resolutionSelect === '720p') {
-                finalWidth = 1280;
-                finalHeight = 720;
-            } else if (resolutionSelect === '1080p') {
-                finalWidth = 1920;
-                finalHeight = 1080;
-            } else if (resolutionSelect === '4k') {
-                finalWidth = 3840;
-                finalHeight = 2160;
-            }
+            // Keep source resolution
+            const finalWidth = currentVideoInfo.width;
+            const finalHeight = currentVideoInfo.height;
 
             // Calculate final FPS
             const fpsSelect = document.getElementById('targetFps').value;
@@ -2409,32 +2376,32 @@
         
         // Stop processing
         document.getElementById('stopBtn').addEventListener('click', function() {
-            if (currentSessionId) {
-                fetch('/stop', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        session_id: currentSessionId
-                    })
+            if (!currentSessionId) return;
+            const stopBtn = this;
+            stopBtn.disabled = true;
+            const phaseEl = document.getElementById('overallProgressPhase');
+            if (phaseEl) phaseEl.textContent = 'Stopping...';
+            fetch('/stop', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    session_id: currentSessionId
                 })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        hideProgressPanel();
-                        currentSessionId = null;
-                        // Reset progress displays
-                        resetProgressDisplay();
-                    } else {
-                        alert('Failed to stop processing: ' + data.error);
-                    }
-                })
-                .catch(error => {
-                    console.error('Stop error:', error);
-                    alert('Failed to stop processing');
-                });
-            }
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (!data.success) {
+                    stopBtn.disabled = false;
+                    alert('Failed to stop processing: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(error => {
+                stopBtn.disabled = false;
+                console.error('Stop error:', error);
+                alert('Failed to stop processing');
+            });
         });
 
         // Reset start time to the beginning
@@ -2481,22 +2448,30 @@
         
         // Reset progress display
         function resetProgressDisplay() {
-            const progressBar = document.querySelector('.progress-bar');
-            progressBar.style.width = '0%';
-            progressBar.classList.remove('bg-success', 'bg-danger');
-            progressBar.classList.add('progress-bar-striped', 'progress-bar-animated');
-            
-            document.getElementById('progressText').textContent = 'Initializing...';
-            document.getElementById('progressPercent').textContent = '0%';
-            document.getElementById('currentFrame').textContent = '0';
-            document.getElementById('totalFrames').textContent = '0';
-            document.getElementById('processingSpeed').textContent = '--';
-            document.getElementById('estimatedTime').textContent = '--';
-            
-            // Reset sub-progress bars
-            document.getElementById('extractProgress').style.width = '0%';
-            document.getElementById('depthProgress').style.width = '0%';
-            document.getElementById('videoProgress').style.width = '0%';
+            const overallBar = document.getElementById('overallProgressBar');
+            const overallText = document.getElementById('overallProgressText');
+            const overallPhase = document.getElementById('overallProgressPhase');
+            if (overallBar) {
+                overallBar.style.width = '0%';
+                overallBar.setAttribute('aria-valuenow', '0');
+                overallBar.classList.remove('bg-success', 'bg-danger', 'bg-warning');
+                overallBar.classList.add('progress-bar-striped', 'progress-bar-animated');
+            }
+            if (overallText) overallText.textContent = '0%';
+            if (overallPhase) overallPhase.textContent = 'Initializing...';
+
+            for (let i = 1; i <= 8; i++) {
+                const bar = document.getElementById(`step${i}Bar`);
+                const text = document.getElementById(`step${i}Progress`);
+                if (bar) {
+                    bar.style.width = '0%';
+                    bar.classList.remove('bg-success');
+                    bar.classList.add('bg-info');
+                }
+                if (text) text.textContent = '0%';
+            }
+            const stopBtn = document.getElementById('stopBtn');
+            if (stopBtn) stopBtn.disabled = false;
         }
 
         // Processing start time for speed calculation
@@ -2534,8 +2509,12 @@
 
         // Update individual step progress bars
         function updateStepProgress(data) {
-            // Use step_index from backend (0-based, so add 1 for display)
-            const stepNum = (data.step_index !== undefined) ? data.step_index + 1 : 1;
+            // Map 9-step VDPP backend indices (extra Temporal Depth Stabilization at index 2) into the 8 UI bars.
+            let rawIndex = (data.step_index !== undefined) ? data.step_index : 0;
+            if (data.total_steps === 9 && rawIndex >= 2) {
+                rawIndex = rawIndex - 1;
+            }
+            const stepNum = Math.min(8, Math.max(1, rawIndex + 1));
             const stepProgress = data.step_progress || 0;
             const stepTotal = data.step_total || 1;
             const stepPercent = stepTotal > 0 ? (stepProgress / stepTotal) * 100 : 0;
@@ -2721,30 +2700,10 @@
             if (stereoLabel) stereoLabel.textContent = 'Stereo Pair (Left)';
             if (vrLabel) vrLabel.textContent = 'VR Output';
 
-            // Reset upload state immediately (don't wait for modal dismiss)
-            uploadedFilename = null;
-            uploadedOutputDir = null;
-
-            // Reset file input to allow uploading new videos
-            const videoFile = document.getElementById('videoFile');
-            if (videoFile) {
-                videoFile.value = '';
-            }
-
-            // Hide video preview and info
-            const videoPreview = document.getElementById('videoPreview');
-            const videoInfo = document.getElementById('videoInfo');
-            if (videoPreview) videoPreview.style.display = 'none';
-            if (videoInfo) videoInfo.style.display = 'none';
-
-            // Reset upload button text
-            const uploadBtnText = document.getElementById('uploadBtnText');
-            if (uploadBtnText) uploadBtnText.textContent = 'Choose Video File';
-
-            // Disable process button until new video is uploaded
+            // Keep uploaded video metadata intact so the user can adjust settings and retry
             const processBtnError = document.getElementById('processBtn');
             if (processBtnError) {
-                processBtnError.disabled = true;
+                processBtnError.disabled = !uploadedOutputDir;
             }
 
             // Show error modal (after all state is reset)
@@ -2770,14 +2729,19 @@
         
         // Handle processing stopped
         function handleProcessingStopped(data) {
-            const progressBar = document.querySelector('.progress-bar');
-            progressBar.classList.remove('progress-bar-animated');
-            progressBar.classList.add('bg-warning');
-            
-            document.getElementById('progressText').textContent = 'Processing stopped';
-            
+            const overallBar = document.getElementById('overallProgressBar');
+            const overallPhase = document.getElementById('overallProgressPhase');
+            if (overallBar) {
+                overallBar.classList.remove('progress-bar-animated');
+                overallBar.classList.add('bg-warning');
+            }
+            if (overallPhase) {
+                overallPhase.textContent = 'Processing stopped';
+            }
+
             // Hide stop button, show start button
             hideProgressPanel();
+            resetProgressDisplay();
             currentSessionId = null;
 
             // Hide preview panel and clear preview images
@@ -2942,10 +2906,6 @@
         });
 
         // Update system info when settings change
-        document.getElementById('resolution').addEventListener('change', function() {
-            updateSystemInfo();
-            updateStep1Display();
-        });
         document.getElementById('targetFps').addEventListener('change', function() {
             updateSystemInfo();
             updateRangeInfo();
@@ -3129,7 +3089,6 @@
                 migrateLegacy: document.getElementById('migrateLegacy').value,
                 
                 // Video enhancement
-                resolution: document.getElementById('resolution').value,
                 targetFps: document.getElementById('targetFps').value,
                 superSample: document.getElementById('superSample').value,
                 device: document.getElementById('device').value,
@@ -3261,9 +3220,8 @@
                 temporalPostprocessor: 'off',
                 stereoIoWorkers: '4',
                 migrateLegacy: 'archive',
-                resolution: 'original',
                 targetFps: 'original',
-                superSample: 'auto',
+                superSample: 'none',
                 device: 'auto',
                 modelSize: 'vitb',
                 depthModelVersion: 'v3',
@@ -3297,10 +3255,13 @@
                 }
             });
             
-            // Trigger change events
+            // Trigger change events and re-sync dependent controls
             document.getElementById('applyDistortion').dispatchEvent(new Event('change'));
             document.getElementById('applyUpscaling').dispatchEvent(new Event('change'));
+            document.getElementById('vrResolution').dispatchEvent(new Event('change'));
             stereoRenderModeExplicit = false;
+            updateDepthModelControls();
+            updateMetricConvergenceControls();
             applyStereoRenderModeDefault();
             updateStereoQualityControls();
 
@@ -3320,7 +3281,7 @@
                 'stereoRenderMode', 'occlusionFillMaxPx',
                 'stereoGeometryMode', 'virtualBaselineMm', 'metricConvergenceMode', 'metricConvergenceDistance', 'maxDisparityPercent',
                 'sceneDetection', 'sceneCutThreshold', 'minSceneFrames', 'rawStorageDtype', 'stereoIoWorkers', 'migrateLegacy',
-                'resolution', 'targetFps', 'superSample', 'device', 'modelSize', 'depthModelVersion', 'depthModelType', 'depthResolution', 'videoEncoder',
+                'targetFps', 'superSample', 'device', 'modelSize', 'depthModelVersion', 'depthModelType', 'depthResolution', 'videoEncoder',
                 'preserveAudio', 'keepIntermediates', 'directVrEncode', 'applyDistortion', 'fisheyeProjection', 'fisheyeFov', 'cropFactor',
                 'fisheyeCropFactor', 'applyUpscaling', 'upscaleModel'
             ];
@@ -3545,6 +3506,22 @@
             }
         });
 
+        function checkActiveSession() {
+            fetch('/status')
+                .then(response => response.ok ? response.json() : null)
+                .then(data => {
+                    if (data && data.active && data.session_id) {
+                        currentSessionId = data.session_id;
+                        showProgressPanel();
+                        updateProgress(data);
+                        if (socket) {
+                            socket.emit('join_session', { session_id: currentSessionId });
+                        }
+                    }
+                })
+                .catch(error => console.debug('Status check failed:', error));
+        }
+
         // Initialize on page load
         document.addEventListener('DOMContentLoaded', function() {
             initSocket();
@@ -3553,11 +3530,15 @@
             loadSettings();
             setupAutoSave();
             checkForResumableJobs();  // Check for incomplete jobs
+            checkActiveSession();     // Rejoin running job after page reload
 
-            // Update system info every 5 seconds
-            setInterval(updateSystemInfo, 5000);
+            // Update system info every 5 seconds only while tab is visible
+            setInterval(function() {
+                if (!document.hidden) {
+                    updateSystemInfo();
+                }
+            }, 5000);
 
-            updateDepthModelControls();
             updateMetricConvergenceControls();
             updateStereoQualityControls();
         });

@@ -519,7 +519,7 @@ def _validate_processing_settings(value: object) -> dict[str, Any]:  # noqa: C90
         "upscale_model": {"none", "x2", "x4", "x4-conservative"},
         "depth_model_version": {"v2", "v3", "see_through", "moge2"},
         "device": {"auto", "cuda", "cpu"},
-        "video_encoder": {"auto", "libx264", "nvenc"},
+        "video_encoder": {"auto", "libx264", "libx265", "nvenc"},
     }
     for key, allowed in choices.items():
         _schema(

@@ -224,6 +224,22 @@ class TestEntryPointImports:
         assert callable(create_stereo_projector)
 
 
+def _iter_project_python_files(project_root: Path):
+    """Yield source/test Python files without recursing into venv, build, output, or worktrees."""
+    for rel in ("app.py", "depth_surge_3d.py", "hatch_build.py"):
+        candidate = project_root / rel
+        if candidate.is_file():
+            yield candidate
+    for folder in ("src", "tests", "scripts"):
+        root = project_root / folder
+        if not root.is_dir():
+            continue
+        for py_file in root.rglob("*.py"):
+            if "__pycache__" in py_file.parts:
+                continue
+            yield py_file
+
+
 class TestNoOrphanedImports:
     """Test that no code uses old import paths."""
 
@@ -231,14 +247,9 @@ class TestNoOrphanedImports:
         """Verify no code uses old utils.console path."""
         project_root = Path(__file__).parent.parent.parent
 
-        # Check source files
         bad_imports = []
-        for py_file in project_root.glob("**/*.py"):
-            if ".venv" in str(py_file) or "__pycache__" in str(py_file):
-                continue
-
+        for py_file in _iter_project_python_files(project_root):
             content = py_file.read_text(encoding="utf-8")
-            # Check for old import pattern (but not the new one)
             if "utils.console" in content and "utils.system.console" not in content:
                 bad_imports.append(str(py_file.relative_to(project_root)))
 
@@ -260,12 +271,8 @@ class TestNoOrphanedImports:
         project_root = Path(__file__).parent.parent.parent
 
         bad_imports = []
-        for py_file in project_root.glob("**/*.py"):
-            if ".venv" in str(py_file) or "__pycache__" in str(py_file):
-                continue
-
+        for py_file in _iter_project_python_files(project_root):
             content = py_file.read_text(encoding="utf-8")
-            # Check for old import pattern (but not the new one)
             if "utils.resolution" in content and "utils.domain.resolution" not in content:
                 bad_imports.append(str(py_file.relative_to(project_root)))
 
@@ -276,12 +283,8 @@ class TestNoOrphanedImports:
         project_root = Path(__file__).parent.parent.parent
 
         bad_imports = []
-        for py_file in project_root.glob("**/*.py"):
-            if ".venv" in str(py_file) or "__pycache__" in str(py_file):
-                continue
-
+        for py_file in _iter_project_python_files(project_root):
             content = py_file.read_text(encoding="utf-8")
-            # Check for old import pattern (but not the new one)
             if "utils.depth_cache" in content and "utils.domain.depth_cache" not in content:
                 bad_imports.append(str(py_file.relative_to(project_root)))
 
@@ -292,16 +295,13 @@ class TestNoOrphanedImports:
         project_root = Path(__file__).parent.parent.parent
 
         bad_imports = []
-        for py_file in project_root.glob("**/*.py"):
-            if ".venv" in str(py_file) or "__pycache__" in str(py_file):
-                continue
-            if "processing/orchestration/video_processor.py" in str(py_file):
+        for py_file in _iter_project_python_files(project_root):
+            if "processing/orchestration/video_processor.py" in py_file.as_posix():
                 continue  # Skip the actual module file
-            if "test_imports.py" in str(py_file):
+            if py_file.name == "test_imports.py":
                 continue  # Skip this test file itself
 
             content = py_file.read_text(encoding="utf-8")
-            # Check for old import pattern
             if "processing.video_processor import VideoProcessor" in content:
                 bad_imports.append(str(py_file.relative_to(project_root)))
 

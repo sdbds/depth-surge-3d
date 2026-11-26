@@ -300,6 +300,7 @@ def _build_processing_settings(args: argparse.Namespace) -> dict[str, object]:
             "depth_resolution": args.depth_resolution,
             "use_metric_depth": use_metric,
             "device": args.device,
+            "video_encoder": args.video_encoder,
         },
         source="explicit",
     )
@@ -559,6 +560,12 @@ Note: V2 uses fixed shot-aware temporal inference; V3, See-Through, and MoGe-2 i
     )
     parser.set_defaults(direct_vr_encode=None)
     parser.add_argument("--target-fps", type=int, help="Target output FPS (default: match source)")
+    parser.add_argument(
+        "--video-encoder",
+        choices=["auto", "nvenc", "libx264", "libx265"],
+        default="auto",
+        help="Video encoder backend (default: %(default)s)",
+    )
 
     # Experimental features
     parser.add_argument(
@@ -704,6 +711,42 @@ def main():  # noqa: C901
         count = clear_cache()
         print(f"Cleared {count} cached video(s) from depth map cache")
         return 0
+
+    if args.model_info:
+        if not _backend_is_available(args.depth_model_version):
+            return 1
+        projector = None
+        try:
+            spec = get_backend_spec(args.depth_model_version)
+            model_size = normalize_model_size(
+                args.depth_model_version,
+                model_path=args.model,
+                model_size=args.model_size,
+            )
+            use_metric = (
+                True
+                if args.depth_model_version == "moge2"
+                else bool(args.metric) and spec.capabilities.metric_depth
+            )
+            projector = create_stereo_projector(
+                args.model,
+                args.device,
+                use_metric,
+                args.depth_model_version,
+                model_size=model_size,
+            )
+            info = projector.get_model_info()
+            print("Model Information:")
+            print("=" * 20)
+            for key, value in info.items():
+                print(f"{key}: {value}")
+            return 0
+        except Exception as exc:
+            print(f"Error inspecting model: {exc}")
+            return 1
+        finally:
+            if projector is not None:
+                projector.unload_model()
 
     # Handle resume mode
     if args.resume:
