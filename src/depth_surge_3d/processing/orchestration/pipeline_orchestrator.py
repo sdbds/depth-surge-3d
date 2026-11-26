@@ -208,13 +208,30 @@ class ProcessingOrchestrator:
         settings: dict[str, Any],
         progress_tracker: Any = None,
     ) -> bool:
-        frame_files = self.video_encoder.extract_frames(
-            video_path, directories, video_properties, settings
+        frame_source = None
+        can_stream_source = (
+            settings.get("keep_intermediates", True) is False
+            and self.preselected_depth_files is None
+            and settings.get("temporal_postprocessor", "off") == "off"
+            and callable(getattr(self.video_encoder, "prepare_streaming_frame_source", None))
+            and bool(getattr(self.depth_processor, "supports_streaming_frame_source", False))
         )
-        if not frame_files:
-            return False
-        print(step_complete(f"Step 1: Extracted {len(frame_files)} frames"))
-        self._print_saved_to(directories.get("frames"), "Extracted frames")
+        if can_stream_source:
+            frame_source = self.video_encoder.prepare_streaming_frame_source(
+                video_path, directories, video_properties, settings
+            )
+
+        if frame_source is not None:
+            frame_files = frame_source.virtual_frame_files()
+            print(step_complete(f"Step 1: Indexed {len(frame_files)} streaming source frames"))
+        else:
+            frame_files = self.video_encoder.extract_frames(
+                video_path, directories, video_properties, settings
+            )
+            if not frame_files:
+                return False
+            print(step_complete(f"Step 1: Extracted {len(frame_files)} frames"))
+            self._print_saved_to(directories.get("frames"), "Extracted frames")
         print()
 
         metric_mode = settings.get("stereo_geometry_mode", "relative") == "metric_camera"
@@ -235,9 +252,18 @@ class ProcessingOrchestrator:
             if self.depth_processor is None:
                 raise RuntimeError("Depth generation requires a configured estimator")
             try:
-                geometry_files = self.depth_processor.generate_depth_map_files(
-                    frame_files, settings, directories, progress_tracker
-                )
+                if frame_source is not None:
+                    geometry_files = self.depth_processor.generate_depth_map_files(
+                        frame_files,
+                        settings,
+                        directories,
+                        progress_tracker,
+                        frame_source=frame_source,
+                    )
+                else:
+                    geometry_files = self.depth_processor.generate_depth_map_files(
+                        frame_files, settings, directories, progress_tracker
+                    )
             finally:
                 self._release_depth_model()
             if geometry_files is None:
@@ -279,6 +305,7 @@ class ProcessingOrchestrator:
             guide_files=frame_files,
             geometry_files=effective_geometry_files,
             geometry_mode=("metric_camera" if metric_mode else "relative"),
+            frame_source=frame_source,
         )
         self.preselected_depth_files = None
 

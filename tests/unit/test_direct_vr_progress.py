@@ -151,7 +151,7 @@ def test_new_step_does_not_spike_eta_from_prior_slow_stage(monkeypatch):
         patch.object(web_app.socketio, "emit"),
         patch.object(web_app.socketio, "sleep"),
     ):
-        # Depth finishes after 228s -> progress reflects realistic ~75% share for See-Through
+        # Depth finishes after 228s -> progress reflects realistic ~84% share post-P3+P4
         clock[0] = 3228.0
         callback.update_progress(
             "Depth map 473/473",
@@ -159,7 +159,7 @@ def test_new_step_does_not_spike_eta_from_prior_slow_stage(monkeypatch):
             step_progress=473,
             step_total=473,
         )
-        assert 70.0 <= web_app.current_processing["progress"] <= 80.0
+        assert 80.0 <= web_app.current_processing["progress"] <= 90.0
 
         # Frame 1 & early frames (<0.5s) of Stereo must NOT extrapolate 4m+ from Depth's speed
         clock[0] = 3228.1

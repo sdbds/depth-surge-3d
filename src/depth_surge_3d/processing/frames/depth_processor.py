@@ -74,11 +74,13 @@ from .scene_analyzer import (
     SCENE_ALGORITHM_VERSION,
     SCENE_SCHEMA_VERSION,
     analyze_scenes,
+    analyze_scenes_from_histograms,
     finalize_scenes,
     sample_scene_depths,
     select_scene_frame_indexes,
 )
 from .source_frame_manifest import frame_sequence_fingerprint
+from .video_frame_source import SequentialVideoFrameReader, VideoFrameSource
 from .metric_geometry import (
     MetricGeometryFrame,
     MetricGeometryStore,
@@ -144,6 +146,8 @@ class DepthMapProcessor:
     - Batch and chunked processing strategies
     """
 
+    supports_streaming_frame_source = True
+
     def __init__(self, depth_estimator, verbose: bool = False):
         """
         Initialize depth map processor.
@@ -154,6 +158,8 @@ class DepthMapProcessor:
         """
         self.depth_estimator = depth_estimator
         self.verbose = verbose
+        self._active_frame_source: VideoFrameSource | None = None
+        self._active_frame_reader: SequentialVideoFrameReader | None = None
 
     def generate_depth_map_files(  # noqa: C901
         self,
@@ -161,10 +167,36 @@ class DepthMapProcessor:
         settings: dict[str, Any],
         directories: dict[str, Path],
         progress_tracker,
+        *,
+        frame_source: VideoFrameSource | None = None,
     ) -> list[Path] | None:
         """Build native raw depth and exactly the selected stage-3 geometry."""
         if not frame_files:
             return None
+
+        self._active_frame_source = frame_source
+        self._active_frame_reader = None
+        try:
+            return self._generate_depth_map_files_impl(
+                frame_files,
+                settings,
+                directories,
+                progress_tracker,
+            )
+        finally:
+            reader = self._active_frame_reader
+            self._active_frame_reader = None
+            self._active_frame_source = None
+            if reader is not None:
+                reader.close()
+
+    def _generate_depth_map_files_impl(  # noqa: C901
+        self,
+        frame_files: list[Path],
+        settings: dict[str, Any],
+        directories: dict[str, Path],
+        progress_tracker,
+    ) -> list[Path] | None:
 
         scene_dir, raw_dir, canonical_dir, metric_dir = self._resolve_depth_directories(
             frame_files, directories
@@ -696,7 +728,15 @@ class DepthMapProcessor:
                 self._reset_stage_directory(raw_dir)
                 self._reset_stage_directory(canonical_dir)
                 self._reset_stage_directory(metric_dir)
-        manifest = analyze_scenes(frame_files, scene_dir, **scene_settings)
+        if self._active_frame_source is not None:
+            manifest = analyze_scenes_from_histograms(
+                self._active_frame_source.frame_names,
+                self._active_frame_source.luma_histograms,
+                scene_dir,
+                **scene_settings,
+            )
+        else:
+            manifest = analyze_scenes(frame_files, scene_dir, **scene_settings)
         manifest["source_frame_fingerprint"] = source_frame_fingerprint
         self._atomic_write_json(scene_dir / "scene_manifest.json", manifest)
         return manifest
@@ -721,8 +761,9 @@ class DepthMapProcessor:
             else:
                 path.unlink()
 
-    @staticmethod
-    def _source_frame_fingerprint(frame_files: list[Path]) -> str:
+    def _source_frame_fingerprint(self, frame_files: list[Path]) -> str:
+        if self._active_frame_source is not None:
+            return self._active_frame_source.source_fingerprint
         return frame_sequence_fingerprint(frame_files)
 
     def _raw_semantic_fingerprint(
@@ -760,8 +801,9 @@ class DepthMapProcessor:
         )
         return self._v2_execution_plan(requested_size, requested_size)
 
-    @staticmethod
-    def _read_source_frame_geometry(frame_file: Path) -> tuple[int, int]:
+    def _read_source_frame_geometry(self, frame_file: Path) -> tuple[int, int]:
+        if self._active_frame_source is not None:
+            return int(self._active_frame_source.height), int(self._active_frame_source.width)
         sample_frame = cv2.imread(str(frame_file))
         if sample_frame is None:
             raise OSError(f"Could not load source frame: {frame_file}")
@@ -979,94 +1021,114 @@ class DepthMapProcessor:
             source_geometry,
         )
         frame_names = [path.name for path in frame_files]
-        if self._supports_sequence_depth():
-            return self._complete_v2_raw_depth_stage(
-                frame_files,
-                frame_names,
-                manifest,
-                settings,
-                raw_dir,
-                semantic_fingerprint,
-                raw_store,
-                requested_dtype,
-                input_size,
-                target_fps,
-                progress_tracker,
-            )
-
-        total_chunks = (len(frame_files) + chunk_size - 1) // chunk_size
-        retain_for_reuse = bool(getattr(self.depth_estimator, "exact_input_batch_reuse", False))
-        previous_chunk: _ReusableRawChunk | None = None
-        reused_frame_count = 0
-        pending: Future[np.ndarray] | None = None
-        prefetch_enabled = True
-        # Only source decoding overlaps. Model calls, store mutation and resume
-        # boundaries stay ordered on the caller; every exit joins the loader.
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="depth-prefetch") as loader:
-            for chunk_start in range(0, len(frame_files), chunk_size):
-                chunk_end = min(chunk_start + chunk_size, len(frame_files))
-                chunk_files = frame_files[chunk_start:chunk_end]
-                chunk_names = frame_names[chunk_start:chunk_end]
-                if raw_store is not None and all(
-                    raw_store.path_for(name).is_file() for name in chunk_names
-                ):
-                    previous_chunk = None
-                    continue
-                source_frames, within_budget = self._consume_raw_chunk_input(
-                    chunk_files, settings, pending
-                )
-                pending = None
-                prefetch_enabled = prefetch_enabled and within_budget
-                next_files = frame_files[chunk_end : chunk_end + chunk_size]
-                if prefetch_enabled and self._can_prefetch_raw_chunk(next_files, raw_store):
-                    pending = loader.submit(self._load_raw_chunk_array, next_files, settings)
-                raw_store, previous_chunk, reused = self._infer_raw_chunk(
-                    chunk_files,
-                    chunk_names,
+        stream_reader = (
+            self._active_frame_source.open_reader(window_size=40, consume_once=False)
+            if self._active_frame_source is not None
+            else None
+        )
+        self._active_frame_reader = stream_reader
+        try:
+            if self._supports_sequence_depth():
+                return self._complete_v2_raw_depth_stage(
+                    frame_files,
                     frame_names,
+                    manifest,
                     settings,
                     raw_dir,
-                    metric_dir,
                     semantic_fingerprint,
                     raw_store,
                     requested_dtype,
                     input_size,
                     target_fps,
-                    estimated_shape,
-                    estimated_storage_bytes,
-                    previous_chunk,
-                    retain_for_reuse=retain_for_reuse,
-                    source_frames=source_frames,
-                )
-                del source_frames
-                if reused:
-                    reused_frame_count += len(chunk_files)
-                self._report_raw_chunk_progress(
                     progress_tracker,
-                    chunk_start // chunk_size + 1,
-                    total_chunks,
-                    chunk_end,
-                    len(frame_files),
                 )
 
-        if raw_store is None:
-            raise RuntimeError("Depth estimator produced no raw depth")
-        raw_store.flush_metadata()
-        if reused_frame_count:
-            print(
-                f"  Reused exact depth for {reused_frame_count} frames "
-                "from identical consecutive batches"
-            )
-        return raw_store
+            total_chunks = (len(frame_files) + chunk_size - 1) // chunk_size
+            retain_for_reuse = bool(getattr(self.depth_estimator, "exact_input_batch_reuse", False))
+            previous_chunk: _ReusableRawChunk | None = None
+            reused_frame_count = 0
+            pending: Future[np.ndarray] | None = None
+            prefetch_enabled = True
+            # Only source decoding overlaps. Model calls, store mutation and resume
+            # boundaries stay ordered on the caller; every exit joins the loader.
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="depth-prefetch") as loader:
+                for chunk_start in range(0, len(frame_files), chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, len(frame_files))
+                    chunk_files = frame_files[chunk_start:chunk_end]
+                    chunk_names = frame_names[chunk_start:chunk_end]
+                    if raw_store is not None and all(
+                        raw_store.path_for(name).is_file() for name in chunk_names
+                    ):
+                        previous_chunk = None
+                        continue
+                    source_frames, within_budget = self._consume_raw_chunk_input(
+                        chunk_files, settings, pending
+                    )
+                    pending = None
+                    prefetch_enabled = prefetch_enabled and within_budget
+                    next_files = frame_files[chunk_end : chunk_end + chunk_size]
+                    if prefetch_enabled and self._can_prefetch_raw_chunk(next_files, raw_store):
+                        pending = loader.submit(self._load_raw_chunk_array, next_files, settings)
+                    raw_store, previous_chunk, reused = self._infer_raw_chunk(
+                        chunk_files,
+                        chunk_names,
+                        frame_names,
+                        settings,
+                        raw_dir,
+                        metric_dir,
+                        semantic_fingerprint,
+                        raw_store,
+                        requested_dtype,
+                        input_size,
+                        target_fps,
+                        estimated_shape,
+                        estimated_storage_bytes,
+                        previous_chunk,
+                        retain_for_reuse=retain_for_reuse,
+                        source_frames=source_frames,
+                    )
+                    del source_frames
+                    if reused:
+                        reused_frame_count += len(chunk_files)
+                    self._report_raw_chunk_progress(
+                        progress_tracker,
+                        chunk_start // chunk_size + 1,
+                        total_chunks,
+                        chunk_end,
+                        len(frame_files),
+                    )
 
-    @staticmethod
-    def _can_prefetch_raw_chunk(chunk_files: list[Path], raw_store: RawDepthStore | None) -> bool:
+            if raw_store is None:
+                raise RuntimeError("Depth estimator produced no raw depth")
+            raw_store.flush_metadata()
+            if reused_frame_count:
+                print(
+                    f"  Reused exact depth for {reused_frame_count} frames "
+                    "from identical consecutive batches"
+                )
+            return raw_store
+        finally:
+            self._active_frame_reader = None
+            if stream_reader is not None:
+                stream_reader.close()
+
+    def _can_prefetch_raw_chunk(
+        self, chunk_files: list[Path], raw_store: RawDepthStore | None
+    ) -> bool:
         if not chunk_files or RAW_DEPTH_PREFETCH_BUDGET_BYTES <= 0:
             return False
         if raw_store is not None and all(
             raw_store.path_for(path.name).is_file() for path in chunk_files
         ):
             return False
+        if self._active_frame_source is not None:
+            decoded_bytes = (
+                len(chunk_files)
+                * self._active_frame_source.width
+                * self._active_frame_source.height
+                * 3
+            )
+            return decoded_bytes * 2 <= RAW_DEPTH_PREFETCH_BUDGET_BYTES
         decoded_bytes = 0
         for path in chunk_files:
             header = read_png_header(path)
@@ -1354,8 +1416,8 @@ class DepthMapProcessor:
         raw_store.write_batch(batch_names, result)
         return raw_store
 
-    @staticmethod
     def _load_shot_frame_indexes(
+        self,
         frame_files: list[Path],
         shot_start: int,
         shot_end: int,
@@ -1371,11 +1433,16 @@ class DepthMapProcessor:
         ):
             raise ValueError("V2 loader index lies outside the current shot")
         frames = []
+        reader = self._active_frame_reader
         for index in indexes:
-            path = frame_files[shot_start + index]
-            frame = cv2.imread(str(path))
-            if frame is None:
-                raise OSError(f"Could not load source frame: {path}")
+            global_index = shot_start + index
+            if reader is not None:
+                frame = reader.get_frame(global_index)
+            else:
+                path = frame_files[global_index]
+                frame = cv2.imread(str(path))
+                if frame is None:
+                    raise OSError(f"Could not load source frame: {path}")
             frames.append(frame)
         if not frames:
             raise ValueError("V2 loader requires at least one source index")
@@ -1562,7 +1629,9 @@ class DepthMapProcessor:
         source_frames: np.ndarray,
     ) -> tuple[RawDepthStore, _ReusableRawChunk | None, bool]:
         source_sizes = (
-            tuple(path.stat().st_size for path in chunk_files) if retain_for_reuse else ()
+            tuple(int(frame.nbytes) for frame in source_frames)
+            if (retain_for_reuse and self._active_frame_source is not None)
+            else (tuple(path.stat().st_size for path in chunk_files) if retain_for_reuse else ())
         )
         reused = retain_for_reuse and self._raw_chunk_matches(
             previous_chunk,
@@ -2344,11 +2413,16 @@ class DepthMapProcessor:
             - Reads images from disk
         """
         chunk_frames = []
+        reader = self._active_frame_reader
+        source = self._active_frame_source
         for frame_file in chunk_files:
-            frame = cv2.imread(str(frame_file))
-            if frame is None:
-                print(f"Warning: Could not load {frame_file}")
-                continue
+            if reader is not None and source is not None:
+                frame = reader.get_frame(source.index_for_path(frame_file))
+            else:
+                frame = cv2.imread(str(frame_file))
+                if frame is None:
+                    print(f"Warning: Could not load {frame_file}")
+                    continue
 
             chunk_frames.append(frame)
 

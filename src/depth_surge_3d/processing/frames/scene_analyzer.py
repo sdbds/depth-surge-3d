@@ -60,6 +60,82 @@ def _load_luma_histograms(frame_files: list[Path]) -> list[np.ndarray]:
         return list(executor.map(_luma_histogram, frame_files))
 
 
+def _detect_scene_cuts(
+    histograms: list[np.ndarray] | tuple[np.ndarray, ...],
+    *,
+    frame_count: int,
+    threshold: float,
+    min_frames: int,
+) -> list[int]:
+    cuts: list[int] = []
+    previous = histograms[0]
+    last_cut = 0
+    for index, current in enumerate(histograms[1:], start=1):
+        distance = float(cv2.compareHist(previous, current, cv2.HISTCMP_BHATTACHARYYA))
+        if distance >= threshold and index - last_cut >= min_frames:
+            cuts.append(index)
+            last_cut = index
+        previous = current
+    while cuts and frame_count - cuts[-1] < min_frames:
+        cuts.pop()
+    return cuts
+
+
+def analyze_scenes_from_histograms(
+    frame_names: Iterable[str],
+    histograms: list[np.ndarray] | tuple[np.ndarray, ...] | None,
+    output_dir: Path,
+    *,
+    enabled: bool = True,
+    threshold: float = 0.55,
+    min_frames: int = 8,
+) -> dict[str, Any]:
+    """Persist provisional frame-to-scene IDs from precomputed luma histograms."""
+
+    names = list(frame_names)
+    if not names:
+        raise ValueError("Scene analysis requires at least one frame")
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("Scene cut threshold must be in [0,1]")
+    if min_frames < 1:
+        raise ValueError("Minimum scene length must be positive")
+
+    cuts: list[int] = []
+    if enabled:
+        if histograms is None or len(histograms) != len(names):
+            raise ValueError("Scene analysis histograms must match frame count")
+        cuts = _detect_scene_cuts(
+            histograms,
+            frame_count=len(names),
+            threshold=threshold,
+            min_frames=min_frames,
+        )
+
+    scene_ids: list[int] = []
+    scene_id = 0
+    cut_set = set(cuts)
+    for index in range(len(names)):
+        if index in cut_set:
+            scene_id += 1
+        scene_ids.append(scene_id)
+
+    manifest: dict[str, Any] = {
+        "schema_version": SCENE_SCHEMA_VERSION,
+        "algorithm_version": SCENE_ALGORITHM_VERSION,
+        "status": "candidate",
+        "frame_names": names,
+        "scene_ids": scene_ids,
+        "candidate_cuts": cuts,
+        "settings": {
+            "enabled": bool(enabled),
+            "threshold": float(threshold),
+            "min_frames": int(min_frames),
+        },
+    }
+    _atomic_write_json(output_dir / "scene_manifest.json", manifest)
+    return manifest
+
+
 def analyze_scenes(
     frame_files: list[Path],
     output_dir: Path,
@@ -76,45 +152,15 @@ def analyze_scenes(
         raise ValueError("Scene cut threshold must be in [0,1]")
     if min_frames < 1:
         raise ValueError("Minimum scene length must be positive")
-
-    cuts: list[int] = []
-    if enabled:
-        histograms = _load_luma_histograms(frame_files)
-        previous = histograms[0]
-        last_cut = 0
-        for index, current in enumerate(histograms[1:], start=1):
-            distance = float(cv2.compareHist(previous, current, cv2.HISTCMP_BHATTACHARYYA))
-            if distance >= threshold and index - last_cut >= min_frames:
-                cuts.append(index)
-                last_cut = index
-            previous = current
-
-        while cuts and len(frame_files) - cuts[-1] < min_frames:
-            cuts.pop()
-
-    scene_ids: list[int] = []
-    scene_id = 0
-    cut_set = set(cuts)
-    for index in range(len(frame_files)):
-        if index in cut_set:
-            scene_id += 1
-        scene_ids.append(scene_id)
-
-    manifest: dict[str, Any] = {
-        "schema_version": SCENE_SCHEMA_VERSION,
-        "algorithm_version": SCENE_ALGORITHM_VERSION,
-        "status": "candidate",
-        "frame_names": [path.name for path in frame_files],
-        "scene_ids": scene_ids,
-        "candidate_cuts": cuts,
-        "settings": {
-            "enabled": bool(enabled),
-            "threshold": float(threshold),
-            "min_frames": int(min_frames),
-        },
-    }
-    _atomic_write_json(output_dir / "scene_manifest.json", manifest)
-    return manifest
+    histograms = _load_luma_histograms(frame_files) if enabled else None
+    return analyze_scenes_from_histograms(
+        [path.name for path in frame_files],
+        histograms,
+        output_dir,
+        enabled=enabled,
+        threshold=threshold,
+        min_frames=min_frames,
+    )
 
 
 def _even_indexes(length: int, limit: int) -> np.ndarray:

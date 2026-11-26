@@ -12,6 +12,7 @@ from typing import Any, Iterator, Literal, Sequence
 
 from ...utils.imaging.png_header import read_png_header
 from .stereo_control import StereoControlStateError
+from .video_frame_source import VideoFrameSource
 
 
 _FRAME_STEM_RE = re.compile(r"^frame_([0-9]{6,})$")
@@ -38,6 +39,7 @@ class StereoInputManifestV1:
     first_index: int
     records: tuple[StereoInputRecord, ...]
     source_metadata: dict[str, Any]
+    frame_source: VideoFrameSource | None = None
 
     @property
     def frame_count(self) -> int:
@@ -100,6 +102,7 @@ def publish_validated_stereo_input_manifest_v1(  # noqa: C901
     guide_files: Sequence[Path],
     geometry_files: Sequence[Path],
     geometry_mode: Literal["relative", "metric_camera", "metric"],
+    frame_source: VideoFrameSource | None = None,
 ) -> StereoInputManifestV1:
     """Validate guide/geometry alignment using headers and stage metadata only."""
 
@@ -140,10 +143,20 @@ def publish_validated_stereo_input_manifest_v1(  # noqa: C901
             )
         )
 
-    first_guide_header = read_png_header(records[0].guide_path)
-    if first_guide_header is None or first_guide_header.bit_depth != 8:
-        raise StereoControlStateError(f"first stereo guide PNG is invalid: {records[0].guide_path}")
-    render_shape = (int(first_guide_header.height), int(first_guide_header.width))
+    if frame_source is not None:
+        if frame_source.frame_count != len(records):
+            raise StereoControlStateError(
+                f"streaming frame count ({frame_source.frame_count}) differs from "
+                f"geometry count ({len(records)})"
+            )
+        render_shape = (int(frame_source.height), int(frame_source.width))
+    else:
+        first_guide_header = read_png_header(records[0].guide_path)
+        if first_guide_header is None or first_guide_header.bit_depth != 8:
+            raise StereoControlStateError(
+                f"first stereo guide PNG is invalid: {records[0].guide_path}"
+            )
+        render_shape = (int(first_guide_header.height), int(first_guide_header.width))
 
     geom_dir = records[0].geometry_path.parent
     source_metadata = _load_stage_metadata(geom_dir)
@@ -186,6 +199,7 @@ def publish_validated_stereo_input_manifest_v1(  # noqa: C901
         first_index=records[0].frame_index,
         records=tuple(records),
         source_metadata=source_metadata,
+        frame_source=frame_source,
     )
 
 

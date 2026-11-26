@@ -981,11 +981,13 @@ class ProgressCallback:
             and (apply_distortion or crop_factor == 1.0)
         )
         is_quality = settings.get("stereo_render_mode") == "quality"
+        if not keep_intermediates and str(settings.get("temporal_postprocessor") or "off") == "off":
+            weights["Frame Extraction"] = 0.01
         if str(settings.get("depth_model_version") or "v2") == "see_through":
-            weights["Depth Map Generation"] = 0.65
-            weights["Stereo Pair Creation"] = 0.22 if is_quality else 0.10
+            weights["Depth Map Generation"] = 0.80
+            weights["Stereo Pair Creation"] = 0.14 if is_quality else 0.06
         elif is_quality:
-            weights["Stereo Pair Creation"] = max(weights["Stereo Pair Creation"], 0.30)
+            weights["Stereo Pair Creation"] = max(weights["Stereo Pair Creation"], 0.25)
         disabled = {
             "Fisheye Distortion": not apply_distortion or streamed_stereo,
             "Crop Frames": (not apply_distortion and crop_factor == 1.0) or streamed_stereo,

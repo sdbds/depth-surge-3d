@@ -42,6 +42,7 @@ from ..frames.source_frame_manifest import (
     source_frame_manifest_mismatch_reason,
     write_source_frame_manifest,
 )
+from ..frames.video_frame_source import VideoFrameSource, build_video_frame_source
 from ..frames.vr_assembler import DirectStereoSource
 from .final_audio import SelectedAudioIdentityV1, prepare_selected_audio_v1
 from .final_container_validation import (
@@ -943,6 +944,30 @@ class VideoEncoder:
             args.extend(["-t", format_ffmpeg_time(end_seconds - clip_start)])
         args.extend(["-i", str(audio_source)])
         return args
+
+    def prepare_streaming_frame_source(
+        self,
+        video_path: str,
+        directories: dict[str, Path],
+        video_properties: dict[str, Any],
+        settings: dict[str, Any],
+    ) -> VideoFrameSource | None:
+        """Build a zero-PNG streaming VideoFrameSource unless reusable PNGs already exist."""
+
+        if not verify_ffmpeg_installation():
+            return None
+        frames_dir = directories.get("frames")
+        if not frames_dir:
+            frames_dir = directories["base"] / INTERMEDIATE_DIRS["frames"]
+        if frames_dir.is_dir() and next(frames_dir.glob("frame_*.png"), None) is not None:
+            return None
+        return build_video_frame_source(
+            video_path,
+            frames_dir,
+            video_properties,
+            settings,
+            compute_histograms=bool(settings.get("scene_detection", True)),
+        )
 
     def extract_frames(
         self,

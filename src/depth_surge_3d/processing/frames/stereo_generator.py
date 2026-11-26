@@ -407,9 +407,20 @@ class StereoPairGenerator:
             renderer = self.renderer
             cancelled = self._cancellation_predicate(progress_tracker)
             total_frames = stereo_input.frame_count
+            stream_reader = (
+                stereo_input.frame_source.open_reader(
+                    window_size=capacity + 8,
+                    consume_once=True,
+                )
+                if stereo_input.frame_source is not None
+                else None
+            )
 
             def decode_record(record: StereoInputRecord) -> Any:
-                frame = cv2.imread(str(record.guide_path), cv2.IMREAD_COLOR)
+                if stream_reader is not None:
+                    frame = stream_reader.get_frame(record.frame_index - stereo_input.first_index)
+                else:
+                    frame = cv2.imread(str(record.guide_path), cv2.IMREAD_COLOR)
                 if frame is None or frame.shape[:2] != render_shape:
                     raise ValueError(f"Failed to decode guide frame: {record.guide_path}")
                 if not is_metric:
@@ -567,6 +578,8 @@ class StereoPairGenerator:
                     is_cancelled=cancelled,
                 )
             finally:
+                if stream_reader is not None:
+                    stream_reader.close()
                 if prev_cv_threads is not None and prev_cv_threads != 1:
                     cv2.setNumThreads(prev_cv_threads)
             self.last_pipeline_stats = StreamingStereoPipelineStats(
