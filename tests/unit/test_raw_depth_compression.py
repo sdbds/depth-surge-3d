@@ -3,7 +3,6 @@
 import io
 import struct
 import zipfile
-import zlib
 from pathlib import Path
 
 import numpy as np
@@ -28,18 +27,17 @@ def _compressed_member(path, name):
     return data[start : start + info.compress_size]
 
 
-def test_raw_payload_uses_fast_lossless_deflate_stream(tmp_path):
+def test_raw_payload_uses_lossless_stored_npz_stream(tmp_path):
     values = (np.arange(16384, dtype=np.float32) % 37).reshape(128, 128)
     destination = tmp_path / "frame.npz"
     _atomic_save_npz(destination, {"values": values})
 
     expected_npy = io.BytesIO()
     np.save(expected_npy, values, allow_pickle=False)
-    compressor = zlib.compressobj(level=1, wbits=-15)
-    expected_stream = compressor.compress(expected_npy.getvalue()) + compressor.flush()
     actual_stream = _compressed_member(destination, "values.npy")
-    assert zlib.decompress(actual_stream, wbits=-15) == expected_npy.getvalue()
-    assert actual_stream == expected_stream
+    assert actual_stream == expected_npy.getvalue()
+    with zipfile.ZipFile(destination) as archive:
+        assert archive.getinfo("values.npy").compress_type == zipfile.ZIP_STORED
 
 
 @pytest.mark.parametrize("dtype", [np.float16, np.float32, np.dtype(">f4")])
@@ -65,7 +63,7 @@ def test_fast_archive_preserves_exact_numpy_members_and_input(tmp_path, dtype, l
         assert new.namelist() == old.namelist() == ["values.npy", "focal_x_normalized.npy"]
         assert new.testzip() is None
         for name in old.namelist():
-            assert new.getinfo(name).compress_type == zipfile.ZIP_DEFLATED
+            assert new.getinfo(name).compress_type == zipfile.ZIP_STORED
             assert new.read(name) == old.read(name)
     with np.load(destination, allow_pickle=False) as payload:
         for name, original in arrays.items():

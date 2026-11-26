@@ -170,10 +170,8 @@ def _atomic_save_npz(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
     temporary = path.with_name(f"{path.name}.tmp")
     try:
         with temporary.open("wb") as handle:
-            # Keep standard NPY members and ZIP64; spend less CPU on raw checkpoints.
-            with zipfile.ZipFile(
-                handle, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1
-            ) as archive:
+            # Float16/float32 depth mantissas barely compress; ZIP_STORED avoids ~80ms/frame CPU zlib tax.
+            with zipfile.ZipFile(handle, "w", compression=zipfile.ZIP_STORED) as archive:
                 for name, values in arrays.items():
                     with archive.open(f"{name}.npy", "w", force_zip64=True) as member:
                         np.lib.format.write_array(member, np.asanyarray(values))
@@ -370,7 +368,7 @@ class RawDepthStore:
             "requested_dtype": requested_dtype,
             "selected_dtype": selected_dtype,
             "storage_provenance": provenance,
-            "compression": "npz_deflate",
+            "compression": "npz_stored",
             "semantic_fingerprint": semantic,
             "camera_model": camera_model,
             "completed_count": 0,
