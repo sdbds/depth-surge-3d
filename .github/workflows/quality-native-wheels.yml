@@ -1,11 +1,7 @@
 name: Quality Native Wheels
 
 on:
-  pull_request:
-    branches: [main, dev]
-  push:
-    branches: [main, dev]
-    tags: ["v*"]
+  workflow_call:
   workflow_dispatch:
 
 jobs:
@@ -26,40 +22,45 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-          cache: pip
 
-      - name: Install native build toolchain
-        run: >-
-          python -m pip install --upgrade
-          pip hatchling "setuptools>=84" "numpy>=1.24,<2" "torch==2.13.0"
+      - name: Build platform wheel with isolated build dependencies
+        run: python -m pip wheel --no-deps --wheel-dir "${{ runner.temp }}/wheelhouse" .
 
-      - name: Build platform wheel
-        run: python -m hatchling build -t wheel -d dist
-
-      - name: Verify prebuilt extension contract
+      # This gate covers the native ABI, not the model stack. In particular,
+      # not all third-party depth backends publish Linux ARM64 wheels.
+      - name: Verify installed native ABI outside the checkout
+        working-directory: ${{ runner.temp }}
         shell: python
         run: |
-          import pathlib
+          import os
+          from pathlib import Path
+          import subprocess
           import sys
-          import zipfile
+          from tempfile import TemporaryDirectory
 
-          wheel = next(pathlib.Path("dist").glob("*.whl"))
-          target = pathlib.Path("wheel-smoke")
-          with zipfile.ZipFile(wheel) as archive:
-              archive.extractall(target)
-          sys.path.insert(0, str(target.resolve()))
-          import _quality_kd_native as native
-
-          info = native.build_info()
-          assert info["runtime_jit"] is False
-          assert info["kd_stack_capacity"] == 64
-          assert info["algorithm"] == (
-              "quality-implicit-region-kd-median-of-medians-v1"
-          )
+          wheel, = Path("wheelhouse").resolve().glob("*.whl")
+          verify = Path(os.environ["GITHUB_WORKSPACE"]) / "scripts" / "verify_installed_quality.py"
+          with TemporaryDirectory(dir=Path.cwd()) as temp:
+              env = Path(temp) / "venv"
+              python = env / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+              subprocess.run([sys.executable, "-I", "-m", "venv", env], cwd=temp, check=True)
+              subprocess.run([python, "-I", "-m", "pip", "install", "--no-index", "--no-deps", wheel],
+                             cwd=temp, check=True)
+              subprocess.run([python, "-I", verify, "--wheel", wheel, "--native-only"],
+                             cwd=temp, check=True)
 
       - name: Upload prebuilt wheel
         uses: actions/upload-artifact@v4
         with:
           name: quality-native-${{ runner.os }}-${{ runner.arch }}-py${{ matrix.python }}
-          path: dist/*.whl
+          path: ${{ runner.temp }}/wheelhouse/*.whl
           if-no-files-found: error
+
+      - name: Check the Windows installer entry point
+        if: runner.os == 'Windows' && matrix.python == '3.11'
+        shell: bash
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/installer-contracts
+        run: |
+          python -m pip install "uv==0.13.1"
+          uv run --locked --only-dev --python 3.11 python -I -m pytest --noconftest tests/unit/test_install_uv_qinglong.py

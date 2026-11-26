@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
+import wave
 from unittest.mock import patch
 
 import pytest
@@ -311,3 +313,132 @@ def test_audio_probe_parser_state_overflow_maps_to_budget_error(tmp_path: Path) 
 
         with pytest.raises(final_audio.FinalAudioProbeBudgetError, match="parser-state"):
             final_audio._probe_first_audio_stream(source, ())
+
+
+def _child(script):
+    return (sys.executable, "-c", script)
+
+
+@pytest.mark.parametrize(
+    ("stage", "script", "error"),
+    [
+        ("probe", "print('not json')", final_audio.FinalAudioProbeError),
+        ("probe", "import sys;sys.exit(2)", final_audio.FinalAudioProbeError),
+        ("probe", "print('x'*300)", final_audio.FinalAudioProbeBudgetError),
+        ("probe", "import time;time.sleep(15)", final_audio.FinalAudioProbeTimeoutError),
+        ("decode", "import sys;sys.stderr.write('bad packet')", final_audio.FinalAudioDecodeError),
+        ("decode", "import sys;sys.stderr.write('x'*300)", final_audio.FinalAudioDecodeBudgetError),
+        ("decode", "import time;time.sleep(15)", final_audio.FinalAudioDecodeTimeoutError),
+    ],
+)
+def test_external_audio_failures_are_classified_before_a_source_can_be_selected(
+    monkeypatch, tmp_path, stage, script, error
+):
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source bytes")
+    probe = """print('{"streams":[{"codec_type":"audio","sample_rate":"48000","channels":2}]}')"""
+    monkeypatch.setattr(
+        final_audio,
+        "audio_probe_command_v1",
+        lambda path: _child(script if stage == "probe" else probe),
+    )
+    monkeypatch.setattr(final_audio, "audio_decode_command_v1", lambda path, clip: _child(script))
+    monkeypatch.setattr(final_audio, "FINAL_AUDIO_PROBE_STDOUT_BYTES", 128)
+    monkeypatch.setattr(final_audio, "FINAL_AUDIO_DECODE_DIAGNOSTIC_BYTES", 128)
+    if "sleep" in script:
+        timeout = (
+            "FINAL_AUDIO_PROBE_TIMEOUT_SECONDS"
+            if stage == "probe"
+            else "FINAL_AUDIO_DECODE_STALL_SECONDS"
+        )
+        monkeypatch.setattr(final_audio, timeout, 0.2)
+    with pytest.raises(error) as caught:
+        final_audio.prepare_selected_audio_v1(
+            output_dir=tmp_path,
+            original_video=source,
+            settings=_settings(),
+            frame_count=1,
+            fps="24",
+        )
+    assert type(caught.value) is error
+    # All input handles have been released even on timeout or a broken external utility.
+    assert source.rename(tmp_path / "released.mp4").read_bytes() == b"source bytes"
+
+
+def test_cancel_during_chunked_audio_hash_closes_source_before_reuse(monkeypatch, tmp_path):
+    source = tmp_path / "selected.flac"
+    source.write_bytes(b"aabbccddeeff")
+    monkeypatch.setattr(final_audio, "FINAL_AUDIO_HASH_STREAM_BYTES", 2)
+    states = iter((False, False, True))
+    with pytest.raises(InterruptedError, match="hashing"):
+        final_audio._hash_open_regular_file(source, cancelled=lambda: next(states))
+    new = source.rename(tmp_path / "usable.flac")
+    assert final_audio._hash_open_regular_file(new).byte_count == 12
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "fps", "settings", "message"),
+    [
+        (0, "24", {}, "frame count"),
+        (1, "x", {}, "frame rate"),
+        (1, "-1", {}, "frame rate"),
+        (1, "24", {"source_fps": "x"}, "source frame rate"),
+        (1, "24", {"source_fps": 0}, "source frame rate"),
+        (2**64 - 1, "1", {}, "sample numerator"),
+        (2, str(2**64 - 1), {}, "end-sample numerator"),
+    ],
+)
+def test_invalid_or_unrepresentable_audio_clock_is_not_rounded_into_a_valid_trim(
+    monkeypatch, tmp_path, frame_count, fps, settings, message
+):
+    source = tmp_path / "selected.wav"
+    source.write_bytes(b"audio")
+    monkeypatch.setattr(
+        final_audio, "_probe_first_audio_stream", lambda *_: AudioProbeStream("audio", 48_000, 2)
+    )
+    monkeypatch.setattr(final_audio, "_decode_pcm_byte_count", lambda *_: 8)
+    with pytest.raises(final_audio.FinalAudioPcmOverflowError, match=message):
+        final_audio.prepare_selected_audio_v1(
+            output_dir=tmp_path,
+            original_video=source,
+            settings=_settings(**settings),
+            frame_count=frame_count,
+            fps=fps,
+        )
+
+
+def test_first_pcm_stream_counts_complete_stereo_frames_through_actual_pipes(tmp_path, monkeypatch):
+    source = tmp_path / "stereo.wav"
+    with wave.open(str(source), "wb") as audio:
+        audio.setparams((2, 4, 48_000, 0, "NONE", "not compressed"))
+        audio.writeframes(bytes(range(8)) * 4_100)
+    probe = (
+        "import wave,sys,json; w=wave.open(sys.argv[1]);"
+        "print(json.dumps({'streams':[{'codec_type':'audio','sample_rate':str(w.getframerate()),"
+        "'channels':w.getnchannels()}]}))"
+    )
+    decode = "import wave,sys; w=wave.open(sys.argv[1]); sys.stdout.buffer.write(w.readframes(w.getnframes()))"
+    monkeypatch.setattr(
+        final_audio, "audio_probe_command_v1", lambda path: (*_child(probe), str(path))
+    )
+    monkeypatch.setattr(
+        final_audio, "audio_decode_command_v1", lambda path, clip: (*_child(decode), str(path))
+    )
+    monkeypatch.setattr(final_audio, "FINAL_AUDIO_STREAM_BYTES", 29)
+    selected = final_audio.prepare_selected_audio_v1(
+        output_dir=tmp_path,
+        original_video=source,
+        settings=_settings(),
+        frame_count=2,
+        fps="24000/1001",
+        clip_start_frame=0,
+        cancelled=lambda: False,
+    )
+    assert selected.usable and selected.selection == "original_video"
+    assert selected.input_arguments() == ("-i", str(source))
+    assert selected.decoded_pcm_bytes == 4100 * 2 * 4
+    assert selected.audio_end_sample == 4004
+    assert "atrim=end_sample=4004,asetpts=PTS-STARTPTS" in selected.output_arguments(3)
+    with pytest.raises(ValueError, match="index"):
+        selected.output_arguments(True)
+    selected.revalidate()

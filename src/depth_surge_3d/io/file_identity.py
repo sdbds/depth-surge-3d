@@ -14,6 +14,8 @@ import sys
 from typing import BinaryIO, Callable, Literal, TypeAlias
 
 
+from . import _win32
+
 LINUX_UUID_DIRECTORY = "/dev/disk/by-uuid"
 LINUX_UUID_ENTRY_CAP = 4096
 LINUX_UUID_SCAN_BUFFER_BYTES = 64 * 1024
@@ -72,10 +74,7 @@ class PosixFileIdentityV1:
         )
         if type(item["handle_type"]) is not int:
             raise PersistentIdentitySchemaError("POSIX handle type is invalid")
-        if (
-            type(item["filesystem_uuid"]) is not str
-            or type(item["file_handle_hex"]) is not str
-        ):
+        if type(item["filesystem_uuid"]) is not str or type(item["file_handle_hex"]) is not str:
             raise PersistentIdentitySchemaError("POSIX identity strings are invalid")
         return cls(
             item["filesystem_uuid"],
@@ -103,9 +102,7 @@ class WindowsFileIdentityV1:
 
     @classmethod
     def from_object(cls, value: object) -> WindowsFileIdentityV1:
-        item = _closed_dict(
-            value, {"volume_serial", "file_id"}, "Windows file identity"
-        )
+        item = _closed_dict(value, {"volume_serial", "file_id"}, "Windows file identity")
         if type(item["volume_serial"]) is not str or type(item["file_id"]) is not str:
             raise PersistentIdentitySchemaError("Windows identity strings are invalid")
         return cls(item["volume_serial"], item["file_id"])
@@ -121,9 +118,7 @@ class PersistedFileIdentityV1:
     link_count: int
 
     def __post_init__(self) -> None:
-        expected = (
-            PosixFileIdentityV1 if self.platform == "posix" else WindowsFileIdentityV1
-        )
+        expected = PosixFileIdentityV1 if self.platform == "posix" else WindowsFileIdentityV1
         if self.platform not in {"posix", "windows"} or not isinstance(
             self.file_identity, expected
         ):
@@ -146,14 +141,10 @@ class PersistedFileIdentityV1:
 
     @classmethod
     def from_object(cls, value: object) -> PersistedFileIdentityV1:
-        item = _closed_dict(
-            value, {"platform", "file_identity", "link_count"}, "file identity"
-        )
+        item = _closed_dict(value, {"platform", "file_identity", "link_count"}, "file identity")
         platform = item["platform"]
         if platform == "posix":
-            inner: BaseFileIdentity = PosixFileIdentityV1.from_object(
-                item["file_identity"]
-            )
+            inner: BaseFileIdentity = PosixFileIdentityV1.from_object(item["file_identity"])
         elif platform == "windows":
             inner = WindowsFileIdentityV1.from_object(item["file_identity"])
         else:
@@ -169,12 +160,8 @@ class DirectoryIdentityV1:
     file_identity: BaseFileIdentity
 
     def __post_init__(self) -> None:
-        expected = (
-            PosixFileIdentityV1 if self.kind == "posix" else WindowsFileIdentityV1
-        )
-        if self.kind not in {"posix", "windows"} or not isinstance(
-            self.file_identity, expected
-        ):
+        expected = PosixFileIdentityV1 if self.kind == "posix" else WindowsFileIdentityV1
+        if self.kind not in {"posix", "windows"} or not isinstance(self.file_identity, expected):
             raise PersistentIdentitySchemaError("directory identity kind is invalid")
 
     @property
@@ -191,9 +178,7 @@ class DirectoryIdentityV1:
         item = _closed_dict(value, {"kind", "file_identity"}, "directory identity")
         kind = item["kind"]
         if kind == "posix":
-            inner: BaseFileIdentity = PosixFileIdentityV1.from_object(
-                item["file_identity"]
-            )
+            inner: BaseFileIdentity = PosixFileIdentityV1.from_object(item["file_identity"])
         elif kind == "windows":
             inner = WindowsFileIdentityV1.from_object(item["file_identity"])
         else:
@@ -232,9 +217,7 @@ def _windows_identity_bindings() -> tuple[
             ("reparse_tag", wintypes.DWORD),
         ]
 
-    get_info = ctypes.WinDLL(
-        "kernel32", use_last_error=True
-    ).GetFileInformationByHandleEx
+    get_info = _win32.load_library("kernel32", use_last_error=True).GetFileInformationByHandleEx
     get_info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
     get_info.restype = wintypes.BOOL
     return FileIdInfo, FileStandardInfo, FileAttributeTagInfo, get_info
@@ -250,9 +233,7 @@ def _windows_handle_identity(
         raise PersistentIdentityCapabilityError("Windows FileIdInfo is unavailable")
     from ctypes import wintypes
 
-    FileIdInfo, FileStandardInfo, FileAttributeTagInfo, get_info = (
-        _windows_identity_bindings()
-    )
+    FileIdInfo, FileStandardInfo, FileAttributeTagInfo, get_info = _windows_identity_bindings()
 
     def query(info_class: int, target: ctypes.Structure, label: str) -> None:
         if not get_info(
@@ -261,10 +242,8 @@ def _windows_handle_identity(
             ctypes.byref(target),
             ctypes.sizeof(target),
         ):
-            code = ctypes.get_last_error()
-            raise PersistentIdentityCapabilityError(
-                f"{label} failed: Windows error {code}"
-            )
+            code = _win32.last_error()
+            raise PersistentIdentityCapabilityError(f"{label} failed: Windows error {code}")
 
     file_id = FileIdInfo()
     standard = FileStandardInfo()
@@ -310,7 +289,7 @@ def directory_identity_from_windows_handle(handle: int) -> DirectoryIdentityV1:
 def _open_windows_path(path: Path, *, directory: bool) -> int:
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = _win32.load_library("kernel32", use_last_error=True)
     create_file = kernel32.CreateFileW
     create_file.argtypes = (
         wintypes.LPCWSTR,
@@ -333,7 +312,7 @@ def _open_windows_path(path: Path, *, directory: bool) -> int:
     )
     invalid = wintypes.HANDLE(-1).value
     if handle == invalid:
-        code = ctypes.get_last_error()
+        code = _win32.last_error()
         raise PersistentIdentityCapabilityError(f"CreateFileW(identity) failed: {code}")
     return int(handle)
 
@@ -400,10 +379,68 @@ def linux_statx_for_fd(descriptor: int, mask: int) -> _Statx:
         code = ctypes.get_errno()
         raise PersistentIdentityCapabilityError(f"statx identity failed: errno {code}")
     if result.mask & mask != mask:
-        raise PersistentIdentityCapabilityError(
-            "statx omitted required identity fields"
-        )
+        raise PersistentIdentityCapabilityError("statx omitted required identity fields")
     return result
+
+
+def _uuid_matches_device(
+    name: str, uuid_fd: int, dev_fd: int, nofollow: int, target_device: tuple[int, int]
+) -> bool:
+    link = os.readlink(name, dir_fd=uuid_fd).encode("ascii", "strict")
+    if len(link) > 255 or not link.startswith(b"../../"):
+        raise PersistentIdentityCapabilityError("Linux UUID link target is unsafe")
+    component = link[6:]
+    if b"/" in component or _DEVICE_COMPONENT.fullmatch(component) is None:
+        raise PersistentIdentityCapabilityError("Linux UUID device component is unsafe")
+    node_fd = os.open(
+        component.decode("ascii"),
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow,
+        dir_fd=dev_fd,
+    )
+    try:
+        node = os.fstat(node_fd)
+        if not stat.S_ISBLK(node.st_mode):
+            raise PersistentIdentityCapabilityError("Linux UUID target is not block storage")
+        if (
+            os.major(node.st_rdev),
+            os.minor(node.st_rdev),
+        ) != target_device:
+            return False
+        if os.readlink(name, dir_fd=uuid_fd).encode("ascii", "strict") != link:
+            raise PersistentIdentityCapabilityError("Linux UUID link changed during audit")
+        node_after = os.fstat(node_fd)
+        if (node.st_dev, node.st_ino, node.st_rdev) != (
+            node_after.st_dev,
+            node_after.st_ino,
+            node_after.st_rdev,
+        ):
+            raise PersistentIdentityCapabilityError("Linux block identity changed")
+        return True
+    finally:
+        os.close(node_fd)
+
+
+def _matching_uuids(
+    uuid_fd: int, dev_fd: int, nofollow: int, target_device: tuple[int, int]
+) -> list[str]:
+    matches: list[str] = []
+    count = 0
+    with os.scandir(uuid_fd) as entries:
+        for entry in entries:
+            if entry.name in {".", ".."}:
+                continue
+            count += 1
+            if count > LINUX_UUID_ENTRY_CAP:
+                raise PersistentIdentityCapabilityError("Linux UUID entry cap exceeded")
+            try:
+                name = entry.name.encode("ascii")
+            except UnicodeEncodeError:
+                continue
+            if _UUID_NAME.fullmatch(name) is None:
+                continue
+            if _uuid_matches_device(entry.name, uuid_fd, dev_fd, nofollow, target_device):
+                matches.append(name.decode("ascii").replace("-", "").lower())
+    return matches
 
 
 def _linux_filesystem_uuid(descriptor: int) -> str:
@@ -413,74 +450,11 @@ def _linux_filesystem_uuid(descriptor: int) -> str:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     dev_fd = disk_fd = uuid_fd = -1
-    matches: list[str] = []
     try:
         dev_fd = os.open("/dev", flags | nofollow)
         disk_fd = os.open("disk", flags | nofollow, dir_fd=dev_fd)
         uuid_fd = os.open("by-uuid", flags | nofollow, dir_fd=disk_fd)
-        count = 0
-        with os.scandir(uuid_fd) as entries:
-            for entry in entries:
-                if entry.name in {".", ".."}:
-                    continue
-                count += 1
-                if count > LINUX_UUID_ENTRY_CAP:
-                    raise PersistentIdentityCapabilityError(
-                        "Linux UUID entry cap exceeded"
-                    )
-                try:
-                    name = entry.name.encode("ascii")
-                except UnicodeEncodeError:
-                    continue
-                if _UUID_NAME.fullmatch(name) is None:
-                    continue
-                link = os.readlink(entry.name, dir_fd=uuid_fd).encode("ascii", "strict")
-                if len(link) > 255 or not link.startswith(b"../../"):
-                    raise PersistentIdentityCapabilityError(
-                        "Linux UUID link target is unsafe"
-                    )
-                component = link[6:]
-                if b"/" in component or _DEVICE_COMPONENT.fullmatch(component) is None:
-                    raise PersistentIdentityCapabilityError(
-                        "Linux UUID device component is unsafe"
-                    )
-                node_fd = os.open(
-                    component.decode("ascii"),
-                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow,
-                    dir_fd=dev_fd,
-                )
-                try:
-                    node = os.fstat(node_fd)
-                    if not stat.S_ISBLK(node.st_mode):
-                        raise PersistentIdentityCapabilityError(
-                            "Linux UUID target is not block storage"
-                        )
-                    if (
-                        os.major(node.st_rdev),
-                        os.minor(node.st_rdev),
-                    ) != target_device:
-                        continue
-                    if (
-                        os.readlink(entry.name, dir_fd=uuid_fd).encode(
-                            "ascii", "strict"
-                        )
-                        != link
-                    ):
-                        raise PersistentIdentityCapabilityError(
-                            "Linux UUID link changed during audit"
-                        )
-                    node_after = os.fstat(node_fd)
-                    if (node.st_dev, node.st_ino, node.st_rdev) != (
-                        node_after.st_dev,
-                        node_after.st_ino,
-                        node_after.st_rdev,
-                    ):
-                        raise PersistentIdentityCapabilityError(
-                            "Linux block identity changed"
-                        )
-                    matches.append(name.decode("ascii").replace("-", "").lower())
-                finally:
-                    os.close(node_fd)
+        matches = _matching_uuids(uuid_fd, dev_fd, nofollow, target_device)
     except (OSError, UnicodeError) as error:
         raise PersistentIdentityCapabilityError(
             "Linux filesystem UUID resolution failed"
@@ -495,9 +469,7 @@ def _linux_filesystem_uuid(descriptor: int) -> str:
         after.st_ino,
         after.st_mode,
     ):
-        raise PersistentIdentityCapabilityError(
-            "owned object changed during UUID audit"
-        )
+        raise PersistentIdentityCapabilityError("owned object changed during UUID audit")
     if len(matches) != 1:
         raise PersistentIdentityCapabilityError("filesystem UUID match is not unique")
     return matches[0]
@@ -507,9 +479,7 @@ def _linux_opaque_handle(descriptor: int) -> tuple[int, bytes]:
     libc = ctypes.CDLL(None, use_errno=True)
     name_to_handle_at = getattr(libc, "name_to_handle_at", None)
     if name_to_handle_at is None:
-        raise PersistentIdentityCapabilityError(
-            "libc does not expose name_to_handle_at"
-        )
+        raise PersistentIdentityCapabilityError("libc does not expose name_to_handle_at")
 
     class FileHandle(ctypes.Structure):
         _fields_ = [
@@ -572,9 +542,7 @@ def _capture_posix_fd(
     descriptor: int, *, require_directory: bool
 ) -> tuple[PosixFileIdentityV1, int]:
     if not sys.platform.startswith("linux"):
-        raise PersistentIdentityCapabilityError(
-            "persistent POSIX identity is Linux-only"
-        )
+        raise PersistentIdentityCapabilityError("persistent POSIX identity is Linux-only")
     metadata = os.fstat(descriptor)
     if stat.S_ISDIR(metadata.st_mode) != require_directory:
         raise PersistentIdentitySchemaError("identity object type changed")
@@ -589,17 +557,13 @@ def _capture_posix_fd(
         after.st_mode,
         after.st_nlink,
     ):
-        raise PersistentIdentityCapabilityError(
-            "owned object changed during handle audit"
-        )
-    return PosixFileIdentityV1(filesystem_uuid, handle_type, handle.hex()), int(
-        after.st_nlink
-    )
+        raise PersistentIdentityCapabilityError("owned object changed during handle audit")
+    return PosixFileIdentityV1(filesystem_uuid, handle_type, handle.hex()), int(after.st_nlink)
 
 
 def directory_identity_from_posix_fd(descriptor: int) -> DirectoryIdentityV1:
-    identity, _links = _capture_posix_fd(descriptor, require_directory=True)
-    return DirectoryIdentityV1("posix", identity)
+    posix_identity, _links = _capture_posix_fd(descriptor, require_directory=True)
+    return DirectoryIdentityV1("posix", posix_identity)
 
 
 def file_identity_from_posix_fd(descriptor: int) -> PersistedFileIdentityV1:
@@ -611,9 +575,7 @@ def file_identity_from_open_handle(handle: BinaryIO) -> PersistedFileIdentityV1:
     """Capture the restart-stable identity of an already opened regular file."""
 
     if os.name == "nt":
-        import msvcrt
-
-        native = msvcrt.get_osfhandle(handle.fileno())
+        native = _win32.get_osfhandle(handle.fileno())
         identity, links, _attributes = _windows_handle_identity(
             native,
             require_directory=False,
@@ -634,15 +596,15 @@ def capture_file_identity(path: Path) -> PersistedFileIdentityV1:
                 require_directory=False,
             )
         finally:
-            ctypes.WinDLL("kernel32").CloseHandle(wintypes.HANDLE(handle))
+            _win32.load_library("kernel32").CloseHandle(wintypes.HANDLE(handle))
         return PersistedFileIdentityV1("windows", identity, links)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
-        identity, links = _capture_posix_fd(descriptor, require_directory=False)
+        posix_identity, links = _capture_posix_fd(descriptor, require_directory=False)
     finally:
         os.close(descriptor)
-    return PersistedFileIdentityV1("posix", identity, links)
+    return PersistedFileIdentityV1("posix", posix_identity, links)
 
 
 def capture_directory_identity(path: Path) -> DirectoryIdentityV1:
@@ -657,7 +619,7 @@ def capture_directory_identity(path: Path) -> DirectoryIdentityV1:
                 require_directory=True,
             )
         finally:
-            ctypes.WinDLL("kernel32").CloseHandle(wintypes.HANDLE(handle))
+            _win32.load_library("kernel32").CloseHandle(wintypes.HANDLE(handle))
         return DirectoryIdentityV1("windows", identity)
     flags = (
         os.O_RDONLY
@@ -667,7 +629,7 @@ def capture_directory_identity(path: Path) -> DirectoryIdentityV1:
     )
     descriptor = os.open(path, flags)
     try:
-        identity, _links = _capture_posix_fd(descriptor, require_directory=True)
+        posix_identity, _links = _capture_posix_fd(descriptor, require_directory=True)
     finally:
         os.close(descriptor)
-    return DirectoryIdentityV1("posix", identity)
+    return DirectoryIdentityV1("posix", posix_identity)

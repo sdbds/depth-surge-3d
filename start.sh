@@ -45,7 +45,7 @@ else
     elif [ -d "venv" ]; then
         source venv/bin/activate
     else
-        echo "Error: No virtual environment found. Please run ./setup.sh first."
+        echo "Error: No virtual environment found. Follow docs/INSTALLATION.md first."
         exit 1
     fi
     

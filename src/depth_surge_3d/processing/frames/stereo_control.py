@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ...io import _win32
+
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import ctypes
@@ -358,6 +360,10 @@ def _validate_provider_item(
             )
         ):
             raise StereoControlStateError("provider image shape is invalid")
+    _validate_provider_paths(item, stem)
+
+
+def _validate_provider_paths(item: StereoProviderItem, stem: str) -> None:
     expected_guide = f"{stem}.png"
     if item.guide_path.name != expected_guide:
         raise StereoControlStateError("provider guide path does not match the canonical stem")
@@ -538,6 +544,15 @@ def validate_stereo_provider_replay(
         _raise_provider_changed("provider item identity changed", mutation_started)
 
 
+def _classify_action(
+    item: StereoProviderItem, classify: Callable[[StereoProviderItem], StereoAction]
+) -> StereoAction:
+    try:
+        return StereoAction(classify(item))
+    except (TypeError, ValueError) as error:
+        raise StereoControlStateError("classifier returned an unknown stereo action") from error
+
+
 def validate_stereo_action_replay(
     provider: ReplayableStereoProvider,
     plan: StereoControlAuditPlan,
@@ -558,12 +573,7 @@ def validate_stereo_action_replay(
                 raise StereoControlStateError("provider replay exceeds its frozen frame count")
             _validate_provider_item(item, plan.generation, expected_index)
             _update_item_digest(digest, item)
-            try:
-                action = StereoAction(classify(item))
-            except (TypeError, ValueError) as error:
-                raise StereoControlStateError(
-                    "classifier returned an unknown stereo action"
-                ) from error
+            action = _classify_action(item, classify)
             if action is not plan.actions.get(expected_index):
                 raise StereoProviderChangedError(
                     "stereo retained-output action changed before mutation"
@@ -575,12 +585,40 @@ def validate_stereo_action_replay(
         raise
     except (StereoControlError, OSError, TypeError, ValueError) as error:
         raise StereoProviderChangedError(str(error)) from error
+    _check_action_replay(plan, expected_index, digest.hexdigest(), render_count, migrate_count)
+
+
+def _check_action_replay(
+    plan: StereoControlAuditPlan,
+    expected_index: int,
+    digest: str,
+    render_count: int,
+    migrate_count: int,
+) -> None:
     if expected_index != plan.generation.frame_count:
         raise StereoProviderChangedError("provider replay ended before its frozen frame count")
-    if digest.hexdigest() != plan.item_stream_sha256:
+    if digest != plan.item_stream_sha256:
         raise StereoProviderChangedError("provider item identity changed")
     if render_count != plan.render_count or migrate_count != plan.migrate_count:
         raise StereoProviderChangedError("stereo retained-output action counts changed")
+
+
+def _iter_provider_items(
+    provider: ReplayableStereoProvider, mutation_started: bool
+) -> Iterator[StereoProviderItem]:
+    try:
+        replay = provider.replay()
+    except (StereoControlError, OSError, TypeError, ValueError) as error:
+        _raise_provider_changed(str(error), mutation_started)
+    while True:
+        try:
+            item = next(replay)
+        except StopIteration:
+            break
+        except (StereoControlError, OSError, TypeError, ValueError) as error:
+            _raise_provider_changed(str(error), mutation_started)
+        yield item
+        del item
 
 
 def iter_stereo_action(
@@ -599,17 +637,7 @@ def iter_stereo_action(
         _raise_provider_changed("provider generation changed", mutation_started)
     digest = hashlib.sha256()
     expected_index = 0
-    try:
-        replay = provider.replay()
-    except (StereoControlError, OSError, TypeError, ValueError) as error:
-        _raise_provider_changed(str(error), mutation_started)
-    while True:
-        try:
-            item = next(replay)
-        except StopIteration:
-            break
-        except (StereoControlError, OSError, TypeError, ValueError) as error:
-            _raise_provider_changed(str(error), mutation_started)
+    for item in _iter_provider_items(provider, mutation_started):
         if expected_index >= plan.generation.frame_count:
             _raise_provider_changed(
                 "provider replay exceeds its frozen frame count",
@@ -815,7 +843,9 @@ class StereoThreadCreationStats:
 
 class _ThreadLike(Protocol):
     name: str
-    ident: int | None
+
+    @property
+    def ident(self) -> int | None: ...
 
     def start(self) -> None: ...
 
@@ -846,6 +876,8 @@ class _WindowsReservedThread:
     def start(self) -> None:
         if self._handle is not None or self._closed:
             raise RuntimeError("reserved thread can only be started once")
+        if sys.platform != "win32":
+            raise OSError("reserved CRT threads require Windows")
         callback_type = ctypes.WINFUNCTYPE(ctypes.c_uint, ctypes.c_void_p)
 
         @callback_type
@@ -885,7 +917,7 @@ class _WindowsReservedThread:
         self._callback = entry
         self._handle = int(handle)
         self.ident = int(thread_id.value)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _win32.load_library("kernel32", use_last_error=True)
         set_description = getattr(kernel32, "SetThreadDescription", None)
         if set_description is not None:
             set_description.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
@@ -895,12 +927,12 @@ class _WindowsReservedThread:
     def is_alive(self) -> bool:
         if self._handle is None or self._closed:
             return False
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _win32.load_library("kernel32", use_last_error=True)
         result = kernel32.WaitForSingleObject(ctypes.c_void_p(self._handle), 0)
         if result == 0x00000102:
             return True
         if result == 0xFFFFFFFF:
-            raise OSError(ctypes.get_last_error(), "WaitForSingleObject failed")
+            raise OSError(_win32.last_error(), "WaitForSingleObject failed")
         return False
 
     def join(self, timeout: float | None = None) -> None:
@@ -912,14 +944,14 @@ class _WindowsReservedThread:
             milliseconds = 0xFFFFFFFF
         else:
             milliseconds = max(0, min(0xFFFFFFFE, int(timeout * 1000)))
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _win32.load_library("kernel32", use_last_error=True)
         result = kernel32.WaitForSingleObject(ctypes.c_void_p(self._handle), milliseconds)
         if result == 0x00000102:
             return
         if result != 0:
-            raise OSError(ctypes.get_last_error(), "WaitForSingleObject failed")
+            raise OSError(_win32.last_error(), "WaitForSingleObject failed")
         if not kernel32.CloseHandle(ctypes.c_void_p(self._handle)):
-            raise OSError(ctypes.get_last_error(), "CloseHandle failed")
+            raise OSError(_win32.last_error(), "CloseHandle failed")
         self._closed = True
         self._callback = None
         self._target = None
@@ -1847,7 +1879,7 @@ def execute_stereo_control_plan(
 
 
 def _windows_stack_evidence() -> StackReservationEvidence:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = _win32.load_library("kernel32", use_last_error=True)
     low = ctypes.c_size_t()
     high = ctypes.c_size_t()
     get_limits = kernel32.GetCurrentThreadStackLimits
@@ -1903,7 +1935,7 @@ def _windows_stack_evidence() -> StackReservationEvidence:
             ctypes.sizeof(info),
         )
         if result != ctypes.sizeof(info) or info.region_size <= 0:
-            raise OSError(ctypes.get_last_error(), "VirtualQuery failed for stack bounds")
+            raise OSError(_win32.last_error(), "VirtualQuery failed for stack bounds")
         region_end = min(address + int(info.region_size), high.value)
         if info.state == 0x1000:
             committed += region_end - address
@@ -1976,14 +2008,14 @@ def _windows_process_thread_count() -> int:
             ("flags", ctypes.c_uint32),
         ]
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = _win32.load_library("kernel32", use_last_error=True)
     snapshot_api = kernel32.CreateToolhelp32Snapshot
     snapshot_api.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
     snapshot_api.restype = ctypes.c_void_p
     snapshot = snapshot_api(0x00000004, 0)
     invalid_handle = ctypes.c_void_p(-1).value
     if snapshot == invalid_handle:
-        raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot failed")
+        raise OSError(_win32.last_error(), "CreateToolhelp32Snapshot failed")
     entry = _ThreadEntry32(size=ctypes.sizeof(_ThreadEntry32))
     first = kernel32.Thread32First
     next_entry = kernel32.Thread32Next
@@ -2034,14 +2066,14 @@ def _windows_process_committed_bytes() -> int:
         ]
 
     counters = _ProcessMemoryCountersEx(size=ctypes.sizeof(_ProcessMemoryCountersEx))
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel32 = _win32.load_library("kernel32", use_last_error=True)
+    psapi = _win32.load_library("psapi", use_last_error=True)
     get_memory = psapi.GetProcessMemoryInfo
     get_memory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
     get_memory.restype = ctypes.c_int
     process = kernel32.GetCurrentProcess()
     if not get_memory(process, ctypes.byref(counters), counters.size):
-        raise OSError(ctypes.get_last_error(), "GetProcessMemoryInfo failed")
+        raise OSError(_win32.last_error(), "GetProcessMemoryInfo failed")
     return int(counters.private_usage)
 
 

@@ -1043,6 +1043,7 @@ def job_output_name_v1(
 
 
 _JSON_NUMBER = re.compile(rb"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+_JSON_LITERALS = {b"true": True, b"false": False, b"null": None}
 
 
 class _BoundedFfprobeJsonCursor:
@@ -1104,28 +1105,29 @@ class _BoundedFfprobeJsonCursor:
                 escaped = True
             elif byte == ord('"'):
                 token = self.raw[start : offset + 1]
-                if len(token) - 2 > maximum_bytes:
-                    raise FfprobeJsonBudgetError(
-                        f"{label} scalar token exceeds its byte cap"
-                    )
-                try:
-                    value = json.loads(token)
-                except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    raise FfprobeJsonError(f"{label} is malformed") from error
-                if not isinstance(value, str):
-                    raise FfprobeJsonError(f"{label} must be a JSON string")
-                try:
-                    encoded_length = len(value.encode("utf-8", errors="strict"))
-                except UnicodeEncodeError as error:
-                    raise FfprobeJsonError(f"{label} contains invalid Unicode") from error
-                if encoded_length > maximum_bytes:
-                    raise FfprobeJsonBudgetError(
-                        f"{label} scalar token exceeds its byte cap"
-                    )
+                value = self._decode_string(token, maximum_bytes, label)
                 self.offset = offset + 1
                 return value
             offset += 1
         raise FfprobeJsonError(f"{label} is unterminated")
+
+    @staticmethod
+    def _decode_string(token: bytes, maximum_bytes: int, label: str) -> str:
+        if len(token) - 2 > maximum_bytes:
+            raise FfprobeJsonBudgetError(f"{label} scalar token exceeds its byte cap")
+        try:
+            value = json.loads(token)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise FfprobeJsonError(f"{label} is malformed") from error
+        if not isinstance(value, str):
+            raise FfprobeJsonError(f"{label} must be a JSON string")
+        try:
+            encoded_length = len(value.encode("utf-8", errors="strict"))
+        except UnicodeEncodeError as error:
+            raise FfprobeJsonError(f"{label} contains invalid Unicode") from error
+        if encoded_length > maximum_bytes:
+            raise FfprobeJsonBudgetError(f"{label} scalar token exceeds its byte cap")
+        return value
 
     def scalar(self, *, maximum_bytes: int, label: str) -> object:
         self._space()
@@ -1139,12 +1141,8 @@ class _BoundedFfprobeJsonCursor:
         token = self.raw[start : self.offset]
         if not token or len(token) > maximum_bytes:
             raise FfprobeJsonBudgetError(f"{label} scalar token exceeds its byte cap")
-        if token == b"true":
-            return True
-        if token == b"false":
-            return False
-        if token == b"null":
-            return None
+        if token in _JSON_LITERALS:
+            return _JSON_LITERALS[token]
         if _JSON_NUMBER.fullmatch(token) is None:
             raise FfprobeJsonError(f"{label} is malformed")
         try:
@@ -1155,9 +1153,9 @@ class _BoundedFfprobeJsonCursor:
     def skip_ignored_value(self, *, depth: int) -> None:  # noqa: C901
         """Consume one ignored JSON value with fixed depth/container/scalar caps."""
 
-        # A frame is [kind, state, depth]. Parent state advances before a child
+        # A frame is (kind, state, depth). Parent state advances before a child
         # starts, so closing a child never needs recursion or a Python value.
-        frames: list[list[object]] = []
+        frames: list[tuple[str, str, int]] = []
 
         def start_value(value_depth: int) -> None:
             self._space()
@@ -1166,18 +1164,12 @@ class _BoundedFfprobeJsonCursor:
                 self.scalar(maximum_bytes=128, label="ignored FFprobe JSON")
                 return
             if value_depth > self.max_depth:
-                raise FfprobeJsonBudgetError(
-                    "FFprobe JSON nesting depth exceeds the cap"
-                )
+                raise FfprobeJsonBudgetError("FFprobe JSON nesting depth exceeds the cap")
             self.ignored_container_starts += 1
             if self.ignored_container_starts > 256:
-                raise FfprobeJsonBudgetError(
-                    "ignored FFprobe JSON container count exceeds the cap"
-                )
+                raise FfprobeJsonBudgetError("ignored FFprobe JSON container count exceeds the cap")
             self.offset += 1
-            frames.append(
-                ["object" if byte == ord("{") else "array", "first", value_depth]
-            )
+            frames.append(("object" if byte == ord("{") else "array", "first", value_depth))
 
         start_value(depth)
         while frames:
@@ -1192,8 +1184,8 @@ class _BoundedFfprobeJsonCursor:
                         continue
                     self.string(maximum_bytes=128, label="ignored FFprobe JSON key")
                     self.take(ord(":"), "ignored FFprobe JSON object")
-                    frames[-1][1] = "after_value"
-                    start_value(int(container_depth) + 1)
+                    frames[-1] = (kind, "after_value", container_depth)
+                    start_value(container_depth + 1)
                     continue
                 if byte == ord("}"):
                     self.offset += 1
@@ -1202,22 +1194,22 @@ class _BoundedFfprobeJsonCursor:
                 self.take(ord(","), "ignored FFprobe JSON object")
                 self.string(maximum_bytes=128, label="ignored FFprobe JSON key")
                 self.take(ord(":"), "ignored FFprobe JSON object")
-                start_value(int(container_depth) + 1)
+                start_value(container_depth + 1)
                 continue
             if state == "first":
                 if byte == ord("]"):
                     self.offset += 1
                     frames.pop()
                     continue
-                frames[-1][1] = "after_value"
-                start_value(int(container_depth) + 1)
+                frames[-1] = (kind, "after_value", container_depth)
+                start_value(container_depth + 1)
                 continue
             if byte == ord("]"):
                 self.offset += 1
                 frames.pop()
                 continue
             self.take(ord(","), "ignored FFprobe JSON array")
-            start_value(int(container_depth) + 1)
+            start_value(container_depth + 1)
 
 
 def _next_member(cursor: _BoundedFfprobeJsonCursor, *, first: bool, label: str) -> bool:
@@ -1261,13 +1253,9 @@ def parse_audio_ffprobe_json(raw: bytes) -> AudioProbeStream | None:  # noqa: C9
         root_keys.add(key)
         cursor.take(ord(":"), "audio FFprobe root object")
         if key == "streams":
-            cursor.enter_known_container(
-                ord("["), depth=2, label="audio FFprobe streams array"
-            )
+            cursor.enter_known_container(ord("["), depth=2, label="audio FFprobe streams array")
             if cursor.peek() != ord("]"):
-                cursor.enter_known_container(
-                    ord("{"), depth=3, label="audio FFprobe stream object"
-                )
+                cursor.enter_known_container(ord("{"), depth=3, label="audio FFprobe stream object")
                 fields: dict[str, object] = {}
                 first_field = True
                 while cursor.peek() != ord("}"):
@@ -1281,9 +1269,7 @@ def parse_audio_ffprobe_json(raw: bytes) -> AudioProbeStream | None:  # noqa: C9
                     if field not in {"codec_type", "sample_rate", "channels"}:
                         raise FfprobeJsonError("audio FFprobe stream keys are invalid")
                     if field in fields:
-                        raise FfprobeJsonError(
-                            f"duplicate authoritative stream key: {field}"
-                        )
+                        raise FfprobeJsonError(f"duplicate authoritative stream key: {field}")
                     cursor.take(ord(":"), "audio FFprobe stream object")
                     fields[field] = cursor.scalar(
                         maximum_bytes=32,
@@ -1292,14 +1278,10 @@ def parse_audio_ffprobe_json(raw: bytes) -> AudioProbeStream | None:  # noqa: C9
                 cursor.take(ord("}"), "audio FFprobe stream object")
                 stream = fields
                 if cursor.peek() != ord("]"):
-                    raise FfprobeJsonError(
-                        "audio FFprobe streams must contain zero or one object"
-                    )
+                    raise FfprobeJsonError("audio FFprobe streams must contain zero or one object")
             cursor.take(ord("]"), "audio FFprobe streams array")
         else:
-            cursor.enter_known_container(
-                ord("["), depth=2, label=f"audio FFprobe {key} wrapper"
-            )
+            cursor.enter_known_container(ord("["), depth=2, label=f"audio FFprobe {key} wrapper")
             first_item = True
             while cursor.peek() != ord("]"):
                 if not first_item:
@@ -1390,6 +1372,43 @@ _FINAL_STREAM_KEYS = frozenset(
 )
 
 
+def _parse_final_probe_stream(cursor: _BoundedFfprobeJsonCursor) -> FinalProbeStream:
+    cursor.enter_known_container(ord("{"), depth=3, label="final FFprobe stream object")
+    fields: dict[str, object] = {}
+    first_field = True
+    while cursor.peek() != ord("}"):
+        if not first_field:
+            cursor.take(ord(","), "final FFprobe stream object")
+        first_field = False
+        field = cursor.string(maximum_bytes=128, label="final FFprobe stream key")
+        if field not in _FINAL_STREAM_KEYS:
+            raise FfprobeJsonError("final FFprobe stream key is outside the allowlist")
+        if field in fields:
+            raise FfprobeJsonError(f"duplicate authoritative stream key: {field}")
+        cursor.take(ord(":"), "final FFprobe stream object")
+        fields[field] = cursor.scalar(
+            maximum_bytes=128,
+            label=f"final FFprobe {field}",
+        )
+    cursor.take(ord("}"), "final FFprobe stream object")
+    return FinalProbeStream(fields)
+
+
+def _parse_final_probe_streams(cursor: _BoundedFfprobeJsonCursor) -> list[FinalProbeStream]:
+    result: list[FinalProbeStream] = []
+    cursor.enter_known_container(ord("["), depth=2, label="final FFprobe streams")
+    first_stream = True
+    while cursor.peek() != ord("]"):
+        if not first_stream:
+            cursor.take(ord(","), "final FFprobe streams array")
+        first_stream = False
+        if len(result) == 2:
+            raise FfprobeJsonError("final FFprobe must contain one or two streams")
+        result.append(_parse_final_probe_stream(cursor))
+    cursor.take(ord("]"), "final FFprobe streams array")
+    return result
+
+
 def parse_final_ffprobe_json(raw: bytes) -> tuple[FinalProbeStream, ...]:
     cursor = _BoundedFfprobeJsonCursor(
         raw,
@@ -1412,47 +1431,12 @@ def parse_final_ffprobe_json(raw: bytes) -> tuple[FinalProbeStream, ...]:
         root_keys.add(key)
         cursor.take(ord(":"), "final FFprobe root object")
         if key != "streams":
-            cursor.enter_known_container(
-                ord("["), depth=2, label=f"final FFprobe {key} wrapper"
-            )
+            cursor.enter_known_container(ord("["), depth=2, label=f"final FFprobe {key} wrapper")
             if cursor.peek() != ord("]"):
                 raise FfprobeJsonError(f"final FFprobe {key} wrapper must be empty")
             cursor.take(ord("]"), f"final FFprobe {key} wrapper")
             continue
-        cursor.enter_known_container(ord("["), depth=2, label="final FFprobe streams")
-        first_stream = True
-        while cursor.peek() != ord("]"):
-            if not first_stream:
-                cursor.take(ord(","), "final FFprobe streams array")
-            first_stream = False
-            if len(result) == 2:
-                raise FfprobeJsonError("final FFprobe must contain one or two streams")
-            cursor.enter_known_container(
-                ord("{"), depth=3, label="final FFprobe stream object"
-            )
-            fields: dict[str, object] = {}
-            first_field = True
-            while cursor.peek() != ord("}"):
-                if not first_field:
-                    cursor.take(ord(","), "final FFprobe stream object")
-                first_field = False
-                field = cursor.string(maximum_bytes=128, label="final FFprobe stream key")
-                if field not in _FINAL_STREAM_KEYS:
-                    raise FfprobeJsonError(
-                        "final FFprobe stream key is outside the allowlist"
-                    )
-                if field in fields:
-                    raise FfprobeJsonError(
-                        f"duplicate authoritative stream key: {field}"
-                    )
-                cursor.take(ord(":"), "final FFprobe stream object")
-                fields[field] = cursor.scalar(
-                    maximum_bytes=128,
-                    label=f"final FFprobe {field}",
-                )
-            cursor.take(ord("}"), "final FFprobe stream object")
-            result.append(FinalProbeStream(fields))
-        cursor.take(ord("]"), "final FFprobe streams array")
+        result = _parse_final_probe_streams(cursor)
     cursor.take(ord("}"), "final FFprobe root object")
     cursor.finish()
     if "streams" not in root_keys:
@@ -1586,9 +1570,7 @@ def validate_final_probe_streams(  # noqa: C901
             audio["nb_read_frames"], "audio packet count", positive=True
         )
         if packet_count > expectation.audio_packet_upper_bound:
-            raise FinalContainerAudioPacketBoundError(
-                "final audio packet bound was exceeded"
-            )
+            raise FinalContainerAudioPacketBoundError("final audio packet bound was exceeded")
     elif audio_streams:
         raise FinalContainerValidationError("final container has unexpected audio")
 
@@ -1612,8 +1594,29 @@ def _parse_progress_numeric_value(key: str, value: bytes) -> int | None:
     return number
 
 
+def _progress_key_value(raw_line: bytes, maximum_value_bytes: int | None) -> tuple[str, bytes]:
+    if len(raw_line) > FINAL_ENCODING_LINE_BYTES:
+        raise EncodingProgressError("progress line exceeds its cap")
+    if raw_line.endswith(b"\r\n"):
+        line = raw_line[:-2]
+    elif raw_line.endswith(b"\n"):
+        line = raw_line[:-1]
+    else:
+        raise EncodingProgressError("progress line has no terminator")
+    if b"=" not in line:
+        raise EncodingProgressError("progress line has no key separator")
+    key, value = line.split(b"=", 1)
+    if maximum_value_bytes is not None and len(value) > maximum_value_bytes:
+        raise EncodingProgressError("progress value exceeds its cap")
+    if not _PROGRESS_KEY.fullmatch(key) or any(byte < 0x20 or byte > 0x7E for byte in value):
+        raise EncodingProgressError("progress line syntax is invalid")
+    return key.decode("ascii"), value
+
+
 class FfmpegProgressParser:
     """Incremental legal-line parser with semantic stall-reset reporting."""
+
+    _VALUE_CAP: int | None = None
 
     def __init__(self) -> None:
         self.maximums = {
@@ -1624,23 +1627,10 @@ class FfmpegProgressParser:
         }
         self.ended = False
 
-    def feed_line(self, raw_line: bytes) -> bool:  # noqa: C901
+    def feed_line(self, raw_line: bytes) -> bool:
         if self.ended:
             raise EncodingProgressError("progress bytes follow progress=end")
-        if len(raw_line) > FINAL_ENCODING_LINE_BYTES:
-            raise EncodingProgressError("progress line exceeds its cap")
-        if raw_line.endswith(b"\r\n"):
-            line = raw_line[:-2]
-        elif raw_line.endswith(b"\n"):
-            line = raw_line[:-1]
-        else:
-            raise EncodingProgressError("progress line has no terminator")
-        if b"=" not in line:
-            raise EncodingProgressError("progress line has no key separator")
-        key, value = line.split(b"=", 1)
-        if not _PROGRESS_KEY.fullmatch(key) or any(byte < 0x20 or byte > 0x7E for byte in value):
-            raise EncodingProgressError("progress line syntax is invalid")
-        decoded_key = key.decode("ascii")
+        decoded_key, value = _progress_key_value(raw_line, self._VALUE_CAP)
         if decoded_key in self.maximums:
             number = _parse_progress_numeric_value(decoded_key, value)
             if number is None:
@@ -1674,43 +1664,6 @@ class FinalDecodeProgressParser(FfmpegProgressParser):
             "out_time_ms": _I64_MIN - 1,
         }
         self.ended = False
-
-    def feed_line(self, raw_line: bytes) -> bool:
-        if self.ended:
-            raise EncodingProgressError("progress bytes follow progress=end")
-        if len(raw_line) > FINAL_ENCODING_LINE_BYTES:
-            raise EncodingProgressError("progress line exceeds its cap")
-        if raw_line.endswith(b"\r\n"):
-            line = raw_line[:-2]
-        elif raw_line.endswith(b"\n"):
-            line = raw_line[:-1]
-        else:
-            raise EncodingProgressError("progress line has no terminator")
-        if b"=" not in line:
-            raise EncodingProgressError("progress line has no key separator")
-        key, value = line.split(b"=", 1)
-        if len(value) > self._VALUE_CAP:
-            raise EncodingProgressError("progress value exceeds its cap")
-        if not _PROGRESS_KEY.fullmatch(key) or any(
-            byte < 0x20 or byte > 0x7E for byte in value
-        ):
-            raise EncodingProgressError("progress line syntax is invalid")
-        decoded_key = key.decode("ascii")
-        if decoded_key in self.maximums:
-            number = _parse_progress_numeric_value(decoded_key, value)
-            if number is None:
-                return False
-            increased = number > self.maximums[decoded_key]
-            self.maximums[decoded_key] = max(self.maximums[decoded_key], number)
-            return increased
-        if decoded_key == "progress":
-            if value == b"continue":
-                return False
-            if value == b"end":
-                self.ended = True
-                return False
-            raise EncodingProgressError("progress control value is invalid")
-        return False
 
 
 def encoding_control_phase_peaks() -> dict[str, int]:

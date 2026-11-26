@@ -27,8 +27,8 @@ DOC_PATHS = (
     Path("CHANGELOG.md"),
 )
 
-MOGE_BASIC_COMMAND = "uv run depth-surge-3d clip.mp4 --depth-model-version moge2 --model-size vitb"
-MOGE_METRIC_COMMAND = """uv run depth-surge-3d clip.mp4 --depth-model-version moge2 --model-size vitb \\
+MOGE_BASIC_COMMAND = "depth-surge-3d clip.mp4 --depth-model-version moge2 --model-size vitb"
+MOGE_METRIC_COMMAND = """depth-surge-3d clip.mp4 --depth-model-version moge2 --model-size vitb \\
   --stereo-geometry-mode metric_camera --format side_by_side --no-distortion \\
   --virtual-baseline-mm 63 --metric-convergence-distance auto \\
   --max-disparity-percent 2"""
@@ -146,7 +146,8 @@ def test_temporal_warning_is_verbatim(path: Path) -> None:
 
 def test_installation_documents_only_supported_optional_command() -> None:
     text = Path("docs/INSTALLATION.md").read_text(encoding="utf-8")
-    assert "uv sync --extra moge2" in text
+    assert "uv sync --extra moge2 --locked --no-editable --no-dev --inexact --python 3.11" in text
+    assert r".\1.install-uv-qinglong.ps1 -WithMoGe2" in text
     assert "uv sync --extra requirements-moge2" not in text
     assert "uv sync -r requirements-moge2.txt" not in text
 

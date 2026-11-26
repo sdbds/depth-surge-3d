@@ -12,7 +12,7 @@ import stat
 from typing import Any, Literal
 
 from ...io.nofollow_io import AcquiredRoot, NoFollowPathError
-from ...utils.path_utils import format_ffmpeg_time, parse_time_string
+from ...utils.path_utils import ffmpeg_frame_interval, format_ffmpeg_time, parse_time_string
 from .bounded_process import (
     BoundedProcessCaptureV1,
     ProcessOutputBudgetError,
@@ -176,12 +176,11 @@ def _identity_from_stat(metadata: os.stat_result) -> OpenFileIdentityV1:
 def _identity_from_open_handle(handle) -> OpenFileIdentityV1:
     if os.name != "nt":
         return _identity_from_stat(os.fstat(handle.fileno()))
-    import msvcrt
-
+    from ...io._win32 import get_osfhandle
     from ...io.file_identity import windows_identity_from_handle
 
     identity, _links, _attributes = windows_identity_from_handle(
-        int(msvcrt.get_osfhandle(handle.fileno())),
+        get_osfhandle(handle.fileno()),
         require_directory=False,
     )
     return OpenFileIdentityV1(
@@ -379,21 +378,7 @@ def _decode_pcm_byte_count(
     return result.byte_count
 
 
-def prepare_selected_audio_v1(
-    *,
-    output_dir: Path,
-    original_video: str | Path,
-    settings: dict[str, Any],
-    frame_count: int,
-    fps: str,
-    cancelled: Callable[[], bool] | None = None,
-) -> SelectedAudioIdentityV1:
-    """Freeze the one selected audio source and its exact usable sample boundary."""
-
-    if not settings.get("preserve_audio", True):
-        return SelectedAudioIdentityV1(
-            "disabled", None, None, None, None, (), "disabled", None, None, None, None
-        )
+def _positive_video_rate(frame_count: int, fps: str) -> Fraction:
     if type(frame_count) is not int or frame_count <= 0:
         raise FinalAudioPcmOverflowError("video frame count must be positive")
     try:
@@ -402,6 +387,56 @@ def prepare_selected_audio_v1(
         raise FinalAudioPcmOverflowError("video frame rate must be positive") from error
     if rate <= 0:
         raise FinalAudioPcmOverflowError("video frame rate must be positive")
+    return rate
+
+
+def _selected_audio_interval(
+    settings: dict[str, Any], frame_count: int, rate: Fraction, clip_start_frame: int | None
+) -> tuple[str, ...]:
+    if clip_start_frame is None:
+        clip_arguments = _resolve_clip_arguments(
+            settings, frame_count=frame_count, output_rate=rate
+        )
+    else:
+        start, duration = ffmpeg_frame_interval(
+            clip_start_frame, clip_start_frame + frame_count, rate
+        )
+        clip_arguments = (
+            *(("-ss", start) if clip_start_frame else ()),
+            *(("-t", duration) if settings.get("end_time") else ()),
+        )
+    return clip_arguments
+
+
+def _audio_end_sample(frame_count: int, sample_rate: int, rate: Fraction) -> int:
+    numerator = _checked_mul(frame_count, sample_rate, "audio sample numerator")
+    numerator = _checked_mul(numerator, rate.denominator, "audio sample numerator")
+    if numerator > _U64_MAX - (rate.numerator - 1):
+        raise FinalAudioPcmOverflowError("audio end-sample numerator exceeds u64")
+    audio_end_sample = (numerator + rate.numerator - 1) // rate.numerator
+    _checked_u64(audio_end_sample, "audio end sample")
+    if audio_end_sample <= 0:
+        raise FinalAudioPcmOverflowError("audio end sample must be positive")
+    return audio_end_sample
+
+
+def prepare_selected_audio_v1(
+    *,
+    output_dir: Path,
+    original_video: str | Path,
+    settings: dict[str, Any],
+    frame_count: int,
+    fps: str,
+    cancelled: Callable[[], bool] | None = None,
+    clip_start_frame: int | None = None,
+) -> SelectedAudioIdentityV1:
+    """Freeze the one selected audio source and its exact usable sample boundary."""
+
+    if not settings.get("preserve_audio", True):
+        return SelectedAudioIdentityV1(
+            "disabled", None, None, None, None, (), "disabled", None, None, None, None
+        )
+    rate = _positive_video_rate(frame_count, fps)
     flac = Path(output_dir) / "original_audio.flac"
     if _regular_nonlink(flac):
         selection: Literal["original_audio_flac", "original_video"] = "original_audio_flac"
@@ -410,11 +445,7 @@ def prepare_selected_audio_v1(
         selection = "original_video"
         selected_path = Path(original_video)
     hashed = _hash_open_regular_file(selected_path, cancelled=cancelled)
-    clip_arguments = _resolve_clip_arguments(
-        settings,
-        frame_count=frame_count,
-        output_rate=rate,
-    )
+    clip_arguments = _selected_audio_interval(settings, frame_count, rate, clip_start_frame)
     if cancelled is None:
         stream = _probe_first_audio_stream(hashed.path, clip_arguments)
     else:
@@ -463,14 +494,7 @@ def prepare_selected_audio_v1(
             0,
             None,
         )
-    numerator = _checked_mul(frame_count, stream.sample_rate, "audio sample numerator")
-    numerator = _checked_mul(numerator, rate.denominator, "audio sample numerator")
-    if numerator > _U64_MAX - (rate.numerator - 1):
-        raise FinalAudioPcmOverflowError("audio end-sample numerator exceeds u64")
-    audio_end_sample = (numerator + rate.numerator - 1) // rate.numerator
-    _checked_u64(audio_end_sample, "audio end sample")
-    if audio_end_sample <= 0:
-        raise FinalAudioPcmOverflowError("audio end sample must be positive")
+    audio_end_sample = _audio_end_sample(frame_count, stream.sample_rate, rate)
     return SelectedAudioIdentityV1(
         selection,
         hashed.path,

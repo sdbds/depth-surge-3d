@@ -26,9 +26,8 @@ dependencies = [
     "torch==2.13.0",
     "torchvision>=0.15.0",
     "xformers; sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
-    "flash-attn==2.8.3.post1; sys_platform == 'linux'",
     "triton-windows; sys_platform == 'win32' and python_version == '3.11'",
-    "flash-attn==2.8.4; sys_platform == 'win32' and python_version == '3.11'",
+    "flash-attn @ https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.4/flash_attn-2.8.4+cu130torch2.13.0cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.11'",
     "opencv-python>=4.8.0",
     "numpy>=1.24.0,<2.0.0",
     "Pillow>=10.0.0",
@@ -46,12 +45,14 @@ dependencies = [
     "matplotlib>=3.7.0",
     "imageio>=2.30.0",
     "imageio-ffmpeg>=0.4.7",
-    "decord>=0.6.0",
+    # Open3D 0.19's Linux/Windows wheels require this; its macOS metadata does not.
+    "ipywidgets>=8.0.4; sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')",
     "addict>=2.4.0",
-    "depth-anything-3",
+    "depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3.git@3d835ec1a5802d64a8b8b15f817a1ab54809bfe4",
 ]
 
 [project.optional-dependencies]
+flash-attn = ["flash-attn==2.8.3.post1; sys_platform == 'linux'"]
 moge2 = [
     "moge @ git+https://github.com/microsoft/MoGe.git@925b8ed835a7a9cdb7578ba15c658a0afc969030",
 ]
@@ -68,10 +69,20 @@ Issues = "https://github.com/Tok/depth-surge-3d/issues"
 requires = [
     "hatchling",
     "setuptools>=84",
-    "numpy>=1.24,<2",
-    "torch==2.13.0",
+    "pybind11==3.0.4",
 ]
 build-backend = "hatchling.build"
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "hatch_build.py" },
+    { file = "scripts/build_quality_task0_native.py" },
+    { file = "native/quality_kd_native.cpp" },
+    { file = "src/depth_surge_3d/**/*.py" },
+    { file = "src/depth_surge_3d/_vendor/**/UPSTREAM.json" },
+    { file = "README.md" },
+]
 
 [tool.uv.extra-build-dependencies]
 depth-anything-3 = ["hatchling"]
@@ -95,8 +106,14 @@ exclude = [
 [tool.hatch.build.hooks.custom]
 path = "hatch_build.py"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/depth_surge_3d"]
+
 [dependency-groups]
 dev= [
+    "hatchling",
+    "setuptools>=84",
+    "pybind11==3.0.4",
     "pytest>=7.0.0",
     "pytest-cov>=4.1.0",
     "black==25.1.0",
@@ -105,7 +122,6 @@ dev= [
 ]
 
 [tool.uv.sources]
-depth-anything-3 = { git = "https://github.com/ByteDance-Seed/Depth-Anything-3" }
 torch = [
     { index = "pytorch-cu130", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
     { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
@@ -116,9 +132,6 @@ torchvision = [
 ]
 xformers = [
     { index = "pytorch-cu130", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
-]
-flash-attn = [
-    { url = "https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.4/flash_attn-2.8.4+cu130torch2.13.0cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl", marker = "sys_platform == 'win32' and python_version == '3.11'" },
 ]
 
 [[tool.uv.index]]

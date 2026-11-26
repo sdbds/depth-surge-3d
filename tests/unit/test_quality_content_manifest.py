@@ -71,6 +71,7 @@ def test_relative_quality_input_manifest_hashes_complete_png_content(
         ],
         "geometry": result.payload["geometry"],
     }
+
     def canonical(value):
         return json.dumps(
             value,
@@ -79,20 +80,26 @@ def test_relative_quality_input_manifest_hashes_complete_png_content(
             ensure_ascii=True,
             allow_nan=False,
         ).encode("ascii")
-    assert result.payload["native_geometry_fingerprint"] == hashlib.sha256(
-        canonical(geometry_identity)
-    ).hexdigest()
-    assert result.payload["native_geometry_fingerprint"] != hashlib.sha256(
-        canonical({**geometry_identity, "geometry_mode": "metric"})
-    ).hexdigest()
-    assert result.payload["native_geometry_fingerprint"] != hashlib.sha256(
-        canonical(
-            {
-                **geometry_identity,
-                "relative_encoding_scale_float32_bits": "3f800000",
-            }
-        )
-    ).hexdigest()
+
+    assert (
+        result.payload["native_geometry_fingerprint"]
+        == hashlib.sha256(canonical(geometry_identity)).hexdigest()
+    )
+    assert (
+        result.payload["native_geometry_fingerprint"]
+        != hashlib.sha256(canonical({**geometry_identity, "geometry_mode": "metric"})).hexdigest()
+    )
+    assert (
+        result.payload["native_geometry_fingerprint"]
+        != hashlib.sha256(
+            canonical(
+                {
+                    **geometry_identity,
+                    "relative_encoding_scale_float32_bits": "3f800000",
+                }
+            )
+        ).hexdigest()
+    )
 
 
 def test_quality_manifest_streams_directly_from_durable_upstream_records(tmp_path: Path) -> None:
@@ -130,9 +137,7 @@ def test_quality_manifest_streams_directly_from_durable_upstream_records(tmp_pat
 
     assert payload["frame_names"] == ["frame_000001"]
     assert payload["guides"][0]["sha256"] == hashlib.sha256(guide.read_bytes()).hexdigest()
-    assert payload["geometry"][0]["sha256"] == hashlib.sha256(
-        geometry.read_bytes()
-    ).hexdigest()
+    assert payload["geometry"][0]["sha256"] == hashlib.sha256(geometry.read_bytes()).hexdigest()
     assert result.raw_sha256 == hashlib.sha256(output.read_bytes()).hexdigest()
     assert output.read_bytes() == legacy.raw
     assert not hasattr(result, "payload")

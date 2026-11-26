@@ -10,17 +10,13 @@ if (Test-Path ".venv\Scripts\Activate.ps1") {
 } elseif (Test-Path "venv\Scripts\Activate.ps1") {
     $venvPath = "venv\Scripts\Activate.ps1"
 } else {
-    Write-Host "Error: Virtual environment not found. Run .\setup.ps1 first." -ForegroundColor Red
+    Write-Host "Error: Virtual environment not found. Run .\1.install-uv-qinglong.ps1 first." -ForegroundColor Red
     exit 1
 }
 
 # Activate virtual environment
 Write-Host "Activating virtual environment..."
 & $venvPath
-
-# Install additional Flask dependencies if needed (quietly)
-Write-Host "Checking dependencies..."
-python -m pip install flask flask-socketio *>$null
 
 # Create upload and output directories
 New-Item -ItemType Directory -Force -Path "uploads" | Out-Null

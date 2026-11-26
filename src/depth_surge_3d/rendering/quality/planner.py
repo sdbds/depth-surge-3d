@@ -201,8 +201,7 @@ def _union_group_pairs(
             right_mask = int(records[right]["lane_mask"])
             if relation == "same":
                 adjacent = (
-                    (((left_mask << 1) & right_mask) | ((right_mask << 1) & left_mask))
-                    & 0xFFFF
+                    (((left_mask << 1) & right_mask) | ((right_mask << 1) & left_mask)) & 0xFFFF
                 ) != 0
             elif relation == "horizontal":
                 adjacent = bool(left_mask & 0x8000) and bool(right_mask & 0x0001)
@@ -257,11 +256,9 @@ def _component_member_order(
     component_ids: np.ndarray,
     component_count: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    members, offsets = (
-        fallback.native_kd._require_native().build_component_member_order(
-            component_ids,
-            component_count,
-        )
+    members, offsets = fallback.native_kd._require_native().build_component_member_order(
+        component_ids,
+        component_count,
     )
     offsets.setflags(write=False)
     members.setflags(write=False)
@@ -280,21 +277,11 @@ def _fixed_graph_components(
     if graph_arena is None:
         raise RuntimeError("Quality graph arena was released before planning")
     storage = graph_arena.storage
-    parent = np.ndarray(
-        (count,), dtype=np.uint32, buffer=storage, offset=_GRAPH_PARENT_OFFSET
-    )
-    rank = np.ndarray(
-        (count,), dtype=np.uint8, buffer=storage, offset=_GRAPH_RANK_OFFSET
-    )
-    members = np.ndarray(
-        (count,), dtype=np.uint32, buffer=storage, offset=_GRAPH_MEMBERS_OFFSET
-    )
-    keys = np.ndarray(
-        (count,), dtype=np.uint32, buffer=storage, offset=_GRAPH_KEYS_OFFSET
-    )
-    workspace_count = (storage.nbytes - _GRAPH_WORKSPACE_OFFSET) // np.dtype(
-        np.int32
-    ).itemsize
+    parent = np.ndarray((count,), dtype=np.uint32, buffer=storage, offset=_GRAPH_PARENT_OFFSET)
+    rank = np.ndarray((count,), dtype=np.uint8, buffer=storage, offset=_GRAPH_RANK_OFFSET)
+    members = np.ndarray((count,), dtype=np.uint32, buffer=storage, offset=_GRAPH_MEMBERS_OFFSET)
+    keys = np.ndarray((count,), dtype=np.uint32, buffer=storage, offset=_GRAPH_KEYS_OFFSET)
+    workspace_count = (storage.nbytes - _GRAPH_WORKSPACE_OFFSET) // np.dtype(np.int32).itemsize
     workspace = np.ndarray(
         (workspace_count,),
         dtype=np.int32,
@@ -373,6 +360,47 @@ def _linear_p95_in_place(values: np.ndarray) -> float:
     upper = int(np.ceil(position))
     fraction = position - lower
     return float(values[lower]) * (1.0 - fraction) + float(values[upper]) * fraction
+
+
+def _component_may_score(
+    working: np.ndarray,
+    indexes: np.ndarray,
+    region_id: int,
+    render_shape: tuple[int, int],
+    repair_arena: QualityByteArena,
+    analysis: QualityVisibilityAnalysis,
+    safe_donor_mask: np.ndarray,
+) -> bool:
+    preflight_mark = repair_arena.mark()
+    native = fallback.native_kd._require_native()
+    try:
+        target_pixels = _component_target_pixels(
+            working,
+            indexes,
+            region_id=region_id,
+            render_shape=render_shape,
+            arena=repair_arena,
+        )
+        if target_pixels.size < QUALITY_EXEMPLAR_MIN_TARGET_PIXELS:
+            return False
+        mask_workspace = repair_arena.allocate(
+            _EXEMPLAR_MASK_PREFLIGHT_BYTES,
+            np.uint8,
+        )
+        return native.component_may_score_exemplar(
+            analysis.coverage_count,
+            analysis.pure_region_id,
+            safe_donor_mask,
+            target_pixels,
+            region_id,
+            mask_workspace,
+        )
+    except native.QualityBudgetError as error:
+        raise QualityRepairBudgetError(
+            "64 MiB repair arena exceeded during exemplar preflight"
+        ) from error
+    finally:
+        repair_arena.rewind(preflight_mark)
 
 
 def plan_quality_repairs(
@@ -488,36 +516,9 @@ def plan_quality_repairs(
         region_id = int(working[int(indexes[0])]["region_id"])
         if not bool(region_has_safe_donor[region_id]):
             continue
-        preflight_mark = repair_arena.mark()
-        native = fallback.native_kd._require_native()
-        try:
-            target_pixels = _component_target_pixels(
-                working,
-                indexes,
-                region_id=region_id,
-                render_shape=render_shape,
-                arena=repair_arena,
-            )
-            if target_pixels.size < QUALITY_EXEMPLAR_MIN_TARGET_PIXELS:
-                continue
-            mask_workspace = repair_arena.allocate(
-                _EXEMPLAR_MASK_PREFLIGHT_BYTES,
-                np.uint8,
-            )
-            may_score = native.component_may_score_exemplar(
-                analysis.coverage_count,
-                analysis.pure_region_id,
-                safe_donor_mask,
-                target_pixels,
-                region_id,
-                mask_workspace,
-            )
-        except native.QualityBudgetError as error:
-            raise QualityRepairBudgetError(
-                "64 MiB repair arena exceeded during exemplar preflight"
-            ) from error
-        finally:
-            repair_arena.rewind(preflight_mark)
+        may_score = _component_may_score(
+            working, indexes, region_id, render_shape, repair_arena, analysis, safe_donor_mask
+        )
         if not may_score:
             continue
         repaired = exemplar.repair_component_exemplar(
@@ -543,9 +544,7 @@ def plan_quality_repairs(
         local_evaluated_slot_count=local_evaluated_slot_count,
         local_physical_sample_read_count=local_physical_sample_read_count,
         local_filled_run_count=local_filled_run_count,
-        local_budget_skipped_run_count=(
-            budgets.local_budget_skipped_run_count - skipped_before
-        ),
+        local_budget_skipped_run_count=(budgets.local_budget_skipped_run_count - skipped_before),
         fallback_indexed_donor_count=fallback_indexed_donor_count,
         fallback_index_bytes=fallback_index_bytes,
         fallback_query_count=fallback_query_count,

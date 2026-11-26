@@ -48,7 +48,7 @@ The approved gate uses CUDA. An exploratory `--device cpu` run records `peak_vra
 Install the pinned optional dependency:
 
 ```powershell
-uv sync --extra moge2
+.\1.install-uv-qinglong.ps1 -WithMoGe2
 ```
 
 ## 4. Run the Gate
@@ -56,7 +56,7 @@ uv sync --extra moge2
 Use the approved corpus and a new, empty output directory:
 
 ```powershell
-uv run --extra moge2 python scripts/verify_moge2_release.py `
+.\.venv\Scripts\python.exe scripts/verify_moge2_release.py `
   --corpus-config D:\moge2-corpus\corpus.json `
   --output-dir artifacts\moge2-release\2026-08-16 `
   --device cuda `

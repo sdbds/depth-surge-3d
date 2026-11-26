@@ -686,11 +686,7 @@ class StreamedVrWorkReservationV1:
 
         self.validate_current_authority()
         observed_ready = self._load_ready()
-        if (
-            self.ready is not None
-            and observed_ready is not None
-            and self.ready != observed_ready
-        ):
+        if self.ready is not None and observed_ready is not None and self.ready != observed_ready:
             raise ReservationConflictError("stream work ready evidence changed")
         ready = self.ready if self.ready is not None else observed_ready
         expected_manifest = ready.manifest_identity if ready is not None else None
@@ -705,9 +701,7 @@ class StreamedVrWorkReservationV1:
         for path in present_manifest_paths:
             self._unlink_work_file(path, expected=expected_manifest)
         self._unlink_work_file(self.output_path, expected=expected_output)
-        if ready is not None and (
-            self.ready_path.exists() or self.ready_path.is_symlink()
-        ):
+        if ready is not None and (self.ready_path.exists() or self.ready_path.is_symlink()):
             self._unlink_control(self.ready_path, canonical_json_bytes(ready.to_object()))
         self._unlink_control(self.index_path, canonical_json_bytes(self.index.to_object()))
         self.ready = None

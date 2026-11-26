@@ -682,15 +682,7 @@ def _canonicalize_present_fields(
         values[field] = value
 
 
-def canonicalize_vdpp_calibration_diagnostics(
-    calibration: object,
-    *,
-    shot_length: int,
-    native_shape: tuple[int, int],
-) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
-    """Canonicalize and strictly validate a writer-supplied calibration record."""
-
-    tile_count = planned_tile_count(shot_length, native_shape)
+def _calibration_record(calibration: object) -> dict[str, Any]:
     if type(calibration) is not dict:
         raise TypeError("VDPP calibration diagnostics must be a dictionary")
     if set(calibration) != set(CALIBRATION_KEYS):
@@ -702,7 +694,12 @@ def canonicalize_vdpp_calibration_diagnostics(
     reason = values["fallback_reason"]
     if reason is not None and (type(reason) is not str or reason not in FALLBACK_REASON_ORDER):
         raise ValueError("VDPP calibration fallback reason is invalid")
+    return values
 
+
+def _canonicalize_sample_counts(
+    values: dict[str, Any], shot_length: int, native_shape: tuple[int, int], tile_count: int
+) -> tuple[int, int, int, int]:
     height, width = native_shape
     shot_pixels = shot_length * height * width
     pair_count = _require_count(values["pair_count"], "pair_count", shot_pixels)
@@ -724,20 +721,10 @@ def canonicalize_vdpp_calibration_diagnostics(
     _same_float(midpoint_fraction, expected_midpoint_fraction, "midpoint_fraction")
     values["midpoint_fraction"] = expected_midpoint_fraction
     _canonicalize_present_fields(values, tile_count=tile_count)
+    return shot_pixels, pair_count, midpoint_count, flat_frame_count
 
-    if mode == "all_midpoint":
-        _require_nullability(values, _MOMENT_FIELDS, False)
-        _require_nullability(values, _FIT_FIELDS, False)
-        _require_nullability(values, _QUALITY_FIELDS, False)
-        if (
-            reason is not None
-            or pair_count != 0
-            or midpoint_count != shot_pixels
-            or flat_frame_count != shot_length
-        ):
-            raise ValueError("VDPP all_midpoint diagnostics are inconsistent")
-        return values
 
+def _required_evidence(mode: str, reason: str | None) -> tuple[bool, str, bool]:
     if mode == "ols" and reason is not None:
         raise ValueError("VDPP OLS calibration cannot have a fallback reason")
     if mode == "base_fallback" and reason is None:
@@ -767,7 +754,12 @@ def canonicalize_vdpp_calibration_diagnostics(
         quality_required = True
     else:
         raise ValueError("VDPP calibration fallback reason is inconsistent")
+    return moment_required, fit_kind, quality_required
 
+
+def _validate_required_fields(
+    values: dict[str, Any], moment_required: bool, fit_kind: str, quality_required: bool
+) -> None:
     _require_nullability(values, _MOMENT_FIELDS, moment_required)
     if fit_kind == "all":
         _require_nullability(values, _FIT_FIELDS, True)
@@ -782,6 +774,16 @@ def canonicalize_vdpp_calibration_diagnostics(
         _require_nullability(values, _FIT_FIELDS, False)
     _require_nullability(values, _QUALITY_FIELDS, quality_required)
 
+
+def _canonicalize_moments(
+    values: dict[str, Any],
+    moment_required: bool,
+    fit_kind: str,
+    quality_required: bool,
+    midpoint_count: int,
+    shot_pixels: int,
+    tile_count: int,
+) -> dict[str, float | None] | None:
     derived: dict[str, float | None] | None = None
     if moment_required:
         expected_source_std = normalize_bounded_stat(
@@ -816,7 +818,10 @@ def canonicalize_vdpp_calibration_diagnostics(
                 ),
                 planned_tile_count=tile_count,
             )
+    return derived
 
+
+def _validate_fit(values: dict[str, Any], fit_kind: str, tile_count: int) -> None:
     source_variance = values["source_variance"]
     raw_variance = values["raw_variance"]
     if fit_kind in {"correlation", "all"}:
@@ -846,6 +851,10 @@ def canonicalize_vdpp_calibration_diagnostics(
             values["scale"] = scale
             values["shift"] = shift
 
+
+def _validate_quality_derivation(
+    values: dict[str, Any], quality_required: bool, derived: dict[str, float | None] | None
+) -> float | None:
     preclip_total: float | None = None
     if quality_required:
         if derived is None:
@@ -859,16 +868,17 @@ def canonicalize_vdpp_calibration_diagnostics(
         preclip_total = derived["preclip_out_of_range_fraction"]
         if preclip_total is None:
             raise ValueError("VDPP preclip fraction could not be derived")
+    return preclip_total
 
-    identifiable_variances = (
-        source_variance is not None
-        and raw_variance is not None
-        and source_variance > VARIANCE_EPSILON
-        and raw_variance > VARIANCE_EPSILON
-    )
-    fit_prerequisites = (
-        flat_frame_count < shot_length and pair_count >= MIN_PAIR_COUNT and identifiable_variances
-    )
+
+def _matches_sample_reason(
+    reason: str,
+    shot_length: int,
+    flat_frame_count: int,
+    pair_count: int,
+    source_variance: float | None,
+    raw_variance: float | None,
+) -> bool:
     if reason == "source_no_range":
         causal = pair_count == 0 and flat_frame_count == shot_length
     elif reason == "too_few_pairs":
@@ -879,14 +889,48 @@ def canonicalize_vdpp_calibration_diagnostics(
         causal = (
             flat_frame_count < shot_length
             and pair_count >= MIN_PAIR_COUNT
+            and source_variance is not None
             and source_variance <= VARIANCE_EPSILON
         )
-    elif reason == "raw_variance":
+    else:
         causal = (
             flat_frame_count < shot_length
             and pair_count >= MIN_PAIR_COUNT
+            and source_variance is not None
+            and raw_variance is not None
             and source_variance > VARIANCE_EPSILON
             and raw_variance <= VARIANCE_EPSILON
+        )
+    return causal
+
+
+def _matches_calibration_reason(
+    values: dict[str, Any],
+    shot_length: int,
+    flat_frame_count: int,
+    pair_count: int,
+    preclip_total: float | None,
+) -> bool:
+    source_variance, raw_variance = values["source_variance"], values["raw_variance"]
+    reason, mode = values["fallback_reason"], values["mode"]
+    identifiable_variances = (
+        source_variance is not None
+        and raw_variance is not None
+        and source_variance > VARIANCE_EPSILON
+        and raw_variance > VARIANCE_EPSILON
+    )
+    fit_prerequisites = (
+        flat_frame_count < shot_length and pair_count >= MIN_PAIR_COUNT and identifiable_variances
+    )
+    if reason in {
+        "source_no_range",
+        "too_few_pairs",
+        "nonfinite_statistics",
+        "source_variance",
+        "raw_variance",
+    }:
+        return _matches_sample_reason(
+            reason, shot_length, flat_frame_count, pair_count, source_variance, raw_variance
         )
     elif reason == "nonfinite_fit":
         causal = fit_prerequisites
@@ -920,6 +964,7 @@ def canonicalize_vdpp_calibration_diagnostics(
             and values["correlation"] >= MIN_CORRELATION
             and values["postclip_contrast_ratio"] >= MIN_POSTCLIP_CONTRAST_RATIO
             and values["postclip_mean_drift"] <= MAX_POSTCLIP_MEAN_DRIFT
+            and preclip_total is not None
             and preclip_total > MAX_PRECLIP_OUT_OF_RANGE_FRACTION
         )
     else:
@@ -930,8 +975,49 @@ def canonicalize_vdpp_calibration_diagnostics(
             and values["correlation"] >= MIN_CORRELATION
             and values["postclip_contrast_ratio"] >= MIN_POSTCLIP_CONTRAST_RATIO
             and values["postclip_mean_drift"] <= MAX_POSTCLIP_MEAN_DRIFT
+            and preclip_total is not None
             and preclip_total <= MAX_PRECLIP_OUT_OF_RANGE_FRACTION
         )
+    return causal
+
+
+def canonicalize_vdpp_calibration_diagnostics(
+    calibration: object,
+    *,
+    shot_length: int,
+    native_shape: tuple[int, int],
+) -> dict[str, Any]:
+    """Canonicalize and strictly validate a writer-supplied calibration record."""
+
+    tile_count = planned_tile_count(shot_length, native_shape)
+    values = _calibration_record(calibration)
+    mode, reason = values["mode"], values["fallback_reason"]
+    shot_pixels, pair_count, midpoint_count, flat_frame_count = _canonicalize_sample_counts(
+        values, shot_length, native_shape, tile_count
+    )
+    if mode == "all_midpoint":
+        _require_nullability(values, _MOMENT_FIELDS, False)
+        _require_nullability(values, _FIT_FIELDS, False)
+        _require_nullability(values, _QUALITY_FIELDS, False)
+        if (
+            reason is not None
+            or pair_count != 0
+            or midpoint_count != shot_pixels
+            or flat_frame_count != shot_length
+        ):
+            raise ValueError("VDPP all_midpoint diagnostics are inconsistent")
+        return values
+
+    moment_required, fit_kind, quality_required = _required_evidence(mode, reason)
+    _validate_required_fields(values, moment_required, fit_kind, quality_required)
+    derived = _canonicalize_moments(
+        values, moment_required, fit_kind, quality_required, midpoint_count, shot_pixels, tile_count
+    )
+    _validate_fit(values, fit_kind, tile_count)
+    preclip_total = _validate_quality_derivation(values, quality_required, derived)
+    causal = _matches_calibration_reason(
+        values, shot_length, flat_frame_count, pair_count, preclip_total
+    )
     if not causal:
         raise ValueError(
             "VDPP calibration fallback mode/reason does not match the first failed gate"
@@ -942,8 +1028,8 @@ def canonicalize_vdpp_calibration_diagnostics(
 def _same_scalar_representation(actual: object, canonical: object) -> bool:
     if type(actual) is not type(canonical):
         return False
-    if type(actual) is float:
-        return actual.hex() == canonical.hex()  # type: ignore[union-attr]
+    if type(actual) is float and type(canonical) is float:
+        return actual.hex() == canonical.hex()
     return actual == canonical
 
 

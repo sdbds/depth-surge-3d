@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from contextvars import ContextVar
 import os
 from pathlib import Path
 import stat
+from typing import BinaryIO
 
 from .bounded_process import (
     BoundedProcessCaptureV1,
@@ -60,6 +62,20 @@ class FinalContainerDecodeBudgetError(FinalContainerProcessError):
 
 FiniteRunner = Callable[..., BoundedProcessResult]
 ProgressRunner = Callable[..., ProgressProcessResult]
+_bound_container: ContextVar[tuple[Path, BinaryIO] | None] = ContextVar(
+    "bound_container", default=None
+)
+
+
+def validate_open_linux_container(handle: BinaryIO, validator: Callable[[Path], bool]) -> bool:
+    """Give FFmpeg a path to this open file, not to a replaceable directory entry."""
+
+    path = Path(f"/proc/{os.getpid()}/fd/{handle.fileno()}")
+    token = _bound_container.set((path, handle))
+    try:
+        return validator(path)
+    finally:
+        _bound_container.reset(token)
 
 
 def _checked_u64(value: int, label: str) -> int:
@@ -140,27 +156,30 @@ def _run_finite(
     ).run(arguments)
 
 
-def validate_final_container_v4(
-    path: Path,
-    expectation: FinalContainerExpectation,
-    *,
-    ffprobe: str = "ffprobe",
-    ffmpeg: str = "ffmpeg",
-    finite_runner: FiniteRunner = _run_finite,
-    progress_runner: ProgressRunner = run_ffmpeg_progress_v1,
-    cancelled: Callable[[], bool] | None = None,
-) -> bool:
-    """Probe scalar media facts, then decode every accepted stream to null."""
-
-    candidate = Path(path)
+def _container_size(candidate: Path) -> int:
+    bound = _bound_container.get()
     try:
-        metadata = candidate.stat(follow_symlinks=False)
+        if bound is not None and candidate == bound[0]:
+            metadata = os.fstat(bound[1].fileno())
+        else:
+            metadata = candidate.lstat()
     except OSError as error:
         raise FinalContainerProcessError("final video candidate is unavailable") from error
-    if not stat.S_ISREG(metadata.st_mode) or candidate.is_symlink() or metadata.st_size <= 0:
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0:
         raise FinalContainerProcessError("final video candidate is not an ordinary file")
+    return metadata.st_size
+
+
+def _probe_final_container(
+    candidate: Path,
+    size: int,
+    expectation: FinalContainerExpectation,
+    ffprobe: str,
+    finite_runner: FiniteRunner,
+    cancelled: Callable[[], bool] | None,
+) -> None:
     probe_timeout_seconds = derive_final_probe_timeout_seconds(
-        metadata.st_size,
+        size,
         expectation,
     )
 
@@ -203,8 +222,14 @@ def validate_final_container_v4(
             "final FFprobe JSON exceeded its parser-state budget"
         ) from error
     validate_final_probe_streams(streams, expectation)
-    del streams, probe
 
+
+def _decode_final_container(
+    candidate: Path,
+    ffmpeg: str,
+    progress_runner: ProgressRunner,
+    cancelled: Callable[[], bool] | None,
+) -> None:
     decode_arguments = (
         ffmpeg,
         "-v",
@@ -246,4 +271,23 @@ def validate_final_container_v4(
         raise FinalContainerProcessError("final full decode emitted diagnostics or failed")
     if not progress.ended:
         raise FinalContainerProcessError("final full decode has no terminal progress state")
+
+
+def validate_final_container_v4(
+    path: Path,
+    expectation: FinalContainerExpectation,
+    *,
+    ffprobe: str = "ffprobe",
+    ffmpeg: str = "ffmpeg",
+    finite_runner: FiniteRunner = _run_finite,
+    progress_runner: ProgressRunner = run_ffmpeg_progress_v1,
+    cancelled: Callable[[], bool] | None = None,
+) -> bool:
+    """Probe scalar media facts, then decode every accepted stream to null."""
+
+    candidate = Path(path)
+    _probe_final_container(
+        candidate, _container_size(candidate), expectation, ffprobe, finite_runner, cancelled
+    )
+    _decode_final_container(candidate, ffmpeg, progress_runner, cancelled)
     return True

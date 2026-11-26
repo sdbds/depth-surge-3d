@@ -96,6 +96,50 @@ def test_rgb_preparation_keeps_cpu_rounding_for_cuda_fp32():
 
 
 class TestSeeThroughDepthEstimator:
+    def test_external_source_location_is_explicit_and_relocatable(self, tmp_path, monkeypatch):
+        module = _module()
+        root = _make_vendor_tree(tmp_path / "checkout")
+        monkeypatch.setenv(module.QINGLONG_CAPTIONS_ENV, str(root))
+        assert module.resolve_qinglong_captions_root() == root
+        invalid = tmp_path / "missing"
+        with pytest.raises(FileNotFoundError, match="source not found"):
+            module.resolve_qinglong_captions_root(invalid)
+        monkeypatch.setenv(module.QINGLONG_CAPTIONS_ENV, str(invalid))
+        with pytest.raises(FileNotFoundError, match="is missing"):
+            module.resolve_qinglong_captions_root()
+        assert module.resolve_qinglong_captions_root(root) == root
+
+    @pytest.mark.parametrize(
+        "error", [ImportError("vendor dependency"), OSError("weights disk offline")]
+    )
+    def test_failed_loader_cannot_advertise_a_ready_backend(self, tmp_path, error, capsys):
+        root = _make_vendor_tree(tmp_path / "checkout")
+        pipeline = MagicMock(side_effect=error)
+        estimator = _module().SeeThroughDepthEstimator(
+            device="cpu", source_root=root, pipeline_loader=pipeline
+        )
+        assert not estimator.load_model()
+        assert str(error) in capsys.readouterr().out
+        assert not estimator.get_model_info()["loaded"]
+        pipeline.assert_called_once()
+        with pytest.raises(RuntimeError, match="not loaded"):
+            estimator.estimate_depth_batch(np.zeros((1, 8, 8, 3), dtype=np.uint8))
+
+    @pytest.mark.parametrize(
+        "output,reason",
+        [
+            (SimpleNamespace(), "no depth map"),
+            (SimpleNamespace(depth_np=np.zeros((1, 3, 8, 8))), "depth shape"),
+        ],
+    )
+    def test_non_depth_output_is_not_a_valid_cpu_batch(self, output, reason):
+        estimator = _module().SeeThroughDepthEstimator(device="cpu", processing_resolution=16)
+        estimator.model = lambda **_: output
+        with pytest.raises(RuntimeError, match=reason):
+            estimator.estimate_depth_batch(np.zeros((1, 8, 8, 3), dtype=np.uint8))
+        estimator.unload_model()
+        assert not estimator.get_model_info()["loaded"]
+
     def test_defaults_target_the_see_through_marigold_model(self):
         module = _module()
 
@@ -450,6 +494,45 @@ def test_depth_processor_honors_estimator_batch_limit():
 
     assert input_size == 1080
     assert chunk_size == 1
+
+
+def test_opaque_batch_matches_individual_denoising_with_the_same_seed():
+    from diffusers import DDIMScheduler
+
+    calls = []
+
+    class TinyUNet:
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        def __call__(self, sample, timestep, encoder_hidden_states):
+            assert sample.shape[1:3] == (1, 12)
+            torch.testing.assert_close(sample[:, :, :4], sample[:, :, 4:8])
+            assert encoder_hidden_states.shape[0] == sample.shape[0]
+            calls.append(int(timestep))
+            return SimpleNamespace(sample=sample[:, :, -4:] * 0.1 + sample[:, :, :4] * 0.2)
+
+    pipeline = SimpleNamespace(
+        vae=SimpleNamespace(device="cpu", dtype=torch.float32),
+        unet=TinyUNet(),
+        scheduler=DDIMScheduler(num_train_timesteps=16),
+        empty_text_embed=None,
+        encode_rgb=lambda x: torch.cat((x, x[:, :1]), dim=1),
+        decode_depth=lambda x: x.mean(dim=1, keepdim=True),
+    )
+    pipeline.encode_empty_text = lambda: setattr(pipeline, "empty_text_embed", torch.zeros(1, 2, 3))
+
+    def denoise(frames):
+        return _module()._run_opaque_marigold_batch(
+            pipeline=pipeline, rgb_frames=frames, denoising_steps=4, seed=21
+        )
+
+    images = np.stack((np.zeros((8, 8, 3), np.uint8), np.full((8, 8, 3), 255, np.uint8)))
+    result = denoise(images)
+    assert calls == [12, 8, 4, 0]
+    np.testing.assert_allclose(result, np.concatenate([denoise(x[None]) for x in images]))
+    assert result.min() >= 0 and result.max() <= 1
+    assert not np.array_equal(result[0], result[1])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA synchronization regression")

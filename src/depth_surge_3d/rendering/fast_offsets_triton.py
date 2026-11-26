@@ -1,9 +1,10 @@
-"""Optional resident CUDA offsets for prevalidated relative Fast geometry."""
+"""Optional resident CUDA offsets for prevalidated relative geometry."""
 
 from __future__ import annotations
 
 import math
 import struct
+from typing import Literal
 
 import numpy as np
 import torch
@@ -19,6 +20,7 @@ except (ImportError, OSError):
 
 
 _DISABLED_CUDA_DEVICES: set[int] = set()
+_DISABLED_SINGLE_EYE_CUDA_DEVICES: set[int] = set()
 _OFFSET_BLOCK_PIXELS = 256
 _MAX_OFFSET_PIXELS = 2**31 - 1
 
@@ -34,6 +36,7 @@ if triton is not None:
         convergence_bits,
         scale_bits,
         BLOCK_PIXELS: tl.constexpr,
+        DIRECTION: tl.constexpr = 0,
     ):
         pixel = tl.program_id(0) * BLOCK_PIXELS + tl.arange(0, BLOCK_PIXELS)
         score = tl.load(near_score + pixel, mask=pixel < pixel_count, other=0.0).to(tl.float64)
@@ -44,10 +47,12 @@ if triton is not None:
         shift = shift * scale
         shift = shift * tl.full((), 16.0, tl.float64)
         half = tl.full((), 0.5, tl.float64)
-        left_value = libdevice.ceil(shift - half).to(tl.int32)
-        right_value = libdevice.ceil(-shift - half).to(tl.int32)
-        tl.store(left + pixel, left_value, mask=pixel < pixel_count)
-        tl.store(right + pixel, right_value, mask=pixel < pixel_count)
+        if DIRECTION >= 0:
+            left_value = libdevice.ceil(shift - half).to(tl.int32)
+            tl.store(left + pixel, left_value, mask=pixel < pixel_count)
+        if DIRECTION <= 0:
+            right_value = libdevice.ceil(-shift - half).to(tl.int32)
+            tl.store(right + pixel, right_value, mask=pixel < pixel_count)
 
 
 def triton_relative_offsets_prevalidated(
@@ -63,12 +68,46 @@ def triton_relative_offsets_prevalidated(
     abs(fine_shift) < width, so both offsets and kernel indexes fit
     int32. Other layouts/sizes retain the original checked host builder.
     """
+    return _relative_offsets_prevalidated(
+        near_score, stereo_strength=stereo_strength, convergence=convergence, direction=0
+    )
+
+
+def triton_relative_eye_offsets_prevalidated(
+    near_score: torch.Tensor,
+    *,
+    stereo_strength: float,
+    convergence: float,
+    eye: Literal["left", "right"],
+) -> torch.Tensor | None:
+    """Use the same bounded arithmetic with only one resident output plane."""
+    if eye not in ("left", "right"):
+        return None
+    result = _relative_offsets_prevalidated(
+        near_score,
+        stereo_strength=stereo_strength,
+        convergence=convergence,
+        direction=1 if eye == "left" else -1,
+    )
+    return None if result is None else result[0]
+
+
+def _relative_offsets_prevalidated(
+    near_score: torch.Tensor,
+    *,
+    stereo_strength: float,
+    convergence: float,
+    direction: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     if triton is None or near_score.device.type != "cuda" or not torch.cuda.is_available():
         return None
     device_index = near_score.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    if device_index in _DISABLED_CUDA_DEVICES:
+    disabled_devices = (
+        _DISABLED_CUDA_DEVICES if direction == 0 else _DISABLED_SINGLE_EYE_CUDA_DEVICES
+    )
+    if device_index in disabled_devices:
         return None
     if (
         near_score.dtype != torch.float32
@@ -87,7 +126,11 @@ def triton_relative_offsets_prevalidated(
     convergence_bits = struct.unpack("<Q", struct.pack("<d", float(np.float64(convergence))))[0]
     scale_bits = struct.unpack("<Q", struct.pack("<d", float(scale64)))[0]
     left = torch.empty(near_score.shape, dtype=torch.int32, device=near_score.device)
-    right = torch.empty(near_score.shape, dtype=torch.int32, device=near_score.device)
+    right = (
+        torch.empty(near_score.shape, dtype=torch.int32, device=near_score.device)
+        if direction == 0
+        else left
+    )
     try:
         _relative_offsets_kernel[(triton.cdiv(near_score.numel(), _OFFSET_BLOCK_PIXELS),)](
             near_score,
@@ -97,11 +140,12 @@ def triton_relative_offsets_prevalidated(
             convergence_bits,
             scale_bits,
             BLOCK_PIXELS=_OFFSET_BLOCK_PIXELS,
+            DIRECTION=direction,
             num_warps=4,
             enable_fp_fusion=False,
         )
     except triton.errors.TritonError:
-        _DISABLED_CUDA_DEVICES.add(device_index)
+        disabled_devices.add(device_index)
         return None
     except RuntimeError as error:
         if str(error) == "Triton Error [CUDA]: out of memory":

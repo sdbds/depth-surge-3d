@@ -130,7 +130,11 @@ class ProcessingOrchestrator:
             self.video_encoder.defer_final_reservation_retirement = True
 
     def _retire_final_encoding_reservation(self, *, success: bool) -> bool:
-        retire = getattr(self.video_encoder, "retire_final_encoding_reservation", None)
+        return self._retire_encoder_reservation(self.video_encoder, success=success)
+
+    @staticmethod
+    def _retire_encoder_reservation(video_encoder, *, success: bool) -> bool:
+        retire = getattr(video_encoder, "retire_final_encoding_reservation", None)
         if not callable(retire):
             return True
         try:
@@ -140,8 +144,15 @@ class ProcessingOrchestrator:
             print(f"Error: Could not retire final encoding reservation: {error}")
             return False
 
-    def _resume_cleanup_only(self, output_dir: Path) -> bool | None:  # noqa: C901
-        """Finish a committed prune generation without reopening the media pipeline."""
+    def _resume_cleanup_only(self, output_dir: Path) -> bool | None:
+        outcome = self.finish_publication_only(output_dir, self.video_encoder)
+        if outcome is not None:
+            self._settings_file = Path(output_dir) / "processing-settings-v5.json"
+        return outcome
+
+    @staticmethod
+    def finish_publication_only(output_dir: Path, video_encoder) -> bool | None:  # noqa: C901
+        """Under the job writer lock, finish proven media without starting a model or encoder."""
 
         settings_file = Path(output_dir) / "processing-settings-v5.json"
         if not settings_file.is_file():
@@ -170,10 +181,22 @@ class ProcessingOrchestrator:
                 phase_artifact = recover_processing_settings_artifact(settings_file)
                 prepared = load_final_encoding_reservation_v1(output_dir, phase_artifact)
                 if prepared.requires_explicit_streamed_recovery():
-                    return None
+                    resume_stream = getattr(video_encoder, "resume_streamed_publication", None)
+                    if not callable(resume_stream):
+                        return None
+                    recovered = resume_stream(output_dir, phase_artifact)
+                    if recovered is not True:
+                        return recovered
+                    phase_artifact = recover_processing_settings_artifact(settings_file)
+                    prepared = load_final_encoding_reservation_v1(output_dir, phase_artifact)
                 reservation = FinalEncodingReservationCapabilityV1.from_prepared(prepared)
                 recovery = prepared.recover_publication_prefix()
                 recovery_phase = recovery.phase
+                if recovery.action == "require-durable-output-evidence":
+                    print(
+                        "Published video has no durable output evidence; leaving it untouched without re-encoding."
+                    )
+                    return False
                 del recovery, prepared, phase_artifact
             except Exception as error:
                 print(f"Error: Could not recover active final publication: {error}")
@@ -185,7 +208,7 @@ class ProcessingOrchestrator:
                 except Exception as error:
                     print(f"Error: Active final publication is invalid: {error}")
                     return False
-                adopt = getattr(self.video_encoder, "adopt_final_encoding_reservation", None)
+                adopt = getattr(video_encoder, "adopt_final_encoding_reservation", None)
                 if not callable(adopt):
                     print("Error: Video encoder cannot adopt active final publication")
                     return False
@@ -207,7 +230,6 @@ class ProcessingOrchestrator:
         if not publication_authenticated:
             print("Error: Cleanup-only recovery lacks an authenticated active publication")
             return False
-        self._settings_file = settings_file
         if keep_intermediates:
             cleanup_status = "not_requested"
         else:
@@ -251,7 +273,9 @@ class ProcessingOrchestrator:
         except Exception as error:
             print(f"Error: Could not retire cleanup reservation: {error}")
             return False
-        if reservation is not None and not self._retire_final_encoding_reservation(success=True):
+        if reservation is not None and not ProcessingOrchestrator._retire_encoder_reservation(
+            video_encoder, success=True
+        ):
             return False
         try:
             completed = recover_processing_settings_artifact(settings_file)
@@ -304,13 +328,7 @@ class ProcessingOrchestrator:
             # Start timer
             self._start_time = time.perf_counter()
 
-            if job_lock is None:
-                output_dir.mkdir(parents=True, exist_ok=True)
-                job_lock = JobWriterLock(output_dir).acquire()
-            elif not job_lock.is_acquired:
-                raise ValueError("The supplied job writer lock is not acquired")
-            elif job_lock.output_dir.resolve() != output_dir.resolve():
-                raise ValueError("The supplied job writer lock belongs to another output directory")
+            job_lock = self._acquire_job_lock(output_dir, job_lock)
             recover_processing_control_prefix_v1(output_dir)
             cleanup_vdpp_private_work(output_dir, job_lock)
 
@@ -319,6 +337,7 @@ class ProcessingOrchestrator:
                 return cleanup_resume
 
             # Setup processing environment
+            video_properties = dict(video_properties)
             output_path, directories, self._settings_file = self._setup_processing(
                 str(video_path), str(output_dir), settings, video_properties
             )
@@ -367,6 +386,17 @@ class ProcessingOrchestrator:
                 finally:
                     self.process_elapsed_seconds = time.perf_counter() - self._start_time
 
+    @staticmethod
+    def _acquire_job_lock(output_dir: Path, job_lock: JobWriterLock | None) -> JobWriterLock:
+        if job_lock is None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            job_lock = JobWriterLock(output_dir).acquire()
+        elif not job_lock.is_acquired:
+            raise ValueError("The supplied job writer lock is not acquired")
+        elif job_lock.output_dir.resolve() != output_dir.resolve():
+            raise ValueError("The supplied job writer lock belongs to another output directory")
+        return job_lock
+
     def _execute_legacy_fast_adoption(
         self,
         video_path: str,
@@ -386,6 +416,7 @@ class ProcessingOrchestrator:
         if self._settings_file is None:
             raise ValueError("legacy Fast adoption requires fixed processing settings")
         artifact = recover_processing_settings_artifact(self._settings_file)
+        assert self.legacy_fast_adoption is not None
         adoption = revalidate_legacy_fast_adoption_v1(
             self.legacy_fast_adoption,
             artifact,
@@ -434,7 +465,6 @@ class ProcessingOrchestrator:
             directories,
             settings,
             adoption.frame_count,
-            float(settings.get("target_fps", 30.0)),
             video_path,
             output_path,
             progress_tracker,
@@ -477,8 +507,6 @@ class ProcessingOrchestrator:
         print(step_complete(f"Step 1: Extracted {len(frame_files)} frames"))
         self._print_saved_to(directories.get("frames"), "Extracted frames")
         print()  # Blank line after step
-
-        fps = video_properties.get("fps", 30.0)
 
         metric_mode = settings.get("stereo_geometry_mode", "relative") == "metric_camera"
         selected_is_stabilized = self.preselected_render_source == "stabilized"
@@ -559,7 +587,6 @@ class ProcessingOrchestrator:
             directories,
             settings,
             stereo_input,
-            fps,
             video_path,
             output_path,
             progress_tracker,
@@ -852,7 +879,6 @@ class ProcessingOrchestrator:
         directories: dict[str, Path],
         settings: dict[str, Any],
         stereo_input: StereoInputManifestV1,
-        fps: float,
         video_path: str,
         output_path: Path,
         progress_tracker=None,
@@ -864,7 +890,6 @@ class ProcessingOrchestrator:
             directories: Dictionary of processing directories
             settings: Processing settings
             stereo_input: Durable scalar descriptor for the upstream sequence
-            fps: Video frames per second
             video_path: Input video path
             output_path: Output directory path
             progress_tracker: Optional progress tracker
@@ -918,7 +943,6 @@ class ProcessingOrchestrator:
             directories,
             settings,
             num_frames,
-            fps,
             video_path,
             output_path,
             progress_tracker,
@@ -929,14 +953,11 @@ class ProcessingOrchestrator:
         directories: dict[str, Path],
         settings: dict[str, Any],
         num_frames: int,
-        fps: float,
         video_path: str,
         output_path: Path,
         progress_tracker=None,
     ) -> bool:
         """Execute distortion through finalization for an authenticated RGB stage."""
-
-        del fps
 
         # Step 4: Apply fisheye distortion (optional - delegated to distortion_processor)
         if settings.get("apply_distortion", True):
@@ -1081,12 +1102,15 @@ class ProcessingOrchestrator:
         batch_name = f"{Path(video_path).stem}_{int(time.time())}"
         fixed_settings = output_path / "processing-settings-v5.json"
         if fixed_settings.is_file():
-            prepare_processing_settings_artifact(
+            prepared = prepare_processing_settings_artifact(
                 fixed_settings,
                 settings=settings,
                 video_properties=video_properties,
                 source_video_path=video_path,
             )
+            # A newer probe must not move the clip in a job created with only binary64 FPS.
+            if "frame_rate" not in prepared.to_object()["video_properties"]:
+                video_properties.pop("frame_rate", None)
             settings_file = fixed_settings
         else:
             settings_file = save_processing_settings(

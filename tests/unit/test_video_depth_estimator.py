@@ -2,6 +2,7 @@
 
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -143,35 +144,27 @@ class TestCreateVideoDepthEstimator:
 class TestEnsureDependencies:
     """Test _ensure_dependencies method."""
 
-    def test_ensure_dependencies_success(self):
-        """Test successful dependency check."""
-        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
+    @pytest.mark.parametrize("checkout", ["missing", "partial", "ready"])
+    @pytest.mark.parametrize("cached", [False, True])
+    def test_only_download_if_the_backend_can_use_the_weights(
+        self, tmp_path, monkeypatch, checkout, cached
+    ):
+        from src.depth_surge_3d.inference.depth import video_depth_estimator as vda
 
-        # Assume dependencies are available in test environment
-        result = estimator._ensure_dependencies()
+        repo = tmp_path / "vendor"
+        model = tmp_path / "vitl.pth"
+        monkeypatch.setattr(vda, "VIDEO_DEPTH_ANYTHING_REPO_DIR", str(repo))
+        if checkout != "missing":
+            (repo / "video_depth_anything").mkdir(parents=True)
+        if checkout == "ready":
+            (repo / "video_depth_anything/video_depth.py").touch()
+        if cached:
+            model.write_bytes(b"locally installed weights")
+        estimator = VideoDepthEstimator(str(model), device="cpu")
 
-        # Should return True if repo exists
-        assert isinstance(result, bool)
-
-    def test_ensure_dependencies_repo_not_exists(self):
-        """Test dependency check when repo doesn't exist."""
-        with patch("pathlib.Path.exists", return_value=False):
-            estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
-            result = estimator._ensure_dependencies()
-
-            # Should return False when repo missing
-            assert result is False
-
-    def test_ensure_dependencies_model_not_found_auto_download_fails(self):
-        """Test when model file doesn't exist and auto-download fails."""
-        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
-
-        # Mock os.path.exists to return False for model file
-        with patch("os.path.exists", return_value=False):
-            with patch.object(estimator, "_auto_download_model", return_value=False):
-                result = estimator._ensure_dependencies()
-
-                assert result is False
+        with patch.object(estimator, "_auto_download_model", return_value=False) as download:
+            assert estimator._ensure_dependencies() is (checkout == "ready" and cached)
+        assert download.call_count == int(checkout == "ready" and not cached)
 
 
 class TestSuppressModelOutput:
@@ -203,6 +196,54 @@ class TestSuppressModelOutput:
 
 class TestLoadModel:
     """Test load_model method."""
+
+    @pytest.mark.parametrize("valid", [True, False])
+    def test_publish_model_only_after_legacy_keys_load_strictly(self, tmp_path, monkeypatch, valid):
+        from src.depth_surge_3d.inference.depth import video_depth_estimator as vda
+
+        class SmallModel(torch.nn.Module):
+            def __init__(self, **config):
+                super().__init__()
+                self.head = torch.nn.Linear(2, 1)
+                self.register_buffer("scale", torch.zeros(1))
+
+        upstream = types.ModuleType("video_depth_anything.video_depth")
+        upstream.VideoDepthAnything = SmallModel
+        monkeypatch.setitem(sys.modules, upstream.__name__, upstream)
+        monkeypatch.setattr(sys, "path", sys.path.copy())
+        monkeypatch.setattr(vda, "VIDEO_DEPTH_ANYTHING_REPO_DIR", str(tmp_path))
+        (tmp_path / "video_depth_anything").mkdir()
+        (tmp_path / "video_depth_anything/video_depth.py").touch()
+        path = tmp_path / "vitl.pth"
+        weights = {
+            "depth_head.weight": torch.tensor([[2.0, 3.0]]),
+            "depth_head.bias": torch.tensor([4.0]),
+            "scale": torch.ones(1),
+        }
+        if not valid:
+            del weights["scale"]
+        torch.save(weights, path)
+        estimator = VideoDepthEstimator(str(path), device="cpu")
+        assert estimator.load_model() is valid
+        if valid:
+            assert not estimator.model.training
+            torch.testing.assert_close(
+                estimator.model.head(torch.tensor([[1.0, 2.0]])), torch.tensor([[12.0]])
+            )
+        else:
+            assert estimator.model is None
+            assert "encoder" not in estimator.get_model_info()
+
+    def test_dependency_io_error_does_not_mask_original_error(self, tmp_path, monkeypatch, capsys):
+        estimator = VideoDepthEstimator(str(tmp_path / "vits.pth"), device="cpu")
+
+        def unavailable():
+            raise OSError("weights volume unavailable")
+
+        monkeypatch.setattr(estimator, "_ensure_dependencies", unavailable)
+        assert estimator.load_model() is False
+        assert "weights volume unavailable" in capsys.readouterr().out
+        assert estimator.model is None
 
     def test_load_model_dependencies_fail(self):
         """Test load_model when dependencies are missing."""
@@ -238,19 +279,19 @@ class TestLoadModel:
 class TestAutoDownloadModel:
     """Test _auto_download_model method."""
 
-    def test_auto_download_model_file_exists(self):
-        """Test auto download when model file already exists."""
-        with patch("pathlib.Path.exists", return_value=True):
-            estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
-            result = estimator._auto_download_model()
+    def test_auto_download_model_file_exists(self, tmp_path):
+        model = tmp_path / "vitl.pth"
+        model.write_bytes(b"installed")
+        estimator = VideoDepthEstimator(str(model), device="cpu")
+        with patch("urllib.request.urlretrieve") as download:
+            assert estimator._auto_download_model()
+        download.assert_not_called()
+        assert model.read_bytes() == b"installed"
 
-            # Should return True if file exists
-            assert result is True
-
-    def test_auto_download_model_no_url(self):
+    def test_auto_download_model_no_url(self, tmp_path):
         """Test auto download when no URL configured."""
         with patch("pathlib.Path.exists", return_value=False):
-            estimator = VideoDepthEstimator("models/unknown_model.pth", device="cpu")
+            estimator = VideoDepthEstimator(str(tmp_path / "unknown_model.pth"), device="cpu")
 
             # Mock MODEL_DOWNLOAD_URLS to not have this model
             with patch(
@@ -261,17 +302,23 @@ class TestAutoDownloadModel:
                 # Should return False when no URL available
                 assert result is False
 
-    def test_auto_download_model_download_exception(self):
-        """Test auto download when download fails with exception."""
-        estimator = VideoDepthEstimator(DEFAULT_MODEL_PATH, device="cpu")
+    def test_interrupted_download_cannot_be_mistaken_for_installed_weights(self, tmp_path):
+        model = tmp_path / "vitl.pth"
+        estimator = VideoDepthEstimator(str(model), device="cpu")
 
-        with patch("pathlib.Path.exists", return_value=False):
-            with patch.object(estimator, "_get_model_type", return_value="vitl"):
-                # Mock urllib.request.urlretrieve to raise an exception
-                with patch("urllib.request.urlretrieve", side_effect=Exception("Network error")):
-                    result = estimator._auto_download_model()
+        def interrupted(_url, path):
+            Path(path).write_bytes(b"first packet")
+            raise OSError("connection lost")
 
-                    assert result is False
+        with patch("urllib.request.urlretrieve", side_effect=interrupted):
+            assert not estimator._auto_download_model()
+        assert not list(tmp_path.iterdir())
+        with patch(
+            "urllib.request.urlretrieve", side_effect=lambda _, p: Path(p).write_bytes(b"complete")
+        ):
+            assert estimator._auto_download_model()
+        assert list(tmp_path.iterdir()) == [model]
+        assert model.read_bytes() == b"complete"
 
 
 class TestGetModelInfo:

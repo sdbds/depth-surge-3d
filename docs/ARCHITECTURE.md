@@ -165,6 +165,24 @@ current bounded prefetch: `_load_raw_chunk_array` can decode the next batch
 while `_infer_raw_chunk` performs inference and ordered raw writes on the caller.
 The current limits and failure behavior are documented under Memory And I/O.
 
+The September 8 overhead trials retained the previous Quality device offsets
+in both arms. An initial combined range-check/inference-context candidate
+matched all outputs in eight complete 48-frame jobs and six complete 195-frame
+jobs, including warmups and a three-frame tail. Whole-job timing varied, and
+the longer run did not establish standalone inference-context acceleration.
+That context change was therefore deferred; opaque inference still uses
+`torch.no_grad()`. The range-check-only candidate reduced helper time and
+temporary allocation, but a fresh 48-frame ABBA comparison did not demonstrate
+a complete-job benefit: medians were 52.369 seconds before and 53.401 seconds
+after, excluding separately measured model loading. All six final-media and
+diagnostic comparisons matched exactly, with equal measured CUDA allocator
+peaks. This does not prove a causal slowdown on a shared workstation, but it
+fails the acceptance threshold for a speed optimization; the range-check
+candidate was also withdrawn. Neither candidate changes the production
+default, model settings, precision, or cache fingerprints. Detailed evidence
+and rejected CUDA Graph, VAE grouping/layout, and decoder-thread probes are in
+`build/raw-write-profile-20260908/results.md`.
+
 ### TensorRT Feasibility Probe
 
 A subsequent September 4 probe installed Torch-TensorRT 2.13.0 and TensorRT
@@ -267,7 +285,8 @@ store exact upstream fingerprints in `metadata.json`.
 Canonical relative disparity is resized to the render target with unchanged
 host bilinear interpolation. Both full-frame eye offset maps use the legacy
 float64 operation order and signed int32 fine-lane storage. Eligible relative
-Fast CUDA rendering builds them directly on device; other paths use the host:
+Fast and Quality CUDA rendering builds them directly on device; other paths
+use the host:
 
 ```text
 scale64 = (float64(target_width) * float64(stereo_strength)) / float64(200)
@@ -444,7 +463,7 @@ two-unit score/convergence distance bounds the fine shift below the width;
 both rounded offsets and even masked tail indexes fit int32. Unsupported sizes
 or layouts retain the checked host builder instead of weakening validation.
 
-Public relative and metric paths retain host float64 offset construction, and
+Public Fast relative and all metric paths retain host float64 offset construction, and
 all host float64 scratch is released when it returns. The relative compact
 fallback builds one host pair lazily if Triton is unavailable, compilation
 fails, or the full-frame preload fails. Its holder retains only CPU inputs and
@@ -706,6 +725,35 @@ rounding is recorded separately, not assumed to be only 512-byte alignment.
 Thirty-two different nonzero control pairs reuse one compiled kernel, and 256
 numerical differential cases matched 18,223,872 int32 outputs exactly. These are
 sample-specific rendering/resource observations, not whole-video guarantees.
+
+Quality relative CUDA rendering reuses that unfused float64 offset kernel with
+a single-eye specialization. It allocates one int32 plane, consumes it directly
+in the existing splat, and releases it before building the other eye. The
+already-preloaded near score is reused; no offset readback, host offset map, or
+offset upload is needed on this path. A conservative host range check preserves
+the int32 proof for resized scores in `[-1, 2]`; unsupported controls, layouts,
+sizes or ranges retain the checked native builder. CPU and metric rendering are
+unchanged. Missing Triton, a failed preload, or a compilation failure also uses
+the host path. Single-eye compilation failures have their own per-device disable
+state and cannot disable the paired Fast helper. Offset-allocation OOM recovery
+unwinds the failed call before releasing memory and retrying the host builder.
+
+A separate local warmed ABBA trial of this Quality change measured 59.50 s
+versus 57.88 s (2.72 percent less) for 48 real 1080p frames from fresh extraction
+through depth inference, encoding, publication, cleanup, terminal audit and
+model release. Model loading was measured separately and is excluded; including
+those warmed loads gives 66.32 s versus 65.07 s (1.89 percent less). Both
+adjacent measured pairs were faster; only two runs per variant were measured.
+Canonical depth PNGs, every streamed RGB frame, MP4 bytes, decoded audio/video,
+summary diagnostics and per-frame diagnostics matched exactly. The model
+artifact, settings and frozen input were unchanged, all three independent
+validations remained enabled, and measured CUDA allocation peaks matched at
+7,268,528,128 bytes. The 48-frame and 360-frame cached-input trials observed
+1.15 and 3.15 percent less completion time, respectively, but had appreciable
+unchanged-stage variance and are not stable speed estimates. These shared-machine
+observations do not establish cold-start or general whole-video gains. The
+isolated harness, input identities and all results are retained under
+`build/quality-device-offsets-20260906/`.
 
 Stereo decode and output work is bounded by both `stereo_io_workers` and a host
 byte budget. End-to-end throughput measurements include decode, render, image
@@ -1166,6 +1214,27 @@ Preflight cannot reserve capacity against other writers. Post-preflight
 `ENOSPC` removes only the current temporary write, keeps prior committed frames
 and writing metadata resumable, withholds completion metadata, and reports the
 preflight bound, current free bytes, and failing path.
+
+### Canonical Metadata Reads
+
+Quality metadata is still revalidated at each original transaction boundary.
+`_ExactCanonicalReader` satisfies already-buffered reads without intermediate
+chunk assembly and consumes ordinary string runs directly from its existing
+64 KiB buffer. Quotes, escapes, nesting/scalar limits, strict ASCII canonical
+decoding, and raw/self fingerprints are unchanged. Runs stop at the first
+possible byte/string budget violation; refill and truncated-read handling
+retain the original path. No earlier validation verdict is cached or trusted.
+
+A September 8 follow-up for single-video workloads compared six complete
+360-frame jobs, including warmups. Raw/canonical/frame pixels, decoded audio
+and video, MP4 bytes, and both diagnostic files matched exactly. Measured
+production finalization medians decreased from 25.571 to 21.554 seconds, with
+both adjacent pairs improving, while complete-process medians were 323.981
+versus 332.539 seconds and unchanged inference/rendering timings varied. This
+is a verified reduction in metadata/finalization overhead, not an established
+whole-generation speedup. The synthetic 10,000-record parser fixture measures
+metadata scaling only, not a generated 10,000-frame video. Evidence and timing
+boundaries are recorded in `build/long-video-profile-20260908/results.md`.
 
 ## Resume And Migration
 

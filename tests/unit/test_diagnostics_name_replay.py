@@ -287,6 +287,55 @@ def test_noop_rechecks_source_content_after_aggregate_validation(
     assert all(path.read_bytes() == expected for path, expected in retained.items())
 
 
+def _change_consolidation_input(tmp_path: Path, manifest, payload: str, geometry: str) -> None:
+    if payload == "manifest":
+        rows = [json.loads(line) for line in manifest.path.read_bytes().splitlines()]
+        rows[-1]["guide"]["sha256"] = "f" * 64
+        manifest.path.write_bytes(
+            b"".join(
+                json.dumps(row, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+                for row in rows
+            )
+        )
+    else:
+        if payload == "guide":
+            directory, suffix = "00_original_frames", ".png"
+        elif geometry == "relative":
+            directory, suffix = "03_disparity_maps", ".png"
+        else:
+            directory, suffix = "03_metric_geometry", ".npz"
+        frame_name = "frame_000002" if geometry == "relative" else "frame_000001"
+        path = tmp_path / directory / f"{frame_name}{suffix}"
+        raw = bytearray(path.read_bytes())
+        raw[-1] ^= 1
+        replacement = path.with_suffix(".replacement")
+        replacement.write_bytes(raw)
+        replacement.replace(path)
+
+
+def _at_consolidation_boundary(monkeypatch, boundary, corrupt):
+    def observe_publish(original):
+        def publish(document, path, **kwargs):
+            fault = kwargs.get("fault")
+
+            def observe(stage):
+                if fault is not None:
+                    fault(stage)
+                if stage == boundary:
+                    corrupt()
+
+            kwargs["fault"] = observe
+            return original(document, path, **kwargs)
+
+        return publish
+
+    for document_type in (
+        transaction.StreamedCanonicalObject,
+        transaction.StreamedCanonicalValue,
+    ):
+        monkeypatch.setattr(document_type, "publish", observe_publish(document_type.publish))
+
+
 @pytest.mark.parametrize(
     ("transient", "render_mode", "geometry"),
     [
@@ -318,51 +367,10 @@ def test_manifest_pipeline_rejects_sources_changed_during_consolidation(
     changed = []
 
     def corrupt():
-        if payload == "manifest":
-            rows = [json.loads(line) for line in manifest.path.read_bytes().splitlines()]
-            rows[-1]["guide"]["sha256"] = "f" * 64
-            manifest.path.write_bytes(
-                b"".join(
-                    json.dumps(row, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
-                    for row in rows
-                )
-            )
-        else:
-            if payload == "guide":
-                directory, suffix = "00_original_frames", ".png"
-            elif geometry == "relative":
-                directory, suffix = "03_disparity_maps", ".png"
-            else:
-                directory, suffix = "03_metric_geometry", ".npz"
-            frame_name = "frame_000002" if geometry == "relative" else "frame_000001"
-            path = tmp_path / directory / f"{frame_name}{suffix}"
-            raw = bytearray(path.read_bytes())
-            raw[-1] ^= 1
-            replacement = path.with_suffix(".replacement")
-            replacement.write_bytes(raw)
-            replacement.replace(path)
+        _change_consolidation_input(tmp_path, manifest, payload, geometry)
         changed.append(boundary)
 
-    def observe_publish(original):
-        def publish(document, path, **kwargs):
-            fault = kwargs.get("fault")
-
-            def observe(stage):
-                if fault is not None:
-                    fault(stage)
-                if stage == boundary:
-                    corrupt()
-
-            kwargs["fault"] = observe
-            return original(document, path, **kwargs)
-
-        return publish
-
-    for document_type in (
-        transaction.StreamedCanonicalObject,
-        transaction.StreamedCanonicalValue,
-    ):
-        monkeypatch.setattr(document_type, "publish", observe_publish(document_type.publish))
+    _at_consolidation_boundary(monkeypatch, boundary, corrupt)
 
     class CountingGenerator(stereo_generator.StereoPairGenerator):
         attempts = 0

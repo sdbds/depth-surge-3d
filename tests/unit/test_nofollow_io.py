@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import os
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -35,6 +38,30 @@ def test_open_regular_beneath_reads_from_the_acquired_regular_handle(tmp_path: P
         payload.replace(payload.with_suffix(".old"))
         payload.write_bytes(b"replacement")
         assert handle.read() == b"original"
+
+
+@pytest.mark.parametrize("owned", [True, False], ids=["standalone", "borrowed-root"])
+def test_buffered_reader_releases_only_the_root_it_owns(tmp_path, monkeypatch, owned):
+    payload = tmp_path / "frame.bin"
+    payload.write_bytes(b"frame")
+    closed = []
+    close_root = AcquiredRoot.close
+
+    def record_close(root):
+        closed.append(root)
+        close_root(root)
+
+    monkeypatch.setattr(AcquiredRoot, "close", record_close)
+    with AcquiredRoot(tmp_path) as root:
+        raw = open_regular_beneath(tmp_path, payload) if owned else root.open_regular(payload)
+        with io.BufferedReader(raw) as reader:
+            buffer = bytearray(5)
+            assert reader.readinto(buffer) == len(buffer) and buffer == b"frame"
+            assert not closed
+        raw.close()
+        assert raw.closed and len(closed) == int(owned)
+        assert root not in closed
+    assert closed[-1] is root and len(closed) == int(owned) + 1
 
 
 def test_open_regular_beneath_rejects_a_final_file_link(tmp_path: Path) -> None:
@@ -530,6 +557,178 @@ def test_safe_tree_mutation_unlinks_only_a_regular_nested_descendant(tmp_path: P
         mutation.unlink_descendant(root, residue, evidence=evidence)
 
     assert not residue.exists()
+
+
+@pytest.mark.parametrize("new_parent", [False, True], ids=["parent-missing", "parent-recreated"])
+def test_nested_cleanup_can_retry_after_the_original_parent_is_restored(tmp_path: Path, new_parent):
+    root = tmp_path / "work"
+    parent = root / "frame"
+    parent.mkdir(parents=True)
+    residue = parent / "unfinished.tmp"
+    residue.write_bytes(b"old partial")
+    original_parent = tmp_path / "earlier-frame"
+    with SafeTreeMutation(tmp_path, (root,)) as cleanup:
+        proof = cleanup.capture_regular_child(root, residue)
+        parent.rename(original_parent)
+        if new_parent:
+            parent.mkdir()
+            residue.write_bytes(b"newly generated output")
+        with pytest.raises(NoFollowPathError, match="parent changed|parent disappeared"):
+            cleanup.unlink_descendant(root, residue, evidence=proof)
+        assert (original_parent / residue.name).read_bytes() == b"old partial"
+        if new_parent:
+            parent.rename(tmp_path / "next-frame")
+        original_parent.rename(parent)
+        cleanup.unlink_descendant(root, residue, evidence=proof)
+    assert not residue.exists()
+    if new_parent:
+        assert (tmp_path / "next-frame" / residue.name).read_bytes() == b"newly generated output"
+
+
+def test_saved_content_and_physical_identity_both_bind_a_resumed_fixed_file(tmp_path: Path):
+    from src.depth_surge_3d.io.file_identity import PersistedFileIdentityV1, capture_file_identity
+
+    current = tmp_path / "output.bin"
+    moved = tmp_path / "saved-output.bin"
+    raw = b"published data"
+    current.write_bytes(raw)
+    proof = scan_fixed_regular_v1(tmp_path, current)
+    saved_identity = PersistedFileIdentityV1.from_object(proof.identity.to_object())
+    current.rename(moved)
+    current.write_bytes(raw)
+    assert capture_file_identity(moved) == saved_identity
+    assert proof.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert proof.byte_count == len(raw)
+    with pytest.raises(NoFollowPathError, match="identity differs"):
+        scan_fixed_regular_v1(tmp_path, current, expected_identity=saved_identity)
+    with pytest.raises(NoFollowPathError, match="byte count differs"):
+        scan_fixed_regular_v1(tmp_path, moved, expected_byte_count=len(raw) - 1)
+    with pytest.raises(NoFollowPathError, match="digest differs"):
+        scan_fixed_regular_v1(tmp_path, moved, expected_raw_sha256="0" * 64)
+    assert (
+        scan_fixed_regular_v1(
+            tmp_path,
+            moved,
+            expected_identity=saved_identity,
+            expected_raw_sha256=proof.raw_sha256,
+            expected_byte_count=proof.byte_count,
+        )
+        == proof
+    )
+    assert current.read_bytes() == moved.read_bytes() == raw
+
+
+def test_optional_reads_distinguish_missing_payloads_from_wrong_type(tmp_path):
+    leaf = tmp_path / "cache" / "state.bin"
+    with AcquiredRoot(tmp_path) as acquired:
+        assert acquired.open_regular_optional(leaf) is None
+        leaf.parent.mkdir()
+        assert acquired.open_regular_optional(leaf) is None
+        leaf.mkdir()
+        with pytest.raises(NoFollowPathError):
+            acquired.open_regular_optional(leaf)
+        assert leaf.is_dir()
+        leaf.rmdir()
+        handle, identity = acquired.create_regular_exclusive(leaf)
+        with handle:
+            handle.write(b"old")
+        with acquired.open_regular_update(leaf) as handle:
+            handle.write(b"new")
+        with acquired.open_regular_optional(leaf) as handle:
+            assert handle.read() == b"new"
+        assert acquired.regular_identity(leaf) == identity
+        acquired.unlink_owned_regular(leaf, expected_identity=identity)
+        assert acquired.open_regular_optional(leaf) is None
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="persistent Linux descriptor kinds"
+)
+def test_persisted_descriptor_kind_is_not_inferred_from_just_the_open_handle(tmp_path):
+    from src.depth_surge_3d.io.file_identity import (
+        PersistentIdentitySchemaError,
+        capture_file_identity,
+        directory_identity_from_posix_fd,
+        file_identity_from_posix_fd,
+    )
+
+    leaf = tmp_path / "state.bin"
+    leaf.write_bytes(b"settings")
+    with leaf.open("rb") as handle:
+        with pytest.raises(PersistentIdentitySchemaError, match="object type changed"):
+            directory_identity_from_posix_fd(handle.fileno())
+        assert file_identity_from_posix_fd(handle.fileno()) == capture_file_identity(leaf)
+    reader, writer = os.pipe()
+    try:
+        with pytest.raises(PersistentIdentitySchemaError, match="not a regular file"):
+            file_identity_from_posix_fd(reader)
+    finally:
+        os.close(reader)
+        os.close(writer)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="persistent Linux handle schema")
+@pytest.mark.parametrize(
+    ("scope", "field", "value"),
+    [
+        ("file", "link_count", 0),
+        ("file", "link_count", True),
+        ("file", "platform", "unknown"),
+        ("handle", "filesystem_uuid", None),
+        ("handle", "handle_type", False),
+        ("handle", "file_handle_hex", "abc"),
+    ],
+)
+def test_invalid_saved_linux_identity_cannot_replace_a_valid_file_proof(
+    tmp_path, scope, field, value
+):
+    from src.depth_surge_3d.io.file_identity import (
+        PersistedFileIdentityV1,
+        PersistentIdentitySchemaError,
+    )
+
+    path = tmp_path / "saved-frame.bin"
+    path.write_bytes(b"frame")
+    original = scan_fixed_regular_v1(tmp_path, path)
+    candidate = original.identity.to_object()
+    target = candidate if scope == "file" else candidate["file_identity"]
+    target[field] = value
+    with pytest.raises(PersistentIdentitySchemaError):
+        PersistedFileIdentityV1.from_object(candidate)
+    assert scan_fixed_regular_v1(tmp_path, path, expected_identity=original.identity) == original
+
+
+def test_scoped_cleanup_uses_only_the_matching_child_and_keeps_borrowed_handle(tmp_path):
+    job = tmp_path / "job"
+    job.mkdir()
+    frames = job / "frames"
+    nested = frames / "shot" / "cache"
+    nested.mkdir(parents=True)
+    own = frames / "owned.tmp"
+    retained = frames / "retained.bin"
+    own.write_bytes(b"partial")
+    retained.write_bytes(b"keep")
+    with AcquiredRoot(job) as namespace:
+        with SafeTreeMutation(job, (frames, frames), acquired=namespace) as mutation:
+            proof = mutation.capture_regular_child(frames, own)
+            tree_proof = mutation.capture_child_tree(frames, nested.parent)
+            with pytest.raises(NoFollowPathError, match="was not preflighted"):
+                mutation.remove_root(nested)
+            with pytest.raises(NoFollowPathError, match="does not match"):
+                mutation.unlink_child(frames, retained, evidence=proof)
+            with pytest.raises(NoFollowPathError, match="direct authorized child"):
+                mutation.remove_child_tree(frames, nested, evidence=tree_proof)
+            missing = frames / "absent"
+            no_tree = mutation.capture_child_tree(frames, missing)
+            mutation.remove_child_tree(frames, missing, evidence=no_tree)
+            missing.mkdir()
+            with pytest.raises(NoFollowPathError, match="appeared"):
+                mutation.remove_child_tree(frames, missing, evidence=no_tree)
+            mutation.remove_child_tree(frames, nested.parent, evidence=tree_proof)
+            mutation.unlink_child(frames, own, evidence=proof)
+        with namespace.open_regular(retained) as handle:
+            assert handle.read() == b"keep"
+        assert missing.is_dir() and not nested.exists() and not own.exists()
 
 
 def test_safe_tree_mutation_rejects_a_wrong_type_nested_descendant(tmp_path: Path) -> None:

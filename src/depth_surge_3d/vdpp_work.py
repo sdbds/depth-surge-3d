@@ -34,6 +34,30 @@ def _require_ordinary_directory(path: Path, description: str) -> None:
         raise ValueError(f"{description} must be an ordinary directory: {path}")
 
 
+def _owned_work_files(work_dir: Path) -> list[Path]:
+    owned_files: list[Path] = []
+    try:
+        entries = list(os.scandir(work_dir))
+    except OSError as exc:
+        raise OSError(f"Could not inspect VDPP private-work directory: {work_dir}") from exc
+    for entry in entries:
+        path = Path(entry.path)
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise OSError(f"Could not inspect VDPP private-work entry: {path}") from exc
+        if (
+            _is_reparse(info)
+            or not stat.S_ISREG(info.st_mode)
+            or _OWNED_WORK_NAME.fullmatch(entry.name) is None
+        ):
+            raise ValueError(
+                f"VDPP private-work directory contains an unknown or unsafe entry: {path}"
+            )
+        owned_files.append(path)
+    return owned_files
+
+
 def cleanup_vdpp_private_work(
     output_root: Path,
     job_lock: "JobWriterLock | Any",
@@ -56,27 +80,7 @@ def cleanup_vdpp_private_work(
         return
     _require_ordinary_directory(work_dir, "VDPP private-work directory")
 
-    owned_files: list[Path] = []
-    try:
-        entries = list(os.scandir(work_dir))
-    except OSError as exc:
-        raise OSError(f"Could not inspect VDPP private-work directory: {work_dir}") from exc
-    for entry in entries:
-        path = Path(entry.path)
-        try:
-            info = entry.stat(follow_symlinks=False)
-        except OSError as exc:
-            raise OSError(f"Could not inspect VDPP private-work entry: {path}") from exc
-        if (
-            _is_reparse(info)
-            or not stat.S_ISREG(info.st_mode)
-            or _OWNED_WORK_NAME.fullmatch(entry.name) is None
-        ):
-            raise ValueError(
-                f"VDPP private-work directory contains an unknown or unsafe entry: {path}"
-            )
-        owned_files.append(path)
-
+    owned_files = _owned_work_files(work_dir)
     for path in owned_files:
         path.unlink()
     work_dir.rmdir()

@@ -462,6 +462,28 @@ def test_raw_transport_reconstructs_container_dimensions_rate_and_count(tmp_path
     assert expectation.fps == "24/1"
 
 
+@pytest.mark.parametrize(
+    ("option", "incorrect"),
+    [("-framerate", "60/1"), ("-frames:v", "2"), ("-vf", "setsar=1")],
+)
+def test_recovery_rejects_lost_source_clock_resampling_or_output_count(tmp_path, option, incorrect):
+    _owner, completed = _complete(tmp_path)
+    projection = EncodingInputPublicationSource.from_path(completed.path).projection()
+    values = _container_settings().to_object()
+    settings = _artifact(
+        video_properties={**values["video_properties"], "fps": 24.0, "frame_rate": "24/1"},
+        processing_settings={**values["processing_settings"], "target_fps": 60},
+    )
+    arguments = list(_invocation().materialized_arguments(completed.staged.fingerprint))
+    arguments[arguments.index("-frames:v") + 1] = "5"
+    arguments[arguments.index("-vf") + 1] = "setsar=1,fps=60/1:round=up"
+    arguments[arguments.index(option) + 1] = incorrect
+    with pytest.raises(FinalPublicationValidationError):
+        _final_container_expectation_from_intent_v1(
+            settings=settings, input_projection=projection, arguments=tuple(arguments)
+        )
+
+
 @pytest.mark.parametrize("change", ["png_command", "png_marker", "settings_shape"])
 def test_raw_container_contract_rejects_transport_or_dimension_confusion(tmp_path, change):
     _spool_owner, completed = _complete(tmp_path)

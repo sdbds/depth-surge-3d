@@ -7,8 +7,9 @@
 
 ## Quick Start
 
+Install the project using the [installation guide](INSTALLATION.md), then activate that environment before running the following from the checkout:
+
 ```bash
-./setup.sh          # Initial setup
 ./test.sh           # Verify installation (CUDA, dependencies, models)
 ./run_ui.sh         # Launch web UI (http://localhost:5000)
 

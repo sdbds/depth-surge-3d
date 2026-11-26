@@ -11,6 +11,13 @@ def web_app():
     return app
 
 
+def test_new_web_job_refuses_unimplemented_motion_interpolation(web_app):
+    with pytest.raises(ValueError, match="(?i)motion interpolation"):
+        web_app._resolve_new_web_stereo_settings(
+            {"device": "cpu", "experimental_frame_interpolation": True}
+        )
+
+
 def test_web_quality_controls_are_visible_and_submitted(web_app) -> None:
     html = web_app.app.test_client().get("/").get_data(as_text=True)
 

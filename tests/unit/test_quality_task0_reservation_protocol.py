@@ -577,7 +577,7 @@ def test_illegal_terminal_intent_never_becomes_recovery_authority() -> None:
                 "sibling_present": True,
             },
             "post_boundary_retry_sibling_present",
-            "reset-final-intent-remove-sibling-reencode",
+            "require-durable-output-evidence",
         ),
         (
             {
@@ -613,7 +613,7 @@ def test_final_publication_crash_prefixes_have_one_forward_only_recovery_action(
     assert result.action == action
 
 
-def test_post_boundary_complete_input_with_zero_final_intent_reencodes_without_rewrite() -> None:
+def test_post_boundary_complete_input_with_zero_final_intent_requires_durable_evidence() -> None:
     observation = reservation_protocol.FinalPublicationObservation(
         video_state="committed-new",
         input_manifest_state="committed-new",
@@ -624,7 +624,7 @@ def test_post_boundary_complete_input_with_zero_final_intent_reencodes_without_r
     result = reservation_protocol.classify_final_publication_observation(observation)
 
     assert result.phase == "input_manifest_committed_no_final_intent"
-    assert result.action == "revalidate-input-and-reencode"
+    assert result.action == "require-durable-output-evidence"
 
 
 def test_final_publication_rejects_complete_input_before_video_boundary() -> None:

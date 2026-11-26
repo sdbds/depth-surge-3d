@@ -23,12 +23,7 @@ We'd rather have your contribution with imperfect formatting than no contributio
 
 ### Quick Start
 
-```bash
-git clone https://github.com/Tok/depth-surge-3d.git
-cd depth-surge-3d
-./setup.sh
-./test.sh  # Verify setup
-```
+Follow the [installation guide](INSTALLATION.md) to install the locked runtime and verify the native extension. For development tools, rerun the documented sync command in the same environment with `--group dev` instead of `--no-dev`.
 
 ### Development Workflow
 

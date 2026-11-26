@@ -7,7 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import struct
-from typing import Any, Iterable, Iterator, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Literal, Sequence
 
 import numpy as np
 
@@ -19,6 +19,10 @@ from .streamed_canonical_json import (
     StreamedCanonicalObject,
     build_streamed_canonical_object_arrays,
 )
+
+
+if TYPE_CHECKING:
+    from ..processing.frames.stereo_input_manifest import StereoInputManifestV1
 
 
 QUALITY_CONTENT_STREAM_BYTES = metric_npz.METRIC_NPZ_WRITE_STREAM_BYTES
@@ -243,6 +247,26 @@ class StreamedQualityInputManifest:
         return self.document.matches(path, acquired=acquired)
 
 
+def _array_fingerprint(identities: Iterable[object]) -> str:
+    digest = hashlib.sha256(b"[")
+    for index, identity in enumerate(identities):
+        if index:
+            digest.update(b",")
+        digest.update(_canonical_json_bytes(identity))
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
+def _audit_source_order(manifest: "StereoInputManifestV1") -> None:
+    audited_count = 0
+    for record in manifest.replay_records():
+        if record.source_index != audited_count:
+            raise ValueError("Quality input manifest source order changed")
+        audited_count += 1
+    if audited_count != manifest.frame_count:
+        raise ValueError("Quality input manifest ended before its declared count")
+
+
 def build_streamed_quality_input_manifest(
     manifest: Any,
     *,
@@ -258,13 +282,7 @@ def build_streamed_quality_input_manifest(
     if not isinstance(validate_payloads, bool):
         raise TypeError("validate_payloads must be boolean")
     if validate_payloads:
-        audited_count = 0
-        for record in manifest.replay_records():
-            if record.source_index != audited_count:
-                raise ValueError("Quality input manifest source order changed")
-            audited_count += 1
-        if audited_count != manifest.frame_count:
-            raise ValueError("Quality input manifest ended before its declared count")
+        _audit_source_order(manifest)
 
     def frame_names():
         for record in manifest.replay_declared_records():
@@ -278,17 +296,7 @@ def build_streamed_quality_input_manifest(
         for record in manifest.replay_declared_records():
             yield record.geometry_identity
 
-    def array_fingerprint(replay: Any) -> str:
-        digest = hashlib.sha256()
-        digest.update(b"[")
-        for index, identity in enumerate(replay()):
-            if index:
-                digest.update(b",")
-            digest.update(_canonical_json_bytes(identity))
-        digest.update(b"]")
-        return digest.hexdigest()
-
-    source_guide_fingerprint = array_fingerprint(guides)
+    source_guide_fingerprint = _array_fingerprint(guides())
 
     scale_bits = manifest.relative_encoding_scale_float32_bits
     native_geometry_fingerprint = build_streamed_canonical_object_arrays(

@@ -22,6 +22,23 @@ from src.depth_surge_3d.io.streamed_canonical_json import (
 )
 
 
+def test_closing_after_array_opener_does_not_start_another_replay():
+    calls = []
+
+    def open_items():
+        calls.append(True)
+        return [1, 2]
+
+    document = build_streamed_canonical_value(ReplayableJsonArray(open_items))
+    assert len(calls) == 1  # The initial pass freezes the identity.
+    chunks = document.chunks()
+    assert next(chunks) == b"["
+    chunks.close()
+    assert len(calls) == 1
+    assert b"".join(document.chunks()) == b"[1,2]"
+    assert len(calls) == 2
+
+
 def test_streamed_canonical_object_matches_regular_encoder_without_a_resident_list(
     tmp_path: Path,
 ) -> None:
@@ -131,9 +148,7 @@ def test_replayable_array_matches_legacy_pretty_json_bytes(tmp_path: Path) -> No
         "schema_version": 1,
     }
     streamed_value = dict(payload)
-    streamed_value["frame_names"] = ReplayableJsonArray(
-        lambda: iter(payload["frame_names"])
-    )
+    streamed_value["frame_names"] = ReplayableJsonArray(lambda: iter(payload["frame_names"]))
     document = build_streamed_pretty_json_value(streamed_value)
     path = tmp_path / "metadata.json"
 

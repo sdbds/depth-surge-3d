@@ -943,7 +943,7 @@
                             </select>
                         </div>
                         <div class="mb-3">
-                            <label class="form-label">Target FPS <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Frame rate for processing. Higher FPS = smoother motion but longer processing time."></i></label>
+                            <label class="form-label">Target FPS <i class="fas fa-info-circle" data-bs-toggle="tooltip" title="Output frame rate. Frames are repeated or dropped to preserve playback duration."></i></label>
                             <select class="form-select" id="targetFps">
                                 <option value="original" selected>Keep Original FPS</option>
                                 <option value="30">30 FPS</option>
@@ -1369,16 +1369,6 @@
                             <small class="form-text text-muted">
                                 <i class="fas fa-microchip"></i> NVENC: ~10x faster on NVIDIA GPUs<br>
                                 <i class="fas fa-server"></i> Software: Works everywhere, CPU-intensive
-                            </small>
-                        </div>
-                        <div class="form-check mb-2">
-                            <input class="form-check-input" type="checkbox" id="experimentalFrameInterpolation">
-                            <label class="form-check-label" for="experimentalFrameInterpolation">
-                                Frame Interpolation (Double FPS)
-                            </label>
-                            <small class="text-muted d-block ms-4">
-                                <i class="fas fa-flask"></i> Experimental: Applies FFmpeg minterpolate to final VR video output<br>
-                                <i class="fas fa-info-circle"></i> Not AI-based, won't alter visual style. May show motion artifacts.
                             </small>
                         </div>
                         <div class="step-indicator">Final output: Calculated at runtime</div>
@@ -2324,7 +2314,6 @@
                 crop_factor: document.getElementById('cropFactor') ? parseFloat(document.getElementById('cropFactor').value) : 0.7,
                 fisheye_crop_factor: parseFloat(document.getElementById('fisheyeCropFactor').value),
                 upscale_model: document.getElementById('applyUpscaling').checked ? document.getElementById('upscaleModel').value : 'none',
-                experimental_frame_interpolation: document.getElementById('experimentalFrameInterpolation').checked,
                 enable_live_preview: document.getElementById('enableLivePreview').checked,
                 preview_update_interval: parseFloat(document.getElementById('previewUpdateInterval').value)
             };
@@ -3162,10 +3151,7 @@
                 cropFactor: document.getElementById('cropFactor').value,
                 fisheyeCropFactor: document.getElementById('fisheyeCropFactor').value,
                 applyUpscaling: document.getElementById('applyUpscaling').checked,
-                upscaleModel: document.getElementById('upscaleModel').value,
-
-                // Experimental features
-                experimentalFrameInterpolation: document.getElementById('experimentalFrameInterpolation').checked
+                upscaleModel: document.getElementById('upscaleModel').value
             };
             
             localStorage.setItem('stereoProjectorSettings', JSON.stringify(settings));
@@ -3336,7 +3322,7 @@
                 'sceneDetection', 'sceneCutThreshold', 'minSceneFrames', 'rawStorageDtype', 'stereoIoWorkers', 'migrateLegacy',
                 'resolution', 'targetFps', 'superSample', 'device', 'modelSize', 'depthModelVersion', 'depthModelType', 'depthResolution', 'videoEncoder',
                 'preserveAudio', 'keepIntermediates', 'directVrEncode', 'applyDistortion', 'fisheyeProjection', 'fisheyeFov', 'cropFactor',
-                'fisheyeCropFactor', 'applyUpscaling', 'upscaleModel', 'experimentalFrameInterpolation'
+                'fisheyeCropFactor', 'applyUpscaling', 'upscaleModel'
             ];
             
             settingsElements.forEach(id => {

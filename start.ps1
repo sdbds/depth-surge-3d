@@ -29,7 +29,7 @@ if (Test-Path ".venv\Scripts\Activate.ps1") {
     Write-Host "Using venv virtual environment..."
     & venv\Scripts\Activate.ps1
 } else {
-    Write-Host "Error: No virtual environment found. Please run .\setup.ps1 first." -ForegroundColor Red
+    Write-Host "Error: No virtual environment found. Run .\1.install-uv-qinglong.ps1 first." -ForegroundColor Red
     exit 1
 }
 

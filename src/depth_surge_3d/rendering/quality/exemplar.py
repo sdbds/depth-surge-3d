@@ -164,9 +164,7 @@ def downsample_exemplar_level(level: ExemplarLevel) -> ExemplarLevel:
     quotients = totals // divisors
     remainders = totals % divisors
     doubled = remainders * np.uint16(2)
-    rounded = quotients + (
-        (doubled > divisors) | ((doubled == divisors) & ((quotients & 1) != 0))
-    )
+    rounded = quotients + ((doubled > divisors) | ((doubled == divisors) & ((quotients & 1) != 0)))
     working = np.ascontiguousarray(rounded.astype(np.uint8))
     working[barrier] = np.uint8(0)
     target &= ~barrier
@@ -272,12 +270,8 @@ def enumerate_donor_centres(donor_mask: np.ndarray) -> np.ndarray:
     )
     rows, columns = np.nonzero(counts == support * support)
     centres = np.empty((rows.size, 2), dtype=np.uint32)
-    centres[:, 0] = rows.astype(np.uint32, copy=False) + np.uint32(
-        _DONOR_SUPPORT_RADIUS
-    )
-    centres[:, 1] = columns.astype(np.uint32, copy=False) + np.uint32(
-        _DONOR_SUPPORT_RADIUS
-    )
+    centres[:, 0] = rows.astype(np.uint32, copy=False) + np.uint32(_DONOR_SUPPORT_RADIUS)
+    centres[:, 1] = columns.astype(np.uint32, copy=False) + np.uint32(_DONOR_SUPPORT_RADIUS)
     return centres
 
 
@@ -412,7 +406,9 @@ def repair_component_exemplar(
         if residual_indexes.size == 0:
             output.setflags(write=False)
             return ExemplarRepairResult(output, 0, 0, 0, 0)
-        work = _prepare_component_work(output, residual_indexes, region, width)
+        work: _ComponentWork | None = _prepare_component_work(
+            output, residual_indexes, region, width
+        )
         selected_record_indexes = None
     else:
         selected_record_indexes = record_indexes
@@ -428,9 +424,9 @@ def repair_component_exemplar(
             width,
             arena,
         )
-        if work is None:
-            output.setflags(write=False)
-            return ExemplarRepairResult(output, 0, 0, 0, 0)
+    if work is None:
+        output.setflags(write=False)
+        return ExemplarRepairResult(output, 0, 0, 0, 0)
     _run_component_cores(
         work,
         analysis,
@@ -659,6 +655,7 @@ def _repair_core(
             )
         finally:
             if scratch_mark is not None:
+                assert arena is not None
                 arena.rewind(scratch_mark)
         core_evaluations += evaluation_count
         work.evaluation_count += evaluation_count
@@ -690,8 +687,7 @@ def _component_budget_available(
 ) -> bool:
     return (
         work.evaluation_count < budgets.exemplar_component_evaluation_cap
-        and budgets.exemplar_eye_evaluations_consumed
-        < budgets.exemplar_eye_evaluation_cap
+        and budgets.exemplar_eye_evaluations_consumed < budgets.exemplar_eye_evaluation_cap
     )
 
 
@@ -700,9 +696,8 @@ def _core_budget_available(
     work: _ComponentWork,
     budgets: QualityRepairBudgets,
 ) -> bool:
-    return (
-        core_evaluations < budgets.exemplar_core_evaluation_cap
-        and _component_budget_available(work, budgets)
+    return core_evaluations < budgets.exemplar_core_evaluation_cap and _component_budget_available(
+        work, budgets
     )
 
 
@@ -735,9 +730,7 @@ def _repair_level(
         return iterations, evaluations
     native = native_kd._require_native()
     if arena is None:
-        donor_gradient_x, donor_gradient_y = native.build_exemplar_sobel_planes(
-            level.working_bgr
-        )
+        donor_gradient_x, donor_gradient_y = native.build_exemplar_sobel_planes(level.working_bgr)
         selected_storage = None
     else:
         donor_gradient_x = arena.allocate(level.target_mask.shape, np.int16)
@@ -806,9 +799,7 @@ def _remaining_evaluations(
 ) -> int:
     return min(
         budgets.exemplar_core_evaluation_cap - core_evaluations - level_evaluations,
-        budgets.exemplar_component_evaluation_cap
-        - component_evaluations
-        - level_evaluations,
+        budgets.exemplar_component_evaluation_cap - component_evaluations - level_evaluations,
         budgets.exemplar_eye_evaluation_cap - budgets.exemplar_eye_evaluations_consumed,
     )
 
@@ -975,10 +966,7 @@ def _build_full_level(
     barrier = ~same_proxy
 
     in_working = (
-        (target_rows >= y0)
-        & (target_rows < y1)
-        & (target_columns >= x0)
-        & (target_columns < x1)
+        (target_rows >= y0) & (target_rows < y1) & (target_columns >= x0) & (target_columns < x1)
     )
     local_indexes = np.flatnonzero(in_working)
     for target_index in local_indexes:
@@ -1153,9 +1141,7 @@ def _commit_completed_records(
     for record in output:
         if int(record["backend"]) != 0:
             continue
-        target_index = int(
-            np.searchsorted(target_pixels, np.uint32(record["pixel_index"]))
-        )
+        target_index = int(np.searchsorted(target_pixels, np.uint32(record["pixel_index"])))
         if target_index < target_pixels.size and completed[target_index]:
             record["fill_bgr"] = completed_colours[target_index]
             record["backend"] = np.uint8(2)
@@ -1175,9 +1161,7 @@ def _collect_component_targets(
         matching = residual[residual["pixel_index"] == pixel]
         target_colours[target_index] = matching[0]["fill_bgr"]
         if np.any(matching["fill_bgr"] != target_colours[target_index]):
-            raise ValueError(
-                "records for one target pixel disagree on provisional colour"
-            )
+            raise ValueError("records for one target pixel disagree on provisional colour")
     return np.ascontiguousarray(target_pixels), target_colours
 
 
@@ -1303,9 +1287,7 @@ def _validate_center(name: str, center: tuple[int, int]) -> tuple[int, int]:
     if (
         not isinstance(center, tuple)
         or len(center) != 2
-        or any(
-            isinstance(value, bool) or not isinstance(value, int) for value in center
-        )
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in center)
     ):
         raise TypeError(f"{name} must be an integer (row, column) tuple")
     return center

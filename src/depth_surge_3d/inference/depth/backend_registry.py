@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib.util
+import sys
 from types import MappingProxyType
 from typing import Any, Callable, Literal, Mapping, cast
 
@@ -75,6 +76,12 @@ def _available() -> BackendAvailability:
     return BackendAvailability(available=True)
 
 
+def moge_install_command() -> str:
+    if sys.platform == "win32":
+        return r".\1.install-uv-qinglong.ps1 -WithMoGe2"
+    return "uv sync --extra moge2 --locked --no-editable --no-dev --inexact --python 3.11"
+
+
 def _moge_availability() -> BackendAvailability:
     try:
         installed = importlib.util.find_spec("moge.model.v2") is not None
@@ -85,7 +92,7 @@ def _moge_availability() -> BackendAvailability:
     return BackendAvailability(
         available=False,
         reason="MoGe-2 optional dependency is not installed",
-        install_command="uv sync --extra moge2",
+        install_command=moge_install_command(),
     )
 
 

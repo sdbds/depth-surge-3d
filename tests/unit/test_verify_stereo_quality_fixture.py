@@ -24,11 +24,14 @@ from scripts.verify_stereo_quality_fixture import (
 from src.depth_surge_3d.rendering.stereo_renderer import StereoRenderer, StereoRenderSettings
 
 
+def _simulate_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Patching os.name process-wide breaks pathlib and pytest on POSIX.
+    monkeypatch.setattr(verifier, "os", SimpleNamespace(**{**vars(verifier.os), "name": "nt"}))
+
+
 @pytest.fixture(autouse=True)
 def _candidate_native_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
-    source_sha256 = verifier._sha256(
-        verifier.PROJECT_ROOT / "native" / "quality_kd_native.cpp"
-    )
+    source_sha256 = verifier._sha256(verifier.PROJECT_ROOT / "native" / "quality_kd_native.cpp")
     monkeypatch.setattr(
         verifier,
         "native_binary_evidence",
@@ -196,7 +199,7 @@ def test_windows_affinity_handoff_waits_and_propagates_child_status(
 ) -> None:
     command = ("python.exe", "verify.py", "--cpu-affinity", "0-15")
     observed: list[tuple[tuple[str, ...], bool]] = []
-    monkeypatch.setattr(verifier.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(
         verifier.subprocess,
         "run",
@@ -224,7 +227,7 @@ def test_windows_physical_core_count_uses_native_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(verifier, "_optional_psutil", lambda: None)
-    monkeypatch.setattr(verifier.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(verifier, "_windows_physical_core_count", lambda: 24)
 
     assert verifier._physical_core_count() == 24
@@ -262,7 +265,7 @@ def test_windows_cpu_model_comes_from_the_processor_name_registry_value(
 def test_windows_affinity_evidence_queries_every_enumerated_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(verifier.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(verifier, "_windows_processor_group_count", lambda: 1)
     monkeypatch.setattr(verifier, "_current_thread_cpu_affinity", lambda: (2, 3))
     monkeypatch.setattr(
@@ -283,7 +286,7 @@ def test_windows_affinity_evidence_queries_every_enumerated_thread(
 def test_windows_affinity_evidence_rejects_one_escaped_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(verifier.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(verifier, "_windows_processor_group_count", lambda: 1)
     monkeypatch.setattr(verifier, "_current_thread_cpu_affinity", lambda: (2, 3))
     monkeypatch.setattr(
@@ -299,7 +302,8 @@ def test_windows_affinity_evidence_rejects_one_escaped_thread(
 def test_multi_group_windows_runtime_fails_closed_without_cross_group_cpu_sets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(verifier.os, "name", "nt")
+    _simulate_windows(monkeypatch)
+    monkeypatch.setattr(verifier, "_windows_cpu_model", lambda: "Fixture CPU")
     monkeypatch.setattr(verifier, "_windows_processor_group_count", lambda: 2)
     monkeypatch.setattr(
         verifier,
@@ -317,7 +321,7 @@ def test_multi_group_windows_runtime_fails_closed_without_cross_group_cpu_sets(
 def test_multi_group_windows_rejects_only_explicit_flat_affinity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(verifier.os, "name", "nt")
+    _simulate_windows(monkeypatch)
     monkeypatch.setattr(verifier, "_windows_processor_group_count", lambda: 2)
 
     with pytest.raises(RuntimeError, match="cross-group"):
@@ -471,9 +475,7 @@ def test_task0_source_accepts_only_evidence_only_descendant_commits(
     evidence.parent.mkdir(parents=True)
     evidence.write_text("generated", encoding="ascii")
     subprocess.run(["git", "add", evidence.as_posix()], cwd=repository, check=True)
-    subprocess.run(
-        ["git", "commit", "-q", "-m", "evidence"], cwd=repository, check=True
-    )
+    subprocess.run(["git", "commit", "-q", "-m", "evidence"], cwd=repository, check=True)
     evidence_descendant = verifier.task0_reporting.capture_source_identity(
         repository,
         excluded_relative_paths=verifier._RELEASE_EVIDENCE_RELATIVE_PATHS,
@@ -486,9 +488,7 @@ def test_task0_source_accepts_only_evidence_only_descendant_commits(
 
     (repository / "tracked.txt").write_text("source change", encoding="ascii")
     subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
-    subprocess.run(
-        ["git", "commit", "-q", "-m", "source"], cwd=repository, check=True
-    )
+    subprocess.run(["git", "commit", "-q", "-m", "source"], cwd=repository, check=True)
     changed_source = verifier.task0_reporting.capture_source_identity(
         repository,
         excluded_relative_paths=verifier._RELEASE_EVIDENCE_RELATIVE_PATHS,
@@ -552,9 +552,7 @@ def test_release_gate_requires_each_independent_benchmark_gate(
             "all_output_shapes_and_dtypes_valid": True,
         }
     ]
-    benchmark_gates = {
-        name: name != failed_gate for name in verifier._BENCHMARK_RELEASE_GATE_NAMES
-    }
+    benchmark_gates = {name: name != failed_gate for name in verifier._BENCHMARK_RELEASE_GATE_NAMES}
     task0 = {
         "candidate_source_match": True,
         "native_build_match": True,
@@ -585,11 +583,7 @@ def test_task0_native_build_match_includes_frozen_source_hash(
         "source_sha256": "a" * 64,
     }
     required_ids = sorted(
-        {
-            run_id
-            for run_ids in verifier._TASK0_RELEASE_RUN_GROUPS.values()
-            for run_id in run_ids
-        }
+        {run_id for run_ids in verifier._TASK0_RELEASE_RUN_GROUPS.values() for run_id in run_ids}
     )
     runs = []
     for index, run_id in enumerate(required_ids):
@@ -668,11 +662,7 @@ def test_full_pipeline_benchmark_publishes_production_diagnostics(
     assert result["published_diagnostic_byte_counts"][0] > 0
     assert (benchmark_root / "04_left_frames" / "benchmark.png").is_file()
     assert (
-        benchmark_root
-        / "04_stereo_diagnostics"
-        / "frames"
-        / "benchmark"
-        / "manifest.json"
+        benchmark_root / "04_stereo_diagnostics" / "frames" / "benchmark" / "manifest.json"
     ).is_file()
 
 

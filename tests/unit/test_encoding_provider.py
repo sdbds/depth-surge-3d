@@ -458,15 +458,9 @@ def test_audio_ffprobe_parser_rejects_duplicate_authority_and_unknown_roots(raw:
 
 def test_audio_ffprobe_parser_enforces_ignored_wrapper_state_caps() -> None:
     accepted = b'{"streams":[],"programs":[' + b",".join([b"{}"] * 256) + b"]}"
-    rejected_containers = (
-        b'{"streams":[],"programs":[' + b",".join([b"{}"] * 257) + b"]}"
-    )
-    accepted_scalar = (
-        b'{"streams":[],"programs":[{"value":"' + (b"x" * 128) + b'"}]}'
-    )
-    rejected_scalar = (
-        b'{"streams":[],"programs":[{"value":"' + (b"x" * 129) + b'"}]}'
-    )
+    rejected_containers = b'{"streams":[],"programs":[' + b",".join([b"{}"] * 257) + b"]}"
+    accepted_scalar = b'{"streams":[],"programs":[{"value":"' + (b"x" * 128) + b'"}]}'
+    rejected_scalar = b'{"streams":[],"programs":[{"value":"' + (b"x" * 129) + b'"}]}'
 
     assert encoding_provider.parse_audio_ffprobe_json(accepted) is None
     assert encoding_provider.parse_audio_ffprobe_json(accepted_scalar) is None
@@ -517,12 +511,8 @@ def test_final_ffprobe_parser_allows_only_empty_optional_wrappers() -> None:
 
 
 def test_final_ffprobe_parser_enforces_scalar_token_cap() -> None:
-    accepted = (
-        b'{"streams":[{"codec_type":"' + (b"x" * 128) + b'"}],"programs":[]}'
-    )
-    rejected = (
-        b'{"streams":[{"codec_type":"' + (b"x" * 129) + b'"}],"programs":[]}'
-    )
+    accepted = b'{"streams":[{"codec_type":"' + (b"x" * 128) + b'"}],"programs":[]}'
+    rejected = b'{"streams":[{"codec_type":"' + (b"x" * 129) + b'"}],"programs":[]}'
 
     assert encoding_provider.parse_final_ffprobe_json(accepted)[0].fields["codec_type"] == (
         "x" * 128

@@ -50,11 +50,7 @@ class QualityByteArena:
         return self.cursor
 
     def rewind(self, mark: int) -> None:
-        if (
-            isinstance(mark, bool)
-            or not isinstance(mark, int)
-            or not 0 <= mark <= self.cursor
-        ):
+        if isinstance(mark, bool) or not isinstance(mark, int) or not 0 <= mark <= self.cursor:
             raise ValueError("arena rewind mark is invalid")
         self.cursor = mark
 

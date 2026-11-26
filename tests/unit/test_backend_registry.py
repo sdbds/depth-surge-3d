@@ -1,6 +1,7 @@
 """Tests for the centralized depth backend registry."""
 
 import importlib.util
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -108,14 +109,22 @@ def test_moge_variants_and_pins_are_exact() -> None:
     )
 
 
-def test_missing_moge_extra_reports_only_supported_command(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("platform", "install_command"),
+    [
+        ("win32", r".\1.install-uv-qinglong.ps1 -WithMoGe2"),
+        ("linux", "uv sync --extra moge2 --locked --no-editable --no-dev --inexact --python 3.11"),
+    ],
+)
+def test_missing_moge_extra_reports_only_supported_command(monkeypatch, platform, install_command):
     """A missing optional dependency gives users the project-supported install path."""
     monkeypatch.setattr(importlib.util, "find_spec", lambda _name: None)
+    monkeypatch.setattr(sys, "platform", platform)
     availability = backend_availability("moge2")
     assert availability == BackendAvailability(
         available=False,
         reason="MoGe-2 optional dependency is not installed",
-        install_command="uv sync --extra moge2",
+        install_command=install_command,
     )
 
 

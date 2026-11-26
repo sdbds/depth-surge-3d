@@ -186,6 +186,41 @@ def _moment_calibration(
     }
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"mode": "guessed"},
+        {"fallback_reason": "unknown"},
+        {"fallback_reason": "source_variance"},
+        {"mode": "base_fallback"},
+        {"midpoint_fraction": None},
+        {"midpoint_count": 1},
+        {"mode": "all_midpoint"},
+        {"correlation": 0.5},
+        {"postclip_contrast_ratio": 0.0},
+        {"source_variance": 0.0},
+        {"pair_count": 1},
+        {"preclip_high_fraction": 1.1},
+    ],
+)
+def test_stored_ols_record_cannot_contradict_its_own_samples(changes):
+    record = {**_ols_calibration(), **changes}
+    with pytest.raises((TypeError, ValueError)):
+        canonicalize_vdpp_calibration_diagnostics(record, shot_length=1, native_shape=(3, 5))
+
+
+def test_bounded_statistics_only_snap_roundoff_not_out_of_range_values():
+    within = math.nextafter(0.0, -math.inf)
+    assert normalize_bounded_stat(within, 0.0, 1.0, planned_tile_count=2) == 0.0
+    with pytest.raises(NumericalContractError):
+        normalize_bounded_stat(-0.01, 0.0, 1.0, planned_tile_count=2)
+    with pytest.raises(ValueError):
+        normalize_bounded_stat(0.5, 2.0, 1.0, planned_tile_count=2)
+    for low, high in ((float("nan"), 1.0), (0.0, float("inf"))):
+        with pytest.raises(TypeError):
+            normalize_bounded_stat(0.5, low, high, planned_tile_count=2)
+
+
 def test_fixed_constants_match_the_v2_execution_contract() -> None:
     assert MIDPOINT_CODE == 32768
     assert MODEL_MIDPOINT_VALUE == 0.5

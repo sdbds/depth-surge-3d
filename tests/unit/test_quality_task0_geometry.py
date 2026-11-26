@@ -1,4 +1,4 @@
-"""Task 0 contracts for one-sided Quality geometry and lifetime order."""
+"""Scalar contracts for one-sided Quality geometry and lifetime order."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.quality_task0 import quality_geometry, region_solver
+from scripts.quality_task0 import region_solver as reference_solver
 from src.depth_surge_3d.rendering.stereo_geometry import (
     build_metric_geometry,
     build_relative_geometry,
@@ -19,11 +19,6 @@ from src.depth_surge_3d.rendering.stereo_renderer import (
     calculate_eye_sample_offsets,
     calculate_geometry_eye_sample_offsets,
 )
-
-
-def _api(name: str):
-    assert hasattr(quality_geometry, name), f"missing Task 0 geometry API: {name}"
-    return getattr(quality_geometry, name)
 
 
 def test_quality_geometry_module_is_importable() -> None:
@@ -94,10 +89,11 @@ def _scalar_one_sided(
 @pytest.mark.parametrize("mask", range(16))
 @pytest.mark.parametrize("output_coordinate", [(0, 0), (1, 1), (2, 2)])
 def test_one_sided_scalar_matches_independent_binary64_oracle(
+    quality_geometry,
     mask: int,
     output_coordinate: tuple[int, int],
 ) -> None:
-    resample = _api("one_sided_resample_scalar")
+    resample = quality_geometry.one_sided_resample_scalar
     values = np.array([[0.125, 0.375], [0.625, 0.875]], dtype=np.float32)
     regions = np.full((2, 2), 2, dtype=np.uint32)
     for index in range(4):
@@ -125,8 +121,8 @@ def test_one_sided_scalar_matches_independent_binary64_oracle(
         assert np.asarray(actual, dtype=np.float32).tobytes() == expected.tobytes()
 
 
-def _offset_for_value(value: np.float32) -> int:
-    build_offsets = _api("build_relative_eye_offsets_into")
+def _offset_for_value(quality_geometry, value: np.float32) -> int:
+    build_offsets = quality_geometry.build_relative_eye_offsets_into
     near_score = np.full((1, 1920), np.float32(0.5), dtype=np.float32)
     near_score[0, 0] = value
     output = np.empty(near_score.shape, dtype=np.int32)
@@ -142,8 +138,8 @@ def _offset_for_value(value: np.float32) -> int:
     return int(output[0, 0])
 
 
-def test_one_ulp_one_sided_primitive_change_crosses_a_relative_fine_lane() -> None:
-    resample = _api("one_sided_resample_scalar")
+def test_one_ulp_one_sided_primitive_change_crosses_a_relative_fine_lane(quality_geometry) -> None:
+    resample = quality_geometry.one_sided_resample_scalar
     boundary = np.float32(0.9052734375)
     above = np.nextafter(boundary, np.float32(1.0))
     regions = np.array([[1, 2], [2, 2]], dtype=np.uint32)
@@ -167,29 +163,29 @@ def test_one_ulp_one_sided_primitive_change_crosses_a_relative_fine_lane() -> No
 
     assert base == boundary
     assert changed == above
-    assert _offset_for_value(base) == 124
-    assert _offset_for_value(changed) == 125
+    assert _offset_for_value(quality_geometry, base) == 124
+    assert _offset_for_value(quality_geometry, changed) == 125
 
 
-def test_streamed_edge_rows_equal_the_full_cross_dilated_oracle() -> None:
-    materialize = _api("materialize_streamed_edge_band")
+def test_streamed_edge_rows_equal_the_full_cross_dilated_oracle(quality_geometry) -> None:
+    materialize = quality_geometry.materialize_streamed_edge_band
     low_regions = np.array(
         [[1, 1, 2], [1, 3, 2], [4, 3, 2]],
         dtype=np.uint32,
     )
     render_shape = (11, 13)
-    mapped = region_solver.nearest_label_upsample(
+    mapped = reference_solver.nearest_label_upsample(
         low_regions,
         render_height=render_shape[0],
         render_width=render_shape[1],
     )
-    radius = region_solver.edge_band_radius(
+    radius = reference_solver.edge_band_radius(
         geometry_height=low_regions.shape[0],
         geometry_width=low_regions.shape[1],
         render_height=render_shape[0],
         render_width=render_shape[1],
     )
-    expected = region_solver.build_four_connected_edge_band(mapped, radius=radius)
+    expected = reference_solver.build_four_connected_edge_band(mapped, radius=radius)
 
     actual = materialize(low_regions, render_shape=render_shape, radius=radius)
 
@@ -207,7 +203,10 @@ def _relative_edge_fixture():
 
 
 def test_relative_ten_step_geometry_uses_final_geodesic_regions_and_exact_baseline() -> None:
-    build = _api("build_relative_quality_geometry")
+    # The Task 0 trace always builds an index; production can use a bounded local query.
+    from scripts.quality_task0 import quality_geometry
+
+    build = quality_geometry.build_relative_quality_geometry
     guide, canonical, render_shape = _relative_edge_fixture()
     result = build(
         guide,
@@ -222,18 +221,18 @@ def test_relative_ten_step_geometry_uses_final_geodesic_regions_and_exact_baseli
         stereo_strength=5.0,
         convergence=0.5,
     )
-    initial = region_solver.nearest_label_upsample(
+    initial = reference_solver.nearest_label_upsample(
         result.source_region_map,
         render_height=render_shape[0],
         render_width=render_shape[1],
     )
-    radius = region_solver.edge_band_radius(
+    radius = reference_solver.edge_band_radius(
         geometry_height=canonical.shape[0],
         geometry_width=canonical.shape[1],
         render_height=render_shape[0],
         render_width=render_shape[1],
     )
-    edge_band = region_solver.build_four_connected_edge_band(initial, radius=radius)
+    edge_band = reference_solver.build_four_connected_edge_band(initial, radius=radius)
 
     np.testing.assert_array_equal(result.near_score[~edge_band], baseline.near_score[~edge_band])
     np.testing.assert_array_equal(
@@ -300,8 +299,8 @@ def _metric_stats_oracle(
     return total, (valid_count, clamped_count, fraction)
 
 
-def test_metric_geometry_resamples_primitives_then_recounts_clamps() -> None:
-    build = _api("build_metric_quality_geometry")
+def test_metric_geometry_resamples_primitives_then_recounts_clamps(quality_geometry) -> None:
+    build = quality_geometry.build_metric_quality_geometry
     inverse = np.array(
         [[0.1, 0.1, 10.0, 10.0], [0.1, 0.1, 10.0, 10.0]],
         dtype=np.float32,
@@ -332,18 +331,18 @@ def test_metric_geometry_resamples_primitives_then_recounts_clamps() -> None:
         retained_crop_width=12,
     )
     _fast_inverse, fast_valid = resize_metric_geometry(inverse, valid, render_shape)
-    initial = region_solver.nearest_label_upsample(
+    initial = reference_solver.nearest_label_upsample(
         result.source_region_map,
         render_height=render_shape[0],
         render_width=render_shape[1],
     )
-    radius = region_solver.edge_band_radius(
+    radius = reference_solver.edge_band_radius(
         geometry_height=inverse.shape[0],
         geometry_width=inverse.shape[1],
         render_height=render_shape[0],
         render_width=render_shape[1],
     )
-    edge_band = region_solver.build_four_connected_edge_band(initial, radius=radius)
+    edge_band = reference_solver.build_four_connected_edge_band(initial, radius=radius)
     expected_total, expected_stats = _metric_stats_oracle(
         result.near_score,
         result.metric_valid,
@@ -378,12 +377,13 @@ def test_metric_geometry_resamples_primitives_then_recounts_clamps() -> None:
     ids=["G_over_Q_0_5", "G_over_Q_1", "G_over_Q_2", "G_over_Q_4"],
 )
 def test_relative_offsets_and_metric_clamps_match_fast_at_all_frozen_ratios(
+    quality_geometry,
     geometry_shape: tuple[int, int],
 ) -> None:
-    build_relative = _api("build_relative_quality_geometry")
-    build_metric = _api("build_metric_quality_geometry")
-    build_offsets = _api("build_relative_eye_offsets_into")
-    build_geometry_offsets = _api("build_geometry_eye_offsets_into")
+    build_relative = quality_geometry.build_relative_quality_geometry
+    build_metric = quality_geometry.build_metric_quality_geometry
+    build_offsets = quality_geometry.build_relative_eye_offsets_into
+    build_geometry_offsets = quality_geometry.build_geometry_eye_offsets_into
     render_shape = (4, 8)
     guide = np.zeros((*render_shape, 3), dtype=np.uint8)
     canonical = np.full(geometry_shape, np.float32(0.9052734375), dtype=np.float32)

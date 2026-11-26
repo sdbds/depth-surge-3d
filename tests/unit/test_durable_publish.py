@@ -66,9 +66,7 @@ def test_owned_temporary_replaces_its_target_and_survives_post_replace_fault(
     owned.sync()
 
     with pytest.raises(RuntimeError, match="simulated crash"):
-        owned.replace(
-            after_replace=lambda: (_ for _ in ()).throw(RuntimeError("simulated crash"))
-        )
+        owned.replace(after_replace=lambda: (_ for _ in ()).throw(RuntimeError("simulated crash")))
     owned.cleanup()
 
     assert target.read_bytes() == b"new"

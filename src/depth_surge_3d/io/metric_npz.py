@@ -7,6 +7,7 @@ import binascii
 import errno
 import hashlib
 import os
+from io import BufferedReader, FileIO
 from pathlib import Path
 import stat
 import struct
@@ -287,11 +288,9 @@ def _regular_open(
     *,
     job_root: Path | None = None,
     acquired: AcquiredRoot | None = None,
-) -> BinaryIO:
+) -> FileIO | BufferedReader:
     if acquired is not None:
-        if job_root is not None and acquired.root != Path(
-            os.path.abspath(os.fspath(job_root))
-        ):
+        if job_root is not None and acquired.root != Path(os.path.abspath(os.fspath(job_root))):
             raise MetricNpzFormatError("metric NPZ acquired the wrong job root")
         return acquired.open_regular(path)
     if job_root is not None:
@@ -779,6 +778,15 @@ def _validate_metric_values(path: Path, ownership: _InflateOwnership) -> int:
     return scratch_peak
 
 
+def _npy_header_extent(path: Path, member: MetricNpzMember, header: bytearray) -> int:
+    if header[:8] != b"\x93NUMPY\x01\x00":
+        raise _format_error(path, f"{member.name} NPY descriptor/version is invalid")
+    header_length = struct.unpack_from("<H", header, 8)[0]
+    if header_length > 256:
+        raise _format_error(path, f"{member.name} NPY header length is invalid")
+    return 10 + header_length
+
+
 def _inflate_member_header(
     handle: BinaryIO,
     path: Path,
@@ -817,12 +825,7 @@ def _inflate_member_header(
             maximum_stream_bytes = max(maximum_stream_bytes, len(output), len(pending))
             header.extend(output)
             if header_total is None and len(header) == 10:
-                if header[:8] != b"\x93NUMPY\x01\x00":
-                    raise _format_error(path, f"{member.name} NPY descriptor/version is invalid")
-                header_length = struct.unpack_from("<H", header, 8)[0]
-                if header_length > 256:
-                    raise _format_error(path, f"{member.name} NPY header length is invalid")
-                header_total = 10 + header_length
+                header_total = _npy_header_extent(path, member, header)
             if decoder.eof and (header_total is None or len(header) < header_total):
                 raise _format_error(path, f"{member.name} NPY header is incomplete")
             if not output and pending and len(pending) == before:

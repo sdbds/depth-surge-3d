@@ -246,8 +246,17 @@ def test_fused_fast_output_returns_none_for_cpu():
 )
 def test_fused_fast_output_rejects_unsupported_inputs_before_allocating(monkeypatch, case):
     colour, prefill, filled, unresolved = _constant_bands()
-    if case == "colour_dtype":
-        colour = colour.to(torch.float64)
+    dtype_cases = {
+        "colour_dtype": ("colour", torch.float64),
+        "prefill_dtype": ("prefill", torch.uint8),
+        "filled_dtype": ("filled", torch.int32),
+        "unresolved_dtype": ("unresolved", torch.float32),
+    }
+    values = dict(colour=colour, prefill=prefill, filled=filled, unresolved=unresolved)
+    if case in dtype_cases:
+        name, dtype = dtype_cases[case]
+        values[name] = values[name].to(dtype)
+        colour, prefill, filled, unresolved = values.values()
     elif case == "colour_channels":
         colour = torch.empty((*colour.shape[:2], 4), device="cuda")
     elif case == "fine_width":
@@ -256,18 +265,11 @@ def test_fused_fast_output_rejects_unsupported_inputs_before_allocating(monkeypa
         prefill = torch.ones((2, 17, 15), dtype=torch.bool, device="cuda")
     elif case == "empty":
         colour, prefill, filled, unresolved = _constant_bands(height=0)
-    elif case == "prefill_dtype":
-        prefill = prefill.to(torch.uint8)
-    elif case == "filled_dtype":
-        filled = filled.to(torch.int32)
-    elif case == "unresolved_dtype":
-        unresolved = unresolved.to(torch.float32)
     elif case == "mask_shape":
         unresolved = torch.zeros((2, 16, 16), dtype=torch.bool, device="cuda")
     elif case == "host_mask":
         filled = filled.cpu()
     else:
-        values = dict(colour=colour, prefill=prefill, filled=filled, unresolved=unresolved)
         key = case.removesuffix("_strides")
         values[key] = values[key].repeat_interleave(2, dim=0)[::2]
         colour, prefill, filled, unresolved = (values[key] for key in values)

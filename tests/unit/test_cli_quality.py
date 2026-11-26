@@ -1,20 +1,42 @@
 from __future__ import annotations
 
-import importlib
 import sys
-from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 
-@pytest.fixture
-def cli_module():
-    project_root = Path(__file__).resolve().parents[2]
-    sys.path.insert(0, str(project_root / "src"))
-    try:
-        yield importlib.import_module("depth_surge_3d.cli")
-    finally:
-        sys.path.pop(0)
+def test_publication_resume_never_repairs_a_job_owned_by_another_writer(
+    cli_module, tmp_path, monkeypatch
+):
+    settings_file = tmp_path / "processing-settings-v5.json"
+    info = {"settings_file": settings_file, "status": "completed"}
+    monkeypatch.setattr(
+        cli_module,
+        "recover_processing_settings_artifact",
+        lambda *_: pytest.fail("recovered without the job lock"),
+    )
+    with cli_module.JobWriterLock(tmp_path):
+        assert cli_module._finish_saved_publication(tmp_path, info) is False
+
+
+@pytest.mark.parametrize("authenticated", [False, True])
+def test_completed_resume_requires_positive_media_audit(
+    cli_module, tmp_path, monkeypatch, authenticated
+):
+    settings_file = tmp_path / "processing-settings-v5.json"
+    info = {"settings_file": settings_file, "status": "completed"}
+    monkeypatch.setattr(
+        cli_module,
+        "recover_processing_settings_artifact",
+        lambda _: SimpleNamespace(status="completed"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "audit_final_media_v1",
+        lambda *_: SimpleNamespace(final_video_authenticated=authenticated),
+    )
+    assert cli_module._finish_saved_publication(tmp_path, info) is authenticated
 
 
 def test_cli_accepts_explicit_quality_controls(cli_module) -> None:
@@ -34,6 +56,16 @@ def test_cli_accepts_explicit_quality_controls(cli_module) -> None:
 
     assert settings["stereo_render_mode"] == "quality"
     assert settings["occlusion_fill_max_px"] == 10
+
+
+def test_cli_refuses_unimplemented_motion_interpolation(cli_module, monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys, "argv", ["depth-surge-3d", "input.mp4", "--experimental-frame-interpolation"]
+    )
+    with pytest.raises(SystemExit) as error:
+        cli_module.main()
+    assert error.value.code == 2
+    assert "motion interpolation" in capsys.readouterr().err.lower()
 
 
 @pytest.mark.parametrize("device", ["cuda", "cpu"])

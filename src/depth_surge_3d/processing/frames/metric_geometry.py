@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ...io import _win32
+
 import ctypes
 from dataclasses import dataclass
 import errno
@@ -318,7 +320,7 @@ def _windows_allocation_unit(directory: Path) -> int | None:
     """Query the Windows cluster size, or report that the query is unavailable."""
 
     try:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _win32.load_library("kernel32", use_last_error=True)
         get_volume_path = kernel32.GetVolumePathNameW
         get_disk_free_space = kernel32.GetDiskFreeSpaceW
         resolved = str(Path(directory).resolve())

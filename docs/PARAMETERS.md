@@ -13,9 +13,22 @@ and stereo output.
   `HH:MM:SS.mmm` form. Whole-second values remain valid.
 - `-f, --format`: `side_by_side` or `over_under`.
 - `--vr-resolution`: named per-eye resolution, `auto`, or `custom`.
-- `--target-fps`: output frame rate. Omit it to preserve the source rate.
+- `--target-fps`: output frame rate. Omit it to keep the source rate, including
+  fractions such as `24000/1001`. A different rate repeats or drops frames;
+  it does not change playback speed or synthesize motion. One second of 24 fps
+  becomes 60 frames at 60 fps, with the original second of audio. If a clip
+  ends between output ticks, the last image covers the remaining fraction of
+  one output frame. The saved frame and progress counts for the source stages
+  still refer to the selected input frames.
 - `--no-audio`: omit source audio.
 - `--no-intermediates`: remove restartable working files after validated output.
+
+When FFprobe reports a valid source clock, new jobs persist it as a fraction.
+The extraction cache binds the selected start and exclusive end frame. Switching
+between equally long clips no longer reuses the old images. A legacy cache
+without the interval must be extracted again; an already encoded legacy movie
+is not retimed during publication recovery. Resume a new job with this version
+or later: older versions expect the previous, closed video metadata shape.
 
 ## Stereo Rendering
 

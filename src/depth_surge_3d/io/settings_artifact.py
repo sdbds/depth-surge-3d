@@ -21,7 +21,7 @@ import numpy as np
 
 from ..core.file_identity import FILE_IDENTITY_ALGORITHM_VERSION
 from ..core.settings import JOB_OUTPUT_NAME_V1_RESOLUTION_PRESETS, validate_settings
-from ..utils.path_utils import calculate_frame_range
+from ..core.video_timing import canonical_frame_rate, selected_frame_range
 from .canonical_json import (
     CanonicalJsonError,
     canonical_json_bytes,
@@ -389,7 +389,9 @@ def job_output_name_v1(source_video_name: object, vr_format: object, vr_resoluti
     raise SettingsArtifactSchemaError("job-output-name-v1 has no portable fallback")
 
 
-def _materialize_processing_settings(values: dict[str, Any]) -> dict[str, Any]:
+def materialize_processing_settings_v5(values: dict[str, Any]) -> dict[str, Any]:
+    """Return the settings representation persisted in a schema-5 artifact."""
+
     _schema(type(values) is dict, "processing_settings must be an object")
     optional_defaults: dict[str, Any] = {
         "start_time": None,
@@ -435,12 +437,7 @@ def _materialize_processing_settings(values: dict[str, Any]) -> dict[str, Any]:
 def _selected_frame_count_v1(
     video_properties: dict[str, Any], processing_settings: dict[str, Any]
 ) -> int:
-    start_frame, end_frame = calculate_frame_range(
-        video_properties["frame_count"],
-        video_properties["fps"],
-        processing_settings["start_time"],
-        processing_settings["end_time"],
-    )
+    start_frame, end_frame = selected_frame_range(video_properties, processing_settings)
     return end_frame - start_frame
 
 
@@ -550,7 +547,15 @@ def _validate_processing_settings(value: object) -> dict[str, Any]:  # noqa: C90
 
 
 def _validate_video_properties(value: object) -> dict[str, Any]:
-    video = _closed_object(value, VIDEO_PROPERTIES_V5_KEYS, "video_properties")
+    keys = VIDEO_PROPERTIES_V5_KEYS
+    if isinstance(value, dict) and "frame_rate" in value:
+        keys = keys | {"frame_rate"}
+        rate = value["frame_rate"]
+        _schema(
+            isinstance(rate, str) and canonical_frame_rate(rate) == rate,
+            "video_properties.frame_rate must be a canonical positive frame rate",
+        )
+    video = _closed_object(value, keys, "video_properties")
     _integer(video["width"], "video_properties.width", 1, 10_000)
     _integer(video["height"], "video_properties.height", 1, 10_000)
     _binary64(video["fps"], "video_properties.fps", np.nextafter(0.0, 1.0), None)
@@ -795,8 +800,7 @@ def _validate_complete_object(value: object) -> dict[str, Any]:  # noqa: C901
                 )
             else:
                 _state(
-                    runtime["frames_processed"]
-                    == _selected_frame_count_v1(video, settings),
+                    runtime["frames_processed"] == _selected_frame_count_v1(video, settings),
                     "completed frame count is invalid",
                 )
             projected = duration_seconds_from_ms_v1(duration)
@@ -921,7 +925,7 @@ class ProcessingSettingsArtifactV5:
                 "processing settings rewrite requires an in-progress job"
             )
         utc_ordinal_usec_v1(updated_at)
-        materialized = _materialize_processing_settings(processing_settings)
+        materialized = materialize_processing_settings_v5(processing_settings)
         metadata = copy.deepcopy(self._value["metadata"])
         metadata["settings_revision"] += 1
         metadata["last_updated_at"] = updated_at
@@ -1040,7 +1044,7 @@ class ProcessingSettingsArtifactV5:
         materialized = (
             copy.deepcopy(self._value["processing_settings"])
             if processing_settings is None
-            else _materialize_processing_settings(processing_settings)
+            else materialize_processing_settings_v5(processing_settings)
         )
         metadata = copy.deepcopy(self._value["metadata"])
         metadata["settings_revision"] += 1
@@ -1077,7 +1081,7 @@ def create_processing_settings_artifact_v5(
     """Build a deterministic initial object before any job mutation."""
 
     utc_ordinal_usec_v1(creation_now_usec)
-    settings = _materialize_processing_settings(processing_settings)
+    settings = materialize_processing_settings_v5(processing_settings)
     output_name = job_output_name_v1(
         source_video_name, settings["vr_format"], settings["vr_resolution"]
     )
@@ -1248,7 +1252,7 @@ def migrate_processing_settings_artifact_v5(
     assert isinstance(legacy_metadata, dict)
     source_version = legacy_metadata.get("settings_schema_version", 1)
     _integer(source_version, "legacy settings schema version", 1, 4)
-    settings = _materialize_processing_settings(migrated_processing_settings)
+    settings = materialize_processing_settings_v5(migrated_processing_settings)
     video = _legacy_video_properties(legacy_settings.get("video_properties"))
     legacy_output = legacy_settings.get("output_info")
     _schema(type(legacy_output) is dict, "legacy output_info must be an object")

@@ -964,13 +964,13 @@ class TestProcessVideoErrorPaths:
 
     @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
-    def test_process_video_invalid_input(self, mock_validate, mock_create):
+    def test_process_video_invalid_input(self, mock_validate, mock_create, tmp_path):
         """Test process_video with invalid video input."""
         mock_create.return_value = MagicMock()
         mock_validate.return_value = False
 
         projector = StereoProjector(device="cpu")
-        result = projector.process_video("invalid.txt", "/tmp/output", {})
+        result = projector.process_video("invalid.txt", str(tmp_path / "output"), {})
 
         assert result is False
         mock_validate.assert_called_once_with("invalid.txt")
@@ -978,33 +978,27 @@ class TestProcessVideoErrorPaths:
     @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
     @patch("src.depth_surge_3d.rendering.stereo_projector.get_video_properties")
-    def test_process_video_model_load_failure(self, mock_get_props, mock_validate, mock_create):
+    def test_process_video_model_load_failure(
+        self, mock_get_props, mock_validate, mock_create, tmp_path
+    ):
         """Test process_video when model fails to load."""
         mock_estimator = MagicMock()
         mock_estimator.load_model.return_value = False
         mock_create.return_value = mock_estimator
         mock_validate.return_value = True
-        mock_get_props.return_value = {
-            "width": 1920,
-            "height": 1080,
-            "fps": 30.0,
-            "frame_count": 1,
-            "sample_aspect_ratio_numerator": 1,
-            "sample_aspect_ratio_denominator": 1,
-        }
+        mock_get_props.return_value = _video_properties()
 
         projector = StereoProjector(device="cpu")
-
-        with patch("pathlib.Path.mkdir"):
-            result = projector.process_video("test.mp4", "/tmp/output", {})
+        result = projector.process_video("test.mp4", str(tmp_path / "output"), {})
 
         assert result is False
         mock_estimator.load_model.assert_called_once()
 
     @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
+    @patch("src.depth_surge_3d.rendering.stereo_projector.get_video_properties")
     def test_process_video_holds_writer_lock_before_model_load(
-        self, mock_validate, mock_create, tmp_path
+        self, mock_get_props, mock_validate, mock_create, tmp_path
     ):
         from src.depth_surge_3d.io.job_lock import JobAlreadyLockedError, JobWriterLock
 
@@ -1013,25 +1007,29 @@ class TestProcessVideoErrorPaths:
         work.mkdir(parents=True)
         (work / "shot_0.raw.f32.mmap").write_bytes(b"stale")
         estimator = MagicMock()
+        cleaned_before_load = []
 
         def observe_lock():
             with pytest.raises(JobAlreadyLockedError):
                 JobWriterLock(output_dir).acquire()
-            assert not work.exists()
+            cleaned_before_load.append(not work.exists())
             return False
 
         estimator.load_model.side_effect = observe_lock
         mock_create.return_value = estimator
         mock_validate.return_value = True
+        mock_get_props.return_value = _video_properties()
 
         projector = StereoProjector(device="cpu")
         assert projector.process_video("test.mp4", str(output_dir), {}) is False
+        estimator.load_model.assert_called_once()
+        assert cleaned_before_load == [True]
 
     @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
     @patch("src.depth_surge_3d.rendering.stereo_projector.get_video_properties")
     def test_process_video_invalid_video_properties(
-        self, mock_get_props, mock_validate, mock_create
+        self, mock_get_props, mock_validate, mock_create, tmp_path
     ):
         """Test process_video when video properties cannot be read."""
         mock_estimator = MagicMock()
@@ -1042,28 +1040,29 @@ class TestProcessVideoErrorPaths:
 
         projector = StereoProjector(device="cpu")
 
-        with patch("pathlib.Path.mkdir"):
-            result = projector.process_video("test.mp4", "/tmp/output", {})
+        result = projector.process_video("test.mp4", str(tmp_path / "output"), {})
 
         assert result is False
         mock_get_props.assert_called_once_with("test.mp4")
 
     @patch("src.depth_surge_3d.rendering.stereo_projector.create_registered_depth_estimator")
     @patch("src.depth_surge_3d.rendering.stereo_projector.validate_video_file")
-    @patch("src.depth_surge_3d.io.operations.get_video_properties")
-    def test_process_video_exception_handling(self, mock_get_props, mock_validate, mock_create):
+    @patch("src.depth_surge_3d.rendering.stereo_projector.get_video_properties")
+    def test_process_video_exception_handling(
+        self, mock_get_props, mock_validate, mock_create, tmp_path
+    ):
         """Test process_video handles exceptions gracefully."""
         mock_estimator = MagicMock()
         mock_estimator.load_model.side_effect = RuntimeError("Model error")
         mock_create.return_value = mock_estimator
         mock_validate.return_value = True
+        mock_get_props.return_value = _video_properties()
 
         projector = StereoProjector(device="cpu")
-
-        with patch("pathlib.Path.mkdir"):
-            result = projector.process_video("test.mp4", "/tmp/output", {})
+        result = projector.process_video("test.mp4", str(tmp_path / "output"), {})
 
         assert result is False
+        mock_estimator.load_model.assert_called_once()
 
 
 class TestProcessImage:

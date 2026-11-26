@@ -1,5 +1,29 @@
 # Web UI Guide
 
+## Local Access
+
+Open `http://127.0.0.1:5000` on the computer running the UI. Use `--port`
+to choose another port. The server binds to loopback only; HTTP and live
+progress connections accept the local UI's own origin, including its port.
+There is no authenticated LAN or multi-user mode. Do not publish the UI via
+a reverse proxy or port forwarding.
+
+Uploads create separate jobs under `output/`, even for repeated filenames.
+For Open, Analyze, Stitch, Process, or Resume, select an individual job folder
+directly inside `output/`, not the collection, a stage subfolder, or another
+location. Jobs that read or write artifacts must contain ordinary files and
+directories, not symbolic links or Windows junctions. Keep this folder under
+the desktop user's control. The Web model selector uses registered presets;
+use the CLI for custom checkpoints.
+
+Stitch saves in the selected job. Give it a video filename (for example,
+`second edit.mp4`), not a destination path. An existing name, including the
+source movie, is never replaced. Wait for any current writer to finish first.
+
+Polling progress or refreshing the page does not shut down media processes.
+Stop applies to the current conversion; closing the server stops its own
+work without terminating other desktop applications' encoders.
+
 ## Stereo Renderer
 
 The Stereo Pair Generation step exposes `Fast` and `Quality`. New jobs default
@@ -36,6 +60,9 @@ VDPP is mainly intended for evaluating framewise V3, See-Through, and relative
 MoGe-2 output. It is not available with `metric_camera` geometry.
 
 ## Resume
+
+Completed jobs are read-only for Resume. To create a different version, start
+a new job; resuming will not migrate an already published one.
 
 The resume selector defaults to `Use saved setting`, not `Off`. This prevents a
 visual default from silently changing a persisted VDPP job. Jobs discovered by

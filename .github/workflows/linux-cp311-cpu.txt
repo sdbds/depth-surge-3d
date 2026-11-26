@@ -1,0 +1,4 @@
+# Only the hosted Linux x86_64 test job substitutes the official CPU builds.
+# All other versions come from uv.lock; pip resolves the project's actual wheel.
+torch @ https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl#sha256=6746dbcbeb526eb61330b76b41ff1b4eb848951103a892eeb080dfa2b264667b
+torchvision @ https://download-r2.pytorch.org/whl/cpu/torchvision-0.28.0%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl#sha256=1dad604dfc0177ecebe0891bd9701fe2c62ec3f7819a247be541b3fb6effee99

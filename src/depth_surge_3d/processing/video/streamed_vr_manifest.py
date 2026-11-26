@@ -50,33 +50,7 @@ class StreamedVrInputManifestV1:
         owned_target_path: Path | None = None,
         owned_temporary_path: Path | None = None,
     ) -> None:
-        provider.validated()
-        if provider.mode != "assembled_vr" or provider.frames_parent is None:
-            raise ValueError("streamed VR manifest requires an assembled provider")
-        width, height = expected_shape
-        if (
-            isinstance(width, bool)
-            or not isinstance(width, int)
-            or isinstance(height, bool)
-            or not isinstance(height, int)
-            or width <= 0
-            or height <= 0
-        ):
-            raise ValueError("streamed VR manifest shape must be positive integers")
-        if input_format not in {"png", "rgb24"}:
-            raise ValueError("streamed VR input format is unsupported")
-        if input_format == "rgb24":
-            if invocation is None:
-                raise ValueError("raw RGB24 streaming requires invocation evidence")
-            if (
-                validate_raw_rgb24_input_v1(invocation.resolved_arguments_template)
-                != expected_shape
-                or invocation.expected_shape != expected_shape
-                or invocation.frame_count != provider.frame_count
-                or invocation.first_index != provider.first_index
-            ):
-                raise ValueError("raw RGB24 invocation differs from its frame sequence")
-
+        self._validate_inputs(provider, expected_shape, input_format, invocation)
         self.provider = provider
         self.expected_shape = expected_shape
         self.input_format = input_format
@@ -131,6 +105,40 @@ class StreamedVrInputManifestV1:
         except BaseException:
             self.abort()
             raise
+
+    @staticmethod
+    def _validate_inputs(
+        provider: EncodingSequenceProvider,
+        expected_shape: tuple[int, int],
+        input_format: Literal["png", "rgb24"],
+        invocation: StreamedVrInvocationV1 | None,
+    ) -> None:
+        provider.validated()
+        if provider.mode != "assembled_vr" or provider.frames_parent is None:
+            raise ValueError("streamed VR manifest requires an assembled provider")
+        width, height = expected_shape
+        if (
+            isinstance(width, bool)
+            or not isinstance(width, int)
+            or isinstance(height, bool)
+            or not isinstance(height, int)
+            or width <= 0
+            or height <= 0
+        ):
+            raise ValueError("streamed VR manifest shape must be positive integers")
+        if input_format not in {"png", "rgb24"}:
+            raise ValueError("streamed VR input format is unsupported")
+        if input_format == "rgb24":
+            if invocation is None:
+                raise ValueError("raw RGB24 streaming requires invocation evidence")
+            if (
+                validate_raw_rgb24_input_v1(invocation.resolved_arguments_template)
+                != expected_shape
+                or invocation.expected_shape != expected_shape
+                or invocation.frame_count != provider.frame_count
+                or invocation.first_index != provider.first_index
+            ):
+                raise ValueError("raw RGB24 invocation differs from its frame sequence")
 
     @property
     def path(self) -> Path:
@@ -246,56 +254,14 @@ class StreamedVrInputManifestV1:
         handle = self._handle
         assert handle is not None
         try:
-            if self.invocation is None:
-                if output_evidence is not None:
-                    raise ValueError("legacy streamed manifest cannot carry output evidence")
-                footer = b'],"left":null,"mode":"assembled_vr","right":null,' b'"schema_version":1}'
-            else:
-                if output_evidence is None:
-                    raise ValueError("recoverable streamed manifest lacks output evidence")
-                schema = b"3" if self.input_format == "rgb24" else b"2"
-                footer = (
-                    b'],"left":null,"mode":"assembled_vr","right":null,'
-                    b'"schema_version":'
-                    + schema
-                    + b',"streamed_output":'
-                    + canonical_json_bytes(output_evidence.to_object())
-                    + b"}"
-                )
+            footer = self._footer(output_evidence)
             self._write(footer)
-            end = handle.tell()
-            fingerprint = self._self_digest.hexdigest()
-            handle.seek(self._fingerprint_offset)
-            if handle.write(fingerprint.encode("ascii")) != 64:
-                raise OSError("short streamed VR manifest fingerprint write")
-            handle.seek(0)
-            raw_digest = hashlib.sha256()
-            remaining = end
-            while remaining:
-                chunk = handle.read(min(FINAL_ENCODING_JSON_STREAM_BYTES, remaining))
-                if not chunk:
-                    raise OSError("streamed VR manifest ended before its written extent")
-                raw_digest.update(chunk)
-                remaining -= len(chunk)
-            handle.seek(end)
-            handle.flush()
-            os.fsync(handle.fileno())
-            if self._reserved_transaction is None:
-                assert self._owned is not None
-                self._owned.replace()
-                self._handle = None
-            else:
-                self._close_reserved_source()
-                phase = self._reserved_transaction.validate_streamed_physical_phase(
-                    prefix_byte_count=end,
-                    prefix_sha256=raw_digest.hexdigest(),
-                )
-                if phase != "full-source":
-                    raise OSError("streamed VR reservation did not retain its full source")
+            end, fingerprint, raw_sha256 = self._seal_manifest(handle)
+            self._publish_completed_storage(end, raw_sha256)
             staged = StagedEncodingInputManifest(
                 provider_audit=self.provider_audit,
                 fingerprint=fingerprint,
-                raw_sha256=raw_digest.hexdigest(),
+                raw_sha256=raw_sha256,
                 raw_byte_count=end,
                 first_headers=(self.expected_shape,),
                 scale_required=False,
@@ -311,6 +277,59 @@ class StreamedVrInputManifestV1:
         except BaseException:
             self.abort()
             raise
+
+    def _footer(self, output_evidence: StreamedVrOutputEvidenceV1 | None) -> bytes:
+        if self.invocation is None:
+            if output_evidence is not None:
+                raise ValueError("legacy streamed manifest cannot carry output evidence")
+            footer = b'],"left":null,"mode":"assembled_vr","right":null,' b'"schema_version":1}'
+        else:
+            if output_evidence is None:
+                raise ValueError("recoverable streamed manifest lacks output evidence")
+            schema = b"3" if self.input_format == "rgb24" else b"2"
+            footer = (
+                b'],"left":null,"mode":"assembled_vr","right":null,'
+                b'"schema_version":'
+                + schema
+                + b',"streamed_output":'
+                + canonical_json_bytes(output_evidence.to_object())
+                + b"}"
+            )
+        return footer
+
+    def _seal_manifest(self, handle: BinaryIO) -> tuple[int, str, str]:
+        end = handle.tell()
+        fingerprint = self._self_digest.hexdigest()
+        handle.seek(self._fingerprint_offset)
+        if handle.write(fingerprint.encode("ascii")) != 64:
+            raise OSError("short streamed VR manifest fingerprint write")
+        handle.seek(0)
+        raw_digest = hashlib.sha256()
+        remaining = end
+        while remaining:
+            chunk = handle.read(min(FINAL_ENCODING_JSON_STREAM_BYTES, remaining))
+            if not chunk:
+                raise OSError("streamed VR manifest ended before its written extent")
+            raw_digest.update(chunk)
+            remaining -= len(chunk)
+        handle.seek(end)
+        handle.flush()
+        os.fsync(handle.fileno())
+        return end, fingerprint, raw_digest.hexdigest()
+
+    def _publish_completed_storage(self, end: int, raw_sha256: str) -> None:
+        if self._reserved_transaction is None:
+            assert self._owned is not None
+            self._owned.replace()
+            self._handle = None
+        else:
+            self._close_reserved_source()
+            phase = self._reserved_transaction.validate_streamed_physical_phase(
+                prefix_byte_count=end,
+                prefix_sha256=raw_sha256,
+            )
+            if phase != "full-source":
+                raise OSError("streamed VR reservation did not retain its full source")
 
     @property
     def owned_source_identity(self) -> PersistedFileIdentityV1:

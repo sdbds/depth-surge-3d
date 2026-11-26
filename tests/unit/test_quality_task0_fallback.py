@@ -1,4 +1,4 @@
-"""Task 0 contracts for full-frame provisional safe-donor fallback."""
+"""Shared contracts for full-frame provisional safe-donor fallback."""
 
 from __future__ import annotations
 
@@ -7,20 +7,12 @@ import importlib.util
 import numpy as np
 import pytest
 
-from scripts.quality_task0 import fallback, local_strip, repair_records
-from scripts.quality_task0.implicit_kd import QualityRepairFallbackQueryBudgetError
-
-
-def _api(name: str):
-    assert hasattr(fallback, name), f"missing Task 0 fallback API: {name}"
-    return getattr(fallback, name)
-
 
 def test_fallback_module_is_importable() -> None:
     assert importlib.util.find_spec("scripts.quality_task0.fallback") is not None
 
 
-def _fallback_fixture():
+def _fallback_fixture(local_strip, repair_records):
     height = width = 9
     coverage = np.full((height, width), 16, dtype=np.uint8)
     regions = np.ones((height, width), dtype=np.uint32)
@@ -45,7 +37,7 @@ def _fallback_fixture():
 
 
 def _scalar_nearest_safe_donor(
-    analysis: local_strip.QualityVisibilityAnalysis,
+    analysis,
     *,
     target_row: int,
     target_column: int,
@@ -89,10 +81,12 @@ def _scalar_nearest_safe_donor(
     return best[1], best[2]
 
 
-def test_provisional_fallback_matches_full_frame_scalar_oracle_then_finalizes() -> None:
-    precompute = _api("precompute_native_fallbacks")
-    finalize = _api("finalize_safe_fallbacks")
-    analysis, records = _fallback_fixture()
+def test_provisional_fallback_matches_full_frame_scalar_oracle_then_finalizes(
+    fallback, local_strip, repair_records
+) -> None:
+    precompute = fallback.precompute_native_fallbacks
+    finalize = fallback.finalize_safe_fallbacks
+    analysis, records = _fallback_fixture(local_strip, repair_records)
     budgets = local_strip.QualityRepairBudgets(repair_fallback_visit_cap=100_000)
     limit = max(1, int(np.floor(256 * 9 / 1080.0 + 0.5)))
     donor_row, donor_column = _scalar_nearest_safe_donor(
@@ -128,9 +122,11 @@ def test_provisional_fallback_matches_full_frame_scalar_oracle_then_finalizes() 
     assert final_records["fill_bgr"].tolist() == [expected]
 
 
-def test_fallback_rejects_partial_proxy_and_cross_region_donors() -> None:
-    is_safe = _api("is_safe_donor")
-    analysis, _ = _fallback_fixture()
+def test_fallback_rejects_partial_proxy_and_cross_region_donors(
+    fallback, local_strip, repair_records
+) -> None:
+    is_safe = fallback.is_safe_donor
+    analysis, _ = _fallback_fixture(local_strip, repair_records)
     analysis.coverage_count[0, 0] = np.uint8(15)
     analysis.pure_region_id[8, 8] = np.uint32(2)
 
@@ -139,10 +135,12 @@ def test_fallback_rejects_partial_proxy_and_cross_region_donors() -> None:
     assert is_safe(analysis, row=0, column=4, region_id=1)
 
 
-def test_fallback_fails_when_no_safe_donor_exists_within_the_limit() -> None:
-    precompute = _api("precompute_native_fallbacks")
-    no_donor_error = _api("QualityRepairNoSafeFallbackError")
-    analysis, records = _fallback_fixture()
+def test_fallback_fails_when_no_safe_donor_exists_within_the_limit(
+    fallback, local_strip, repair_records
+) -> None:
+    precompute = fallback.precompute_native_fallbacks
+    no_donor_error = fallback.QualityRepairNoSafeFallbackError
+    analysis, records = _fallback_fixture(local_strip, repair_records)
     analysis.coverage_count[:] = np.uint8(15)
 
     with pytest.raises(no_donor_error, match="no safe donor"):
@@ -155,8 +153,10 @@ def test_fallback_fails_when_no_safe_donor_exists_within_the_limit() -> None:
         )
 
 
-def test_fallback_uses_full_pure_core_when_a_thin_region_has_no_safe_interior() -> None:
-    precompute = _api("precompute_native_fallbacks")
+def test_fallback_uses_full_pure_core_when_a_thin_region_has_no_safe_interior(
+    fallback, local_strip, repair_records
+) -> None:
+    precompute = fallback.precompute_native_fallbacks
     height = width = 9
     coverage = np.full((height, width), 16, dtype=np.uint8)
     regions = np.full((height, width), 2, dtype=np.uint32)
@@ -193,9 +193,11 @@ def test_fallback_uses_full_pure_core_when_a_thin_region_has_no_safe_interior() 
     assert result.indexed_donor_count == 8
 
 
-def test_seeded_boundary_colour_is_retained_only_when_no_proxy_donor_exists() -> None:
-    precompute = _api("precompute_native_fallbacks")
-    analysis, records = _fallback_fixture()
+def test_seeded_boundary_colour_is_retained_only_when_no_proxy_donor_exists(
+    fallback, local_strip, repair_records
+) -> None:
+    precompute = fallback.precompute_native_fallbacks
+    analysis, records = _fallback_fixture(local_strip, repair_records)
     analysis = local_strip.QualityVisibilityAnalysis(
         np.zeros_like(analysis.coverage_count),
         np.full_like(analysis.pure_region_id, np.uint32(0xFFFFFFFF)),
@@ -216,13 +218,15 @@ def test_seeded_boundary_colour_is_retained_only_when_no_proxy_donor_exists() ->
     assert result.anchor_fallback_count == 1
 
 
-def test_fallback_visit_cap_is_fatal_before_returning_a_current_best() -> None:
-    precompute = _api("precompute_native_fallbacks")
-    analysis, records = _fallback_fixture()
+def test_fallback_visit_cap_is_fatal_before_returning_a_current_best(
+    fallback, local_strip, repair_records, kd
+) -> None:
+    precompute = fallback.precompute_native_fallbacks
+    analysis, records = _fallback_fixture(local_strip, repair_records)
     original = records.tobytes()
     budgets = local_strip.QualityRepairBudgets(repair_fallback_visit_cap=0)
 
-    with pytest.raises(QualityRepairFallbackQueryBudgetError, match="visit cap"):
+    with pytest.raises(kd.QualityRepairFallbackQueryBudgetError, match="visit cap"):
         precompute(
             records,
             analysis,
@@ -235,13 +239,15 @@ def test_fallback_visit_cap_is_fatal_before_returning_a_current_best() -> None:
     assert budgets.repair_fallback_visits_consumed == 0
 
 
-def test_fallback_next_node_overflow_discards_an_existing_current_best() -> None:
-    precompute = _api("precompute_native_fallbacks")
-    analysis, records = _fallback_fixture()
+def test_fallback_next_node_overflow_discards_an_existing_current_best(
+    fallback, local_strip, repair_records, kd
+) -> None:
+    precompute = fallback.precompute_native_fallbacks
+    analysis, records = _fallback_fixture(local_strip, repair_records)
     original = records.tobytes()
     budgets = local_strip.QualityRepairBudgets(repair_fallback_visit_cap=1)
 
-    with pytest.raises(QualityRepairFallbackQueryBudgetError, match="visit cap"):
+    with pytest.raises(kd.QualityRepairFallbackQueryBudgetError, match="visit cap"):
         precompute(
             records,
             analysis,
@@ -254,8 +260,10 @@ def test_fallback_next_node_overflow_discards_an_existing_current_best() -> None
     assert budgets.repair_fallback_visits_consumed == 1
 
 
-def test_degenerate_single_column_donors_match_the_scalar_oracle() -> None:
-    precompute = _api("precompute_native_fallbacks")
+def test_degenerate_single_column_donors_match_the_scalar_oracle(
+    fallback, local_strip, repair_records
+) -> None:
+    precompute = fallback.precompute_native_fallbacks
     height = width = 9
     coverage = np.zeros((height, width), dtype=np.uint8)
     regions = np.full((height, width), np.uint32(0xFFFFFFFF), dtype=np.uint32)
@@ -298,7 +306,9 @@ def test_degenerate_single_column_donors_match_the_scalar_oracle() -> None:
 
 @pytest.mark.slow
 def test_4k_twenty_five_percent_fallback_stays_inside_fixed_arenas_and_visit_cap() -> None:
-    precompute = _api("precompute_native_fallbacks")
+    from scripts.quality_task0 import fallback, local_strip, repair_records
+
+    precompute = fallback.precompute_native_fallbacks
     height, width = 2160, 3840
     hole_columns = np.arange(width) % 16 < 4
     coverage = np.full((height, width), 16, dtype=np.uint8)

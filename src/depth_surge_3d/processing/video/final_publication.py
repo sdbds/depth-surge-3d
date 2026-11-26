@@ -15,10 +15,12 @@ import secrets
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Callable, Iterable, Literal, cast
+from typing import BinaryIO, Callable, Iterable, Literal, TypeVar, cast
 
+from ...core.video_timing import EncodingTimeline, rate_text
 from ...rendering.quality.cleanup_transaction import (
     _validate_payload_pruned_projection,
+    PlannedPruneMarkerV1,
     build_payload_pruned_document,
     plan_prune_markers_v1,
     prune_entry_from_reservation_v1,
@@ -67,6 +69,7 @@ from .encoding_provider import FinalContainerExpectation
 from .final_container_validation import (
     FinalContainerProcessError,
     validate_final_container_v4,
+    validate_open_linux_container,
 )
 from .streamed_vr_evidence import (
     StreamedVrInvocationV1,
@@ -74,12 +77,15 @@ from .streamed_vr_evidence import (
     validate_raw_rgb24_input_v1,
 )
 from ...io.reservation_protocol import (
+    SETTINGS_ARTIFACT_RELATIVE_PATH,
     AllocationAdapter,
+    JobControlV1,
     AllocationCounter,
     FinalPublicationRecovery,
     FinalPublicationObservation,
     InjectedReservationCrash,
     ReservationConflictError,
+    ReservationIncompleteError,
     DirectoryIdentity,
     ReservationFileIdentity,
     ReservationDescriptor,
@@ -184,10 +190,11 @@ class FinalEncodingReservationIndexV1:
     diagnostics_metadata_fingerprint_at_preflight: str | None
     extent_entries: tuple[dict, ...]
     fingerprint: str
+    schema_version: int = 1
 
     def _base_object(self) -> dict:
         return {
-            "schema_version": 1,
+            "schema_version": self.schema_version,
             "algorithm_version": "final-encoding-reservation-v1",
             "job_id": self.job_id,
             "settings_artifact_relative_path": "processing-settings-v5.json",
@@ -221,6 +228,17 @@ class FinalEncodingReservationIndexV1:
         return {**self._base_object(), "fingerprint": self.fingerprint}
 
     def _validate_contract(self) -> None:
+        self._validate_index_identity()
+        self._validate_video_paths()
+        diagnostics = self._validated_diagnostics_binding()
+        entries = self._validated_extents(diagnostics)
+        self._validate_extent_ownership(entries)
+
+    def _validate_index_identity(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version not in (1, 2):
+            raise ReservationConflictError("final encoding index version is invalid")
+        if self.schema_version == 2 and self.final_video_publication_method != "replace_existing":
+            raise ReservationConflictError("explicit replacement index has no existing target")
         for value, digits, label in (
             (self.job_id, 32, "final index job id"),
             (self.settings_identity_fingerprint, 64, "final index settings identity"),
@@ -239,6 +257,8 @@ class FinalEncodingReservationIndexV1:
             or not 0 <= self.settings_revision_at_preflight <= 2**64 - 1
         ):
             raise ReservationConflictError("final index settings revision is invalid")
+
+    def _validate_video_paths(self) -> None:
         validate_portable_final_component_v1(self.final_video_relative_path)
         if self.sibling_video_temporary_relative_path != (
             f".depth-surge-final-v4-{self.publication_generation}.tmp.mp4"
@@ -261,6 +281,8 @@ class FinalEncodingReservationIndexV1:
                 raise ReservationConflictError("replacement publication lost its old target")
         else:
             raise ReservationConflictError("final video publication method is invalid")
+
+    def _validated_diagnostics_binding(self) -> tuple[str | None, str | None]:
         diagnostics = (
             self.diagnostics_metadata_raw_sha256_at_preflight,
             self.diagnostics_metadata_fingerprint_at_preflight,
@@ -270,6 +292,9 @@ class FinalEncodingReservationIndexV1:
         for value in diagnostics:
             if value is not None and _HEX64.fullmatch(value) is None:
                 raise ReservationConflictError("final index diagnostics hash is invalid")
+        return diagnostics
+
+    def _validated_extents(self, diagnostics: tuple[str | None, str | None]) -> tuple[dict, ...]:
         if not 1 <= len(self.extent_entries) <= 64:
             raise ReservationConflictError("final index extent count is invalid")
         entries = tuple(validate_reservation_entry_v1(entry) for entry in self.extent_entries)
@@ -288,6 +313,9 @@ class FinalEncodingReservationIndexV1:
             raise ReservationConflictError(
                 "final index diagnostics extent hash crosses its metadata binding"
             )
+        return entries
+
+    def _validate_extent_ownership(self, entries: tuple[dict, ...]) -> None:
         seen_reservations: set[tuple[str, str]] = set()
         seen_descriptors: set[str] = set()
         seen_sources: set[str] = set()
@@ -316,6 +344,17 @@ class FinalEncodingReservationIndexV1:
             if entry["source_extent_relative_path"] in seen_sources:
                 raise ReservationConflictError("final index repeats a source path")
             seen_sources.add(entry["source_extent_relative_path"])
+
+    def reject_implicit_video_replacement(self, root: Path) -> None:
+        # V1 recorded a file found at preflight, not the caller's permission to replace it.
+        if self.schema_version == 1 and self.final_video_publication_method == "replace_existing":
+            current = capture_optional_publication_target_identity(
+                root / self.final_video_relative_path
+            )
+            if current == self.final_video_existing_target_identity_at_preflight:
+                raise ReservationConflictError(
+                    "historical reservation has no explicit replacement authority; preserving the existing video"
+                )
 
     @classmethod
     def build(cls, **values) -> "FinalEncodingReservationIndexV1":
@@ -349,7 +388,8 @@ class FinalEncodingReservationIndexV1:
         if not isinstance(value, dict) or set(value) != expected:
             raise ReservationConflictError("final encoding index schema is not closed")
         if (
-            value["schema_version"] != 1
+            type(value["schema_version"]) is not int
+            or value["schema_version"] not in (1, 2)
             or value["algorithm_version"] != "final-encoding-reservation-v1"
             or value["settings_artifact_relative_path"] != "processing-settings-v5.json"
             or not isinstance(value["extent_entries"], list)
@@ -357,6 +397,7 @@ class FinalEncodingReservationIndexV1:
             raise ReservationConflictError("final encoding index version is invalid")
         existing = value["final_video_existing_target_identity_at_preflight"]
         index = cls(
+            schema_version=value["schema_version"],
             job_id=value["job_id"],
             settings_identity_fingerprint=value["settings_identity_fingerprint"],
             settings_raw_sha256_at_preflight=value["settings_raw_sha256_at_preflight"],
@@ -609,7 +650,7 @@ def _final_video_target_descriptor_raw_bound_v1(
         parent_identity = index.sibling_video_parent_identity.file_identity
         if index.sibling_video_parent_identity.kind == "windows":
             assert isinstance(parent_identity, WindowsFileIdentityV1)
-            maximum_inner = WindowsFileIdentityV1(
+            maximum_inner: WindowsFileIdentityV1 | PosixFileIdentityV1 = WindowsFileIdentityV1(
                 parent_identity.volume_serial,
                 "f" * 32,
             )
@@ -684,7 +725,19 @@ def _validate_committed_publication_triad_v1(
             relative_path=index.final_video_relative_path,
             expected_mode=input_projection.mode,
         )
-        video_sha256, video_byte_count = _hash_file(root, final_video_path)
+        proof = manifest.encoded_output
+        if proof is not None and (
+            input_projection.streamed_invocation is not None
+            or proof.reservation_index_fingerprint != index.fingerprint
+            or proof.sibling_relative_path != index.sibling_video_temporary_relative_path
+        ):
+            raise FinalPublicationValidationError(
+                "committed file-backed evidence differs from index"
+            )
+        scanned = _scan_fixed_file_v1(
+            root, final_video_path, expected_identity=proof.identity if proof else None
+        )
+        video_sha256, video_byte_count = scanned.raw_sha256, scanned.byte_count
         streamed_invocation = input_projection.streamed_invocation
         streamed_output = input_projection.streamed_output
         if streamed_invocation is not None:
@@ -870,6 +923,16 @@ class PreparedFinalEncodingReservationV1:
             raise ReservationConflictError("streamed intent has a foreign prefix")
         if prefix == 0:
             return "zero"
+        PreparedFinalEncodingReservationV1._verify_streamed_prefix(path, prefix, document)
+        if prefix < document.raw_byte_count:
+            return "partial"
+        return transaction.validate_streamed_physical_phase(
+            prefix_byte_count=document.raw_byte_count,
+            prefix_sha256=document.raw_sha256,
+        )
+
+    @staticmethod
+    def _verify_streamed_prefix(path: Path, prefix: int, document: StreamedCanonicalObject) -> None:
         remaining = prefix
         digest = hashlib.sha256()
         count = 0
@@ -889,12 +952,6 @@ class PreparedFinalEncodingReservationV1:
                 raise ReservationConflictError("streamed intent prefix exceeds its document")
         if count != document.raw_byte_count or digest.hexdigest() != document.raw_sha256:
             raise ReservationConflictError("streamed intent replay identity changed")
-        if prefix < document.raw_byte_count:
-            return "partial"
-        return transaction.validate_streamed_physical_phase(
-            prefix_byte_count=document.raw_byte_count,
-            prefix_sha256=document.raw_sha256,
-        )
 
     def _recover_monotonic_extent_intent_prefix(self) -> bool:
         """Publish one durable semantic intent before any terminal retirement."""
@@ -932,33 +989,8 @@ class PreparedFinalEncodingReservationV1:
             self.prune_marker_transactions = tuple(updated)
             return True
 
-        transaction = self.diagnostics_payload_pruned_transaction
-        if transaction is not None:
-            if transaction.source_path.exists():
-                prefix = self._canonical_prefix_byte_count(transaction.source_path)
-                if prefix is None:
-                    raise ReservationConflictError(
-                        "diagnostics payload-pruned source has a foreign prefix"
-                    )
-                if prefix == 0:
-                    transaction = None
-            if transaction is None:
-                pass
-            else:
-                document = self._payload_pruned_document(transaction)
-                state = self._streamed_intent_state(transaction, document)
-                if state in {
-                    "full-source",
-                    "short-source",
-                    "replacement-gap",
-                    "committed-target",
-                }:
-                    transaction.recover_streamed_prefix(
-                        prefix_byte_count=document.raw_byte_count,
-                        prefix_sha256=document.raw_sha256,
-                    )
-                    self.diagnostics_payload_pruned_transaction = None
-                    return True
+        if self._recover_diagnostics_intent_prefix():
+            return True
 
         transaction = self.cleanup_pending_settings_transaction
         payload = self.cleanup_pending_settings_payload
@@ -970,6 +1002,29 @@ class PreparedFinalEncodingReservationV1:
             self.commit_cleanup_pending_settings()
             return True
         return False
+
+    def _recover_diagnostics_intent_prefix(self) -> bool:
+        transaction = self.diagnostics_payload_pruned_transaction
+        if transaction is None:
+            return False
+        if transaction.source_path.exists():
+            prefix = self._canonical_prefix_byte_count(transaction.source_path)
+            if prefix is None:
+                raise ReservationConflictError(
+                    "diagnostics payload-pruned source has a foreign prefix"
+                )
+            if prefix == 0:
+                return False
+        document = self._payload_pruned_document(transaction)
+        state = self._streamed_intent_state(transaction, document)
+        if state not in {"full-source", "short-source", "replacement-gap", "committed-target"}:
+            return False
+        transaction.recover_streamed_prefix(
+            prefix_byte_count=document.raw_byte_count,
+            prefix_sha256=document.raw_sha256,
+        )
+        self.diagnostics_payload_pruned_transaction = None
+        return True
 
     def validate_indexed_predecessor(
         self,
@@ -1201,6 +1256,7 @@ class PreparedFinalEncodingReservationV1:
             return PreparedFinalEncodingReservationV1._canonical_prefix_byte_count_handle(handle)
 
     def _video_state(self) -> str:
+        self.index.reject_implicit_video_replacement(self.job_root)
         final = self.final_video_path
         sibling_present = self.sibling_path.exists() or self.sibling_path.is_symlink()
         if final.exists() or final.is_symlink():
@@ -1212,32 +1268,24 @@ class PreparedFinalEncodingReservationV1:
                 )
                 return "reserved-target"
             return "committed-new"
-        if sibling_present and _regular_nonlink(self.sibling_path):
+        if os.name == "nt" and sibling_present and _regular_nonlink(self.sibling_path):
             return "windows-replacement-gap"
         raise ReservationConflictError("final video is outside its indexed namespace states")
 
     def _input_manifest_state(self, video_state: str) -> str:
         transaction = self.input_manifest_transaction
         target = self.job_root / ENCODING_INPUT_MANIFEST_RELATIVE_PATH
-        if transaction is None:
+        if transaction is None or not transaction.source_path.exists():
             if not _regular_nonlink(target):
-                raise ReservationConflictError("committed input manifest is missing")
+                if transaction is None:
+                    raise ReservationConflictError("committed input manifest is missing")
+                raise ReservationConflictError("input extent has no authorized location")
             _stream_input_manifest_identity(
                 self.job_root,
                 target,
                 expected_frame_count=_load_settings_frame_count_v1(self.job_root),
             )
             return "committed-new"
-        source = transaction.source_path
-        if not source.exists():
-            if _regular_nonlink(target):
-                _stream_input_manifest_identity(
-                    self.job_root,
-                    target,
-                    expected_frame_count=_load_settings_frame_count_v1(self.job_root),
-                )
-                return "committed-new"
-            raise ReservationConflictError("input extent has no authorized location")
         with transaction.open_authenticated_source() as handle:
             source_size = os.fstat(handle.fileno()).st_size
             prefix = self._canonical_prefix_byte_count_handle(handle)
@@ -1252,19 +1300,12 @@ class PreparedFinalEncodingReservationV1:
                     raw_byte_count=prefix,
                     expected_frame_count=_load_settings_frame_count_v1(self.job_root),
                 )
-                if source_size == transaction.descriptor.logical_byte_count:
-                    tail = source_size - projection.raw_byte_count
-                    while tail:
-                        chunk = handle.read(min(1024 * 1024, tail))
-                        if not chunk or any(chunk):
-                            raise FinalPublicationValidationError(
-                                "encoding input reservation tail is not all zero"
-                            )
-                        tail -= len(chunk)
-                elif source_size != projection.raw_byte_count:
-                    raise FinalPublicationValidationError(
-                        "encoding input source has an intermediate length"
-                    )
+                self._validate_input_extent_tail(
+                    handle,
+                    source_size,
+                    transaction.descriptor.logical_byte_count,
+                    projection.raw_byte_count,
+                )
             except FinalPublicationValidationError:
                 return "partial"
         transaction.validate_streamed_physical_phase(
@@ -1275,39 +1316,52 @@ class PreparedFinalEncodingReservationV1:
             return "complete-short"
         return "complete-full" if video_state != "reserved-target" else "encoding-prepass-staged"
 
-    def _final_manifest_state(self) -> str:  # noqa: C901
+    @staticmethod
+    def _validate_input_extent_tail(
+        handle: BinaryIO, source_size: int, logical_size: int, raw_size: int
+    ) -> None:
+        if source_size == logical_size:
+            tail = source_size - raw_size
+            while tail:
+                chunk = handle.read(min(1024 * 1024, tail))
+                if not chunk or any(chunk):
+                    raise FinalPublicationValidationError(
+                        "encoding input reservation tail is not all zero"
+                    )
+                tail -= len(chunk)
+        elif source_size != raw_size:
+            raise FinalPublicationValidationError(
+                "encoding input source has an intermediate length"
+            )
+
+    def _final_manifest_state(self) -> str:
+        return self._final_manifest_observation()[0]
+
+    def _final_manifest_observation(self) -> tuple[str, FinalVideoManifestV4 | None]:
         transaction = self.final_manifest_transaction
         target = self.job_root / FINAL_VIDEO_MANIFEST_RELATIVE_PATH
-        if transaction is None:
+        if transaction is None or not transaction.source_path.exists():
             if not _regular_nonlink(target):
-                raise ReservationConflictError("committed final manifest is missing")
-            parse_final_video_manifest_v4(
-                _read_bounded_regular_file(
-                    target,
-                    max_bytes=FINAL_VIDEO_MANIFEST_MAX_RAW_BYTES,
-                )
+                if transaction is None:
+                    raise ReservationConflictError("committed final manifest is missing")
+                raise ReservationConflictError("final manifest extent has no authorized location")
+            return "committed-new", parse_final_video_manifest_v4(
+                _read_bounded_regular_file(target, max_bytes=FINAL_VIDEO_MANIFEST_MAX_RAW_BYTES)
             )
-            return "committed-new"
-        source = transaction.source_path
-        if not source.exists():
-            if _regular_nonlink(target):
-                parse_final_video_manifest_v4(
-                    _read_bounded_regular_file(
-                        target,
-                        max_bytes=FINAL_VIDEO_MANIFEST_MAX_RAW_BYTES,
-                    )
-                )
-                return "committed-new"
-            raise ReservationConflictError("final manifest extent has no authorized location")
+        return self._final_manifest_source_observation(transaction)
+
+    def _final_manifest_source_observation(
+        self, transaction: ReservedArtifactTransaction
+    ) -> tuple[str, FinalVideoManifestV4 | None]:
         with transaction.open_authenticated_source() as handle:
             source_size = os.fstat(handle.fileno()).st_size
             prefix = self._canonical_prefix_byte_count_handle(handle)
             if prefix is None:
-                return "partial"
+                return "partial", None
             if prefix == 0:
-                return "zero"
+                return "zero", None
             if prefix > transaction.descriptor.payload_raw_max:
-                return "partial"
+                return "partial", None
             handle.seek(0)
             raw = handle.read(prefix)
             if len(raw) != prefix:
@@ -1315,14 +1369,14 @@ class PreparedFinalEncodingReservationV1:
                     "final manifest source changed during authenticated read"
                 )
         try:
-            parse_final_video_manifest_v4(raw)
+            manifest = parse_final_video_manifest_v4(raw)
         except FinalPublicationValidationError:
-            return "partial"
+            return "partial", None
         if source_size == prefix:
-            return "complete-short"
+            return "complete-short", manifest
         if source_size == transaction.descriptor.logical_byte_count:
-            return "complete-full"
-        return "partial"
+            return "complete-full", manifest
+        return "partial", None
 
     def _validate_committed_publication_triad(self) -> None:
         _validate_committed_publication_triad_v1(self.job_root, self.index)
@@ -1382,7 +1436,49 @@ class PreparedFinalEncodingReservationV1:
     def observe(self) -> FinalPublicationRecovery:
         video_state = self._video_state()
         input_state = self._input_manifest_state(video_state)
-        final_state = self._final_manifest_state()
+        final_state, manifest = self._final_manifest_observation()
+        sibling_present = self.sibling_path.exists() or self.sibling_path.is_symlink()
+        if (
+            video_state == "reserved-target"
+            and input_state == "encoding-prepass-staged"
+            and sibling_present
+            and final_state == "partial"
+        ):
+            raise ReservationIncompleteError(
+                "incomplete encoded-output evidence; the candidate and existing target are preserved. "
+                "Restore the complete job metadata from backup or use a new output directory."
+            )
+        if manifest is not None and manifest.encoded_output is not None:
+            proof = manifest.encoded_output
+            pre_rename = video_state in {"reserved-target", "windows-replacement-gap"}
+            candidate = self.sibling_path if pre_rename else self.final_video_path
+            if (
+                proof.reservation_index_fingerprint != self.index.fingerprint
+                or proof.sibling_relative_path != self.sibling_path.name
+                or manifest.relative_path != self.index.final_video_relative_path
+                or sibling_present != pre_rename
+                or not _regular_nonlink(candidate)
+                or _reservation_identity(candidate) != proof.identity
+            ):
+                raise ReservationConflictError(
+                    "encoded video no longer belongs to this publication"
+                )
+            if pre_rename:
+                if final_state != "complete-full" or input_state not in {
+                    "encoding-prepass-staged",
+                    "complete-full",
+                }:
+                    raise ReservationConflictError(
+                        "encoded output has an invalid pre-rename prefix"
+                    )
+                return FinalPublicationRecovery("encoded_output_staged", "publish-validated-video")
+            if final_state == "complete-full" and input_state in {
+                "complete-full",
+                "complete-short",
+            }:
+                return FinalPublicationRecovery(
+                    "video_replaced_input_intent", "commit-input-manifest"
+                )
         if (video_state, input_state, final_state) == (
             "committed-new",
             "committed-new",
@@ -1394,7 +1490,7 @@ class PreparedFinalEncodingReservationV1:
                 video_state=video_state,
                 input_manifest_state=input_state,
                 final_manifest_state=final_state,
-                sibling_present=self.sibling_path.exists() or self.sibling_path.is_symlink(),
+                sibling_present=sibling_present,
             )
         )
 
@@ -1532,8 +1628,13 @@ class PreparedFinalEncodingReservationV1:
 
     def input_publication_source(self) -> "EncodingInputPublicationSource | None":
         transaction = self.input_manifest_transaction
-        if transaction is None:
+        if transaction is None or not transaction.source_path.exists():
             target = self.job_root / ENCODING_INPUT_MANIFEST_RELATIVE_PATH
+            if (
+                transaction is not None
+                and _reservation_identity(target) != transaction.descriptor.filesystem_identity
+            ):
+                raise ReservationConflictError("committed input differs from its reserved file")
             return EncodingInputPublicationSource.from_path(target)
         source = transaction.source_path
         prefix = self._canonical_prefix_byte_count(source)
@@ -1592,7 +1693,12 @@ class PreparedFinalEncodingReservationV1:
         with transaction.source_path.open("rb", buffering=0) as handle:
             raw = handle.read(prefix)
         manifest = parse_final_video_manifest_v4(raw)
-        video_hash, video_count = _hash_file(self.job_root, self.final_video_path)
+        scan = _scan_fixed_file_v1(
+            self.job_root,
+            self.final_video_path,
+            expected_identity=manifest.encoded_output.identity if manifest.encoded_output else None,
+        )
+        video_hash, video_count = scan.raw_sha256, scan.byte_count
         if (video_hash, video_count) != (manifest.sha256, manifest.byte_count):
             raise ReservationConflictError("final manifest no longer binds the current video")
         input_source = EncodingInputPublicationSource.from_path(
@@ -1616,52 +1722,14 @@ class PreparedFinalEncodingReservationV1:
     ) -> FinalVideoManifestV4:
         """Finish a validated post-video v3 publication without re-encoding."""
 
-        recovery = self.observe()
-        if recovery.phase == "post_boundary_retry_sibling_present":
-            self.discard_nonsemantic_sibling()
-            recovery = self.observe()
-        if recovery.phase in {
-            "windows_video_replace_gap_before_input_commit",
-            "windows_video_replace_gap_after_input_commit",
-        }:
-            self.recover_video_replacement_gap()
-            recovery = self.observe()
-        if recovery.phase == "video_replaced_input_intent":
-            self.recover_input_manifest_intent()
-            recovery = self.observe()
+        recovery = self._advance_existing_video_prefix()
         if recovery.phase == "final_manifest_intent":
-            transaction = self.final_manifest_transaction
-            if transaction is None:
-                raise ReservationConflictError(
-                    "streamed final-manifest intent lost its reservation"
-                )
-            prefix = self._canonical_prefix_byte_count(transaction.source_path)
-            if prefix in {None, 0} or prefix > transaction.descriptor.payload_raw_max:
-                raise ReservationConflictError("streamed final-manifest intent is incomplete")
-            with transaction.open_authenticated_source() as handle:
-                raw = handle.read(prefix)
-                if len(raw) != prefix:
-                    raise ReservationConflictError(
-                        "streamed final-manifest intent changed during read"
-                    )
-            intended = parse_final_video_manifest_v4(raw)
-            expected = build_final_video_manifest_v4(
-                relative_path=self.index.final_video_relative_path,
-                video_sha256=expected_video_sha256,
-                video_byte_count=expected_video_byte_count,
-                input_stage_fingerprint=input_stage_fingerprint,
-                resolved_encoding_arguments=resolved_encoding_arguments,
+            return self._recover_matching_final_manifest(
+                input_stage_fingerprint,
+                resolved_encoding_arguments,
+                expected_video_sha256,
+                expected_video_byte_count,
             )
-            if intended != expected:
-                raise ReservationConflictError(
-                    "streamed final-manifest intent differs from v3 evidence"
-                )
-            manifest = self.recover_final_manifest_intent()
-            if self.observe().phase != "publication_authenticated":
-                raise ReservationConflictError(
-                    "streamed final-manifest recovery did not authenticate"
-                )
-            return manifest
         if recovery.phase == "publication_authenticated":
             return parse_final_video_manifest_v4(
                 _read_bounded_regular_file(
@@ -1716,27 +1784,9 @@ class PreparedFinalEncodingReservationV1:
             relative_path=self.index.final_video_relative_path,
             expected_mode=input_projection.mode,
         )
-        final_path = self.final_video_path
-        try:
-            with AcquiredRoot(self.job_root) as acquired:
-                with acquired.open_regular_locked(final_path) as handle:
-                    identity = file_identity_from_open_handle(handle)
-                    video_sha256, video_byte_count = _hash_open_file(handle)
-                    if (
-                        identity != expected_video_identity
-                        or acquired.persistent_regular_identity(final_path) != identity
-                    ):
-                        raise ReservationConflictError("existing streamed video identity changed")
-        except (NoFollowPathError, FileNotFoundError, OSError) as error:
-            raise ReservationConflictError(
-                "existing streamed video cannot be acquired without following links"
-            ) from error
-        if (video_sha256, video_byte_count) != (
-            expected_video_sha256,
-            expected_video_byte_count,
-        ):
-            raise ReservationConflictError("existing streamed video bytes changed")
-
+        video_sha256, video_byte_count = self._verify_existing_video(
+            expected_video_identity, expected_video_sha256, expected_video_byte_count
+        )
         final_manifest = build_final_video_manifest_v4(
             relative_path=self.index.final_video_relative_path,
             video_sha256=video_sha256,
@@ -1757,6 +1807,84 @@ class PreparedFinalEncodingReservationV1:
                 "existing-video completion did not authenticate publication"
             )
         return final_manifest
+
+    def _advance_existing_video_prefix(self) -> FinalPublicationRecovery:
+        recovery = self.observe()
+        if recovery.phase == "post_boundary_retry_sibling_present":
+            self.discard_nonsemantic_sibling()
+            recovery = self.observe()
+        if recovery.phase in {
+            "windows_video_replace_gap_before_input_commit",
+            "windows_video_replace_gap_after_input_commit",
+        }:
+            self.recover_video_replacement_gap()
+            recovery = self.observe()
+        if recovery.phase == "video_replaced_input_intent":
+            self.recover_input_manifest_intent()
+            recovery = self.observe()
+        return recovery
+
+    def _recover_matching_final_manifest(
+        self,
+        input_stage_fingerprint: str,
+        resolved_encoding_arguments: tuple[str, ...],
+        expected_video_sha256: str,
+        expected_video_byte_count: int,
+    ) -> FinalVideoManifestV4:
+        transaction = self.final_manifest_transaction
+        if transaction is None:
+            raise ReservationConflictError("streamed final-manifest intent lost its reservation")
+        prefix = self._canonical_prefix_byte_count(transaction.source_path)
+        if prefix in {None, 0} or prefix > transaction.descriptor.payload_raw_max:
+            raise ReservationConflictError("streamed final-manifest intent is incomplete")
+        with transaction.open_authenticated_source() as handle:
+            raw = handle.read(prefix)
+            if len(raw) != prefix:
+                raise ReservationConflictError("streamed final-manifest intent changed during read")
+        intended = parse_final_video_manifest_v4(raw)
+        expected = build_final_video_manifest_v4(
+            relative_path=self.index.final_video_relative_path,
+            video_sha256=expected_video_sha256,
+            video_byte_count=expected_video_byte_count,
+            input_stage_fingerprint=input_stage_fingerprint,
+            resolved_encoding_arguments=resolved_encoding_arguments,
+        )
+        if intended != expected:
+            raise ReservationConflictError(
+                "streamed final-manifest intent differs from v3 evidence"
+            )
+        manifest = self.recover_final_manifest_intent()
+        if self.observe().phase != "publication_authenticated":
+            raise ReservationConflictError("streamed final-manifest recovery did not authenticate")
+        return manifest
+
+    def _verify_existing_video(
+        self,
+        expected_video_identity: PersistedFileIdentityV1,
+        expected_video_sha256: str,
+        expected_video_byte_count: int,
+    ) -> tuple[str, int]:
+        final_path = self.final_video_path
+        try:
+            with AcquiredRoot(self.job_root) as acquired:
+                with acquired.open_regular_locked(final_path) as handle:
+                    identity = file_identity_from_open_handle(handle)
+                    video_sha256, video_byte_count = _hash_open_file(handle)
+                    if (
+                        identity != expected_video_identity
+                        or acquired.persistent_regular_identity(final_path) != identity
+                    ):
+                        raise ReservationConflictError("existing streamed video identity changed")
+        except (NoFollowPathError, FileNotFoundError, OSError) as error:
+            raise ReservationConflictError(
+                "existing streamed video cannot be acquired without following links"
+            ) from error
+        if (video_sha256, video_byte_count) != (
+            expected_video_sha256,
+            expected_video_byte_count,
+        ):
+            raise ReservationConflictError("existing streamed video bytes changed")
+        return video_sha256, video_byte_count
 
     def _retire_committed_manifest_descriptor_prefix(self) -> bool:
         input_transaction = self.input_manifest_transaction
@@ -1798,6 +1926,62 @@ class PreparedFinalEncodingReservationV1:
             return True
         return False
 
+    def has_file_backed_output(self) -> bool:
+        _, manifest = self._final_manifest_observation()
+        return manifest is not None and manifest.encoded_output is not None
+
+    def _resume_file_backed_output(self) -> None:
+        state, manifest = self._final_manifest_observation()
+        if manifest is None or manifest.encoded_output is None or state == "committed-new":
+            return
+        phase = self.observe().phase
+        proof = manifest.encoded_output
+        source = self.input_publication_source()
+        if source is None or source.fingerprint != manifest.input_stage_fingerprint:
+            raise ReservationConflictError("encoded output does not bind the reserved inputs")
+        projection = source.projection(
+            expected_frame_count=_load_settings_frame_count_v1(self.job_root)
+        )
+        if projection.streamed_invocation is not None:
+            raise ReservationConflictError("file-backed proof cannot publish streamed inputs")
+        _validate_normalized_argv(
+            manifest.resolved_encoding_arguments,
+            input_stage_fingerprint=source.fingerprint,
+            relative_path=manifest.relative_path,
+            expected_mode=projection.mode,
+        )
+        pre_rename = phase == "encoded_output_staged"
+        _scan_fixed_file_v1(
+            self.job_root,
+            self.sibling_path if pre_rename else self.final_video_path,
+            expected_identity=proof.identity,
+            expected_raw_sha256=proof.raw_sha256,
+            expected_byte_count=proof.byte_count,
+        )
+        if pre_rename:
+            transaction = self.final_manifest_transaction
+            assert transaction is not None
+            # A dead writer may have filled the extent but not yet returned from fsync.
+            with transaction.open_authenticated_source(writable=True) as handle:
+                raw = manifest.encode()
+                if handle.read(len(raw)) != raw:
+                    raise ReservationConflictError("encoded-output intent changed before sync")
+                os.fsync(handle.fileno())
+            gap = self._video_state() == "windows-replacement-gap"
+            same_parent_replace_v1(
+                self.sibling_path,
+                self.final_video_path,
+                expected_source_identity=proof.identity,
+                expected_target_identity=(
+                    None if gap else self.target_descriptor.reserved_target_identity
+                ),
+                expected_parent_identity=self.target_descriptor.target_parent_identity,
+                replace_existing=not gap,
+            )
+        else:
+            # Re-establish the video rename barrier before committing either manifest.
+            _sync_parent(self.final_video_path.parent)
+
     def recover_publication_prefix(self) -> FinalPublicationRecovery:
         """Finish every deterministic, index-owned publication prefix step."""
 
@@ -1805,6 +1989,13 @@ class PreparedFinalEncodingReservationV1:
             raise ReservationConflictError(
                 "streamed v3 publication requires evidence-bound recovery"
             )
+        if (
+            self.input_manifest_transaction is not None
+            or self.final_manifest_transaction is not None
+        ):
+            # Consuming a staged manifest can disguise an unrelated final as a legal retry.
+            self.observe()
+        self._resume_file_backed_output()
         for _ in range(len(self.index.extent_entries) + 8):
             if self._retire_committed_manifest_descriptor_prefix():
                 continue
@@ -1928,6 +2119,22 @@ class FinalEncodingReservationCapabilityV1:
             raise ReservationConflictError(
                 "final reservation capability has no recovered settings authority"
             )
+        return self._load_bound_reservation(settings)
+
+    def materialize_for_publication(self) -> PreparedFinalEncodingReservationV1:
+        # The live publisher owns the ordering of video, input and final manifest.
+        # Running global restart recovery here would commit its next step prematurely.
+        settings = ProcessingSettingsArtifactV5.parse(
+            _read_bounded_regular_file(
+                self.job_root / SETTINGS_ARTIFACT_RELATIVE_PATH,
+                max_bytes=SETTINGS_ARTIFACT_MAX_RAW_BYTES,
+            )
+        )
+        return self._load_bound_reservation(settings)
+
+    def _load_bound_reservation(
+        self, settings: ProcessingSettingsArtifactV5
+    ) -> PreparedFinalEncodingReservationV1:
         reservation = load_final_encoding_reservation_v1(self.job_root, settings)
         if reservation.index.fingerprint != self.index_fingerprint:
             raise ReservationConflictError("final reservation capability changed generation")
@@ -2189,6 +2396,7 @@ def prepare_final_encoding_reservation_v1(  # noqa: C901
     publication_generation: str,
     input_manifest_raw_max: int,
     final_manifest_raw_max: int,
+    expected_existing_video_identity: ReservationFileIdentity | None = None,
     allocation_unit: int | None = None,
     free_bytes: Callable[[Path], int] | None = None,
     allocation_adapter: AllocationAdapter = platform_allocation_adapter,
@@ -2221,9 +2429,17 @@ def prepare_final_encoding_reservation_v1(  # noqa: C901
     if sibling_path.exists() or sibling_path.is_symlink():
         raise ReservationConflictError("fixed final-video sibling collides at preflight")
     if final_path.exists() or final_path.is_symlink():
+        if expected_existing_video_identity is None:
+            raise ReservationConflictError(
+                "final video already exists without replacement authority; preserving it"
+            )
         existing_identity = _reservation_identity(final_path)
+        if existing_identity != expected_existing_video_identity:
+            raise ReservationConflictError("authorized final-video predecessor identity changed")
         publication_method: Literal["replace_placeholder", "replace_existing"] = "replace_existing"
     else:
+        if expected_existing_video_identity is not None:
+            raise ReservationConflictError("authorized final-video predecessor is missing")
         existing_identity = None
         publication_method = "replace_placeholder"
     settings_path = root / "processing-settings-v5.json"
@@ -2274,7 +2490,7 @@ def prepare_final_encoding_reservation_v1(  # noqa: C901
     diagnostics_raw_sha256: str | None = None
     diagnostics_fingerprint: str | None = None
     diagnostics_raw_max: int | None = None
-    marker_specs = ()
+    marker_specs: tuple[PlannedPruneMarkerV1, ...] = ()
     if not keep_intermediates:
         diagnostics_projection = _diagnostics_prune_preflight(
             root,
@@ -2474,6 +2690,7 @@ def prepare_final_encoding_reservation_v1(  # noqa: C901
     extent_entries.extend(terminal_entries)
     validate_final_encoding_entry_order([entry["reservation_kind"] for entry in extent_entries])
     index = FinalEncodingReservationIndexV1.build(
+        schema_version=2 if expected_existing_video_identity is not None else 1,
         job_id=job_id,
         settings_identity_fingerprint=settings_identity_fingerprint,
         settings_raw_sha256_at_preflight=raw_sha,
@@ -2696,6 +2913,109 @@ def _publish_current_target_descriptor_v1(
     )
 
 
+def _check_final_candidate_namespace(root: Path, path: Path) -> None:
+    control = load_job_control(root)
+    candidate_temporary = path.with_name(f".{path.name}.create-new.tmp")
+    assert_only_job_control_owned_reservations_v1(
+        root,
+        control,
+        allowed_relative_paths=(candidate_temporary.relative_to(root).as_posix(),),
+    )
+
+
+def _check_final_candidate_target(root: Path, value: FinalEncodingReservationIndexV1) -> None:
+    target_descriptor = root / value.final_video_target_descriptor_relative_path
+    target_descriptor_temporary = target_descriptor.with_name(
+        f".{target_descriptor.name}.create-new.tmp"
+    )
+    sibling = root / value.sibling_video_temporary_relative_path
+    if any(
+        candidate.exists() or candidate.is_symlink()
+        for candidate in (
+            target_descriptor,
+            target_descriptor_temporary,
+            sibling,
+        )
+    ):
+        raise ReservationConflictError("final encoding candidate has downstream target artifacts")
+    final_target = root / value.final_video_relative_path
+    if value.final_video_publication_method == "replace_placeholder":
+        if final_target.exists() or final_target.is_symlink():
+            raise ReservationConflictError("final encoding candidate placeholder already exists")
+    elif (
+        not _regular_nonlink(final_target)
+        or _reservation_identity(final_target)
+        != value.final_video_existing_target_identity_at_preflight
+    ):
+        raise ReservationConflictError("final encoding candidate existing target changed")
+
+
+def _check_final_candidate_extent(root: Path, entry: dict) -> None:
+    if entry["reservation_kind"] == "job_terminal_settings":
+        return
+    descriptor, source = _indexed_extent_paths(root, entry)
+    descriptor_temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
+    if any(
+        candidate.exists() or candidate.is_symlink()
+        for candidate in (descriptor, descriptor_temporary, source)
+    ):
+        raise ReservationConflictError("final encoding candidate has downstream extent artifacts")
+    target = root / entry["target_relative_path"]
+    if entry["publication_method"] == "replace_placeholder":
+        if target.exists() or target.is_symlink():
+            raise ReservationConflictError(
+                "final encoding candidate extent placeholder already exists"
+            )
+        return
+    if entry["reservation_kind"] in {"producer_settings", "cleanup_pending_settings"}:
+        # These entries bind the single fixed settings artifact via the index
+        # hash and revision checked above, not a separate per-extent triple.
+        return
+    expected = entry["existing_target_identity_at_preflight"]
+    if (
+        expected is None
+        or not _regular_nonlink(target)
+        or _reservation_identity(target) != ReservationFileIdentity.from_object(expected)
+        or _hash_file(root, target)
+        != (
+            entry["existing_target_raw_sha256_at_preflight"],
+            entry["existing_target_byte_count_at_preflight"],
+        )
+    ):
+        raise ReservationConflictError("final encoding candidate extent target changed")
+
+
+def _validate_final_index_candidate(root: Path, path: Path, value: object) -> None:
+    if not isinstance(value, FinalEncodingReservationIndexV1):
+        raise ReservationConflictError("final encoding temporary has the wrong type")
+    _validate_index_job_control(root, value)
+    value.reject_implicit_video_replacement(root)
+    settings_path = root / "processing-settings-v5.json"
+    if not _regular_nonlink(settings_path):
+        raise ReservationConflictError("final encoding temporary has no durable preflight settings")
+    settings_raw = _read_bounded_regular_file(settings_path, max_bytes=512 * 1024)
+    settings = ProcessingSettingsArtifactV5.parse(settings_raw)
+    metadata = settings.to_object()["metadata"]
+    if (
+        hashlib.sha256(settings_raw).hexdigest() != value.settings_raw_sha256_at_preflight
+        or settings.revision != value.settings_revision_at_preflight
+        or metadata["job_id"] != value.job_id
+        or metadata["settings_identity_fingerprint"] != value.settings_identity_fingerprint
+    ):
+        raise ReservationConflictError("final encoding temporary preflight settings changed")
+    settings_index = root / (".depth-surge-reservations-v1/settings-transition-reservation-v1.json")
+    settings_index_temporary = settings_index.with_name(f".{settings_index.name}.create-new.tmp")
+    if any(
+        candidate.exists() or candidate.is_symlink()
+        for candidate in (settings_index, settings_index_temporary)
+    ):
+        raise ReservationConflictError("final encoding candidate overlaps a settings authority")
+    _check_final_candidate_namespace(root, path)
+    _check_final_candidate_target(root, value)
+    for entry in value.extent_entries:
+        _check_final_candidate_extent(root, entry)
+
+
 def recover_final_encoding_index_pair_v1(
     job_root: Path,
 ) -> FinalEncodingReservationIndexV1 | None:
@@ -2707,124 +3027,23 @@ def recover_final_encoding_index_pair_v1(
             strict_canonical_json_loads(raw, max_bytes=256 * 1024)
         )
 
-    def validate_before_publish(value: object) -> None:
-        if not isinstance(value, FinalEncodingReservationIndexV1):
-            raise ReservationConflictError("final encoding temporary has the wrong type")
-        _validate_index_job_control(root, value)
-        settings_path = root / "processing-settings-v5.json"
-        if not _regular_nonlink(settings_path):
-            raise ReservationConflictError(
-                "final encoding temporary has no durable preflight settings"
-            )
-        settings_raw = _read_bounded_regular_file(settings_path, max_bytes=512 * 1024)
-        settings = ProcessingSettingsArtifactV5.parse(settings_raw)
-        metadata = settings.to_object()["metadata"]
-        if (
-            hashlib.sha256(settings_raw).hexdigest() != value.settings_raw_sha256_at_preflight
-            or settings.revision != value.settings_revision_at_preflight
-            or metadata["job_id"] != value.job_id
-            or metadata["settings_identity_fingerprint"] != value.settings_identity_fingerprint
-        ):
-            raise ReservationConflictError("final encoding temporary preflight settings changed")
-        settings_index = root / (
-            ".depth-surge-reservations-v1/settings-transition-reservation-v1.json"
-        )
-        settings_index_temporary = settings_index.with_name(
-            f".{settings_index.name}.create-new.tmp"
-        )
-        if any(
-            candidate.exists() or candidate.is_symlink()
-            for candidate in (settings_index, settings_index_temporary)
-        ):
-            raise ReservationConflictError("final encoding candidate overlaps a settings authority")
-        control = load_job_control(root)
-        candidate_temporary = path.with_name(f".{path.name}.create-new.tmp")
-        assert_only_job_control_owned_reservations_v1(
-            root,
-            control,
-            allowed_relative_paths=(candidate_temporary.relative_to(root).as_posix(),),
-        )
-        target_descriptor = root / value.final_video_target_descriptor_relative_path
-        target_descriptor_temporary = target_descriptor.with_name(
-            f".{target_descriptor.name}.create-new.tmp"
-        )
-        sibling = root / value.sibling_video_temporary_relative_path
-        if any(
-            candidate.exists() or candidate.is_symlink()
-            for candidate in (
-                target_descriptor,
-                target_descriptor_temporary,
-                sibling,
-            )
-        ):
-            raise ReservationConflictError(
-                "final encoding candidate has downstream target artifacts"
-            )
-        final_target = root / value.final_video_relative_path
-        if value.final_video_publication_method == "replace_placeholder":
-            if final_target.exists() or final_target.is_symlink():
-                raise ReservationConflictError(
-                    "final encoding candidate placeholder already exists"
-                )
-        elif (
-            not _regular_nonlink(final_target)
-            or _reservation_identity(final_target)
-            != value.final_video_existing_target_identity_at_preflight
-        ):
-            raise ReservationConflictError("final encoding candidate existing target changed")
-        for entry in value.extent_entries:
-            if entry["reservation_kind"] == "job_terminal_settings":
-                continue
-            descriptor, source = _indexed_extent_paths(root, entry)
-            descriptor_temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
-            if any(
-                candidate.exists() or candidate.is_symlink()
-                for candidate in (descriptor, descriptor_temporary, source)
-            ):
-                raise ReservationConflictError(
-                    "final encoding candidate has downstream extent artifacts"
-                )
-            target = root / entry["target_relative_path"]
-            if entry["publication_method"] == "replace_placeholder":
-                if target.exists() or target.is_symlink():
-                    raise ReservationConflictError(
-                        "final encoding candidate extent placeholder already exists"
-                    )
-                continue
-            expected = entry["existing_target_identity_at_preflight"]
-            if (
-                expected is None
-                or not _regular_nonlink(target)
-                or _reservation_identity(target) != ReservationFileIdentity.from_object(expected)
-                or _hash_file(root, target)
-                != (
-                    entry["existing_target_raw_sha256_at_preflight"],
-                    entry["existing_target_byte_count_at_preflight"],
-                )
-            ):
-                raise ReservationConflictError("final encoding candidate extent target changed")
-
-    def validate_before_unlink() -> None:
-        control = load_job_control(root)
-        candidate_temporary = path.with_name(f".{path.name}.create-new.tmp")
-        assert_only_job_control_owned_reservations_v1(
-            root,
-            control,
-            allowed_relative_paths=(candidate_temporary.relative_to(root).as_posix(),),
-        )
-
+    # A committed index wins, but even a redundant temporary must survive a refusal.
+    temporary = path.with_name(f".{path.name}.create-new.tmp")
+    if path.is_file() and (temporary.exists() or temporary.is_symlink()):
+        _load_final_encoding_index_readonly_v1(root).reject_implicit_video_replacement(root)
     recovered = recover_control_artifact_pair_v1(
         path,
         max_bytes=256 * 1024,
         parser=parse,
-        prepublish_validate=validate_before_publish,
-        preunlink_validate=validate_before_unlink,
+        prepublish_validate=lambda value: _validate_final_index_candidate(root, path, value),
+        preunlink_validate=lambda: _check_final_candidate_namespace(root, path),
     )
     if recovered is None:
         return None
     if not isinstance(recovered, FinalEncodingReservationIndexV1):
         raise ReservationConflictError("final encoding control type changed")
     _validate_index_job_control(root, recovered)
+    recovered.reject_implicit_video_replacement(root)
     target_descriptor = PurePosixPath(recovered.final_video_target_descriptor_relative_path)
     assert_index_owned_reservation_namespace_v1(
         root,
@@ -3083,6 +3302,93 @@ def _settings_payload_intent(
     return raw
 
 
+def _validate_settings_gap_descriptor(
+    index: FinalEncodingReservationIndexV1,
+    control: JobControlV1,
+    entry: dict,
+    transaction: ReservedArtifactTransaction,
+) -> None:
+    kind = entry["reservation_kind"]
+    if kind == "job_terminal_settings":
+        owner_revision = None
+        owner_hash = None
+        owner_path = Path("job-control-v1.json")
+        owner_fingerprint = control.fingerprint
+    else:
+        owner_revision = index.settings_revision_at_preflight
+        owner_hash = index.settings_raw_sha256_at_preflight
+        owner_path = FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+        owner_fingerprint = index.fingerprint
+    validate_descriptor_against_entry_v1(
+        transaction.descriptor,
+        entry,
+        job_id=index.job_id,
+        settings_identity_fingerprint=index.settings_identity_fingerprint,
+        settings_revision_at_creation=owner_revision,
+        settings_raw_sha256_at_creation=owner_hash,
+        transaction_index_relative_path=owner_path,
+        transaction_index_fingerprint=owner_fingerprint,
+    )
+
+
+def _validate_settings_gap_artifact(
+    index: FinalEncodingReservationIndexV1, kind: str, artifact: ProcessingSettingsArtifactV5
+) -> None:
+    metadata = artifact.to_object()["metadata"]
+    if (
+        metadata["job_id"] != index.job_id
+        or metadata["settings_identity_fingerprint"] != index.settings_identity_fingerprint
+    ):
+        raise ReservationConflictError("indexed settings gap belongs to another job")
+    if kind == "producer_settings" and (
+        metadata["final_media_publication_generation"] != index.publication_generation
+    ):
+        raise ReservationConflictError("producer settings gap has another generation")
+    if kind == "cleanup_pending_settings" and metadata["cleanup_status"] != "pending":
+        raise ReservationConflictError("cleanup settings gap is not pending")
+    if kind == "job_terminal_settings" and artifact.status not in {
+        "completed",
+        "failed",
+    }:
+        raise ReservationConflictError("terminal settings gap is nonterminal")
+
+
+def _settings_gap_candidate(
+    root: Path,
+    index: FinalEncodingReservationIndexV1,
+    control: JobControlV1,
+    entry: dict,
+    allocation_adapter: AllocationAdapter,
+    allocation_counter: AllocationCounter | None,
+) -> tuple[ReservedArtifactTransaction, ProcessingSettingsArtifactV5] | None:
+    kind = entry["reservation_kind"]
+    if kind not in {
+        "producer_settings",
+        "cleanup_pending_settings",
+        "job_terminal_settings",
+    }:
+        return None
+    descriptor_path = root / entry["descriptor_relative_path"]
+    if not descriptor_path.is_file() or descriptor_path.is_symlink():
+        return None
+    transaction = ReservedArtifactTransaction.load(
+        descriptor_path,
+        allocation_adapter=allocation_adapter,
+        allocation_counter=allocation_counter,
+    )
+    _validate_settings_gap_descriptor(index, control, entry, transaction)
+    if not transaction.source_path.is_file() or transaction.source_path.is_symlink():
+        return None
+    payload = _settings_payload_intent(transaction)
+    if payload is None:
+        return None
+    artifact = ProcessingSettingsArtifactV5.parse(payload)
+    _validate_settings_gap_artifact(index, kind, artifact)
+    if transaction.validate_physical_phase(payload) == "replacement-gap":
+        return transaction, artifact
+    return None
+
+
 def recover_settings_replacement_gap_from_final_index_v1(
     job_root: Path,
     *,
@@ -3105,66 +3411,11 @@ def recover_settings_replacement_gap_from_final_index_v1(
     control = load_job_control(root)
     candidates: list[tuple[ReservedArtifactTransaction, ProcessingSettingsArtifactV5]] = []
     for entry in index.extent_entries:
-        kind = entry["reservation_kind"]
-        if kind not in {
-            "producer_settings",
-            "cleanup_pending_settings",
-            "job_terminal_settings",
-        }:
-            continue
-        descriptor_path = root / entry["descriptor_relative_path"]
-        if not descriptor_path.is_file() or descriptor_path.is_symlink():
-            continue
-        transaction = ReservedArtifactTransaction.load(
-            descriptor_path,
-            allocation_adapter=allocation_adapter,
-            allocation_counter=allocation_counter,
+        candidate = _settings_gap_candidate(
+            root, index, control, entry, allocation_adapter, allocation_counter
         )
-        if kind == "job_terminal_settings":
-            owner_revision = None
-            owner_hash = None
-            owner_path = Path("job-control-v1.json")
-            owner_fingerprint = control.fingerprint
-        else:
-            owner_revision = index.settings_revision_at_preflight
-            owner_hash = index.settings_raw_sha256_at_preflight
-            owner_path = FINAL_ENCODING_RESERVATION_RELATIVE_PATH
-            owner_fingerprint = index.fingerprint
-        validate_descriptor_against_entry_v1(
-            transaction.descriptor,
-            entry,
-            job_id=index.job_id,
-            settings_identity_fingerprint=index.settings_identity_fingerprint,
-            settings_revision_at_creation=owner_revision,
-            settings_raw_sha256_at_creation=owner_hash,
-            transaction_index_relative_path=owner_path,
-            transaction_index_fingerprint=owner_fingerprint,
-        )
-        if not transaction.source_path.is_file() or transaction.source_path.is_symlink():
-            continue
-        payload = _settings_payload_intent(transaction)
-        if payload is None:
-            continue
-        artifact = ProcessingSettingsArtifactV5.parse(payload)
-        metadata = artifact.to_object()["metadata"]
-        if (
-            metadata["job_id"] != index.job_id
-            or metadata["settings_identity_fingerprint"] != index.settings_identity_fingerprint
-        ):
-            raise ReservationConflictError("indexed settings gap belongs to another job")
-        if kind == "producer_settings" and (
-            metadata["final_media_publication_generation"] != index.publication_generation
-        ):
-            raise ReservationConflictError("producer settings gap has another generation")
-        if kind == "cleanup_pending_settings" and metadata["cleanup_status"] != "pending":
-            raise ReservationConflictError("cleanup settings gap is not pending")
-        if kind == "job_terminal_settings" and artifact.status not in {
-            "completed",
-            "failed",
-        }:
-            raise ReservationConflictError("terminal settings gap is nonterminal")
-        if transaction.validate_physical_phase(payload) == "replacement-gap":
-            candidates.append((transaction, artifact))
+        if candidate is not None:
+            candidates.append(candidate)
     if len(candidates) != 1:
         raise ReservationConflictError(
             "missing fixed settings has no unique active-index replacement gap"
@@ -3227,21 +3478,19 @@ def _load_diagnostics_projection(root: Path) -> DiagnosticsMetadataProjection:
     return projection
 
 
-def _rebuild_payload_pruned_document_v1(
-    root: Path,
-    index: FinalEncodingReservationIndexV1,
-    transaction: ReservedArtifactTransaction,
-) -> StreamedCanonicalObject:
-    """Rebuild one indexed payload-pruned intent without materializing frame names."""
+def _check_prune_predecessor_binding(projection: DiagnosticsMetadataProjection) -> None:
+    try:
+        projection.validate_state_contract()
+        validate_quality_input_binding(projection)
+    except (OSError, ValueError) as error:
+        raise ReservationConflictError(
+            "payload-pruned diagnostics predecessor is invalid"
+        ) from error
 
-    marker_entries = [
-        entry for entry in index.extent_entries if entry["reservation_kind"] == "prune_marker"
-    ]
-    expected_entries = [_marker_payload_from_entry(entry)[0] for entry in marker_entries]
-    final_manifest = root / FINAL_VIDEO_MANIFEST_RELATIVE_PATH
-    if not _regular_nonlink(final_manifest):
-        raise ReservationConflictError("payload-pruned intent has no committed final manifest")
-    final_sha256, _final_count = _hash_file(root, final_manifest)
+
+def _payload_prune_predecessor(
+    transaction: ReservedArtifactTransaction,
+) -> DiagnosticsMetadataProjection:
     projection: DiagnosticsMetadataProjection | None = None
     if _regular_nonlink(transaction.target_path):
         try:
@@ -3268,13 +3517,17 @@ def _rebuild_payload_pruned_document_v1(
         raise ReservationConflictError(
             "payload-pruned intent has no replayable diagnostics predecessor"
         )
-    try:
-        projection.validate_state_contract()
-        validate_quality_input_binding(projection)
-    except (OSError, ValueError) as error:
-        raise ReservationConflictError(
-            "payload-pruned diagnostics predecessor is invalid"
-        ) from error
+    _check_prune_predecessor_binding(projection)
+    return projection
+
+
+def _payload_prune_successor(
+    root: Path,
+    index: FinalEncodingReservationIndexV1,
+    projection: DiagnosticsMetadataProjection,
+    expected_entries: list[dict],
+    final_sha256: str,
+) -> StreamedCanonicalObject:
     if projection.status == "payload_pruned":
         try:
             _validate_payload_pruned_projection(root, projection)
@@ -3307,6 +3560,26 @@ def _rebuild_payload_pruned_document_v1(
             prune_entries=expected_entries,
             final_video_manifest_sha256=final_sha256,
         )
+    return document
+
+
+def _rebuild_payload_pruned_document_v1(
+    root: Path,
+    index: FinalEncodingReservationIndexV1,
+    transaction: ReservedArtifactTransaction,
+) -> StreamedCanonicalObject:
+    """Rebuild one indexed payload-pruned intent without materializing frame names."""
+
+    marker_entries = [
+        entry for entry in index.extent_entries if entry["reservation_kind"] == "prune_marker"
+    ]
+    expected_entries = [_marker_payload_from_entry(entry)[0] for entry in marker_entries]
+    final_manifest = root / FINAL_VIDEO_MANIFEST_RELATIVE_PATH
+    if not _regular_nonlink(final_manifest):
+        raise ReservationConflictError("payload-pruned intent has no committed final manifest")
+    final_sha256, _final_count = _hash_file(root, final_manifest)
+    projection = _payload_prune_predecessor(transaction)
+    document = _payload_prune_successor(root, index, projection, expected_entries, final_sha256)
     if document.raw_byte_count != transaction.descriptor.payload_raw_max:
         raise ReservationConflictError(
             "rebuilt payload-pruned intent differs from its indexed bound"
@@ -3370,6 +3643,48 @@ def _validate_completed_descriptorless_retirement_v1(
             )
 
 
+def _retired_settings_entry_is_committed(
+    root: Path, index: FinalEncodingReservationIndexV1, kind: str
+) -> bool:
+    try:
+        settings = ProcessingSettingsArtifactV5.parse(
+            _read_bounded_regular_file(
+                root / "processing-settings-v5.json",
+                max_bytes=512 * 1024,
+            )
+        )
+    except (OSError, SettingsArtifactSchemaError):
+        return False
+    metadata = settings.to_object()["metadata"]
+    if kind == "producer_settings":
+        return (
+            metadata["final_media_producer_contract_version"] == 4
+            and metadata["final_media_publication_generation"] == index.publication_generation
+        )
+    return metadata["cleanup_status"] not in {
+        "not_started",
+        "not_requested",
+    }
+
+
+def _retired_prune_entry_is_committed(root: Path, entry: dict) -> bool:
+    kind = entry["reservation_kind"]
+    try:
+        diagnostics = _load_diagnostics_projection(root)
+    except (OSError, ReservationConflictError):
+        return False
+    if diagnostics.status != "payload_pruned":
+        return False
+    try:
+        _validate_payload_pruned_projection(root, diagnostics)
+    except RuntimeError:
+        return False
+    if kind == "diagnostics_payload_pruned":
+        return True
+    expected, _payload = _marker_payload_from_entry(entry)
+    return expected in diagnostics.static_fields.get("prune_entries", [])
+
+
 def _descriptorless_failed_entry_is_committed_v1(
     root: Path,
     index: FinalEncodingReservationIndexV1,
@@ -3396,40 +3711,9 @@ def _descriptorless_failed_entry_is_committed_v1(
             return False
         return True
     if kind in {"producer_settings", "cleanup_pending_settings"}:
-        try:
-            settings = ProcessingSettingsArtifactV5.parse(
-                _read_bounded_regular_file(
-                    root / "processing-settings-v5.json",
-                    max_bytes=512 * 1024,
-                )
-            )
-        except (OSError, SettingsArtifactSchemaError):
-            return False
-        metadata = settings.to_object()["metadata"]
-        if kind == "producer_settings":
-            return (
-                metadata["final_media_producer_contract_version"] == 4
-                and metadata["final_media_publication_generation"] == index.publication_generation
-            )
-        return metadata["cleanup_status"] not in {
-            "not_started",
-            "not_requested",
-        }
+        return _retired_settings_entry_is_committed(root, index, kind)
     if kind in {"prune_marker", "diagnostics_payload_pruned"}:
-        try:
-            diagnostics = _load_diagnostics_projection(root)
-        except (OSError, ReservationConflictError):
-            return False
-        if diagnostics.status != "payload_pruned":
-            return False
-        try:
-            _validate_payload_pruned_projection(root, diagnostics)
-        except RuntimeError:
-            return False
-        if kind == "diagnostics_payload_pruned":
-            return True
-        expected, _payload = _marker_payload_from_entry(entry)
-        return expected in diagnostics.static_fields.get("prune_entries", [])
+        return _retired_prune_entry_is_committed(root, entry)
     return False
 
 
@@ -3595,11 +3879,11 @@ def _snapshot_completed_retirement_plan_v1(
     for entry in index.extent_entries:
         if entry["reservation_kind"] == "job_terminal_settings":
             continue
-        descriptor, source = _indexed_extent_paths(root, entry)
-        descriptor_temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
+        descriptor_path, source = _indexed_extent_paths(root, entry)
+        descriptor_temporary = descriptor_path.with_name(f".{descriptor_path.name}.create-new.tmp")
         if any(
             path.exists() or path.is_symlink()
-            for path in (descriptor, descriptor_temporary, source)
+            for path in (descriptor_path, descriptor_temporary, source)
         ):
             raise ReservationConflictError(
                 f"{entry['reservation_kind']} extent remains active at completed retirement"
@@ -3721,61 +4005,41 @@ def _recover_completed_final_retirement_v1(
         event("reservation:index-retired")
 
 
-def load_final_encoding_reservation_v1(
-    job_root: Path,
-    settings: ProcessingSettingsArtifactV5,
-    *,
-    allocation_adapter: AllocationAdapter = platform_allocation_adapter,
-    allocation_counter: AllocationCounter | None = platform_allocation_counter,
-    event: Callable[[str], None] | None = None,
-) -> PreparedFinalEncodingReservationV1:
-    """Reopen the durable index and derive its current physical publication phase."""
-
-    root = Path(job_root).resolve()
-    settings_authority = _scalarize_final_settings_for_load_v1(settings)
-    del settings
-    index = recover_final_encoding_index_pair_v1(root)
-    if index is None:
-        raise ReservationConflictError("final encoding reservation is missing")
-    if (
-        index.job_id != settings_authority.job_id
-        or index.settings_identity_fingerprint != settings_authority.settings_identity_fingerprint
-        or settings_authority.final_media_publication_generation
-        not in {None, index.publication_generation}
-        or index.final_video_relative_path != settings_authority.expected_final_relative_path
-        or index.sibling_video_parent_identity != _reservation_directory_identity(root)
-    ):
-        raise ReservationConflictError("active final index belongs to different job settings")
-    producer_entry: dict | None = None
-    diagnostics_entry: dict | None = None
-    cleanup_entry: dict | None = None
-    marker_entries: list[dict] = []
+def _group_final_extents(
+    index: FinalEncodingReservationIndexV1,
+) -> tuple[dict | None, list[dict], dict | None, dict | None]:
+    singletons: dict[str, dict] = {}
+    markers: list[dict] = []
     for entry in index.extent_entries:
         kind = entry.get("reservation_kind")
-        if kind == "producer_settings":
-            if producer_entry is not None:
+        if kind == "prune_marker":
+            markers.append(entry)
+        elif kind in {
+            "producer_settings",
+            "diagnostics_payload_pruned",
+            "cleanup_pending_settings",
+        }:
+            if kind in singletons:
                 raise ReservationConflictError("final index has duplicate singleton extents")
-            producer_entry = entry
-        elif kind == "prune_marker":
-            marker_entries.append(entry)
-        elif kind == "diagnostics_payload_pruned":
-            if diagnostics_entry is not None:
-                raise ReservationConflictError("final index has duplicate singleton extents")
-            diagnostics_entry = entry
-        elif kind == "cleanup_pending_settings":
-            if cleanup_entry is not None:
-                raise ReservationConflictError("final index has duplicate singleton extents")
-            cleanup_entry = entry
-    producer_consumed = (
-        settings_authority.final_media_publication_generation == index.publication_generation
+            singletons[kind] = entry
+    return (
+        singletons.get("producer_settings"),
+        markers,
+        singletons.get("diagnostics_payload_pruned"),
+        singletons.get("cleanup_pending_settings"),
     )
-    cleanup_consumed = settings_authority.cleanup_consumed
-    del settings_authority
+
+
+def _load_committed_prune_entries(
+    root: Path,
+    index: FinalEncodingReservationIndexV1,
+    marker_entries: list[dict],
+    diagnostics_entry: dict | None,
+) -> tuple[dict, ...] | None:
     diagnostics_projection: DiagnosticsMetadataProjection | None = None
     diagnostics_path = root / "04_stereo_diagnostics" / "metadata.json"
     if (marker_entries or diagnostics_entry is not None) and _regular_nonlink(diagnostics_path):
         diagnostics_projection = _load_diagnostics_projection(root)
-    diagnostics_consumed = False
     committed_prune_entries: tuple[dict, ...] | None = None
     if diagnostics_projection is not None and diagnostics_projection.status == "payload_pruned":
         try:
@@ -3796,10 +4060,15 @@ def load_final_encoding_reservation_v1(
             raise ReservationConflictError(
                 "payload-pruned diagnostics belong to another final reservation"
             )
-        diagnostics_consumed = True
         committed_prune_entries = tuple(dict(entry) for entry in expected_entries)
         del expected_entries, fields, pruned_from
     del diagnostics_projection
+    return committed_prune_entries
+
+
+def _load_or_create_final_target(
+    root: Path, index: FinalEncodingReservationIndexV1
+) -> FinalVideoTargetReservationV1:
     target_path = root / index.final_video_target_descriptor_relative_path
     if target_path.exists() or target_path.is_symlink():
         target = FinalVideoTargetReservationV1.from_object(
@@ -3858,25 +4127,13 @@ def load_final_encoding_reservation_v1(
             target.to_object(),
             validate_authority=validate_target_descriptor_authority,
         )
-    if (
-        target.job_id != index.job_id
-        or target.settings_identity_fingerprint != index.settings_identity_fingerprint
-        or target.settings_raw_sha256_at_preflight != index.settings_raw_sha256_at_preflight
-        or target.settings_revision_at_preflight != index.settings_revision_at_preflight
-        or target.transaction_index_fingerprint != index.fingerprint
-        or target.publication_generation != index.publication_generation
-        or target.reservation_generation != index.reservation_generation
-        or target.final_video_relative_path != index.final_video_relative_path
-        or target.sibling_video_temporary_relative_path
-        != index.sibling_video_temporary_relative_path
-        or target.target_parent_identity != index.sibling_video_parent_identity
-        or target.publication_method != index.final_video_publication_method
-    ):
-        raise ReservationConflictError("final target descriptor differs from its index")
-    if target.publication_method == "replace_existing" and (
-        target.reserved_target_identity != index.final_video_existing_target_identity_at_preflight
-    ):
-        raise ReservationConflictError("final target descriptor changed the old target identity")
+    _validate_target_descriptor_against_index_v1(index, target)
+    return target
+
+
+def _observe_final_target(
+    root: Path, index: FinalEncodingReservationIndexV1, target: FinalVideoTargetReservationV1
+) -> None:
     current_final = root / index.final_video_relative_path
     if current_final.exists() or current_final.is_symlink():
         current_identity = _reservation_identity(current_final)
@@ -3888,18 +4145,16 @@ def load_final_encoding_reservation_v1(
             and current_final.stat().st_size == 0
         ):
             raise ReservationConflictError("final placeholder identity differs from descriptor")
-    producer_transaction = (
-        _load_indexed_extent(
-            root=root,
-            index=index,
-            entry=producer_entry,
-            allocation_adapter=allocation_adapter,
-            allocation_counter=allocation_counter,
-            committed=producer_consumed,
-        )
-        if producer_entry is not None
-        else None
-    )
+
+
+def _load_final_prune_markers(
+    root: Path,
+    index: FinalEncodingReservationIndexV1,
+    marker_entries: list[dict],
+    committed_prune_entries: tuple[dict, ...] | None,
+    allocation_adapter: AllocationAdapter,
+    allocation_counter: AllocationCounter | None,
+) -> tuple[tuple[dict, ReservedArtifactTransaction | None, bytes], ...]:
     prune_transactions: list[tuple[dict, ReservedArtifactTransaction | None, bytes]] = []
     for marker_index, entry in enumerate(marker_entries):
         prune_entry, payload = _marker_payload_from_entry(entry)
@@ -3928,6 +4183,61 @@ def load_final_encoding_reservation_v1(
                 payload,
             )
         )
+    return tuple(prune_transactions)
+
+
+def load_final_encoding_reservation_v1(
+    job_root: Path,
+    settings: ProcessingSettingsArtifactV5,
+    *,
+    allocation_adapter: AllocationAdapter = platform_allocation_adapter,
+    allocation_counter: AllocationCounter | None = platform_allocation_counter,
+    event: Callable[[str], None] | None = None,
+) -> PreparedFinalEncodingReservationV1:
+    """Reopen the durable index and derive its current physical publication phase."""
+
+    root = Path(job_root).resolve()
+    settings_authority = _scalarize_final_settings_for_load_v1(settings)
+    del settings
+    index = recover_final_encoding_index_pair_v1(root)
+    if index is None:
+        raise ReservationConflictError("final encoding reservation is missing")
+    if (
+        index.job_id != settings_authority.job_id
+        or index.settings_identity_fingerprint != settings_authority.settings_identity_fingerprint
+        or settings_authority.final_media_publication_generation
+        not in {None, index.publication_generation}
+        or index.final_video_relative_path != settings_authority.expected_final_relative_path
+        or index.sibling_video_parent_identity != _reservation_directory_identity(root)
+    ):
+        raise ReservationConflictError("active final index belongs to different job settings")
+    producer_entry, marker_entries, diagnostics_entry, cleanup_entry = _group_final_extents(index)
+    producer_consumed = (
+        settings_authority.final_media_publication_generation == index.publication_generation
+    )
+    cleanup_consumed = settings_authority.cleanup_consumed
+    del settings_authority
+    committed_prune_entries = _load_committed_prune_entries(
+        root, index, marker_entries, diagnostics_entry
+    )
+    diagnostics_consumed = committed_prune_entries is not None
+    target = _load_or_create_final_target(root, index)
+    _observe_final_target(root, index, target)
+    producer_transaction = (
+        _load_indexed_extent(
+            root=root,
+            index=index,
+            entry=producer_entry,
+            allocation_adapter=allocation_adapter,
+            allocation_counter=allocation_counter,
+            committed=producer_consumed,
+        )
+        if producer_entry is not None
+        else None
+    )
+    prune_transactions = _load_final_prune_markers(
+        root, index, marker_entries, committed_prune_entries, allocation_adapter, allocation_counter
+    )
     diagnostics_transaction = (
         _load_indexed_extent(
             root=root,
@@ -3973,7 +4283,7 @@ def load_final_encoding_reservation_v1(
         event=event,
         producer_settings_transaction=producer_transaction,
         producer_settings_payload=_settings_payload_intent(producer_transaction),
-        prune_marker_transactions=tuple(prune_transactions),
+        prune_marker_transactions=prune_transactions,
         diagnostics_payload_pruned_transaction=diagnostics_transaction,
         cleanup_pending_settings_transaction=cleanup_transaction,
         cleanup_pending_settings_payload=_settings_payload_intent(cleanup_transaction),
@@ -4027,114 +4337,109 @@ def recover_final_encoding_terminal_retirement_v1(  # noqa: C901
     return True
 
 
-def _snapshot_failed_retirement_plan_v1(
+def _load_retirement_extent_descriptor(
+    path: Path, index: FinalEncodingReservationIndexV1, entry: dict
+) -> ReservationDescriptor:
+    descriptor = ReservationDescriptor.from_object(
+        _load_reservation_json(path, max_bytes=1024 * 1024)
+    )
+    validate_descriptor_against_entry_v1(
+        descriptor,
+        entry,
+        job_id=index.job_id,
+        settings_identity_fingerprint=index.settings_identity_fingerprint,
+        settings_revision_at_creation=index.settings_revision_at_preflight,
+        settings_raw_sha256_at_creation=index.settings_raw_sha256_at_preflight,
+        transaction_index_relative_path=FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+        transaction_index_fingerprint=index.fingerprint,
+    )
+    return descriptor
+
+
+def _snapshot_failed_extent(
+    root: Path, index: FinalEncodingReservationIndexV1, position: int, entry: dict
+) -> _FailedExtentRetirementV1:
+    kind = entry["reservation_kind"]
+    descriptor_path, source_path = _indexed_extent_paths(root, entry)
+    descriptor_temporary_path = descriptor_path.with_name(f".{descriptor_path.name}.create-new.tmp")
+    descriptor_temporary = _snapshot_retirement_path_v1(
+        descriptor_temporary_path,
+        label=f"{kind} descriptor temporary",
+    )
+    descriptor_snapshot = _snapshot_retirement_path_v1(
+        descriptor_path,
+        label=f"{kind} descriptor",
+    )
+    source_snapshot: _RetirementPathV1 | None = None
+    target_snapshot: _RetirementPathV1 | None = None
+    if descriptor_snapshot is not None:
+        descriptor = _load_retirement_extent_descriptor(descriptor_path, index, entry)
+        if descriptor_temporary is not None:
+            _validate_descriptor_temporary_prefix_v1(
+                descriptor_temporary_path,
+                canonical_json_bytes(descriptor.to_object()),
+                label=f"{kind} descriptor temporary",
+            )
+        source_snapshot = _snapshot_retirement_path_v1(
+            source_path,
+            label=f"{kind} source",
+            expected_identity=descriptor.filesystem_identity,
+        )
+        target_path = root / descriptor.target_relative_path
+        if (
+            descriptor.publication_method == "replace_placeholder"
+            and descriptor.placeholder_identity is not None
+            and (target_path.exists() or target_path.is_symlink())
+            and _reservation_identity(target_path) == descriptor.placeholder_identity
+        ):
+            if target_path.stat(follow_symlinks=False).st_size != 0:
+                raise ReservationConflictError(f"unused {kind} placeholder is nonempty")
+            target_snapshot = _snapshot_retirement_path_v1(
+                target_path,
+                label=f"{kind} placeholder",
+                expected_identity=descriptor.placeholder_identity,
+                expected_parent_identity=descriptor.target_parent_identity,
+            )
+    elif source_path.exists() or source_path.is_symlink():
+        raise ReservationConflictError(f"{kind} source appeared without its descriptor")
+    elif descriptor_temporary is not None:
+        _load_retirement_extent_descriptor(descriptor_temporary_path, index, entry)
+    return _FailedExtentRetirementV1(
+        position=position,
+        source=source_snapshot,
+        target_placeholder=target_snapshot,
+        descriptor_temporary=descriptor_temporary,
+        descriptor=descriptor_snapshot,
+    )
+
+
+def _snapshot_failed_final_placeholder(
     root: Path,
     index: FinalEncodingReservationIndexV1,
-    *,
+    target_descriptor: FinalVideoTargetReservationV1,
+) -> _RetirementPathV1 | None:
+    final_path = root / index.final_video_relative_path
+    if (
+        target_descriptor.publication_method == "replace_placeholder"
+        and (final_path.exists() or final_path.is_symlink())
+        and _reservation_identity(final_path) == target_descriptor.reserved_target_identity
+    ):
+        if final_path.stat(follow_symlinks=False).st_size != 0:
+            raise ReservationConflictError("unused final placeholder is nonempty")
+        return _snapshot_retirement_path_v1(
+            final_path,
+            label="final video placeholder",
+            expected_identity=target_descriptor.reserved_target_identity,
+            expected_parent_identity=target_descriptor.target_parent_identity,
+        )
+    return None
+
+
+def _snapshot_failed_final_target(
+    root: Path,
+    index: FinalEncodingReservationIndexV1,
     target_descriptor: FinalVideoTargetReservationV1 | None,
-) -> _FailedRetirementPlanV1:
-    """Freeze every delete identity after the read-only semantic preflight."""
-
-    sibling = _snapshot_retirement_path_v1(
-        root / index.sibling_video_temporary_relative_path,
-        label="indexed sibling",
-        expected_parent_identity=index.sibling_video_parent_identity,
-    )
-    index_path = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
-    index_temporary_path = index_path.with_name(f".{index_path.name}.create-new.tmp")
-    index_temporary = _snapshot_retirement_path_v1(
-        index_temporary_path,
-        label="final index temporary",
-    )
-
-    extent_plans: list[_FailedExtentRetirementV1] = []
-    for position, entry in enumerate(index.extent_entries):
-        if entry["reservation_kind"] == "job_terminal_settings":
-            continue
-        kind = entry["reservation_kind"]
-        descriptor_path, source_path = _indexed_extent_paths(root, entry)
-        descriptor_temporary_path = descriptor_path.with_name(
-            f".{descriptor_path.name}.create-new.tmp"
-        )
-        descriptor_temporary = _snapshot_retirement_path_v1(
-            descriptor_temporary_path,
-            label=f"{kind} descriptor temporary",
-        )
-        descriptor_snapshot = _snapshot_retirement_path_v1(
-            descriptor_path,
-            label=f"{kind} descriptor",
-        )
-        source_snapshot: _RetirementPathV1 | None = None
-        target_snapshot: _RetirementPathV1 | None = None
-        if descriptor_snapshot is not None:
-            descriptor = ReservationDescriptor.from_object(
-                _load_reservation_json(descriptor_path, max_bytes=1024 * 1024)
-            )
-            validate_descriptor_against_entry_v1(
-                descriptor,
-                entry,
-                job_id=index.job_id,
-                settings_identity_fingerprint=index.settings_identity_fingerprint,
-                settings_revision_at_creation=index.settings_revision_at_preflight,
-                settings_raw_sha256_at_creation=index.settings_raw_sha256_at_preflight,
-                transaction_index_relative_path=FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
-                transaction_index_fingerprint=index.fingerprint,
-            )
-            if descriptor_temporary is not None:
-                _validate_descriptor_temporary_prefix_v1(
-                    descriptor_temporary_path,
-                    canonical_json_bytes(descriptor.to_object()),
-                    label=f"{kind} descriptor temporary",
-                )
-            source_snapshot = _snapshot_retirement_path_v1(
-                source_path,
-                label=f"{kind} source",
-                expected_identity=descriptor.filesystem_identity,
-            )
-            target_path = root / descriptor.target_relative_path
-            if (
-                descriptor.publication_method == "replace_placeholder"
-                and descriptor.placeholder_identity is not None
-                and (target_path.exists() or target_path.is_symlink())
-                and _reservation_identity(target_path) == descriptor.placeholder_identity
-            ):
-                if target_path.stat(follow_symlinks=False).st_size != 0:
-                    raise ReservationConflictError(f"unused {kind} placeholder is nonempty")
-                target_snapshot = _snapshot_retirement_path_v1(
-                    target_path,
-                    label=f"{kind} placeholder",
-                    expected_identity=descriptor.placeholder_identity,
-                    expected_parent_identity=descriptor.target_parent_identity,
-                )
-        elif source_path.exists() or source_path.is_symlink():
-            raise ReservationConflictError(f"{kind} source appeared without its descriptor")
-        elif descriptor_temporary is not None:
-            temporary_descriptor = ReservationDescriptor.from_object(
-                _load_reservation_json(
-                    descriptor_temporary_path,
-                    max_bytes=1024 * 1024,
-                )
-            )
-            validate_descriptor_against_entry_v1(
-                temporary_descriptor,
-                entry,
-                job_id=index.job_id,
-                settings_identity_fingerprint=index.settings_identity_fingerprint,
-                settings_revision_at_creation=index.settings_revision_at_preflight,
-                settings_raw_sha256_at_creation=index.settings_raw_sha256_at_preflight,
-                transaction_index_relative_path=FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
-                transaction_index_fingerprint=index.fingerprint,
-            )
-        extent_plans.append(
-            _FailedExtentRetirementV1(
-                position=position,
-                source=source_snapshot,
-                target_placeholder=target_snapshot,
-                descriptor_temporary=descriptor_temporary,
-                descriptor=descriptor_snapshot,
-            )
-        )
-
+) -> tuple[_RetirementPathV1 | None, _RetirementPathV1 | None, _RetirementPathV1 | None]:
     target_descriptor_path = root / index.final_video_target_descriptor_relative_path
     target_descriptor_temporary_path = target_descriptor_path.with_name(
         f".{target_descriptor_path.name}.create-new.tmp"
@@ -4160,20 +4465,7 @@ def _snapshot_failed_retirement_plan_v1(
                 canonical_json_bytes(current_target_descriptor.to_object()),
                 label="final target descriptor temporary",
             )
-        final_path = root / index.final_video_relative_path
-        if (
-            target_descriptor.publication_method == "replace_placeholder"
-            and (final_path.exists() or final_path.is_symlink())
-            and _reservation_identity(final_path) == target_descriptor.reserved_target_identity
-        ):
-            if final_path.stat(follow_symlinks=False).st_size != 0:
-                raise ReservationConflictError("unused final placeholder is nonempty")
-            final_placeholder = _snapshot_retirement_path_v1(
-                final_path,
-                label="final video placeholder",
-                expected_identity=target_descriptor.reserved_target_identity,
-                expected_parent_identity=target_descriptor.target_parent_identity,
-            )
+        final_placeholder = _snapshot_failed_final_placeholder(root, index, target_descriptor)
     elif target_descriptor_temporary is not None:
         temporary_target_descriptor = FinalVideoTargetReservationV1.from_object(
             _load_reservation_json(
@@ -4192,6 +4484,38 @@ def _snapshot_failed_retirement_plan_v1(
     elif target_descriptor is not None:
         raise ReservationConflictError("final target descriptor disappeared during preflight")
 
+    return final_placeholder, target_descriptor_temporary, target_descriptor_snapshot
+
+
+def _snapshot_failed_retirement_plan_v1(
+    root: Path,
+    index: FinalEncodingReservationIndexV1,
+    *,
+    target_descriptor: FinalVideoTargetReservationV1 | None,
+) -> _FailedRetirementPlanV1:
+    """Freeze every delete identity after the read-only semantic preflight."""
+
+    sibling = _snapshot_retirement_path_v1(
+        root / index.sibling_video_temporary_relative_path,
+        label="indexed sibling",
+        expected_parent_identity=index.sibling_video_parent_identity,
+    )
+    index_path = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+    index_temporary_path = index_path.with_name(f".{index_path.name}.create-new.tmp")
+    index_temporary = _snapshot_retirement_path_v1(
+        index_temporary_path,
+        label="final index temporary",
+    )
+
+    extent_plans: list[_FailedExtentRetirementV1] = []
+    for position, entry in enumerate(index.extent_entries):
+        if entry["reservation_kind"] == "job_terminal_settings":
+            continue
+        extent_plans.append(_snapshot_failed_extent(root, index, position, entry))
+
+    final_placeholder, target_descriptor_temporary, target_descriptor_snapshot = (
+        _snapshot_failed_final_target(root, index, target_descriptor)
+    )
     index_snapshot = _snapshot_retirement_path_v1(
         index_path,
         label="final encoding index",
@@ -4209,34 +4533,102 @@ def _snapshot_failed_retirement_plan_v1(
     )
 
 
-def _assert_failed_retirement_has_no_forward_obligation_v1(
-    root: Path,
-    index: FinalEncodingReservationIndexV1,
-    *,
-    allocation_adapter: AllocationAdapter,
-    allocation_counter: AllocationCounter | None,
-    expected_status: Literal["in_progress", "failed"],
-) -> _FailedRetirementPlanV1:
-    """Fail closed if a terminal transition crossed a durable artifact intent."""
+def _published_failed_retirement_target(
+    final: Path, target_descriptor: FinalVideoTargetReservationV1
+) -> bool:
+    if final.exists() or final.is_symlink():
+        if _reservation_identity(final) != target_descriptor.reserved_target_identity:
+            if (
+                target_descriptor.publication_method == "replace_placeholder"
+                and _regular_nonlink(final)
+                and final.stat().st_size == 0
+            ):
+                raise ReservationConflictError("final placeholder identity changed")
+            if not _regular_nonlink(final) or final.stat().st_nlink != 1:
+                raise ReservationConflictError("published final target is unsafe")
+            return True
+        else:
+            _assert_reserved_final_target_preboundary_v1(final, target_descriptor)
+    elif target_descriptor.publication_method == "replace_existing":
+        raise ReservationConflictError("existing final target is missing")
+    return False
 
-    input_retirement_state: str | None = None
-    final_manifest_retirement_state: str | None = None
-    normalize_entries: list[dict] = []
-    normalize_target: FinalVideoTargetReservationV1 | None = None
-    terminal_settings = ProcessingSettingsArtifactV5.parse(
-        _read_bounded_regular_file(
-            root / "processing-settings-v5.json",
-            max_bytes=512 * 1024,
+
+def _observe_failed_target_temporary(
+    root: Path, index: FinalEncodingReservationIndexV1, target_descriptor_temporary: Path
+) -> tuple[FinalVideoTargetReservationV1, FinalVideoTargetReservationV1 | None]:
+    temporary_raw = _read_bounded_regular_file(
+        target_descriptor_temporary,
+        max_bytes=1024 * 1024,
+    )
+    try:
+        complete_temporary = FinalVideoTargetReservationV1.from_object(
+            strict_canonical_json_loads(
+                temporary_raw,
+                max_bytes=1024 * 1024,
+            )
         )
-    )
-    settings_entry_consumed = _validate_terminal_revision_v1(
-        index,
-        terminal_settings,
-        expected_status=expected_status,
-    )
+    except (CanonicalJsonError, ReservationConflictError):
+        complete_temporary = None
+    if complete_temporary is not None:
+        _validate_target_descriptor_against_index_v1(index, complete_temporary)
+        return complete_temporary, None
+    else:
+        target_descriptor = _current_target_descriptor_from_index_v1(root, index)
+        _validate_descriptor_temporary_prefix_v1(
+            target_descriptor_temporary,
+            canonical_json_bytes(target_descriptor.to_object()),
+            label="final target descriptor temporary",
+        )
+        return target_descriptor, target_descriptor
 
+
+def _validate_failed_retirement_sibling(
+    sibling: Path,
+    final: Path,
+    target_descriptor: FinalVideoTargetReservationV1 | None,
+    final_published: bool,
+) -> None:
+    if not _regular_nonlink(sibling):
+        raise ReservationConflictError("indexed sibling is unsafe at failed retirement")
+    if target_descriptor is None:
+        raise ReservationConflictError("final-video sibling has no authoritative target descriptor")
+    if not (final.exists() or final.is_symlink()):
+        raise ReservationConflictError("failed retirement crossed a final-video replacement gap")
+    if not _regular_nonlink(final):
+        raise ReservationConflictError("final target is unsafe at failed retirement")
+    if (
+        not final_published
+        and _reservation_identity(final) != target_descriptor.reserved_target_identity
+    ):
+        raise ReservationConflictError(
+            "failed retirement found a sibling beside a replaced final target"
+        )
+
+
+def _descriptorless_final_is_published(final: Path, index: FinalEncodingReservationIndexV1) -> bool:
+    if not _regular_nonlink(final):
+        raise ReservationConflictError("descriptorless final target is unsafe")
+    if index.final_video_publication_method == "replace_placeholder":
+        if final.stat().st_size == 0:
+            raise ReservationConflictError("descriptorless final target has no retirement evidence")
+        if final.stat().st_nlink != 1:
+            raise ReservationConflictError("descriptorless published final is unsafe")
+        return True
+    else:
+        expected = index.final_video_existing_target_identity_at_preflight
+        if expected is None or _reservation_identity(final) != expected:
+            if final.stat().st_nlink != 1:
+                raise ReservationConflictError("descriptorless published final is unsafe")
+            return True
+
+    return False
+
+
+def _observe_failed_retirement_target(
+    root: Path, index: FinalEncodingReservationIndexV1
+) -> tuple[FinalVideoTargetReservationV1 | None, bool, FinalVideoTargetReservationV1 | None]:
     final = root / index.final_video_relative_path
-    sibling = root / index.sibling_video_temporary_relative_path
     target_descriptor_path = root / index.final_video_target_descriptor_relative_path
     target_descriptor_temporary = target_descriptor_path.with_name(
         f".{target_descriptor_path.name}.create-new.tmp"
@@ -4245,6 +4637,7 @@ def _assert_failed_retirement_has_no_forward_obligation_v1(
         if not _regular_nonlink(target_descriptor_temporary):
             raise ReservationConflictError("final target descriptor temporary is unsafe")
     target_descriptor: FinalVideoTargetReservationV1 | None = None
+    normalize_target = None
     final_published = False
     if target_descriptor_path.exists() or target_descriptor_path.is_symlink():
         if not _regular_nonlink(target_descriptor_path):
@@ -4252,390 +4645,358 @@ def _assert_failed_retirement_has_no_forward_obligation_v1(
         target_descriptor = FinalVideoTargetReservationV1.from_object(
             _load_reservation_json(target_descriptor_path, max_bytes=1024 * 1024)
         )
-        if (
-            target_descriptor.job_id != index.job_id
-            or target_descriptor.settings_identity_fingerprint
-            != index.settings_identity_fingerprint
-            or target_descriptor.settings_raw_sha256_at_preflight
-            != index.settings_raw_sha256_at_preflight
-            or target_descriptor.settings_revision_at_preflight
-            != index.settings_revision_at_preflight
-            or target_descriptor.transaction_index_fingerprint != index.fingerprint
-            or target_descriptor.publication_generation != index.publication_generation
-            or target_descriptor.reservation_generation != index.reservation_generation
-            or target_descriptor.final_video_relative_path != index.final_video_relative_path
-            or target_descriptor.sibling_video_temporary_relative_path
-            != index.sibling_video_temporary_relative_path
-            or target_descriptor.target_parent_identity != index.sibling_video_parent_identity
-            or target_descriptor.publication_method != index.final_video_publication_method
-        ):
-            raise ReservationConflictError("final target descriptor differs from its index")
-        if (
-            target_descriptor.publication_method == "replace_existing"
-            and target_descriptor.reserved_target_identity
-            != index.final_video_existing_target_identity_at_preflight
-        ):
-            raise ReservationConflictError(
-                "final target descriptor changed the old target identity"
-            )
+        _validate_target_descriptor_against_index_v1(index, target_descriptor)
         if target_descriptor_temporary.exists() or target_descriptor_temporary.is_symlink():
             _validate_descriptor_temporary_prefix_v1(
                 target_descriptor_temporary,
                 canonical_json_bytes(target_descriptor.to_object()),
                 label="final target descriptor temporary",
             )
-        if final.exists() or final.is_symlink():
-            if _reservation_identity(final) != target_descriptor.reserved_target_identity:
-                if (
-                    target_descriptor.publication_method == "replace_placeholder"
-                    and _regular_nonlink(final)
-                    and final.stat().st_size == 0
-                ):
-                    raise ReservationConflictError("final placeholder identity changed")
-                if not _regular_nonlink(final) or final.stat().st_nlink != 1:
-                    raise ReservationConflictError("published final target is unsafe")
-                final_published = True
-            else:
-                _assert_reserved_final_target_preboundary_v1(final, target_descriptor)
-        elif target_descriptor.publication_method == "replace_existing":
-            raise ReservationConflictError("existing final target is missing")
+        final_published = _published_failed_retirement_target(final, target_descriptor)
     elif target_descriptor_temporary.exists() or target_descriptor_temporary.is_symlink():
-        temporary_raw = _read_bounded_regular_file(
-            target_descriptor_temporary,
-            max_bytes=1024 * 1024,
+        target_descriptor, normalize_target = _observe_failed_target_temporary(
+            root, index, target_descriptor_temporary
         )
-        try:
-            complete_temporary = FinalVideoTargetReservationV1.from_object(
-                strict_canonical_json_loads(
-                    temporary_raw,
-                    max_bytes=1024 * 1024,
-                )
-            )
-        except (CanonicalJsonError, ReservationConflictError):
-            complete_temporary = None
-        if complete_temporary is not None:
-            _validate_target_descriptor_against_index_v1(index, complete_temporary)
-            target_descriptor = complete_temporary
-        else:
-            target_descriptor = _current_target_descriptor_from_index_v1(root, index)
-            _validate_descriptor_temporary_prefix_v1(
-                target_descriptor_temporary,
-                canonical_json_bytes(target_descriptor.to_object()),
-                label="final target descriptor temporary",
-            )
-            normalize_target = target_descriptor
 
+    sibling = root / index.sibling_video_temporary_relative_path
     if sibling.exists() or sibling.is_symlink():
-        if not _regular_nonlink(sibling):
-            raise ReservationConflictError("indexed sibling is unsafe at failed retirement")
-        if target_descriptor is None:
-            raise ReservationConflictError(
-                "final-video sibling has no authoritative target descriptor"
-            )
-        if not (final.exists() or final.is_symlink()):
-            raise ReservationConflictError(
-                "failed retirement crossed a final-video replacement gap"
-            )
-        if not _regular_nonlink(final):
-            raise ReservationConflictError("final target is unsafe at failed retirement")
-        if (
-            not final_published
-            and _reservation_identity(final) != target_descriptor.reserved_target_identity
-        ):
-            raise ReservationConflictError(
-                "failed retirement found a sibling beside a replaced final target"
-            )
+        _validate_failed_retirement_sibling(sibling, final, target_descriptor, final_published)
     elif target_descriptor is None and (final.exists() or final.is_symlink()):
-        if not _regular_nonlink(final):
-            raise ReservationConflictError("descriptorless final target is unsafe")
-        if index.final_video_publication_method == "replace_placeholder":
-            if final.stat().st_size == 0:
-                raise ReservationConflictError(
-                    "descriptorless final target has no retirement evidence"
-                )
-            if final.stat().st_nlink != 1:
-                raise ReservationConflictError("descriptorless published final is unsafe")
-            final_published = True
-        else:
-            expected = index.final_video_existing_target_identity_at_preflight
-            if expected is None or _reservation_identity(final) != expected:
-                if final.stat().st_nlink != 1:
-                    raise ReservationConflictError("descriptorless published final is unsafe")
-                final_published = True
+        final_published = _descriptorless_final_is_published(final, index)
+    return target_descriptor, final_published, normalize_target
 
-    for entry in index.extent_entries:
+
+def _failed_input_intent_state(
+    root: Path,
+    source_path: Path,
+    transaction: ReservedArtifactTransaction,
+    final: Path,
+    target_descriptor: FinalVideoTargetReservationV1 | None,
+) -> str | None:
+    prefix = PreparedFinalEncodingReservationV1._canonical_prefix_byte_count(source_path)
+    if prefix is None:
+        return "partial"
+    if prefix == 0:
+        return "zero"
+    try:
+        _fingerprint, digest, count = _stream_input_manifest_identity(
+            root,
+            source_path,
+            raw_byte_count=prefix,
+            logical_byte_count=(
+                transaction.descriptor.logical_byte_count
+                if source_path.stat().st_size == transaction.descriptor.logical_byte_count
+                else None
+            ),
+            expected_frame_count=_load_settings_frame_count_v1(root),
+        )
+        phase = transaction.validate_streamed_physical_phase(
+            prefix_byte_count=count,
+            prefix_sha256=digest,
+        )
+    except FinalPublicationValidationError:
+        return None
+    final_is_reserved = bool(
+        target_descriptor is not None
+        and _regular_nonlink(final)
+        and _reservation_identity(final) == target_descriptor.reserved_target_identity
+    )
+    if phase == "full-source" and final_is_reserved:
+        return "staged"
+    raise ReservationConflictError("failed retirement crossed a durable encoding-input intent")
+
+
+def _failed_final_manifest_intent_state(
+    source_path: Path, transaction: ReservedArtifactTransaction
+) -> str | None:
+    payload = PreparedFinalEncodingReservationV1._bounded_payload_intent(transaction)
+    if payload is None:
+        prefix = PreparedFinalEncodingReservationV1._canonical_prefix_byte_count(source_path)
+        return "zero" if prefix == 0 else "partial"
+    try:
+        parse_final_video_manifest_v4(payload)
+    except FinalPublicationValidationError:
+        return None
+    if PreparedFinalEncodingReservationV1._bounded_transaction_has_durable_intent(
+        transaction,
+        payload,
+    ):
+        raise ReservationConflictError("failed retirement crossed a durable final-manifest intent")
+    return None
+
+
+def _check_failed_prune_intent(
+    root: Path, index: FinalEncodingReservationIndexV1, transaction: ReservedArtifactTransaction
+) -> None:
+    prefix = PreparedFinalEncodingReservationV1._canonical_prefix_byte_count(
+        transaction.source_path
+    )
+    if prefix is None:
+        raise ReservationConflictError("failed retirement found a foreign payload-pruned prefix")
+    if prefix == 0:
+        return
+    document = _rebuild_payload_pruned_document_v1(root, index, transaction)
+    state = PreparedFinalEncodingReservationV1._streamed_intent_state(
+        transaction,
+        document,
+    )
+    if state == "partial":
+        return
+    raise ReservationConflictError(
+        "failed retirement crossed a durable diagnostics_payload_pruned intent"
+    )
+
+
+def _check_failed_metadata_intent(
+    root: Path,
+    index: FinalEncodingReservationIndexV1,
+    entry: dict,
+    transaction: ReservedArtifactTransaction,
+) -> None:
+    kind = entry["reservation_kind"]
+    payload: bytes | None
+    if kind == "prune_marker":
+        _prune_entry, payload = _marker_payload_from_entry(entry)
+    elif kind in {"producer_settings", "cleanup_pending_settings"}:
+        payload = _settings_payload_intent(transaction)
+    elif kind == "diagnostics_payload_pruned":
+        _check_failed_prune_intent(root, index, transaction)
+        return
+    else:
+        payload = None
+    if payload is not None and (
+        PreparedFinalEncodingReservationV1._bounded_transaction_has_durable_intent(
+            transaction,
+            payload,
+        )
+    ):
+        raise ReservationConflictError(f"failed retirement crossed a durable {kind} intent")
+
+
+@dataclass(frozen=True)
+class _FailedExtentNames:
+    descriptor: Path
+    temporary: Path
+    source: Path
+    target: Path
+    descriptor_present: bool
+    temporary_present: bool
+    source_present: bool
+    target_present: bool
+
+    @classmethod
+    def observe(cls, root: Path, entry: dict) -> "_FailedExtentNames":
+        descriptor, source = _indexed_extent_paths(root, entry)
+        temporary = descriptor.with_name(f".{descriptor.name}.create-new.tmp")
+        target = root / entry["target_relative_path"]
+        return cls(
+            descriptor,
+            temporary,
+            source,
+            target,
+            descriptor.exists() or descriptor.is_symlink(),
+            temporary.exists() or temporary.is_symlink(),
+            source.exists() or source.is_symlink(),
+            target.exists() or target.is_symlink(),
+        )
+
+
+@dataclass
+class _FailedRetirementExtents:
+    root: Path
+    index: FinalEncodingReservationIndexV1
+    allocation_adapter: AllocationAdapter
+    allocation_counter: AllocationCounter | None
+    target_descriptor: FinalVideoTargetReservationV1 | None
+    settings_entry_consumed: dict[str, bool]
+    normalize_entries: list[dict]
+
+    def observe(self, entry: dict) -> str | None:
         kind = entry["reservation_kind"]
-        if kind == "job_terminal_settings":
-            continue
-        descriptor_path, source_path = _indexed_extent_paths(root, entry)
-        descriptor_temporary = descriptor_path.with_name(f".{descriptor_path.name}.create-new.tmp")
-        descriptor_present = descriptor_path.exists() or descriptor_path.is_symlink()
-        temporary_present = descriptor_temporary.exists() or descriptor_temporary.is_symlink()
-        source_present = source_path.exists() or source_path.is_symlink()
-        target_path = root / entry["target_relative_path"]
-        target_present = target_path.exists() or target_path.is_symlink()
-        if temporary_present and not _regular_nonlink(descriptor_temporary):
+        names = _FailedExtentNames.observe(self.root, entry)
+        if names.temporary_present and not _regular_nonlink(names.temporary):
             raise ReservationConflictError(f"{kind} descriptor temporary is unsafe")
-        transaction: ReservedArtifactTransaction | None = None
-        if not descriptor_present and temporary_present and source_present:
-            transaction = _validate_partial_indexed_extent_descriptor_v1(
-                root=root,
-                index=index,
-                entry=entry,
-                allocation_adapter=allocation_adapter,
-                allocation_counter=allocation_counter,
-            )
-            normalize_entries.append(entry)
-        elif not descriptor_present:
-            if temporary_present:
-                temporary_descriptor = ReservationDescriptor.from_object(
-                    _load_reservation_json(
-                        descriptor_temporary,
-                        max_bytes=1024 * 1024,
-                    )
-                )
-                validate_descriptor_against_entry_v1(
-                    temporary_descriptor,
-                    entry,
-                    job_id=index.job_id,
-                    settings_identity_fingerprint=index.settings_identity_fingerprint,
-                    settings_revision_at_creation=index.settings_revision_at_preflight,
-                    settings_raw_sha256_at_creation=index.settings_raw_sha256_at_preflight,
-                    transaction_index_relative_path=FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
-                    transaction_index_fingerprint=index.fingerprint,
-                )
-            if source_present:
-                raise ReservationConflictError(f"{kind} source has no descriptor")
-            if target_present:
-                target_is_preflight = False
-                if entry["publication_method"] == "replace_existing":
-                    expected = entry["existing_target_identity_at_preflight"]
-                    target_is_preflight = bool(
-                        expected is not None
-                        and _regular_nonlink(target_path)
-                        and _reservation_identity(target_path)
-                        == ReservationFileIdentity.from_object(expected)
-                        and _hash_file(root, target_path)
-                        == (
-                            entry["existing_target_raw_sha256_at_preflight"],
-                            entry["existing_target_byte_count_at_preflight"],
-                        )
-                    )
-                committed = (
-                    not target_is_preflight
-                    and _descriptorless_failed_entry_is_committed_v1(root, index, entry)
-                )
-                if not target_is_preflight and not committed:
-                    raise ReservationConflictError(
-                        "descriptorless extent target has no retirement evidence"
-                    )
-                if kind == "encoding_input_manifest":
-                    input_retirement_state = "committed" if committed else "unused"
-                elif kind == "final_video_manifest":
-                    final_manifest_retirement_state = "committed" if committed else "unused"
-            elif entry["publication_method"] == "replace_existing":
-                raise ReservationConflictError("descriptorless existing extent target is missing")
-            elif kind == "encoding_input_manifest":
-                input_retirement_state = "unused"
-            elif kind == "final_video_manifest":
-                final_manifest_retirement_state = "unused"
-            continue
-        if transaction is None:
-            if not _regular_nonlink(descriptor_path):
-                raise ReservationConflictError(f"{kind} descriptor is unsafe")
-            transaction = _load_indexed_extent(
-                root=root,
-                index=index,
-                entry=entry,
-                allocation_adapter=allocation_adapter,
-                allocation_counter=allocation_counter,
-            )
-        if transaction is None:
-            raise ReservationConflictError(f"{kind} descriptor disappeared")
+        if not names.descriptor_present and not (names.temporary_present and names.source_present):
+            return self._descriptorless_state(entry, names)
+        transaction = self._active_transaction(entry, names)
         descriptor = transaction.descriptor
-        entry_committed = False
-        if source_present:
-            if not _regular_nonlink(source_path):
+        if names.source_present:
+            if not _regular_nonlink(names.source):
                 raise ReservationConflictError(f"{kind} source is unsafe")
-            if _reservation_identity(source_path) != descriptor.filesystem_identity:
+            if _reservation_identity(names.source) != descriptor.filesystem_identity:
                 raise ReservationConflictError(f"{kind} source identity changed")
-
         if descriptor.publication_method == "replace_placeholder":
-            if target_present:
-                if not _regular_nonlink(target_path):
-                    raise ReservationConflictError(f"{kind} placeholder is unsafe")
-                target_identity = _reservation_identity(target_path)
-                if target_identity == descriptor.filesystem_identity:
-                    if source_present:
-                        raise ReservationConflictError(
-                            f"{kind} source and committed target are both present"
-                        )
-                    entry_committed = _descriptorless_failed_entry_is_committed_v1(
-                        root,
-                        index,
-                        entry,
-                    )
-                    if not entry_committed:
-                        raise ReservationConflictError(
-                            f"failed retirement crossed an unauthenticated {kind} target"
-                        )
-                if not entry_committed and (
-                    descriptor.placeholder_identity is None
-                    or target_identity != descriptor.placeholder_identity
-                    or target_path.stat().st_size != 0
-                ):
-                    raise ReservationConflictError(f"unused {kind} placeholder changed")
-            elif source_present:
-                raise ReservationConflictError(f"failed retirement found a {kind} replacement gap")
+            committed = self._placeholder_committed(entry, names, descriptor)
         else:
-            if not target_present or not _regular_nonlink(target_path):
-                raise ReservationConflictError(f"existing {kind} target is missing or unsafe")
-            target_identity = _reservation_identity(target_path)
-            if target_identity == descriptor.filesystem_identity:
-                if source_present:
-                    raise ReservationConflictError(
-                        f"{kind} source and committed target are both present"
-                    )
-                entry_committed = _descriptorless_failed_entry_is_committed_v1(
-                    root,
-                    index,
-                    entry,
-                )
-                if not entry_committed:
-                    raise ReservationConflictError(
-                        f"failed retirement crossed an unauthenticated {kind} target"
-                    )
-            settings_successor = bool(
-                kind in {"producer_settings", "cleanup_pending_settings"}
-                and entry["target_relative_path"] == "processing-settings-v5.json"
-            )
-            if settings_successor and settings_entry_consumed[kind]:
-                if source_present:
-                    raise ReservationConflictError(
-                        f"consumed {kind} unexpectedly retains its source"
-                    )
-                entry_committed = True
-            if (
-                not entry_committed
-                and not settings_successor
-                and (
-                    descriptor.existing_target_identity_at_preflight is None
-                    or target_identity != descriptor.existing_target_identity_at_preflight
-                    or _hash_file(root, target_path)
-                    != (
-                        descriptor.existing_target_raw_sha256_at_preflight,
-                        descriptor.existing_target_byte_count_at_preflight,
-                    )
-                )
-            ):
-                raise ReservationConflictError(f"existing {kind} target changed")
+            committed = self._existing_committed(entry, names, descriptor)
+        if committed:
+            return "committed"
+        if not names.source_present:
+            return "unused"
+        return self._source_intent_state(entry, names.source, transaction)
 
-        if entry_committed:
-            if kind == "encoding_input_manifest":
-                input_retirement_state = "committed"
-            elif kind == "final_video_manifest":
-                final_manifest_retirement_state = "committed"
-            continue
-        if not source_present:
-            if kind == "encoding_input_manifest":
-                input_retirement_state = "unused"
-            elif kind == "final_video_manifest":
-                final_manifest_retirement_state = "unused"
-            continue
-
+    def _source_intent_state(
+        self, entry: dict, source: Path, transaction: ReservedArtifactTransaction
+    ) -> str | None:
+        kind = entry["reservation_kind"]
         if kind == "encoding_input_manifest":
-            prefix = PreparedFinalEncodingReservationV1._canonical_prefix_byte_count(source_path)
-            if prefix is None:
-                input_retirement_state = "partial"
-                continue
-            if prefix == 0:
-                input_retirement_state = "zero"
-                continue
-            try:
-                _fingerprint, digest, count = _stream_input_manifest_identity(
-                    root,
-                    source_path,
-                    raw_byte_count=prefix,
-                    logical_byte_count=(
-                        transaction.descriptor.logical_byte_count
-                        if source_path.stat().st_size == transaction.descriptor.logical_byte_count
-                        else None
-                    ),
-                    expected_frame_count=_load_settings_frame_count_v1(root),
-                )
-                phase = transaction.validate_streamed_physical_phase(
-                    prefix_byte_count=count,
-                    prefix_sha256=digest,
-                )
-            except FinalPublicationValidationError:
-                continue
-            final_is_reserved = bool(
-                target_descriptor is not None
-                and _regular_nonlink(final)
-                and _reservation_identity(final) == target_descriptor.reserved_target_identity
+            return _failed_input_intent_state(
+                self.root,
+                source,
+                transaction,
+                self.root / self.index.final_video_relative_path,
+                self.target_descriptor,
             )
-            if phase == "full-source" and final_is_reserved:
-                input_retirement_state = "staged"
-                continue
-            raise ReservationConflictError(
-                "failed retirement crossed a durable encoding-input intent"
-            )
-
         if kind == "final_video_manifest":
-            payload = PreparedFinalEncodingReservationV1._bounded_payload_intent(transaction)
-            if payload is None:
-                prefix = PreparedFinalEncodingReservationV1._canonical_prefix_byte_count(
-                    source_path
-                )
-                final_manifest_retirement_state = "zero" if prefix == 0 else "partial"
-                continue
-            try:
-                parse_final_video_manifest_v4(payload)
-            except FinalPublicationValidationError:
-                continue
-            if PreparedFinalEncodingReservationV1._bounded_transaction_has_durable_intent(
-                transaction,
-                payload,
-            ):
-                raise ReservationConflictError(
-                    "failed retirement crossed a durable final-manifest intent"
-                )
-            continue
+            return _failed_final_manifest_intent_state(source, transaction)
+        _check_failed_metadata_intent(self.root, self.index, entry, transaction)
+        return None
 
-        if kind == "prune_marker":
-            _prune_entry, payload = _marker_payload_from_entry(entry)
-        elif kind in {"producer_settings", "cleanup_pending_settings"}:
-            payload = _settings_payload_intent(transaction)
-        elif kind == "diagnostics_payload_pruned":
-            prefix = PreparedFinalEncodingReservationV1._canonical_prefix_byte_count(
-                transaction.source_path
+    def _active_transaction(
+        self, entry: dict, names: _FailedExtentNames
+    ) -> ReservedArtifactTransaction:
+        kind = entry["reservation_kind"]
+        if not names.descriptor_present:
+            transaction = _validate_partial_indexed_extent_descriptor_v1(
+                root=self.root,
+                index=self.index,
+                entry=entry,
+                allocation_adapter=self.allocation_adapter,
+                allocation_counter=self.allocation_counter,
             )
-            if prefix is None:
-                raise ReservationConflictError(
-                    "failed retirement found a foreign payload-pruned prefix"
-                )
-            if prefix == 0:
-                continue
-            document = _rebuild_payload_pruned_document_v1(root, index, transaction)
-            state = PreparedFinalEncodingReservationV1._streamed_intent_state(
-                transaction,
-                document,
-            )
-            if state == "partial":
-                continue
-            raise ReservationConflictError(
-                "failed retirement crossed a durable diagnostics_payload_pruned intent"
-            )
-        else:
-            payload = None
-        if payload is not None and (
-            PreparedFinalEncodingReservationV1._bounded_transaction_has_durable_intent(
-                transaction,
-                payload,
+            self.normalize_entries.append(entry)
+            return transaction
+        if not _regular_nonlink(names.descriptor):
+            raise ReservationConflictError(f"{kind} descriptor is unsafe")
+        loaded = _load_indexed_extent(
+            root=self.root,
+            index=self.index,
+            entry=entry,
+            allocation_adapter=self.allocation_adapter,
+            allocation_counter=self.allocation_counter,
+        )
+        if loaded is None:
+            raise ReservationConflictError(f"{kind} descriptor disappeared")
+        return loaded
+
+    def _descriptorless_state(self, entry: dict, names: _FailedExtentNames) -> str:
+        kind = entry["reservation_kind"]
+        if names.temporary_present:
+            _load_retirement_extent_descriptor(names.temporary, self.index, entry)
+        if names.source_present:
+            raise ReservationConflictError(f"{kind} source has no descriptor")
+        if not names.target_present:
+            if entry["publication_method"] == "replace_existing":
+                raise ReservationConflictError("descriptorless existing extent target is missing")
+            return "unused"
+        expected = (
+            entry["existing_target_identity_at_preflight"]
+            if entry["publication_method"] == "replace_existing"
+            else None
+        )
+        if (
+            expected is not None
+            and _regular_nonlink(names.target)
+            and _reservation_identity(names.target) == ReservationFileIdentity.from_object(expected)
+            and _hash_file(self.root, names.target)
+            == (
+                entry["existing_target_raw_sha256_at_preflight"],
+                entry["existing_target_byte_count_at_preflight"],
             )
         ):
-            raise ReservationConflictError(f"failed retirement crossed a durable {kind} intent")
+            return "unused"
+        if _descriptorless_failed_entry_is_committed_v1(self.root, self.index, entry):
+            return "committed"
+        raise ReservationConflictError("descriptorless extent target has no retirement evidence")
 
+    def _require_committed(self, entry: dict, names: _FailedExtentNames) -> None:
+        kind = entry["reservation_kind"]
+        if names.source_present:
+            raise ReservationConflictError(f"{kind} source and committed target are both present")
+        if not _descriptorless_failed_entry_is_committed_v1(self.root, self.index, entry):
+            raise ReservationConflictError(
+                f"failed retirement crossed an unauthenticated {kind} target"
+            )
+
+    def _placeholder_committed(
+        self, entry: dict, names: _FailedExtentNames, descriptor: ReservationDescriptor
+    ) -> bool:
+        kind = entry["reservation_kind"]
+        if not names.target_present:
+            if names.source_present:
+                raise ReservationConflictError(f"failed retirement found a {kind} replacement gap")
+            return False
+        if not _regular_nonlink(names.target):
+            raise ReservationConflictError(f"{kind} placeholder is unsafe")
+        identity = _reservation_identity(names.target)
+        if identity == descriptor.filesystem_identity:
+            self._require_committed(entry, names)
+            return True
+        if (
+            descriptor.placeholder_identity is None
+            or identity != descriptor.placeholder_identity
+            or names.target.stat().st_size != 0
+        ):
+            raise ReservationConflictError(f"unused {kind} placeholder changed")
+        return False
+
+    def _existing_committed(
+        self, entry: dict, names: _FailedExtentNames, descriptor: ReservationDescriptor
+    ) -> bool:
+        kind = entry["reservation_kind"]
+        if not names.target_present or not _regular_nonlink(names.target):
+            raise ReservationConflictError(f"existing {kind} target is missing or unsafe")
+        identity = _reservation_identity(names.target)
+        committed = identity == descriptor.filesystem_identity
+        if committed:
+            self._require_committed(entry, names)
+        settings_successor = (
+            kind in {"producer_settings", "cleanup_pending_settings"}
+            and entry["target_relative_path"] == "processing-settings-v5.json"
+        )
+        if settings_successor and self.settings_entry_consumed[kind]:
+            if names.source_present:
+                raise ReservationConflictError(f"consumed {kind} unexpectedly retains its source")
+            return True
+        if (
+            not committed
+            and not settings_successor
+            and (
+                descriptor.existing_target_identity_at_preflight is None
+                or identity != descriptor.existing_target_identity_at_preflight
+                or _hash_file(self.root, names.target)
+                != (
+                    descriptor.existing_target_raw_sha256_at_preflight,
+                    descriptor.existing_target_byte_count_at_preflight,
+                )
+            )
+        ):
+            raise ReservationConflictError(f"existing {kind} target changed")
+        return committed
+
+    def normalize(self, normalize_target: FinalVideoTargetReservationV1 | None) -> None:
+        if normalize_target is not None:
+            _publish_current_target_descriptor_v1(self.root, self.index, normalize_target)
+        for entry in self.normalize_entries:
+            transaction = _load_indexed_extent(
+                root=self.root,
+                index=self.index,
+                entry=entry,
+                allocation_adapter=self.allocation_adapter,
+                allocation_counter=self.allocation_counter,
+            )
+            if transaction is None:
+                raise ReservationConflictError(
+                    f"{entry['reservation_kind']} descriptor normalization disappeared"
+                )
+
+
+def _check_failed_publication_suffix(
+    final_published: bool,
+    sibling: Path,
+    input_retirement_state: str | None,
+    final_manifest_retirement_state: str | None,
+) -> None:
     if final_published:
         if input_retirement_state != "committed":
             raise ReservationConflictError("published final video lacks a committed input manifest")
@@ -4655,21 +5016,58 @@ def _assert_failed_retirement_has_no_forward_obligation_v1(
         raise ReservationConflictError(
             "committed publication manifest exists before the video boundary"
         )
-    if normalize_target is not None or normalize_entries:
-        if normalize_target is not None:
-            _publish_current_target_descriptor_v1(root, index, normalize_target)
-        for entry in normalize_entries:
-            transaction = _load_indexed_extent(
-                root=root,
-                index=index,
-                entry=entry,
-                allocation_adapter=allocation_adapter,
-                allocation_counter=allocation_counter,
-            )
-            if transaction is None:
-                raise ReservationConflictError(
-                    f"{entry['reservation_kind']} descriptor normalization disappeared"
-                )
+
+
+def _assert_failed_retirement_has_no_forward_obligation_v1(
+    root: Path,
+    index: FinalEncodingReservationIndexV1,
+    *,
+    allocation_adapter: AllocationAdapter,
+    allocation_counter: AllocationCounter | None,
+    expected_status: Literal["in_progress", "failed"],
+) -> _FailedRetirementPlanV1:
+    """Fail closed if a terminal transition crossed a durable artifact intent."""
+
+    terminal_settings = ProcessingSettingsArtifactV5.parse(
+        _read_bounded_regular_file(
+            root / "processing-settings-v5.json",
+            max_bytes=512 * 1024,
+        )
+    )
+    settings_entry_consumed = _validate_terminal_revision_v1(
+        index,
+        terminal_settings,
+        expected_status=expected_status,
+    )
+
+    target_descriptor, final_published, normalize_target = _observe_failed_retirement_target(
+        root, index
+    )
+    audit = _FailedRetirementExtents(
+        root,
+        index,
+        allocation_adapter,
+        allocation_counter,
+        target_descriptor,
+        settings_entry_consumed,
+        [],
+    )
+    states: dict[str, str] = {}
+    for entry in index.extent_entries:
+        kind = entry["reservation_kind"]
+        if kind == "job_terminal_settings":
+            continue
+        state = audit.observe(entry)
+        if kind in {"encoding_input_manifest", "final_video_manifest"} and state is not None:
+            states[kind] = state
+    _check_failed_publication_suffix(
+        final_published,
+        root / index.sibling_video_temporary_relative_path,
+        states.get("encoding_input_manifest"),
+        states.get("final_video_manifest"),
+    )
+    if normalize_target is not None or audit.normalize_entries:
+        audit.normalize(normalize_target)
         return _assert_failed_retirement_has_no_forward_obligation_v1(
             root,
             index,
@@ -4809,7 +5207,7 @@ def _hash_file(job_root: Path, path: Path) -> tuple[str, int]:
     return scanned.raw_sha256, scanned.byte_count
 
 
-def _hash_open_file(handle: BinaryIO) -> tuple[str, int]:
+def _hash_open_file(handle: io.FileIO) -> tuple[str, int]:
     digest = hashlib.sha256()
     byte_count = 0
     buffer = bytearray(FINAL_FIXED_TARGET_HASH_STREAM_BYTES)
@@ -4827,11 +5225,13 @@ def _hash_open_file(handle: BinaryIO) -> tuple[str, int]:
     return digest.hexdigest(), byte_count
 
 
-def _container_validation_path_v1(path: Path, handle: BinaryIO) -> Path:
+def _validate_open_container_v1(
+    path: Path, handle: BinaryIO, validator: Callable[[Path], bool]
+) -> bool:
     if os.name == "nt":
-        return Path(path)
+        return validator(path)
     if sys.platform.startswith("linux") and Path("/proc").is_dir():
-        return Path(f"/proc/{os.getpid()}/fd/{handle.fileno()}")
+        return validate_open_linux_container(handle, validator)
     raise FinalPublicationValidationError(
         "container validation cannot bind an opened file on this platform"
     )
@@ -4866,7 +5266,7 @@ def validate_final_container_evidence_v1(
                         "sibling video identity changed before validation"
                     )
                 before = os.fstat(handle.fileno())
-                if not container_validator(_container_validation_path_v1(candidate, handle)):
+                if not _validate_open_container_v1(candidate, handle, container_validator):
                     raise FinalPublicationValidationError(
                         "sibling video failed container validation"
                     )
@@ -5007,9 +5407,7 @@ class _EncodingManifestReader:
                 f"encoding input manifest expected a JSON {description}"
             )
         token = bytearray()
-        depth = 0
-        in_string = False
-        escaped = False
+        scan = _ManifestTokenScan(object_value)
         while True:
             if len(token) >= _ENCODING_MANIFEST_VALUE_MAX_BYTES:
                 raise FinalPublicationValidationError(
@@ -5019,41 +5417,52 @@ class _EncodingManifestReader:
                 raise FinalPublicationValidationError("encoding input manifest ended unexpectedly")
             start = self.position
             end = min(len(self.buffer), start + _ENCODING_MANIFEST_VALUE_MAX_BYTES - len(token))
-            escaped_position = start if escaped else -1
-            complete = False
-            # Scan delimiters in C, retaining only lexical state across bounded chunks.
-            for match in _ENCODING_MANIFEST_TOKEN_DELIMITERS.finditer(self.buffer, start, end):
-                position = match.start()
-                byte = self.buffer[position]
-                if in_string:
-                    if position == escaped_position:
-                        continue
-                    if byte == ord("\\"):
-                        escaped_position = position + 1
-                    elif byte == ord('"'):
-                        in_string = False
-                        if not object_value:
-                            end = position + 1
-                            complete = True
-                            break
-                elif byte == ord('"'):
-                    in_string = True
-                elif byte == ord("{"):
-                    depth += 1
-                elif byte == ord("}"):
-                    depth -= 1
-                    if depth == 0:
-                        end = position + 1
-                        complete = True
-                        break
-                    if depth < 0:
-                        raise FinalPublicationValidationError(
-                            "encoding input manifest object nesting is invalid"
-                        )
-            escaped = escaped_position == end
+            end, complete = scan.chunk(self.buffer, start, end)
             token.extend(self.take(end - start))
             if complete:
                 return bytes(token)
+
+
+@dataclass
+class _ManifestTokenScan:
+    object_value: bool
+    depth: int = 0
+    in_string: bool = False
+    escaped: bool = False
+
+    def chunk(self, buffer: bytes, start: int, end: int) -> tuple[int, bool]:
+        # Scan delimiters in C, retaining only lexical state across bounded chunks.
+        escaped_position = start if self.escaped else -1
+        for match in _ENCODING_MANIFEST_TOKEN_DELIMITERS.finditer(buffer, start, end):
+            pos = match.start()
+            byte = buffer[pos]
+            if self.in_string:
+                if pos == escaped_position:
+                    continue
+                if byte == ord("\\"):
+                    escaped_position = pos + 1
+                elif byte == ord('"'):
+                    self.in_string = False
+                    if not self.object_value:
+                        return pos + 1, True
+            elif self.delimiter_closes_object(byte):
+                return pos + 1, True
+        self.escaped = escaped_position == end
+        return end, False
+
+    def delimiter_closes_object(self, byte: int) -> bool:
+        if byte == ord('"'):
+            self.in_string = True
+        elif byte == ord("{"):
+            self.depth += 1
+        elif byte == ord("}"):
+            self.depth -= 1
+            if self.depth < 0:
+                raise FinalPublicationValidationError(
+                    "encoding input manifest object nesting is invalid"
+                )
+            return self.depth == 0
+        return False
 
 
 def _canonical_frame_stem_v1(index: int) -> str:
@@ -5168,63 +5577,95 @@ def _frame_names_projection_v1(
     return first_index, count
 
 
+_ArrayResult = TypeVar("_ArrayResult")
+
+
+def _try_buffered_array(
+    reader: _EncodingManifestReader,
+    buffered: tuple[list[object], int] | None,
+    project: Callable[[list[object]], _ArrayResult],
+) -> _ArrayResult | None:
+    if buffered is None:
+        return None
+    values, byte_count = buffered
+    try:
+        result = project(values)
+    except (FinalPublicationValidationError, ValueError):
+        return None
+    reader.take(byte_count)
+    return result
+
+
+def _manifest_array_has_next(reader: _EncodingManifestReader, description: str) -> bool:
+    separator = reader.take_byte()
+    if separator == ord("]"):
+        return False
+    if separator != ord(","):
+        raise FinalPublicationValidationError(f"encoding input {description} array is malformed")
+    return True
+
+
+def _stream_manifest_array(
+    reader: _EncodingManifestReader,
+    state: _ArrayResult,
+    *,
+    object_values: bool,
+    element_description: str,
+    array_description: str,
+    extend: Callable[[Iterable[object], _ArrayResult], _ArrayResult],
+    before_item: Callable[[_ArrayResult], None] | None = None,
+) -> _ArrayResult:
+    reader.expect(b"[")
+    if reader.peek_byte() == ord("]"):
+        reader.expect(b"]")
+        return state
+    attempted_loaded = -1
+    while True:
+        if before_item is not None:
+            before_item(state)
+        next_state = None
+        if reader.loaded != attempted_loaded:
+            attempted_loaded = reader.loaded
+            buffered = _buffered_array_items_v1(reader, object_values=object_values)
+            next_state = _try_buffered_array(reader, buffered, lambda values: extend(values, state))
+        if next_state is None:
+            token = reader.json_object_token() if object_values else reader.json_string_token()
+            value = _parse_bounded_canonical_value(token, description=element_description)
+            next_state = extend((value,), state)
+        state = next_state
+        if not _manifest_array_has_next(reader, array_description):
+            return state
+
+
 def _parse_frame_names_v1(
     reader: _EncodingManifestReader,
     *,
     expected_frame_count: int | None,
 ) -> tuple[int, int]:
     buffered = _buffered_canonical_array_v1(reader)
-    if buffered is not None:
-        values, byte_count = buffered
-        try:
-            first_index, count = _extend_frame_names_v1(values, first_index=None, count=0)
-            result = _frame_names_projection_v1(
-                first_index, count, expected_frame_count=expected_frame_count
-            )
-        except (FinalPublicationValidationError, ValueError):
-            pass
-        else:
-            reader.take(byte_count)
-            return result
+    result = _try_buffered_array(
+        reader,
+        buffered,
+        lambda values: _frame_names_projection_v1(
+            *_extend_frame_names_v1(values, first_index=None, count=0),
+            expected_frame_count=expected_frame_count,
+        ),
+    )
+    if result is not None:
+        return result
 
-    reader.expect(b"[")
-    first_index, count = None, 0
-    attempted_loaded = -1
-    if reader.peek_byte() == ord("]"):
-        reader.expect(b"]")
-    else:
-        while True:
-            batched = False
-            if reader.loaded != attempted_loaded:
-                attempted_loaded = reader.loaded
-                buffered = _buffered_array_items_v1(reader, object_values=False)
-                if buffered is not None:
-                    values, byte_count = buffered
-                    try:
-                        next_state = _extend_frame_names_v1(
-                            values, first_index=first_index, count=count
-                        )
-                    except (FinalPublicationValidationError, ValueError):
-                        pass
-                    else:
-                        reader.take(byte_count)
-                        first_index, count = next_state
-                        batched = True
-            if not batched:
-                name = _parse_bounded_canonical_value(
-                    reader.json_string_token(), description="frame name"
-                )
-                first_index, count = _extend_frame_names_v1(
-                    (name,), first_index=first_index, count=count
-                )
-            separator = reader.take_byte()
-            if separator == ord("]"):
-                break
-            if separator != ord(","):
-                raise FinalPublicationValidationError(
-                    "encoding input frame-name array is malformed"
-                )
+    def extend(values: Iterable[object], state: tuple[int | None, int]) -> tuple[int | None, int]:
+        return _extend_frame_names_v1(values, first_index=state[0], count=state[1])
 
+    initial: tuple[int | None, int] = (None, 0)
+    first_index, count = _stream_manifest_array(
+        reader,
+        initial,
+        object_values=False,
+        element_description="frame name",
+        array_description="frame-name",
+        extend=extend,
+    )
     return _frame_names_projection_v1(first_index, count, expected_frame_count=expected_frame_count)
 
 
@@ -5350,6 +5791,9 @@ def _validate_raw_rgb24_identity_v1(
     return parent, (width, height)
 
 
+_IdentityArrayState = tuple[int, str | None, tuple[int, int] | None]
+
+
 def _parse_identity_array_v1(
     reader: _EncodingManifestReader,
     *,
@@ -5360,82 +5804,46 @@ def _parse_identity_array_v1(
     if reader.peek_byte() == ord("n"):
         reader.expect(b"null")
         return None
+    initial: _IdentityArrayState = (0, None, None)
+
+    def extend(values: Iterable[object], state: _IdentityArrayState) -> _IdentityArrayState:
+        return _extend_identity_array_v1(
+            values,
+            first_index=first_index,
+            frame_count=frame_count,
+            raw_rgb24=raw_rgb24,
+            count=state[0],
+            parent=state[1],
+            first_header=state[2],
+        )
+
+    def check_capacity(state: _IdentityArrayState) -> None:
+        if state[0] >= frame_count:
+            raise FinalPublicationValidationError(
+                "encoding input identity array exceeds frame cardinality"
+            )
+
     buffered = _buffered_canonical_array_v1(reader)
     if buffered is not None and type(frame_count) is int and 1 <= len(buffered[0]) <= frame_count:
-        values, byte_count = buffered
-        try:
-            state = _extend_identity_array_v1(
-                values,
-                first_index=first_index,
-                frame_count=frame_count,
-                raw_rgb24=raw_rgb24,
-                count=0,
-                parent=None,
-                first_header=None,
-            )
-            result = _identity_array_projection_v1(*state, frame_count=frame_count)
-        except (FinalPublicationValidationError, ValueError):
-            pass
-        else:
-            reader.take(byte_count)
-            return result
-
-    reader.expect(b"[")
-    count = 0
-    parent: str | None = None
-    first_header: tuple[int, int] | None = None
-    attempted_loaded = -1
-    if reader.peek_byte() == ord("]"):
-        reader.expect(b"]")
-    else:
-        while True:
-            if count >= frame_count:
-                raise FinalPublicationValidationError(
-                    "encoding input identity array exceeds frame cardinality"
-                )
-            batched = False
-            if reader.loaded != attempted_loaded:
-                attempted_loaded = reader.loaded
-                buffered = _buffered_array_items_v1(reader, object_values=True)
-                if buffered is not None:
-                    values, byte_count = buffered
-                    try:
-                        next_state = _extend_identity_array_v1(
-                            values,
-                            first_index=first_index,
-                            frame_count=frame_count,
-                            raw_rgb24=raw_rgb24,
-                            count=count,
-                            parent=parent,
-                            first_header=first_header,
-                        )
-                    except (FinalPublicationValidationError, ValueError):
-                        pass
-                    else:
-                        reader.take(byte_count)
-                        count, parent, first_header = next_state
-                        batched = True
-            if not batched:
-                value = _parse_bounded_canonical_value(
-                    reader.json_object_token(),
-                    description="raw RGB24 identity" if raw_rgb24 else "image identity",
-                )
-                count, parent, first_header = _extend_identity_array_v1(
-                    (value,),
-                    first_index=first_index,
-                    frame_count=frame_count,
-                    raw_rgb24=raw_rgb24,
-                    count=count,
-                    parent=parent,
-                    first_header=first_header,
-                )
-            separator = reader.take_byte()
-            if separator == ord("]"):
-                break
-            if separator != ord(","):
-                raise FinalPublicationValidationError("encoding input identity array is malformed")
-
-    return _identity_array_projection_v1(count, parent, first_header, frame_count=frame_count)
+        projection = _try_buffered_array(
+            reader,
+            buffered,
+            lambda values: _identity_array_projection_v1(
+                *extend(values, initial), frame_count=frame_count
+            ),
+        )
+        if projection is not None:
+            return projection
+    state = _stream_manifest_array(
+        reader,
+        initial,
+        object_values=True,
+        element_description="raw RGB24 identity" if raw_rgb24 else "image identity",
+        array_description="identity",
+        extend=extend,
+        before_item=check_capacity,
+    )
+    return _identity_array_projection_v1(*state, frame_count=frame_count)
 
 
 def _extend_identity_array_v1(
@@ -5487,20 +5895,7 @@ def _identity_array_projection_v1(
     return count, parent, first_header
 
 
-def _parse_encoding_input_manifest_stream_v1(
-    handle: BinaryIO,
-    *,
-    raw_byte_count: int | None,
-    expected_frame_count: int | None,
-) -> _EncodingInputManifestProjection:
-    if raw_byte_count is not None and (type(raw_byte_count) is not int or raw_byte_count < 1):
-        raise FinalPublicationValidationError("encoding input raw byte count is invalid")
-    if expected_frame_count is not None and (
-        type(expected_frame_count) is not int
-        or not 1 <= expected_frame_count <= _ENCODING_CONTROL_FRAME_CAP
-    ):
-        raise FinalPublicationValidationError("encoding input expected frame count is invalid")
-    reader = _EncodingManifestReader(handle, raw_byte_count=raw_byte_count)
+def _read_input_manifest_header(reader: _EncodingManifestReader) -> tuple[bytes, str]:
     reader.expect(_INPUT_MANIFEST_ALGORITHM_PREFIX)
     algorithm_digit = reader.take(1)
     if algorithm_digit not in {b"2", b"3", b"4"}:
@@ -5517,11 +5912,10 @@ def _parse_encoding_input_manifest_stream_v1(
     reader.self_digest.update(_INPUT_MANIFEST_ALGORITHM_PREFIX + algorithm_digit + b'"')
     reader.include_in_self_digest = True
 
-    reader.expect(b',"frame_names":')
-    first_index, frame_count = _parse_frame_names_v1(
-        reader,
-        expected_frame_count=expected_frame_count,
-    )
+    return algorithm_digit, fingerprint
+
+
+def _read_manifest_invocation(reader: _EncodingManifestReader) -> StreamedVrInvocationV1 | None:
     reader.expect(b",")
     next_key = _parse_bounded_canonical_value(
         reader.json_string_token(),
@@ -5544,6 +5938,135 @@ def _parse_encoding_input_manifest_stream_v1(
         reader.expect(b',"frames":')
     elif next_key != "frames":
         raise FinalPublicationValidationError("encoding input post-frame-names key is invalid")
+    return streamed_invocation
+
+
+def _read_manifest_output(
+    reader: _EncodingManifestReader,
+) -> tuple[bytes, StreamedVrOutputEvidenceV1 | None]:
+    reader.expect(b',"schema_version":')
+    schema_byte = reader.take(1)
+    streamed_output: StreamedVrOutputEvidenceV1 | None = None
+    if schema_byte == b"1":
+        reader.expect(b"}")
+    elif schema_byte in {b"2", b"3"}:
+        reader.expect(b',"streamed_output":')
+        try:
+            streamed_output = StreamedVrOutputEvidenceV1.from_object(
+                _parse_bounded_canonical_value(
+                    reader.json_object_token(),
+                    description="streamed output evidence",
+                )
+            )
+        except (TypeError, ValueError) as error:
+            raise FinalPublicationValidationError("streamed output evidence is invalid") from error
+        reader.expect(b"}")
+    else:
+        raise FinalPublicationValidationError("encoding input schema version is invalid")
+    return schema_byte, streamed_output
+
+
+def _check_input_manifest_schema(
+    algorithm_digit: bytes,
+    schema_byte: bytes,
+    streamed_invocation: StreamedVrInvocationV1 | None,
+    streamed_output: StreamedVrOutputEvidenceV1 | None,
+) -> None:
+    if algorithm_digit == b"2" and (
+        schema_byte != b"1" or streamed_invocation is not None or streamed_output is not None
+    ):
+        raise FinalPublicationValidationError("encoding input v2 schema is inconsistent")
+    if algorithm_digit == b"3" and (
+        schema_byte != b"2" or streamed_invocation is None or streamed_output is None
+    ):
+        raise FinalPublicationValidationError("encoding input v3 schema is incomplete")
+    if algorithm_digit == b"4" and (
+        schema_byte != b"3" or streamed_invocation is None or streamed_output is None
+    ):
+        raise FinalPublicationValidationError("encoding input v4 schema is incomplete")
+
+
+_ManifestSequence = tuple[int, str, tuple[int, int]]
+
+
+def _check_manifest_arrays(
+    mode: Literal["direct_stereo", "assembled_vr"],
+    frames_sequence: _ManifestSequence | None,
+    left_sequence: _ManifestSequence | None,
+    right_sequence: _ManifestSequence | None,
+) -> None:
+    if mode == "direct_stereo":
+        if frames_sequence is not None or left_sequence is None or right_sequence is None:
+            raise FinalPublicationValidationError(
+                "direct encoding input manifest has the wrong array shape"
+            )
+    elif frames_sequence is None or left_sequence is not None or right_sequence is not None:
+        raise FinalPublicationValidationError(
+            "assembled encoding input manifest has the wrong array shape"
+        )
+
+
+def _check_manifest_invocation(
+    algorithm_digit: bytes,
+    mode: Literal["direct_stereo", "assembled_vr"],
+    frame_count: int,
+    first_index: int,
+    frames_sequence: _ManifestSequence | None,
+    streamed_invocation: StreamedVrInvocationV1,
+    streamed_output: StreamedVrOutputEvidenceV1 | None,
+) -> None:
+    if (
+        mode != "assembled_vr"
+        or frames_sequence is None
+        or streamed_invocation.frame_count != frame_count
+        or streamed_invocation.first_index != first_index
+        or streamed_invocation.expected_shape != frames_sequence[2]
+    ):
+        raise FinalPublicationValidationError("streamed invocation differs from its frame sequence")
+    assert streamed_output is not None
+    expected_sibling = (
+        f".depth-surge-final-v4-" f"{streamed_invocation.publication_generation}.tmp.mp4"
+    )
+    if streamed_output.sibling_relative_path != expected_sibling:
+        raise FinalPublicationValidationError(
+            "streamed output sibling differs from its publication generation"
+        )
+    transport = _normalized_image_transport_v1(
+        streamed_invocation.resolved_arguments_template, mode
+    )
+    if algorithm_digit == b"4":
+        if (
+            transport != "rawvideo"
+            or validate_raw_rgb24_input_v1(streamed_invocation.resolved_arguments_template)
+            != streamed_invocation.expected_shape
+        ):
+            raise FinalPublicationValidationError("raw RGB24 invocation shape or transport differs")
+    elif transport != "image2pipe":
+        raise FinalPublicationValidationError("PNG invocation requires image2pipe transport")
+
+
+def _parse_encoding_input_manifest_stream_v1(
+    handle: BinaryIO,
+    *,
+    raw_byte_count: int | None,
+    expected_frame_count: int | None,
+) -> _EncodingInputManifestProjection:
+    if raw_byte_count is not None and (type(raw_byte_count) is not int or raw_byte_count < 1):
+        raise FinalPublicationValidationError("encoding input raw byte count is invalid")
+    if expected_frame_count is not None and (
+        type(expected_frame_count) is not int
+        or not 1 <= expected_frame_count <= _ENCODING_CONTROL_FRAME_CAP
+    ):
+        raise FinalPublicationValidationError("encoding input expected frame count is invalid")
+    reader = _EncodingManifestReader(handle, raw_byte_count=raw_byte_count)
+    algorithm_digit, fingerprint = _read_input_manifest_header(reader)
+
+    reader.expect(b',"frame_names":')
+    first_index, frame_count = _parse_frame_names_v1(
+        reader,
+        expected_frame_count=expected_frame_count,
+    )
+    streamed_invocation = _read_manifest_invocation(reader)
     frames_sequence = _parse_identity_array_v1(
         reader,
         first_index=first_index,
@@ -5570,79 +6093,19 @@ def _parse_encoding_input_manifest_stream_v1(
         first_index=first_index,
         frame_count=frame_count,
     )
-    reader.expect(b',"schema_version":')
-    schema_byte = reader.take(1)
-    streamed_output: StreamedVrOutputEvidenceV1 | None = None
-    if schema_byte == b"1":
-        reader.expect(b"}")
-    elif schema_byte in {b"2", b"3"}:
-        reader.expect(b',"streamed_output":')
-        try:
-            streamed_output = StreamedVrOutputEvidenceV1.from_object(
-                _parse_bounded_canonical_value(
-                    reader.json_object_token(),
-                    description="streamed output evidence",
-                )
-            )
-        except (TypeError, ValueError) as error:
-            raise FinalPublicationValidationError("streamed output evidence is invalid") from error
-        reader.expect(b"}")
-    else:
-        raise FinalPublicationValidationError("encoding input schema version is invalid")
-    if algorithm_digit == b"2" and (
-        schema_byte != b"1" or streamed_invocation is not None or streamed_output is not None
-    ):
-        raise FinalPublicationValidationError("encoding input v2 schema is inconsistent")
-    if algorithm_digit == b"3" and (
-        schema_byte != b"2" or streamed_invocation is None or streamed_output is None
-    ):
-        raise FinalPublicationValidationError("encoding input v3 schema is incomplete")
-    if algorithm_digit == b"4" and (
-        schema_byte != b"3" or streamed_invocation is None or streamed_output is None
-    ):
-        raise FinalPublicationValidationError("encoding input v4 schema is incomplete")
-    if mode == "direct_stereo":
-        if frames_sequence is not None or left_sequence is None or right_sequence is None:
-            raise FinalPublicationValidationError(
-                "direct encoding input manifest has the wrong array shape"
-            )
-    elif frames_sequence is None or left_sequence is not None or right_sequence is not None:
-        raise FinalPublicationValidationError(
-            "assembled encoding input manifest has the wrong array shape"
-        )
+    schema_byte, streamed_output = _read_manifest_output(reader)
+    _check_input_manifest_schema(algorithm_digit, schema_byte, streamed_invocation, streamed_output)
+    _check_manifest_arrays(mode, frames_sequence, left_sequence, right_sequence)
     if streamed_invocation is not None:
-        if (
-            mode != "assembled_vr"
-            or frames_sequence is None
-            or streamed_invocation.frame_count != frame_count
-            or streamed_invocation.first_index != first_index
-            or streamed_invocation.expected_shape != frames_sequence[2]
-        ):
-            raise FinalPublicationValidationError(
-                "streamed invocation differs from its frame sequence"
-            )
-        assert streamed_output is not None
-        expected_sibling = (
-            f".depth-surge-final-v4-" f"{streamed_invocation.publication_generation}.tmp.mp4"
+        _check_manifest_invocation(
+            algorithm_digit,
+            mode,
+            frame_count,
+            first_index,
+            frames_sequence,
+            streamed_invocation,
+            streamed_output,
         )
-        if streamed_output.sibling_relative_path != expected_sibling:
-            raise FinalPublicationValidationError(
-                "streamed output sibling differs from its publication generation"
-            )
-        transport = _normalized_image_transport_v1(
-            streamed_invocation.resolved_arguments_template, mode
-        )
-        if algorithm_digit == b"4":
-            if (
-                transport != "rawvideo"
-                or validate_raw_rgb24_input_v1(streamed_invocation.resolved_arguments_template)
-                != streamed_invocation.expected_shape
-            ):
-                raise FinalPublicationValidationError(
-                    "raw RGB24 invocation shape or transport differs"
-                )
-        elif transport != "image2pipe":
-            raise FinalPublicationValidationError("PNG invocation requires image2pipe transport")
     if raw_byte_count is not None and reader.consumed != raw_byte_count:
         raise FinalPublicationValidationError(
             "encoding input raw byte count includes trailing bytes"
@@ -5987,29 +6450,9 @@ def _normalized_option_values_v1(
     return tuple(values)
 
 
-def _normalized_image_transport_v1(
-    arguments: tuple[str, ...],
-    mode: Literal["direct_stereo", "assembled_vr"],
-) -> Literal["image2", "image2pipe", "rawvideo"]:
-    formats = _normalized_option_values_v1(arguments, "-f")
-    input_codecs = _normalized_option_values_v1(arguments, "-vcodec")
-    raw_options = _normalized_option_values_v1(arguments, "-pixel_format") + (
-        _normalized_option_values_v1(arguments, "-video_size")
-    )
-    if formats == ("rawvideo",):
-        if mode != "assembled_vr":
-            raise FinalPublicationValidationError("raw RGB24 transport requires assembled VR")
-        try:
-            validate_raw_rgb24_input_v1(arguments)
-        except ValueError as error:
-            raise FinalPublicationValidationError(
-                "raw RGB24 input declaration is invalid"
-            ) from error
-        return "rawvideo"
-    if raw_options:
-        raise FinalPublicationValidationError("raw input options cannot bind a PNG transport")
-    if not formats and not input_codecs:
-        return "image2"
+def _validate_image2pipe_transport(
+    arguments: tuple[str, ...], mode: str, formats: tuple[str, ...], input_codecs: tuple[str, ...]
+) -> None:
     if mode != "assembled_vr":
         raise FinalPublicationValidationError(
             "normalized image2pipe transport requires assembled VR"
@@ -6034,26 +6477,41 @@ def _normalized_image_transport_v1(
         raise FinalPublicationValidationError(
             "normalized image2pipe options do not bind the image input"
         )
+
+
+def _normalized_image_transport_v1(
+    arguments: tuple[str, ...],
+    mode: Literal["direct_stereo", "assembled_vr"],
+) -> Literal["image2", "image2pipe", "rawvideo"]:
+    formats = _normalized_option_values_v1(arguments, "-f")
+    input_codecs = _normalized_option_values_v1(arguments, "-vcodec")
+    raw_options = _normalized_option_values_v1(arguments, "-pixel_format") + (
+        _normalized_option_values_v1(arguments, "-video_size")
+    )
+    if formats == ("rawvideo",):
+        if mode != "assembled_vr":
+            raise FinalPublicationValidationError("raw RGB24 transport requires assembled VR")
+        try:
+            validate_raw_rgb24_input_v1(arguments)
+        except ValueError as error:
+            raise FinalPublicationValidationError(
+                "raw RGB24 input declaration is invalid"
+            ) from error
+        return "rawvideo"
+    if raw_options:
+        raise FinalPublicationValidationError("raw input options cannot bind a PNG transport")
+    if not formats and not input_codecs:
+        return "image2"
+    _validate_image2pipe_transport(arguments, mode, formats, input_codecs)
     return "image2pipe"
 
 
-def _final_container_expectation_from_intent_v1(
-    *,
-    settings: ProcessingSettingsArtifactV5,
-    input_projection: _EncodingInputManifestProjection,
+def _normalized_input_rate(
     arguments: tuple[str, ...],
-) -> FinalContainerExpectation:
-    settings_value = settings.to_object()["processing_settings"]
-    width = settings_value["vr_output_width"]
-    height = settings_value["vr_output_height"]
-    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
-        raise FinalPublicationValidationError("durable settings lack final container dimensions")
-
-    frame_values = _normalized_option_values_v1(arguments, "-frames:v")
-    if frame_values != (str(input_projection.frame_count),):
-        raise FinalPublicationValidationError(
-            "normalized argv frame limit differs from the input manifest"
-        )
+    input_projection: _EncodingInputManifestProjection,
+    width: int,
+    height: int,
+) -> Fraction:
     transport = _normalized_image_transport_v1(arguments, input_projection.mode)
     if (transport == "rawvideo") != (input_projection.raw_pixel_format == "rgb24"):
         raise FinalPublicationValidationError("encoding transport differs from raw frame evidence")
@@ -6079,15 +6537,69 @@ def _final_container_expectation_from_intent_v1(
         raise FinalPublicationValidationError("normalized argv frame rate is invalid") from error
     if rate <= 0:
         raise FinalPublicationValidationError("normalized argv frame rate must be positive")
+    return rate
 
-    encoder_values = _normalized_option_values_v1(arguments, "-c:v")
-    if len(encoder_values) != 1 or encoder_values[0] not in {
-        "libx264",
-        "libx265",
-        "hevc_nvenc",
-    }:
-        raise FinalPublicationValidationError("normalized argv final encoder is invalid")
+
+def _validate_timeline_filter(
+    timeline: EncodingTimeline,
+    input_projection: _EncodingInputManifestProjection,
+    filters: tuple[str, ...],
+    converted: bool,
+    bounded_filter: bool,
+) -> None:
+    expected_filter, _ = timeline.ffmpeg_video_options(
+        input_projection.frame_count, drain_audio=bounded_filter
+    )
+    if input_projection.mode == "assembled_vr":
+        valid_filter = filters == (expected_filter,)
+    else:
+        valid_filter = (
+            len(filters) == 1
+            and filters[0].endswith(f";[stacked]{expected_filter}[vr]")
+            and filters[0].count("fps=") == int(converted)
+        )
+    if not valid_filter:
+        raise FinalPublicationValidationError("normalized frame-rate filter is inconsistent")
+
+
+def _normalized_output_timing(
+    values: dict,
+    arguments: tuple[str, ...],
+    input_projection: _EncodingInputManifestProjection,
+    rate: Fraction,
+) -> tuple[Fraction, int, bool]:
+    filters = _normalized_option_values_v1(
+        arguments, "-vf" if input_projection.mode == "assembled_vr" else "-filter_complex"
+    )
+    converted = any("fps=" in graph for graph in filters)
+    frame_values = _normalized_option_values_v1(arguments, "-frames:v")
+    bounded_filter = not frame_values
     audio_expected = any(_AUDIO_TOKEN.fullmatch(item) is not None for item in arguments)
+    output_count = input_projection.frame_count
+    if converted or bounded_filter or "frame_rate" in values["video_properties"]:
+        # Old, already published jobs lacking an exact source clock keep their frozen argv.
+        timeline = EncodingTimeline.from_artifact(values)
+        if rate != timeline.source or converted != (timeline.source != timeline.output):
+            raise FinalPublicationValidationError(
+                "normalized timeline differs from durable settings"
+            )
+        if bounded_filter and not audio_expected:
+            raise FinalPublicationValidationError("normalized argv has no video frame limit")
+        if converted or bounded_filter:
+            _validate_timeline_filter(
+                timeline, input_projection, filters, converted, bounded_filter
+            )
+        output_count = timeline.output_frames(input_projection.frame_count)
+        rate = timeline.output
+    if not bounded_filter and frame_values != (str(output_count),):
+        raise FinalPublicationValidationError(
+            "normalized argv frame limit differs from the input manifest"
+        )
+
+    return rate, output_count, audio_expected
+
+
+def _normalized_audio_packet_bound(arguments: tuple[str, ...], audio_expected: bool) -> int:
     audio_packet_upper_bound = 0
     audio_filters = _normalized_option_values_v1(arguments, "-filter:a")
     if audio_expected:
@@ -6108,13 +6620,41 @@ def _final_container_expectation_from_intent_v1(
         raise FinalPublicationValidationError(
             "normalized argv has an audio filter without audio input"
         )
+    return audio_packet_upper_bound
+
+
+def _final_container_expectation_from_intent_v1(
+    *,
+    settings: ProcessingSettingsArtifactV5,
+    input_projection: _EncodingInputManifestProjection,
+    arguments: tuple[str, ...],
+) -> FinalContainerExpectation:
+    values = settings.to_object()
+    settings_value = values["processing_settings"]
+    width = settings_value["vr_output_width"]
+    height = settings_value["vr_output_height"]
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+        raise FinalPublicationValidationError("durable settings lack final container dimensions")
+
+    rate = _normalized_input_rate(arguments, input_projection, width, height)
+    rate, output_count, audio_expected = _normalized_output_timing(
+        values, arguments, input_projection, rate
+    )
+    encoder_values = _normalized_option_values_v1(arguments, "-c:v")
+    if len(encoder_values) != 1 or encoder_values[0] not in {
+        "libx264",
+        "libx265",
+        "hevc_nvenc",
+    }:
+        raise FinalPublicationValidationError("normalized argv final encoder is invalid")
+    audio_packet_upper_bound = _normalized_audio_packet_bound(arguments, audio_expected)
     try:
         return FinalContainerExpectation(
             width=width,
             height=height,
-            fps=f"{rate.numerator}/{rate.denominator}",
-            frame_count=input_projection.frame_count,
-            resolved_encoder=encoder_values[0],
+            fps=rate_text(rate),
+            frame_count=output_count,
+            resolved_encoder=cast(Literal["libx264", "libx265", "hevc_nvenc"], encoder_values[0]),
             audio_expected=audio_expected,
             audio_packet_upper_bound=audio_packet_upper_bound,
         )
@@ -6133,11 +6673,13 @@ class FinalVideoManifestV4:
     resolved_encoding_arguments: tuple[str, ...]
     encoding_settings_fingerprint: str
     fingerprint: str
+    encoded_output: StreamedVrOutputEvidenceV1 | None = None
 
     def _base_object(self) -> dict:
         return {
-            "schema_version": 1,
+            "schema_version": 2 if self.encoded_output is not None else 1,
             "algorithm_version": "final-video-publication-v4",
+            **({"encoded_output": self.encoded_output.to_object()} if self.encoded_output else {}),
             "relative_path": self.relative_path,
             "sha256": self.sha256,
             "byte_count": self.byte_count,
@@ -6160,6 +6702,7 @@ def build_final_video_manifest_v4(
     video_byte_count: int,
     input_stage_fingerprint: str,
     resolved_encoding_arguments: tuple[str, ...],
+    encoded_output: StreamedVrOutputEvidenceV1 | None = None,
 ) -> FinalVideoManifestV4:
     try:
         validate_contained_legacy_final_component_v1(relative_path)
@@ -6171,6 +6714,11 @@ def build_final_video_manifest_v4(
         raise FinalPublicationValidationError("final publication hash is invalid")
     if type(video_byte_count) is not int or video_byte_count <= 0:
         raise FinalPublicationValidationError("final video byte count must be positive")
+    if encoded_output is not None and (encoded_output.raw_sha256, encoded_output.byte_count) != (
+        video_sha256,
+        video_byte_count,
+    ):
+        raise FinalPublicationValidationError("encoded output differs from final manifest")
     arguments = tuple(resolved_encoding_arguments)
     _validate_normalized_argv(
         arguments,
@@ -6190,6 +6738,7 @@ def build_final_video_manifest_v4(
         resolved_encoding_arguments=arguments,
         encoding_settings_fingerprint=settings_fingerprint,
         fingerprint="",
+        encoded_output=encoded_output,
     )
     fingerprint = hashlib.sha256(canonical_json_bytes(provisional._base_object())).hexdigest()
     return FinalVideoManifestV4(**{**provisional.__dict__, "fingerprint": fingerprint})
@@ -6211,22 +6760,35 @@ def parse_final_video_manifest_v4(raw: bytes) -> FinalVideoManifestV4:
         "encoding_settings_fingerprint",
         "fingerprint",
     }
-    if type(value) is not dict or set(value) != expected:
+    if type(value) is not dict:
+        raise FinalPublicationValidationError("final manifest must be an object")
+    if value.get("schema_version") == 2:
+        expected.add("encoded_output")
+    if set(value) != expected:
         raise FinalPublicationValidationError("final manifest schema is not closed")
     assert isinstance(value, dict)
     if (
-        value["schema_version"] != 1
-        or type(value["schema_version"]) is not int
+        type(value["schema_version"]) is not int
+        or value["schema_version"] not in (1, 2)
         or value["algorithm_version"] != "final-video-publication-v4"
         or type(value["resolved_encoding_arguments"]) is not list
     ):
         raise FinalPublicationValidationError("final manifest version is invalid")
+    try:
+        output = (
+            StreamedVrOutputEvidenceV1.from_object(value["encoded_output"])
+            if value["schema_version"] == 2
+            else None
+        )
+    except (TypeError, ValueError) as error:
+        raise FinalPublicationValidationError("invalid file-backed output evidence") from error
     manifest = build_final_video_manifest_v4(
         relative_path=value["relative_path"],
         video_sha256=value["sha256"],
         video_byte_count=value["byte_count"],
         input_stage_fingerprint=value["input_stage_fingerprint"],
         resolved_encoding_arguments=tuple(value["resolved_encoding_arguments"]),
+        encoded_output=output,
     )
     if (
         manifest.encoding_settings_fingerprint != value["encoding_settings_fingerprint"]
@@ -6349,61 +6911,7 @@ class EncodingInputPublicationSource:
                 raise FinalPublicationValidationError(
                     "staged encoding input manifest authority is incomplete"
                 )
-            assert self.job_root is not None
-            assert self.job_root_identity is not None
-            assert self.source_parent_identity is not None
-            assert self.source_identity is not None
-            try:
-                with AcquiredRoot(self.job_root) as acquired:
-                    if acquired.persistent_identity != self.job_root_identity:
-                        raise FinalPublicationValidationError(
-                            "staged encoding input job root identity differs"
-                        )
-                    if acquired.directory_identity(path.parent) != self.source_parent_identity:
-                        raise FinalPublicationValidationError(
-                            "staged encoding input parent identity differs"
-                        )
-                    with acquired.open_regular(path) as handle:
-                        if (
-                            file_identity_from_open_handle(handle) != self.source_identity
-                            or acquired.persistent_regular_identity(path) != self.source_identity
-                        ):
-                            raise FinalPublicationValidationError(
-                                "staged encoding input file identity differs"
-                            )
-                        if (
-                            self.logical_byte_count is not None
-                            and os.fstat(handle.fileno()).st_size != self.logical_byte_count
-                        ):
-                            raise FinalPublicationValidationError(
-                                "staged encoding input manifest logical length differs"
-                            )
-                        projection = _stream_input_manifest_projection_handle_v1(
-                            handle,
-                            raw_byte_count=(
-                                self.raw_byte_count if self.logical_byte_count is not None else None
-                            ),
-                            logical_byte_count=self.logical_byte_count,
-                            expected_frame_count=expected_frame_count,
-                        )
-                        if (
-                            file_identity_from_open_handle(handle) != self.source_identity
-                            or acquired.persistent_regular_identity(path) != self.source_identity
-                        ):
-                            raise FinalPublicationValidationError(
-                                "staged encoding input identity changed during read"
-                            )
-                    if (
-                        acquired.directory_identity(path.parent) != self.source_parent_identity
-                        or acquired.persistent_identity != self.job_root_identity
-                    ):
-                        raise FinalPublicationValidationError(
-                            "staged encoding input namespace changed during read"
-                        )
-            except (NoFollowPathError, FileNotFoundError) as error:
-                raise FinalPublicationValidationError(
-                    "staged encoding input manifest failed no-follow acquisition"
-                ) from error
+            projection = self._authenticated_projection(path, expected_frame_count)
         else:
             if not _regular_nonlink(path):
                 raise FinalPublicationValidationError(
@@ -6433,6 +6941,66 @@ class EncodingInputPublicationSource:
             raise FinalPublicationValidationError("staged encoding input manifest evidence differs")
         return projection
 
+    def _authenticated_projection(
+        self, path: Path, expected_frame_count: int | None
+    ) -> _EncodingInputManifestProjection:
+        assert self.job_root is not None
+        assert self.job_root_identity is not None
+        assert self.source_parent_identity is not None
+        assert self.source_identity is not None
+        try:
+            with AcquiredRoot(self.job_root) as acquired:
+                if acquired.persistent_identity != self.job_root_identity:
+                    raise FinalPublicationValidationError(
+                        "staged encoding input job root identity differs"
+                    )
+                if acquired.directory_identity(path.parent) != self.source_parent_identity:
+                    raise FinalPublicationValidationError(
+                        "staged encoding input parent identity differs"
+                    )
+                with acquired.open_regular(path) as handle:
+                    if (
+                        file_identity_from_open_handle(handle) != self.source_identity
+                        or acquired.persistent_regular_identity(path) != self.source_identity
+                    ):
+                        raise FinalPublicationValidationError(
+                            "staged encoding input file identity differs"
+                        )
+                    if (
+                        self.logical_byte_count is not None
+                        and os.fstat(handle.fileno()).st_size != self.logical_byte_count
+                    ):
+                        raise FinalPublicationValidationError(
+                            "staged encoding input manifest logical length differs"
+                        )
+                    projection = _stream_input_manifest_projection_handle_v1(
+                        handle,
+                        raw_byte_count=(
+                            self.raw_byte_count if self.logical_byte_count is not None else None
+                        ),
+                        logical_byte_count=self.logical_byte_count,
+                        expected_frame_count=expected_frame_count,
+                    )
+                    if (
+                        file_identity_from_open_handle(handle) != self.source_identity
+                        or acquired.persistent_regular_identity(path) != self.source_identity
+                    ):
+                        raise FinalPublicationValidationError(
+                            "staged encoding input identity changed during read"
+                        )
+                if (
+                    acquired.directory_identity(path.parent) != self.source_parent_identity
+                    or acquired.persistent_identity != self.job_root_identity
+                ):
+                    raise FinalPublicationValidationError(
+                        "staged encoding input namespace changed during read"
+                    )
+        except (NoFollowPathError, FileNotFoundError) as error:
+            raise FinalPublicationValidationError(
+                "staged encoding input manifest failed no-follow acquisition"
+            ) from error
+        return projection
+
     def validated(
         self,
         *,
@@ -6459,6 +7027,7 @@ class FinalPublicationTransactionV4:
         expected_sibling_identity: PersistedFileIdentityV1 | None = None,
         expected_sibling_sha256: str | None = None,
         expected_sibling_byte_count: int | None = None,
+        expected_existing_video_identity: PersistedFileIdentityV1 | None = None,
         reservation: (
             PreparedFinalEncodingReservationV1 | FinalEncodingReservationCapabilityV1 | None
         ) = None,
@@ -6495,10 +7064,13 @@ class FinalPublicationTransactionV4:
             raise ValueError("publication lacks container validation evidence")
         self.expected_sibling_sha256 = expected_sibling_sha256
         self.expected_sibling_byte_count = expected_sibling_byte_count
+        self.expected_existing_video_identity = expected_existing_video_identity
         self.reservation = reservation
         self.retire_reservation = retire_reservation
         self.event = event
         if reservation is not None:
+            if expected_existing_video_identity is not None:
+                raise ValueError("an active reservation supplies its own final target identity")
             if retire_reservation:
                 raise ValueError("final reservation retirement requires durable terminal settings")
             if reservation.job_root != self.job_root.resolve():
@@ -6509,7 +7081,7 @@ class FinalPublicationTransactionV4:
     def _materialize_reservation(self) -> PreparedFinalEncodingReservationV1:
         reservation = self.reservation
         if isinstance(reservation, FinalEncodingReservationCapabilityV1):
-            return reservation.materialize()
+            return reservation.materialize_for_publication()
         if reservation is None:
             raise ValueError("final publication has no reservation authority")
         return reservation
@@ -6539,9 +7111,14 @@ class FinalPublicationTransactionV4:
         standalone_input_target_identity = None
         standalone_manifest_target_identity = None
         if self.reservation is None:
-            standalone_final_target_identity = capture_optional_publication_target_identity(
-                final_path
-            )
+            standalone_final_target_identity = self.expected_existing_video_identity
+            if (
+                capture_optional_publication_target_identity(final_path)
+                != standalone_final_target_identity
+            ):
+                raise FinalPublicationValidationError(
+                    "final video differs from the authorized predecessor; preserving the target"
+                )
             standalone_input_target_identity = capture_optional_publication_target_identity(
                 input_target
             )
@@ -6598,10 +7175,7 @@ class FinalPublicationTransactionV4:
                 )
             if reservation_phase == "ready_pre_video":
                 reservation.validate_reserved_target()
-            elif reservation_phase not in {
-                "input_manifest_committed_no_final_intent",
-                "post_boundary_retry_sibling_present",
-            }:
+            else:
                 raise FinalPublicationValidationError(
                     f"reservation cannot accept an encoded sibling in phase {reservation_phase}"
                 )
@@ -6629,11 +7203,8 @@ class FinalPublicationTransactionV4:
                     before = os.fstat(frozen_handle.fileno())
                     if self.container_validator is not None:
                         try:
-                            container_valid = self.container_validator(
-                                _container_validation_path_v1(
-                                    sibling,
-                                    frozen_handle,
-                                )
+                            container_valid = _validate_open_container_v1(
+                                sibling, frozen_handle, self.container_validator
                             )
                         except InterruptedError:
                             raise
@@ -6678,17 +7249,49 @@ class FinalPublicationTransactionV4:
             raise FinalPublicationValidationError(
                 "sibling video failed no-follow acquisition"
             ) from error
-        if self.reservation is not None:
-            expected_target_identity = (
-                reserved_target_identity
-                if reservation_phase == "ready_pre_video"
-                else _reservation_identity(final_path)
+        final_manifest = None
+        if (
+            self.reservation is not None
+            and streamed_output is None
+            and self.expected_sibling_sha256 is not None
+        ):
+            reservation = self._materialize_reservation()
+            if (
+                reservation_phase != "ready_pre_video"
+                or reservation.final_manifest_transaction is None
+            ):
+                raise ReservationConflictError(
+                    "file-backed encode cannot replace a published video"
+                )
+            evidence = StreamedVrOutputEvidenceV1(
+                reservation.index.fingerprint,
+                self.sibling_relative_path,
+                frozen_sibling_identity,
+                video_sha256,
+                video_byte_count,
             )
+            final_manifest = build_final_video_manifest_v4(
+                relative_path=relative_path,
+                video_sha256=video_sha256,
+                video_byte_count=video_byte_count,
+                input_stage_fingerprint=self.input_stage_fingerprint,
+                resolved_encoding_arguments=self.resolved_encoding_arguments,
+                encoded_output=evidence,
+            )
+            # Sync the exact manifest we will later publish, without consuming its extent yet.
+            # The input extent and encoded video are already durable at this boundary.
+            _sync_parent(sibling.parent)
+            reservation.final_manifest_transaction.stage_complete_full(final_manifest.encode())
+            del reservation
+            self._emit("encoded-output:synced")
+        if self.reservation is not None:
+            if reserved_target_parent_identity is None:
+                raise ReservationConflictError("final target parent authority is missing")
             same_parent_replace_v1(
                 sibling,
                 final_path,
                 expected_source_identity=frozen_sibling_identity,
-                expected_target_identity=expected_target_identity,
+                expected_target_identity=reserved_target_identity,
                 expected_parent_identity=reserved_target_parent_identity,
                 replace_existing=True,
             )
@@ -6776,7 +7379,7 @@ class FinalPublicationTransactionV4:
         if crash_at == "after-input-manifest":
             raise InjectedFinalPublicationCrash(crash_at)
 
-        final_manifest = build_final_video_manifest_v4(
+        final_manifest = final_manifest or build_final_video_manifest_v4(
             relative_path=relative_path,
             video_sha256=video_sha256,
             video_byte_count=video_byte_count,
@@ -6790,14 +7393,19 @@ class FinalPublicationTransactionV4:
                 raise FinalPublicationValidationError("final manifest reservation is consumed")
             try:
                 reservation.validate_indexed_predecessor(final_transaction)
-                final_transaction.consume(
-                    final_manifest.encode(),
-                    crash_at=(
-                        "after-complete-full-sync"
-                        if crash_at == "after-final-intent-sync"
-                        else None
-                    ),
-                )
+                if final_manifest.encoded_output is not None:
+                    if crash_at == "after-final-intent-sync":
+                        raise InjectedFinalPublicationCrash(crash_at)
+                    final_transaction.recover(final_manifest.encode())
+                else:
+                    final_transaction.consume(
+                        final_manifest.encode(),
+                        crash_at=(
+                            "after-complete-full-sync"
+                            if crash_at == "after-final-intent-sync"
+                            else None
+                        ),
+                    )
             except InjectedReservationCrash as error:
                 raise InjectedFinalPublicationCrash("after-final-intent-sync") from error
             reservation.final_manifest_transaction = None
@@ -6827,6 +7435,93 @@ class FinalMediaAuditDispositionV1:
     final_video_present: bool
     final_video_authenticated: bool
     final_video_authentication_reason: AuthenticationReason | None
+
+
+def _verify_audited_video(
+    root: Path,
+    final_path: Path,
+    manifest: FinalVideoManifestV4,
+    input_projection: _EncodingInputManifestProjection,
+) -> None:
+    proof = manifest.encoded_output
+    if proof is not None and input_projection.streamed_invocation is not None:
+        raise FinalPublicationValidationError(
+            "file-backed proof cannot authenticate streamed inputs"
+        )
+    scanned = _scan_fixed_file_v1(
+        root, final_path, expected_identity=proof.identity if proof else None
+    )
+    video_hash, video_count = scanned.raw_sha256, scanned.byte_count
+    if manifest.sha256 != video_hash or manifest.byte_count != video_count:
+        raise FinalPublicationValidationError("final video identity differs")
+    streamed_invocation = input_projection.streamed_invocation
+    streamed_output = input_projection.streamed_output
+    if streamed_invocation is not None:
+        assert streamed_output is not None
+        if (
+            streamed_invocation.materialized_arguments(input_projection.fingerprint)
+            != manifest.resolved_encoding_arguments
+            or streamed_output.identity != capture_file_identity(final_path)
+            or streamed_output.raw_sha256 != video_hash
+            or streamed_output.byte_count != video_count
+        ):
+            raise FinalPublicationValidationError(
+                "final streamed video differs from its launch evidence"
+            )
+
+
+def _authenticate_media_audit(
+    root: Path,
+    settings: ProcessingSettingsArtifactV5,
+    settings_value: dict,
+    expected: str,
+    final_path: Path,
+    input_path: Path,
+    publication_path: Path,
+    container_validator: Callable[[Path], bool] | None,
+) -> None:
+    if not all(_regular_nonlink(path) for path in (final_path, input_path, publication_path)):
+        raise FinalPublicationValidationError("publication entry is unsafe")
+    metadata = settings_value["metadata"]
+    if (
+        metadata["final_media_producer_contract_version"] != 4
+        or metadata["final_media_publication_generation"] is None
+    ):
+        raise FinalPublicationValidationError("producer marker is invalid")
+    input_projection = _stream_input_manifest_projection_v1(
+        root,
+        input_path,
+        expected_frame_count=_settings_frame_count_v1(settings),
+    )
+    manifest = parse_final_video_manifest_v4(
+        _read_bounded_regular_file(
+            publication_path,
+            max_bytes=FINAL_VIDEO_MANIFEST_MAX_RAW_BYTES,
+        )
+    )
+    if (
+        manifest.relative_path != expected
+        or manifest.input_stage_fingerprint != input_projection.fingerprint
+    ):
+        raise FinalPublicationValidationError("three-way publication binding differs")
+    _validate_normalized_argv(
+        manifest.resolved_encoding_arguments,
+        input_stage_fingerprint=input_projection.fingerprint,
+        relative_path=expected,
+        expected_mode=input_projection.mode,
+    )
+    _verify_audited_video(root, final_path, manifest, input_projection)
+    if container_validator is None:
+        expectation = _final_container_expectation_from_intent_v1(
+            settings=settings,
+            input_projection=input_projection,
+            arguments=manifest.resolved_encoding_arguments,
+        )
+        valid = validate_final_container_v4(final_path, expectation)
+    else:
+        valid = container_validator(final_path)
+    if not valid:
+        raise FinalPublicationValidationError("final video container validation failed")
 
 
 def audit_final_media_v1(
@@ -6872,66 +7567,16 @@ def audit_final_media_v1(
             "legacy_no_publication_manifests" if legacy else "incomplete_publication_evidence",
         )
     try:
-        if not all(_regular_nonlink(path) for path in (final_path, input_path, publication_path)):
-            raise FinalPublicationValidationError("publication entry is unsafe")
-        metadata = settings_value["metadata"]
-        if (
-            metadata["final_media_producer_contract_version"] != 4
-            or metadata["final_media_publication_generation"] is None
-        ):
-            raise FinalPublicationValidationError("producer marker is invalid")
-        input_projection = _stream_input_manifest_projection_v1(
+        _authenticate_media_audit(
             root,
+            settings,
+            settings_value,
+            expected,
+            final_path,
             input_path,
-            expected_frame_count=_settings_frame_count_v1(settings),
+            publication_path,
+            container_validator,
         )
-        manifest = parse_final_video_manifest_v4(
-            _read_bounded_regular_file(
-                publication_path,
-                max_bytes=FINAL_VIDEO_MANIFEST_MAX_RAW_BYTES,
-            )
-        )
-        if (
-            manifest.relative_path != expected
-            or manifest.input_stage_fingerprint != input_projection.fingerprint
-        ):
-            raise FinalPublicationValidationError("three-way publication binding differs")
-        _validate_normalized_argv(
-            manifest.resolved_encoding_arguments,
-            input_stage_fingerprint=input_projection.fingerprint,
-            relative_path=expected,
-            expected_mode=input_projection.mode,
-        )
-        video_hash, video_count = _hash_file(root, final_path)
-        if manifest.sha256 != video_hash or manifest.byte_count != video_count:
-            raise FinalPublicationValidationError("final video identity differs")
-        streamed_invocation = input_projection.streamed_invocation
-        streamed_output = input_projection.streamed_output
-        if streamed_invocation is not None:
-            assert streamed_output is not None
-            if (
-                streamed_invocation.materialized_arguments(input_projection.fingerprint)
-                != manifest.resolved_encoding_arguments
-                or streamed_output.identity != capture_file_identity(final_path)
-                or streamed_output.raw_sha256 != video_hash
-                or streamed_output.byte_count != video_count
-            ):
-                raise FinalPublicationValidationError(
-                    "final streamed video differs from its launch evidence"
-                )
-        validator = container_validator
-        if validator is None:
-            expectation = _final_container_expectation_from_intent_v1(
-                settings=settings,
-                input_projection=input_projection,
-                arguments=manifest.resolved_encoding_arguments,
-            )
-
-            def validator(path: Path) -> bool:
-                return validate_final_container_v4(path, expectation)
-
-        if not validator(final_path):
-            raise FinalPublicationValidationError("final video container validation failed")
     except (
         OSError,
         CanonicalJsonError,

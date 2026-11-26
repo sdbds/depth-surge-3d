@@ -63,9 +63,7 @@ class QualityRepairBudgets:
             "exemplar_eye_evaluation_cap",
         ):
             value = getattr(self, name)
-            if isinstance(value, (bool, np.bool_)) or not isinstance(
-                value, (int, np.integer)
-            ):
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
                 raise TypeError(f"{name} must be an integer")
             if not 0 <= int(value) <= _UINT64_MAX:
                 raise ValueError(f"{name} must fit uint64")
@@ -81,10 +79,7 @@ class QualityRepairBudgets:
             self.local_neighbor_samples_consumed,
             sample_charge,
         )
-        if (
-            next_slots > self.local_slot_cap
-            or next_samples > self.local_neighbor_sample_cap
-        ):
+        if next_slots > self.local_slot_cap or next_samples > self.local_neighbor_sample_cap:
             self.local_budget_skipped_run_count += 1
             return False
         self.local_slots_consumed = next_slots
@@ -130,9 +125,7 @@ def plan_local_strips(
         local_limit_px,
         budgets,
     )
-    raw_records = records.view(np.uint8).reshape(
-        records.size, REPAIR_RECORD_DTYPE.itemsize
-    )
+    raw_records = records.view(np.uint8).reshape(records.size, REPAIR_RECORD_DTYPE.itemsize)
     search_limit = max(1, math.floor((64 * height) / 1080.0 + 0.5))
     safe_radius = max(1, math.floor(height / 1080.0 + 0.5))
     records.setflags(write=True)
@@ -196,10 +189,7 @@ def _validate_inputs(
     if (
         not isinstance(render_shape, tuple)
         or len(render_shape) != 2
-        or any(
-            isinstance(value, bool) or not isinstance(value, int)
-            for value in render_shape
-        )
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in render_shape)
     ):
         raise TypeError("render_shape must be an integer (height, width) tuple")
     height, width = render_shape
@@ -242,9 +232,7 @@ def _validate_analysis(
             or plane.shape != shape
             or not plane.flags.c_contiguous
         ):
-            raise TypeError(
-                "pure_bgr planes must be matching C-contiguous uint8 rasters"
-            )
+            raise TypeError("pure_bgr planes must be matching C-contiguous uint8 rasters")
     for left in range(3):
         for right in range(left + 1, 3):
             if np.shares_memory(analysis.pure_bgr[left], analysis.pure_bgr[right]):
@@ -369,9 +357,7 @@ def _evaluate_local_slot(
         candidate_start + 2 * direction,
         candidate_start + direction,
     )
-    donor_columns = tuple(
-        candidate_start - index * direction for index in range(donor_count)
-    )
+    donor_columns = tuple(candidate_start - index * direction for index in range(donor_count))
     if not _slot_coordinates_are_legal(
         candidate_row,
         candidate_columns,

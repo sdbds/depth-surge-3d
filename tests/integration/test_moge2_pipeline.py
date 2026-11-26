@@ -440,7 +440,7 @@ class _PipelineHarness:
             if not path.is_file():
                 assert cv2.imwrite(str(path), frame)
             frame_files.append(path)
-        write_source_frame_manifest(frame_files, video_path)
+        write_source_frame_manifest(frame_files, video_path, (0, _FRAME_COUNT))
         return frame_files
 
     def _create_video(

@@ -661,3 +661,148 @@ def test_parent_sync_failure_occurs_after_irreversible_replace(tmp_path: Path) -
     assert path.read_bytes() != old
     audit = metric_npz.audit_metric_npz(path, expected_shape=(2, 3))
     assert audit.layout.archive_form == "owned-zip32-v1"
+
+
+def test_multiblock_depth_frame_has_one_identity_and_roundtrips_without_aliasing(tmp_path):
+    from src.depth_surge_3d.io.nofollow_io import AcquiredRoot
+
+    shape = (512, 768)
+    row = np.linspace(0.125, 4.0, shape[1], dtype=np.float32)
+    inverse = np.tile(row, (shape[0], 1))
+    valid = inverse < 3.0
+    inverse[~valid] = 0.0
+    path = tmp_path / "frame.npz"
+    trace = metric_npz.write_metric_npz(path, inverse, valid, np.float32(0.75))
+    with AcquiredRoot(tmp_path) as acquired:
+        identity = metric_npz.audit_metric_npz_identity(
+            path, expected_shape=shape, acquired=acquired
+        )
+        full = metric_npz.audit_metric_npz(path, expected_shape=shape, acquired=acquired)
+    assert identity.sha256 == full.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert identity.byte_count == path.stat().st_size
+    assert identity.member_shapes == (shape, shape, ())
+    assert 0 < full.stream_workspace_peak_bytes <= metric_npz.METRIC_NPZ_WRITE_STREAM_BYTES
+    assert 0 < trace.maximum_input_chunk_bytes < inverse.nbytes
+    np.testing.assert_array_equal(full.inverse_depth, inverse)
+    np.testing.assert_array_equal(full.valid, valid)
+    assert full.focal_x_normalized == np.float32(0.75)
+    assert not full.inverse_depth.flags.writeable and not full.valid.flags.writeable
+    inverse[0, 0] = 99
+    assert full.inverse_depth[0, 0] == row[0]
+
+
+@pytest.mark.parametrize(
+    ("bad_value", "reason"),
+    [
+        ("nan-depth", "finite"),
+        ("negative-zero", "positive zero"),
+        ("no-depth", "must be positive"),
+        ("negative-focal", "focal value"),
+    ],
+)
+def test_legacy_archive_identity_is_not_proof_of_valid_metric_values(tmp_path, bad_value, reason):
+    inverse, valid, focal = _metric_values()
+    if bad_value == "nan-depth":
+        inverse[0, 1] = np.nan
+    elif bad_value == "negative-zero":
+        inverse[0, 0] = -0.0
+    elif bad_value == "no-depth":
+        inverse[0, 1] = 0.0
+    else:
+        focal = np.float32(-0.5)
+    path = tmp_path / "old-cache.npz"
+    np.savez_compressed(path, inverse_depth=inverse, valid=valid, focal_x_normalized=focal)
+    identity = metric_npz.audit_metric_npz_identity(path, expected_shape=(2, 3), job_root=tmp_path)
+    with pytest.raises(metric_npz.MetricNpzContentError, match=reason):
+        metric_npz.audit_metric_npz(path, expected_shape=(2, 3), job_root=tmp_path)
+    assert identity.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("failure", ["memory", "wrong-depth-dtype", "readonly-mask"])
+def test_array_allocation_failure_leaves_cached_depth_retryable(tmp_path, failure):
+    path = tmp_path / "frame.npz"
+    _write_owned(path)
+    original = path.read_bytes()
+
+    def unavailable(shape, dtype):
+        if failure == "memory":
+            raise MemoryError("worker has insufficient memory")
+        if failure == "wrong-depth-dtype" and dtype == np.float32:
+            return np.empty(shape, dtype=np.float64)
+        result = np.empty(shape, dtype=dtype)
+        if dtype == np.bool_:
+            result.flags.writeable = False
+        return result
+
+    with pytest.raises(metric_npz.MetricNpzAllocationError):
+        metric_npz.audit_metric_npz(path, allocator=unavailable)
+    assert path.read_bytes() == original
+    np.testing.assert_array_equal(metric_npz.audit_metric_npz(path).valid, _metric_values()[1])
+
+
+@pytest.mark.parametrize(
+    "invalid", ["dtype", "transposed", "mask-dtype", "mask-shape", "focal-type"]
+)
+def test_mismatched_frame_cannot_replace_the_existing_metric_cache(tmp_path, invalid):
+    path = tmp_path / "known-good.npz"
+    _write_owned(path)
+    old = path.read_bytes()
+    inverse, valid, focal = _metric_values()
+    if invalid == "dtype":
+        inverse = inverse.astype(np.float64)
+    elif invalid == "transposed":
+        inverse = inverse.T
+    elif invalid == "mask-dtype":
+        valid = valid.astype(np.uint8)
+    elif invalid == "mask-shape":
+        valid = valid[:1]
+    else:
+        focal = float(focal)
+    with pytest.raises((TypeError, ValueError)):
+        metric_npz.write_metric_npz(path, inverse, valid, focal)
+    assert path.read_bytes() == old
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("checkpoint", ["start", "compressed-data", "central-record", "footer"])
+def test_truncated_metric_archive_is_not_a_resume_source(tmp_path, checkpoint):
+    target = tmp_path / "valid.npz"
+    _write_owned(target)
+    expected = target.read_bytes()
+    identity = metric_npz.audit_metric_npz_identity(target)
+    cutoff = {
+        "start": 0,
+        "compressed-data": identity.layout.members[0].data_offset + 1,
+        "central-record": identity.layout.central_offset + 5,
+        "footer": len(expected) - 3,
+    }[checkpoint]
+    partial = tmp_path / "incomplete.npz"
+    partial.write_bytes(expected[:cutoff])
+    for audit in (metric_npz.audit_metric_npz, metric_npz.audit_metric_npz_identity):
+        with pytest.raises(metric_npz.MetricNpzFormatError):
+            audit(partial, expected_shape=(2, 3))
+    assert target.read_bytes() == expected
+    assert partial.read_bytes() == expected[:cutoff]
+
+
+def test_identity_audit_requires_the_original_job_and_both_array_shapes(tmp_path):
+    from src.depth_surge_3d.io.nofollow_io import AcquiredRoot
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    path = first / "metric.npz"
+    inverse, valid, focal = _metric_values()
+    np.savez_compressed(path, inverse_depth=inverse, valid=valid[:1], focal_x_normalized=focal)
+    with AcquiredRoot(first) as acquired:
+        with pytest.raises(metric_npz.MetricNpzFormatError, match="wrong job root"):
+            metric_npz.audit_metric_npz_identity(path, job_root=second, acquired=acquired)
+        with pytest.raises(metric_npz.MetricNpzFormatError, match="shapes differ"):
+            metric_npz.audit_metric_npz_identity(path, job_root=first, acquired=acquired)
+    _write_owned(path)
+    with pytest.raises(metric_npz.MetricNpzFormatError, match="shape mismatch"):
+        metric_npz.audit_metric_npz_identity(path, expected_shape=(3, 2), job_root=first)
+    assert metric_npz.audit_metric_npz_identity(path, expected_shape=(2, 3)).member_shapes[0] == (
+        2,
+        3,
+    )

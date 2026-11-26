@@ -1,4 +1,4 @@
-"""Task 0 contracts for the indexed heap and integer geodesic solver."""
+"""Shared contracts for the indexed heap and integer geodesic solver."""
 
 from __future__ import annotations
 
@@ -8,16 +8,9 @@ import importlib.util
 import numpy as np
 import pytest
 
-from scripts.quality_task0 import indexed_heap, region_solver
-
 
 def test_region_solver_prototype_module_is_importable() -> None:
     assert importlib.util.find_spec("scripts.quality_task0.region_solver") is not None
-
-
-def _api(module, name: str):
-    assert hasattr(module, name), f"missing Task 0 API: {module.__name__}.{name}"
-    return getattr(module, name)
 
 
 def _priority(
@@ -122,8 +115,8 @@ def _scalar_geodesic_oracle(  # noqa: C901 - intentionally independent oracle
     return owner, distance
 
 
-def test_indexed_heap_uses_full_priority_and_one_live_entry_per_pixel() -> None:
-    heap_type = _api(indexed_heap, "IndexedRegionHeap")
+def test_indexed_heap_uses_full_priority_and_one_live_entry_per_pixel(indexed_heap) -> None:
+    heap_type = indexed_heap.IndexedRegionHeap
     distance = np.full((2, 3), np.iinfo(np.uint64).max, dtype=np.uint64)
     owner = np.zeros((2, 3), dtype=np.uint32)
     ranks = np.asarray([0, 10, 20], dtype=np.uint32)
@@ -144,9 +137,9 @@ def test_indexed_heap_uses_full_priority_and_one_live_entry_per_pixel() -> None:
     assert np.all(heap.position.flat[[0, 1, 2]] == -2)
 
 
-def test_indexed_heap_fails_on_capacity_and_settled_decrease() -> None:
-    heap_type = _api(indexed_heap, "IndexedRegionHeap")
-    queue_error = _api(indexed_heap, "QualityRegionQueueBudgetError")
+def test_indexed_heap_fails_on_capacity_and_settled_decrease(indexed_heap) -> None:
+    heap_type = indexed_heap.IndexedRegionHeap
+    queue_error = indexed_heap.QualityRegionQueueBudgetError
     distance = np.asarray([[1, 2]], dtype=np.uint64)
     owner = np.asarray([[1, 1]], dtype=np.uint32)
     ranks = np.asarray([0, 1], dtype=np.uint32)
@@ -160,9 +153,9 @@ def test_indexed_heap_fails_on_capacity_and_settled_decrease() -> None:
         heap.push_or_decrease(0)
 
 
-def test_indexed_heap_rejects_an_inconsistent_dense_position() -> None:
-    heap_type = _api(indexed_heap, "IndexedRegionHeap")
-    queue_error = _api(indexed_heap, "QualityRegionQueueBudgetError")
+def test_indexed_heap_rejects_an_inconsistent_dense_position(indexed_heap) -> None:
+    heap_type = indexed_heap.IndexedRegionHeap
+    queue_error = indexed_heap.QualityRegionQueueBudgetError
     distance = np.asarray([[1, 2]], dtype=np.uint64)
     owner = np.asarray([[1, 1]], dtype=np.uint32)
     ranks = np.asarray([0, 1], dtype=np.uint32)
@@ -174,8 +167,8 @@ def test_indexed_heap_rejects_an_inconsistent_dense_position() -> None:
         heap.push_or_decrease(0)
 
 
-def test_integer_movement_cost_uses_maximum_bgr_channel_delta() -> None:
-    movement_cost = _api(region_solver, "integer_bgr_movement_cost")
+def test_integer_movement_cost_uses_maximum_bgr_channel_delta(region_solver) -> None:
+    movement_cost = region_solver.integer_bgr_movement_cost
 
     assert (
         movement_cost(
@@ -187,8 +180,11 @@ def test_integer_movement_cost_uses_maximum_bgr_channel_delta() -> None:
 
 
 @pytest.mark.parametrize("step", [3, 4, 5, 6])
-def test_clean_bgr_step_moves_the_region_boundary_to_the_exact_step(step: int) -> None:
-    solve = _api(region_solver, "solve_geodesic_regions")
+def test_clean_bgr_step_moves_the_region_boundary_to_the_exact_step(
+    region_solver,
+    step: int,
+) -> None:
+    solve = region_solver.solve_geodesic_regions
     width = 10
     guide = np.zeros((1, width, 3), dtype=np.uint8)
     guide[:, step:] = np.uint8(255)
@@ -205,8 +201,8 @@ def test_clean_bgr_step_moves_the_region_boundary_to_the_exact_step(step: int) -
     assert np.all(result.heap_position[band] == -2)
 
 
-def test_indexed_solver_matches_independent_duplicate_heap_oracle() -> None:
-    solve = _api(region_solver, "solve_geodesic_regions")
+def test_indexed_solver_matches_independent_duplicate_heap_oracle(region_solver) -> None:
+    solve = region_solver.solve_geodesic_regions
     rng = np.random.default_rng(20260823)
     guide = rng.integers(0, 256, size=(5, 7, 3), dtype=np.uint8)
     band = np.zeros((5, 7), dtype=np.bool_)
@@ -229,8 +225,8 @@ def test_indexed_solver_matches_independent_duplicate_heap_oracle() -> None:
     assert np.array_equal(actual.distance, expected_distance)
 
 
-def test_solver_rejects_non_uint8_guide_and_seedless_band() -> None:
-    solve = _api(region_solver, "solve_geodesic_regions")
+def test_solver_rejects_non_uint8_guide_and_seedless_band(region_solver) -> None:
+    solve = region_solver.solve_geodesic_regions
     band = np.ones((1, 3), dtype=np.bool_)
     seeds = np.zeros((1, 3), dtype=np.uint32)
     ranks = np.asarray([0, 1], dtype=np.uint32)
@@ -241,8 +237,8 @@ def test_solver_rejects_non_uint8_guide_and_seedless_band() -> None:
         solve(np.zeros((1, 3, 3), dtype=np.uint8), band, seeds, ranks)
 
 
-def test_low_resolution_regions_use_validity_jump_and_canonical_keys() -> None:
-    build = _api(region_solver, "build_low_resolution_regions")
+def test_low_resolution_regions_use_validity_jump_and_canonical_keys(region_solver) -> None:
+    build = region_solver.build_low_resolution_regions
     displacement = np.asarray(
         [[0.0, 0.5, 1.5], [0.2, 0.7, 1.6]],
         dtype=np.float64,
@@ -264,9 +260,9 @@ def test_low_resolution_regions_use_validity_jump_and_canonical_keys() -> None:
     assert np.array_equal(result.region_rank_bits, expected_ranks)
 
 
-def test_half_pixel_nearest_labels_and_sample_centres_are_explicit() -> None:
-    upsample = _api(region_solver, "nearest_label_upsample")
-    centres = _api(region_solver, "map_low_resolution_centres")
+def test_half_pixel_nearest_labels_and_sample_centres_are_explicit(region_solver) -> None:
+    upsample = region_solver.nearest_label_upsample
+    centres = region_solver.map_low_resolution_centres
     labels = np.asarray([[1, 2, 3], [4, 5, 6]], dtype=np.uint32)
 
     actual = upsample(labels, render_height=3, render_width=5)
@@ -286,8 +282,8 @@ def test_half_pixel_nearest_labels_and_sample_centres_are_explicit() -> None:
     assert columns.tolist() == [0, 2, 4]
 
 
-def test_boundary_band_marks_both_sides_and_uses_cross_dilation() -> None:
-    make_band = _api(region_solver, "build_four_connected_edge_band")
+def test_boundary_band_marks_both_sides_and_uses_cross_dilation(region_solver) -> None:
+    make_band = region_solver.build_four_connected_edge_band
     labels = np.asarray(
         [
             [1, 1, 1, 2, 2],
@@ -310,15 +306,15 @@ def test_boundary_band_marks_both_sides_and_uses_cross_dilation() -> None:
     ]
 
 
-def test_boundary_band_ignores_unknown_and_no_region_sentinels() -> None:
-    make_band = _api(region_solver, "build_four_connected_edge_band")
+def test_boundary_band_ignores_unknown_and_no_region_sentinels(region_solver) -> None:
+    make_band = region_solver.build_four_connected_edge_band
     labels = np.asarray([[1, 1, 0, 2, 2, 0xFFFFFFFF, 3]], dtype=np.uint32)
 
     assert not np.any(make_band(labels, radius=2))
 
 
-def test_cross_skeleton_matches_repeated_opening_and_erosion() -> None:
-    skeleton = _api(region_solver, "cross_skeleton")
+def test_cross_skeleton_matches_repeated_opening_and_erosion(region_solver) -> None:
+    skeleton = region_solver.cross_skeleton
     fragment = np.ones((3, 3), dtype=np.bool_)
 
     assert skeleton(fragment).tolist() == [
@@ -328,8 +324,8 @@ def test_cross_skeleton_matches_repeated_opening_and_erosion() -> None:
     ]
 
 
-def test_sparse_region_seeds_erode_or_fall_back_to_fragment_skeleton() -> None:
-    build_seeds = _api(region_solver, "build_sparse_region_seeds")
+def test_sparse_region_seeds_erode_or_fall_back_to_fragment_skeleton(region_solver) -> None:
+    build_seeds = region_solver.build_sparse_region_seeds
     labels = np.ones((11, 16), dtype=np.uint32)
     labels[:, 8:] = np.uint32(2)
     band = np.zeros((11, 16), dtype=np.bool_)
@@ -349,8 +345,8 @@ def test_sparse_region_seeds_erode_or_fall_back_to_fragment_skeleton() -> None:
     assert tiny_seeds.tolist() == [[1, 2, 2]]
 
 
-def test_each_disconnected_region_fragment_gets_its_own_fallback_seed() -> None:
-    build_seeds = _api(region_solver, "build_sparse_region_seeds")
+def test_each_disconnected_region_fragment_gets_its_own_fallback_seed(region_solver) -> None:
+    build_seeds = region_solver.build_sparse_region_seeds
     labels = np.full((7, 10), 2, dtype=np.uint32)
     labels[:, :5] = np.uint32(1)
     labels[3, 8] = np.uint32(1)
@@ -362,8 +358,8 @@ def test_each_disconnected_region_fragment_gets_its_own_fallback_seed() -> None:
     assert np.count_nonzero(seeds == 1) > 1
 
 
-def test_competing_highlight_transition_and_fringe_choose_true_edge() -> None:
-    solve = _api(region_solver, "solve_geodesic_regions")
+def test_competing_highlight_transition_and_fringe_choose_true_edge(region_solver) -> None:
+    solve = region_solver.solve_geodesic_regions
     guide = np.zeros((1, 12, 3), dtype=np.uint8)
     guide[:, 5:] = np.uint8(32)
     guide[:, 6:] = np.uint8(224)
@@ -379,8 +375,8 @@ def test_competing_highlight_transition_and_fringe_choose_true_edge() -> None:
     assert result.region_map.tolist() == [[1] * 6 + [2] * 6]
 
 
-def test_flat_colour_tie_uses_rank_then_region_id() -> None:
-    solve = _api(region_solver, "solve_geodesic_regions")
+def test_flat_colour_tie_uses_rank_then_region_id(region_solver) -> None:
+    solve = region_solver.solve_geodesic_regions
     guide = np.zeros((1, 9, 3), dtype=np.uint8)
     band = np.ones((1, 9), dtype=np.bool_)
     seeds = np.zeros((1, 9), dtype=np.uint32)
@@ -399,8 +395,8 @@ def test_flat_colour_tie_uses_rank_then_region_id() -> None:
     assert result.distance_bytes == 9 * 8
 
 
-def test_global_solver_propagates_across_an_imaginary_row_chunk_boundary() -> None:
-    solve = _api(region_solver, "solve_geodesic_regions")
+def test_global_solver_propagates_across_an_imaginary_row_chunk_boundary(region_solver) -> None:
+    solve = region_solver.solve_geodesic_regions
     guide = np.zeros((8, 5, 3), dtype=np.uint8)
     guide[:, 3:] = np.uint8(255)
     band = np.ones((8, 5), dtype=np.bool_)

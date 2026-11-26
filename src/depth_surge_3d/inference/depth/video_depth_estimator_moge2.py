@@ -18,7 +18,6 @@ from .types import DepthBatch, DepthRepresentation, PinholeCameraBatch
 MOGE_SOURCE_REVISION = "925b8ed835a7a9cdb7578ba15c658a0afc969030"
 MOGE_RESOLUTION_LEVEL = 9
 MOGE_PREPROCESSING_ALGORITHM = "moge2-rgb-area-max-edge-v1"
-MOGE_INSTALL_COMMAND = "uv sync --extra moge2"
 
 _DEFAULT_MODEL_ARTIFACTS = {
     "vits": (
@@ -155,9 +154,11 @@ class VideoDepthEstimatorMoGe2:
         try:
             from moge.model.v2 import MoGeModel  # type: ignore[import-not-found]
         except ImportError as error:
+            from .backend_registry import moge_install_command
+
             raise RuntimeError(
                 f"MoGe-2 optional dependency is not installed. "
-                f"Install with: {MOGE_INSTALL_COMMAND}"
+                f"Install with: {moge_install_command()}"
             ) from error
 
         self.checkpoint_path = checkpoint_path

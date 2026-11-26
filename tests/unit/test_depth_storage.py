@@ -159,6 +159,68 @@ def v3_pinhole_store(tmp_path: Path) -> RawDepthStore:
     return store
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("semantic_fingerprint", None),
+        ("semantic_fingerprint", {"camera_model": "none"}),
+        ("camera_model", "unknown"),
+        ("representation", "unscaled_metres"),
+        ("frame_names", ["different.png"]),
+        ("storage_status", "unknown"),
+        ("selected_dtype", "float64"),
+        ("native_shape", None),
+        ("native_shape", [0, 3]),
+    ],
+)
+def test_refused_raw_resume_does_not_modify_committed_camera_values(v3_pinhole_store, field, value):
+    store = v3_pinhole_store
+    metadata = dict(store.metadata)
+    metadata[field] = value
+    metadata["fingerprint"] = store._fingerprint(metadata)
+    path = store.directory / "metadata.json"
+    path.write_text(json.dumps(metadata))
+    target = store.path_for("frame_000001.png")
+    original = (target.read_bytes(), path.read_bytes())
+    with pytest.raises(RawDepthFingerprintError):
+        RawDepthStore.open_existing(
+            store.directory,
+            frame_names=["frame_000001.png"],
+            semantic_fingerprint={"camera_model": "pinhole_fx"},
+            requested_dtype="float32",
+        )
+    assert (target.read_bytes(), path.read_bytes()) == original
+
+
+@pytest.mark.parametrize(
+    "bad", ["not_a_batch", "representation", "shape", "camera", "name_count", "unknown"]
+)
+def test_incompatible_inference_batch_never_rewrites_an_existing_frame(v3_pinhole_store, bad):
+    store = v3_pinhole_store
+    target = store.path_for("frame_000001.png")
+    before = target.stat().st_mtime_ns, target.read_bytes()
+    names = ["frame_000001.png"]
+    batch = metric_batch_with_focal(0.5)
+    if bad == "not_a_batch":
+        batch = batch.values
+    elif bad == "representation":
+        batch = _batch(batch.values)
+    elif bad == "shape":
+        batch = DepthBatch(
+            np.ones((1, 3, 2), np.float32), DepthRepresentation.METRIC_DEPTH, batch.camera
+        )
+    elif bad == "camera":
+        batch = DepthBatch(batch.values, DepthRepresentation.METRIC_DEPTH)
+    elif bad == "name_count":
+        names = []
+    elif bad == "unknown":
+        names = ["frame_000002.png"]
+    with pytest.raises((TypeError, ValueError, RawDepthFingerprintError)):
+        store.write_batch(names, batch)
+    assert (target.stat().st_mtime_ns, target.read_bytes()) == before
+    assert store.complete_files == [target]
+
+
 def test_model_fingerprint_hashes_local_weights_and_is_deterministic(tmp_path: Path) -> None:
     weights = tmp_path / "weights.bin"
     weights.write_bytes(b"stable weights")

@@ -722,6 +722,130 @@ def _analyze_packed_lane_validity(
     )
 
 
+def _unfused_fast_band(
+    rendered: torch.Tensor, filled: torch.Tensor, unresolved: torch.Tensor, background: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    fine_repair = _fast_repair_lane_flags(filled, unresolved, background=background)
+    downsampled = _downsample_subpixel_band(rendered)
+    lane_counts = torch.stack(
+        (
+            torch.count_nonzero(filled),
+            torch.count_nonzero(unresolved),
+            torch.count_nonzero(~torch.isfinite(downsampled)),
+        )
+    )
+    return fine_repair, downsampled, lane_counts
+
+
+def _check_finite_fast_band(counts: np.ndarray) -> None:
+    if counts[2] != 0:
+        raise ValueError("Rendered image contains non-finite values")
+
+
+def _store_prefill_flags(repair: np.ndarray, coverage: np.ndarray) -> None:
+    repair[(coverage > 0) & (coverage < HORIZONTAL_SUBPIXELS)] |= np.uint8(0x01)
+    repair[coverage == 0] |= np.uint8(0x02)
+
+
+def _store_packed_fast_band(
+    rendered: torch.Tensor,
+    prefill: torch.Tensor,
+    filled: torch.Tensor,
+    unresolved: torch.Tensor,
+    lane_histogram: np.ndarray,
+    span_histogram: np.ndarray,
+    coverage: np.ndarray,
+    repair: np.ndarray,
+    output: np.ndarray,
+    *,
+    background: bool,
+    native_extension,
+    lane_weights: torch.Tensor,
+    analysis_queue: _FastLaneAnalysisQueue | None,
+) -> tuple[int, int]:
+    from .fast_output_triton import triton_fast_band_payload
+
+    payload = triton_fast_band_payload(
+        rendered,
+        prefill,
+        filled,
+        unresolved,
+        background=background,
+        include_coverage_flags=True,
+    )
+    if payload is not None:
+        host_image, packed_missing, host_repair, counts = _download_fast_cuda_payload(
+            payload, output.shape, coverage.shape
+        )
+    else:
+        fine_repair, downsampled, lane_counts = _unfused_fast_band(
+            rendered, filled, unresolved, background
+        )
+        host_image, packed_missing, host_repair, counts = _download_fast_cuda_band(
+            downsampled, prefill, lane_weights, fine_repair, lane_counts
+        )
+    _analyze_packed_lane_validity(
+        packed_missing,
+        lane_histogram,
+        span_histogram,
+        coverage,
+        native_extension=native_extension,
+        analysis_queue=analysis_queue,
+        defer_coverage=payload is not None,
+    )
+    _check_finite_fast_band(counts)
+    if payload is not None:
+        repair[:] = host_repair
+    else:
+        _store_prefill_flags(repair, coverage)
+    output[:] = host_image
+    if payload is None:
+        repair |= host_repair
+    return int(counts[0]), int(counts[1])
+
+
+def _store_unpacked_fast_band(
+    rendered: torch.Tensor,
+    prefill: torch.Tensor,
+    filled: torch.Tensor,
+    unresolved: torch.Tensor,
+    lane_histogram: np.ndarray,
+    span_histogram: np.ndarray,
+    coverage: np.ndarray,
+    repair: np.ndarray,
+    output: np.ndarray,
+    *,
+    background: bool,
+    native_extension,
+    lane_weights: torch.Tensor | None,
+    analysis_queue: _FastLaneAnalysisQueue | None,
+    cuda: bool,
+) -> tuple[int, int]:
+    _analyze_lane_validity(
+        prefill,
+        lane_histogram,
+        span_histogram,
+        coverage,
+        native_extension=native_extension,
+        lane_weights=lane_weights,
+        analysis_queue=analysis_queue,
+    )
+    fine_repair, downsampled, lane_counts = _unfused_fast_band(
+        rendered, filled, unresolved, background
+    )
+    counts = None
+    if not cuda:
+        counts = lane_counts.detach().numpy()
+        _check_finite_fast_band(counts)
+    _store_prefill_flags(repair, coverage)
+    output[:] = _convert_image_band(downsampled, output.dtype)
+    repair |= fine_repair.detach().cpu().numpy()
+    if counts is None:
+        counts = lane_counts.detach().cpu().numpy()
+        _check_finite_fast_band(counts)
+    return int(counts[0]), int(counts[1])
+
+
 def _fast_repair_lane_flags(
     filled: torch.Tensor,
     unresolved: torch.Tensor,
@@ -1435,11 +1559,11 @@ class StereoRenderer:
                     source_band = device_frame.source[start_row:end_row]
                     near_score_band = device_frame.near_score[start_row:end_row]
                     source_valid_band = device_frame.source_valid[start_row:end_row]
-                offset_band = (
-                    self._transfer_offset_band(sample_offsets[start_row:end_row])
-                    if device_offsets is None
-                    else device_offsets[start_row:end_row]
-                )
+                if device_offsets is None:
+                    assert sample_offsets is not None
+                    offset_band = self._transfer_offset_band(sample_offsets[start_row:end_row])
+                else:
+                    offset_band = device_offsets[start_row:end_row]
                 splat = _forward_splat_band_prevalidated(
                     source_band,
                     near_score_band,
@@ -1460,117 +1584,44 @@ class StereoRenderer:
                 prefill = splat.valid.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
                 filled = fillable.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
                 unresolved = hole_mask.reshape(row_count, width, HORIZONTAL_SUBPIXELS)
-                coverage = coverage_output[start_row:end_row]
-                if not batched_download:
-                    _analyze_lane_validity(
-                        prefill,
-                        lane_histogram,
-                        span_histogram,
-                        coverage,
-                        native_extension=native_extension,
-                        lane_weights=lane_weights,
-                        analysis_queue=analysis_queue,
-                    )
-                fused_payload = None
                 if batched_download:
-                    from .fast_output_triton import triton_fast_band_payload
-
-                    fused_payload = triton_fast_band_payload(
+                    assert lane_weights is not None
+                    counts = _store_packed_fast_band(
                         rendered,
                         prefill,
                         filled,
                         unresolved,
-                        background=settings.occlusion_fill == "background",
-                        include_coverage_flags=True,
-                    )
-                host_lane_counts = None
-                fine_repair = downsampled = lane_counts = None
-                if fused_payload is not None:
-                    host_image, packed_missing, host_repair, host_lane_counts = (
-                        _download_fast_cuda_payload(
-                            fused_payload, (row_count, width, 3), (row_count, width)
-                        )
-                    )
-                else:
-                    fine_repair = _fast_repair_lane_flags(
-                        filled,
-                        unresolved,
-                        background=settings.occlusion_fill == "background",
-                    )
-                    downsampled = _downsample_subpixel_band(rendered)
-                    lane_counts = torch.stack(
-                        (
-                            torch.count_nonzero(filled),
-                            torch.count_nonzero(unresolved),
-                            torch.count_nonzero(~torch.isfinite(downsampled)),
-                        )
-                    )
-                    if batched_download:
-                        assert lane_weights is not None
-                        host_image, packed_missing, host_repair, host_lane_counts = (
-                            _download_fast_cuda_band(
-                                downsampled, prefill, lane_weights, fine_repair, lane_counts
-                            )
-                        )
-                if batched_download:
-                    _analyze_packed_lane_validity(
-                        packed_missing,
                         lane_histogram,
                         span_histogram,
-                        coverage,
+                        coverage_output[start_row:end_row],
+                        repair_output[start_row:end_row],
+                        output[start_row:end_row],
+                        background=settings.occlusion_fill == "background",
                         native_extension=native_extension,
+                        lane_weights=lane_weights,
                         analysis_queue=analysis_queue,
-                        defer_coverage=fused_payload is not None,
                     )
-                    if host_lane_counts[2] != 0:
-                        raise ValueError("Rendered image contains non-finite values")
-                elif self.device.type != "cuda":
-                    host_lane_counts = lane_counts.detach().numpy()
-                    if host_lane_counts[2] != 0:
-                        raise ValueError("Rendered image contains non-finite values")
-                repair = repair_output[start_row:end_row]
-                if fused_payload is not None:
-                    repair[:] = host_repair
                 else:
-                    repair[(coverage > 0) & (coverage < HORIZONTAL_SUBPIXELS)] |= np.uint8(0x01)
-                    repair[coverage == 0] |= np.uint8(0x02)
-                if batched_download:
-                    output[start_row:end_row] = host_image
-                    if fused_payload is None:
-                        repair |= host_repair
-                    del host_image, packed_missing, host_repair
-                else:
-                    output[start_row:end_row] = _convert_image_band(
-                        downsampled,
-                        source.dtype,
+                    counts = _store_unpacked_fast_band(
+                        rendered,
+                        prefill,
+                        filled,
+                        unresolved,
+                        lane_histogram,
+                        span_histogram,
+                        coverage_output[start_row:end_row],
+                        repair_output[start_row:end_row],
+                        output[start_row:end_row],
+                        background=settings.occlusion_fill == "background",
+                        native_extension=native_extension,
+                        lane_weights=lane_weights,
+                        analysis_queue=analysis_queue,
+                        cuda=self.device.type == "cuda",
                     )
-                    repair |= fine_repair.detach().cpu().numpy()
-                if host_lane_counts is None:
-                    host_lane_counts = lane_counts.detach().cpu().numpy()
-                    if host_lane_counts[2] != 0:
-                        raise ValueError("Rendered image contains non-finite values")
-                local_filled_lane_count += int(host_lane_counts[0])
-                final_unresolved_lane_count += int(host_lane_counts[1])
-                del (
-                    source_band,
-                    near_score_band,
-                    source_valid_band,
-                    offset_band,
-                    splat,
-                    rendered,
-                    hole_mask,
-                    fillable,
-                    prefill,
-                    filled,
-                    unresolved,
-                    fine_repair,
-                    fused_payload,
-                    lane_counts,
-                    host_lane_counts,
-                    coverage,
-                    repair,
-                    downsampled,
-                )
+                local_filled_lane_count += counts[0]
+                final_unresolved_lane_count += counts[1]
+                del source_band, near_score_band, source_valid_band, offset_band, splat
+                del rendered, hole_mask, fillable, prefill, filled, unresolved
         if analysis_queue is not None:
             analysis_queue.finish_pending()
         hole_runs = HoleRunDiagnostics(

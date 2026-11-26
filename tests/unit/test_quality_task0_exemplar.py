@@ -1,4 +1,4 @@
-"""Task 0 contracts for the bounded deterministic exemplar prototype."""
+"""Shared contracts for the bounded deterministic exemplar prototype."""
 
 from __future__ import annotations
 
@@ -7,20 +7,13 @@ import importlib.util
 import numpy as np
 import pytest
 
-from scripts.quality_task0 import exemplar, local_strip, repair_records
-
-
-def _api(name: str):
-    assert hasattr(exemplar, name), f"missing Task 0 exemplar API: {name}"
-    return getattr(exemplar, name)
-
 
 def test_exemplar_module_is_importable() -> None:
     assert importlib.util.find_spec("scripts.quality_task0.exemplar") is not None
 
 
-def test_component_core_interiors_partition_bbox_and_halos_never_own_targets() -> None:
-    partition = _api("partition_exemplar_cores")
+def test_component_core_interiors_partition_bbox_and_halos_never_own_targets(exemplar) -> None:
+    partition = exemplar.partition_exemplar_cores
     component_bbox = (10, 410, 20, 800)
 
     cores = partition(component_bbox, frame_shape=(600, 1000))
@@ -48,6 +41,7 @@ def test_component_core_interiors_partition_bbox_and_halos_never_own_targets() -
 
 
 def _level(
+    exemplar,
     working: np.ndarray,
     *,
     donor: np.ndarray,
@@ -55,12 +49,12 @@ def _level(
     processed: np.ndarray,
     barrier: np.ndarray,
 ):
-    level_type = _api("ExemplarLevel")
+    level_type = exemplar.ExemplarLevel
     return level_type(working, donor, target, processed, barrier)
 
 
-def test_pyramid_parent_flags_and_child_means_use_ties_to_even() -> None:
-    downsample = _api("downsample_exemplar_level")
+def test_pyramid_parent_flags_and_child_means_use_ties_to_even(exemplar) -> None:
+    downsample = exemplar.downsample_exemplar_level
     working = np.asarray(
         [
             [[0, 1, 3], [1, 2, 3]],
@@ -73,6 +67,7 @@ def test_pyramid_parent_flags_and_child_means_use_ties_to_even() -> None:
 
     parent = downsample(
         _level(
+            exemplar,
             working,
             donor=all_true,
             target=all_false,
@@ -93,6 +88,7 @@ def test_pyramid_parent_flags_and_child_means_use_ties_to_even() -> None:
     target[1, 1] = True
     blocked = downsample(
         _level(
+            exemplar,
             working,
             donor=all_true,
             target=target,
@@ -107,10 +103,11 @@ def test_pyramid_parent_flags_and_child_means_use_ties_to_even() -> None:
     assert blocked.processed_mask.tolist() == [[False]]
 
 
-def test_pyramid_omits_a_coarser_level_below_thirty_two_pixels() -> None:
-    build = _api("build_exemplar_pyramid")
+def test_pyramid_omits_a_coarser_level_below_thirty_two_pixels(exemplar) -> None:
+    build = exemplar.build_exemplar_pyramid
     shape = (64, 64)
     full = _level(
+        exemplar,
         np.zeros((*shape, 3), dtype=np.uint8),
         donor=np.ones(shape, dtype=np.bool_),
         target=np.zeros(shape, dtype=np.bool_),
@@ -123,8 +120,8 @@ def test_pyramid_omits_a_coarser_level_below_thirty_two_pixels() -> None:
     assert [level.working_bgr.shape[:2] for level in levels] == [(64, 64), (32, 32)]
 
 
-def test_frontier_selection_uses_processed_count_then_row_and_column() -> None:
-    select = _api("select_frontier_target")
+def test_frontier_selection_uses_processed_count_then_row_and_column(exemplar) -> None:
+    select = exemplar.select_frontier_target
     shape = (9, 10)
     target = np.zeros(shape, dtype=np.bool_)
     target[4, 1] = True
@@ -133,6 +130,7 @@ def test_frontier_selection_uses_processed_count_then_row_and_column() -> None:
     processed = np.ones(shape, dtype=np.bool_)
     processed[target] = False
     level = _level(
+        exemplar,
         np.zeros((*shape, 3), dtype=np.uint8),
         donor=np.zeros(shape, dtype=np.bool_),
         target=target,
@@ -143,8 +141,8 @@ def test_frontier_selection_uses_processed_count_then_row_and_column() -> None:
     assert select(level) == (4, 5, 47)
 
 
-def test_frontier_rejects_clipped_or_barrier_crossing_7x7_patches() -> None:
-    select = _api("select_frontier_target")
+def test_frontier_rejects_clipped_or_barrier_crossing_7x7_patches(exemplar) -> None:
+    select = exemplar.select_frontier_target
     shape = (9, 9)
     target = np.zeros(shape, dtype=np.bool_)
     target[2, 4] = True
@@ -153,6 +151,7 @@ def test_frontier_rejects_clipped_or_barrier_crossing_7x7_patches() -> None:
     processed[target] = False
     barrier = np.zeros(shape, dtype=np.bool_)
     level = _level(
+        exemplar,
         np.zeros((*shape, 3), dtype=np.uint8),
         donor=np.zeros(shape, dtype=np.bool_),
         target=target,
@@ -166,8 +165,8 @@ def test_frontier_rejects_clipped_or_barrier_crossing_7x7_patches() -> None:
     assert select(level) is None
 
 
-def test_candidate_centres_require_a_complete_original_safe_donor_9x9() -> None:
-    enumerate_centres = _api("enumerate_donor_centres")
+def test_candidate_centres_require_a_complete_original_safe_donor_9x9(exemplar) -> None:
+    enumerate_centres = exemplar.enumerate_donor_centres
     donor = np.ones((9, 10), dtype=np.bool_)
 
     assert enumerate_centres(donor).tolist() == [[4, 4], [4, 5]]
@@ -176,9 +175,9 @@ def test_candidate_centres_require_a_complete_original_safe_donor_9x9() -> None:
     assert enumerate_centres(donor).tolist() == [[4, 5]]
 
 
-def test_reflect_101_and_candidate_subsampling_are_frozen() -> None:
-    reflect = _api("reflect_101_index")
-    subsample = _api("subsample_candidate_indexes")
+def test_reflect_101_and_candidate_subsampling_are_frozen(exemplar) -> None:
+    reflect = exemplar.reflect_101_index
+    subsample = exemplar.subsample_candidate_indexes
 
     assert [reflect(index, 5) for index in range(-3, 8)] == [
         3,
@@ -307,8 +306,8 @@ def _scalar_patch_score(
     return score
 
 
-def test_patch_score_uses_reflect_101_only_for_target_gradient_support() -> None:
-    score_patch = _api("score_exemplar_patch")
+def test_patch_score_uses_reflect_101_only_for_target_gradient_support(exemplar) -> None:
+    score_patch = exemplar.score_exemplar_patch
     height, width = 12, 13
     rows, columns = np.indices((height, width), dtype=np.uint16)
     working = np.empty((height, width, 3), dtype=np.uint8)
@@ -320,6 +319,7 @@ def test_patch_score_uses_reflect_101_only_for_target_gradient_support() -> None
     processed = np.ones((height, width), dtype=np.bool_)
     processed[target] = False
     level = _level(
+        exemplar,
         working,
         donor=np.ones((height, width), dtype=np.bool_),
         target=target,
@@ -332,7 +332,7 @@ def test_patch_score_uses_reflect_101_only_for_target_gradient_support() -> None
     assert score_patch(level, target_center=(3, 4), donor_center=(7, 8)) == expected
 
 
-def _component_fixture():
+def _component_fixture(local_strip, repair_records):
     height = width = 25
     target_row = target_column = 12
     coverage = np.full((height, width), 16, dtype=np.uint8)
@@ -358,9 +358,11 @@ def _component_fixture():
     return analysis, safe_donor, records
 
 
-def test_full_level_completion_overwrites_provisional_but_not_donor_identity() -> None:
-    repair = _api("repair_component_exemplar")
-    analysis, safe_donor, records = _component_fixture()
+def test_full_level_completion_overwrites_provisional_but_not_donor_identity(
+    exemplar, local_strip, repair_records
+) -> None:
+    repair = exemplar.repair_component_exemplar
+    analysis, safe_donor, records = _component_fixture(local_strip, repair_records)
     budgets = local_strip.QualityRepairBudgets()
 
     result = repair(
@@ -381,9 +383,11 @@ def test_full_level_completion_overwrites_provisional_but_not_donor_identity() -
     assert budgets.exemplar_eye_evaluations_consumed > 0
 
 
-def test_unfinished_target_retains_provisional_backend_zero() -> None:
-    repair = _api("repair_component_exemplar")
-    analysis, safe_donor, records = _component_fixture()
+def test_unfinished_target_retains_provisional_backend_zero(
+    exemplar, local_strip, repair_records
+) -> None:
+    repair = exemplar.repair_component_exemplar
+    analysis, safe_donor, records = _component_fixture(local_strip, repair_records)
     safe_donor[:] = False
 
     result = repair(
@@ -410,11 +414,14 @@ def test_unfinished_target_retains_provisional_backend_zero() -> None:
     ],
 )
 def test_zero_budget_terminates_before_candidate_enumeration(
+    exemplar,
+    local_strip,
+    repair_records,
     monkeypatch: pytest.MonkeyPatch,
     budget_name: str,
 ) -> None:
-    repair = _api("repair_component_exemplar")
-    analysis, safe_donor, records = _component_fixture()
+    repair = exemplar.repair_component_exemplar
+    analysis, safe_donor, records = _component_fixture(local_strip, repair_records)
     budgets = local_strip.QualityRepairBudgets(**{budget_name: 0})
 
     def fail_if_enumerated(_mask: np.ndarray) -> np.ndarray:
@@ -436,9 +443,11 @@ def test_zero_budget_terminates_before_candidate_enumeration(
     assert budgets.exemplar_eye_evaluations_consumed == 0
 
 
-def test_exact_single_evaluation_budget_scores_once_and_completes() -> None:
-    repair = _api("repair_component_exemplar")
-    analysis, safe_donor, records = _component_fixture()
+def test_exact_single_evaluation_budget_scores_once_and_completes(
+    exemplar, local_strip, repair_records
+) -> None:
+    repair = exemplar.repair_component_exemplar
+    analysis, safe_donor, records = _component_fixture(local_strip, repair_records)
     budgets = local_strip.QualityRepairBudgets(
         exemplar_core_evaluation_cap=1,
         exemplar_component_evaluation_cap=1,

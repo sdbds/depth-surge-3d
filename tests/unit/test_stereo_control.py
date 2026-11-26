@@ -138,6 +138,98 @@ def test_provider_audit_is_lazy_and_freezes_one_generation() -> None:
     assert not hasattr(plan, "items")
 
 
+@pytest.mark.parametrize(
+    "alter",
+    [
+        dict(frame_name="frame1"),
+        dict(guide_sha256="missing"),
+        dict(guide_byte_count=0),
+        dict(guide_shape=(0, 2)),
+        dict(geometry_shape=(2,)),
+        dict(guide_path=Path("guides/other.png")),
+        dict(geometry_path=Path("geometry/wrong.npz")),
+        dict(right_path=Path("right/other.png")),
+    ],
+)
+def test_provider_items_must_bind_the_selected_frame_and_both_eyes(alter):
+    original = _provider(1)
+    changed = replace(next(original.replay()), **alter)
+    provider = stereo_control.ReplayableStereoProvider(original.generation, lambda: iter([changed]))
+
+    def classify(_item):
+        pytest.fail("must not classify an invalid provider item")
+
+    with pytest.raises(stereo_control.StereoControlStateError):
+        stereo_control.audit_stereo_provider(provider, classify)
+
+
+@pytest.mark.parametrize(
+    "change", ["generation", "early_end", "extra", "io_error", "late_error", "hash", "non_item"]
+)
+def test_replay_preserves_the_distinction_between_replan_and_interrupted_stage(change):
+    original = _provider(1)
+    gen = original.generation
+    item = next(original.replay())
+    action = stereo_control.StereoAction.RENDER
+    plan = stereo_control.audit_stereo_provider(original, lambda _: action)
+
+    def replay():
+        if change == "io_error":
+            raise OSError("input unavailable")
+        if change == "late_error":
+
+            def late_failure():
+                yield item
+                raise OSError("read error")
+
+            return late_failure()
+        entries = {
+            "early_end": [],
+            "extra": [item, item],
+            "hash": [replace(item, guide_sha256="71" * 32)],
+            "non_item": [None],
+            "generation": [item],
+        }
+        return iter(entries[change])
+
+    if change == "generation":
+        gen = replace(gen, audit_generation_id="ff" * 16)
+    provider = stereo_control.ReplayableStereoProvider(gen, replay)
+    with pytest.raises(stereo_control.StereoProviderChangedError):
+        stereo_control.validate_stereo_action_replay(provider, plan, lambda _: action)
+    for started, error in (
+        (False, stereo_control.StereoProviderChangedError),
+        (True, stereo_control.StereoStageInputChangedError),
+    ):
+        with pytest.raises(error):
+            list(
+                stereo_control.iter_stereo_action(provider, plan, action, mutation_started=started)
+            )
+
+
+@pytest.mark.parametrize("quality", [False, True])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("configured_workers", False),
+        ("configured_workers", 17),
+        ("pending_render_count", 1.5),
+        ("pending_render_count", -1),
+        ("retained_bytes", -1),
+    ],
+)
+def test_invalid_admission_never_allocates_a_pipeline(quality, field, value):
+    kwargs = {"configured_workers": 2, "pending_render_count": 1, "retained_bytes": 0, field: value}
+    if quality:
+        select = stereo_control.select_quality_pipeline_capacity
+        kwargs.update(quality_active_scratch=128, quality_slot_bytes=16)
+    else:
+        select = stereo_control.select_fast_pipeline_capacity
+        kwargs.update(fast_active_scratch=128, fast_slot_bytes=16)
+    with pytest.raises((TypeError, ValueError)):
+        select(**kwargs)
+
+
 def _published_relative_provider(tmp_path: Path, count: int = 2):
     guides = tmp_path / "00_original_frames"
     geometry = tmp_path / "03_disparity_maps"
@@ -218,6 +310,143 @@ def test_every_provider_replay_rehashes_actual_source_payload(tmp_path: Path) ->
             plan,
             mutation_started=False,
         )
+
+
+@pytest.mark.parametrize(
+    "line,field,bad",
+    [
+        (0, "schema_version", True),
+        (0, "algorithm_version", "obsolete"),
+        (0, "frame_count", 0),
+        (0, "geometry_mode", "unknown"),
+        (0, "source_metadata", None),
+        (0, "source_metadata.native_shape", [0, 3]),
+        (0, "source_metadata.source_geometry_fingerprint", ""),
+        (0, "source_metadata.relative_encoding_scale_float32_bits", "0"),
+        (0, "source_metadata.resolved_auto_distance_m", 2),
+        (1, "source_index", False),
+        (1, "frame_index", 1.0),
+        (1, "guide.frame_name", "frame_000002"),
+        (1, "guide.sha256", ""),
+        (1, "guide.byte_count", 0),
+        (1, "guide.png_header.bit_depth", 16),
+        (1, "geometry.payload_kind", "metric_npz"),
+        (1, "geometry.png_header.width", 99),
+    ],
+)
+def test_durable_stereo_input_requires_consistent_typed_metadata(tmp_path, line, field, bad):
+    descriptor, _, guides, maps = _published_relative_provider(tmp_path, count=1)
+    lines = [json.loads(raw) for raw in descriptor.path.read_bytes().splitlines()]
+    record = lines[line]
+    parts = field.split(".")
+    for key in parts[:-1]:
+        record = record[key]
+    record[parts[-1]] = bad
+    descriptor.path.write_bytes(
+        b"".join(stereo_input_manifest._canonical_line(value) for value in lines)
+    )
+    before = [p.read_bytes() for p in guides + maps]
+    with pytest.raises(
+        (stereo_control.StereoControlError, stereo_control.StereoControlBudgetError)
+    ):
+        stereo_input_manifest.load_stereo_input_manifest_v1(descriptor.path, job_root=tmp_path)
+    assert [p.read_bytes() for p in guides + maps] == before
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [
+        "empty_guides",
+        "short_guides",
+        "short_maps",
+        "long_guides",
+        "long_maps",
+        "reshaped",
+        "wrong_mode",
+        "over_budget",
+        "missing_identity",
+    ],
+)
+def test_interrupted_upstream_handoff_does_not_replace_last_committed_manifest(tmp_path, problem):
+    descriptor, _, guides, maps = _published_relative_provider(tmp_path)
+    previous = descriptor.path.read_bytes()
+    existing_files = set(descriptor.path.parent.iterdir())
+    if problem == "empty_guides":
+        guides.clear()
+    elif problem == "short_guides":
+        guides.pop()
+    elif problem == "short_maps":
+        maps.pop()
+    elif problem == "long_guides":
+        guides.append(guides[-1])
+    elif problem == "long_maps":
+        maps.append(maps[-1])
+    elif problem == "reshaped":
+        assert cv2.imwrite(str(guides[1]), np.zeros((8, 8, 3), dtype=np.uint8))
+    kwargs = dict(
+        job_root=tmp_path,
+        manifest_path=descriptor.path,
+        guide_files=iter(guides),
+        geometry_files=iter(maps),
+        geometry_mode="relative",
+        frame_count=2,
+        source_metadata={"fingerprint": "ab" * 32, "encoding_scale": 65535.0},
+    )
+    if problem == "wrong_mode":
+        kwargs["geometry_mode"] = "packed"
+    elif problem == "over_budget":
+        kwargs["frame_count"] = stereo_input_manifest.STEREO_CONTROL_FRAME_CAP + 1
+    elif problem == "missing_identity":
+        kwargs["source_metadata"] = {"encoding_scale": 65535.0}
+    with pytest.raises(
+        (stereo_control.StereoControlError, stereo_control.StereoControlBudgetError, ValueError)
+    ):
+        stereo_input_manifest.publish_stereo_input_manifest_v1(**kwargs)
+    assert descriptor.path.read_bytes() == previous
+    assert set(descriptor.path.parent.iterdir()) == existing_files
+
+
+@pytest.mark.parametrize(
+    "bad,reason",
+    [
+        ("root", "different job"),
+        ("metric", "geometry mode"),
+        ("render_mode", "Fast or Quality"),
+        ("negative_memory", "nonnegative"),
+        ("boolean_memory", "nonnegative"),
+        ("without_consumer", "requires a frame consumer"),
+        ("with_intermediates", "without intermediates"),
+    ],
+)
+def test_mismatched_render_requests_leave_previous_stereo_outputs_alone(tmp_path, bad, reason):
+    from src.depth_surge_3d.processing.frames.stereo_generator import StereoPairGenerator
+
+    descriptor, _, _, _ = _published_relative_provider(tmp_path, count=1)
+    left, right = tmp_path / "04_left_frames", tmp_path / "04_right_frames"
+    existing = left / "old.png"
+    existing.write_bytes(b"previous output")
+    dirs = {
+        "base": tmp_path / "other" if bad == "root" else tmp_path,
+        "left_frames": left,
+        "right_frames": right,
+    }
+    settings = {"keep_intermediates": bad == "with_intermediates"}
+    if bad == "metric":
+        settings["stereo_geometry_mode"] = "metric_camera"
+    if bad == "render_mode":
+        settings["stereo_render_mode"] = "preview"
+    consumer = (
+        (lambda *_: pytest.fail("received a frame before validation"))
+        if bad == "with_intermediates"
+        else None
+    )
+    memory = {"negative_memory": -1, "boolean_memory": True, "without_consumer": 1}.get(bad, 0)
+    with pytest.raises(ValueError, match=reason):
+        StereoPairGenerator().create_stereo_pairs_from_manifest(
+            descriptor, dirs, settings, frame_consumer=consumer, frame_consumer_memory_bytes=memory
+        )
+    assert existing.read_bytes() == b"previous output"
+    assert not list(right.iterdir())
 
 
 def test_relative_provider_replay_streams_each_declared_payload_identity(
@@ -1267,13 +1496,30 @@ class _Payload:
         self.data = bytearray(1024 * 1024)
 
 
+@pytest.fixture
+def verify_joined_stereo_workers(monkeypatch):
+    groups = []
+    create = stereo_control.create_parked_stereo_workers
+
+    def observe(**kwargs):
+        group = create(**kwargs)
+        groups.append((group, group.live_thread_count))
+        return group
+
+    monkeypatch.setattr(stereo_control, "create_parked_stereo_workers", observe)
+    yield
+    ((group, started),) = groups
+    assert started == 3  # One feeder, decoder and writer, not other threads in the process.
+    assert group.live_thread_count == 0
+
+
+@pytest.mark.usefixtures("verify_joined_stereo_workers")
 def test_downstream_mutation_failure_cancels_workers_before_gate_release() -> None:
     provider = _provider(4)
     plan = stereo_control.audit_stereo_provider(
         provider,
         lambda _item: stereo_control.StereoAction.RENDER,
     )
-    baseline = stereo_control.current_process_thread_count()
     touched: list[str] = []
 
     with pytest.raises(RuntimeError, match="injected mutation"):
@@ -1289,9 +1535,9 @@ def test_downstream_mutation_failure_cancels_workers_before_gate_release() -> No
         )
 
     assert touched == []
-    assert stereo_control.current_process_thread_count() == baseline
 
 
+@pytest.mark.usefixtures("verify_joined_stereo_workers")
 def test_parked_workers_get_a_final_provider_replay_before_mutation() -> None:
     base = _provider(2)
     replay_count = 0
@@ -1309,7 +1555,6 @@ def test_parked_workers_get_a_final_provider_replay_before_mutation() -> None:
         lambda _item: stereo_control.StereoAction.RENDER,
     )
     mutations: list[str] = []
-    baseline = stereo_control.current_process_thread_count()
 
     with pytest.raises(
         stereo_control.StereoProviderChangedError,
@@ -1327,7 +1572,6 @@ def test_parked_workers_get_a_final_provider_replay_before_mutation() -> None:
         )
 
     assert mutations == []
-    assert stereo_control.current_process_thread_count() == baseline
 
 
 def test_downstream_mutation_input_change_is_typed_after_the_boundary() -> None:
@@ -1415,9 +1659,11 @@ def test_streaming_pipeline_propagates_first_worker_error_without_deadlock(
         assert f"injected {failure_stage} failure" in str(result[0])
 
 
+@pytest.mark.usefixtures("verify_joined_stereo_workers")
 def test_late_feeder_error_after_last_render_cannot_return_success() -> None:
     base = _provider(4)
     replay_count = 0
+    written = threading.Event()
 
     def replay():
         nonlocal replay_count
@@ -1425,7 +1671,7 @@ def test_late_feeder_error_after_last_render_cannot_return_success() -> None:
         current = replay_count
         yield from base.replay()
         if current == 4:
-            time.sleep(0.1)
+            assert written.wait(timeout=5), "the only rendered frame never reached the writer"
             raise stereo_control.StereoControlStateError("late feeder corruption")
 
     provider = stereo_control.ReplayableStereoProvider(base.generation, replay)
@@ -1437,7 +1683,6 @@ def test_late_feeder_error_after_last_render_cannot_return_success() -> None:
             else stereo_control.StereoAction.REUSE
         ),
     )
-    baseline = stereo_control.current_process_thread_count()
 
     with pytest.raises(
         stereo_control.StereoStageInputChangedError,
@@ -1450,11 +1695,9 @@ def test_late_feeder_error_after_last_render_cannot_return_success() -> None:
             effective_workers=1,
             decode=lambda item: bytearray(1024 * 1024),
             render=lambda payload: payload,
-            write=lambda _payload: None,
+            write=lambda _payload: written.set(),
             mutation=lambda: None,
         )
-
-    assert stereo_control.current_process_thread_count() == baseline
 
 
 def test_decoder_input_identity_mismatch_is_fatal_after_mutation() -> None:

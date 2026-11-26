@@ -4,8 +4,10 @@ from dataclasses import replace
 import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -13,6 +15,9 @@ from src.depth_surge_3d.processing.video import final_container_validation as va
 from src.depth_surge_3d.processing.video.encoding_provider import (
     FinalContainerExpectation,
     FinalContainerValidationError,
+)
+from src.depth_surge_3d.processing.video.final_publication import (
+    validate_final_container_evidence_v1,
 )
 
 
@@ -97,6 +102,27 @@ def final_media(tmp_path_factory):
         return path, expectation
 
     return load
+
+
+def test_publication_validates_the_opened_movie_with_real_ffmpeg(final_media):
+    path, expectation = final_media("libx264", False)
+    evidence = validate_final_container_evidence_v1(
+        path.parent,
+        path,
+        lambda opened: validation.validate_final_container_v4(opened, expectation),
+    )
+    assert evidence.byte_count == path.stat().st_size
+    assert evidence.raw_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="procfs file descriptors are Linux-specific")
+def test_unbound_descriptor_is_not_an_ordinary_movie_path(final_media):
+    path, expectation = final_media("libx264", False)
+    with path.open("rb") as handle:
+        with pytest.raises(validation.FinalContainerProcessError, match="not an ordinary file"):
+            validation.validate_final_container_v4(
+                Path(f"/proc/{os.getpid()}/fd/{handle.fileno()}"), expectation
+            )
 
 
 @pytest.mark.parametrize("codec", ["libx264", "libx265"])

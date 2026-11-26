@@ -11,7 +11,7 @@ elif [ -d "venv" ]; then
     source venv/bin/activate
 else
     echo "❌ Error: Virtual environment not found."
-    echo "   Run ./setup.sh first to create a virtual environment."
+    echo "   Follow docs/INSTALLATION.md and include the dev group."
     exit 1
 fi
 

@@ -15,10 +15,14 @@ import argparse
 import sys
 import signal
 import base64
+import stat
+import tempfile
 from dataclasses import asdict
 import json
 from datetime import datetime
-from pathlib import Path
+from ipaddress import ip_address
+from pathlib import Path, PureWindowsPath
+from threading import RLock, current_thread
 from typing import Any
 import cv2
 import numpy as np
@@ -38,6 +42,8 @@ warnings.filterwarnings("ignore", category=SyntaxWarning)  # moviepy old regex p
 # Import our constants and utilities
 from depth_surge_3d.core.constants import (  # noqa: E402
     DEFAULT_SETTINGS,
+    MODEL_PATHS,
+    MODEL_PATHS_METRIC,
     INTERMEDIATE_DIRS,
     SOCKETIO_PING_TIMEOUT,
     SOCKETIO_PING_INTERVAL,
@@ -56,7 +62,7 @@ from depth_surge_3d.core.constants import (  # noqa: E402
     VDPP_PROGRESS_STEP_WEIGHTS,
     PREVIEW_UPDATE_INTERVAL,
     PREVIEW_DOWNSCALE_WIDTH,
-    FFMPEG_OVERWRITE_FLAG,
+    SUPPORTED_VIDEO_FORMATS,
     FFMPEG_CRF_HIGH_QUALITY,
     FFMPEG_CRF_MEDIUM_QUALITY,
     FFMPEG_CRF_FAST_QUALITY,
@@ -84,11 +90,30 @@ from depth_surge_3d.core.settings import (  # noqa: E402
     resolve_temporal_postprocessor,
     validate_settings,
 )
-from depth_surge_3d.io.operations import get_video_properties  # noqa: E402
+from depth_surge_3d.io.operations import (  # noqa: E402
+    find_settings_file,
+    get_video_info_ffprobe,
+    get_video_properties,
+    load_processing_settings,
+)
+from depth_surge_3d.core.video_timing import (  # noqa: E402
+    MOTION_INTERPOLATION_UNAVAILABLE,
+    EncodingTimeline,
+    canonical_frame_rate,
+    probe_frame_rate,
+    rate_text,
+    selected_frame_range,
+)
+from depth_surge_3d.utils.path_utils import (  # noqa: E402
+    calculate_start_frame,
+    ffmpeg_frame_interval,
+)
+from depth_surge_3d.io.settings_artifact import validate_portable_final_component_v1  # noqa: E402
 from depth_surge_3d.utils.domain.resolution import resolve_depth_input_size  # noqa: E402
 
 from flask import Flask, render_template, request, jsonify  # noqa: E402
 from flask_socketio import SocketIO  # noqa: E402
+from werkzeug.wrappers import Request, Response  # noqa: E402
 from socketio.exceptions import (  # type: ignore[import-untyped]  # noqa: E402
     TimeoutError as SocketIOTimeoutError,
 )
@@ -103,7 +128,7 @@ from depth_surge_3d.io.resume import (  # noqa: E402
     resolve_resume_depth_model_version,
     resolve_resume_source_video,
 )
-from depth_surge_3d.io.job_lock import JobWriterLock  # noqa: E402
+from depth_surge_3d.io.job_lock import JobAlreadyLockedError, JobWriterLock  # noqa: E402
 from depth_surge_3d.vdpp_work import cleanup_vdpp_private_work  # noqa: E402
 from depth_surge_3d.processing.frames.depth_storage import (  # noqa: E402
     build_current_model_fingerprint,
@@ -115,7 +140,8 @@ from depth_surge_3d.processing.orchestration.execution_plan import (  # noqa: E4
 # Global flags and state
 VERBOSE = False
 SHUTDOWN_FLAG = False
-ACTIVE_PROCESSES = set()
+ACTIVE_PROCESSES: set[subprocess.Popen] = set()
+_MEDIA_PROCESS_LOCK = RLock()
 PROCESSING_CONFIGURATION_ACK_TIMEOUT = 5.0
 
 
@@ -187,6 +213,8 @@ def _resolve_new_web_stereo_settings(settings: dict[str, Any]) -> dict[str, Any]
     """Resolve omitted new-job controls without changing library defaults."""
 
     values = dict(settings)
+    if values.get("experimental_frame_interpolation") is True:
+        raise ValueError(MOTION_INTERPOLATION_UNAVAILABLE)
     values["stereo_render_mode"] = resolve_stereo_render_mode(
         persisted=None,
         override=values.get("stereo_render_mode"),
@@ -261,6 +289,20 @@ def _normalize_available_depth_backend_settings(settings: dict[str, Any]) -> dic
     if availability.install_command:
         error = f"{error}. Install with: {availability.install_command}"
     raise ValueError(error)
+
+
+def _check_web_model_selection(settings: dict[str, Any]) -> None:
+    """The desktop UI selects installed presets, never a client-specified checkpoint."""
+    model_path = settings.get("model_path")
+    if model_path is None:
+        return
+    spec = get_backend_spec(settings.get("depth_model_version", "v3"))
+    allowed = {value for v in spec.variants.values() for value in (v.backend_value, v.repo_id)}
+    if spec.backend_id == "v2":
+        allowed.update(MODEL_PATHS.values())
+        allowed.update(MODEL_PATHS_METRIC.values())
+    if not isinstance(model_path, str) or model_path not in allowed:
+        raise _WebRequestError("Custom model_path is only supported by the CLI", 400)
 
 
 def _depth_backend_options() -> list[dict[str, Any]]:
@@ -425,31 +467,50 @@ def print_banner() -> None:
     print()
 
 
-def cleanup_processes() -> None:
-    """Clean up any active processing threads or subprocesses"""
-    global SHUTDOWN_FLAG
-
-    SHUTDOWN_FLAG = True
-    vprint("Cleaning up active processes...")
-
-    # Kill any ffmpeg processes related to this app
+def _run_web_media(command: list[str], *, timeout: float) -> subprocess.CompletedProcess:
+    """Keep a handle to this server's child until its output is drained."""
+    with _MEDIA_PROCESS_LOCK:
+        if SHUTDOWN_FLAG:
+            raise RuntimeError("The desktop UI is shutting down")
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+        )
+        ACTIVE_PROCESSES.add(proc)
     try:
-        subprocess.run(["pkill", "-f", "ffmpeg.*depth-surge"], check=False, capture_output=True)
-    except Exception:
-        pass
-
-    # Clean up any tracked processes
-    for proc in list(ACTIVE_PROCESSES):
         try:
-            if hasattr(proc, "terminate"):
-                proc.terminate()
-            elif hasattr(proc, "kill"):
-                proc.kill()
-        except Exception:
-            pass
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except BaseException:
+            proc.kill()
+            proc.communicate()
+            raise
+        return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    finally:
+        with _MEDIA_PROCESS_LOCK:
+            ACTIVE_PROCESSES.discard(proc)
 
-    ACTIVE_PROCESSES.clear()
-    vprint("Process cleanup completed")
+
+def cleanup_processes() -> None:
+    """Stop only media children owned by this server, on explicit shutdown."""
+    global SHUTDOWN_FLAG
+    with _MEDIA_PROCESS_LOCK:
+        SHUTDOWN_FLAG = True
+        children = tuple(ACTIVE_PROCESSES)
+    for child in children:
+        try:
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=SIGNAL_SHUTDOWN_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=SIGNAL_SHUTDOWN_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            vprint(f"Could not stop a desktop media process: {exc}")
 
 
 def signal_handler(signum: int, frame: Any) -> None:
@@ -457,43 +518,69 @@ def signal_handler(signum: int, frame: Any) -> None:
     print(f"\nReceived signal {signum}, shutting down gracefully...")
 
     # Stop any active processing
-    if current_processing["active"]:
+    with _PROCESSING_LOCK:
+        active = current_processing["active"]
+        worker = current_processing["thread"]
+        if active:
+            current_processing["stop_requested"] = True
+    if active:
         print("   Stopping active video processing...")
-        current_processing["stop_requested"] = True
-        # Wait a moment for cleanup
-        if current_processing["thread"] and current_processing["thread"].is_alive():
-            current_processing["thread"].join(timeout=SIGNAL_SHUTDOWN_TIMEOUT)
+        if worker is not None and worker is not current_thread() and worker.is_alive():
+            worker.join(timeout=SIGNAL_SHUTDOWN_TIMEOUT)
 
     # Clean up all processes
     cleanup_processes()
     sys.exit(0)
 
 
+def _desktop_transport(application):
+    """Apply the same local peer, Host and Origin checks before HTTP or Socket.IO."""
+
+    def serve(environ, start_response):
+        incoming = Request(environ, shallow=True)
+        try:
+            local_peer = ip_address(incoming.remote_addr or "").is_loopback
+        except ValueError:
+            local_peer = False
+        scheme = incoming.scheme
+        port = environ.get("SERVER_PORT")
+        suffix = "" if (scheme, port) in {("http", "80"), ("https", "443")} else f":{port}"
+        host = incoming.host.lower()
+        allowed_hosts = {name + suffix for name in ("localhost", "127.0.0.1", "[::1]")}
+        origin = incoming.headers.get("Origin")
+        cross_site_post = (
+            incoming.method == "POST" and incoming.headers.get("Sec-Fetch-Site") == "cross-site"
+        )
+        if (
+            not local_peer
+            or host not in allowed_hosts
+            or (origin is not None and origin != f"{scheme}://{host}")
+            or cross_site_post
+        ):
+            denied = Response("Only local, same-origin desktop requests are accepted.", status=403)
+            return denied(environ, start_response)
+        return application(environ, start_response)
+
+    return serve
+
+
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "depth-surge-3d-secret"
+app.config["SECRET_KEY"] = os.urandom(32)
 app.config["OUTPUT_FOLDER"] = str(Path("output").resolve())
 # Use threading async_mode and disable ping timeout for long-running tasks
 socketio = SocketIO(
     app,
-    cors_allowed_origins="*",
     logger=False,
     engineio_logger=False,
     async_mode="threading",
     ping_timeout=SOCKETIO_PING_TIMEOUT,
     ping_interval=SOCKETIO_PING_INTERVAL,
 )
-
-
-@app.teardown_appcontext
-def cleanup_on_teardown(error: Exception | None) -> None:
-    """Clean up processes when Flask shuts down"""
-    if error:
-        vprint(f"App teardown due to error: {error}")
-    cleanup_processes()
+app.wsgi_app = _desktop_transport(app.wsgi_app)
 
 
 # Global variables for processing state
-current_processing = {
+_INITIAL_JOB_STATE = {
     "active": False,
     "progress": 0,
     "stage": "",
@@ -503,22 +590,88 @@ current_processing = {
     "stop_requested": False,
     "thread": None,
 }
+_PROCESSING_LOCK = RLock()
+current_processing: dict[str, Any] = dict(_INITIAL_JOB_STATE)
+_PUBLIC_JOB_FIELDS = (
+    "active",
+    "session_id",
+    "stop_requested",
+    "progress",
+    "stage",
+    "current_frame",
+    "total_frames",
+    "phase",
+    "step_name",
+    "step_progress",
+    "step_total",
+    "step_index",
+    "total_steps",
+    "eta",
+)
 
 
-def _is_active_job_session_id(session_id: object) -> bool:
-    """Accept only the canonical UUID room issued for the active job."""
+def _processing_status() -> dict[str, Any]:
+    with _PROCESSING_LOCK:
+        return {
+            key: current_processing[key] for key in _PUBLIC_JOB_FIELDS if key in current_processing
+        }
+
+
+def _release_processing_job(session_id: str) -> None:
+    with _PROCESSING_LOCK:
+        if current_processing["session_id"] == session_id:
+            current_processing.update(
+                active=False, session_id=None, stop_requested=False, thread=None
+            )
+
+
+def _run_claimed_job(session_id: str, *args: Any) -> None:
+    with _PROCESSING_LOCK:
+        if current_processing["session_id"] != session_id:
+            return
+        current_processing["thread"] = current_thread()
+    try:
+        process_video_async(session_id, *args)
+    finally:
+        _release_processing_job(session_id)
+
+
+def _start_processing_job(*args: Any) -> str:
+    session_id = str(uuid.uuid4())
+    with _PROCESSING_LOCK:
+        if current_processing["active"]:
+            raise _WebRequestError("Processing already in progress", 400)
+        current_processing.clear()
+        current_processing.update(_INITIAL_JOB_STATE, active=True, session_id=session_id)
+    try:
+        worker = socketio.start_background_task(_run_claimed_job, session_id, *args)
+    except BaseException:
+        with _PROCESSING_LOCK:
+            if current_processing["session_id"] == session_id:
+                if current_processing["thread"] is None:
+                    _release_processing_job(session_id)
+                else:
+                    # The launcher may have started its worker before reporting failure.
+                    current_processing["stop_requested"] = True
+        raise
+    with _PROCESSING_LOCK:
+        if current_processing["session_id"] == session_id:
+            current_processing["thread"] = worker
+    return session_id
+
+
+def _active_session_snapshot(session_id: object) -> dict[str, Any] | None:
+    """Return the issuing job's state when joining its canonical UUID room."""
     if not isinstance(session_id, str):
-        return False
+        return None
     try:
         parsed = uuid.UUID(session_id)
     except ValueError:
-        return False
-    return (
-        parsed.version == 4
-        and str(parsed) == session_id
-        and current_processing.get("active") is True
-        and current_processing.get("session_id") == session_id
-    )
+        return None
+    if parsed.version != 4 or str(parsed) != session_id:
+        return None
+    status = _processing_status()
+    return status if status["active"] and status["session_id"] == session_id else None
 
 
 def _acknowledge_processing_configuration(requester_socket_id: str, report: dict[str, Any]) -> None:
@@ -544,7 +697,98 @@ def _acknowledge_processing_configuration(requester_socket_id: str, report: dict
 
 def ensure_directories() -> None:
     """Ensure output directory exists"""
-    Path(app.config["OUTPUT_FOLDER"]).mkdir(exist_ok=True)
+    Path(app.config["OUTPUT_FOLDER"]).mkdir(parents=True, exist_ok=True)
+
+
+class _WebRequestError(ValueError):
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@app.errorhandler(_WebRequestError)
+def _invalid_web_request(error):
+    return jsonify({"success": False, "error": str(error)}), error.status_code
+
+
+def _json_object() -> dict[str, Any]:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise _WebRequestError("Request body must be a JSON object", 400)
+    return data
+
+
+def _web_video_filename(value: object) -> str:
+    try:
+        name = validate_portable_final_component_v1(value)
+    except ValueError as exc:
+        raise _WebRequestError("Use a video filename without a directory path", 400) from exc
+    if (
+        PureWindowsPath(name).is_reserved()
+        or Path(name).suffix.lower() not in SUPPORTED_VIDEO_FORMATS
+    ):
+        raise _WebRequestError("Use a filename with a supported video extension", 400)
+    return name
+
+
+def _is_reparse_point(info: os.stat_result) -> bool:
+    return bool(getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _check_job_contents(job: Path) -> None:
+    """Independent readers and encoders must not be handed a redirected job tree."""
+    directories = [os.fspath(job)]
+    while directories:
+        with os.scandir(directories.pop()) as entries:
+            for entry in entries:
+                if entry.is_symlink() or (
+                    os.name == "nt" and _is_reparse_point(entry.stat(follow_symlinks=False))
+                ):
+                    raise _WebRequestError("Web jobs cannot contain linked files or folders", 403)
+                if entry.is_dir(follow_symlinks=False):
+                    directories.append(entry.path)
+                elif not entry.is_file(follow_symlinks=False):
+                    raise _WebRequestError(
+                        "Web jobs can contain only regular files and folders", 403
+                    )
+
+
+def _managed_job_directory(value: object, *, inspect_contents: bool = True) -> Path:
+    """Accept existing, immediate job directories, not the collection or its aliases."""
+    if not isinstance(value, (str, Path)) or not str(value).strip() or "\x00" in str(value):
+        raise _WebRequestError("A job directory path is required", 400)
+    configured_root = Path(os.path.abspath(app.config["OUTPUT_FOLDER"]))
+    root = configured_root.resolve()
+    roots = (configured_root, root)
+    supplied = Path(value)
+    job = Path(os.path.abspath(supplied))
+    if ".." in supplied.parts or job in roots or job.parent not in roots:
+        raise _WebRequestError("Select a job directly inside the managed output folder", 403)
+    job = root / job.name
+    try:
+        info = job.lstat()
+        if stat.S_ISLNK(info.st_mode) or _is_reparse_point(info):
+            raise _WebRequestError("Linked job directories are not supported", 403)
+        if not stat.S_ISDIR(info.st_mode):
+            raise _WebRequestError("Select a job directory, not a file", 400)
+        if inspect_contents:
+            _check_job_contents(job)
+    except FileNotFoundError as exc:
+        raise _WebRequestError("Job directory or one of its files no longer exists", 404) from exc
+    except OSError as exc:
+        raise _WebRequestError("Could not inspect the managed job directory", 403) from exc
+    return job
+
+
+def _load_incomplete_web_settings(settings_file: Path | None) -> dict[str, Any] | None:
+    if settings_file is None:
+        return None
+    saved = load_processing_settings(settings_file)
+    if not isinstance(saved, dict) or not isinstance(saved.get("metadata", {}), dict):
+        raise _WebRequestError("Could not read resume metadata", 409)
+    if saved.get("metadata", {}).get("processing_status") == "completed":
+        raise _WebRequestError("This job is already completed. Start a new job instead.", 409)
+    return saved
 
 
 def get_video_info(video_path: str | Path) -> dict[str, Any] | None:
@@ -588,12 +832,14 @@ def find_source_video(directory: Path) -> Path | None:
     Returns:
         Path to source video, or None if not found
     """
-    video_extensions = [".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"]
-
-    for ext in video_extensions:
-        for video_file in directory.glob(f"*{ext}"):
-            # Skip processed output files (they contain _3D_)
-            if "_3D_" not in video_file.name:
+    files = list(directory.iterdir())
+    for ext in SUPPORTED_VIDEO_FORMATS:
+        for video_file in files:
+            if (
+                video_file.suffix.lower() == ext
+                and "_3D_" not in video_file.name
+                and video_file.is_file()
+            ):
                 return video_file
 
     return None
@@ -644,6 +890,8 @@ class ProgressCallback:
         temporal_postprocessor: str = "off",
     ) -> None:
         self.session_id = session_id
+        with _PROCESSING_LOCK:
+            self._owned_job = current_processing["session_id"] == session_id
         self.total_frames = total_frames
         self.current_frame = 0
         self.last_update_time = 0
@@ -691,7 +939,11 @@ class ProgressCallback:
     def is_cancelled(self) -> bool:
         """Return the shared user-stop state without emitting progress."""
 
-        return bool(current_processing.get("stop_requested", False))
+        with _PROCESSING_LOCK:
+            owner = current_processing["session_id"]
+            if self._owned_job and owner != self.session_id:
+                return True
+            return owner in (None, self.session_id) and current_processing["stop_requested"]
 
     def send_preview_frame(
         self,
@@ -964,7 +1216,7 @@ class ProgressCallback:
         import time
 
         # Check if stop has been requested
-        if current_processing.get("stop_requested", False):
+        if self.is_cancelled():
             raise InterruptedError("Processing stopped by user request")
 
         # Throttle updates to avoid threading issues
@@ -998,9 +1250,6 @@ class ProgressCallback:
 
         if frame_num is not None:
             self.current_frame = frame_num
-            current_processing["current_frame"] = frame_num
-
-        current_processing["stage"] = stage
 
         # Calculate overall progress using weighted steps
         step_progress_ratio = (
@@ -1016,19 +1265,12 @@ class ProgressCallback:
 
         progress = round(cumulative_weight * 100, PROGRESS_DECIMAL_PLACES)
 
-        current_processing["progress"] = round(progress, PROGRESS_DECIMAL_PLACES)
-        current_processing["phase"] = self.current_phase
-        current_processing["step_name"] = step_name or self.current_step_name
-        current_processing["step_progress"] = self.step_progress
-        current_processing["step_total"] = self.step_total
-        current_processing["step_index"] = self.current_step_index
-
         # Calculate ETA
         eta_str = self._calculate_eta(progress)
 
         # Emit progress update (always include step data for UI)
         progress_data = {
-            "progress": current_processing["progress"],
+            "progress": progress,
             "stage": stage,
             "current_frame": self.current_frame,
             "total_frames": self.total_frames,
@@ -1040,6 +1282,11 @@ class ProgressCallback:
             "total_steps": len(self.steps),
             "eta": eta_str,  # Add ETA
         }
+
+        with _PROCESSING_LOCK:
+            owner = current_processing["session_id"]
+            if owner == self.session_id or (owner is None and not self._owned_job):
+                current_processing.update(progress_data)
 
         # Console output - show both overall and step progress
         step_percent = (
@@ -1100,12 +1347,23 @@ def process_video_async(  # noqa: C901
     projector = None
     job_lock = None
     try:
-        current_processing["active"] = True
-        current_processing["session_id"] = session_id
-        current_processing["stop_requested"] = False
+        with _PROCESSING_LOCK:
+            if (
+                current_processing["session_id"] == session_id
+                and current_processing["stop_requested"]
+            ):
+                raise InterruptedError("Processing stopped by user request")
         resolved_output_dir = Path(output_dir).resolve()
         resolved_output_dir.mkdir(parents=True, exist_ok=True)
         job_lock = JobWriterLock(resolved_output_dir).acquire()
+        existing_settings = None
+        if resume_context is not None:
+            # Another writer may have finished between the HTTP check and this lock.
+            existing_settings = _load_incomplete_web_settings(
+                find_settings_file(resolved_output_dir)
+            )
+        elif (fixed := resolved_output_dir / "processing-settings-v5.json").is_file():
+            existing_settings = load_processing_settings(fixed)
         cleanup_vdpp_private_work(resolved_output_dir, job_lock)
 
         selected_artifact = None
@@ -1236,22 +1494,15 @@ def process_video_async(  # noqa: C901
             resolved_temporal = settings.get("temporal_postprocessor", "off")
             settings = dict(resume_report.migrated_settings)
             settings.setdefault("temporal_postprocessor", resolved_temporal)
+            if "video_path" in settings:
+                settings["video_path"] = str(video_path)
 
         video_info = video_properties
-
-        # Calculate expected frame count based on time range and ORIGINAL fps (since we extract at original fps)
-        start_time = settings.get("start_time")
-        end_time = settings.get("end_time")
-
-        # Always use original FPS for frame count calculation (interpolation happens at the end)
-        original_fps = video_info["fps"]
-
-        # Calculate actual frame range that will be extracted (matching VideoProcessor logic)
-        from depth_surge_3d.utils.path_utils import calculate_frame_range
-
-        start_frame, end_frame = calculate_frame_range(
-            video_info["frame_count"], original_fps, start_time, end_time
-        )
+        saved_video = (existing_settings or {}).get("video_properties")
+        if isinstance(saved_video, dict) and "frame_rate" not in saved_video:
+            video_info = dict(video_info)
+            video_info.pop("frame_rate", None)
+        start_frame, end_frame = selected_frame_range(video_info, settings)
         expected_frames = end_frame - start_frame
 
         enable_live_preview = settings.get("enable_live_preview", True)
@@ -1395,10 +1646,6 @@ def process_video_async(  # noqa: C901
                 print(console_warning(f"Error unloading depth model: {cleanup_error}"))
         if job_lock is not None:
             job_lock.release()
-        current_processing["active"] = False
-        current_processing["session_id"] = None
-        current_processing["stop_requested"] = False
-        current_processing["thread"] = None
 
 
 @app.route("/")
@@ -1416,15 +1663,21 @@ def upload_video() -> tuple[dict[str, Any], int] | tuple[Any, int]:
         return jsonify({"error": "No video file provided"}), 400
 
     file = request.files["video"]
-    if file.filename == "":
+    if not file.filename:
         return jsonify({"error": "No file selected"}), 400
 
     # Create timestamped output directory with sanitized filename
-    original_filename = sanitize_filename(file.filename)
-    video_name = Path(original_filename).stem
+    original_filename = _web_video_filename(sanitize_filename(file.filename))
+    video_name = Path(original_filename).stem[:48]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(app.config["OUTPUT_FOLDER"]) / f"{int(time.time())}_{video_name}_{timestamp}"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_directories()
+    output_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f"{int(time.time())}_{video_name}_",
+            suffix=f"_{timestamp}",
+            dir=app.config["OUTPUT_FOLDER"],
+        )
+    )
     vprint(f"Created output directory: {output_dir}")
     vprint(f"  Directory exists: {output_dir.exists()}")
 
@@ -1443,7 +1696,7 @@ def upload_video() -> tuple[dict[str, Any], int] | tuple[Any, int]:
     audio_path = output_dir / "original_audio.flac"
     try:
         # First check if video has an audio stream
-        probe_result = subprocess.run(
+        probe_result = _run_web_media(
             [
                 "ffprobe",
                 "-v",
@@ -1456,18 +1709,16 @@ def upload_video() -> tuple[dict[str, Any], int] | tuple[Any, int]:
                 "default=noprint_wrappers=1:nokey=1",
                 str(video_path),
             ],
-            capture_output=True,
-            text=True,
             timeout=10,
         )
 
         if probe_result.stdout.strip() == "audio":
             # Video has audio, extract it
             print(f"Extracting audio to: {audio_path}")
-            result = subprocess.run(
+            result = _run_web_media(
                 [
                     "ffmpeg",
-                    "-y",  # Overwrite existing files
+                    "-n",
                     "-i",
                     str(video_path),
                     "-vn",  # No video
@@ -1477,8 +1728,6 @@ def upload_video() -> tuple[dict[str, Any], int] | tuple[Any, int]:
                     "8",  # Maximum compression (still lossless)
                     str(audio_path),
                 ],
-                capture_output=True,
-                text=True,
                 timeout=60,
             )
             if result.returncode != 0:
@@ -1512,14 +1761,19 @@ def upload_video() -> tuple[dict[str, Any], int] | tuple[Any, int]:
 @app.route("/process", methods=["POST"])
 def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:  # noqa: C901
     """Start video processing"""
-    if current_processing["active"]:
+    if _processing_status()["active"]:
         return jsonify({"error": "Processing already in progress"}), 400
 
-    data = request.json
+    data = _json_object()
     output_dir_str = data.get("output_dir")
     settings = data.get("settings", {})
 
     try:
+        if not isinstance(settings, dict):
+            raise ValueError("settings must be a JSON object")
+        if settings.get("video_path") is not None:
+            raise ValueError("video_path is selected from the managed job, not the request")
+        _check_web_model_selection(settings)
         settings = _resolve_new_web_stereo_settings(settings)
         settings = _normalize_available_depth_backend_settings(settings)
         settings = _validate_web_settings(settings, source="explicit")
@@ -1531,32 +1785,8 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:  # noqa:
         if settings.get("device") == "cpu" or not torch.cuda.is_available():
             return jsonify({"error": "VDPP generation requires CUDA"}), 400
 
-    if not output_dir_str:
-        return jsonify({"error": "No output directory provided"}), 400
-
-    output_dir = Path(output_dir_str).resolve()  # Resolve to absolute path
+    output_dir = _managed_job_directory(output_dir_str)
     vprint(f"Processing request for output directory: {output_dir}")
-
-    # Security: Ensure output_dir is within OUTPUT_FOLDER (prevent path traversal)
-    allowed_base = Path(app.config["OUTPUT_FOLDER"]).resolve()
-    try:
-        output_dir.relative_to(allowed_base)
-    except ValueError:
-        vprint("ERROR: Path traversal attempt detected!")
-        vprint(f"  Requested path: {output_dir}")
-        vprint(f"  Allowed base: {allowed_base}")
-        return (
-            jsonify({"error": "Invalid output directory: must be within output folder"}),
-            403,
-        )
-
-    if not output_dir.exists():
-        vprint("ERROR: Output directory not found!")
-        vprint(f"  Requested path: {output_dir_str}")
-        vprint(f"  Resolved path: {output_dir}")
-        vprint(f"  Exists: {output_dir.exists()}")
-        vprint(f"  Current working directory: {Path.cwd()}")
-        return jsonify({"error": f"Output directory not found: {output_dir}"}), 404
 
     # Find the source video file in output directory
     video_path = find_source_video(output_dir)
@@ -1585,28 +1815,9 @@ def start_processing() -> tuple[dict[str, Any], int] | tuple[Any, int]:  # noqa:
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
-    # Generate session ID
-    session_id = str(uuid.uuid4())
-    current_processing["active"] = True
-    current_processing["session_id"] = session_id
-
-    # Start processing in background using socketio's method for proper context handling
-    try:
-        thread = socketio.start_background_task(
-            process_video_async,
-            session_id,
-            requester_socket_id,
-            video_path,
-            settings,
-            output_dir,
-            None,
-            video_properties,
-        )
-    except Exception:
-        current_processing["active"] = False
-        current_processing["session_id"] = None
-        raise
-    current_processing["thread"] = thread
+    session_id = _start_processing_job(
+        requester_socket_id, video_path, settings, output_dir, None, video_properties
+    )
 
     return jsonify({"success": True, "session_id": session_id, "output_dir": str(output_dir)})
 
@@ -1617,22 +1828,14 @@ def stop_processing() -> dict[str, Any]:
     data = request.json
     session_id = data.get("session_id")
 
-    if not current_processing["active"]:
-        return jsonify({"success": False, "error": "No processing currently active"})
-
-    if session_id != current_processing["session_id"]:
-        return jsonify({"success": False, "error": "Invalid session ID"})
-
-    # Request stop
-    current_processing["stop_requested"] = True
+    with _PROCESSING_LOCK:
+        if not current_processing["active"]:
+            return jsonify({"success": False, "error": "No processing currently active"})
+        if session_id != current_processing["session_id"]:
+            return jsonify({"success": False, "error": "Invalid session ID"})
+        current_processing["stop_requested"] = True
 
     return jsonify({"success": True, "message": "Stop request sent"})
-
-
-class _ResumeRequestError(ValueError):
-    def __init__(self, message: str, status_code: int) -> None:
-        super().__init__(message)
-        self.status_code = status_code
 
 
 def _prepare_resume_request(  # noqa: C901
@@ -1641,7 +1844,7 @@ def _prepare_resume_request(  # noqa: C901
     """Validate resume overrides and constrain the requested output directory."""
 
     if not isinstance(data, dict):
-        raise _ResumeRequestError("Request body must be a JSON object", 400)
+        raise _WebRequestError("Request body must be a JSON object", 400)
 
     output_dir = data.get("output_dir")
     migrate_legacy = data.get("migrate_legacy", "archive")
@@ -1664,21 +1867,9 @@ def _prepare_resume_request(  # noqa: C901
     try:
         validated = validate_settings(resume_overrides, source="explicit")
     except (TypeError, ValueError) as exc:
-        raise _ResumeRequestError(str(exc), 400) from exc
+        raise _WebRequestError(str(exc), 400) from exc
 
-    if not output_dir:
-        raise _ResumeRequestError("No output directory provided", 400)
-    output_path = Path(output_dir).resolve()
-    allowed_base = Path(app.config["OUTPUT_FOLDER"]).resolve()
-    try:
-        output_path.relative_to(allowed_base)
-    except ValueError as exc:
-        raise _ResumeRequestError(
-            "Output directory must be within the managed output folder",
-            403,
-        ) from exc
-    if not output_path.exists():
-        raise _ResumeRequestError("Output directory does not exist", 404)
+    output_path = _managed_job_directory(output_dir)
 
     selected_dtype = validated.get("raw_storage_dtype") if raw_storage_dtype is not None else None
     selected_temporal = validated["temporal_postprocessor"] if temporal_present else None
@@ -1697,24 +1888,25 @@ def _prepare_resume_request(  # noqa: C901
 @app.route("/resume", methods=["POST"])
 def resume_processing():  # noqa: C901
     """Resume processing from a previous interrupted batch"""
-    if current_processing["active"]:
+    if _processing_status()["active"]:
         return jsonify({"error": "Processing already in progress"}), 400
 
-    try:
-        (
-            output_path,
-            migrate_legacy,
-            raw_storage_dtype,
-            temporal_override,
-            stereo_override,
-            fill_limit_override,
-        ) = _prepare_resume_request(request.json)
-    except _ResumeRequestError as exc:
-        return jsonify({"error": str(exc)}), exc.status_code
-
-    from depth_surge_3d.io.operations import find_settings_file
+    (
+        output_path,
+        migrate_legacy,
+        raw_storage_dtype,
+        temporal_override,
+        stereo_override,
+        fill_limit_override,
+    ) = _prepare_resume_request(_json_object())
 
     settings_file = find_settings_file(output_path)
+    try:
+        settings = detect_resume_settings(output_path, settings_file=settings_file)
+    except _WebRequestError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        return jsonify({"error": f"Could not read resume settings: {exc}"}), 409
     try:
         source_video = resolve_resume_source_video(
             output_path,
@@ -1722,16 +1914,12 @@ def resume_processing():  # noqa: C901
         )
     except (OSError, TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 409
-    # Try to detect settings from existing files/directories
-    try:
-        settings = detect_resume_settings(output_path, settings_file=settings_file)
-    except (OSError, TypeError, ValueError) as exc:
-        return jsonify({"error": f"Could not read resume settings: {exc}"}), 409
     settings["depth_model_version"] = resolve_resume_depth_model_version(
         settings,
         output_path,
         default="v3",
     )
+    _check_web_model_selection(settings)
     settings["migrate_legacy"] = migrate_legacy
     if raw_storage_dtype is not None:
         settings["raw_storage_dtype"] = raw_storage_dtype
@@ -1768,27 +1956,13 @@ def resume_processing():  # noqa: C901
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
-    # Generate session ID
-    session_id = str(uuid.uuid4())
-    current_processing["active"] = True
-    current_processing["session_id"] = session_id
-
-    # Start processing in background using socketio's method for proper context handling
-    try:
-        thread = socketio.start_background_task(
-            process_video_async,
-            session_id,
-            requester_socket_id,
-            source_video,
-            settings,
-            output_path,
-            {"migration_mode": migrate_legacy, "settings_file": settings_file},
-        )
-    except Exception:
-        current_processing["active"] = False
-        current_processing["session_id"] = None
-        raise
-    current_processing["thread"] = thread
+    session_id = _start_processing_job(
+        requester_socket_id,
+        source_video,
+        settings,
+        output_path,
+        {"migration_mode": migrate_legacy, "settings_file": settings_file},
+    )
 
     return jsonify(
         {
@@ -1814,12 +1988,10 @@ def detect_resume_settings(output_path, *, settings_file=None):
 
     # A resume must use the exact model and geometry from the interrupted run.
     # Directory-shape inference is only a fallback for legacy jobs without metadata.
-    from depth_surge_3d.io.operations import find_settings_file, load_processing_settings
-
     selected = settings_file or find_settings_file(output_path)
     settings_files = [selected] if selected is not None else []
     for settings_file in settings_files:
-        saved_data = load_processing_settings(settings_file)
+        saved_data = _load_incomplete_web_settings(settings_file)
         saved_settings = saved_data.get("processing_settings") if saved_data else None
         if isinstance(saved_settings, dict):
             metadata = saved_data.get("metadata", {})
@@ -1861,13 +2033,49 @@ def detect_resume_settings(output_path, *, settings_file=None):
 @app.route("/status")
 def get_status():
     """Get current processing status"""
-    return jsonify(current_processing)
+    return jsonify(_processing_status())
 
 
 @app.route("/system_info")
 def get_system_info_endpoint():
     """Get system information"""
     return jsonify(get_system_info())
+
+
+def _resumable_job_summary(candidate: Path) -> dict[str, Any] | None:
+    try:
+        batch_dir = _managed_job_directory(candidate, inspect_contents=False)
+        if not os.path.lexists(batch_dir / INTERMEDIATE_DIRS["frames"]) or any(
+            batch_dir.glob("*_3D_*.mp4")
+        ):
+            return None
+        _check_job_contents(batch_dir)
+    except (_WebRequestError, OSError):
+        return None
+
+    # Check for source video file
+    source_video = find_source_video(batch_dir)
+
+    if not source_video:
+        return None
+
+    analysis = analyze_batch_directory(batch_dir)
+    job = {
+        "path": str(batch_dir),
+        "name": batch_dir.name,
+        "highest_stage": analysis.get("highest_stage", "unknown"),
+        "frame_count": analysis.get("frame_count", 0),
+        "vr_format": analysis.get("vr_format", "unknown"),
+        "resolution": analysis.get("resolution", "unknown"),
+    }
+    try:
+        resume_settings = detect_resume_settings(batch_dir)
+        job["temporal_postprocessor"] = resume_settings.get("temporal_postprocessor", "off")
+    except _WebRequestError:
+        return None
+    except (OSError, TypeError, ValueError):
+        pass
+    return job
 
 
 @app.route("/detect_resumable")
@@ -1881,39 +2089,11 @@ def detect_resumable_jobs():
 
     try:
         # Scan output directories for incomplete jobs
-        for batch_dir in output_folder.iterdir():
-            if not batch_dir.is_dir():
+        for candidate in output_folder.iterdir():
+            job = _resumable_job_summary(candidate)
+            if job is None:
                 continue
-
-            # Check for source video file
-            source_video = find_source_video(batch_dir)
-
-            if not source_video:
-                continue
-
-            # Check if processing is incomplete (has frames but no final video)
-            has_frames = (batch_dir / INTERMEDIATE_DIRS["frames"]).exists()
-            has_final_video = any(batch_dir.glob("*_3D_*.mp4"))
-
-            if has_frames and not has_final_video:
-                # This is a resumable job
-                analysis = analyze_batch_directory(batch_dir)
-                job = {
-                    "path": str(batch_dir),
-                    "name": batch_dir.name,
-                    "highest_stage": analysis.get("highest_stage", "unknown"),
-                    "frame_count": analysis.get("frame_count", 0),
-                    "vr_format": analysis.get("vr_format", "unknown"),
-                    "resolution": analysis.get("resolution", "unknown"),
-                }
-                try:
-                    resume_settings = detect_resume_settings(batch_dir)
-                    job["temporal_postprocessor"] = resume_settings.get(
-                        "temporal_postprocessor", "off"
-                    )
-                except (OSError, TypeError, ValueError):
-                    pass
-                resumable_jobs.append(job)
+            resumable_jobs.append(job)
 
         # Sort by modification time (most recent first)
         resumable_jobs.sort(key=lambda x: Path(x["path"]).stat().st_mtime, reverse=True)
@@ -1928,11 +2108,7 @@ def detect_resumable_jobs():
 @app.route("/open_directory", methods=["POST"])
 def open_directory():
     """Open directory in file explorer"""
-    data = request.json
-    directory_path = data.get("path")
-
-    if not directory_path or not os.path.exists(directory_path):
-        return jsonify({"success": False, "error": "Invalid directory path"})
+    directory_path = str(_managed_job_directory(_json_object().get("path"), inspect_contents=False))
 
     try:
         system = platform.system()
@@ -2043,6 +2219,90 @@ def analyze_batch_directory(batch_path):  # noqa: C901
     return analysis
 
 
+_STITCHED_VIDEO_COMMENT = "Depth Surge 3D manual frame export"
+
+
+def _stitch_source(batch_path, settings_file, metadata):
+    """Prefer the recorded local source; never mistake our previous export for it."""
+    if metadata.get("source_video") or metadata.get("source_video_name"):
+        try:
+            source = resolve_resume_source_video(batch_path, settings_file=settings_file)
+        except ValueError:
+            return None, {}
+        return source, get_video_info_ffprobe(str(source))
+
+    candidates = []
+    for path in batch_path.iterdir():
+        name = path.name.lower()
+        if (
+            not path.is_file()
+            or path.suffix.lower() not in SUPPORTED_VIDEO_FORMATS
+            or "_3d_" in name
+            or "_stitched_" in name
+        ):
+            continue
+        info = get_video_info_ffprobe(str(path))
+        tags = info.get("format", {}).get("tags", {})
+        if any(k.lower() == "comment" and v == _STITCHED_VIDEO_COMMENT for k, v in tags.items()):
+            continue
+        candidates.append((path, info))
+        if len(candidates) > 1:
+            raise ValueError("Cannot identify the original video among multiple files in this job")
+    return candidates[0] if candidates else (None, {})
+
+
+def _stitch_media_inputs(batch_path, target, include_audio, frame_count):
+    settings_file = find_settings_file(batch_path)
+    saved = load_processing_settings(settings_file) if settings_file is not None else {}
+    if not isinstance(saved, dict):
+        raise ValueError("Could not read the saved job settings")
+    properties = saved.get("video_properties", {})
+    processing = saved.get("processing_settings", {})
+    source_rate = canonical_frame_rate(properties.get("frame_rate")) or canonical_frame_rate(
+        processing.get("source_fps")
+    )
+    audio = batch_path / "original_audio.flac" if include_audio else None
+    if audio is not None and not audio.is_file():
+        audio = None
+    if source_rate is None or (include_audio and audio is None):
+        source, info = _stitch_source(batch_path, settings_file, saved.get("metadata", {}))
+        stream = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), {})
+        source_rate = (
+            source_rate
+            or probe_frame_rate(stream)
+            or processing.get("source_fps")
+            or properties.get("fps")
+        )
+        if source_rate is None:
+            if settings_file is not None or source is not None:
+                raise ValueError("Cannot determine the source frame rate for this job")
+            source_rate = DEFAULT_FALLBACK_FPS if target in (None, "original") else target
+        if (
+            include_audio
+            and audio is None
+            and any(s.get("codec_type") == "audio" for s in info.get("streams", []))
+        ):
+            audio = source
+    timeline = EncodingTimeline.resolve(source_rate, target)
+    audio_args = []
+    if audio is not None:
+        clock = (
+            timeline.source
+            if properties.get("frame_rate") or not properties.get("fps")
+            else float(properties["fps"])
+        )
+        start_frame = calculate_start_frame(
+            properties.get("frame_count"), clock, processing.get("start_time")
+        )
+        start, duration = ffmpeg_frame_interval(
+            start_frame, start_frame + frame_count, timeline.source
+        )
+        if start_frame:
+            audio_args.extend(["-ss", start])
+        audio_args.extend(["-t", duration, "-i", str(audio)])
+    return timeline, audio_args
+
+
 def create_video_from_batch(batch_path, settings):  # noqa: C901
     """Create video from batch frames using FFmpeg"""
     frame_source = settings.get("frame_source", "auto")
@@ -2059,9 +2319,13 @@ def create_video_from_batch(batch_path, settings):  # noqa: C901
     if not frame_dir or not frame_dir.exists():
         raise Exception(f"Frame directory not found: {frame_dir}")
 
-    frame_files = sorted(frame_dir.glob("*.png"))
-    if not frame_files:
+    frame_names = {path.name for path in frame_dir.glob("frame_*.png")}
+    if not frame_names:
         raise Exception(f"No frames found in {frame_dir}")
+    first_index = 0 if "frame_000000.png" in frame_names else 1
+    indices = range(first_index, first_index + len(frame_names))
+    if any(f"frame_{n:06d}.png" not in frame_names for n in indices):
+        raise ValueError("Expected a contiguous sequence of numbered VR frames")
 
     # Determine output filename
     if not output_filename:
@@ -2069,14 +2333,29 @@ def create_video_from_batch(batch_path, settings):  # noqa: C901
         timestamp = datetime.now().strftime("%H%M%S")
         output_filename = f"{batch_name}_stitched_{timestamp}.mp4"
 
-    output_path = batch_path / output_filename
+    output_path = batch_path / _web_video_filename(output_filename)
+    if os.path.lexists(output_path):
+        raise _WebRequestError("That filename already exists. Choose a new name.", 409)
 
-    # Build FFmpeg command
-    cmd = ["ffmpeg", FFMPEG_OVERWRITE_FLAG]
-
-    # Input frames
-    cmd.extend(["-framerate", str(fps) if fps != "original" else str(DEFAULT_FALLBACK_FPS)])
-    cmd.extend(["-i", str(frame_dir / "frame_%06d.png")])
+    timeline, audio_args = _stitch_media_inputs(batch_path, fps, include_audio, len(frame_names))
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-n",
+        "-framerate",
+        rate_text(timeline.source),
+        "-start_number",
+        str(first_index),
+        "-i",
+        str(frame_dir / "frame_%06d.png"),
+        *audio_args,
+        "-map",
+        "0:v:0",
+        "-vf",
+        timeline.video_filter,
+    ]
+    if audio_args:
+        cmd.extend(["-map", "1:a:0?", "-c:a", "aac"])
 
     # Quality settings
     quality_map = {
@@ -2089,29 +2368,23 @@ def create_video_from_batch(batch_path, settings):  # noqa: C901
     cmd.extend(["-c:v", "libx264", "-crf", crf, "-preset", FFMPEG_DEFAULT_PRESET])
     cmd.extend(["-pix_fmt", FFMPEG_PIX_FORMAT])  # For compatibility
 
-    # Add audio if requested and available - use pre-extracted audio file
-    if include_audio:
-        # Look for pre-extracted audio file in batch directory
-        audio_file = batch_path / "original_audio.flac"
-        if audio_file.exists():
-            cmd.extend(["-i", str(audio_file)])
-            cmd.extend(["-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0"])
-        else:
-            # Fallback: look for source video in batch directory
-            source_video = find_source_video(batch_path)
-            if source_video:
-                cmd.extend(["-i", str(source_video)])
-                cmd.extend(["-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0"])
+    cmd.extend(["-metadata", f"comment={_STITCHED_VIDEO_COMMENT}"])
 
-    cmd.append(str(output_path))
-
-    # Execute FFmpeg
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=VIDEO_CREATION_TIMEOUT)
-        if result.returncode != 0:
-            raise Exception(f"FFmpeg error: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        raise Exception("Video creation timed out")
+    # Publish a complete movie without replacing a destination created during encoding.
+    with tempfile.TemporaryDirectory(prefix=".stitch-", dir=batch_path) as staging:
+        encoded = Path(staging) / ("video" + output_path.suffix.lower())
+        try:
+            result = _run_web_media([*cmd, str(encoded)], timeout=VIDEO_CREATION_TIMEOUT)
+            if result.returncode != 0:
+                raise ValueError(f"FFmpeg error: {result.stderr}")
+            if os.name == "nt":
+                encoded.rename(output_path)  # Windows rename never replaces an existing file.
+            else:
+                os.link(encoded, output_path)
+        except FileExistsError as exc:
+            raise _WebRequestError("That filename already exists. Choose a new name.", 409) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("Video creation timed out") from exc
 
     return output_path
 
@@ -2119,15 +2392,7 @@ def create_video_from_batch(batch_path, settings):  # noqa: C901
 @app.route("/analyze_batch", methods=["POST"])
 def analyze_batch():
     """Analyze a batch directory for video stitching"""
-    data = request.json
-    batch_dir = data.get("batch_dir")
-
-    if not batch_dir:
-        return jsonify({"success": False, "error": "No batch directory provided"})
-
-    batch_path = Path(batch_dir)
-    if not batch_path.exists():
-        return jsonify({"success": False, "error": "Batch directory does not exist"})
+    batch_path = _managed_job_directory(_json_object().get("batch_dir"))
 
     try:
         analysis = analyze_batch_directory(batch_path)
@@ -2139,19 +2404,17 @@ def analyze_batch():
 @app.route("/stitch_video", methods=["POST"])
 def stitch_video():
     """Create video from batch frames"""
-    data = request.json
-    batch_dir = data.get("batch_dir")
-
-    if not batch_dir:
-        return jsonify({"success": False, "error": "No batch directory provided"})
-
-    batch_path = Path(batch_dir)
-    if not batch_path.exists():
-        return jsonify({"success": False, "error": "Batch directory does not exist"})
+    data = _json_object()
+    batch_path = _managed_job_directory(data.get("batch_dir"))
 
     try:
-        output_path = create_video_from_batch(batch_path, data)
+        with JobWriterLock(batch_path):
+            output_path = create_video_from_batch(batch_path, data)
         return jsonify({"success": True, "output_path": str(output_path)})
+    except _WebRequestError:
+        raise
+    except JobAlreadyLockedError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 409
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
@@ -2173,7 +2436,8 @@ def handle_disconnect():
 @socketio.on("join_session")
 def handle_join_session(data):
     session_id = data.get("session_id") if isinstance(data, dict) else None
-    if _is_active_job_session_id(session_id):
+    status = _active_session_snapshot(session_id)
+    if status is not None:
         # Join the session room for progress updates
         from flask_socketio import join_room
 
@@ -2183,14 +2447,14 @@ def handle_join_session(data):
         # Send initial status to joined client
         try:
             initial_data = {
-                "progress": current_processing.get("progress", 0),
-                "stage": current_processing.get("stage", "Initializing..."),
-                "current_frame": current_processing.get("current_frame", 0),
-                "total_frames": current_processing.get("total_frames", 0),
-                "phase": current_processing.get("phase", "extraction"),
-                "step_index": current_processing.get("step_index", 0),
-                "step_progress": current_processing.get("step_progress", 0),
-                "step_total": current_processing.get("step_total", 0),
+                "progress": status.get("progress", 0),
+                "stage": status.get("stage", "Initializing..."),
+                "current_frame": status.get("current_frame", 0),
+                "total_frames": status.get("total_frames", 0),
+                "phase": status.get("phase", "extraction"),
+                "step_index": status.get("step_index", 0),
+                "step_progress": status.get("step_progress", 0),
+                "step_total": status.get("step_total", 0),
             }
             socketio.emit("progress_update", initial_data, room=session_id)
         except Exception as e:
@@ -2221,7 +2485,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--host",
         default=DEFAULT_SERVER_HOST,
-        help=f"Host to bind to (default: {DEFAULT_SERVER_HOST})",
+        choices=("127.0.0.1", "localhost", "::1"),
+        help=f"Loopback address only; LAN access is not supported (default: {DEFAULT_SERVER_HOST})",
     )
     args = parser.parse_args()
 
@@ -2253,10 +2518,13 @@ if __name__ == "__main__":
 
         warnings.filterwarnings("ignore", message=".*Werkzeug.*production.*")
 
-    socketio.run(
-        app,
-        host=args.host,
-        port=args.port,
-        debug=args.verbose,
-        allow_unsafe_werkzeug=True,
-    )
+    try:
+        socketio.run(
+            app,
+            host=DEFAULT_SERVER_HOST if args.host == "localhost" else args.host,
+            port=args.port,
+            debug=False,
+            allow_unsafe_werkzeug=True,
+        )
+    finally:
+        cleanup_processes()

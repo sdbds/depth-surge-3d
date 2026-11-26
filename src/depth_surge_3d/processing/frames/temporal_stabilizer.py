@@ -682,6 +682,7 @@ class TemporalDepthStabilizer:
         calibration["postclip_contrast_ratio"] = derived["postclip_contrast_ratio"]
         calibration["postclip_mean_drift"] = derived["postclip_mean_drift"]
         preclip_total = derived["preclip_out_of_range_fraction"]
+        assert preclip_total is not None
         if calibration["postclip_contrast_ratio"] < MIN_POSTCLIP_CONTRAST_RATIO:
             calibration["fallback_reason"] = "contrast"
         elif calibration["postclip_mean_drift"] > MAX_POSTCLIP_MEAN_DRIFT:
@@ -734,7 +735,12 @@ class TemporalDepthStabilizer:
                 if not isinstance(item, tuple) or len(item) != 2:
                     raise ValueError("VDPP output must be an index/value pair")
                 local_index, raw_output = item
-                if local_index != expected_local or expected_local >= scan.length:
+                if (
+                    isinstance(local_index, (bool, np.bool_))
+                    or not isinstance(local_index, (int, np.integer))
+                    or local_index != expected_local
+                    or expected_local >= scan.length
+                ):
                     raise ValueError("VDPP output indexes are not ordered and contiguous")
                 if (
                     not isinstance(raw_output, np.ndarray)
@@ -785,8 +791,9 @@ class TemporalDepthStabilizer:
                 pair_count,
                 statistics_failed=statistics_failed,
             )
-            output_iterator = (
-                cls._accepted_outputs(
+            if calibration["mode"] == "ols":
+                assert scale is not None and shift is not None
+                output_iterator = cls._accepted_outputs(
                     raw_memmap,
                     base_files,
                     scan,
@@ -794,9 +801,8 @@ class TemporalDepthStabilizer:
                     scale=scale,
                     shift=shift,
                 )
-                if calibration["mode"] == "ols"
-                else cls._copy_outputs(base_files, scan, native_shape)
-            )
+            else:
+                output_iterator = cls._copy_outputs(base_files, scan, native_shape)
             store.commit_shot(
                 scan.shot_id,
                 output_iterator,

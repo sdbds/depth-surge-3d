@@ -508,7 +508,7 @@ def _add_histogram_pairs(
     if isinstance(pairs, DenseHistogramPairs):
         if pairs.bins.shape != target.shape:
             raise ValueError("dense histogram width changed between frames")
-        source = enumerate(pairs.bins)
+        source: Iterable[Iterable[int]] = enumerate(pairs.bins)
     else:
         source = pairs
     for bucket, count in source:

@@ -6,6 +6,7 @@ import errno
 import hashlib
 from pathlib import Path
 import os
+import sys
 
 import pytest
 
@@ -48,7 +49,9 @@ def test_persisted_file_and_directory_identities_use_the_frozen_nested_schema(
             "file_handle_hex",
         }
     assert reservation_protocol.ReservationFileIdentity.from_object(file_object) == file_identity
-    assert reservation_protocol.DirectoryIdentity.from_object(directory_object) == directory_identity
+    assert (
+        reservation_protocol.DirectoryIdentity.from_object(directory_object) == directory_identity
+    )
 
 
 def test_platform_allocation_adapter_proves_a_fsynced_full_extent(tmp_path: Path) -> None:
@@ -66,6 +69,28 @@ def test_platform_allocation_adapter_proves_a_fsynced_full_extent(tmp_path: Path
     assert evidence.platform in {"windows-allocated-ranges-v1", "linux-fiemap-v1"}
     assert len(evidence.token) == 64
     assert reservation_protocol.platform_allocation_counter(path) >= logical
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux FIEMAP evidence")
+def test_sparse_logical_reservation_is_not_available_disk_capacity(tmp_path):
+    path = tmp_path / "extent.bin"
+    logical = 1024 * 1024
+    with path.open("wb") as handle:
+        handle.seek(logical - 1)
+        handle.write(b"x")
+        handle.flush()
+        os.fsync(handle.fileno())
+    assert path.stat().st_size == logical
+    if reservation_protocol.platform_allocation_counter(path) >= logical:
+        pytest.skip("filesystem did not create a sparse file")
+    with pytest.raises(reservation_protocol.ReservationIncompleteError):
+        reservation_protocol.platform_allocation_adapter(path, logical)
+    with pytest.raises(reservation_protocol.ReservationIncompleteError, match="EOF differs"):
+        reservation_protocol.platform_allocation_adapter(path, logical + 1)
+    assert path.stat().st_size == logical
+    with path.open("rb") as handle:
+        handle.seek(-1, os.SEEK_END)
+        assert handle.read() == b"x"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows handle-relative rename contract")
@@ -192,9 +217,7 @@ def test_reservation_create_propagates_cancellation_from_fixed_target_scan(
     with pytest.raises(InterruptedError, match="cancelled"):
         reservation_protocol.ReservedArtifactTransaction.create(
             job_root=tmp_path,
-            index_relative_path=Path(
-                ".depth-surge-reservations-v1/final-index.json"
-            ),
+            index_relative_path=Path(".depth-surge-reservations-v1/final-index.json"),
             target_relative_path=Path("encoding_input_manifest.json"),
             reservation_kind="encoding_input_manifest",
             payload_raw_max=4217,
@@ -330,6 +353,72 @@ def test_control_publication_rejects_parent_replacement_after_temporary_write(
     assert (parked / temporary.name).is_file()
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux RENAME_NOREPLACE")
+def test_first_publication_creates_a_new_name_only_once(tmp_path: Path) -> None:
+    target = tmp_path / "job-control.json"
+    source = tmp_path / "new.tmp"
+
+    def publish():
+        reservation_protocol.same_parent_replace_v1(
+            source,
+            target,
+            expected_source_identity=reservation_protocol._identity(source),
+            expected_parent_identity=reservation_protocol._directory_identity(tmp_path),
+            expected_target_identity=None,
+            replace_existing=False,
+        )
+
+    source.write_bytes(b"first")
+    publish()
+    assert not source.exists()
+    source.write_bytes(b"second")
+    with pytest.raises(reservation_protocol.ReservationConflictError):
+        publish()
+    assert target.read_bytes() == b"first"
+    assert source.read_bytes() == b"second"
+
+
+def test_native_rename_retry_cannot_replace_the_already_published_video(tmp_path: Path) -> None:
+    sibling = tmp_path / "encoded.tmp.mp4"
+    final = tmp_path / "final.mp4"
+    final.touch()
+    predecessor = reservation_protocol._identity(final)
+    parent = reservation_protocol._directory_identity(tmp_path)
+    sibling.write_bytes(b"first encode")
+    encoded = reservation_protocol._identity(sibling)
+
+    def interrupt():
+        raise reservation_protocol.InjectedReservationCrash("after namespace replacement")
+
+    with pytest.raises(reservation_protocol.InjectedReservationCrash):
+        reservation_protocol.same_parent_replace_v1(
+            sibling,
+            final,
+            expected_source_identity=encoded,
+            expected_target_identity=predecessor,
+            expected_parent_identity=parent,
+            replace_existing=True,
+            after_namespace_replace=interrupt,
+        )
+
+    assert not sibling.exists()
+    assert reservation_protocol._identity(final) == encoded
+    sibling.write_bytes(b"retry encode")
+    with pytest.raises(reservation_protocol.ReservationConflictError):
+        reservation_protocol.same_parent_replace_v1(
+            sibling,
+            final,
+            expected_source_identity=reservation_protocol._identity(sibling),
+            expected_target_identity=predecessor,
+            expected_parent_identity=parent,
+            replace_existing=True,
+        )
+
+    assert final.read_bytes() == b"first encode"
+    assert reservation_protocol._identity(final) == encoded
+    assert sibling.read_bytes() == b"retry encode"
+
+
 def test_posix_replace_fault_boundary_is_between_rename_and_parent_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -393,9 +482,7 @@ def test_control_recovery_syncs_a_complete_temporary_before_promotion(
 ) -> None:
     final = tmp_path / "job-control-v1.json"
     temporary = tmp_path / ".job-control-v1.json.create-new.tmp"
-    raw = reservation_protocol.canonical_json_bytes(
-        {"algorithm_version": "test-control-v1"}
-    )
+    raw = reservation_protocol.canonical_json_bytes({"algorithm_version": "test-control-v1"})
     temporary.write_bytes(raw)
     original_fsync = reservation_protocol.os.fsync
     original_replace = reservation_protocol.same_parent_replace_v1
@@ -413,11 +500,14 @@ def test_control_recovery_syncs_a_complete_temporary_before_promotion(
     monkeypatch.setattr(reservation_protocol.os, "fsync", fsync)
     monkeypatch.setattr(reservation_protocol, "same_parent_replace_v1", replace)
 
-    assert reservation_protocol.recover_control_artifact_pair_v1(
-        final,
-        max_bytes=4096,
-        parser=lambda value: value,
-    ) == raw
+    assert (
+        reservation_protocol.recover_control_artifact_pair_v1(
+            final,
+            max_bytes=4096,
+            parser=lambda value: value,
+        )
+        == raw
+    )
 
     assert events.index("file-sync") < events.index("rename")
     assert final.read_bytes() == raw
@@ -428,9 +518,7 @@ def test_control_publication_never_overwrites_a_different_durable_temporary(
 ) -> None:
     final = tmp_path / "job-control-v1.json"
     temporary = tmp_path / ".job-control-v1.json.create-new.tmp"
-    original = reservation_protocol.canonical_json_bytes(
-        {"algorithm_version": "first-control-v1"}
-    )
+    original = reservation_protocol.canonical_json_bytes({"algorithm_version": "first-control-v1"})
     reservation_protocol._write_control_temporary(temporary, original, event=None)
 
     with pytest.raises(reservation_protocol.ReservationIncompleteError):
@@ -448,9 +536,7 @@ def test_control_recovery_checks_preconditions_before_promoting_temporary(
 ) -> None:
     final = tmp_path / "job-control-v1.json"
     temporary = tmp_path / ".job-control-v1.json.create-new.tmp"
-    raw = reservation_protocol.canonical_json_bytes(
-        {"algorithm_version": "test-control-v1"}
-    )
+    raw = reservation_protocol.canonical_json_bytes({"algorithm_version": "test-control-v1"})
     reservation_protocol._write_control_temporary(temporary, raw, event=None)
 
     def reject(_value: object) -> None:
@@ -605,9 +691,7 @@ def test_control_recovery_rejects_temporary_swap_before_unlink(
 ) -> None:
     final = tmp_path / "job-control-v1.json"
     temporary = tmp_path / ".job-control-v1.json.create-new.tmp"
-    raw = reservation_protocol.canonical_json_bytes(
-        {"algorithm_version": "test-control-v1"}
-    )
+    raw = reservation_protocol.canonical_json_bytes({"algorithm_version": "test-control-v1"})
     final.write_bytes(raw)
     temporary.write_bytes(b"durable-prefix")
     original_read = reservation_protocol._read_bounded_regular_file_with_identity
@@ -729,6 +813,141 @@ def test_streamed_prefix_can_be_staged_from_bounded_chunks(tmp_path: Path) -> No
 
     assert transaction.target_path.stat().st_size == payload_size
     assert hashlib.sha256(transaction.target_path.read_bytes()).hexdigest() == payload_sha256
+
+
+@pytest.mark.parametrize("stop_on_pass", [1, 2], ids=["preflight", "writing"])
+def test_interrupted_stream_replays_from_its_own_partial_extent(tmp_path: Path, stop_on_pass):
+    chunks = (b'{"frames":[', b'"a","b"]}')
+    payload = b"".join(chunks)
+    proof = {
+        "prefix_byte_count": len(payload),
+        "prefix_sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    transaction = _create_transaction(tmp_path)
+    calls = 0
+
+    def interrupted_reader():
+        nonlocal calls
+        calls += 1
+        yield chunks[0]
+        if calls == stop_on_pass:
+            raise InterruptedError("input reader stopped")
+        yield chunks[1]
+
+    with pytest.raises(InterruptedError, match="input reader stopped"):
+        transaction.stage_complete_full_streamed(chunks=interrupted_reader, **proof)
+    assert transaction.target_path.read_bytes() == b""
+    prefix = chunks[0] if stop_on_pass == 2 else b""
+    assert transaction.source_path.read_bytes() == prefix.ljust(
+        transaction.descriptor.logical_byte_count, b"\0"
+    )
+    reopened = reservation_protocol.ReservedArtifactTransaction.load(
+        transaction.descriptor_path, allocation_adapter=_adapter
+    )
+    reopened.stage_complete_full_streamed(chunks=lambda: iter(chunks), **proof)
+    reopened.consume_streamed_prefix(**proof)
+    assert reopened.target_path.read_bytes() == payload
+    assert not reopened.descriptor_path.exists()
+
+
+@pytest.mark.parametrize("role", ["source", "target"])
+def test_optional_authenticated_handle_does_not_hide_a_missing_input(tmp_path: Path, role):
+    transaction = _create_transaction(tmp_path)
+    opener = (
+        transaction.open_authenticated_source(missing_ok=True)
+        if role == "source"
+        else transaction.open_authenticated_target(expected_identity=None, missing_ok=True)
+    )
+    other_input = tmp_path / "missing-encoder-input.bin"
+    with pytest.raises(FileNotFoundError) as caught:
+        with opener as opened:
+            assert opened is not None
+            other_input.read_bytes()
+    assert caught.value.filename == str(other_input)
+    assert transaction.target_path.read_bytes() == b""
+    assert transaction.source_path.stat().st_size == transaction.descriptor.logical_byte_count
+
+
+def test_streaming_publication_waits_for_confirmed_space_release_then_resumes(tmp_path):
+    observed = []
+
+    def not_released(path):
+        observed.append(path.stat().st_size)
+        return 1 << 20
+
+    tx = _create_transaction(tmp_path, counter=not_released)
+    payload = b'{"streamed":"ready"}'
+    proof = dict(prefix_byte_count=len(payload), prefix_sha256=hashlib.sha256(payload).hexdigest())
+    tx.stage_complete_full_streamed(chunks=lambda: (payload,), **proof)
+    with pytest.raises(reservation_protocol.ReservationIncompleteError, match="release"):
+        tx.consume_streamed_prefix(**proof)
+    assert len(observed) >= 2 and observed[-2:] == [len(payload)] * 2
+    assert tx.source_path.read_bytes() == payload
+    assert tx.target_path.read_bytes() == b""
+    assert tx.descriptor_path.is_file()
+    restored = reservation_protocol.ReservedArtifactTransaction.load(
+        tx.descriptor_path,
+        allocation_adapter=_adapter,
+        allocation_counter=reservation_protocol.platform_allocation_counter,
+    )
+    restored.recover_streamed_prefix(**proof)
+    assert restored.target_path.read_bytes() == payload
+    assert not restored.source_path.exists() and not restored.descriptor_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("boundary", "phase"),
+    [
+        ("after-truncate", "short-source"),
+        ("after-truncate-sync", "short-source"),
+        ("after-rename-parent-sync", "committed-target"),
+    ],
+)
+def test_streamed_reopen_honors_the_actual_namespace_at_each_boundary(tmp_path, boundary, phase):
+    tx = _create_transaction(tmp_path)
+    payload = b'{"frames":["first","second"]}'
+    proof = dict(prefix_byte_count=len(payload), prefix_sha256=hashlib.sha256(payload).hexdigest())
+    tx.stage_complete_full_streamed(chunks=lambda: (payload[:8], payload[8:]), **proof)
+    with pytest.raises(reservation_protocol.InjectedReservationCrash, match=boundary):
+        tx.consume_streamed_prefix(crash_at=boundary, **proof)
+    restored = reservation_protocol.ReservedArtifactTransaction.load(
+        tx.descriptor_path,
+        allocation_adapter=_adapter,
+    )
+    assert restored.validate_streamed_physical_phase(**proof) == phase
+    if phase == "short-source":
+        assert tx.target_path.read_bytes() == b""
+        assert tx.source_path.read_bytes() == payload
+    else:
+        assert not tx.source_path.exists() and tx.target_path.read_bytes() == payload
+    assert restored.recover_streamed_prefix(**proof) == "committed-target"
+    assert restored.target_path.read_bytes() == payload and not restored.descriptor_path.exists()
+
+
+@pytest.mark.parametrize("problem", ["early-eof", "digest", "different-prefix", "nonzero-tail"])
+def test_inconsistent_stream_is_never_committed_over_a_preexisting_target(tmp_path, problem):
+    target = tmp_path / "encoding_input_manifest.json"
+    target.write_bytes(b"previous published input")
+    tx = _create_transaction(tmp_path)
+    chunks = (b'{"frames":', b"[]}")
+    payload = b"".join(chunks)
+    if problem == "different-prefix":
+        with tx.source_path.open("r+b") as handle:
+            handle.write(b'{"scene"')
+    if problem == "nonzero-tail":
+        with tx.source_path.open("r+b") as handle:
+            handle.seek(len(payload) + 1)
+            handle.write(b"x")
+    expected_hash = "0" * 64 if problem == "digest" else hashlib.sha256(payload).hexdigest()
+    before = tx.source_path.read_bytes()
+    with pytest.raises(reservation_protocol.ReservationConflictError):
+        tx.stage_complete_full_streamed(
+            chunks=lambda: chunks[:1] if problem == "early-eof" else chunks,
+            prefix_byte_count=len(payload),
+            prefix_sha256=expected_hash,
+        )
+    assert target.read_bytes() == b"previous published input"
+    assert tx.source_path.read_bytes() == before and tx.descriptor_path.is_file()
 
 
 def test_write_ahead_index_is_durable_before_placeholder_extent_and_descriptor(
@@ -897,6 +1116,55 @@ def test_rename_parent_sync_crash_recovers_committed_target_without_full_adapter
     assert loaded.recover(payload) == "committed-target"
     assert loaded.target_path.read_bytes() == payload
     assert not loaded.descriptor_path.exists()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX directory fsync")
+@pytest.mark.parametrize("streamed", [False, True])
+def test_recovered_rename_syncs_the_target_directory_before_retiring_its_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, streamed: bool
+) -> None:
+    transaction = _create_transaction(tmp_path)
+    payload = b"completed manifest"
+    prefix = {
+        "prefix_byte_count": len(payload),
+        "prefix_sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    if streamed:
+        transaction.stage_complete_full(payload)
+    source_identity = reservation_protocol._identity(transaction.source_path)
+    target_parent = transaction.target_path.parent.stat()
+    assert transaction.descriptor_path.parent != transaction.target_path.parent
+    fsync = os.fsync
+
+    def interrupt_directory_sync(fd: int) -> None:
+        if os.path.samestat(target_parent, os.fstat(fd)) and not transaction.source_path.exists():
+            raise OSError(errno.EIO, "target directory sync unavailable")
+        fsync(fd)
+
+    def finish(reopened):
+        return reopened.recover_streamed_prefix(**prefix) if streamed else reopened.recover(payload)
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(os, "fsync", interrupt_directory_sync)
+        with pytest.raises(OSError, match="target directory sync unavailable"):
+            if streamed:
+                transaction.consume_streamed_prefix(**prefix)
+            else:
+                transaction.consume(payload)
+        assert not transaction.source_path.exists()
+        assert reservation_protocol._identity(transaction.target_path) == source_identity
+
+        reopened = reservation_protocol.ReservedArtifactTransaction.load(
+            transaction.descriptor_path, allocation_adapter=_adapter
+        )
+        with pytest.raises(OSError, match="target directory sync unavailable"):
+            finish(reopened)
+        assert transaction.descriptor_path.is_file()
+
+    assert finish(reopened) == "committed-target"
+    assert not transaction.descriptor_path.exists()
+    assert reservation_protocol._identity(transaction.target_path) == source_identity
+    assert transaction.target_path.read_bytes() == payload
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows replacement gaps are platform-specific")
@@ -1390,7 +1658,7 @@ def test_illegal_terminal_intent_never_becomes_recovery_authority() -> None:
                 "sibling_present": True,
             },
             "post_boundary_retry_sibling_present",
-            "reset-final-intent-remove-sibling-reencode",
+            "require-durable-output-evidence",
         ),
         (
             {
@@ -1426,7 +1694,7 @@ def test_final_publication_crash_prefixes_have_one_forward_only_recovery_action(
     assert result.action == action
 
 
-def test_post_boundary_complete_input_with_zero_final_intent_reencodes_without_rewrite() -> None:
+def test_post_boundary_complete_input_with_zero_final_intent_requires_durable_evidence() -> None:
     observation = reservation_protocol.FinalPublicationObservation(
         video_state="committed-new",
         input_manifest_state="committed-new",
@@ -1437,7 +1705,7 @@ def test_post_boundary_complete_input_with_zero_final_intent_reencodes_without_r
     result = reservation_protocol.classify_final_publication_observation(observation)
 
     assert result.phase == "input_manifest_committed_no_final_intent"
-    assert result.action == "revalidate-input-and-reencode"
+    assert result.action == "require-durable-output-evidence"
 
 
 def test_final_publication_rejects_complete_input_before_video_boundary() -> None:

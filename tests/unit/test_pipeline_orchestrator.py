@@ -999,7 +999,11 @@ class TestCleanupOnlyResume:
 
             @staticmethod
             def recover_publication_prefix():
-                return SimpleNamespace(phase="publication_authenticated")
+                from src.depth_surge_3d.io.reservation_protocol import FinalPublicationRecovery
+
+                return FinalPublicationRecovery(
+                    "publication_authenticated", "continue-finalization"
+                )
 
         capability = Mock()
         encoder = Mock()
@@ -1243,7 +1247,6 @@ class TestExecutePipeline:
                 directories,
                 settings,
                 manifest,
-                24.0,
                 "source.mp4",
                 tmp_path,
                 progress,
@@ -1305,7 +1308,6 @@ class TestExecutePipeline:
                 },
                 self._streamed_stereo_settings(),
                 manifest,
-                24.0,
                 "source.mp4",
                 tmp_path,
             )
@@ -1344,7 +1346,6 @@ class TestExecutePipeline:
                     },
                     self._streamed_stereo_settings(),
                     manifest,
-                    24.0,
                     "source.mp4",
                     tmp_path,
                 )
@@ -1388,7 +1389,6 @@ class TestExecutePipeline:
                 },
                 self._streamed_stereo_settings(),
                 manifest,
-                24.0,
                 "source.mp4",
                 tmp_path,
             )
@@ -1456,8 +1456,10 @@ class TestExecutePipeline:
             )
 
 
+@pytest.mark.parametrize("fps_settings", [{}, {"target_fps": None}, {"target_fps": "original"}])
 def test_legacy_fast_adoption_skips_upstream_manifest_and_stereo_provider(
     tmp_path: Path,
+    fps_settings,
 ) -> None:
     adoption = LegacyFastAdoptionV1(
         job_root=tmp_path,
@@ -1543,7 +1545,7 @@ def test_legacy_fast_adoption_skips_upstream_manifest_and_stereo_provider(
             tmp_path / "source.mp4",
             tmp_path,
             {"fps": 30.0},
-            {"keep_intermediates": False},
+            {"keep_intermediates": False, **fps_settings},
             job_lock=lock,
         )
 
@@ -1558,6 +1560,8 @@ def test_legacy_fast_adoption_skips_upstream_manifest_and_stereo_provider(
     encoder.extract_frames.assert_not_called()
     stereo.create_stereo_pairs_from_manifest.assert_not_called()
 
+
+class TestPipelineStages:
     def test_releases_depth_model_before_starting_step_3(self, tmp_path):
         """The depth model leaves memory as soon as its pipeline stage is complete."""
 
@@ -1771,7 +1775,6 @@ def test_legacy_fast_adoption_skips_upstream_manifest_and_stereo_provider(
                 directories,
                 settings,
                 Mock(frame_count=1),
-                24.0,
                 "source.mp4",
                 directories["base"],
                 progress_tracker,
@@ -1816,7 +1819,6 @@ def test_legacy_fast_adoption_skips_upstream_manifest_and_stereo_provider(
                 directories,
                 settings,
                 Mock(frame_count=1),
-                24.0,
                 "source.mp4",
                 directories["base"],
             )
@@ -1851,7 +1853,6 @@ def test_legacy_fast_adoption_skips_upstream_manifest_and_stereo_provider(
                 directories,
                 settings,
                 Mock(frame_count=1),
-                24.0,
                 "source.mp4",
                 directories["base"],
             )
@@ -1878,7 +1879,6 @@ def test_legacy_fast_adoption_skips_upstream_manifest_and_stereo_provider(
             directories,
             settings,
             Mock(frame_count=1),
-            24.0,
             "source.mp4",
             directories["base"],
         )
@@ -1919,7 +1919,6 @@ def test_legacy_fast_adoption_skips_upstream_manifest_and_stereo_provider(
                 directories,
                 settings,
                 Mock(frame_count=1),
-                24.0,
                 "source.mp4",
                 directories["base"],
                 progress_tracker,
@@ -1955,7 +1954,6 @@ def test_legacy_fast_adoption_skips_upstream_manifest_and_stereo_provider(
             },
             {"apply_distortion": True},
             Mock(frame_count=1),
-            30.0,
             "source.mp4",
             tmp_path,
         )
@@ -2102,7 +2100,6 @@ def test_failed_direct_encoding_does_not_finish_progress(tmp_path: Path) -> None
             directories,
             settings,
             Mock(frame_count=1),
-            24.0,
             "source.mp4",
             tmp_path,
             progress_tracker,
@@ -2159,7 +2156,6 @@ def test_distortion_pipeline_fuses_stage_five_and_crop(tmp_path: Path) -> None:
             directories,
             settings,
             1,
-            24.0,
             "source.mp4",
             tmp_path,
         )

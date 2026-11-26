@@ -90,9 +90,7 @@ class OwnedSiblingTemporary:
             source_identity = capture_file_identity(path)
             parent_identity = capture_directory_identity(target.parent)
             current_target = acquired.regular_identity(target, missing_ok=True)
-            target_identity = (
-                None if current_target is None else capture_file_identity(target)
-            )
+            target_identity = None if current_target is None else capture_file_identity(target)
         except BaseException:
             handle.close()
             try:
@@ -229,9 +227,7 @@ def durable_replace(
             ) from error
     current_target = capture_optional_publication_target_identity(target)
     if current_target != expected_target_identity:
-        raise OwnedTemporaryIdentityError(
-            f"publication target identity changed: {target}"
-        )
+        raise OwnedTemporaryIdentityError(f"publication target identity changed: {target}")
     try:
         same_parent_replace_v1(
             source,
@@ -253,7 +249,5 @@ def durable_sync_parent(path: Path) -> None:
 
     parent = _absolute(path)
     if os.name == "nt":
-        raise OSError(
-            "Windows namespace durability requires a write-through native operation"
-        )
+        raise OSError("Windows namespace durability requires a write-through native operation")
     _sync_posix_directory(parent)

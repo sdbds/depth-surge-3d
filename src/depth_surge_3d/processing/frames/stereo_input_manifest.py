@@ -84,11 +84,11 @@ def _regular_file(
     *,
     job_root: Path | None = None,
     acquired: AcquiredRoot | None = None,
-) -> tuple[BinaryIO, os.stat_result]:
+) -> tuple[io.FileIO, os.stat_result]:
     if acquired is not None:
         if job_root is not None and acquired.root != Path(os.path.abspath(os.fspath(job_root))):
             raise StereoControlStateError("stereo input acquired the wrong job root")
-        handle = acquired.open_regular(path)
+        handle: io.FileIO = acquired.open_regular(path)
         return handle, os.fstat(handle.fileno())
     if job_root is not None:
         handle = open_regular_beneath(job_root, path)
@@ -273,7 +273,10 @@ def _compact_source_metadata(
         convergence = source_metadata.get("convergence")
         if not isinstance(convergence, Mapping):
             raise StereoControlStateError("metric convergence metadata is invalid")
-        resolved_auto = float(convergence.get("resolved_auto_distance_m"))
+        distance = convergence.get("resolved_auto_distance_m")
+        if distance is None:
+            raise TypeError("metric auto convergence distance cannot be null")
+        resolved_auto = float(distance)
         if not math.isfinite(resolved_auto) or resolved_auto <= 0.0:
             raise StereoControlStateError("metric auto convergence is invalid")
     return {
@@ -641,64 +644,9 @@ def _positive_shape(value: object, label: str) -> tuple[int, int]:
     return int(value[0]), int(value[1])
 
 
-def load_stereo_input_manifest_v1(
-    manifest_path: Path,
-    *,
-    job_root: Path,
-    validate_payloads: bool = True,
-) -> StereoInputManifestV1:
-    """Boundedly adopt a durable upstream manifest without directory inference."""
-
-    root = Path(os.path.abspath(os.fspath(job_root)))
-    path = Path(os.path.abspath(os.fspath(manifest_path)))
-    try:
-        path.relative_to(root)
-    except ValueError as error:
-        raise StereoControlStateError("stereo input manifest escapes the job root") from error
-    raw_sha256, raw_byte_count, _header_prefix = _stream_identity(path, job_root=root)
-    with _regular_file(path, job_root=root)[0] as handle:
-        raw = _read_line(handle)
-    if raw is None:
-        raise StereoControlStateError("stereo input manifest is empty")
-    header = _parse_line(raw)
-    if set(header) != {
-        "algorithm_version",
-        "frame_count",
-        "geometry_mode",
-        "schema_version",
-        "source_metadata",
-    }:
-        raise StereoControlStateError("stereo input manifest header schema changed")
-    frame_count = header.get("frame_count")
-    if (
-        isinstance(frame_count, bool)
-        or not isinstance(frame_count, int)
-        or frame_count <= 0
-        or frame_count > STEREO_CONTROL_FRAME_CAP
-    ):
-        raise StereoControlBudgetError("stereo input manifest frame count is outside the cap")
-    geometry_mode = header.get("geometry_mode")
-    if geometry_mode not in {"relative", "metric"}:
-        raise StereoControlStateError("stereo input manifest geometry mode is invalid")
-    if (
-        header.get("schema_version") != STEREO_INPUT_MANIFEST_SCHEMA_VERSION
-        or header.get("algorithm_version") != STEREO_INPUT_MANIFEST_ALGORITHM_VERSION
-    ):
-        raise StereoControlStateError("stereo input manifest version is unsupported")
-    metadata = header.get("source_metadata")
-    if not isinstance(metadata, dict) or set(metadata) != {
-        "native_shape",
-        "relative_encoding_scale_float32_bits",
-        "render_shape",
-        "resolved_auto_distance_m",
-        "source_geometry_fingerprint",
-    }:
-        raise StereoControlStateError("stereo input source metadata schema changed")
-    render_shape = _positive_shape(metadata["render_shape"], "render shape")
-    native_shape = _positive_shape(metadata["native_shape"], "native shape")
-    source_fingerprint = metadata["source_geometry_fingerprint"]
-    if not _is_hex64(source_fingerprint):
-        raise StereoControlStateError("stereo input source fingerprint is invalid")
+def _manifest_projection_scalars(
+    metadata: dict[str, Any], geometry_mode: str
+) -> tuple[str | None, float | None]:
     scale_bits = metadata["relative_encoding_scale_float32_bits"]
     resolved_auto = metadata["resolved_auto_distance_m"]
     if geometry_mode == "relative":
@@ -722,6 +670,74 @@ def load_stereo_input_manifest_v1(
         resolved_auto = float(resolved_auto)
         if not math.isfinite(resolved_auto) or resolved_auto <= 0.0:
             raise StereoControlStateError("metric stereo input convergence is invalid")
+    return scale_bits, resolved_auto
+
+
+def _read_manifest_header(path: Path, root: Path) -> dict[str, Any]:
+    with _regular_file(path, job_root=root)[0] as handle:
+        raw = _read_line(handle)
+    if raw is None:
+        raise StereoControlStateError("stereo input manifest is empty")
+    header = _parse_line(raw)
+    if set(header) != {
+        "algorithm_version",
+        "frame_count",
+        "geometry_mode",
+        "schema_version",
+        "source_metadata",
+    }:
+        raise StereoControlStateError("stereo input manifest header schema changed")
+    return header
+
+
+def load_stereo_input_manifest_v1(
+    manifest_path: Path,
+    *,
+    job_root: Path,
+    validate_payloads: bool = True,
+) -> StereoInputManifestV1:
+    """Boundedly adopt a durable upstream manifest without directory inference."""
+
+    root = Path(os.path.abspath(os.fspath(job_root)))
+    path = Path(os.path.abspath(os.fspath(manifest_path)))
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise StereoControlStateError("stereo input manifest escapes the job root") from error
+    raw_sha256, raw_byte_count, _header_prefix = _stream_identity(path, job_root=root)
+    header = _read_manifest_header(path, root)
+    frame_count = header.get("frame_count")
+    if (
+        isinstance(frame_count, bool)
+        or not isinstance(frame_count, int)
+        or frame_count <= 0
+        or frame_count > STEREO_CONTROL_FRAME_CAP
+    ):
+        raise StereoControlBudgetError("stereo input manifest frame count is outside the cap")
+    geometry_mode = header.get("geometry_mode")
+    if geometry_mode not in {"relative", "metric"}:
+        raise StereoControlStateError("stereo input manifest geometry mode is invalid")
+    if (
+        type(header["schema_version"]) is not int
+        or header["schema_version"] != STEREO_INPUT_MANIFEST_SCHEMA_VERSION
+        or header.get("algorithm_version") != STEREO_INPUT_MANIFEST_ALGORITHM_VERSION
+    ):
+        raise StereoControlStateError("stereo input manifest version is unsupported")
+    metadata = header.get("source_metadata")
+    if not isinstance(metadata, dict) or set(metadata) != {
+        "native_shape",
+        "relative_encoding_scale_float32_bits",
+        "render_shape",
+        "resolved_auto_distance_m",
+        "source_geometry_fingerprint",
+    }:
+        raise StereoControlStateError("stereo input source metadata schema changed")
+    render_shape = _positive_shape(metadata["render_shape"], "render shape")
+    native_shape = _positive_shape(metadata["native_shape"], "native shape")
+    source_fingerprint = metadata["source_geometry_fingerprint"]
+    if not _is_hex64(source_fingerprint):
+        raise StereoControlStateError("stereo input source fingerprint is invalid")
+    scale_bits, resolved_auto = _manifest_projection_scalars(metadata, geometry_mode)
     descriptor = StereoInputManifestV1(
         path=path,
         job_root=root,
@@ -789,6 +805,20 @@ def _validate_identity_common(
     return value
 
 
+def _validate_guide_identity(value: object, frame_name: str, render_shape: tuple[int, int]) -> None:
+    guide = _validate_identity_common(value, frame_name=frame_name, suffix=".png")
+    if set(guide) != {"byte_count", "frame_name", "png_header", "relative_path", "sha256"}:
+        raise StereoControlStateError("stereo guide identity schema changed")
+    header = guide.get("png_header")
+    if header != {
+        "bit_depth": 8,
+        "color_type": 2,
+        "height": render_shape[0],
+        "width": render_shape[1],
+    }:
+        raise StereoControlStateError("stereo guide header changed")
+
+
 def _validate_item(
     value: dict[str, Any],
     *,
@@ -798,25 +828,17 @@ def _validate_item(
 ) -> tuple[dict[str, Any], int]:
     if set(value) != {"frame_index", "frame_name", "geometry", "guide", "source_index"}:
         raise StereoControlStateError("stereo input manifest item schema changed")
-    if value["source_index"] != expected_source_index:
+    if type(value["source_index"]) is not int or value["source_index"] != expected_source_index:
         raise StereoControlStateError("stereo input source indexes are noncontiguous")
     frame_name = value["frame_name"]
     frame_index = _canonical_frame_index(frame_name)
-    if value["frame_index"] != frame_index or (
-        expected_frame_index is not None and frame_index != expected_frame_index
+    if (
+        type(value["frame_index"]) is not int
+        or value["frame_index"] != frame_index
+        or (expected_frame_index is not None and frame_index != expected_frame_index)
     ):
         raise StereoControlStateError("stereo input frame indexes are noncontiguous")
-    guide = _validate_identity_common(value["guide"], frame_name=frame_name, suffix=".png")
-    if set(guide) != {"byte_count", "frame_name", "png_header", "relative_path", "sha256"}:
-        raise StereoControlStateError("stereo guide identity schema changed")
-    header = guide.get("png_header")
-    if header != {
-        "bit_depth": 8,
-        "color_type": 2,
-        "height": descriptor.render_shape[0],
-        "width": descriptor.render_shape[1],
-    }:
-        raise StereoControlStateError("stereo guide header changed")
+    _validate_guide_identity(value["guide"], frame_name, descriptor.render_shape)
     geometry_suffix = ".png" if descriptor.geometry_mode == "relative" else ".npz"
     geometry = _validate_identity_common(
         value["geometry"],

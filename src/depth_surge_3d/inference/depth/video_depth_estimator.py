@@ -6,8 +6,8 @@ which provides temporal consistency for video depth estimation.
 
 from __future__ import annotations
 
-import os
 import sys
+import tempfile
 import urllib.request
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -294,6 +294,7 @@ class VideoDepthEstimator:
         Returns:
             True if model loaded successfully
         """
+        model_type = None
         try:
             # Ensure dependencies are available
             if not self._ensure_dependencies():
@@ -306,7 +307,6 @@ class VideoDepthEstimator:
                 return False
 
             model_config = MODEL_CONFIGS[model_type]
-            self.model_config = model_config
 
             # Import and load model
             repo_path = Path(VIDEO_DEPTH_ANYTHING_REPO_DIR)
@@ -315,10 +315,10 @@ class VideoDepthEstimator:
 
             from video_depth_anything.video_depth import VideoDepthAnything
 
-            self.model = VideoDepthAnything(**model_config, metric=self.metric)
+            candidate = VideoDepthAnything(**model_config, metric=self.metric)
 
             # Load state dict and fix key names if needed
-            state_dict = torch.load(self.model_path, map_location="cpu")
+            state_dict = torch.load(self.model_path, map_location="cpu", weights_only=True)
 
             # Remap depth_head.* to head.* for compatibility
             fixed_state_dict = {}
@@ -329,8 +329,9 @@ class VideoDepthEstimator:
                 else:
                     fixed_state_dict[key] = value
 
-            self.model.load_state_dict(fixed_state_dict, strict=True)  # type: ignore[attr-defined]
-            self.model = self.model.to(self.device).eval()  # type: ignore[attr-defined]
+            candidate.load_state_dict(fixed_state_dict, strict=True)
+            self.model = candidate.to(self.device).eval()
+            self.model_config = model_config
 
             model_variant = "Metric-" if self.metric else ""
             print(f"Loaded {model_variant}Video-Depth-Anything ({model_type}) on {self.device}")
@@ -338,35 +339,31 @@ class VideoDepthEstimator:
 
         except Exception as e:
             print(f"Error loading video model: {e}")
-            print("Try downloading the model manually from:")
-            print(f"  {MODEL_DOWNLOAD_URLS.get(model_type, 'Unknown')}")  # type: ignore[arg-type]
+            if model_type is not None and model_type in MODEL_DOWNLOAD_URLS:
+                print(f"Try downloading the model manually from: {MODEL_DOWNLOAD_URLS[model_type]}")
             return False
 
     def _ensure_dependencies(self) -> bool:
         """Ensure model file and repository are available."""
-        # Check model file
-        if not os.path.exists(self.model_path):
-            print(f"Model not found at {self.model_path}")
-            if not self._auto_download_model():
-                return False
-
-        # Check repository
         repo_path = Path(VIDEO_DEPTH_ANYTHING_REPO_DIR)
-        if not repo_path.exists():
-            print("Video-Depth-Anything repository not found")
+        if not (repo_path / "video_depth_anything/video_depth.py").is_file():
+            print("Video-Depth-Anything repository is missing or incomplete")
             print("Please ensure the repository is cloned to the vendor directory:")
             print(
                 f"  mkdir -p vendor && git clone https://github.com/DepthAnything/Video-Depth-Anything.git {VIDEO_DEPTH_ANYTHING_REPO_DIR}"
             )
             return False
 
-        return True
+        if Path(self.model_path).is_file():
+            return True
+        print(f"Model not found at {self.model_path}")
+        return self._auto_download_model()
 
     def _auto_download_model(self) -> bool:
         """Auto-download the model if missing."""
         model_path = Path(self.model_path)
         if model_path.exists():
-            return True
+            return model_path.is_file()
 
         print("Attempting to download video model automatically...")
 
@@ -384,7 +381,13 @@ class VideoDepthEstimator:
 
         try:
             print(f"Downloading video model to {self.model_path}...")
-            urllib.request.urlretrieve(download_url, self.model_path)
+            # A partial transfer must never look like a cached checkpoint on the next run.
+            with tempfile.TemporaryDirectory(dir=model_dir, prefix=f".{model_path.name}-") as work:
+                partial = Path(work) / model_path.name
+                urllib.request.urlretrieve(download_url, partial)
+                if partial.stat().st_size == 0:
+                    raise OSError("downloaded checkpoint is empty")
+                partial.replace(model_path)
             print(console_success("Video model downloaded successfully"))
             return True
         except Exception as e:

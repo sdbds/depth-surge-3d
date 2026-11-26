@@ -1125,10 +1125,10 @@ def classify_final_publication_observation(  # noqa: C901
         if sibling:
             return FinalPublicationRecovery(
                 "post_boundary_retry_sibling_present",
-                "reset-final-intent-remove-sibling-reencode",
+                "require-durable-output-evidence",
             )
         return FinalPublicationRecovery(
-            "input_manifest_committed_no_final_intent", "revalidate-input-and-reencode"
+            "input_manifest_committed_no_final_intent", "require-durable-output-evidence"
         )
     if sibling:
         raise ReservationConflictError("complete final intent cannot coexist with a sibling")

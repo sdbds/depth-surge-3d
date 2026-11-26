@@ -133,7 +133,7 @@ class TestPythonVersionCheck:
         with patch.object(sys, "version_info", (3, 13, 0, "final", 0)):
             with pytest.raises(
                 RuntimeError,
-                match=r"(?s)Depth Surge 3D requires Python 3\.9-3\.12.*Python 3\.13.*not yet supported",
+                match=r"(?s)Depth Surge 3D requires Python 3\.10-3\.12.*Python 3\.13",
             ):
                 # Force reimport to trigger version check
                 import importlib
@@ -142,12 +142,11 @@ class TestPythonVersionCheck:
                 importlib.reload(src.depth_surge_3d)
 
     def test_python_version_too_old(self):
-        """Test that Python < 3.9 raises RuntimeError."""
-        # Mock sys.version_info to simulate Python 3.8
-        with patch.object(sys, "version_info", (3, 8, 10, "final", 0)):
+        """The runtime and the package metadata both exclude Python 3.9."""
+        with patch.object(sys, "version_info", (3, 9, 10, "final", 0)):
             with pytest.raises(
                 RuntimeError,
-                match=r"(?s)Depth Surge 3D requires Python 3\.9 or newer.*Python 3\.8",
+                match=r"(?s)Depth Surge 3D requires Python 3\.10-3\.12.*Python 3\.9",
             ):
                 # Force reimport to trigger version check
                 import importlib
@@ -156,9 +155,9 @@ class TestPythonVersionCheck:
                 importlib.reload(src.depth_surge_3d)
 
     def test_python_version_supported(self):
-        """Test that supported Python versions (3.9-3.12) work correctly."""
+        """Test that supported Python versions (3.10-3.12) work correctly."""
         # Test with various supported versions
-        for minor_version in [9, 10, 11, 12]:
+        for minor_version in [10, 11, 12]:
             with patch.object(sys, "version_info", (3, minor_version, 0, "final", 0)):
                 # Should not raise any errors
                 import importlib

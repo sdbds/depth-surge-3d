@@ -9,21 +9,16 @@ import sys
 import sysconfig
 from pathlib import Path
 
-import numpy as np
-from setuptools import Distribution, Extension
-from setuptools.command.build_ext import build_ext
-from torch.utils.cpp_extension import include_paths
-
-
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "native" / "quality_kd_native.cpp"
-BUILD_TEMP = ROOT / "build" / "quality-task0-native" / sysconfig.get_platform()
-BUILD_OUTPUT = ROOT / "build" / "quality-task0-native-artifacts" / sysconfig.get_platform()
+_BUILD_TAG = f"{sys.implementation.cache_tag}-{sysconfig.get_platform()}"
+BUILD_TEMP = ROOT / "build" / "quality-task0-native" / _BUILD_TAG
+BUILD_OUTPUT = ROOT / "build" / "quality-task0-native-artifacts" / _BUILD_TAG
 
 
 def _compile_arguments() -> list[str]:
     if os.name == "nt":
-        return ["/O2", "/std:c++17", "/EHsc", "/permissive-", "/fp:strict"]
+        return ["/O2", "/std:c++17", "/EHsc", "/permissive-", "/fp:strict", "/utf-8"]
     return ["-O3", "-std=c++17", "-fvisibility=hidden", "-ffp-contract=off", "-pthread"]
 
 
@@ -38,6 +33,11 @@ def build_native_extension(
 ) -> Path:
     """Compile to the repository root; importing never invokes this function."""
 
+    from pybind11 import get_include
+    from setuptools import Distribution, Extension
+    from setuptools.command.build_ext import build_ext
+
+    output_dir, build_temp = output_dir.resolve(), build_temp.resolve()
     build_temp.mkdir(parents=True, exist_ok=True)
     source_sha256 = hashlib.sha256(SOURCE.read_bytes()).hexdigest()
     identity_header = build_temp / "quality_kd_build_identity.h"
@@ -47,8 +47,9 @@ def build_native_extension(
     )
     extension = Extension(
         "_quality_kd_native",
-        sources=[str(SOURCE)],
-        include_dirs=[str(build_temp), np.get_include(), *include_paths()],
+        sources=[str(SOURCE.relative_to(ROOT))],
+        include_dirs=[str(build_temp), get_include()],
+        depends=[str(identity_header)],
         language="c++",
         extra_compile_args=_compile_arguments(),
         extra_link_args=_link_arguments(),
@@ -64,7 +65,14 @@ def build_native_extension(
     command.build_lib = str(output_dir)
     command.build_temp = str(build_temp)
     command.ensure_finalized()
-    command.run()
+    # MSVC/setuptools mirrors each source path below build_temp. An absolute
+    # sdist path there repeats the whole uv cache prefix and can exceed MAX_PATH.
+    previous = Path.cwd()
+    try:
+        os.chdir(ROOT)
+        command.run()
+    finally:
+        os.chdir(previous)
     artifact = output_dir / command.get_ext_filename(extension.name)
     if not artifact.is_file():
         raise RuntimeError(f"Native build did not produce the expected artifact: {artifact}")

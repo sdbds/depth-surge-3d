@@ -8,6 +8,7 @@ import argparse
 import json
 import math
 import sys
+import tempfile
 from pathlib import Path
 
 from depth_surge_3d.core.constants import (
@@ -31,6 +32,7 @@ from depth_surge_3d.io.operations import (
     can_resume_processing,
     get_video_properties,
     load_processing_settings,
+    recover_processing_settings_artifact,
     validate_video_file,
 )
 from depth_surge_3d.io.job_lock import JobWriterLock
@@ -44,11 +46,16 @@ from depth_surge_3d.io.resume import (
 )
 from depth_surge_3d.processing.frames.depth_storage import build_current_model_fingerprint
 from depth_surge_3d.processing.orchestration.execution_plan import build_artifact_execution_plan
+from depth_surge_3d.processing.video.final_publication import (
+    FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+    audit_final_media_v1,
+)
 from depth_surge_3d.utils import (
     get_available_resolutions,
     warning as console_warning,
 )
 from depth_surge_3d.utils.domain.resolution import get_resolution_dimensions
+from depth_surge_3d.core.video_timing import MOTION_INTERPOLATION_UNAVAILABLE
 
 
 def create_stereo_projector(*args, **kwargs):
@@ -57,6 +64,39 @@ def create_stereo_projector(*args, **kwargs):
     from depth_surge_3d.rendering import create_stereo_projector as factory
 
     return factory(*args, **kwargs)
+
+
+def _finish_saved_publication(root: Path, info: dict) -> bool | None:
+    """Try the saved transaction before planning inference or looking for source frames."""
+    settings_file = info.get("settings_file")
+    active = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+    if not isinstance(settings_file, Path) or settings_file.name != "processing-settings-v5.json":
+        return None
+    if info.get("status") != "completed" and not active.is_file():
+        return None
+    try:
+        with JobWriterLock(root):
+            artifact = recover_processing_settings_artifact(settings_file)
+            if artifact.status == "completed":
+                if not audit_final_media_v1(root, artifact).final_video_authenticated:
+                    print("The existing final video could not be verified; it was left untouched.")
+                    return False
+                print("The existing final video is verified; nothing was re-encoded.")
+                return True
+            if artifact.status != "in_progress" or not active.is_file():
+                return None
+            from depth_surge_3d.processing.orchestration.pipeline_orchestrator import (
+                ProcessingOrchestrator,
+            )
+            from depth_surge_3d.processing.video.video_encoder import VideoEncoder
+
+            finished = ProcessingOrchestrator.finish_publication_only(root, VideoEncoder())
+            if finished:
+                print("Recovered the already encoded final video using its saved settings.")
+            return finished
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"Cannot recover the existing final video: {error}")
+        return False
 
 
 def _preserved_render_artifact(report, mode: str) -> tuple[list[Path], str] | None:  # noqa: C901
@@ -80,6 +120,8 @@ def _preserved_render_artifact(report, mode: str) -> tuple[list[Path], str] | No
         metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
     except (OSError, TypeError, ValueError):
         return None
+    if not isinstance(metadata, dict):
+        return None
     if stage_name == "disparity_stabilized":
         semantic = metadata.get("semantic_identity", {})
         frame_names = semantic.get("frame_names") if isinstance(semantic, dict) else None
@@ -87,7 +129,11 @@ def _preserved_render_artifact(report, mode: str) -> tuple[list[Path], str] | No
     else:
         frame_names = metadata.get("frame_names")
         producer = "base"
-    if not isinstance(frame_names, list) or not all(isinstance(name, str) for name in frame_names):
+    if (
+        not isinstance(frame_names, list)
+        or not frame_names
+        or not all(isinstance(name, str) and name for name in frame_names)
+    ):
         return None
     return [directory / f"{Path(name).stem}.png" for name in frame_names], producer
 
@@ -518,7 +564,7 @@ Note: V2 uses fixed shot-aware temporal inference; V3, See-Through, and MoGe-2 i
     parser.add_argument(
         "--experimental-frame-interpolation",
         action="store_true",
-        help="EXPERIMENTAL: Double FPS using motion interpolation. WARNING: May produce artifacts, wobbling, or poor quality. Recommended for artistic experimentation only.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--upscale-model",
@@ -627,6 +673,8 @@ def main():  # noqa: C901
     """Main entry point."""
     parser = create_argument_parser()
     args = parser.parse_args()
+    if args.experimental_frame_interpolation:
+        parser.error(MOTION_INTERPOLATION_UNAVAILABLE)
 
     # Handle special commands
     if args.list_resolutions:
@@ -660,7 +708,11 @@ def main():  # noqa: C901
     # Handle resume mode
     if args.resume:
         print(f"Checking resume capability for: {args.resume}")
-        resume_info = can_resume_processing(Path(args.resume))
+        root = Path(args.resume).resolve()
+        resume_info = can_resume_processing(root)
+        finished = _finish_saved_publication(root, resume_info)
+        if finished is not None:
+            return 0 if finished else 1
 
         if not resume_info["can_resume"]:
             print("Cannot resume processing:")
@@ -939,24 +991,20 @@ def main():  # noqa: C901
         print(f"Format: {args.format}")
         print(f"Resolution: {args.vr_resolution}")
 
-        # Show warning for experimental features
-        if args.experimental_frame_interpolation:
-            print(console_warning("WARNING: Experimental frame interpolation enabled!"))
-            print("   This feature may produce artifacts, wobbling, or poor quality.")
-            print("   Recommended for artistic experimentation only.")
-            print()
+        from datetime import datetime
 
-        # Create batch-specific output directory
-        if args.resume:
-            # Use existing directory for resume
-            batch_output_dir = args.resume
-        else:
-            # Create new batch directory
-            from datetime import datetime
-
-            video_name = Path(args.input_video).stem
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            batch_output_dir = Path(args.output_dir) / f"{video_name}_{timestamp}"
+        video_name = Path(args.input_video).stem
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_parent = Path(args.output_dir)
+        output_parent.mkdir(parents=True, exist_ok=True)
+        batch_output_dir = output_parent / f"{video_name}_{timestamp}"
+        try:
+            batch_output_dir.mkdir()
+        except FileExistsError:
+            # Preserve the usual readable name, but never adopt a competing job.
+            batch_output_dir = Path(
+                tempfile.mkdtemp(prefix=f"{batch_output_dir.name}_", dir=output_parent)
+            )
 
         success = projector.process_video(
             video_path=args.input_video,

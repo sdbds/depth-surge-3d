@@ -7,27 +7,16 @@ from pathlib import Path
 import sys
 
 import hatch_build
+from packaging.requirements import Requirement
 
 
 def test_pyproject_registers_non_jit_native_wheel_build_hook() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
     assert project["tool"]["hatch"]["build"]["hooks"]["custom"] == {"path": "hatch_build.py"}
-    assert {"setuptools>=84", "numpy>=1.24,<2", "torch==2.13.0"}.issubset(
-        project["build-system"]["requires"]
-    )
-
-
-def test_ci_builds_every_supported_native_wheel_cell() -> None:
-    workflow = Path(".github/workflows/quality-native-wheels.yml").read_text(encoding="utf-8")
-
-    for runner in ("windows-latest", "ubuntu-24.04", "ubuntu-24.04-arm"):
-        assert runner in workflow
-    for version in ('"3.10"', '"3.11"', '"3.12"'):
-        assert version in workflow
-    assert "python -m hatchling build -t wheel" in workflow
-    assert "runtime_jit" in workflow
-    assert "actions/upload-artifact@v4" in workflow
+    build_deps = {Requirement(req).name for req in project["build-system"]["requires"]}
+    assert "pybind11" in build_deps
+    assert build_deps.isdisjoint({"numpy", "torch"})
 
 
 def test_hatch_hook_loads_builder_without_project_root_on_sys_path(

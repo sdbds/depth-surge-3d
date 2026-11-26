@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -169,6 +170,56 @@ def test_stream_input_manifest_validates_schema_and_settings_cardinality(tmp_pat
         )
 
 
+@pytest.mark.parametrize("bound", [False, True], ids=["staged", "handle-bound"])
+@pytest.mark.parametrize("change", ["removed", "short", "padding", "different-generation"])
+def test_partial_or_changed_manifest_never_satisfies_saved_publication_evidence(
+    tmp_path, bound, change
+):
+    from src.depth_surge_3d.io.nofollow_io import AcquiredRoot
+
+    path = tmp_path / "encoding-input.reserved"
+    raw, fingerprint = _input_manifest(frame_count=2)
+    logical = len(raw) + 256
+    original = raw.ljust(logical, b"\0")
+    path.write_bytes(original)
+    counts = dict(raw_byte_count=len(raw), logical_byte_count=logical, expected_frame_count=2)
+    if bound:
+        with AcquiredRoot(tmp_path) as acquired, acquired.open_regular(path) as handle:
+            source = EncodingInputPublicationSource.from_authenticated_handle(
+                path=path,
+                handle=handle,
+                job_root=tmp_path,
+                job_root_identity=acquired.persistent_identity,
+                source_parent_identity=acquired.directory_identity(path.parent),
+                source_identity=acquired.persistent_regular_identity(path),
+                **counts,
+            )
+    else:
+        source = EncodingInputPublicationSource.from_path(path, **counts)
+    assert source.projection(expected_frame_count=2).fingerprint == fingerprint
+    backup = tmp_path / "saved-input.reserved"
+    if change == "removed":
+        path.rename(backup)
+    elif change == "short":
+        path.write_bytes(raw)
+    elif change == "padding":
+        path.write_bytes(original[:-1] + b"x")
+    else:
+        document = _input_manifest_value(frame_count=2)
+        document["frames"][0]["sha256"] = "a" * 64
+        next_raw, next_fingerprint = _encode_input_manifest(document)
+        assert next_fingerprint != fingerprint
+        path.write_bytes(next_raw.ljust(logical, b"\0"))
+    with pytest.raises(FinalPublicationValidationError):
+        source.projection(expected_frame_count=2)
+    if change == "removed":
+        assert not path.exists()
+        backup.rename(path)
+    else:
+        path.write_bytes(original)
+    assert source.projection(expected_frame_count=2).raw_sha256 == hashlib.sha256(raw).hexdigest()
+
+
 def test_settings_frame_count_uses_selected_clip_extent() -> None:
     settings = _artifact(
         video_properties={
@@ -321,10 +372,11 @@ def test_stream_input_manifest_rejects_rehashed_semantic_corruption(tmp_path, ca
     elif case == "frame_gap":
         value["frame_names"][1] = "frame_000002"
         value["frames"][1]["relative_path"] = "99_vr_frames/frame_000002.png"
-    elif case == "identity_filename":
-        value["frames"][1]["relative_path"] = "99_vr_frames/not-the-frame.png"
-    elif case == "identity_parent":
-        value["frames"][1]["relative_path"] = "another/frame_000001.png"
+    elif case in {"identity_filename", "identity_parent"}:
+        value["frames"][1]["relative_path"] = {
+            "identity_filename": "99_vr_frames/not-the-frame.png",
+            "identity_parent": "another/frame_000001.png",
+        }[case]
     elif case == "identity_unknown_key":
         value["frames"][0]["unexpected"] = 1
     elif case == "identity_hash":
@@ -429,6 +481,81 @@ def test_streamed_image2pipe_intent_requires_complete_input_declaration(
             relative_path="result.mp4",
             expected_mode="assembled_vr",
         )
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        ("none", None),
+        ("wrong-start", "start number"),
+        ("rate-missing", "frame rate is incomplete"),
+        ("rate-invalid", "frame rate is invalid"),
+        ("rate-zero", "must be positive"),
+        ("wrong-frame-count", "frame limit"),
+        ("encoder-absent", "encoder is invalid"),
+        ("missing-audio-bound", "audio filter is missing"),
+        ("invalid-audio-bound", "sample bound is invalid"),
+        ("wrong-audio-index", "wrong input index"),
+        ("audio-map-without-input", "without an audio identity"),
+    ],
+)
+def test_recovered_encoder_contract_binds_the_clip_clock_and_audio_stream(change, reason):
+    raw, fingerprint = _input_manifest(frame_count=2)
+    projection = final_publication_module._parse_input_manifest_projection_v1(
+        raw, expected_frame_count=2
+    )
+    settings = _artifact(
+        processing_settings=validate_settings(
+            {"vr_output_width": 1920, "vr_output_height": 1080},
+            source="explicit",
+        )
+    )
+    args = list(_streamed_assembled_arguments(fingerprint, "result.mp4"))
+    image = args.index("-vf")
+    if change != "audio-map-without-input":
+        args[image:image] = ["-i", f"@audio:sha256={'9' * 64}:bytes=2048:stream=a:0"]
+    args[-1:-1] = ["-map", "1:a:0" if change != "wrong-audio-index" else "2:a:0"]
+    if change != "missing-audio-bound":
+        bound = "0" if change == "invalid-audio-bound" else "2049"
+        args[-1:-1] = ["-filter:a", f"atrim=end_sample={bound},asetpts=PTS-STARTPTS"]
+    if change == "wrong-start":
+        args[1:1] = ["-start_number", "1"]
+    elif change in {"rate-invalid", "rate-zero", "wrong-frame-count"}:
+        key, value = {
+            "rate-invalid": ("-framerate", "24/0"),
+            "rate-zero": ("-framerate", "0"),
+            "wrong-frame-count": ("-frames:v", "3"),
+        }[change]
+        args[args.index(key) + 1] = value
+    elif change in {"rate-missing", "encoder-absent"}:
+        offset = args.index("-framerate" if change == "rate-missing" else "-c:v")
+        del args[offset : offset + 2]
+
+    def reconstruct():
+        final_publication_module._validate_normalized_argv(
+            tuple(args),
+            input_stage_fingerprint=fingerprint,
+            expected_mode="assembled_vr",
+            relative_path="result.mp4",
+        )
+        return final_publication_module._final_container_expectation_from_intent_v1(
+            settings=settings,
+            input_projection=projection,
+            arguments=tuple(args),
+        )
+
+    if reason:
+        with pytest.raises(FinalPublicationValidationError, match=reason):
+            reconstruct()
+    else:
+        expected = reconstruct()
+        assert (expected.width, expected.height, expected.frame_count, expected.fps) == (
+            1920,
+            1080,
+            2,
+            "24/1",
+        )
+        assert expected.audio_expected and expected.audio_packet_upper_bound == 5
 
 
 def _complete_prune_diagnostics(root) -> None:
@@ -564,6 +691,20 @@ def _install_schema5_job(root, artifact, *, initial=None) -> None:
             reservation_id="cc" * 16,
         )
         transition.commit()
+
+
+@pytest.fixture
+def native_job(tmp_path: Path):
+    initial = _artifact()
+    reservation_protocol.bootstrap_settings_job_v1(
+        job_root=tmp_path,
+        artifact=initial,
+        initial_settings_reservation_id="aa" * 16,
+        allocation_unit=reservation_protocol.allocation_unit_for_path(tmp_path),
+        allocation_adapter=reservation_protocol.platform_allocation_adapter,
+        allocation_counter=reservation_protocol.platform_allocation_counter,
+    )
+    return initial
 
 
 def _published_pruning_reservation(root, *, diagnostic_frame_count: int = 1):
@@ -831,6 +972,46 @@ def test_successful_publication_orders_video_then_input_then_final_and_audits(
     )
 
 
+@pytest.mark.parametrize("authorization", ["none", "changed", "missing"])
+def test_standalone_publication_requires_the_exact_authorized_predecessor(
+    tmp_path: Path, authorization: str
+) -> None:
+    artifact = _producer_artifact()
+    relative = artifact.to_object()["output_info"]["expected_final_relative_path"]
+    final = tmp_path / relative
+    final.write_bytes(b"already encoded")
+    authority = {}
+    if authorization != "none":
+        authority["expected_existing_video_identity"] = capture_file_identity(final)
+        final.rename(tmp_path / "approved-predecessor.mp4")
+        if authorization == "changed":
+            final.write_bytes(b"already encoded")
+    foreign_identity = capture_file_identity(final) if final.exists() else None
+    sibling = tmp_path / "candidate.mp4"
+    sibling.write_bytes(b"newly encoded")
+    raw, fingerprint = _input_manifest()
+    transaction = FinalPublicationTransactionV4(
+        job_root=tmp_path,
+        settings=artifact,
+        sibling_relative_path=sibling.name,
+        encoding_input_manifest_raw=raw,
+        input_stage_fingerprint=fingerprint,
+        resolved_encoding_arguments=_assembled_arguments(fingerprint, relative),
+        container_validator=lambda path: path.read_bytes() == b"newly encoded",
+        **authority,
+    )
+    before = set(tmp_path.iterdir())
+
+    with pytest.raises(FinalPublicationValidationError):
+        transaction.publish()
+
+    assert set(tmp_path.iterdir()) == before
+    assert sibling.read_bytes() == b"newly encoded"
+    if foreign_identity is not None:
+        assert final.read_bytes() == b"already encoded"
+        assert capture_file_identity(final) == foreign_identity
+
+
 def test_publication_rejects_sibling_swapped_after_container_validation(
     tmp_path,
 ) -> None:
@@ -954,6 +1135,7 @@ def test_post_video_crash_is_classified_from_actual_mixed_generation(tmp_path) -
     artifact = _producer_artifact()
     expected = artifact.to_object()["output_info"]["expected_final_relative_path"]
     (tmp_path / expected).write_bytes(b"old-video")
+    old_video_identity = capture_file_identity(tmp_path / expected)
     old_input, old_input_fingerprint = _input_manifest()
     (tmp_path / "encoding_input_manifest.json").write_bytes(old_input)
     old_manifest = build_final_video_manifest_v4(
@@ -974,6 +1156,7 @@ def test_post_video_crash_is_classified_from_actual_mixed_generation(tmp_path) -
         job_root=tmp_path,
         settings=artifact,
         sibling_relative_path=sibling.name,
+        expected_existing_video_identity=old_video_identity,
         encoding_input_manifest_raw=input_raw,
         input_stage_fingerprint=input_fingerprint,
         resolved_encoding_arguments=(
@@ -1092,6 +1275,332 @@ def test_final_encoding_reservation_publishes_index_before_owned_namespace(
     recovery = loaded.observe()
     assert recovery.phase == "ready_pre_video"
     assert recovery.action == "encode"
+
+
+def _interrupt_before_final_index_rename(root: Path, settings, *, prior=None) -> Path:
+    def interrupt(stage: str) -> None:
+        if stage == "index:temporary":
+            raise InjectedFinalPublicationCrash(stage)
+
+    with pytest.raises(InjectedFinalPublicationCrash, match="index:temporary"):
+        prepare_final_encoding_reservation_v1(
+            job_root=root,
+            settings=settings,
+            publication_generation="44" * 16,
+            input_manifest_raw_max=4096,
+            final_manifest_raw_max=4096,
+            expected_existing_video_identity=prior,
+            event=interrupt,
+        )
+    index = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+    assert not index.exists()
+    return index.with_name(f".{index.name}.create-new.tmp")
+
+
+@pytest.mark.parametrize("target_state", ["absent", "approved-existing", "new-user-file"])
+def test_pending_final_index_only_promotes_the_original_preflight(
+    tmp_path: Path, native_job, target_state: str
+) -> None:
+    final = tmp_path / native_job.to_object()["output_info"]["expected_final_relative_path"]
+    index = tmp_path / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+    prior = None
+    if target_state == "approved-existing":
+        final.write_bytes(b"previous published output")
+        prior = capture_file_identity(final)
+    temporary = _interrupt_before_final_index_rename(tmp_path, native_job, prior=prior)
+    candidate = temporary.read_bytes()
+    if target_state == "new-user-file":
+        final.write_bytes(b"another export")
+        prior = capture_file_identity(final)
+        with pytest.raises(reservation_protocol.ReservationConflictError, match="already exists"):
+            final_publication_module.recover_final_encoding_index_pair_v1(tmp_path)
+        assert temporary.read_bytes() == candidate and not index.exists()
+        assert final.read_bytes() == b"another export" and capture_file_identity(final) == prior
+        final.rename(tmp_path / "kept-export.mp4")
+
+    recovered = final_publication_module.recover_final_encoding_index_pair_v1(tmp_path)
+    assert recovered is not None and recovered.to_object() == json.loads(candidate)
+    assert index.read_bytes() == candidate and not temporary.exists()
+    assert final_publication_module.recover_final_encoding_index_pair_v1(tmp_path) == recovered
+    if target_state == "approved-existing":
+        assert final.read_bytes() == b"previous published output"
+        assert capture_file_identity(final) == prior
+    else:
+        assert not final.exists()
+        if target_state == "new-user-file":
+            assert (tmp_path / "kept-export.mp4").read_bytes() == b"another export"
+
+
+@pytest.mark.parametrize("changed", ["settings", "diagnostics"])
+def test_pending_prune_index_still_authenticates_settings_and_previous_manifest(tmp_path, changed):
+    initial = _pruning_artifact()
+    _install_schema5_job(tmp_path, initial)
+    _complete_prune_diagnostics(tmp_path)
+    temporary = _interrupt_before_final_index_rename(tmp_path, initial)
+    pending = temporary.read_bytes()
+    if changed == "settings":
+        path = tmp_path / "processing-settings-v5.json"
+        other = initial.with_producer_marker(
+            generation="44" * 16, updated_at="2026-08-24T12:34:57.123456Z"
+        ).encode()
+        reason = "preflight settings changed"
+    else:
+        path = tmp_path / "04_stereo_diagnostics" / "metadata.json"
+        other = path.read_bytes() + b"\n"
+        reason = "extent target changed"
+    saved = path.read_bytes()
+    path.write_bytes(other)
+    with pytest.raises(reservation_protocol.ReservationConflictError, match=reason):
+        final_publication_module.recover_final_encoding_index_pair_v1(tmp_path)
+    assert temporary.read_bytes() == pending
+    assert path.read_bytes() == other
+    assert not (tmp_path / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).exists()
+    path.write_bytes(saved)
+    restored = final_publication_module.recover_final_encoding_index_pair_v1(tmp_path)
+    assert restored is not None and restored.to_object() == json.loads(pending)
+
+
+def test_discarding_unfinished_encode_keeps_previous_published_output(tmp_path, native_job):
+    final = tmp_path / native_job.to_object()["output_info"]["expected_final_relative_path"]
+    final.write_bytes(b"previous complete encode")
+    previous = capture_file_identity(final)
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=native_job,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=4096,
+        final_manifest_raw_max=4096,
+        expected_existing_video_identity=previous,
+    )
+    reservation.sibling_path.write_bytes(b"unfinished encoder output")
+    capability = FinalEncodingReservationCapabilityV1.from_prepared(reservation)
+    assert capability.discard_nonsemantic_sibling()
+    assert not capability.discard_nonsemantic_sibling()
+    assert not reservation.sibling_path.exists()
+    assert (
+        final.read_bytes() == b"previous complete encode"
+        and capture_file_identity(final) == previous
+    )
+    assert reservation.index_path.exists() and reservation.target_descriptor_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "reason"),
+    [
+        ("schema_version", 9, "version"),
+        ("publication_generation", "", "generation"),
+        ("settings_revision_at_preflight", -1, "revision"),
+        ("final_video_publication_method", "replace_existing", "old target"),
+        ("sibling_video_temporary_relative_path", "other-export.tmp.mp4", "sibling name"),
+        ("final_video_target_descriptor_relative_path", "old-descriptor.json", "descriptor name"),
+        ("diagnostics_metadata_raw_sha256_at_preflight", "a" * 64, "binding is incomplete"),
+        ("extent_entries", [], "extent count"),
+    ],
+)
+def test_inconsistent_index_snapshot_never_promotes_a_candidate(
+    tmp_path, native_job, field, replacement, reason
+):
+    pending = _interrupt_before_final_index_rename(tmp_path, native_job)
+    original = pending.read_bytes()
+    data = json.loads(original)
+    data[field] = replacement
+    data["fingerprint"] = self_fingerprint(data)
+    with pytest.raises(reservation_protocol.ReservationConflictError, match=reason):
+        final_publication_module.FinalEncodingReservationIndexV1.from_object(data)
+    # With no following extents a torn candidate can be discarded; no final name is published.
+    pending.write_bytes(canonical_json_bytes(data))
+    assert final_publication_module.recover_final_encoding_index_pair_v1(tmp_path) is None
+    assert (
+        not pending.exists() and not (tmp_path / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).exists()
+    )
+    assert (tmp_path / "processing-settings-v5.json").read_bytes() == native_job.encode()
+    pending.write_bytes(original)
+    assert final_publication_module.recover_final_encoding_index_pair_v1(tmp_path) is not None
+
+
+@pytest.mark.parametrize("prior_authority", ["none", "replaced", "removed"])
+def test_new_final_reservation_refuses_an_unowned_or_changed_target(
+    tmp_path: Path, native_job, prior_authority: str
+) -> None:
+    name = native_job.to_object()["output_info"]["expected_final_relative_path"]
+    final = tmp_path / name
+    original = b"already encoded video"
+    final.write_bytes(original)
+    expected_identity = capture_file_identity(final)
+    authority = {}
+    if prior_authority != "none":
+        authority["expected_existing_video_identity"] = expected_identity
+        final.rename(tmp_path / "previous.mp4")
+        if prior_authority == "replaced":
+            final.write_bytes(original)
+            assert capture_file_identity(final) != expected_identity
+    existing = capture_file_identity(final) if final.exists() else None
+    names_before = set(tmp_path.rglob("*"))
+
+    with pytest.raises(reservation_protocol.ReservationConflictError):
+        prepare_final_encoding_reservation_v1(
+            job_root=tmp_path,
+            settings=native_job,
+            publication_generation="44" * 16,
+            input_manifest_raw_max=4096,
+            final_manifest_raw_max=4096,
+            **authority,
+        )
+
+    assert set(tmp_path.rglob("*")) == names_before
+    if existing is not None:
+        assert capture_file_identity(final) == existing
+        assert final.read_bytes() == original
+    else:
+        assert not final.exists()
+
+
+@pytest.fixture
+def legacy_final_index_writer(monkeypatch):
+    # Emit the previous wire format before the real writer binds all downstream descriptors.
+    index_type = final_publication_module.FinalEncodingReservationIndexV1
+    build = index_type.build
+
+    def build_legacy(**fields):
+        value = build(**fields).to_object()
+        value["schema_version"] = 1
+        value["algorithm_version"] = "final-encoding-reservation-v1"
+        value["fingerprint"] = self_fingerprint(value)
+        return index_type.from_object(value)
+
+    monkeypatch.setattr(index_type, "build", staticmethod(build_legacy))
+
+
+@pytest.mark.parametrize(
+    "boundary", ["index:temporary", "index:published", "ready", "redundant-temp"]
+)
+def test_historical_implicit_video_predecessor_is_preserved(
+    tmp_path, native_job, legacy_final_index_writer, boundary
+):
+    final = tmp_path / native_job.to_object()["output_info"]["expected_final_relative_path"]
+    final.write_bytes(b"pre-existing movie never explicitly approved for replacement")
+    original = capture_file_identity(final)
+
+    def interrupt(event):
+        if event == boundary:
+            raise InjectedFinalPublicationCrash(event)
+
+    def prepare():
+        return prepare_final_encoding_reservation_v1(
+            job_root=tmp_path,
+            settings=native_job,
+            publication_generation="44" * 16,
+            input_manifest_raw_max=4096,
+            final_manifest_raw_max=4096,
+            expected_existing_video_identity=original,
+            event=interrupt,
+        )
+
+    if boundary in {"ready", "redundant-temp"}:
+        reservation = prepare()
+        reservation.sibling_path.write_bytes(b"old unfinished encode")
+    else:
+        with pytest.raises(InjectedFinalPublicationCrash):
+            prepare()
+    index_path = tmp_path / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+    temporary = index_path.with_name(f".{index_path.name}.create-new.tmp")
+    wire_path = temporary if boundary == "index:temporary" else index_path
+    assert json.loads(wire_path.read_bytes())["schema_version"] == 1
+    if boundary == "redundant-temp":
+        temporary.write_bytes(index_path.read_bytes())
+
+    def snapshot():
+        return {
+            path: (capture_file_identity(path), path.stat().st_mtime_ns, path.read_bytes())
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+    for _ in range(2):
+        with pytest.raises(
+            reservation_protocol.ReservationConflictError, match="replacement authority"
+        ):
+            reopened = load_final_encoding_reservation_v1(tmp_path, native_job)
+            reopened.recover_publication_prefix()
+        assert snapshot() == before
+    if boundary == "ready":
+        from src.depth_surge_3d.processing.video.video_encoder import VideoEncoder
+
+        with pytest.raises(
+            reservation_protocol.ReservationConflictError, match="replacement authority"
+        ):
+            VideoEncoder().resume_streamed_publication(tmp_path, native_job)
+        assert snapshot() == before
+
+
+def test_historical_replacement_can_finish_an_already_published_video(
+    tmp_path, native_job, legacy_final_index_writer
+):
+    final = tmp_path / native_job.to_object()["output_info"]["expected_final_relative_path"]
+    final.write_bytes(b"historical predecessor")
+    raw, fingerprint = _input_manifest()
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=native_job,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=len(raw),
+        final_manifest_raw_max=4096,
+        expected_existing_video_identity=capture_file_identity(final),
+    )
+    producer = reservation.commit_producer_settings()
+    reservation.input_manifest_transaction.stage_complete_full(raw)
+    encoded = b"historical encode with durable publication intent"
+    reservation.sibling_path.write_bytes(encoded)
+    original = capture_file_identity(reservation.sibling_path)
+    # Recreate a V1 publisher that died after writing the final intent, before its rename.
+    reservation.sibling_path.replace(final)
+    reservation.input_manifest_transaction.recover(raw)
+    manifest = build_final_video_manifest_v4(
+        relative_path=final.name,
+        video_sha256=hashlib.sha256(encoded).hexdigest(),
+        video_byte_count=len(encoded),
+        input_stage_fingerprint=fingerprint,
+        resolved_encoding_arguments=_assembled_arguments(fingerprint, final.name),
+    )
+    reservation.final_manifest_transaction.stage_complete_full(manifest.encode())
+    assert json.loads(reservation.index_path.read_bytes())["schema_version"] == 1
+    for _ in range(2):
+        reopened = load_final_encoding_reservation_v1(tmp_path, producer)
+        assert reopened.recover_publication_prefix().phase == "publication_authenticated"
+        assert capture_file_identity(final) == original and final.read_bytes() == encoded
+        assert (tmp_path / "final_video_manifest.json").read_bytes() == manifest.encode()
+
+
+def test_explicit_existing_video_authority_survives_restart(tmp_path, native_job):
+    final = tmp_path / native_job.to_object()["output_info"]["expected_final_relative_path"]
+    final.write_bytes(b"explicitly approved predecessor")
+    raw, fingerprint = _input_manifest()
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=native_job,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=len(raw),
+        final_manifest_raw_max=4096,
+        expected_existing_video_identity=capture_file_identity(final),
+    )
+    assert json.loads(reservation.index_path.read_bytes())["schema_version"] == 2
+    producer = reservation.commit_producer_settings()
+    reopened = load_final_encoding_reservation_v1(tmp_path, producer)
+    reopened.input_manifest_transaction.stage_complete_full(raw)
+    reopened.sibling_path.write_bytes(b"approved encode")
+    identity = capture_file_identity(reopened.sibling_path)
+    FinalPublicationTransactionV4(
+        job_root=tmp_path,
+        settings=producer,
+        sibling_relative_path=reopened.sibling_path.name,
+        encoding_input_manifest_raw=raw,
+        input_stage_fingerprint=fingerprint,
+        resolved_encoding_arguments=_assembled_arguments(fingerprint, final.name),
+        container_validator=lambda path: path.read_bytes() == b"approved encode",
+        reservation=reopened,
+    ).publish()
+    assert capture_file_identity(final) == identity and final.read_bytes() == b"approved encode"
 
 
 def test_final_placeholder_never_writes_through_a_swapped_job_root(
@@ -1772,6 +2281,84 @@ def test_pruning_success_consumes_all_extents_before_index_last_retirement(
     assert not list(reservation_dir.glob("d-r-55*"))
 
 
+def test_completed_resume_distinguishes_archived_history_from_reusable_payloads(tmp_path):
+    from src.depth_surge_3d.io.resume import build_resume_report
+
+    _producer, reservation, _transaction, _document = _published_pruning_reservation(tmp_path)
+    pruned = commit_payload_pruned(tmp_path, reservation=reservation)
+    pending = reservation.commit_cleanup_pending_settings()
+    allocation = {
+        "allocation_adapter": _test_allocation,
+        "allocation_counter": _test_allocation_counter,
+    }
+    assert run_authorized_cleanup(tmp_path, metadata=pruned, **allocation) > 0
+    completed = pending.completed(
+        terminal_at="2026-08-24T12:35:00.000000Z", frames_processed=1, cleanup_status="complete"
+    )
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path, current=pending, target=completed, **allocation
+    )
+    reservation.retire()
+    final = reservation.final_video_path
+    final.rename(tmp_path / "moved-by-user.mp4")
+    settings = validate_settings({"keep_intermediates": False}, source="explicit")
+    fixed = tmp_path / "processing-settings-v5.json"
+    diagnostics = tmp_path / "04_stereo_diagnostics"
+    report = build_resume_report(tmp_path, settings, settings_file=fixed)
+    assert report.historical_diagnostics_valid is True
+    assert report.stereo_payload_reusable is False
+    assert report.final_media_audit == FinalMediaAuditDispositionV1(
+        False, False, "incomplete_publication_evidence"
+    )
+
+    summary = diagnostics / "stereo_coverage_summary.json"
+    summary.write_bytes(b"changed after archiving")
+    damaged = build_resume_report(tmp_path, settings, settings_file=fixed)
+    assert damaged.historical_diagnostics_valid is False
+    assert damaged.stereo_payload_reusable is False
+    assert damaged.final_media_audit == report.final_media_audit
+    assert summary.read_bytes() == b"changed after archiving"
+    assert not final.exists() and (tmp_path / "moved-by-user.mp4").is_file()
+
+
+def test_failed_cleanup_retirement_leaves_published_data_and_demands_intact_history(tmp_path):
+    _producer, reservation, _transaction, _document = _published_pruning_reservation(tmp_path)
+    pruned = commit_payload_pruned(tmp_path, reservation=reservation)
+    pending = reservation.commit_cleanup_pending_settings()
+    failed = pending.failed(terminal_at="2026-08-24T12:35:00.000000Z", diagnostic_code="IO_ERROR")
+    allocation = {
+        "allocation_adapter": _test_allocation,
+        "allocation_counter": _test_allocation_counter,
+    }
+    reservation_protocol.commit_terminal_settings_v1(
+        job_root=tmp_path, current=pending, target=failed, **allocation
+    )
+    retained = [
+        reservation.final_video_path,
+        tmp_path / "encoding_input_manifest.json",
+        tmp_path / "final_video_manifest.json",
+        tmp_path / "04_stereo_diagnostics" / "metadata.json",
+        tmp_path / "00_original_frames" / "payload.bin",
+    ]
+    before = {p: p.read_bytes() for p in retained}
+    summary = tmp_path / "04_stereo_diagnostics" / "stereo_coverage_summary.json"
+    original = summary.read_bytes()
+    summary.write_bytes(b"incomplete copy")
+    index_raw = reservation.index_path.read_bytes()
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError, match="no retirement evidence"
+    ):
+        recover_final_encoding_terminal_retirement_v1(tmp_path, failed, **allocation)
+    assert reservation.index_path.read_bytes() == index_raw
+    assert all(p.read_bytes() == data for p, data in before.items())
+
+    summary.write_bytes(original)
+    assert recover_final_encoding_terminal_retirement_v1(tmp_path, failed, **allocation)
+    assert not reservation.index_path.exists()
+    assert all(p.read_bytes() == data for p, data in before.items())
+    assert project_diagnostics_metadata(retained[3]).fingerprint == pruned.fingerprint
+
+
 def test_pruning_crash_after_markers_reopens_the_remaining_ordered_prefix(
     tmp_path,
 ) -> None:
@@ -2146,9 +2733,12 @@ def test_final_target_descriptor_rewrites_an_index_owned_partial_temporary(
 ) -> None:
     artifact = _producer_artifact()
     _install_schema5_job(tmp_path, artifact)
+    expected_identity = None
     if existing_final:
         expected = artifact.to_object()["output_info"]["expected_final_relative_path"]
-        (tmp_path / expected).write_bytes(b"authenticated-old-final")
+        target = tmp_path / expected
+        target.write_bytes(b"authenticated-old-final")
+        expected_identity = capture_file_identity(target)
 
     def stop(value: str) -> None:
         if value == "index:published":
@@ -2161,6 +2751,7 @@ def test_final_target_descriptor_rewrites_an_index_owned_partial_temporary(
             publication_generation="44" * 16,
             input_manifest_raw_max=4096,
             final_manifest_raw_max=4096,
+            expected_existing_video_identity=expected_identity,
             allocation_unit=4096,
             allocation_adapter=_test_allocation,
             allocation_counter=_test_allocation_counter,
@@ -2461,6 +3052,285 @@ def test_reserved_post_video_crash_keeps_index_as_recovery_authority(tmp_path) -
     assert recovery.action == "commit-input-manifest"
 
 
+@pytest.mark.parametrize(
+    "target_state",
+    [
+        "foreign",
+        pytest.param(
+            "missing",
+            marks=pytest.mark.skipif(sys.platform != "linux", reason="Linux rename is atomic"),
+        ),
+    ],
+)
+def test_recovery_preserves_staged_input_when_the_prepublication_target_is_lost(
+    tmp_path: Path, native_job, target_state: str
+) -> None:
+    raw, _fingerprint = _input_manifest()
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=tmp_path,
+        settings=native_job,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=len(raw),
+        final_manifest_raw_max=4096,
+    )
+    producer = reservation.commit_producer_settings()
+    staged = reservation.input_manifest_transaction
+    assert staged is not None
+    staged.stage_complete_full(raw)
+    staged_bytes = staged.source_path.read_bytes()
+    encoded = b"encoded video"
+    reservation.sibling_path.write_bytes(encoded)
+    sibling_identity = capture_file_identity(reservation.sibling_path)
+    if target_state == "missing":
+        reservation.final_video_path.unlink()
+    else:
+        # Identical bytes at a different name do not prove the indexed sibling moved.
+        foreign = tmp_path / "unowned.mp4"
+        foreign.write_bytes(encoded)
+        foreign_identity = capture_file_identity(foreign)
+        assert foreign_identity != sibling_identity
+        os.replace(foreign, reservation.final_video_path)
+
+    reopened = load_final_encoding_reservation_v1(tmp_path, producer)
+    with pytest.raises(reservation_protocol.ReservationConflictError):
+        reopened.recover_publication_prefix()
+
+    assert staged.source_path.read_bytes() == staged_bytes
+    assert staged.descriptor_path.is_file()
+    assert staged.target_path.read_bytes() == b""
+    assert reservation.index_path.is_file()
+    assert reservation.sibling_path.read_bytes() == encoded
+    assert capture_file_identity(reservation.sibling_path) == sibling_identity
+    if target_state == "missing":
+        assert not reservation.final_video_path.exists()
+    else:
+        assert reservation.final_video_path.read_bytes() == encoded
+        assert capture_file_identity(reservation.final_video_path) == foreign_identity
+
+
+def _interrupt_file_backed_publication(root: Path, settings, boundary: str):
+    raw, fingerprint = _input_manifest()
+    reservation = prepare_final_encoding_reservation_v1(
+        job_root=root,
+        settings=settings,
+        publication_generation="44" * 16,
+        input_manifest_raw_max=len(raw),
+        final_manifest_raw_max=4096,
+    )
+    producer = reservation.commit_producer_settings()
+    staged = reservation.input_manifest_transaction
+    assert staged is not None
+    staged.stage_complete_full(raw)
+    encoded = b"validated file-backed encode"
+    reservation.sibling_path.write_bytes(encoded)
+    validated = final_publication_module.validate_final_container_evidence_v1(
+        root, reservation.sibling_path, lambda path: path.read_bytes() == encoded
+    )
+    arguments = _assembled_arguments(fingerprint, reservation.final_video_path.name)
+
+    class PowerLoss(BaseException):
+        pass
+
+    def interrupt(event: str) -> None:
+        if event == boundary:
+            raise PowerLoss(event)
+
+    with pytest.raises(PowerLoss, match=boundary):
+        FinalPublicationTransactionV4(
+            job_root=root,
+            settings=producer,
+            sibling_relative_path=reservation.sibling_path.name,
+            encoding_input_manifest_raw=raw,
+            input_stage_fingerprint=fingerprint,
+            resolved_encoding_arguments=arguments,
+            container_validator=None,
+            expected_sibling_identity=validated.identity,
+            expected_sibling_sha256=validated.raw_sha256,
+            expected_sibling_byte_count=validated.byte_count,
+            reservation=reservation,
+            event=interrupt,
+        ).publish()
+    return producer, reservation, raw, validated, arguments
+
+
+def test_discard_preserves_staged_encode_that_already_has_durable_output_evidence(
+    tmp_path, native_job
+):
+    producer, reservation, _raw, validated, _args = _interrupt_file_backed_publication(
+        tmp_path, native_job, "encoded-output:synced"
+    )
+    reopened = load_final_encoding_reservation_v1(tmp_path, producer)
+    assert reopened.observe().phase == "encoded_output_staged"
+    assert not reopened.discard_nonsemantic_sibling()
+    assert capture_file_identity(reservation.sibling_path) == validated.identity
+    assert reopened.recover_publication_prefix().phase == "publication_authenticated"
+    assert capture_file_identity(reservation.final_video_path) == validated.identity
+
+
+@pytest.mark.parametrize(
+    ("boundary", "phase"),
+    [
+        ("encoded-output:synced", "encoded_output_staged"),
+        ("video:published", "video_replaced_input_intent"),
+        ("input-manifest:published", "final_manifest_intent"),
+        ("final-manifest:published", "publication_authenticated"),
+    ],
+)
+def test_file_backed_recovery_publishes_the_validated_generation_once(
+    tmp_path: Path, native_job, boundary: str, phase: str
+) -> None:
+    producer, reservation, raw, validated, arguments = _interrupt_file_backed_publication(
+        tmp_path, native_job, boundary
+    )
+    reopened = load_final_encoding_reservation_v1(tmp_path, producer)
+    assert reopened.observe().phase == phase
+    candidate = (
+        reservation.sibling_path
+        if boundary == "encoded-output:synced"
+        else reservation.final_video_path
+    )
+    encoded_mtime = candidate.stat().st_mtime_ns
+    assert capture_file_identity(candidate) == validated.identity
+
+    assert reopened.recover_publication_prefix().phase == "publication_authenticated"
+    input_path = tmp_path / "encoding_input_manifest.json"
+    manifest_path = tmp_path / "final_video_manifest.json"
+    final = reservation.final_video_path
+    assert not reservation.sibling_path.exists()
+    assert capture_file_identity(final) == validated.identity
+    assert final.stat().st_mtime_ns == encoded_mtime
+    video = final.read_bytes()
+    assert (hashlib.sha256(video).hexdigest(), len(video)) == (
+        validated.raw_sha256,
+        validated.byte_count,
+    )
+    assert input_path.read_bytes() == raw
+    manifest_raw = manifest_path.read_bytes()
+    manifest = json.loads(manifest_raw)
+    assert manifest["schema_version"] == 2
+    assert manifest["encoded_output"] == {
+        "byte_count": validated.byte_count,
+        "identity": validated.identity.to_object(),
+        "raw_sha256": validated.raw_sha256,
+        "reservation_index_fingerprint": reservation.index.fingerprint,
+        "sibling_relative_path": reservation.sibling_path.name,
+    }
+    assert tuple(manifest["resolved_encoding_arguments"]) == arguments
+    assert manifest["input_stage_fingerprint"] == json.loads(raw)["fingerprint"]
+    paths = (final, input_path, manifest_path)
+    committed = [(capture_file_identity(path), path.stat().st_mtime_ns) for path in paths]
+
+    again = load_final_encoding_reservation_v1(tmp_path, producer)
+    assert again.recover_publication_prefix().phase == "publication_authenticated"
+    assert [(capture_file_identity(path), path.stat().st_mtime_ns) for path in paths] == committed
+    assert manifest_path.read_bytes() == manifest_raw
+
+
+@pytest.mark.parametrize("manifest_kind", ["input", "final"])
+@pytest.mark.parametrize("crash_at", ["after-truncate-sync", "after-rename-parent-sync"])
+def test_file_backed_recovery_finishes_an_interrupted_manifest_rename(
+    tmp_path: Path, native_job, manifest_kind: str, crash_at: str
+) -> None:
+    boundary = "video:published" if manifest_kind == "input" else "input-manifest:published"
+    producer, reservation, raw, validated, _arguments = _interrupt_file_backed_publication(
+        tmp_path, native_job, boundary
+    )
+    transaction = (
+        reservation.input_manifest_transaction
+        if manifest_kind == "input"
+        else reservation.final_manifest_transaction
+    )
+    assert transaction is not None
+    payload = (
+        raw if manifest_kind == "input" else transaction.source_path.read_bytes().rstrip(b"\0")
+    )
+    with pytest.raises(reservation_protocol.InjectedReservationCrash):
+        transaction.consume_streamed_prefix(
+            prefix_byte_count=len(payload),
+            prefix_sha256=hashlib.sha256(payload).hexdigest(),
+            crash_at=crash_at,
+        )
+    assert transaction.descriptor_path.exists()
+    assert transaction.source_path.exists() == (crash_at == "after-truncate-sync")
+
+    reopened = load_final_encoding_reservation_v1(tmp_path, producer)
+    assert reopened.recover_publication_prefix().phase == "publication_authenticated"
+    assert transaction.target_path.read_bytes() == payload
+    assert not transaction.descriptor_path.exists()
+    assert capture_file_identity(reservation.final_video_path) == validated.identity
+
+
+@pytest.mark.parametrize(
+    ("boundary", "corruption"),
+    [
+        ("encoded-output:synced", "identical-copy"),
+        ("encoded-output:synced", "different-input"),
+        ("video:published", "same-inode-edit"),
+        ("input-manifest:published", "different-owner"),
+        ("final-manifest:published", "identical-copy"),
+    ],
+)
+def test_file_backed_evidence_conflict_is_readonly_and_retryable(
+    tmp_path: Path, native_job, boundary: str, corruption: str
+) -> None:
+    producer, reservation, raw, validated, _arguments = _interrupt_file_backed_publication(
+        tmp_path, native_job, boundary
+    )
+    candidate = (
+        reservation.sibling_path
+        if boundary == "encoded-output:synced"
+        else reservation.final_video_path
+    )
+    parked = tmp_path / "parked-original.mp4"
+    if corruption == "identical-copy":
+        candidate.rename(parked)
+        candidate.write_bytes(parked.read_bytes())
+        assert capture_file_identity(candidate) != validated.identity
+    else:
+        if corruption == "same-inode-edit":
+            changed = candidate
+            original = changed.read_bytes()
+            changed.write_bytes(b"!" + original[1:])
+            assert capture_file_identity(candidate) == validated.identity
+        elif corruption == "different-input":
+            changed = reservation.input_manifest_transaction.source_path
+            original = changed.read_bytes()
+            value = json.loads(raw)
+            value["frames"][0]["sha256"] = "c" * 64
+            other, _ = _encode_input_manifest(value)
+            changed.write_bytes(other.ljust(len(original), b"\0"))
+        else:
+            changed = reservation.final_manifest_transaction.source_path
+            original = changed.read_bytes()
+            receipt = json.loads(original.rstrip(b"\0"))
+            receipt["encoded_output"]["reservation_index_fingerprint"] = "c" * 64
+            receipt["fingerprint"] = self_fingerprint(receipt)
+            changed.write_bytes(canonical_json_bytes(receipt).ljust(len(original), b"\0"))
+
+    def snapshot():
+        return {
+            path: (capture_file_identity(path), hashlib.sha256(path.read_bytes()).digest())
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+    with pytest.raises(
+        (FinalPublicationValidationError, reservation_protocol.ReservationConflictError)
+    ):
+        reopened = load_final_encoding_reservation_v1(tmp_path, producer)
+        reopened.recover_publication_prefix()
+    assert snapshot() == before
+
+    if corruption == "identical-copy":
+        os.replace(parked, candidate)
+    else:
+        changed.write_bytes(original)
+    reopened = load_final_encoding_reservation_v1(tmp_path, producer)
+    assert reopened.recover_publication_prefix().phase == "publication_authenticated"
+    assert capture_file_identity(reservation.final_video_path) == validated.identity
+
+
 def test_reserved_input_manifest_refuses_a_replaced_preflight_target(tmp_path) -> None:
     artifact = _producer_artifact()
     _install_schema5_job(tmp_path, artifact)
@@ -2552,7 +3422,7 @@ def test_reserved_windows_video_replacement_gap_moves_indexed_sibling_forward(
         (
             "after-input-manifest",
             "input_manifest_committed_no_final_intent",
-            "revalidate-input-and-reencode",
+            "require-durable-output-evidence",
         ),
         (
             "after-final-manifest",

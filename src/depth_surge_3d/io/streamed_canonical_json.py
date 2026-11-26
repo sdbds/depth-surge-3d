@@ -56,14 +56,19 @@ class ReplayableJsonArray:
             raise TypeError("replayable JSON array requires a callable factory")
 
 
+def _array_chunks(value: Iterable[object] | ReplayableJsonArray) -> Iterator[bytes]:
+    yield b"["
+    items = value.items() if isinstance(value, ReplayableJsonArray) else value
+    for index, item in enumerate(items):
+        if index:
+            yield b","
+        yield from _value_chunks(item)
+    yield b"]"
+
+
 def _value_chunks(value: object) -> Iterator[bytes]:
     if isinstance(value, ReplayableJsonArray):
-        yield b"["
-        for index, item in enumerate(value.items()):
-            if index:
-                yield b","
-            yield from _value_chunks(item)
-        yield b"]"
+        yield from _array_chunks(value)
         return
     if isinstance(value, dict):
         if not all(isinstance(key, str) for key in value):
@@ -78,12 +83,7 @@ def _value_chunks(value: object) -> Iterator[bytes]:
         yield b"}"
         return
     if isinstance(value, (list, tuple)):
-        yield b"["
-        for index, item in enumerate(value):
-            if index:
-                yield b","
-            yield from _value_chunks(item)
-        yield b"]"
+        yield from _array_chunks(value)
         return
     yield canonical_json_bytes(value)
 

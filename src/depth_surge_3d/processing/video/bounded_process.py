@@ -623,8 +623,9 @@ class FfmpegInputPipeProcessV1:
             while process.poll() is None and self._current_failure() is None:
                 self._wake.wait(0.05)
                 self._wake.clear()
+            self._close_runtime(terminate=self._current_failure() is not None)
+            # The last progress or diagnostic bytes can arrive after the child exits.
             failure = self._current_failure()
-            self._close_runtime(terminate=failure is not None)
             if failure is not None:
                 raise failure
             self.parser.finish()

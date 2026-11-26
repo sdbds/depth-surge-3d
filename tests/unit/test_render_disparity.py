@@ -220,6 +220,81 @@ def test_accepts_historical_base_canonical_artifact(tmp_path: Path) -> None:
     assert artifact.native_shape == (3, 5)
 
 
+def _audit_fixture(root, metadata, *, plan=None, names=None):
+    semantic = metadata["semantic_identity"]
+    return audit_stabilized_shot_records(
+        root,
+        metadata=metadata,
+        frame_names=semantic["frame_names"] if names is None else names,
+        shot_plan=semantic["shot_plan"] if plan is None else plan,
+        native_shape=(3, 5),
+    )
+
+
+def test_audit_separates_reusable_pending_and_unusable_shots_without_touching_files(tmp_path):
+    root = tmp_path / "stage"
+    depths, _, metadata = _write_stabilized(root)
+    saved = depths[0].read_bytes()
+    metadata["completed_shots"].append(dict(metadata["completed_shots"][0], shot_id=2))
+    plan = [{"shot_id": i, "start": i, "end": i + 1} for i in range(3)]
+    names = [f"frame_{i:06}.png" for i in range(1, 4)]
+    audit = _audit_fixture(root, metadata, plan=plan, names=names)
+    assert audit.reusable_shot_ids == (0,)
+    assert audit.pending_shot_ids == (1,)
+    assert audit.invalid_shot_ids == (2,)
+    assert [entry["shot_id"] for entry in audit.payload_records] == [0]
+    assert depths[0].read_bytes() == saved
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("shot_id", False),
+        ("start", False),
+        ("end", True),
+        ("end", 1.0),
+        ("schema_version", 3),
+        ("files", []),
+        ("files", [{"name": "frame_000002.png", "sha256": "0" * 64}]),
+        ("shot_payload_sha256", "0" * 64),
+    ],
+)
+def test_audit_does_not_reuse_malformed_rehashed_shot_manifests(tmp_path, field, value):
+    root = tmp_path / "stage"
+    _write_stabilized(root)
+    path = root / "shot_manifests/shot_000000.json"
+    manifest = json.loads(path.read_text())
+    manifest[field] = value
+    path.write_text(json.dumps(manifest))
+    _rehash_stabilized(root)
+    metadata = json.loads((root / "metadata.json").read_text())
+    audit = _audit_fixture(root, metadata)
+    assert audit.invalid_shot_ids == (0,)
+    assert not audit.reusable_shot_ids and not audit.payload_records
+
+
+@pytest.mark.parametrize(
+    "patch,reason",
+    [
+        ({"plan": []}, "shot plan"),
+        ({"plan": [None]}, "shot plan"),
+        ({"plan": [{"shot_id": 0, "start": 0, "end": 1, "extra": 0}]}, "not canonical"),
+        ({"names": ["a", "b"]}, "does not cover every frame"),
+        ({"names": [1]}, "frame manifest"),
+        ({"completed": {}}, "must be a list"),
+        ({"completed": [None]}, "not an object"),
+        ({"completed": [{"shot_id": False}]}, "ID is invalid"),
+    ],
+)
+def test_ambiguous_shot_inventory_is_a_structural_error(tmp_path, patch, reason):
+    root = tmp_path / "stage"
+    _, _, metadata = _write_stabilized(root)
+    if "completed" in patch:
+        metadata["completed_shots"] = patch["completed"]
+    with pytest.raises(ValueError, match=reason):
+        _audit_fixture(root, metadata, names=patch.get("names"), plan=patch.get("plan"))
+
+
 def test_accepts_content_addressed_stabilized_artifact(tmp_path: Path) -> None:
     depth_files, frame_files, metadata = _write_stabilized(tmp_path / "03_disparity_stabilized")
 

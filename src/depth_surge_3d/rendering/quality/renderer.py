@@ -304,13 +304,15 @@ def _quality_device_band(
     renderer: StereoRenderer,
     source: np.ndarray,
     geometry: QualityGeometryResult,
-    offsets: np.ndarray,
+    offsets: np.ndarray | torch.Tensor,
     start_row: int,
     end_row: int,
     *,
     device_frame: _QualityDeviceFrame | None = None,
     device_offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if isinstance(offsets, torch.Tensor):
+        device_offsets = offsets
     if device_frame is None:
         source_band = torch.from_numpy(np.ascontiguousarray(source[start_row:end_row])).to(
             renderer.device
@@ -321,16 +323,15 @@ def _quality_device_band(
         source_valid_band = torch.from_numpy(
             np.array(geometry.source_valid[start_row:end_row], copy=True, order="C")
         ).to(renderer.device)
-        offset_band = renderer._transfer_offset_band(offsets[start_row:end_row])
     else:
         source_band = device_frame.source[start_row:end_row]
         near_score_band = device_frame.near_score[start_row:end_row]
         source_valid_band = device_frame.source_valid[start_row:end_row]
-        offset_band = (
-            renderer._transfer_offset_band(offsets[start_row:end_row])
-            if device_offsets is None
-            else device_offsets[start_row:end_row]
-        )
+    if device_offsets is None:
+        assert isinstance(offsets, np.ndarray)
+        offset_band = renderer._transfer_offset_band(offsets[start_row:end_row])
+    else:
+        offset_band = device_offsets[start_row:end_row]
     return source_band, near_score_band, source_valid_band, offset_band
 
 
@@ -338,7 +339,7 @@ def _quality_splat(
     renderer: StereoRenderer,
     source: np.ndarray,
     geometry: QualityGeometryResult,
-    offsets: np.ndarray,
+    offsets: np.ndarray | torch.Tensor,
     start_row: int,
     end_row: int,
     *,
@@ -369,7 +370,7 @@ def _quality_compact_cuda_splat(
     renderer: StereoRenderer,
     source: np.ndarray,
     geometry: QualityGeometryResult,
-    offsets: np.ndarray,
+    offsets: np.ndarray | torch.Tensor,
     start_row: int,
     end_row: int,
     *,
@@ -617,7 +618,7 @@ def _render_unrepaired_eye_once(
     renderer: StereoRenderer,
     source: np.ndarray,
     geometry: QualityGeometryResult,
-    offsets: np.ndarray,
+    offsets: np.ndarray | torch.Tensor,
     band_height: int,
     device_frame: _QualityDeviceFrame | None = None,
 ) -> _UnrepairedEyeResult:
@@ -631,8 +632,8 @@ def _render_unrepaired_eye_once(
     if renderer.device.type == "cuda":
         native_extension = native_kd._require_native()
         lane_weights = _lane_mask_weights(renderer.device)
-    device_offsets = None
-    if device_frame is not None:
+    device_offsets = offsets if isinstance(offsets, torch.Tensor) else None
+    if device_frame is not None and isinstance(offsets, np.ndarray):
         try:
             device_offsets = renderer._transfer_offset_band(offsets)
         except torch.cuda.OutOfMemoryError:
@@ -720,7 +721,7 @@ def _render_none_eye_once(
     renderer: StereoRenderer,
     source: np.ndarray,
     geometry: QualityGeometryResult,
-    offsets: np.ndarray,
+    offsets: np.ndarray | torch.Tensor,
     band_height: int,
     device_frame: _QualityDeviceFrame | None = None,
 ) -> _CompactEyeResult:
@@ -1168,11 +1169,12 @@ def _finish_background_eye(
             proxy = np.array(source, copy=True, order="C")
         else:
             radius = min(3, max(1, local_limit))
+            first_row, end_row, first_col, end_col = mask_bounds
             proxy = _inpaint_background_proxy(
                 proxy_source,
                 mask,
                 radius_px=radius,
-                mask_bounds=tuple(int(value) for value in mask_bounds),
+                mask_bounds=(int(first_row), int(end_row), int(first_col), int(end_col)),
             )
         image = native.composite_background_proxy(
             pre_repair.image,
@@ -1199,7 +1201,9 @@ def _render_quality_eyes(
     renderer: StereoRenderer,
     source: np.ndarray,
     geometry: QualityGeometryResult,
-    offset_builder: Callable[[Literal["left", "right"]], np.ndarray],
+    offset_builder: Callable[
+        [Literal["left", "right"], _QualityDeviceFrame | None], np.ndarray | torch.Tensor
+    ],
     occlusion_fill: Literal["none", "background"],
     controls_limit_px: int,
 ) -> tuple[_CompactEyeResult, _CompactEyeResult, dict[str, float]]:
@@ -1215,12 +1219,22 @@ def _render_quality_eyes(
         retry_height=max(1, initial_height // 2),
         current_height=initial_height,
     )
+
+    def build_offsets(eye: Literal["left", "right"]):
+        try:
+            return offset_builder(eye, device_frame)
+        except torch.cuda.OutOfMemoryError:
+            pass
+        # End the exception scope before releasing partial kernel allocations.
+        _release_after_oom(renderer)
+        return offset_builder(eye, None)
+
     if occlusion_fill == "none":
         eyes: list[_CompactEyeResult] = []
         eye_seconds: dict[str, float] = {}
         for eye in ("left", "right"):
             eye_started = time.perf_counter()
-            offsets = offset_builder(eye)
+            offsets = build_offsets(eye)
             result = _retry_after_oom(
                 renderer,
                 band_state,
@@ -1238,7 +1252,7 @@ def _render_quality_eyes(
 
     def render_unrepaired(eye: Literal["left", "right"]):
         started = time.perf_counter()
-        offsets = offset_builder(eye)
+        offsets = build_offsets(eye)
         result = _retry_after_oom(
             renderer,
             band_state,
@@ -1286,7 +1300,24 @@ def _build_eye_offsets(
     geometry: QualityGeometryResult,
     settings: StereoRenderSettings,
     eye: Literal["left", "right"],
-) -> np.ndarray:
+    device_frame: _QualityDeviceFrame | None = None,
+) -> np.ndarray | torch.Tensor:
+    if (
+        device_frame is not None
+        and np.min(geometry.near_score) >= -1.0
+        and np.max(geometry.near_score) <= 2.0
+    ):
+        from ..fast_offsets_triton import triton_relative_eye_offsets_prevalidated
+
+        # Keep the shared kernel's two-unit int32 proof, including resize roundoff.
+        resident = triton_relative_eye_offsets_prevalidated(
+            device_frame.near_score,
+            stereo_strength=settings.stereo_strength,
+            convergence=settings.convergence,
+            eye=eye,
+        )
+        if resident is not None:
+            return resident
     output = np.empty(geometry.near_score.shape, dtype=np.int32)
     build_relative_eye_offsets_into(
         geometry.near_score,
@@ -1348,7 +1379,7 @@ def _render_metric_quality_eyes(
         renderer=renderer,
         source=source,
         geometry=geometry,
-        offset_builder=lambda eye: _build_metric_eye_offsets(geometry, eye),
+        offset_builder=lambda eye, _device_frame: _build_metric_eye_offsets(geometry, eye),
         occlusion_fill=controls.occlusion_fill,
         controls_limit_px=controls.occlusion_fill_max_px,
     )
@@ -1418,7 +1449,9 @@ def render_prepared_relative_quality_compact(
         renderer=renderer,
         source=source,
         geometry=geometry,
-        offset_builder=lambda eye: _build_eye_offsets(geometry, settings, eye),
+        offset_builder=lambda eye, device_frame: _build_eye_offsets(
+            geometry, settings, eye, device_frame
+        ),
         occlusion_fill=settings.occlusion_fill,
         controls_limit_px=settings.occlusion_fill_max_px,
     )

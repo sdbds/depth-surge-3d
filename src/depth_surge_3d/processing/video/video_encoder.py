@@ -29,7 +29,7 @@ from ...io.operations import (
     recover_processing_control_prefix_v1,
     verify_ffmpeg_installation,
 )
-from ...io.nofollow_io import AcquiredRoot, NoFollowPathError
+from ...io.nofollow_io import AcquiredRoot, ContainedDirectoryEntry, NoFollowPathError
 from ...io.file_identity import (
     DirectoryIdentityV1,
     PersistedFileIdentityV1,
@@ -46,7 +46,7 @@ from ...io.reservation_protocol import (
 )
 from ...io.settings_artifact import ProcessingSettingsArtifactV5
 from ...utils.path_utils import (
-    calculate_frame_range,
+    ffmpeg_frame_interval,
     format_ffmpeg_time,
     generate_output_filename,
     parse_time_string,
@@ -62,6 +62,7 @@ from ..frames.source_frame_manifest import (
 )
 from ..frames.vr_assembler import DirectStereoSource
 from ...core.file_identity import file_sample_fingerprint
+from ...core.video_timing import EncodingTimeline, probe_frame_rate, rate_text, selected_frame_range
 from ...utils.imaging.png_header import PngHeader, read_png_header
 from .encoding_provider import (
     FINAL_DECODE_DIAGNOSTIC_BYTES,
@@ -86,6 +87,7 @@ from .final_publication import (
     FinalPublicationValidationError,
     FinalPublicationTransactionV4,
     PreparedFinalEncodingReservationV1,
+    audit_final_media_v1,
     validate_final_container_evidence_v1,
     prepare_final_encoding_reservation_v1,
     load_final_encoding_reservation_v1,
@@ -156,7 +158,7 @@ class _Schema5EncodingContext:
     expected_relative_path: str
     sibling_path: Path
     reservation: FinalEncodingReservationCapabilityV1
-    resolved_fps: str
+    timeline: EncodingTimeline
     already_authenticated: bool = False
 
 
@@ -239,7 +241,7 @@ class StreamedVrEncodingSession:
         process: FfmpegInputPipeProcessV1,
         command: list[str],
         selected_audio: SelectedAudioIdentityV1,
-        resolved_fps: str,
+        timeline: EncodingTimeline,
         resolved_encoder: str,
         expected_relative_path: str,
         publication_generation: str,
@@ -255,7 +257,7 @@ class StreamedVrEncodingSession:
         self.process = process
         self.command = list(command)
         self.selected_audio = selected_audio
-        self.resolved_fps = resolved_fps
+        self.timeline = timeline
         self.resolved_encoder = resolved_encoder
         self.expected_relative_path = expected_relative_path
         self.publication_generation = publication_generation
@@ -479,8 +481,8 @@ class StreamedVrEncodingSession:
         self.work.validate_ready_work_files()
         validator = self.encoder._container_validator_for_invocation(
             self.settings,
-            self.provider.frame_count,
-            self.resolved_fps,
+            self.timeline.output_frames(self.provider.frame_count),
+            rate_text(self.timeline.output),
             self.resolved_encoder,
             self.selected_audio.audio_end_sample,
             self.cancelled,
@@ -626,12 +628,12 @@ class StreamedVrEncodingSession:
             isinstance(error, ReservationIncompleteError) for _operation, error in cleanup_errors
         )
         if retryable_control_active or strict_cleanup_failed:
-            error = ReservationIncompleteError("streamed work cleanup remains retryable")
+            retry_error = ReservationIncompleteError("streamed work cleanup remains retryable")
             if cleanup_errors:
-                raise error from cleanup_errors[0][1]
-            raise error
-        for operation, error in cleanup_errors:
-            print(f"Warning: Could not {operation}: {error}")
+                raise retry_error from cleanup_errors[0][1]
+            raise retry_error
+        for operation, cleanup_error in cleanup_errors:
+            print(f"Warning: Could not {operation}: {cleanup_error}")
 
     def abort(self) -> None:
         self._cleanup_resources()
@@ -783,7 +785,7 @@ class VideoEncoder:
         publication_generation = values["metadata"][
             "final_media_publication_generation"
         ] or secrets.token_hex(16)
-        resolved_fps = self._resolve_schema5_output_fps_value(values)
+        timeline = EncodingTimeline.from_artifact(values)
         provider = EncodingSequenceProvider.freeze(
             mode="assembled_vr",
             frame_count=frame_count,
@@ -795,12 +797,12 @@ class VideoEncoder:
             durable_settings.get("video_encoder", "auto"),
             cancelled=cancelled,
         )
-        selected_audio = prepare_selected_audio_v1(
+        selected_audio = self._prepare_timeline_audio(
             output_dir=root,
             original_video=original_video,
             settings=durable_settings,
             frame_count=frame_count,
-            fps=resolved_fps,
+            timeline=timeline,
             cancelled=cancelled,
         )
         width = int(durable_settings["vr_output_width"])
@@ -820,7 +822,7 @@ class VideoEncoder:
                 work_output,
                 durable_settings,
                 selected_audio,
-                resolved_fps,
+                timeline,
                 resolved_encoder,
                 input_format="rgb24",
             )
@@ -844,7 +846,7 @@ class VideoEncoder:
                     Literal["libx264", "libx265", "hevc_nvenc"],
                     resolved_encoder,
                 ),
-                resolved_fps=resolved_fps,
+                resolved_fps=rate_text(timeline.output),
                 audio_end_sample=selected_audio.audio_end_sample,
                 resolved_arguments_template=normalized_template,
             )
@@ -892,7 +894,7 @@ class VideoEncoder:
                 process=process,
                 command=command,
                 selected_audio=selected_audio,
-                resolved_fps=resolved_fps,
+                timeline=timeline,
                 resolved_encoder=resolved_encoder,
                 expected_relative_path=expected_relative_path,
                 publication_generation=publication_generation,
@@ -932,8 +934,8 @@ class VideoEncoder:
                 raise ReservationIncompleteError(
                     "streamed session setup cleanup remains retryable"
                 ) from cause
-            for error in cleanup_errors:
-                print(f"Warning: Could not clean failed streamed session setup: {error}")
+            for cleanup_error in cleanup_errors:
+                print(f"Warning: Could not clean failed streamed session setup: {cleanup_error}")
             raise
 
     def create_video(  # noqa: C901
@@ -964,6 +966,9 @@ class VideoEncoder:
         cancelled = self._cancellation_predicate(progress_tracker)
         try:
             recovered_settings = recover_processing_control_prefix_v1(output_dir)
+            reuse = self._reuse_file_backed_output(output_dir, recovered_settings)
+            if reuse is not None:
+                return reuse
         except InterruptedError:
             raise
         except ReservationIncompleteError:
@@ -1021,16 +1026,16 @@ class VideoEncoder:
         else:
             output_path = schema5_context.sibling_path
         # Build base FFmpeg command
-        base_fps = (
-            schema5_context.resolved_fps
+        timeline = (
+            schema5_context.timeline
             if schema5_context is not None
-            else self._resolve_output_fps(original_video, settings)
+            else self._legacy_timeline(original_video, settings)
         )
 
         cmd = ["ffmpeg", "-y"]
         if schema5_context is not None:
             cmd.extend(["-v", "error", "-xerror", "-nostats", "-progress", "pipe:1"])
-        cmd.extend(["-framerate", str(base_fps)])
+        cmd.extend(["-framerate", rate_text(timeline.source)])
         if schema5_context is not None:
             cmd.extend(["-start_number", str(schema5_context.provider.first_index)])
         if schema5_context is None:
@@ -1050,20 +1055,21 @@ class VideoEncoder:
         # freezes an exact audio identity before constructing the command.
         audio_source: str | Path | None = None
         if schema5_context is not None:
-            audio_kwargs: dict[str, object] = {
-                "output_dir": output_dir,
-                "original_video": original_video,
-                "settings": settings,
-                "frame_count": schema5_context.provider.frame_count,
-                "fps": str(base_fps),
-            }
-            if cancelled is not None:
-                audio_kwargs["cancelled"] = cancelled
-            selected_audio = prepare_selected_audio_v1(**audio_kwargs)
+            selected_audio = self._prepare_timeline_audio(
+                output_dir=output_dir,
+                original_video=original_video,
+                settings=settings,
+                frame_count=schema5_context.provider.frame_count,
+                timeline=timeline,
+                cancelled=cancelled,
+            )
             cmd.extend(selected_audio.input_arguments())
-            cmd.extend(["-vf", "setsar=1", "-map", "0:v:0"])
+            video_filter, limit = timeline.ffmpeg_video_options(
+                schema5_context.provider.frame_count, drain_audio=selected_audio.usable
+            )
+            cmd.extend(["-vf", video_filter, "-map", "0:v:0"])
             cmd.extend(selected_audio.output_arguments(1))
-            cmd.extend(["-frames:v", str(schema5_context.provider.frame_count)])
+            cmd.extend(limit)
         elif settings.get("preserve_audio", True):
             audio_file = output_dir / "original_audio.flac"
             print(f"Looking for pre-extracted audio at: {audio_file}")
@@ -1077,6 +1083,9 @@ class VideoEncoder:
             assert audio_source is not None
             cmd.extend(self._build_audio_input_args(audio_source, settings))
             cmd.extend(["-c:a", "aac", "-shortest"])
+
+        if schema5_context is None and timeline.source != timeline.output:
+            cmd.extend(["-vf", timeline.video_filter])
 
         # Add video encoding settings
         encoder = settings.get("video_encoder", "auto")
@@ -1103,7 +1112,7 @@ class VideoEncoder:
                 )
                 returncode, diagnostics = self._run_schema5_ffmpeg_with_progress(
                     cmd,
-                    schema5_context.provider.frame_count,
+                    timeline.output_frames(schema5_context.provider.frame_count),
                     progress_tracker,
                 )
                 if returncode != 0:
@@ -1140,8 +1149,8 @@ class VideoEncoder:
                 )
                 container_validator = self._container_validator_for_invocation(
                     settings,
-                    schema5_context.provider.frame_count,
-                    str(base_fps),
+                    timeline.output_frames(schema5_context.provider.frame_count),
+                    rate_text(timeline.output),
                     resolved_encoder,
                     selected_audio.audio_end_sample,
                     cancelled,
@@ -1184,6 +1193,28 @@ class VideoEncoder:
             if schema5_context is not None:
                 self._discard_schema5_sibling_after_attempt(schema5_context)
 
+    def _reuse_file_backed_output(
+        self, root: Path, artifact: ProcessingSettingsArtifactV5 | None
+    ) -> bool | None:
+        """Finish a proven encode before asking for source frames or an encoder."""
+        if artifact is None:
+            return None
+        if not (root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH).is_file():
+            if artifact.status == "completed":
+                return audit_final_media_v1(root, artifact).final_video_authenticated
+            return None
+        if _streamed_work_control_visible(root):
+            return None
+        prepared = load_final_encoding_reservation_v1(root, artifact)
+        if not prepared.has_file_backed_output():
+            return None
+        capability = FinalEncodingReservationCapabilityV1.from_prepared(prepared)
+        self._pending_final_reservation = capability
+        if prepared.recover_publication_prefix().phase != "publication_authenticated":
+            raise ReservationConflictError("file-backed publication did not authenticate")
+        capability.validate_authenticated_publication()
+        return True
+
     @staticmethod
     def _per_eye_size(settings: dict[str, Any]) -> tuple[int, int]:
         try:
@@ -1222,34 +1253,7 @@ class VideoEncoder:
             parent = lexical_parent.relative_to(root)
         except ValueError as error:
             raise ValueError("assembled frame parent is outside the job root") from error
-        frame_count = 0
-        first_index: int | None = None
-        last_index: int | None = None
-        try:
-            with AcquiredRoot(root) as acquired:
-                for entry in acquired.iter_directory(lexical_parent):
-                    if cancelled is not None and cancelled():
-                        raise InterruptedError("final encoding input audit was cancelled")
-                    match = _DIRECT_FRAME_NAME.fullmatch(entry.name)
-                    if match is None:
-                        folded = entry.name.casefold()
-                        if folded.startswith("frame_") and folded.endswith(".png"):
-                            raise ValueError("assembled frame name is noncanonical")
-                        continue
-                    if not entry.is_regular:
-                        raise ValueError("assembled frame is not an ordinary file")
-                    index = int(match.group(1))
-                    if entry.name != f"frame_{index:06d}.png":
-                        raise ValueError("assembled frame padding is noncanonical")
-                    frame_count += 1
-                    first_index = index if first_index is None else min(first_index, index)
-                    last_index = index if last_index is None else max(last_index, index)
-        except NoFollowPathError as error:
-            raise ValueError(str(error)) from error
-        if frame_count == 0 or first_index is None or last_index is None:
-            raise ValueError("assembled schema-5 encoding has no frames")
-        if frame_count != last_index - first_index + 1:
-            raise ValueError("assembled schema-5 frame sequence is not contiguous")
+        first_index, frame_count = self._assembled_frame_span(root, lexical_parent, cancelled)
         provider = EncodingSequenceProvider.freeze(
             mode="assembled_vr",
             frame_count=frame_count,
@@ -1262,6 +1266,46 @@ class VideoEncoder:
             settings=settings,
             cancelled=cancelled,
         )
+
+    def _assembled_frame_span(
+        self, root: Path, lexical_parent: Path, cancelled: Callable[[], bool] | None
+    ) -> tuple[int, int]:
+        frame_count = 0
+        first_index: int | None = None
+        last_index: int | None = None
+        try:
+            with AcquiredRoot(root) as acquired:
+                for entry in acquired.iter_directory(lexical_parent):
+                    if cancelled is not None and cancelled():
+                        raise InterruptedError("final encoding input audit was cancelled")
+                    index = self._assembled_frame_index(entry)
+                    if index is None:
+                        continue
+                    frame_count += 1
+                    first_index = index if first_index is None else min(first_index, index)
+                    last_index = index if last_index is None else max(last_index, index)
+        except NoFollowPathError as error:
+            raise ValueError(str(error)) from error
+        if frame_count == 0 or first_index is None or last_index is None:
+            raise ValueError("assembled schema-5 encoding has no frames")
+        if frame_count != last_index - first_index + 1:
+            raise ValueError("assembled schema-5 frame sequence is not contiguous")
+        return first_index, frame_count
+
+    @staticmethod
+    def _assembled_frame_index(entry: ContainedDirectoryEntry) -> int | None:
+        match = _DIRECT_FRAME_NAME.fullmatch(entry.name)
+        if match is None:
+            folded = entry.name.casefold()
+            if folded.startswith("frame_") and folded.endswith(".png"):
+                raise ValueError("assembled frame name is noncanonical")
+            return None
+        if not entry.is_regular:
+            raise ValueError("assembled frame is not an ordinary file")
+        index = int(match.group(1))
+        if entry.name != f"frame_{index:06d}.png":
+            raise ValueError("assembled frame padding is noncanonical")
+        return index
 
     def _prepare_schema5_direct_context(
         self,
@@ -1332,31 +1376,15 @@ class VideoEncoder:
         metadata = artifact_value["metadata"]
         publication_generation = metadata["final_media_publication_generation"]
         expected_relative_path = artifact_value["output_info"]["expected_final_relative_path"]
-        resolved_fps = self._resolve_schema5_output_fps_value(artifact_value)
+        timeline = EncodingTimeline.from_artifact(artifact_value)
         del metadata, artifact_value, artifact
         active_index = output_dir / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
         allow_prelaunch_rebuild = _allow_prelaunch_rebuild
         while True:
             if active_index.is_file():
-                phase_settings = recover_processing_control_prefix_v1(output_dir)
-                if phase_settings is None:
-                    raise ReservationConflictError(
-                        "active final reservation lost its settings authority"
-                    )
-                reservation = load_final_encoding_reservation_v1(output_dir, phase_settings)
-                del phase_settings
-                capability = FinalEncodingReservationCapabilityV1.from_prepared(reservation)
-                self._pending_final_reservation = capability
-                if reservation.requires_explicit_streamed_recovery():
-                    raise ReservationConflictError(
-                        "streamed v3 publication requires evidence-bound recovery"
-                    )
-                recovery = reservation.recover_publication_prefix()
-                recovery_phase = recovery.phase
-                del recovery
-                if recovery_phase == "publication_authenticated":
+                capability, authority, generation = self._resume_schema5_reservation(output_dir)
+                if authority is None:
                     assert publication_generation is not None
-                    del reservation
                     return _Schema5EncodingContext(
                         provider=provider,
                         staged_manifest=None,
@@ -1364,91 +1392,30 @@ class VideoEncoder:
                         expected_relative_path=expected_relative_path,
                         sibling_path=capability.sibling_path,
                         reservation=capability,
-                        resolved_fps=resolved_fps,
+                        timeline=timeline,
                         already_authenticated=True,
                     )
-                if recovery_phase not in {
-                    "ready_pre_video",
-                    "input_manifest_committed_no_final_intent",
-                    "post_boundary_retry_sibling_present",
-                }:
-                    raise ValueError(f"unsupported final encoding recovery phase: {recovery_phase}")
-                if reservation.sibling_path.exists() or reservation.sibling_path.is_symlink():
-                    if not reservation.discard_nonsemantic_sibling():
-                        raise ValueError("indexed sibling is not discardable in this phase")
-                reservation.reset_incomplete_manifest_sources()
-                authority = self._encoding_manifest_extent_authority(reservation)
-                publication_generation = reservation.index.publication_generation
-                del reservation
-                manifest_source = self._recover_encoding_manifest_source(
+                publication_generation = generation
+                stage = self._resume_schema5_manifest(
+                    provider,
+                    output_dir,
+                    settings,
+                    cancelled,
+                    capability,
                     authority,
-                    expected_frame_count=frame_count,
+                    allow_prelaunch_rebuild,
                 )
-                if manifest_source is None:
-                    staged, manifest_source = self._stage_encoding_manifest_file(
-                        provider=provider,
-                        output_dir=output_dir,
-                        settings=settings,
-                        reservation=capability,
-                        authority=authority,
-                        cancelled=cancelled,
-                    )
-                else:
-                    try:
-                        staged = audit_encoding_input_manifest(
-                            provider,
-                            job_root=output_dir,
-                            expected_fingerprint=manifest_source.fingerprint,
-                            expected_raw_sha256=manifest_source.raw_sha256,
-                            expected_raw_byte_count=manifest_source.raw_byte_count,
-                            per_eye_size=self._per_eye_size(settings),
-                            vr_format=settings["vr_format"],
-                            cancelled=cancelled,
-                        )
-                    except (EncodingProviderError, OSError, ValueError):
-                        if recovery_phase != "ready_pre_video" or not allow_prelaunch_rebuild:
-                            raise
-                        capability.discard_prelaunch_invocation()
-                        allow_prelaunch_rebuild = False
-                        del authority, capability, manifest_source
-                        continue
+                if stage is None:
+                    allow_prelaunch_rebuild = False
+                    del authority, capability
+                    continue
+                staged, manifest_source = stage
             else:
                 if publication_generation is None:
                     publication_generation = secrets.token_hex(16)
-                phase_settings = recover_processing_control_prefix_v1(output_dir)
-                if phase_settings is None:
-                    raise ReservationConflictError(
-                        "final reservation preflight lost its settings authority"
-                    )
-                try:
-                    reservation = prepare_final_encoding_reservation_v1(
-                        job_root=output_dir,
-                        settings=phase_settings,
-                        publication_generation=publication_generation,
-                        input_manifest_raw_max=self._encoding_manifest_raw_bound(provider),
-                        final_manifest_raw_max=1024 * 1024,
-                        cancelled=cancelled,
-                    )
-                except ReservationIncompleteError:
-                    raise
-                except BaseException:
-                    if active_index.is_file():
-                        recovery_settings = recover_processing_control_prefix_v1(output_dir)
-                        if recovery_settings is not None:
-                            recovered = load_final_encoding_reservation_v1(
-                                output_dir, recovery_settings
-                            )
-                            self._pending_final_reservation = (
-                                FinalEncodingReservationCapabilityV1.from_prepared(recovered)
-                            )
-                            del recovered, recovery_settings
-                    raise
-                finally:
-                    del phase_settings
-                capability = FinalEncodingReservationCapabilityV1.from_prepared(reservation)
-                self._pending_final_reservation = capability
-                authority = self._encoding_manifest_extent_authority(reservation)
-                del reservation
+                capability, authority = self._prepare_new_schema5_reservation(
+                    output_dir, provider, publication_generation, active_index, cancelled
+                )
                 staged, manifest_source = self._stage_encoding_manifest_file(
                     provider=provider,
                     output_dir=output_dir,
@@ -1464,8 +1431,131 @@ class VideoEncoder:
                 expected_relative_path=expected_relative_path,
                 sibling_path=capability.sibling_path,
                 reservation=capability,
-                resolved_fps=resolved_fps,
+                timeline=timeline,
             )
+
+    def _resume_schema5_reservation(
+        self, output_dir: Path
+    ) -> tuple[
+        FinalEncodingReservationCapabilityV1, _EncodingManifestExtentAuthority | None, str | None
+    ]:
+        phase_settings = recover_processing_control_prefix_v1(output_dir)
+        if phase_settings is None:
+            raise ReservationConflictError("active final reservation lost its settings authority")
+        reservation = load_final_encoding_reservation_v1(output_dir, phase_settings)
+        del phase_settings
+        capability = FinalEncodingReservationCapabilityV1.from_prepared(reservation)
+        self._pending_final_reservation = capability
+        if reservation.requires_explicit_streamed_recovery():
+            raise ReservationConflictError(
+                "streamed v3 publication requires evidence-bound recovery"
+            )
+        recovery = reservation.recover_publication_prefix()
+        recovery_phase = recovery.phase
+        del recovery
+        if recovery_phase == "publication_authenticated":
+            return capability, None, None
+        if recovery_phase in {
+            "input_manifest_committed_no_final_intent",
+            "post_boundary_retry_sibling_present",
+        }:
+            raise ReservationConflictError(
+                "published video lacks durable encoded-output evidence; preserving it without re-encoding"
+            )
+        if recovery_phase != "ready_pre_video":
+            raise ValueError(f"unsupported final encoding recovery phase: {recovery_phase}")
+        if reservation.sibling_path.exists() or reservation.sibling_path.is_symlink():
+            if not reservation.discard_nonsemantic_sibling():
+                raise ValueError("indexed sibling is not discardable in this phase")
+        reservation.reset_incomplete_manifest_sources()
+        authority = self._encoding_manifest_extent_authority(reservation)
+        publication_generation = reservation.index.publication_generation
+        del reservation
+        return capability, authority, publication_generation
+
+    def _resume_schema5_manifest(
+        self,
+        provider: EncodingSequenceProvider,
+        output_dir: Path,
+        settings: dict[str, Any],
+        cancelled: Callable[[], bool] | None,
+        capability: FinalEncodingReservationCapabilityV1,
+        authority: _EncodingManifestExtentAuthority,
+        allow_prelaunch_rebuild: bool,
+    ) -> tuple[StagedEncodingInputManifest, EncodingInputPublicationSource] | None:
+        manifest_source = self._recover_encoding_manifest_source(
+            authority,
+            expected_frame_count=provider.frame_count,
+        )
+        if manifest_source is None:
+            staged, manifest_source = self._stage_encoding_manifest_file(
+                provider=provider,
+                output_dir=output_dir,
+                settings=settings,
+                reservation=capability,
+                authority=authority,
+                cancelled=cancelled,
+            )
+        else:
+            try:
+                staged = audit_encoding_input_manifest(
+                    provider,
+                    job_root=output_dir,
+                    expected_fingerprint=manifest_source.fingerprint,
+                    expected_raw_sha256=manifest_source.raw_sha256,
+                    expected_raw_byte_count=manifest_source.raw_byte_count,
+                    per_eye_size=self._per_eye_size(settings),
+                    vr_format=settings["vr_format"],
+                    cancelled=cancelled,
+                )
+            except (EncodingProviderError, OSError, ValueError):
+                if not allow_prelaunch_rebuild:
+                    raise
+                capability.discard_prelaunch_invocation()
+                return None
+        return staged, manifest_source
+
+    def _prepare_new_schema5_reservation(
+        self,
+        output_dir: Path,
+        provider: EncodingSequenceProvider,
+        publication_generation: str,
+        active_index: Path,
+        cancelled: Callable[[], bool] | None,
+    ) -> tuple[FinalEncodingReservationCapabilityV1, _EncodingManifestExtentAuthority]:
+        phase_settings = recover_processing_control_prefix_v1(output_dir)
+        if phase_settings is None:
+            raise ReservationConflictError(
+                "final reservation preflight lost its settings authority"
+            )
+        try:
+            reservation = prepare_final_encoding_reservation_v1(
+                job_root=output_dir,
+                settings=phase_settings,
+                publication_generation=publication_generation,
+                input_manifest_raw_max=self._encoding_manifest_raw_bound(provider),
+                final_manifest_raw_max=1024 * 1024,
+                cancelled=cancelled,
+            )
+        except ReservationIncompleteError:
+            raise
+        except BaseException:
+            if active_index.is_file():
+                recovery_settings = recover_processing_control_prefix_v1(output_dir)
+                if recovery_settings is not None:
+                    recovered = load_final_encoding_reservation_v1(output_dir, recovery_settings)
+                    self._pending_final_reservation = (
+                        FinalEncodingReservationCapabilityV1.from_prepared(recovered)
+                    )
+                    del recovered, recovery_settings
+            raise
+        finally:
+            del phase_settings
+        capability = FinalEncodingReservationCapabilityV1.from_prepared(reservation)
+        self._pending_final_reservation = capability
+        authority = self._encoding_manifest_extent_authority(reservation)
+        del reservation
+        return capability, authority
 
     @staticmethod
     def _encoding_manifest_extent_authority(
@@ -1884,66 +1974,72 @@ class VideoEncoder:
         return args
 
     @staticmethod
-    def _normalize_frame_rate(value: Any) -> str | None:
-        """Return a positive FFmpeg frame-rate value, preserving exact fractions."""
-        if value is None:
-            return None
+    def _prepare_timeline_audio(
+        *,
+        output_dir: Path,
+        original_video: str,
+        settings: dict[str, Any],
+        frame_count: int,
+        timeline: EncodingTimeline,
+        cancelled: Callable[[], bool] | None,
+    ) -> SelectedAudioIdentityV1:
+        # Audio follows the selected source interval, not a rounded output frame count.
+        source_rate = rate_text(timeline.source)
+        return prepare_selected_audio_v1(
+            output_dir=output_dir,
+            original_video=original_video,
+            settings={**settings, "source_fps": source_rate},
+            frame_count=frame_count,
+            fps=source_rate,
+            cancelled=cancelled,
+            **(
+                {"clip_start_frame": timeline.clip_start_frame}
+                if timeline.clip_start_frame is not None
+                else {}
+            ),
+        )
 
-        text = str(value).strip()
-        if not text or text.lower() in {"none", "original"}:
-            return None
-
-        try:
-            if Fraction(text) <= 0:
+    @staticmethod
+    def _legacy_timeline(original_video: str, settings: dict[str, Any]) -> EncodingTimeline:
+        def optional_rate(value: object) -> Fraction | None:
+            try:
+                return EncodingTimeline.resolve(value, None).source
+            except (ValueError, ZeroDivisionError):
                 return None
-        except (ValueError, ZeroDivisionError):
-            return None
-
-        return text
-
-    @staticmethod
-    def _resolve_schema5_output_fps(artifact: ProcessingSettingsArtifactV5) -> str:
-        """Resolve one canonical rational exclusively from durable schema-5 scalars."""
-
-        return VideoEncoder._resolve_schema5_output_fps_value(artifact.to_object())
-
-    @staticmethod
-    def _resolve_schema5_output_fps_value(values: dict[str, Any]) -> str:
-        """Resolve the schema-5 rate from one already-validated settings value."""
-
-        settings = values["processing_settings"]
-        target = settings["target_fps"]
-        if type(target) is int:
-            rate = Fraction(target, 1)
-        else:
-            source = settings["source_fps"]
-            if source is None or source <= 0:
-                source = values["video_properties"]["fps"]
-            rate = Fraction(str(source))
-        if rate <= 0:
-            raise ValueError("schema-5 output frame rate must be positive")
-        return f"{rate.numerator}/{rate.denominator}"
-
-    def _resolve_output_fps(self, original_video: str, settings: dict[str, Any]) -> str:
-        """Resolve explicit FPS or preserve the source video's exact stream rate."""
-        target_fps = self._normalize_frame_rate(settings.get("target_fps"))
-        if target_fps is not None:
-            return target_fps
 
         video_info = get_video_info_ffprobe(original_video)
-        for stream in video_info.get("streams", []):
-            if stream.get("codec_type") != "video":
-                continue
-            for rate_key in ("avg_frame_rate", "r_frame_rate"):
-                source_rate = self._normalize_frame_rate(stream.get(rate_key))
-                if source_rate is not None:
-                    return source_rate
+        stream: dict[str, Any] = next(
+            (s for s in video_info.get("streams", []) if s.get("codec_type") == "video"), {}
+        )
+        target = optional_rate(settings.get("target_fps"))
+        source = optional_rate(probe_frame_rate(stream)) or optional_rate(
+            settings.get("source_fps")
+        )
+        source = source or target or Fraction(DEFAULT_FALLBACK_FPS)
+        return EncodingTimeline(source, target or source)
 
-        source_fps = self._normalize_frame_rate(settings.get("source_fps"))
-        if source_fps is not None:
-            return source_fps
-
-        return str(DEFAULT_FALLBACK_FPS)
+    @staticmethod
+    def _frozen_single_clock(
+        values: dict[str, Any], invocation: StreamedVrInvocationV1
+    ) -> EncodingTimeline | None:
+        """Recognize the exact timing convention of an already encoded, pre-clock job."""
+        if "frame_rate" in values["video_properties"]:
+            return None
+        arguments = invocation.resolved_arguments_template
+        if "-frames:v" not in arguments:
+            return None
+        input_clock = arguments[arguments.index("-framerate") + 1]
+        if input_clock != invocation.resolved_fps:
+            return None
+        settings = values["processing_settings"]
+        target = settings["target_fps"]
+        old_source = settings.get("source_fps")
+        if old_source is None or old_source <= 0:
+            old_source = values["video_properties"]["fps"]
+        old_rate = Fraction(target) if type(target) is int else Fraction(str(old_source))
+        if input_clock != rate_text(old_rate):
+            return None
+        return EncodingTimeline(old_rate, old_rate)
 
     @staticmethod
     def _direct_frame_index(path: Path) -> int:
@@ -1992,14 +2088,7 @@ class VideoEncoder:
         assert minimum is not None and maximum is not None
         if maximum - minimum + 1 != frame_count:
             raise ValueError("Direct stereo sequence frame indices must be gap-free")
-        seen = bytearray((frame_count + 7) // 8)
-        for path in left_files:
-            relative_index = self._direct_frame_index(Path(path)) - minimum
-            byte_index, bit_index = divmod(relative_index, 8)
-            mask = 1 << bit_index
-            if seen[byte_index] & mask:
-                raise ValueError("Direct stereo sequence frame indices must be unique")
-            seen[byte_index] |= mask
+        self._ensure_unique_direct_indices(left_files, minimum, frame_count)
 
         first_left = left_parent / f"frame_{minimum:06d}.png"
         first_right = right_parent / f"frame_{minimum:06d}.png"
@@ -2017,6 +2106,18 @@ class VideoEncoder:
             right_header=right_header,
         )
 
+    def _ensure_unique_direct_indices(
+        self, left_files: Sequence[Path], minimum: int, frame_count: int
+    ) -> None:
+        seen = bytearray((frame_count + 7) // 8)
+        for path in left_files:
+            relative_index = self._direct_frame_index(Path(path)) - minimum
+            byte_index, bit_index = divmod(relative_index, 8)
+            mask = 1 << bit_index
+            if seen[byte_index] & mask:
+                raise ValueError("Direct stereo sequence frame indices must be unique")
+            seen[byte_index] |= mask
+
     def _build_direct_stereo_command(  # noqa: C901
         self,
         sequence: _DirectStereoSequence,
@@ -2025,7 +2126,7 @@ class VideoEncoder:
         settings: dict[str, Any],
         *,
         selected_audio: SelectedAudioIdentityV1 | None = None,
-        resolved_fps: str | None = None,
+        timeline: EncodingTimeline | None = None,
     ) -> list[str]:
         """Build an FFmpeg command that stacks validated left and right image2 inputs."""
 
@@ -2047,7 +2148,8 @@ class VideoEncoder:
         if stack_filter is None:
             raise ValueError(f"Unsupported direct VR format: {vr_format}")
 
-        fps = resolved_fps or self._resolve_output_fps(original_video, settings)
+        timeline = timeline or self._legacy_timeline(original_video, settings)
+        fps = rate_text(timeline.source)
         start_number = str(sequence.start_number)
         command = ["ffmpeg", "-y"]
         if selected_audio is not None:
@@ -2072,6 +2174,10 @@ class VideoEncoder:
         )
 
         preserve_audio = settings.get("preserve_audio", True)
+        video_filter, limit = timeline.ffmpeg_video_options(
+            sequence.frame_count,
+            drain_audio=selected_audio.usable if selected_audio is not None else preserve_audio,
+        )
         if selected_audio is not None:
             command.extend(selected_audio.input_arguments())
         elif preserve_audio:
@@ -2091,7 +2197,7 @@ class VideoEncoder:
             filter_graph = (
                 "[0:v]setsar=1[left];[1:v]setsar=1[right];"
                 f"[left][right]{stack_filter}=inputs=2:shortest=1[stacked];"
-                "[stacked]setsar=1[vr]"
+                f"[stacked]{video_filter}[vr]"
             )
         else:
             filter_graph = (
@@ -2100,7 +2206,7 @@ class VideoEncoder:
                 f"[1:v]scale={per_eye_width}:{per_eye_height}:"
                 "flags=bicubic+accurate_rnd,setsar=1[right];"
                 f"[left][right]{stack_filter}=inputs=2:shortest=1[stacked];"
-                "[stacked]setsar=1[vr]"
+                f"[stacked]{video_filter}[vr]"
             )
 
         command.extend(["-filter_complex", filter_graph, "-map", "[vr]"])
@@ -2108,7 +2214,7 @@ class VideoEncoder:
             command.extend(selected_audio.output_arguments(2))
         elif preserve_audio:
             command.extend(["-map", "2:a:0?", "-c:a", "aac", "-shortest"])
-        command.extend(["-frames:v", str(sequence.frame_count), "-progress", "pipe:1"])
+        command.extend([*limit, "-progress", "pipe:1"])
         encoder_args, _ = self._build_encoder_cmd(
             settings.get("video_encoder", "auto"), temporary_output
         )
@@ -2123,7 +2229,7 @@ class VideoEncoder:
         original_video: str,
         settings: dict[str, Any],
         selected_audio: SelectedAudioIdentityV1,
-        fps: str,
+        timeline: EncodingTimeline,
         resolved_encoder: str,
     ) -> list[str]:
         """Build the production direct command only from provider scalar state."""
@@ -2138,6 +2244,8 @@ class VideoEncoder:
             raise ValueError("schema-5 direct provider/header state is invalid")
         per_eye_width, per_eye_height = self._per_eye_size(settings)
         vr_format = settings.get("vr_format")
+        if vr_format is None:
+            raise ValueError(f"Unsupported direct VR format: {vr_format}")
         stack_filter = {
             "side_by_side": "hstack",
             "over_under": "vstack",
@@ -2148,7 +2256,12 @@ class VideoEncoder:
         root = temporary_output.parent
         left_pattern = root.joinpath(*provider.left_parent.parts) / "frame_%06d.png"
         right_pattern = root.joinpath(*provider.right_parent.parts) / "frame_%06d.png"
-        common = ["-framerate", fps, "-start_number", str(provider.first_index)]
+        common = [
+            "-framerate",
+            rate_text(timeline.source),
+            "-start_number",
+            str(provider.first_index),
+        ]
         command = [
             "ffmpeg",
             "-y",
@@ -2165,22 +2278,25 @@ class VideoEncoder:
             *selected_audio.input_arguments(),
         ]
         target = (per_eye_width, per_eye_height)
+        video_filter, limit = timeline.ffmpeg_video_options(
+            provider.frame_count, drain_audio=selected_audio.usable
+        )
         if first_headers == (target, target):
             filter_graph = (
                 "[0:v]setsar=1[left];[1:v]setsar=1[right];"
                 f"[left][right]{stack_filter}=inputs=2:shortest=1[stacked];"
-                "[stacked]setsar=1[vr]"
+                f"[stacked]{video_filter}[vr]"
             )
         else:
             scale = f"scale={per_eye_width}:{per_eye_height}:" "flags=bicubic+accurate_rnd,setsar=1"
             filter_graph = (
                 f"[0:v]{scale}[left];[1:v]{scale}[right];"
                 f"[left][right]{stack_filter}=inputs=2:shortest=1[stacked];"
-                "[stacked]setsar=1[vr]"
+                f"[stacked]{video_filter}[vr]"
             )
         command.extend(["-filter_complex", filter_graph, "-map", "[vr]"])
         command.extend(selected_audio.output_arguments(2))
-        command.extend(["-frames:v", str(provider.frame_count), "-progress", "pipe:1"])
+        command.extend([*limit, "-progress", "pipe:1"])
         encoder_args, _ = self._build_encoder_cmd(
             settings.get("video_encoder", "auto"),
             temporary_output,
@@ -2195,22 +2311,17 @@ class VideoEncoder:
         temporary_output: Path,
         settings: dict[str, Any],
         selected_audio: SelectedAudioIdentityV1,
-        fps: str,
+        timeline: EncodingTimeline,
         resolved_encoder: str,
         *,
         input_format: Literal["png", "rgb24"] = "png",
+        historical_frame_limit: bool = False,
     ) -> list[str]:
         """Build one explicit assembled image input without image2 numbering."""
 
         provider.validated()
         if provider.mode != "assembled_vr" or provider.frames_parent is None:
             raise ValueError("streamed VR encoding requires an assembled provider")
-        try:
-            rate = Fraction(fps)
-        except (TypeError, ValueError, ZeroDivisionError) as error:
-            raise ValueError("streamed VR frame rate is invalid") from error
-        if rate <= 0:
-            raise ValueError("streamed VR frame rate must be positive")
         width = int(settings["vr_output_width"])
         height = int(settings["vr_output_height"])
         if width <= 0 or height <= 0:
@@ -2228,6 +2339,9 @@ class VideoEncoder:
             input_arguments = ["-f", "image2pipe", "-vcodec", "png"]
         else:
             raise ValueError("streamed VR input format is unsupported")
+        video_filter, limit = timeline.ffmpeg_video_options(
+            provider.frame_count, drain_audio=selected_audio.usable and not historical_frame_limit
+        )
         command = [
             "ffmpeg",
             "-y",
@@ -2236,18 +2350,17 @@ class VideoEncoder:
             "-xerror",
             "-nostats",
             "-framerate",
-            f"{rate.numerator}/{rate.denominator}",
+            rate_text(timeline.source),
             *input_arguments,
             "-i",
             "pipe:0",
             *selected_audio.input_arguments(),
             "-vf",
-            "setsar=1",
+            video_filter,
             "-map",
             "0:v:0",
             *selected_audio.output_arguments(1),
-            "-frames:v",
-            str(provider.frame_count),
+            *limit,
             "-progress",
             "pipe:1",
         ]
@@ -2547,6 +2660,19 @@ class VideoEncoder:
         ):
             self._discard_streamed_prelaunch(capability, work=work)
 
+    def resume_streamed_publication(
+        self, root: Path, artifact: ProcessingSettingsArtifactV5
+    ) -> bool | None:
+        """Recover from durable stream evidence, without requiring a frame provider."""
+        saved = artifact.to_object()
+        return self._recover_streamed_vr_sibling(
+            output_dir=root,
+            original_video=saved["metadata"]["source_video"],
+            settings=saved["processing_settings"],
+            cancelled=None,
+            artifact=artifact,
+        )
+
     def _recover_streamed_vr_sibling(  # noqa: C901
         self,
         *,
@@ -2642,7 +2768,8 @@ class VideoEncoder:
             raise ValueError("runtime streamed recovery settings differ from durable settings")
         if not verify_ffmpeg_installation():
             raise RuntimeError("FFmpeg is unavailable for streamed VR recovery")
-        resolved_fps = self._resolve_schema5_output_fps_value(values)
+        frozen_clock = self._frozen_single_clock(values, invocation)
+        timeline = frozen_clock or EncodingTimeline.from_artifact(values)
         metadata = values["metadata"]
         expected_relative_path = values["output_info"]["expected_final_relative_path"]
         try:
@@ -2660,7 +2787,7 @@ class VideoEncoder:
                     int(durable_settings["vr_output_width"]),
                     int(durable_settings["vr_output_height"]),
                 )
-                or invocation.resolved_fps != resolved_fps
+                or invocation.resolved_fps != rate_text(timeline.output)
                 or output_evidence.reservation_index_fingerprint != capability.index_fingerprint
                 or output_evidence.sibling_relative_path != sibling.name
             ):
@@ -2672,14 +2799,24 @@ class VideoEncoder:
                 self._discard_streamed_prelaunch(capability)
                 return None
             raise ReservationConflictError("post-boundary streamed authority differs") from error
-        selected_audio = prepare_selected_audio_v1(
-            output_dir=root,
-            original_video=original_video,
-            settings=durable_settings,
-            frame_count=projection.frame_count,
-            fps=resolved_fps,
-            cancelled=cancelled,
-        )
+        if frozen_clock is not None:
+            selected_audio = prepare_selected_audio_v1(
+                output_dir=root,
+                original_video=original_video,
+                settings=durable_settings,
+                frame_count=projection.frame_count,
+                fps=rate_text(frozen_clock.output),
+                cancelled=cancelled,
+            )
+        else:
+            selected_audio = self._prepare_timeline_audio(
+                output_dir=root,
+                original_video=original_video,
+                settings=durable_settings,
+                frame_count=projection.frame_count,
+                timeline=timeline,
+                cancelled=cancelled,
+            )
         provider = EncodingSequenceProvider.freeze(
             mode="assembled_vr",
             frame_count=projection.frame_count,
@@ -2691,9 +2828,10 @@ class VideoEncoder:
             video_path,
             durable_settings,
             selected_audio,
-            resolved_fps,
+            timeline,
             invocation.resolved_encoder,
             input_format=projection.raw_pixel_format or "png",
+            historical_frame_limit=frozen_clock is not None,
         )
         normalized_template = self._normalize_publication_arguments(
             command=command,
@@ -2719,8 +2857,8 @@ class VideoEncoder:
             raise ReservationConflictError("post-boundary streamed invocation differs") from error
         validator = self._container_validator_for_invocation(
             durable_settings,
-            projection.frame_count,
-            resolved_fps,
+            timeline.output_frames(projection.frame_count),
+            rate_text(timeline.output),
             invocation.resolved_encoder,
             selected_audio.audio_end_sample,
             cancelled,
@@ -2810,6 +2948,9 @@ class VideoEncoder:
                 if final_active
                 else recover_processing_control_prefix_v1(root)
             )
+            reuse = self._reuse_file_backed_output(root, recovered_settings)
+            if reuse is not None:
+                return reuse
         except InterruptedError:
             raise
         except ReservationIncompleteError:
@@ -2894,17 +3035,15 @@ class VideoEncoder:
             manifest_source = schema5_context.manifest_source
             if staged is None or manifest_source is None:
                 raise ValueError("schema-5 direct source has no staged input manifest")
-            resolved_fps = schema5_context.resolved_fps
-            audio_kwargs = {
-                "output_dir": output_dir,
-                "original_video": original_video,
-                "settings": settings,
-                "frame_count": provider.frame_count,
-                "fps": resolved_fps,
-            }
-            if cancelled is not None:
-                audio_kwargs["cancelled"] = cancelled
-            selected_audio = prepare_selected_audio_v1(**audio_kwargs)
+            timeline = schema5_context.timeline
+            selected_audio = self._prepare_timeline_audio(
+                output_dir=output_dir,
+                original_video=original_video,
+                settings=settings,
+                frame_count=provider.frame_count,
+                timeline=timeline,
+                cancelled=cancelled,
+            )
             temporary = schema5_context.sibling_path
             if temporary.exists() or temporary.is_symlink():
                 raise ReservationConflictError(
@@ -2917,7 +3056,7 @@ class VideoEncoder:
                 original_video,
                 settings,
                 selected_audio,
-                resolved_fps,
+                timeline,
                 resolved_encoder_name,
             )
             self._commit_schema5_launch_boundary(
@@ -2928,7 +3067,7 @@ class VideoEncoder:
             )
             returncode, diagnostics = self._run_schema5_ffmpeg_with_progress(
                 command,
-                provider.frame_count,
+                timeline.output_frames(provider.frame_count),
                 progress_tracker,
             )
             if returncode != 0:
@@ -2960,8 +3099,8 @@ class VideoEncoder:
             )
             container_validator = self._container_validator_for_invocation(
                 settings,
-                provider.frame_count,
-                resolved_fps,
+                timeline.output_frames(provider.frame_count),
+                rate_text(timeline.output),
                 resolved_encoder_name,
                 selected_audio.audio_end_sample,
                 cancelled,
@@ -3074,20 +3213,18 @@ class VideoEncoder:
                 print("Error: FFmpeg not found. Cannot create output video.")
                 return False
             if schema5_context is not None:
-                resolved_fps = schema5_context.resolved_fps
-                audio_kwargs = {
-                    "output_dir": output_dir,
-                    "original_video": original_video,
-                    "settings": settings,
-                    "frame_count": sequence.frame_count,
-                    "fps": resolved_fps,
-                }
-                if cancelled is not None:
-                    audio_kwargs["cancelled"] = cancelled
-                selected_audio = prepare_selected_audio_v1(**audio_kwargs)
+                timeline = schema5_context.timeline
+                selected_audio = self._prepare_timeline_audio(
+                    output_dir=output_dir,
+                    original_video=original_video,
+                    settings=settings,
+                    frame_count=sequence.frame_count,
+                    timeline=timeline,
+                    cancelled=cancelled,
+                )
             else:
                 selected_audio = None
-                resolved_fps = None
+                timeline = self._legacy_timeline(original_video, settings)
             if schema5_context is None:
                 assert legacy_output_path is not None and temporary is not None
                 output_path = legacy_output_path
@@ -3106,7 +3243,7 @@ class VideoEncoder:
                 original_video,
                 settings,
                 selected_audio=selected_audio,
-                resolved_fps=resolved_fps,
+                timeline=timeline,
             )
             if schema5_context is not None:
                 assert schema5_context.staged_manifest is not None
@@ -3118,11 +3255,11 @@ class VideoEncoder:
                 )
             if schema5_context is None:
                 returncode, diagnostics = self._run_ffmpeg_with_progress(
-                    command, sequence.frame_count, progress_tracker
+                    command, timeline.output_frames(sequence.frame_count), progress_tracker
                 )
             else:
                 returncode, diagnostics = self._run_schema5_ffmpeg_with_progress(
-                    command, sequence.frame_count, progress_tracker
+                    command, timeline.output_frames(sequence.frame_count), progress_tracker
                 )
             if returncode != 0:
                 self._print_direct_ffmpeg_failure(returncode, diagnostics)
@@ -3159,8 +3296,8 @@ class VideoEncoder:
                 )
                 container_validator = self._container_validator_for_invocation(
                     settings,
-                    schema5_context.provider.frame_count,
-                    schema5_context.resolved_fps,
+                    timeline.output_frames(schema5_context.provider.frame_count),
+                    rate_text(timeline.output),
                     command[command.index("-c:v") + 1],
                     selected_audio.audio_end_sample,
                     cancelled,
@@ -3237,34 +3374,15 @@ class VideoEncoder:
             frames_dir.mkdir(exist_ok=True)
 
         # Calculate frame range and timing
-        total_frames = video_properties["frame_count"]
         fps = video_properties["fps"]
-        start_frame, end_frame = calculate_frame_range(
-            total_frames, fps, settings.get("start_time"), settings.get("end_time")
-        )
+        frame_range = selected_frame_range(video_properties, settings)
+        start_frame, end_frame = frame_range
         expected_frames = end_frame - start_frame
 
         existing_frames = sorted(frames_dir.glob("frame_*.png"))
-        frame_count_tolerance = max(2, (expected_frames + 999) // 1000)
-        exact_count = len(existing_frames) == expected_frames
-        tolerated_vfr_drift = (
-            bool(existing_frames)
-            and abs(len(existing_frames) - expected_frames) <= frame_count_tolerance
-            and self._has_downstream_progress(directories)
-        )
-        source_path = Path(video_path)
-        reusable_manifest = False
-        if source_path.is_file():
-            source_fingerprint = file_sample_fingerprint(source_path)
-            reusable_manifest = (
-                source_frame_manifest_mismatch_reason(
-                    read_source_frame_manifest(frames_dir),
-                    existing_frames,
-                    source_fingerprint,
-                )
-                is None
-            )
-        if expected_frames > 0 and (exact_count or tolerated_vfr_drift) and reusable_manifest:
+        if self._extracted_frames_are_reusable(
+            directories, video_path, frames_dir, existing_frames, frame_range
+        ):
             print(f"  Reusing {len(existing_frames)} already extracted frames")
             return existing_frames
 
@@ -3275,8 +3393,13 @@ class VideoEncoder:
         (frames_dir / "metadata.json").unlink(missing_ok=True)
 
         # Convert frame numbers to timestamps for more efficient seeking
-        start_time = start_frame / fps if fps > 0 else 0
-        duration = expected_frames / fps if fps > 0 else 0
+        if video_properties.get("frame_rate"):
+            start_time, duration = ffmpeg_frame_interval(
+                start_frame, end_frame, Fraction(video_properties["frame_rate"])
+            )
+        else:
+            start_time = str(start_frame / fps if fps > 0 else 0)
+            duration = str(expected_frames / fps if fps > 0 else 0)
 
         # Try CUDA hardware decoding with optimized seeking
         cmd_cuda = [
@@ -3329,8 +3452,39 @@ class VideoEncoder:
 
         frame_files = get_frame_files(frames_dir)
         if frame_files:
-            write_source_frame_manifest(frame_files, video_path)
+            write_source_frame_manifest(frame_files, video_path, frame_range)
         return frame_files
+
+    def _extracted_frames_are_reusable(
+        self,
+        directories: dict[str, Path],
+        video_path: str,
+        frames_dir: Path,
+        existing_frames: list[Path],
+        frame_range: tuple[int, int],
+    ) -> bool:
+        expected_frames = frame_range[1] - frame_range[0]
+        frame_count_tolerance = max(2, (expected_frames + 999) // 1000)
+        exact_count = len(existing_frames) == expected_frames
+        tolerated_vfr_drift = (
+            bool(existing_frames)
+            and abs(len(existing_frames) - expected_frames) <= frame_count_tolerance
+            and self._has_downstream_progress(directories)
+        )
+        source_path = Path(video_path)
+        reusable_manifest = False
+        if source_path.is_file():
+            source_fingerprint = file_sample_fingerprint(source_path)
+            reusable_manifest = (
+                source_frame_manifest_mismatch_reason(
+                    read_source_frame_manifest(frames_dir),
+                    existing_frames,
+                    source_fingerprint,
+                    frame_range,
+                )
+                is None
+            )
+        return expected_frames > 0 and (exact_count or tolerated_vfr_drift) and reusable_manifest
 
     @staticmethod
     def _has_downstream_progress(directories: dict[str, Path]) -> bool:
@@ -3361,21 +3515,36 @@ class VideoEncoder:
             - Executes FFmpeg subprocess for encoder detection
         """
         try:
+            # A CPU-only machine may still list hevc_nvenc in the FFmpeg build.
             test_result = BoundedProcessCaptureV1(
                 stdout_cap=1024 * 1024,
                 stderr_cap=64 * 1024,
                 timeout_seconds=10.0,
                 cancelled=cancelled,
-            ).run(("ffmpeg", "-hide_banner", "-encoders"))
+            ).run(
+                (
+                    "ffmpeg",
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=size=256x256:rate=1",
+                    "-frames:v",
+                    "1",
+                    "-c:v",
+                    "hevc_nvenc",
+                    "-f",
+                    "hevc",
+                    "pipe:1",
+                )
+            )
         except InterruptedError:
             raise
         except (BoundedProcessError, OSError):
             return False
-        return (
-            test_result.returncode == 0
-            and not test_result.stderr
-            and b"hevc_nvenc" in test_result.stdout
-        )
+        return test_result.returncode == 0 and not test_result.stderr and bool(test_result.stdout)
 
     def _resolve_encoder_name(
         self,

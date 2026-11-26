@@ -157,6 +157,126 @@ def complete_metric_store(tmp_path: Path) -> MetricGeometryStore:
     return store
 
 
+@pytest.mark.parametrize(
+    "distance,indexes,count,error",
+    [
+        (2.0, (0,), 1, TypeError),
+        (np.float32(-1), (0,), 1, ValueError),
+        (np.float32(1), [0], 1, TypeError),
+        (np.float32(1), (), 1, ValueError),
+        (np.float32(1), (True,), 1, ValueError),
+        (np.float32(1), (0, 0), 1, ValueError),
+        (np.float32(1), (2, 1), 1, ValueError),
+        (np.float32(1), (0,), False, TypeError),
+        (np.float32(1), (0,), 0, ValueError),
+    ],
+)
+def test_convergence_rejects_unknown_units_counts_and_frame_order(distance, indexes, count, error):
+    with pytest.raises(error):
+        ClipConvergence(distance, indexes, count)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("frame_names", []),
+        ("frame_names", [None]),
+        ("frame_names", ["frame.png", "frame.jpg"]),
+        ("native_shape", (True, 1)),
+        ("native_shape", [1, 1]),
+        ("candidate_scene_fingerprint", ""),
+        ("source_raw_fingerprint", None),
+        ("preflight_required_bytes", True),
+        ("preflight_required_bytes", -1),
+    ],
+)
+def test_metric_store_rejects_invalid_declaration_before_creating_state(tmp_path, field, value):
+    options = dict(
+        frame_names=FRAME_NAMES,
+        native_shape=(1, 1),
+        source_raw_fingerprint="raw",
+        source_frame_fingerprint="frames",
+        candidate_scene_fingerprint="scenes",
+        preflight_required_bytes=1024,
+    )
+    with pytest.raises((TypeError, ValueError)):
+        MetricGeometryStore.open_or_create(tmp_path / "new", **{**options, field: value})
+    assert not (tmp_path / "new").exists()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("frame_names", []),
+        ("frame_names", [None]),
+        ("frame_names", ["a.png", "a.jpg"]),
+        ("source_frame_fingerprint", ""),
+        ("storage_dtype", "float16"),
+        ("status", "writing"),
+        ("native_shape", [1]),
+        ("convergence", None),
+        ("convergence.algorithm_version", "old"),
+        ("convergence.selected_frame_indexes", []),
+        ("convergence.selected_frame_indexes", [1]),
+        ("convergence.sample_count", False),
+        ("convergence.resolved_auto_distance_m", 0),
+    ],
+)
+def test_complete_store_refuses_inconsistent_metadata_without_modifying_payloads(
+    complete_metric_store, field, value
+):
+    store = complete_metric_store
+    data = json.loads(store.metadata_path.read_bytes())
+    data.pop("fingerprint")
+    if "." in field:
+        name, key = field.split(".")
+        data[name][key] = value
+    else:
+        data[field] = value
+    data["fingerprint"] = canonical_json_hash(data)
+    store.metadata_path.write_text(json.dumps(data))
+    payload = store.path_for(FRAME_NAMES[0])
+    before = payload.read_bytes()
+    with pytest.raises(ValueError):
+        MetricGeometryStore.open_existing(
+            store.directory,
+            frame_names=[FRAME_NAMES[0]],
+            source_raw_fingerprint="raw-fingerprint",
+            source_frame_fingerprint="frame-fingerprint",
+            candidate_scene_fingerprint="scene-fingerprint",
+        )
+    assert payload.read_bytes() == before
+
+
+def test_writing_store_keeps_valid_payloads_until_all_convergence_inputs_exist(
+    partial_metric_store,
+):
+    store = partial_metric_store
+    first = store.path_for(FRAME_NAMES[0])
+    before = first.stat().st_mtime_ns, first.read_bytes(), store.metadata_path.read_bytes()
+    assert store.write_frame(FRAME_NAMES[0], VALID_FRAME) == first
+    with pytest.raises(ValueError, match="missing"):
+        store.finalize(ClipConvergence(np.float32(1), (0,), 1))
+    with pytest.raises(TypeError, match="MetricGeometryFrame"):
+        store.write_frame(FRAME_NAMES[1], None)
+    with pytest.raises(ValueError, match="shape"):
+        store.write_frame(
+            FRAME_NAMES[1], metric_frame_from_depth(np.ones((2, 2), np.float32), np.float32(0.8))
+        )
+    assert (
+        first.stat().st_mtime_ns,
+        first.read_bytes(),
+        store.metadata_path.read_bytes(),
+    ) == before
+    store.write_frame(FRAME_NAMES[1], VALID_FRAME)
+    with pytest.raises(ValueError, match="outside"):
+        store.finalize(ClipConvergence(np.float32(1), (2,), 1))
+    complete = store.finalize(ClipConvergence(np.float32(1), (0, 1), 2))
+    assert store.finalize(ClipConvergence(np.float32(1), (0, 1), 2)) == complete
+    with pytest.raises(ValueError, match="complete"):
+        store.write_frame(FRAME_NAMES[0], VALID_FRAME)
+
+
 def test_metric_frame_derives_finite_inverse_depth_and_explicit_validity() -> None:
     smallest_subnormal = np.nextafter(np.float32(0.0), np.float32(1.0), dtype=np.float32)
     depth = np.array([[2.0, 0.0, np.inf], [4.0, -1.0, smallest_subnormal]], dtype=np.float32)
@@ -381,7 +501,9 @@ def test_windows_allocation_unit_queries_folder_mounted_volume(
             total_clusters._obj.value = 20
             return 1
 
-    monkeypatch.setattr(metric_geometry.ctypes, "WinDLL", lambda *_args, **_kwargs: Kernel32())
+    monkeypatch.setattr(
+        metric_geometry._win32, "load_library", lambda *_args, **_kwargs: Kernel32()
+    )
 
     assert metric_geometry._windows_allocation_unit(tmp_path / "folder") == 32_768
     assert calls["source"] == str((tmp_path / "folder").resolve())
@@ -392,8 +514,11 @@ def test_windows_allocation_unit_queries_folder_mounted_volume(
 def test_windows_allocation_query_failure_or_invalid_value_uses_fallback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_point: str
 ) -> None:
+    queries = []
+
     class Kernel32:
         def GetVolumePathNameW(self, _source, volume_path, _length) -> int:
+            queries.append("volume")
             if failure_point == "exception":
                 raise TypeError("unavailable Windows API")
             volume_path.value = "C:\\mounted-volume\\"
@@ -402,12 +527,18 @@ def test_windows_allocation_query_failure_or_invalid_value_uses_fallback(
         def GetDiskFreeSpaceW(
             self, _volume_path, sectors, bytes_per_sector, _free_clusters, _total_clusters
         ) -> int:
+            queries.append("disk")
             sectors._obj.value = 0 if failure_point == "invalid" else 8
             bytes_per_sector._obj.value = 4096
             return int(failure_point != "disk")
 
-    monkeypatch.setattr(metric_geometry.ctypes, "WinDLL", lambda *_args, **_kwargs: Kernel32())
+    monkeypatch.setattr(
+        metric_geometry._win32, "load_library", lambda *_args, **_kwargs: Kernel32()
+    )
     assert metric_geometry._windows_allocation_unit(tmp_path) is None
+    assert queries == (
+        ["volume"] if failure_point in {"volume", "exception"} else ["volume", "disk"]
+    )
     monkeypatch.setattr(metric_geometry, "_windows_allocation_unit", lambda _path: None)
     monkeypatch.setattr(
         "os.statvfs",

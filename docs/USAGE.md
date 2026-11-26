@@ -52,17 +52,16 @@ Run `python depth_surge_3d.py --help` for every option and its current default.
 
 ### MoGe-2 Examples
 
-Install the optional extra first with `uv sync --extra moge2`. Relative
-geometry is the default:
+Install the [optional MoGe-2 backend](INSTALLATION.md#optional-moge-2) first. The examples below use the installed CLI on `PATH`; on Windows without activation, use `.\.venv\Scripts\depth-surge-3d.exe`. Relative geometry is the default:
 
 ```bash
-uv run depth-surge-3d clip.mp4 --depth-model-version moge2 --model-size vitb
+depth-surge-3d clip.mp4 --depth-model-version moge2 --model-size vitb
 ```
 
 The Experimental metric-camera path uses flat rectilinear side-by-side output:
 
 ```bash
-uv run depth-surge-3d clip.mp4 --depth-model-version moge2 --model-size vitb \
+depth-surge-3d clip.mp4 --depth-model-version moge2 --model-size vitb \
   --stereo-geometry-mode metric_camera --format side_by_side --no-distortion \
   --virtual-baseline-mm 63 --metric-convergence-distance auto \
   --max-disparity-percent 2
@@ -124,8 +123,22 @@ continues to consume the lossless NPZ geometry, not these visualization files.
 ## Resume
 
 ```bash
-python depth_surge_3d.py --resume ./output/video_timestamp/
+depth-surge-3d --resume ./output/video_timestamp/
 ```
+
+If encoding finished but publication was interrupted, resume first checks the
+saved output's file identity, length, digest, and encoding manifest under the
+job lock. A matching output is published with its saved settings. This does
+not require the original frame PNGs, a depth model, or another FFmpeg encode;
+FFmpeg can still run to **decode and verify** the existing movie. Repeating
+the command on a verified completed job leaves the movie unchanged.
+
+A different file at the expected name is not permission to overwrite it, even
+if its bytes match. Recovery also stops if the proof itself was only partially
+written, or if an older job never recorded it. Keep the existing movie and
+job directory. Restore complete job metadata from a known backup to retry, or
+use a new output directory for a fresh conversion; do not delete the manifests
+or force an overwrite.
 
 Resume validates the selected settings file, its recorded source-video path and
 SHA-256, the extraction-time frame-content fingerprint, contiguous frame names,
@@ -186,8 +199,8 @@ after its clip-global convergence metadata is finalized.
 Stereo renderer v3 invalidates v1 left/right metadata and all tracked
 downstream frame stages while preserving valid source, scene, raw-depth, and
 canonical data. An existing encoded video is not a tracked frame stage and is
-not implicitly deleted; the resumed run encodes its new result through the
-normal output path.
+not implicitly deleted or overwritten; use a different output directory for
+a new rendering of an already published movie.
 
 ## Viewing
 

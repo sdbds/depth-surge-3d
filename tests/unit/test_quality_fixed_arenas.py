@@ -14,12 +14,8 @@ def fixed_arenas():
 
 
 def _single_invalid_lane_band():
-    forward_splat = importlib.import_module(
-        "src.depth_surge_3d.rendering.forward_splat"
-    )
-    visibility = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.visibility"
-    )
+    forward_splat = importlib.import_module("src.depth_surge_3d.rendering.forward_splat")
+    visibility = importlib.import_module("src.depth_surge_3d.rendering.quality.visibility")
     valid = np.ones((1, 16), dtype=np.bool_)
     valid[0, 5] = False
     winner_sources = np.zeros((1, 16), dtype=np.int64)
@@ -35,9 +31,7 @@ def _single_invalid_lane_band():
 
 
 def _single_pixel_analysis():
-    local_strip = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.local_strip"
-    )
+    local_strip = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
     return local_strip.QualityVisibilityAnalysis(
         coverage_count=np.empty((1, 1), dtype=np.uint8),
         pure_region_id=np.empty((1, 1), dtype=np.uint32),
@@ -56,26 +50,18 @@ def _random_final_records(
     pixel_count: int,
     record_count: int,
 ) -> np.ndarray:
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
     records = np.zeros(record_count, dtype=repair_records.REPAIR_RECORD_DTYPE)
     if record_count == 0:
         return records
     records["pixel_index"] = np.sort(
-        generator.choice(pixel_count, size=record_count, replace=False).astype(
-            np.uint32
-        )
+        generator.choice(pixel_count, size=record_count, replace=False).astype(np.uint32)
     )
     for record in records:
         lane_start = int(generator.integers(0, 16))
         lane_end = int(generator.integers(lane_start + 1, 17))
-        record["lane_mask"] = np.uint16(
-            ((1 << (lane_end - lane_start)) - 1) << lane_start
-        )
-    records["fill_bgr"] = generator.integers(
-        0, 256, size=(record_count, 3), dtype=np.uint8
-    )
+        record["lane_mask"] = np.uint16(((1 << (lane_end - lane_start)) - 1) << lane_start)
+    records["fill_bgr"] = generator.integers(0, 256, size=(record_count, 3), dtype=np.uint8)
     records["backend"] = generator.integers(1, 4, size=record_count, dtype=np.uint8)
     return records
 
@@ -103,9 +89,7 @@ def _downsample_exemplar_oracle(
             parent_target[row, column] = not block_barrier and block_target
             parent_donor[row, column] = not block_barrier and bool(np.all(donor[block]))
             parent_processed[row, column] = (
-                not block_target
-                and not block_barrier
-                and bool(np.all(processed[block]))
+                not block_target and not block_barrier and bool(np.all(processed[block]))
             )
     return parent_donor, parent_target, parent_processed, parent_barrier
 
@@ -116,15 +100,11 @@ def _exemplar_level_may_score_oracle(
     processed: np.ndarray,
     barrier: np.ndarray,
 ) -> bool:
-    has_candidate = False
-    for row in range(4, donor.shape[0] - 4):
-        for column in range(4, donor.shape[1] - 4):
-            if np.all(donor[row - 4 : row + 5, column - 4 : column + 5]):
-                has_candidate = True
-                break
-        if has_candidate:
-            break
-    if not has_candidate:
+    if not any(
+        np.all(donor[row - 4 : row + 5, column - 4 : column + 5])
+        for row in range(4, donor.shape[0] - 4)
+        for column in range(4, donor.shape[1] - 4)
+    ):
         return False
     for row in range(3, target.shape[0] - 3):
         for column in range(3, target.shape[1] - 3):
@@ -163,9 +143,7 @@ def _component_may_score_exemplar_oracle(
     y1 = min(height, int(rows.max()) + 65)
     x0 = max(0, int(columns.min()) - 64)
     x1 = min(width, int(columns.max()) + 65)
-    same_proxy = (coverage[y0:y1, x0:x1] > 0) & (
-        regions[y0:y1, x0:x1] == np.uint32(region)
-    )
+    same_proxy = (coverage[y0:y1, x0:x1] > 0) & (regions[y0:y1, x0:x1] == np.uint32(region))
     donor = same_proxy & safe[y0:y1, x0:x1]
     target = np.zeros_like(donor)
     processed = same_proxy.copy()
@@ -216,9 +194,7 @@ def test_fixed_graph_matches_legacy_component_and_member_order_oracle(
     fixed_arenas,
 ) -> None:
     planner = importlib.import_module("src.depth_surge_3d.rendering.quality.planner")
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
     generator = np.random.default_rng(2026082501)
 
     for _case in range(32):
@@ -226,9 +202,7 @@ def test_fixed_graph_matches_legacy_component_and_member_order_oracle(
         width = int(generator.integers(1, 10))
         valid = np.ascontiguousarray(generator.random((height, width * 16)) > 0.22)
         near = np.ascontiguousarray(generator.random(valid.shape), dtype=np.float32)
-        regions = np.ascontiguousarray(
-            generator.integers(1, 5, size=valid.shape, dtype=np.uint32)
-        )
+        regions = np.ascontiguousarray(generator.integers(1, 5, size=valid.shape, dtype=np.uint32))
         built = repair_records.build_repair_records(valid, near, regions)
 
         expected_ids, expected_count = planner.build_record_component_ids(
@@ -252,9 +226,7 @@ def test_fixed_graph_matches_legacy_component_and_member_order_oracle(
 
 def test_fixed_graph_workspace_boundary_uses_budget_error(fixed_arenas) -> None:
     planner = importlib.import_module("src.depth_surge_3d.rendering.quality.planner")
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
     records = np.empty(0, dtype=repair_records.REPAIR_RECORD_DTYPE)
     workspace_width = (12 * 1024 * 1024) // (4 * np.dtype(np.int32).itemsize)
 
@@ -276,9 +248,7 @@ def test_fixed_graph_workspace_boundary_uses_budget_error(fixed_arenas) -> None:
 
 
 def test_record_arena_exposes_the_exact_canonical_cap(fixed_arenas) -> None:
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
 
     records = fixed_arenas.records()
 
@@ -288,9 +258,7 @@ def test_record_arena_exposes_the_exact_canonical_cap(fixed_arenas) -> None:
 
 def test_first_band_record_capacity_overflow_uses_budget_error() -> None:
     renderer = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
     output = np.empty(0, dtype=repair_records.REPAIR_RECORD_DTYPE)
 
     with pytest.raises(repair_records.QualityRepairBudgetError):
@@ -308,9 +276,7 @@ def test_first_band_record_capacity_overflow_uses_budget_error() -> None:
 
 def test_later_band_record_capacity_overflow_uses_budget_error() -> None:
     renderer = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
     output = np.empty(1, dtype=repair_records.REPAIR_RECORD_DTYPE)
     arguments = (
         _single_invalid_lane_band(),
@@ -339,12 +305,8 @@ def test_later_band_record_capacity_overflow_uses_budget_error() -> None:
 def test_fallback_phase_owns_full_repair_arena_before_reset() -> None:
     arena_module = importlib.import_module("src.depth_surge_3d.rendering.quality.arena")
     fallback = importlib.import_module("src.depth_surge_3d.rendering.quality.fallback")
-    local_strip = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.local_strip"
-    )
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    local_strip = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
     height = width = 9
     coverage = np.full((height, width), 16, dtype=np.uint8)
     coverage[4, 4] = 0
@@ -386,12 +348,8 @@ def test_injected_repair_arena_avoids_bulk_numpy_allocators(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     planner = importlib.import_module("src.depth_surge_3d.rendering.quality.planner")
-    local_strip = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.local_strip"
-    )
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    local_strip = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
     height = width = 9
     coverage = np.full((height, width), 16, dtype=np.uint8)
     coverage[4, 4] = 0
@@ -448,9 +406,7 @@ def test_native_float_scatter_matches_expand_oracle_randomized() -> None:
             record_count=record_count,
         )
         raw = _raw_records(records)
-        expected_indexes, expected_colours = native_kd.expand_repair_scatter(
-            raw, height, width
-        )
+        expected_indexes, expected_colours = native_kd.expand_repair_scatter(raw, height, width)
         actual = np.full((pixel_count * 16, 3), -7.0, dtype=np.float32)
         expected = actual.copy()
         expected[expected_indexes] = expected_colours
@@ -490,9 +446,7 @@ def test_native_u8_scatter_clears_stale_workspace_and_matches_oracle() -> None:
 
 
 def test_native_u8_scatter_rejects_overlapping_records() -> None:
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
     native_kd = importlib.import_module(
         "src.depth_surge_3d.rendering.quality.native_kd"
     )._require_native()
@@ -504,16 +458,12 @@ def test_native_u8_scatter_rejects_overlapping_records() -> None:
     mask = np.empty(16, dtype=np.bool_)
 
     with pytest.raises(RuntimeError, match="overlap"):
-        native_kd.materialize_repair_scatter_u8_into(
-            _raw_records(records), 0, colours, mask
-        )
+        native_kd.materialize_repair_scatter_u8_into(_raw_records(records), 0, colours, mask)
 
 
 def test_native_u8_scatter_preserves_chunk_boundary_offsets() -> None:
     renderer = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
     native_kd = importlib.import_module(
         "src.depth_surge_3d.rendering.quality.native_kd"
     )._require_native()
@@ -558,14 +508,10 @@ def test_native_exemplar_preflight_matches_independent_mask_oracle() -> None:
         region = int(generator.integers(1, 4))
         target_count = int(generator.integers(1, min(20, height * width) + 1))
         targets = np.sort(
-            generator.choice(height * width, size=target_count, replace=False).astype(
-                np.uint32
-            )
+            generator.choice(height * width, size=target_count, replace=False).astype(np.uint32)
         )
 
-        expected = _component_may_score_exemplar_oracle(
-            coverage, regions, safe, targets, region
-        )
+        expected = _component_may_score_exemplar_oracle(coverage, regions, safe, targets, region)
         actual = native_kd.component_may_score_exemplar(
             coverage, regions, safe, targets, region, workspace
         )
@@ -584,9 +530,7 @@ def test_native_exemplar_preflight_accepts_known_scoreable_component() -> None:
     workspace = np.empty(4 * (512 * 512 + 256 * 256 + 128 * 128), dtype=np.uint8)
 
     expected = _component_may_score_exemplar_oracle(coverage, regions, safe, targets, 1)
-    actual = native_kd.component_may_score_exemplar(
-        coverage, regions, safe, targets, 1, workspace
-    )
+    actual = native_kd.component_may_score_exemplar(coverage, regions, safe, targets, 1, workspace)
 
     assert expected is True
     assert actual is True
@@ -595,12 +539,8 @@ def test_native_exemplar_preflight_accepts_known_scoreable_component() -> None:
 def test_fixed_exemplar_pyramid_and_donor_enumeration_use_native_exact_oracles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    arena_module = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.arena"
-    )
-    exemplar = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.exemplar"
-    )
+    arena_module = importlib.import_module("src.depth_surge_3d.rendering.quality.arena")
+    exemplar = importlib.import_module("src.depth_surge_3d.rendering.quality.exemplar")
     generator = np.random.default_rng(2026082505)
     shape = (67, 71)
     working = generator.integers(0, 256, size=(*shape, 3), dtype=np.uint8)
@@ -654,18 +594,10 @@ def test_fixed_exemplar_pyramid_and_donor_enumeration_use_native_exact_oracles(
 
 
 def test_indexed_fixed_exemplar_repairs_the_full_record_arena_without_copying() -> None:
-    arena_module = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.arena"
-    )
-    exemplar = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.exemplar"
-    )
-    local_strip = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.local_strip"
-    )
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    arena_module = importlib.import_module("src.depth_surge_3d.rendering.quality.arena")
+    exemplar = importlib.import_module("src.depth_surge_3d.rendering.quality.exemplar")
+    local_strip = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
     height = width = 65
     target_pixel = 32 * width + 32
     coverage = np.full((height, width), 16, dtype=np.uint8)
@@ -675,10 +607,7 @@ def test_indexed_fixed_exemplar_repairs_the_full_record_arena_without_copying() 
     analysis = local_strip.QualityVisibilityAnalysis(
         coverage,
         regions,
-        tuple(
-            np.full((height, width), value, dtype=np.uint8)
-            for value in (10, 20, 30)
-        ),
+        tuple(np.full((height, width), value, dtype=np.uint8) for value in (10, 20, 30)),
     )
     safe = np.ones((height, width), dtype=np.bool_)
     safe[31:34, 31:34] = False
@@ -730,30 +659,16 @@ def test_indexed_fixed_exemplar_repairs_the_full_record_arena_without_copying() 
 def test_planner_passes_component_indexes_without_allocating_record_copies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    arena_module = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.arena"
-    )
-    exemplar = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.exemplar"
-    )
-    local_strip = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.local_strip"
-    )
-    planner = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.planner"
-    )
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    arena_module = importlib.import_module("src.depth_surge_3d.rendering.quality.arena")
+    exemplar = importlib.import_module("src.depth_surge_3d.rendering.quality.exemplar")
+    local_strip = importlib.import_module("src.depth_surge_3d.rendering.quality.local_strip")
+    planner = importlib.import_module("src.depth_surge_3d.rendering.quality.planner")
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
     height = width = 64
     coverage = np.full((height, width), 16, dtype=np.uint8)
     regions = np.ones((height, width), dtype=np.uint32)
     target_pixels = np.array(
-        [
-            row * width + column
-            for row in range(28, 35)
-            for column in range(28, 35)
-        ],
+        [row * width + column for row in range(28, 35) for column in range(28, 35)],
         dtype=np.uint32,
     )
     target_rows = target_pixels // np.uint32(width)
@@ -763,10 +678,7 @@ def test_planner_passes_component_indexes_without_allocating_record_copies(
     analysis = local_strip.QualityVisibilityAnalysis(
         coverage,
         regions,
-        tuple(
-            np.full((height, width), value, dtype=np.uint8)
-            for value in (10, 20, 30)
-        ),
+        tuple(np.full((height, width), value, dtype=np.uint8) for value in (10, 20, 30)),
     )
     records = np.zeros(50, dtype=repair_records.REPAIR_RECORD_DTYPE)
     records[0]["pixel_index"] = np.uint32(0)

@@ -266,6 +266,106 @@ def test_settings_transaction_recovers_exact_durable_semantic_payload(tmp_path) 
     ).exists()
 
 
+@pytest.mark.parametrize("complete", [True, False], ids=["durable-intent", "short-write"])
+def test_settings_restart_uses_only_a_complete_pending_index(tmp_path, complete):
+    initial = _artifact()
+    _bootstrap_settings(tmp_path, initial)
+    target = initial.with_producer_marker(
+        generation="44" * 16, updated_at="2026-08-24T12:34:57.123456Z"
+    )
+    intent = reservation_protocol.SettingsTransitionIntentV1.create(
+        job_root=tmp_path,
+        current=initial,
+        target=target,
+        reservation_generation="55" * 16,
+        reservation_id="66" * 16,
+        allocation_unit=4096,
+    )
+    index = tmp_path / reservation_protocol.SETTINGS_TRANSITION_INDEX_RELATIVE_PATH
+
+    def interrupt(event):
+        if event == "index:temporary":
+            raise reservation_protocol.InjectedReservationCrash(event)
+
+    with pytest.raises(reservation_protocol.InjectedReservationCrash, match="index:temporary"):
+        reservation_protocol.publish_write_ahead_intent(index, intent.to_object(), event=interrupt)
+    temporary = index.with_name(f".{index.name}.create-new.tmp")
+    if not complete:
+        with temporary.open("r+b") as handle:
+            handle.truncate(23)
+    fixed = tmp_path / reservation_protocol.SETTINGS_ARTIFACT_RELATIVE_PATH
+    assert fixed.read_bytes() == initial.encode() and not index.exists()
+
+    for _ in range(2):
+        recovered = reservation_protocol.SettingsArtifactTransactionV1.recover(
+            tmp_path, allocation_adapter=_allocation_adapter
+        )
+        assert recovered == (target if complete else initial)
+        assert fixed.read_bytes() == recovered.encode()
+        assert not temporary.exists() and not index.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "bad", "reason"),
+    [
+        ("target_settings_revision", 3, "revision equation"),
+        ("settings_revision_at_preflight", False, "revision_at_preflight"),
+        ("transition_kind", "attempt_restart", "terminal entry"),
+        ("publication_generation", "aa" * 16, "publication generation differs"),
+        ("target_settings_raw_sha256", "ab" * 32, "hashes or identity differ"),
+        ("extent_entries", [], "primary entry"),
+    ],
+)
+def test_inconsistent_transition_index_preserves_its_source_until_restored(
+    tmp_path, field, bad, reason
+):
+    from src.depth_surge_3d.io.canonical_json import canonical_json_bytes
+
+    initial = _artifact()
+    _bootstrap_settings(tmp_path, initial)
+    target = initial.with_processing_settings(
+        validate_settings({"occlusion_fill_max_px": 11}, source="explicit"),
+        updated_at="2026-08-24T12:34:57.123456Z",
+    )
+    stage = reservation_protocol.SettingsArtifactTransactionV1.begin(
+        job_root=tmp_path,
+        current=initial,
+        target=target,
+        allocation_adapter=_allocation_adapter,
+        allocation_unit=4096,
+        reservation_generation="54" * 16,
+        reservation_id="65" * 16,
+    )
+    original = stage.index_path.read_bytes()
+    value = json.loads(original)
+    value[field] = bad
+    value["fingerprint"] = reservation_protocol.sha256_canonical(
+        {name: v for name, v in value.items() if name != "fingerprint"}
+    )
+    with pytest.raises(reservation_protocol.ReservationConflictError, match=reason):
+        reservation_protocol.SettingsTransitionIntentV1.from_object(value)
+    damaged = canonical_json_bytes(value)
+    stage.index_path.write_bytes(damaged)
+    with pytest.raises(
+        reservation_protocol.ReservationConflictError, match="control artifact is malformed"
+    ):
+        reservation_protocol.SettingsArtifactTransactionV1.recover(
+            tmp_path, allocation_adapter=_allocation_adapter
+        )
+    assert stage.index_path.read_bytes() == damaged
+    assert stage.transaction.target_path.read_bytes() == initial.encode()
+    assert stage.transaction.source_path.read_bytes() == bytes(
+        stage.transaction.descriptor.logical_byte_count
+    )
+    stage.index_path.write_bytes(original)
+    assert (
+        reservation_protocol.SettingsArtifactTransactionV1.recover(
+            tmp_path, allocation_adapter=_allocation_adapter
+        )
+        == target
+    )
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows replacement gaps are platform-specific")
 def test_settings_transaction_recovers_missing_fixed_target_from_descriptor(tmp_path) -> None:
     initial = _artifact()
@@ -546,6 +646,62 @@ def test_lifecycle_terminal_extent_recovers_complete_full_intent(tmp_path) -> No
     )
 
 
+@pytest.mark.parametrize("state", ["partial-full", "partial-short", "nonterminal-full"])
+def test_incomplete_terminal_write_is_reset_only_before_release(tmp_path, state):
+    initial = _artifact()
+    _bootstrap_settings(tmp_path, initial)
+    control = reservation_protocol.load_job_control(tmp_path)
+    entry = next(
+        item
+        for item in control.bootstrap_extent_entries
+        if item["reservation_kind"] == "job_terminal_settings"
+    )
+    descriptor = tmp_path / entry["descriptor_relative_path"]
+    extent = tmp_path / entry["source_extent_relative_path"]
+    intent = initial.failed(terminal_at="2026-08-24T12:35:01.123456Z", diagnostic_code="IO_ERROR")
+    with extent.open("r+b") as handle:
+        written = initial.encode() if state == "nonterminal-full" else intent.encode()[:23]
+        handle.write(written)
+        if state == "partial-short":
+            handle.truncate()
+    before_descriptor = descriptor.read_bytes()
+    before_source = extent.read_bytes()
+    fixed = tmp_path / reservation_protocol.SETTINGS_ARTIFACT_RELATIVE_PATH
+    if state == "partial-full":
+        assert (
+            reservation_protocol.recover_settings_job_v1(
+                tmp_path, allocation_adapter=_allocation_adapter
+            )
+            == initial
+        )
+        assert extent.read_bytes() == bytes(len(before_source))
+        assert (
+            descriptor.read_bytes() == before_descriptor and fixed.read_bytes() == initial.encode()
+        )
+        assert (
+            reservation_protocol.commit_terminal_settings_v1(
+                job_root=tmp_path,
+                current=initial,
+                target=intent,
+                allocation_adapter=_allocation_adapter,
+            )
+            == intent
+        )
+        assert fixed.read_bytes() == intent.encode()
+    else:
+        reason = (
+            "not a canonical artifact" if state == "partial-short" else "illegal semantic intent"
+        )
+        with pytest.raises(reservation_protocol.ReservationConflictError, match=reason):
+            reservation_protocol.recover_settings_job_v1(
+                tmp_path, allocation_adapter=_allocation_adapter
+            )
+        assert extent.read_bytes() == before_source
+        assert (
+            descriptor.read_bytes() == before_descriptor and fixed.read_bytes() == initial.encode()
+        )
+
+
 def test_attempt_restart_updates_settings_and_recreates_terminal_extent(tmp_path) -> None:
     initial = _artifact()
     reservation_protocol.bootstrap_settings_job_v1(
@@ -736,10 +892,12 @@ def test_operations_new_job_path_uses_schema5_locator_and_terminal_extent(tmp_pa
             {"stereo_render_mode": "quality", "occlusion_fill_max_px": 7},
             source="explicit",
         ),
-        video_properties=video_properties,
+        video_properties={**video_properties, "frame_rate": "24/1"},
         source_video_path=str(source),
     )
     assert restarted.status == "in_progress"
+    # Reprobing a pre-clock job must not rewrite its immutable video properties.
+    assert restarted.to_object()["video_properties"] == video_properties
     assert restarted.to_object()["metadata"]["processing_attempt"] == 2
     assert restarted.to_object()["processing_settings"]["stereo_render_mode"] == "quality"
     assert (

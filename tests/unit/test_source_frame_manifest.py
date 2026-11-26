@@ -28,7 +28,7 @@ def test_frame_fingerprint_uses_filesystem_metadata_not_payload_reads(
 
 
 def test_source_frame_contract_marks_the_lightweight_algorithm() -> None:
-    assert SOURCE_FRAME_SCHEMA_VERSION == 2
+    assert SOURCE_FRAME_SCHEMA_VERSION == 3
     assert SOURCE_FRAME_ALGORITHM_VERSION == "png-stat-v1"
 
 

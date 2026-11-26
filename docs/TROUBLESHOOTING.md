@@ -22,7 +22,7 @@ This warning is normal and doesn't affect functionality. The system will use PyT
 
 ### CUDA initialization errors
 - **Enable persistence mode**: Run `sudo nvidia-smi -pm 1` to enable GPU persistence mode
-- **Check CUDA version**: Ensure CUDA 13.0+ is installed
+- **Check driver compatibility**: The locked PyTorch GPU wheels use CUDA 13.0. A CUDA Toolkit installation is not a substitute for a compatible NVIDIA driver.
 - **Check driver version**: Update NVIDIA drivers to latest version
 - **Reboot after driver updates**: Some CUDA changes require a system restart
 
@@ -51,11 +51,7 @@ The system will skip already-completed processing steps.
 ### MoGe-2 Optional Backend
 
 `MoGe-2 optional dependency is not installed` means the default environment is
-working but the optional source package is absent. Run:
-
-```bash
-uv sync --extra moge2
-```
+working but the optional source package is absent. Follow the [MoGe-2 install instructions](INSTALLATION.md#optional-moge-2) for your current environment; on Windows rerun `.\1.install-uv-qinglong.ps1 -WithMoGe2` from the checkout.
 
 If a pinned snapshot cannot resolve, reconnect so the exact repository revision
 can be downloaded or populate the Hugging Face cache with that exact snapshot.

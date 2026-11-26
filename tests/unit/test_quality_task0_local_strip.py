@@ -1,4 +1,4 @@
-"""Task 0 contracts for repair records and bounded local-strip planning."""
+"""Shared contracts for repair records and bounded local-strip planning."""
 
 from __future__ import annotations
 
@@ -7,13 +7,6 @@ import importlib.util
 import numpy as np
 import pytest
 
-from scripts.quality_task0 import local_strip, native_repair, repair_records
-
-
-def _api(module, name: str):
-    assert hasattr(module, name), f"missing Task 0 API: {module.__name__}.{name}"
-    return getattr(module, name)
-
 
 def test_repair_record_and_local_strip_modules_are_importable() -> None:
     assert importlib.util.find_spec("scripts.quality_task0.repair_records") is not None
@@ -21,8 +14,8 @@ def test_repair_record_and_local_strip_modules_are_importable() -> None:
     assert importlib.util.find_spec("scripts.quality_task0.native_repair") is not None
 
 
-def test_repair_record_dtype_is_frozen_unaligned_and_exactly_sixteen_bytes() -> None:
-    record_dtype = _api(repair_records, "REPAIR_RECORD_DTYPE")
+def test_repair_record_dtype_is_frozen_unaligned_and_exactly_sixteen_bytes(repair_records) -> None:
+    record_dtype = repair_records.REPAIR_RECORD_DTYPE
 
     assert record_dtype.itemsize == 16
     assert not record_dtype.isalignedstruct
@@ -53,8 +46,8 @@ def _winner_rasters(fine_width: int) -> tuple[np.ndarray, np.ndarray, np.ndarray
     return valid, near_score, region_id
 
 
-def test_record_builder_splits_runs_and_preserves_far_side_identity() -> None:
-    build = _api(repair_records, "build_repair_records")
+def test_record_builder_splits_runs_and_preserves_far_side_identity(repair_records) -> None:
+    build = repair_records.build_repair_records
     valid, near_score, region_id = _winner_rasters(48)
 
     valid[0, 2:6] = False
@@ -84,8 +77,8 @@ def test_record_builder_splits_runs_and_preserves_far_side_identity() -> None:
     assert result.invalid_lane_count == 12
 
 
-def test_record_builder_uses_the_only_boundary_at_each_frame_edge() -> None:
-    build = _api(repair_records, "build_repair_records")
+def test_record_builder_uses_the_only_boundary_at_each_frame_edge(repair_records) -> None:
+    build = repair_records.build_repair_records
     valid, near_score, region_id = _winner_rasters(32)
     valid[0, :3] = False
     valid[0, -5:] = False
@@ -99,9 +92,9 @@ def test_record_builder_uses_the_only_boundary_at_each_frame_edge() -> None:
     assert result.records["far_side"].tolist() == [1, 0]
 
 
-def test_record_builder_rejects_a_row_wide_no_donor_run() -> None:
-    build = _api(repair_records, "build_repair_records")
-    no_donor_error = _api(repair_records, "QualityRepairNoDonorError")
+def test_record_builder_rejects_a_row_wide_no_donor_run(repair_records) -> None:
+    build = repair_records.build_repair_records
+    no_donor_error = repair_records.QualityRepairNoDonorError
     valid = np.zeros((1, 16), dtype=np.bool_)
     near_score = np.zeros((1, 16), dtype=np.float32)
     region_id = np.zeros((1, 16), dtype=np.uint32)
@@ -111,7 +104,9 @@ def test_record_builder_rejects_a_row_wide_no_donor_run() -> None:
 
 
 def test_million_one_lane_runs_fit_the_fixed_record_arena_without_a_list() -> None:
-    build = _api(native_repair, "build_native_repair_records")
+    from scripts.quality_task0 import native_repair
+
+    build = native_repair.build_native_repair_records
     fine_width = 2_000_000
     valid = np.ones((1, fine_width), dtype=np.bool_)
     valid[:, ::2] = False
@@ -128,9 +123,11 @@ def test_million_one_lane_runs_fit_the_fixed_record_arena_without_a_list() -> No
     assert np.all(result.records[1:]["far_side"] == 0)
 
 
-def test_native_record_builder_is_byte_exact_with_the_scalar_builder() -> None:
-    build_native = _api(native_repair, "build_native_repair_records")
-    build_scalar = _api(repair_records, "build_repair_records")
+def test_native_record_builder_is_byte_exact_with_the_scalar_builder(
+    repair_records, native_repair
+) -> None:
+    build_native = native_repair.build_native_repair_records
+    build_scalar = repair_records.build_repair_records
     valid, near_score, region_id = _winner_rasters(64)
     valid[0, :3] = False
     valid[0, 10:35] = False
@@ -151,8 +148,10 @@ def test_native_record_builder_is_byte_exact_with_the_scalar_builder() -> None:
     assert actual.invalid_lane_count == expected.invalid_lane_count
 
 
-def test_native_record_builder_seeds_each_run_from_its_selected_boundary_colour() -> None:
-    build_native = _api(native_repair, "build_native_repair_records")
+def test_native_record_builder_seeds_each_run_from_its_selected_boundary_colour(
+    native_repair,
+) -> None:
+    build_native = native_repair.build_native_repair_records
     valid, near_score, region_id = _winner_rasters(32)
     valid[0, :16] = False
     winner_bgr = np.zeros((1, 32, 3), dtype=np.float32)
@@ -169,10 +168,10 @@ def test_native_record_builder_seeds_each_run_from_its_selected_boundary_colour(
     assert result.records["far_side"].tolist() == [1]
 
 
-def test_record_coverage_detects_overlap_missing_bits_and_wrong_popcount() -> None:
-    validate = _api(repair_records, "validate_record_coverage")
-    coverage_error = _api(repair_records, "QualityRepairRecordCoverageError")
-    dtype = _api(repair_records, "REPAIR_RECORD_DTYPE")
+def test_record_coverage_detects_overlap_missing_bits_and_wrong_popcount(repair_records) -> None:
+    validate = repair_records.validate_record_coverage
+    coverage_error = repair_records.QualityRepairRecordCoverageError
+    dtype = repair_records.REPAIR_RECORD_DTYPE
     invalid = np.zeros((1, 16), dtype=np.bool_)
     invalid[0, 2:6] = True
     records = np.zeros(2, dtype=dtype)
@@ -191,9 +190,9 @@ def test_record_coverage_detects_overlap_missing_bits_and_wrong_popcount() -> No
         validate(records, invalid)
 
 
-def test_reconstruction_joins_only_consecutive_matching_record_pieces() -> None:
-    reconstruct = _api(repair_records, "reconstruct_repair_runs")
-    dtype = _api(repair_records, "REPAIR_RECORD_DTYPE")
+def test_reconstruction_joins_only_consecutive_matching_record_pieces(repair_records) -> None:
+    reconstruct = repair_records.reconstruct_repair_runs
+    dtype = repair_records.REPAIR_RECORD_DTYPE
     records = np.zeros(4, dtype=dtype)
     records["pixel_index"] = [0, 1, 2, 2]
     records["lane_mask"] = [0xF000, 0xFFFF, 0x0003, 0x0030]
@@ -208,8 +207,8 @@ def test_reconstruction_joins_only_consecutive_matching_record_pieces() -> None:
     assert runs["end_fine"].tolist() == [33, 37]
 
 
-def _analysis(height: int, width: int):
-    analysis_type = _api(local_strip, "QualityVisibilityAnalysis")
+def _analysis(local_strip, height: int, width: int):
+    analysis_type = local_strip.QualityVisibilityAnalysis
     coverage = np.full((height, width), 16, dtype=np.uint8)
     regions = np.ones((height, width), dtype=np.uint32)
     blue = np.tile(np.arange(width, dtype=np.uint8), (height, 1))
@@ -218,8 +217,8 @@ def _analysis(height: int, width: int):
     return analysis_type(coverage, regions, (blue, green, red))
 
 
-def _two_pixel_run_records(*, height: int, width: int, far_side: int) -> np.ndarray:
-    dtype = _api(repair_records, "REPAIR_RECORD_DTYPE")
+def _two_pixel_run_records(repair_records, *, height: int, width: int, far_side: int) -> np.ndarray:
+    dtype = repair_records.REPAIR_RECORD_DTYPE
     records = np.zeros(2, dtype=dtype)
     row = height // 2
     if far_side == 0:
@@ -303,14 +302,17 @@ def _scalar_two_pixel_oracle(
     [(0, [3, 4]), (1, [7, 8])],
 )
 def test_local_strip_preserves_target_and_donor_direction(
+    local_strip,
+    repair_records,
     far_side: int,
     expected_blue: list[int],
 ) -> None:
-    plan = _api(local_strip, "plan_local_strips")
-    budgets_type = _api(local_strip, "QualityRepairBudgets")
+    plan = local_strip.plan_local_strips
+    budgets_type = local_strip.QualityRepairBudgets
     height, width = 34, 12
-    analysis = _analysis(height, width)
+    analysis = _analysis(local_strip, height, width)
     records = _two_pixel_run_records(
+        repair_records,
         height=height,
         width=width,
         far_side=far_side,
@@ -336,10 +338,14 @@ def test_local_strip_preserves_target_and_donor_direction(
 
 
 @pytest.mark.parametrize("far_side", [0, 1])
-def test_local_strip_matches_an_independent_random_scalar_oracle(far_side: int) -> None:
-    plan = _api(local_strip, "plan_local_strips")
-    budgets_type = _api(local_strip, "QualityRepairBudgets")
-    analysis_type = _api(local_strip, "QualityVisibilityAnalysis")
+def test_local_strip_matches_an_independent_random_scalar_oracle(
+    local_strip,
+    repair_records,
+    far_side: int,
+) -> None:
+    plan = local_strip.plan_local_strips
+    budgets_type = local_strip.QualityRepairBudgets
+    analysis_type = local_strip.QualityVisibilityAnalysis
     height, width = 34, 12
     rng = np.random.default_rng(8000 + far_side)
     guide = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
@@ -349,6 +355,7 @@ def test_local_strip_matches_an_independent_random_scalar_oracle(far_side: int) 
         tuple(np.ascontiguousarray(guide[:, :, channel]) for channel in range(3)),
     )
     records = _two_pixel_run_records(
+        repair_records,
         height=height,
         width=width,
         far_side=far_side,
@@ -370,12 +377,14 @@ def test_local_strip_matches_an_independent_random_scalar_oracle(far_side: int) 
     assert result.eligible_slot_count == expected_eligible
 
 
-def test_local_budget_skip_is_whole_run_and_performs_no_sample_reads() -> None:
-    plan = _api(local_strip, "plan_local_strips")
-    budgets_type = _api(local_strip, "QualityRepairBudgets")
+def test_local_budget_skip_is_whole_run_and_performs_no_sample_reads(
+    local_strip, repair_records
+) -> None:
+    plan = local_strip.plan_local_strips
+    budgets_type = local_strip.QualityRepairBudgets
     height, width = 34, 12
-    analysis = _analysis(height, width)
-    records = _two_pixel_run_records(height=height, width=width, far_side=0)
+    analysis = _analysis(local_strip, height, width)
+    records = _two_pixel_run_records(repair_records, height=height, width=width, far_side=0)
     budgets = budgets_type(local_slot_cap=9, local_neighbor_sample_cap=10_000)
 
     result = plan(
@@ -394,13 +403,15 @@ def test_local_budget_skip_is_whole_run_and_performs_no_sample_reads() -> None:
     assert result.physical_sample_read_count == 0
 
 
-def test_local_strip_rejects_every_slot_whose_donor_crosses_a_region_edge() -> None:
-    plan = _api(local_strip, "plan_local_strips")
-    budgets_type = _api(local_strip, "QualityRepairBudgets")
+def test_local_strip_rejects_every_slot_whose_donor_crosses_a_region_edge(
+    local_strip, repair_records
+) -> None:
+    plan = local_strip.plan_local_strips
+    budgets_type = local_strip.QualityRepairBudgets
     height, width = 34, 12
-    analysis = _analysis(height, width)
+    analysis = _analysis(local_strip, height, width)
     analysis.coverage_count[:, 5] = np.uint8(15)
-    records = _two_pixel_run_records(height=height, width=width, far_side=0)
+    records = _two_pixel_run_records(repair_records, height=height, width=width, far_side=0)
 
     result = plan(
         records,
@@ -416,13 +427,15 @@ def test_local_strip_rejects_every_slot_whose_donor_crosses_a_region_edge() -> N
     assert result.evaluated_slot_count == 10
 
 
-def test_shared_budgets_are_not_reset_between_left_and_right_eye_plans() -> None:
-    plan = _api(local_strip, "plan_local_strips")
-    budgets_type = _api(local_strip, "QualityRepairBudgets")
+def test_shared_budgets_are_not_reset_between_left_and_right_eye_plans(
+    local_strip, repair_records
+) -> None:
+    plan = local_strip.plan_local_strips
+    budgets_type = local_strip.QualityRepairBudgets
     height, width = 34, 12
-    analysis = _analysis(height, width)
-    left = _two_pixel_run_records(height=height, width=width, far_side=0)
-    right = _two_pixel_run_records(height=height, width=width, far_side=1)
+    analysis = _analysis(local_strip, height, width)
+    left = _two_pixel_run_records(repair_records, height=height, width=width, far_side=0)
+    right = _two_pixel_run_records(repair_records, height=height, width=width, far_side=1)
     budgets = budgets_type(local_slot_cap=10, local_neighbor_sample_cap=213)
 
     left_result = plan(

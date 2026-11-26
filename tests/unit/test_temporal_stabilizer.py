@@ -97,6 +97,16 @@ class _InvalidOutputPostprocessor(_FakePostprocessor):
 
     def process_shot(self, frame_count, load_window):
         values = load_window(0, frame_count)
+        if self.failure == "incomplete":
+            yield 0, values[0]
+            return
+        if self.failure == "missing_index":
+            yield values[0]
+            return
+        if self.failure == "boolean_index":
+            for index, output in enumerate(values):
+                yield bool(index), output
+            return
         if self.failure == "ordering":
             yield 1, values[0]
             return
@@ -569,6 +579,9 @@ def test_release_failure_does_not_hide_primary_inference_error(
         ("nonfinite", "non-finite"),
         ("shape", "native-shape"),
         ("ordering", "ordered and contiguous"),
+        ("missing_index", "index/value"),
+        ("incomplete", "emitted 1 frames; expected 2"),
+        ("boolean_index", "ordered and contiguous"),
     ],
 )
 def test_invalid_model_output_is_a_hard_failure_and_never_committed(
@@ -790,6 +803,27 @@ def test_failed_calibration_gate_commits_a_bit_exact_whole_shot_fallback(
     )
     assert manifest["calibration"]["mode"] == "base_fallback"
     assert manifest["calibration"]["fallback_reason"] == reason
+
+
+@pytest.mark.parametrize("where", ["reduce_pair_tile", "finalize_pair_moments", "_quality_pass"])
+def test_unusable_arithmetic_copies_the_whole_shot_and_releases_work(tmp_path, monkeypatch, where):
+    def unavailable(*args, **kwargs):
+        raise FloatingPointError("nonfinite fit")
+
+    owner = TemporalDepthStabilizer if where == "_quality_pass" else temporal_stabilizer_module
+    monkeypatch.setattr(owner, where, unavailable)
+    files, _, dirs = _write_base(tmp_path, 2, [])
+    backend = _FakePostprocessor()
+    outputs = _coordinator(tmp_path, backend).generate_files(
+        files, {"temporal_postprocessor": "vdpp"}, dirs
+    )
+    for source, target in zip(files, outputs, strict=True):
+        np.testing.assert_array_equal(cv2.imread(str(source), -1), cv2.imread(str(target), -1))
+    record = json.loads(
+        (dirs["disparity_stabilized"] / "shot_manifests/shot_000000.json").read_text()
+    )
+    assert record["calibration"]["fallback_reason"] == "nonfinite_statistics"
+    assert backend.released and not (dirs["disparity_stabilized"] / ".vdpp-work").exists()
 
 
 def test_flat_frame_inside_ranged_shot_is_model_fed_midpoint_and_copied_exactly(

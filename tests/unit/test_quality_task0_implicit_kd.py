@@ -1,4 +1,4 @@
-"""Task 0 contract tests for the deterministic implicit per-region k-d index."""
+"""Shared contract tests for the deterministic implicit per-region k-d index."""
 
 from __future__ import annotations
 
@@ -8,16 +8,9 @@ from collections.abc import Iterable
 import numpy as np
 import pytest
 
-from scripts.quality_task0 import implicit_kd as kd
-
 
 def test_implicit_kd_prototype_module_is_importable() -> None:
     assert importlib.util.find_spec("scripts.quality_task0.implicit_kd") is not None
-
-
-def _api(name: str):
-    assert hasattr(kd, name), f"missing Task 0 API: {name}"
-    return getattr(kd, name)
 
 
 def _included_members(
@@ -71,8 +64,8 @@ def _geometry_oracle(
     return best[3], best[0]
 
 
-def test_grouping_uses_uint32_reverse_fill_and_row_major_members() -> None:
-    group_region_members = _api("group_region_members")
+def test_grouping_uses_uint32_reverse_fill_and_row_major_members(kd) -> None:
+    group_region_members = kd.group_region_members
     region_ids = np.asarray([[2, 1, 2], [1, 2, 1]], dtype=np.uint32)
 
     members, offsets = group_region_members(region_ids, region_count=2)
@@ -83,8 +76,8 @@ def test_grouping_uses_uint32_reverse_fill_and_row_major_members() -> None:
     assert offsets.tolist() == [0, 3, 6]
 
 
-def test_grouping_retains_empty_region_ranges_for_filtered_donors() -> None:
-    group_region_members = _api("group_region_members")
+def test_grouping_retains_empty_region_ranges_for_filtered_donors(kd) -> None:
+    group_region_members = kd.group_region_members
     region_ids = np.asarray([[1, 1, 2], [2, 3, 3]], dtype=np.uint32)
     include = np.asarray([[True, False, False], [False, True, True]], dtype=np.bool_)
 
@@ -102,18 +95,19 @@ def test_grouping_retains_empty_region_ranges_for_filtered_donors() -> None:
     ],
 )
 def test_geometry_grouping_rejects_noncanonical_region_labels(
+    kd,
     region_ids: np.ndarray,
     region_count: int,
     message: str,
 ) -> None:
-    group_region_members = _api("group_region_members")
+    group_region_members = kd.group_region_members
 
     with pytest.raises(ValueError, match=message):
         group_region_members(region_ids, region_count=region_count)
 
 
-def test_build_uses_lower_median_and_exact_array_byte_accounting() -> None:
-    build_index = _api("build_implicit_region_kd")
+def test_build_uses_lower_median_and_exact_array_byte_accounting(kd) -> None:
+    build_index = kd.build_implicit_region_kd
     region_ids = np.ones((2, 2), dtype=np.uint32)
 
     index = build_index(region_ids, region_count=1)
@@ -145,8 +139,8 @@ def _expected_implicit_layout(samples: list[int], width: int, depth: int = 0) ->
     )
 
 
-def test_build_matches_independent_alternating_axis_lower_median_layout() -> None:
-    build_index = _api("build_implicit_region_kd")
+def test_build_matches_independent_alternating_axis_lower_median_layout(kd) -> None:
+    build_index = kd.build_implicit_region_kd
     region_ids = np.ones((3, 4), dtype=np.uint32)
 
     index = build_index(region_ids, region_count=1)
@@ -154,18 +148,18 @@ def test_build_matches_independent_alternating_axis_lower_median_layout() -> Non
     assert index.member_index.tolist() == _expected_implicit_layout(list(range(12)), width=4)
 
 
-def test_build_checks_its_fixed_stack_capacity(monkeypatch: pytest.MonkeyPatch) -> None:
-    build_index = _api("build_implicit_region_kd")
-    stack_error = _api("QualityKdStackError")
+def test_build_checks_its_fixed_stack_capacity(kd, monkeypatch: pytest.MonkeyPatch) -> None:
+    build_index = kd.build_implicit_region_kd
+    stack_error = kd.QualityKdStackError
     monkeypatch.setattr(kd, "KD_STACK_CAPACITY", 1)
 
     with pytest.raises(stack_error, match="construction stack"):
         build_index(np.ones((2, 2), dtype=np.uint32), region_count=1)
 
 
-def test_repair_query_uses_exact_radius_and_row_column_ties() -> None:
-    build_index = _api("build_implicit_region_kd")
-    visit_budget = _api("VisitBudget")
+def test_repair_query_uses_exact_radius_and_row_column_ties(kd) -> None:
+    build_index = kd.build_implicit_region_kd
+    visit_budget = kd.VisitBudget
     region_ids = np.ones((3, 3), dtype=np.uint32)
     donors = np.asarray(
         [[False, True, False], [True, False, True], [False, True, False]],
@@ -187,9 +181,9 @@ def test_repair_query_uses_exact_radius_and_row_column_ties() -> None:
     assert index.query_repair(1, target_y=0, target_x=0, radius_px=0, budget=budget) is None
 
 
-def test_repair_query_matches_independent_scalar_oracle() -> None:
-    build_index = _api("build_implicit_region_kd")
-    visit_budget = _api("VisitBudget")
+def test_repair_query_matches_independent_scalar_oracle(kd) -> None:
+    build_index = kd.build_implicit_region_kd
+    visit_budget = kd.VisitBudget
     rng = np.random.default_rng(8675309)
     region_ids = np.asarray(
         [[1, 1, 1, 2, 2, 2, 2], [1, 1, 1, 2, 2, 2, 2], [1, 1, 3, 3, 3, 2, 2]],
@@ -226,9 +220,9 @@ def test_repair_query_matches_independent_scalar_oracle() -> None:
                     ) == (expected)
 
 
-def test_filtered_region_without_a_donor_has_no_repair_result() -> None:
-    build_index = _api("build_implicit_region_kd")
-    visit_budget = _api("VisitBudget")
+def test_filtered_region_without_a_donor_has_no_repair_result(kd) -> None:
+    build_index = kd.build_implicit_region_kd
+    visit_budget = kd.VisitBudget
     region_ids = np.asarray([[1, 1, 2, 2]], dtype=np.uint32)
     include = np.asarray([[True, False, False, False]], dtype=np.bool_)
     index = build_index(region_ids, region_count=2, include=include)
@@ -238,10 +232,10 @@ def test_filtered_region_without_a_donor_has_no_repair_result() -> None:
     assert budget.consumed == 0
 
 
-def test_repair_query_fails_before_using_the_node_past_shared_budget() -> None:
-    build_index = _api("build_implicit_region_kd")
-    visit_budget = _api("VisitBudget")
-    budget_error = _api("QualityRepairFallbackQueryBudgetError")
+def test_repair_query_fails_before_using_the_node_past_shared_budget(kd) -> None:
+    build_index = kd.build_implicit_region_kd
+    visit_budget = kd.VisitBudget
+    budget_error = kd.QualityRepairFallbackQueryBudgetError
     index = build_index(np.ones((1, 7), dtype=np.uint32), region_count=1)
     budget = visit_budget(limit=1)
 
@@ -251,9 +245,9 @@ def test_repair_query_fails_before_using_the_node_past_shared_budget() -> None:
     assert budget.consumed == 1
 
 
-def test_geometry_query_uses_unclipped_binary64_coordinates_and_ties() -> None:
-    build_index = _api("build_implicit_region_kd")
-    visit_budget = _api("VisitBudget")
+def test_geometry_query_uses_unclipped_binary64_coordinates_and_ties(kd) -> None:
+    build_index = kd.build_implicit_region_kd
+    visit_budget = kd.VisitBudget
     region_ids = np.ones((2, 2), dtype=np.uint32)
     index = build_index(region_ids, region_count=1)
     budget = visit_budget(limit=100)
@@ -267,9 +261,9 @@ def test_geometry_query_uses_unclipped_binary64_coordinates_and_ties() -> None:
     assert unclipped.distance2 == np.float64(0.3125)
 
 
-def test_geometry_query_matches_independent_scalar_oracle_on_degenerate_regions() -> None:
-    build_index = _api("build_implicit_region_kd")
-    visit_budget = _api("VisitBudget")
+def test_geometry_query_matches_independent_scalar_oracle_on_degenerate_regions(kd) -> None:
+    build_index = kd.build_implicit_region_kd
+    visit_budget = kd.VisitBudget
     region_ids = np.asarray([[1, 1, 1, 2, 2, 2, 2]], dtype=np.uint32)
     index = build_index(region_ids, region_count=2)
     budget = visit_budget(limit=10_000)
@@ -282,9 +276,9 @@ def test_geometry_query_matches_independent_scalar_oracle_on_degenerate_regions(
             assert actual.distance2 == expected[1]
 
 
-def test_geometry_query_matches_independent_scalar_oracle_on_seeded_2d_queries() -> None:
-    build_index = _api("build_implicit_region_kd")
-    visit_budget = _api("VisitBudget")
+def test_geometry_query_matches_independent_scalar_oracle_on_seeded_2d_queries(kd) -> None:
+    build_index = kd.build_implicit_region_kd
+    visit_budget = kd.VisitBudget
     region_ids = np.asarray(
         [
             [1, 1, 1, 2, 2],
@@ -311,10 +305,10 @@ def test_geometry_query_matches_independent_scalar_oracle_on_seeded_2d_queries()
             assert actual.distance2 == expected[1]
 
 
-def test_geometry_query_uses_its_distinct_fatal_budget_error() -> None:
-    build_index = _api("build_implicit_region_kd")
-    visit_budget = _api("VisitBudget")
-    budget_error = _api("QualityGeometryQueryBudgetError")
+def test_geometry_query_uses_its_distinct_fatal_budget_error(kd) -> None:
+    build_index = kd.build_implicit_region_kd
+    visit_budget = kd.VisitBudget
+    budget_error = kd.QualityGeometryQueryBudgetError
     index = build_index(np.ones((1, 7), dtype=np.uint32), region_count=1)
     budget = visit_budget(limit=0)
 

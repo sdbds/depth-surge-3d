@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from src.depth_surge_3d.core.file_identity import file_sample_fingerprint
+from src.depth_surge_3d.core.video_timing import EncodingTimeline
 from src.depth_surge_3d.processing.video.final_audio import (
     OpenFileIdentityV1,
     SelectedAudioIdentityV1,
@@ -135,7 +136,7 @@ def _disabled_audio() -> SelectedAudioIdentityV1:
     )
 
 
-def _streamed_schema5_job(tmp_path: Path, *, frame_count: int = 1):
+def _streamed_schema5_job(tmp_path: Path, *, frame_count: int = 1, target_fps="original"):
     from src.depth_surge_3d.core.settings import validate_settings
     from src.depth_surge_3d.io.operations import save_processing_settings
 
@@ -148,7 +149,7 @@ def _streamed_schema5_job(tmp_path: Path, *, frame_count: int = 1):
             "direct_vr_encode": True,
             "keep_intermediates": True,
             "video_encoder": "libx264",
-            "target_fps": "original",
+            "target_fps": target_fps,
             "vr_resolution": "custom:4x4",
             "per_eye_width": 4,
             "per_eye_height": 4,
@@ -218,7 +219,7 @@ def test_streamed_vr_command_uses_one_png_image2pipe_input(tmp_path) -> None:
             vr_output_height=4,
         ),
         _disabled_audio(),
-        "24000/1001",
+        EncodingTimeline.resolve("24000/1001", None),
         "libx264",
     )
 
@@ -246,7 +247,7 @@ def test_streamed_vr_command_binds_rgb24_format_and_shape_before_input(tmp_path)
         tmp_path / "raw.mp4",
         _direct_settings(vr_output_width=12, vr_output_height=4),
         _disabled_audio(),
-        "24000/1001",
+        EncodingTimeline.resolve("24000/1001", None),
         "libx264",
         input_format="rgb24",
     )
@@ -643,7 +644,7 @@ def test_nvenc_capability_probe_is_bounded_and_cancellable() -> None:
         "src.depth_surge_3d.processing.video.video_encoder.BoundedProcessCaptureV1"
     ) as capture:
         capture.return_value.run.return_value = BoundedProcessResult(
-            b" V..... hevc_nvenc NVIDIA NVENC hevc encoder\n",
+            b"encoded HEVC frame",
             b"",
             0,
         )
@@ -656,7 +657,22 @@ def test_nvenc_capability_probe_is_bounded_and_cancellable() -> None:
         timeout_seconds=10.0,
         cancelled=cancelled,
     )
-    capture.return_value.run.assert_called_once_with(("ffmpeg", "-hide_banner", "-encoders"))
+    (command,) = capture.return_value.run.call_args.args
+    assert command[command.index("-c:v") + 1] == "hevc_nvenc"
+    assert command[command.index("-frames:v") + 1] == "1"
+    assert command[-1] == "pipe:1"
+
+
+def test_auto_encoder_does_not_select_an_unusable_compiled_in_nvenc(monkeypatch):
+    def ffmpeg(_self, command):
+        if "-encoders" in command:
+            return BoundedProcessResult(b" V..... hevc_nvenc NVIDIA NVENC\n", b"", 0)
+        return BoundedProcessResult(b"", b"no CUDA-capable device", 1)
+
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.BoundedProcessCaptureV1.run", ffmpeg
+    )
+    assert VideoEncoder()._resolve_encoder_name("auto") == "libx264"
 
 
 def test_direct_runner_merges_stderr_tracks_frames_and_waits():
@@ -1121,6 +1137,7 @@ def test_extract_frames_writes_content_bound_stage_manifest(tmp_path):
     metadata = json.loads((frames_dir / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["frame_names"] == [path.name for path in frame_files]
     assert metadata["source_video_fingerprint"] == file_sample_fingerprint(source_video)
+    assert (metadata["start_frame"], metadata["end_frame_exclusive"]) == (0, 2)
     assert metadata["source_frame_fingerprint"]
     assert metadata["fingerprint"]
 
@@ -1243,6 +1260,17 @@ def test_create_video_preserves_fractional_source_fps_when_target_is_original(tm
     assert command[frame_rate_index] == "24000/1001"
 
 
+@pytest.mark.parametrize("missing_rate", [-1, "N/A", float("nan")])
+def test_unknown_legacy_source_rate_keeps_fallback(missing_rate, monkeypatch):
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.video_encoder.get_video_info_ffprobe", lambda _: {}
+    )
+    timeline = VideoEncoder._legacy_timeline(
+        "missing-source.mp4", {"source_fps": missing_rate, "target_fps": "original"}
+    )
+    assert timeline.source == timeline.output == 30
+
+
 def test_create_video_trims_preextracted_audio_to_selected_clip(tmp_path):
     """A clipped frame sequence must not be muxed with audio from source time zero."""
     frames_dir = tmp_path / "frames"
@@ -1306,7 +1334,8 @@ def test_audio_input_arguments_preserve_milliseconds_after_one_hour():
     ]
 
 
-def test_extract_frames_reuses_complete_existing_sequence(tmp_path):
+@pytest.mark.parametrize("start,end", [(None, None), ("0:00.001", "0:15")])
+def test_extract_frames_reuses_complete_existing_sequence(tmp_path, start, end):
     """Resuming a stopped job does not decode a complete frame sequence again."""
     frames_dir = tmp_path / "frames"
     frames_dir.mkdir()
@@ -1317,14 +1346,14 @@ def test_extract_frames_reuses_complete_existing_sequence(tmp_path):
         expected.append(path)
     source_video = tmp_path / "source.mp4"
     source_video.write_bytes(b"source-video")
-    write_source_frame_manifest(expected, source_video)
+    write_source_frame_manifest(expected, source_video, (0, 3))
 
     with patch("src.depth_surge_3d.processing.video.video_encoder.subprocess.run") as run:
         result = VideoEncoder().extract_frames(
             str(source_video),
             {"base": tmp_path, "frames": frames_dir},
             {"frame_count": 3, "fps": 30.0},
-            {"start_time": None, "end_time": None},
+            {"start_time": start, "end_time": end},
         )
 
     assert result == expected
@@ -1345,7 +1374,7 @@ def test_extract_frames_tolerates_small_vfr_metadata_count_drift(tmp_path):
     (depth_dir / "frame_000001.png").write_bytes(b"depth")
     source_video = tmp_path / "source.mp4"
     source_video.write_bytes(b"source-video")
-    write_source_frame_manifest(expected, source_video)
+    write_source_frame_manifest(expected, source_video, (0, 100))
 
     with patch("src.depth_surge_3d.processing.video.video_encoder.subprocess.run") as run:
         result = VideoEncoder().extract_frames(
@@ -1493,6 +1522,10 @@ def test_schema5_assembled_encode_publishes_bound_video_and_manifests(tmp_path, 
     )
     monkeypatch.setattr(VideoEncoder, "_run_schema5_ffmpeg_with_progress", fake_bounded_run)
     monkeypatch.setattr(VideoEncoder, "_validate_final_container", lambda *_args: True)
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.final_publication.validate_final_container_v4",
+        lambda path, _: path.read_bytes() == b"validated-mp4",
+    )
     monkeypatch.setattr(
         io,
         "BytesIO",
@@ -2061,14 +2094,60 @@ def test_streamed_post_boundary_overlap_remains_retryable(
     assert work_index.read_bytes() == b"active-work"
 
 
+def _inject_stream_publication_exit(monkeypatch, crash_boundary, hard_exit) -> None:
+    from src.depth_surge_3d.processing.video.final_publication import (
+        FinalEncodingReservationCapabilityV1 as capability_type,
+        FinalPublicationTransactionV4,
+        InjectedFinalPublicationCrash,
+    )
+
+    original_publish = FinalPublicationTransactionV4.publish
+
+    if crash_boundary == "before_producer_commit":
+        monkeypatch.setattr(
+            capability_type,
+            "commit_producer_settings",
+            lambda _self: (_ for _ in ()).throw(hard_exit()),
+        )
+    elif crash_boundary == "before_publication":
+        monkeypatch.setattr(
+            FinalPublicationTransactionV4,
+            "publish",
+            lambda _self: (_ for _ in ()).throw(hard_exit()),
+        )
+    else:
+
+        def crash_inside_publication(self):
+            try:
+                boundary = (
+                    "after-input-manifest"
+                    if crash_boundary == "post-boundary-scratch"
+                    else crash_boundary
+                )
+                original_publish(self, crash_at=boundary)
+            except InjectedFinalPublicationCrash as error:
+                raise hard_exit() from error
+
+        monkeypatch.setattr(
+            FinalPublicationTransactionV4,
+            "publish",
+            crash_inside_publication,
+        )
+
+
 @pytest.mark.parametrize("input_format", ["png", "rgb24"])
 @pytest.mark.parametrize(
-    "crash_boundary",
+    ("crash_boundary", "historical_clock"),
     [
-        "before_producer_commit",
-        "before_publication",
-        "after-video",
-        "after-input-manifest",
+        ("before_producer_commit", False),
+        ("before_publication", False),
+        ("after-video", False),
+        ("after-input-manifest", False),
+        ("after-final-intent-sync", False),
+        ("after-final-manifest", False),
+        ("post-boundary-scratch", False),
+        ("before_publication", True),
+        ("after-video", True),
     ],
 )
 def test_schema5_streamed_sibling_recovers_without_file_backed_reencode(
@@ -2076,14 +2155,17 @@ def test_schema5_streamed_sibling_recovers_without_file_backed_reencode(
     monkeypatch: pytest.MonkeyPatch,
     crash_boundary: str,
     input_format: str,
+    historical_clock: bool,
 ) -> None:
+    from src.depth_surge_3d.io.file_identity import capture_file_identity
     from src.depth_surge_3d.processing.frames.vr_assembler import DirectStereoSource
     from src.depth_surge_3d.processing.video.final_publication import (
         FinalPublicationTransactionV4,
-        InjectedFinalPublicationCrash,
     )
 
-    source, job, settings, settings_file = _streamed_schema5_job(tmp_path)
+    source, job, settings, settings_file = _streamed_schema5_job(
+        tmp_path, target_fps=60 if historical_clock else "original"
+    )
 
     class FakeInputPipe:
         def __init__(self, **_kwargs):
@@ -2118,6 +2200,13 @@ def test_schema5_streamed_sibling_recovers_without_file_backed_reencode(
 
     with monkeypatch.context() as launch_patch:
         _select_streamed_test_format(launch_patch, input_format)
+        if historical_clock:
+            # Pre-upgrade jobs put the selected output rate on the *input* image sequence.
+            launch_patch.setattr(
+                EncodingTimeline,
+                "from_artifact",
+                classmethod(lambda *_: EncodingTimeline.resolve(60, 60)),
+            )
         session = VideoEncoder().open_streamed_vr_session(
             output_dir=job,
             original_video=str(source),
@@ -2135,41 +2224,21 @@ def test_schema5_streamed_sibling_recovers_without_file_backed_reencode(
 
     capability_type = FinalEncodingReservationCapabilityV1
     original_commit = capability_type.commit_producer_settings
-    if crash_boundary == "before_producer_commit":
-        monkeypatch.setattr(
-            capability_type,
-            "commit_producer_settings",
-            lambda _self: (_ for _ in ()).throw(SimulatedHardExit()),
-        )
-    elif crash_boundary == "before_publication":
-        monkeypatch.setattr(
-            FinalPublicationTransactionV4,
-            "publish",
-            lambda _self: (_ for _ in ()).throw(SimulatedHardExit()),
-        )
-    else:
-
-        def crash_inside_publication(self):
-            try:
-                original_publish(self, crash_at=crash_boundary)
-            except InjectedFinalPublicationCrash as error:
-                raise SimulatedHardExit() from error
-
-        monkeypatch.setattr(
-            FinalPublicationTransactionV4,
-            "publish",
-            crash_inside_publication,
-        )
+    _inject_stream_publication_exit(monkeypatch, crash_boundary, SimulatedHardExit)
     with pytest.raises(SimulatedHardExit):
         session._finish_and_publish()
 
     assert session._reservation is not None
     sibling = session._reservation.sibling_path
     final_path = session._reservation.final_video_path
+    if crash_boundary == "post-boundary-scratch":
+        sibling.write_bytes(b"retry scratch, not the committed output")
     if crash_boundary in {"before_producer_commit", "before_publication"}:
-        assert sibling.read_bytes() == b"recoverable-streamed-mp4"
+        durable_video = sibling
     else:
-        assert final_path.read_bytes() == b"recoverable-streamed-mp4"
+        durable_video = final_path
+    assert durable_video.read_bytes() == b"recoverable-streamed-mp4"
+    original_identity = capture_file_identity(durable_video)
     prepared = load_final_encoding_reservation_v1(
         job,
         ProcessingSettingsArtifactV5.parse(settings_file.read_bytes()),
@@ -2179,6 +2248,9 @@ def test_schema5_streamed_sibling_recovers_without_file_backed_reencode(
         "before_publication": "ready_pre_video",
         "after-video": "video_replaced_input_intent",
         "after-input-manifest": "input_manifest_committed_no_final_intent",
+        "after-final-intent-sync": "final_manifest_intent",
+        "after-final-manifest": "publication_authenticated",
+        "post-boundary-scratch": "post_boundary_retry_sibling_present",
     }[crash_boundary]
     assert prepared.observe().phase == expected_phase
     authority = VideoEncoder._encoding_manifest_extent_authority(prepared)
@@ -2220,10 +2292,16 @@ def test_schema5_streamed_sibling_recovers_without_file_backed_reencode(
         total_frames=1,
     )
     final_manifest = json.loads((job / "final_video_manifest.json").read_bytes())
+    assert final_path.read_bytes() == b"recoverable-streamed-mp4"
+    assert capture_file_identity(final_path) == original_identity
     arguments = final_manifest["resolved_encoding_arguments"]
     assert arguments[arguments.index("-f") + 1] == (
         "image2pipe" if input_format == "png" else "rawvideo"
     )
+    if historical_clock:
+        assert arguments[arguments.index("-framerate") + 1] == "60/1"
+        assert arguments[arguments.index("-vf") + 1] == "setsar=1"
+        assert arguments[arguments.index("-frames:v") + 1] == "1"
 
 
 def test_schema5_partial_streamed_reservation_falls_back_to_file_backed_reencode(
@@ -2959,11 +3037,9 @@ def test_schema5_assembled_launch_uses_provider_path_and_one_final_launch_gate(
         sibling_path=sibling,
         expected_relative_path="result.mp4",
         provider=provider,
-        settings=Mock(),
+        timeline=EncodingTimeline.resolve(24, None),
     )
-    selected_audio = Mock(audio_end_sample=None)
-    selected_audio.input_arguments.return_value = []
-    selected_audio.output_arguments.return_value = []
+    selected_audio = _disabled_audio()
     monkeypatch.setattr(
         "src.depth_surge_3d.processing.video.video_encoder." "recover_processing_control_prefix_v1",
         lambda _root: Mock(),
@@ -3636,15 +3712,10 @@ def test_maximum_encoding_manifest_bound_is_a_disk_extent_not_a_resident_cap() -
 
 
 @pytest.mark.parametrize(
-    ("crash_point", "expected_launches"),
-    [
-        ("after-video", 2),
-        ("after-input-manifest", 2),
-        ("after-final-intent-sync", 1),
-    ],
+    "crash_point", ["after-video", "after-input-manifest", "after-final-intent-sync"]
 )
-def test_schema5_post_boundary_restart_reencodes_without_rewriting_input_manifest(
-    tmp_path, monkeypatch, crash_point, expected_launches
+def test_schema5_post_boundary_restart_reuses_video_without_rewriting_input_manifest(
+    tmp_path, monkeypatch, crash_point
 ):
     from src.depth_surge_3d.core.settings import validate_settings
     from src.depth_surge_3d.io.operations import save_processing_settings
@@ -3706,6 +3777,10 @@ def test_schema5_post_boundary_restart_reencodes_without_rewriting_input_manifes
     )
     monkeypatch.setattr(VideoEncoder, "_run_schema5_ffmpeg_with_progress", fake_bounded_run)
     monkeypatch.setattr(VideoEncoder, "_validate_final_container", lambda *_args: True)
+    monkeypatch.setattr(
+        "src.depth_surge_3d.processing.video.final_publication.validate_final_container_v4",
+        lambda path, _: path.read_bytes() == b"validated-1",
+    )
     original_publish = FinalPublicationTransactionV4.publish
 
     def crash_after_input(self):
@@ -3728,7 +3803,7 @@ def test_schema5_post_boundary_restart_reencodes_without_rewriting_input_manifes
 
     artifact = ProcessingSettingsArtifactV5.parse(settings_file.read_bytes())
     assert artifact.status == "in_progress"
-    assert launches == expected_launches
+    assert launches == 1
     if committed_input is not None:
         assert (job / "encoding_input_manifest.json").read_bytes() == committed_input
     assert resumed_encoder.pending_final_encoding_reservation is not None

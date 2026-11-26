@@ -254,7 +254,7 @@ DEFAULT_FALLBACK_FPS = 30  # FPS to use when original FPS cannot be determined
 
 # Server configuration (for Flask web UI)
 DEFAULT_SERVER_PORT = 5000  # Default port for web interface
-DEFAULT_SERVER_HOST = "0.0.0.0"  # Default host binding (all interfaces)
+DEFAULT_SERVER_HOST = "127.0.0.1"  # The unauthenticated desktop UI is local only.
 SIGNAL_SHUTDOWN_TIMEOUT = 5  # seconds - timeout for graceful shutdown
 
 # Image processing constants

@@ -43,8 +43,11 @@ DEPTH_CACHE_SETTING_KEYS = (
 )
 
 
-def _is_valid_canonical_metadata(metadata: dict[str, Any], num_frames: int) -> bool:
-    if metadata.get("schema_version") != CANONICAL_DEPTH_SCHEMA_VERSION:
+def _is_valid_canonical_metadata(metadata: object, num_frames: int) -> bool:
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("schema_version") != CANONICAL_DEPTH_SCHEMA_VERSION
+    ):
         return False
     if metadata.get("algorithm_version") != CANONICAL_DEPTH_ALGORITHM_VERSION:
         return False
@@ -148,12 +151,13 @@ def _load_cacheable_metadata(
             metadata = json.load(handle)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
-    checks = (
-        _is_valid_canonical_metadata(metadata, len(depth_files)),
-        metadata.get("source_model_fingerprint") == expected_model_fingerprint,
-        metadata.get("frame_names") == [path.name for path in depth_files],
-    )
-    return metadata if all(checks) else None
+    if (
+        _is_valid_canonical_metadata(metadata, len(depth_files))
+        and metadata.get("source_model_fingerprint") == expected_model_fingerprint
+        and metadata.get("frame_names") == [path.name for path in depth_files]
+    ):
+        return metadata
+    return None
 
 
 def save_depth_map_files_to_cache(

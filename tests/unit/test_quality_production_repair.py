@@ -718,9 +718,7 @@ def test_safe_donor_index_staging_and_capacity_fallback_are_byte_exact() -> None
 
 def test_native_unplanned_region_projection_validates_and_counts_records() -> None:
     native_kd = importlib.import_module("src.depth_surge_3d.rendering.quality.native_kd")
-    repair_records = importlib.import_module(
-        "src.depth_surge_3d.rendering.quality.repair_records"
-    )
+    repair_records = importlib.import_module("src.depth_surge_3d.rendering.quality.repair_records")
     native = native_kd._require_native()
     records = np.zeros(3, dtype=repair_records.REPAIR_RECORD_DTYPE)
     records["pixel_index"] = (1, 5, 0xFFFFFFFF)

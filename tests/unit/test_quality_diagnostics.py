@@ -590,6 +590,53 @@ def test_legacy_fast_unavailable_preserves_foreign_prefix_entry(tmp_path: Path) 
     assert foreign.read_bytes() == b"keep me"
 
 
+@pytest.mark.parametrize("partial_state", ["matching", "different", "extra-bytes"])
+def test_legacy_summary_restart_recognizes_only_an_exact_writer_prefix(
+    tmp_path: Path, partial_state: str
+) -> None:
+    from src.depth_surge_3d.io.durable_publish import publication_temporary_path
+    from src.depth_surge_3d.io.resume import (
+        load_legacy_fast_adoption_intent_v1,
+        publish_legacy_fast_adoption_intent_v1,
+    )
+    from src.depth_surge_3d.rendering.quality import diagnostic_transaction as transactions
+
+    context, adoption = _legacy_fast_case(transactions, tmp_path)
+    publish_legacy_fast_adoption_intent_v1(adoption)
+    transactions.publish_legacy_fast_unavailable(context, adoption)
+    root = tmp_path / "04_stereo_diagnostics"
+    summary = root / "stereo_coverage_summary.json"
+    metadata = root / "metadata.json"
+    jsonl = root / "stereo_coverage_frames.jsonl"
+    expected_summary = summary.read_bytes()
+    expected_metadata = metadata.read_bytes()
+    partial = expected_summary[: len(expected_summary) // 2]
+    if partial_state == "different":
+        partial = partial[:-1] + b"!"
+    elif partial_state == "extra-bytes":
+        partial = expected_summary + b"!"
+
+    # This is the disk state after writing a summary temporary but before its rename.
+    metadata.unlink()
+    summary.unlink()
+    publish_legacy_fast_adoption_intent_v1(adoption)
+    temporary = publication_temporary_path(summary)
+    temporary.write_bytes(partial)
+    if partial_state == "matching":
+        transactions.publish_legacy_fast_unavailable(context, adoption)
+        assert summary.read_bytes() == expected_summary
+        assert metadata.read_bytes() == expected_metadata
+        assert not temporary.exists()
+        assert load_legacy_fast_adoption_intent_v1(tmp_path) is None
+    else:
+        with pytest.raises(ValueError, match="temporary is foreign"):
+            transactions.publish_legacy_fast_unavailable(context, adoption)
+        assert temporary.read_bytes() == partial
+        assert not summary.exists() and not metadata.exists()
+        assert load_legacy_fast_adoption_intent_v1(tmp_path) == adoption
+    assert jsonl.read_bytes() == b""
+
+
 def test_quality_frame_can_omit_mask_payloads_without_omitting_stats(
     tmp_path: Path,
 ) -> None:

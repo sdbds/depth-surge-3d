@@ -8,11 +8,17 @@ import hashlib
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+from io import FileIO
 from pathlib import Path
 import stat
 import secrets
 import sys
-from typing import BinaryIO, Callable, Iterator, Protocol
+from typing import TYPE_CHECKING, BinaryIO, Callable, Iterator, Protocol
+
+from . import _win32
+
+if TYPE_CHECKING:
+    from .file_identity import PersistedFileIdentityV1
 
 
 class NoFollowPathError(ValueError):
@@ -64,30 +70,13 @@ def posix_quarantine_name_v1(identity: bytes) -> str:
     return _POSIX_QUARANTINE_PREFIX + hashlib.sha256(identity).hexdigest()[:32]
 
 
-def posix_remove_verified_name(
+def _quarantine_for_removal(
     parent: int,
     name: str,
-    opened_descriptor: int,
-    *,
-    directory: bool,
-    quarantine_name: str | None = None,
-    recovering: bool = False,
-    fault: Callable[[str, str], None] | None = None,
-) -> None:
-    """Move a verified object away from its public name before deleting it.
-
-    Linux cannot unlink by object descriptor. This adapter closes races on the
-    authorized public name with renameat2(NO_REPLACE), then operates in the
-    process-private quarantine namespace. Same-principal active monitoring of
-    that internal random name is outside the application's concurrency model.
-    """
-
-    if "/" in name or name in {"", ".", ".."}:
-        raise NoFollowPathError("verified deletion name is not one component")
-    opened = os.fstat(opened_descriptor)
-    expected_type = stat.S_IFMT(opened.st_mode)
-    if directory != stat.S_ISDIR(opened.st_mode):
-        raise NoFollowPathError(f"verified deletion object has the wrong type: {name}")
+    quarantine_name: str | None,
+    recovering: bool,
+    fault: Callable[[str, str], None] | None,
+) -> str:
     if not isinstance(recovering, bool):
         raise TypeError("quarantine recovery state must be boolean")
     if recovering and not name.startswith(_POSIX_QUARANTINE_PREFIX):
@@ -114,6 +103,10 @@ def posix_remove_verified_name(
         if fault is not None:
             fault("after_quarantine_rename", quarantine)
     assert quarantine is not None
+    return quarantine
+
+
+def _quarantined_open_flags(directory: bool) -> int:
     if directory:
         flags = (
             os.O_RDONLY
@@ -126,43 +119,87 @@ def posix_remove_verified_name(
         if not path_only:
             raise NoFollowPathError("POSIX safe deletion requires O_PATH")
         flags = path_only | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    return flags
+
+
+def _verify_quarantine_identity(
+    parent: int,
+    name: str,
+    quarantine: str,
+    quarantined: int,
+    opened: os.stat_result,
+    recovering: bool,
+) -> None:
+    actual = os.fstat(quarantined)
+    if stat.S_IFMT(actual.st_mode) != stat.S_IFMT(opened.st_mode) or (
+        int(actual.st_dev),
+        int(actual.st_ino),
+    ) != (int(opened.st_dev), int(opened.st_ino)):
+        if not recovering:
+            try:
+                _posix_quarantine_noreplace(parent, quarantine, parent, name)
+            except OSError:
+                pass
+        raise NoFollowPathError(f"name changed before quarantine acquisition: {name}")
+
+
+def _remove_quarantined_entry(
+    parent: int,
+    name: str,
+    quarantine: str,
+    quarantined: int,
+    opened: os.stat_result,
+    directory: bool,
+) -> None:
+    if directory:
+        with os.scandir(quarantined) as iterator:
+            if next(iterator, None) is not None:
+                raise NoFollowPathError(f"quarantined directory is no longer empty: {name}")
+    latest = os.stat(quarantine, dir_fd=parent, follow_symlinks=False)
+    if stat.S_IFMT(latest.st_mode) != stat.S_IFMT(opened.st_mode) or (
+        int(latest.st_dev),
+        int(latest.st_ino),
+    ) != (int(opened.st_dev), int(opened.st_ino)):
+        raise NoFollowPathError(f"quarantine identity changed before deletion: {name}")
+    if directory:
+        os.rmdir(quarantine, dir_fd=parent)
+    else:
+        os.unlink(quarantine, dir_fd=parent)
+    os.fsync(parent)
+
+
+def posix_remove_verified_name(
+    parent: int,
+    name: str,
+    opened_descriptor: int,
+    *,
+    directory: bool,
+    quarantine_name: str | None = None,
+    recovering: bool = False,
+    fault: Callable[[str, str], None] | None = None,
+) -> None:
+    """Move a verified object away from its public name before deleting it.
+
+    Linux cannot unlink by object descriptor. This adapter closes races on the
+    authorized public name with renameat2(NO_REPLACE), then operates in the
+    process-private quarantine namespace. Same-principal active monitoring of
+    that internal random name is outside the application's concurrency model.
+    """
+
+    if "/" in name or name in {"", ".", ".."}:
+        raise NoFollowPathError("verified deletion name is not one component")
+    opened = os.fstat(opened_descriptor)
+    if directory != stat.S_ISDIR(opened.st_mode):
+        raise NoFollowPathError(f"verified deletion object has the wrong type: {name}")
+    quarantine = _quarantine_for_removal(parent, name, quarantine_name, recovering, fault)
+    flags = _quarantined_open_flags(directory)
     quarantined = -1
     try:
         quarantined = os.open(quarantine, flags, dir_fd=parent)
-        actual = os.fstat(quarantined)
-        if stat.S_IFMT(actual.st_mode) != expected_type or (
-            int(actual.st_dev),
-            int(actual.st_ino),
-        ) != (int(opened.st_dev), int(opened.st_ino)):
-            if not recovering:
-                try:
-                    _posix_quarantine_noreplace(parent, quarantine, parent, name)
-                except OSError:
-                    pass
-            raise NoFollowPathError(
-                f"name changed before quarantine acquisition: {name}"
-            )
+        _verify_quarantine_identity(parent, name, quarantine, quarantined, opened, recovering)
         if fault is not None:
             fault("after_quarantine_identity", quarantine)
-        if directory:
-            with os.scandir(quarantined) as iterator:
-                if next(iterator, None) is not None:
-                    raise NoFollowPathError(
-                        f"quarantined directory is no longer empty: {name}"
-                    )
-        latest = os.stat(quarantine, dir_fd=parent, follow_symlinks=False)
-        if stat.S_IFMT(latest.st_mode) != expected_type or (
-            int(latest.st_dev),
-            int(latest.st_ino),
-        ) != (int(opened.st_dev), int(opened.st_ino)):
-            raise NoFollowPathError(
-                f"quarantine identity changed before deletion: {name}"
-            )
-        if directory:
-            os.rmdir(quarantine, dir_fd=parent)
-        else:
-            os.unlink(quarantine, dir_fd=parent)
-        os.fsync(parent)
+        _remove_quarantined_entry(parent, name, quarantine, quarantined, opened, directory)
         if not recovering:
             try:
                 os.stat(name, dir_fd=parent, follow_symlinks=False)
@@ -250,7 +287,7 @@ class ChildMutationEvidence:
 class AuthenticatedFixedFileV1:
     """Scalar identity, digest, and length from one exact regular-file handle."""
 
-    identity: object
+    identity: PersistedFileIdentityV1
     raw_sha256: str
     byte_count: int
 
@@ -272,9 +309,7 @@ def _relative_parts(
     try:
         relative = lexical_path.relative_to(lexical_root)
     except ValueError as error:
-        raise NoFollowPathError(
-            f"path is not beneath the acquired root: {path}"
-        ) from error
+        raise NoFollowPathError(f"path is not beneath the acquired root: {path}") from error
     if not relative.parts:
         if allow_root:
             return ()
@@ -284,8 +319,8 @@ def _relative_parts(
     return tuple(relative.parts)
 
 
-def _is_missing_path_error(error: NoFollowPathError) -> bool:
-    if isinstance(error.__cause__, FileNotFoundError):
+def _is_missing_path_error(error: NoFollowPathError | FileNotFoundError) -> bool:
+    if isinstance(error, FileNotFoundError) or isinstance(error.__cause__, FileNotFoundError):
         return True
     return os.name == "nt" and any(
         marker in str(error) for marker in ("Windows error 2", "Windows error 3")
@@ -408,18 +443,17 @@ def regular_allocation_evidence(handle: BinaryIO) -> RegularAllocationEvidence |
         )
 
     from ctypes import wintypes
-    import msvcrt
 
     from .file_identity import windows_identity_from_handle
 
-    windows_handle = int(msvcrt.get_osfhandle(descriptor))
+    windows_handle = int(_win32.get_osfhandle(descriptor))
     identity, links, attributes = windows_identity_from_handle(
         windows_handle,
         require_directory=False,
     )
     if links != 1 or attributes & (0x200 | 0x400 | 0x800 | 0x4000):
         return None
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = _win32.load_library("kernel32", use_last_error=True)
     get_volume = getattr(kernel32, "GetVolumeInformationByHandleW", None)
     if get_volume is None:
         return None
@@ -478,11 +512,11 @@ class _AcquiredRootImpl(Protocol):
 
     def persistent_identity(self) -> object: ...
 
-    def open_regular(self, parts: tuple[str, ...]) -> BinaryIO: ...
+    def open_regular(self, parts: tuple[str, ...]) -> _RegularReadHandle: ...
 
-    def open_regular_update(self, parts: tuple[str, ...]) -> BinaryIO: ...
+    def open_regular_update(self, parts: tuple[str, ...]) -> FileIO: ...
 
-    def open_regular_locked(self, parts: tuple[str, ...]) -> BinaryIO: ...
+    def open_regular_locked(self, parts: tuple[str, ...]) -> FileIO: ...
 
     def create_regular_exclusive(
         self,
@@ -496,13 +530,9 @@ class _AcquiredRootImpl(Protocol):
         missing_ok: bool,
     ) -> object | None: ...
 
-    def iter_directory(
-        self, parts: tuple[str, ...]
-    ) -> Iterator[ContainedDirectoryEntry]: ...
+    def iter_directory(self, parts: tuple[str, ...]) -> Iterator[ContainedDirectoryEntry]: ...
 
-    def attest_tree(
-        self, parts: tuple[str, ...], *, missing_ok: bool
-    ) -> object | None: ...
+    def attest_tree(self, parts: tuple[str, ...], *, missing_ok: bool) -> object | None: ...
 
     def directory_identity(
         self,
@@ -551,10 +581,7 @@ class _PosixAcquiredRoot:
         if not nofollow:
             raise NoFollowPathError("platform has no no-follow regular-file open")
         self._directory_flags = (
-            os.O_RDONLY
-            | nofollow
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
+            os.O_RDONLY | nofollow | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
         )
         try:
             self._root_fd = os.open(root, self._directory_flags)
@@ -580,17 +607,12 @@ class _PosixAcquiredRoot:
 
         return directory_identity_from_posix_fd(self._root_fd)
 
-    def _verify(
-        self, descriptor: int, *, directory: bool, component: object
-    ) -> os.stat_result:
+    def _verify(self, descriptor: int, *, directory: bool, component: object) -> os.stat_result:
         metadata = os.fstat(descriptor)
         expected_type = stat.S_ISDIR if directory else stat.S_ISREG
         if not expected_type(metadata.st_mode):
             raise NoFollowPathError(f"path component has the wrong type: {component}")
-        if (
-            int(metadata.st_dev) != self._device
-            or _linux_mount_identity(descriptor) != self._mount
-        ):
+        if int(metadata.st_dev) != self._device or _linux_mount_identity(descriptor) != self._mount:
             raise NoFollowPathError(f"path crossed a filesystem mount: {component}")
         return metadata
 
@@ -615,7 +637,7 @@ class _PosixAcquiredRoot:
                 ) from error
             raise
 
-    def open_regular(self, parts: tuple[str, ...]) -> BinaryIO:
+    def open_regular(self, parts: tuple[str, ...]) -> _RegularReadHandle:
         parent = self._open_directory(parts[:-1])
         descriptor = -1
         try:
@@ -628,13 +650,11 @@ class _PosixAcquiredRoot:
                 dir_fd=parent,
             )
             self._verify(descriptor, directory=False, component=parts[-1])
-            handle = os.fdopen(descriptor, "rb", buffering=0, closefd=True)
+            handle = _RegularReadHandle(descriptor, "rb", closefd=True)
             descriptor = -1
             return handle
         except OSError as error:
-            raise NoFollowPathError(
-                f"path crossed a link or invalid component: {error}"
-            ) from error
+            raise NoFollowPathError(f"path crossed a link or invalid component: {error}") from error
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -651,11 +671,9 @@ class _PosixAcquiredRoot:
             or int(opened.st_ino) != int(enumerated.st_ino)
             or stat.S_IFMT(opened.st_mode) != stat.S_IFMT(enumerated.st_mode)
         ):
-            raise NoFollowPathError(
-                f"directory child changed before acquisition: {name}"
-            )
+            raise NoFollowPathError(f"directory child changed before acquisition: {name}")
 
-    def open_regular_update(self, parts: tuple[str, ...]) -> BinaryIO:
+    def open_regular_update(self, parts: tuple[str, ...]) -> FileIO:
         parent = self._open_directory(parts[:-1])
         descriptor = -1
         try:
@@ -676,7 +694,7 @@ class _PosixAcquiredRoot:
                 os.close(descriptor)
             os.close(parent)
 
-    def open_regular_locked(self, parts: tuple[str, ...]) -> BinaryIO:
+    def open_regular_locked(self, parts: tuple[str, ...]) -> FileIO:
         return self.open_regular_update(parts)
 
     def create_regular_exclusive(
@@ -743,20 +761,14 @@ class _PosixAcquiredRoot:
                 os.close(descriptor)
             os.close(parent)
 
-    def iter_directory(
-        self, parts: tuple[str, ...]
-    ) -> Iterator[ContainedDirectoryEntry]:
+    def iter_directory(self, parts: tuple[str, ...]) -> Iterator[ContainedDirectoryEntry]:
         directory = self._open_directory(parts)
         try:
             with os.scandir(directory) as iterator:
                 for entry in iterator:
-                    metadata = os.stat(
-                        entry.name, dir_fd=directory, follow_symlinks=False
-                    )
+                    metadata = os.stat(entry.name, dir_fd=directory, follow_symlinks=False)
                     if stat.S_ISLNK(metadata.st_mode):
-                        raise NoFollowPathError(
-                            f"directory contains a link: {entry.name}"
-                        )
+                        raise NoFollowPathError(f"directory contains a link: {entry.name}")
                     is_directory = stat.S_ISDIR(metadata.st_mode)
                     is_regular = stat.S_ISREG(metadata.st_mode)
                     flags = (
@@ -779,8 +791,7 @@ class _PosixAcquiredRoot:
                             opened = os.fstat(child)
                             if int(opened.st_dev) != self._device:
                                 raise NoFollowPathError(
-                                    "directory entry crossed a filesystem: "
-                                    f"{entry.name}"
+                                    "directory entry crossed a filesystem: " f"{entry.name}"
                                 )
                         self._require_enumerated_child_identity(
                             opened,
@@ -797,9 +808,7 @@ class _PosixAcquiredRoot:
         finally:
             os.close(directory)
 
-    def _open_directory_optional(
-        self, parts: tuple[str, ...], *, missing_ok: bool
-    ) -> int:
+    def _open_directory_optional(self, parts: tuple[str, ...], *, missing_ok: bool) -> int:
         try:
             return self._open_directory(parts)
         except NoFollowPathError as error:
@@ -831,9 +840,7 @@ class _PosixAcquiredRoot:
                         os.close(child)
                     continue
                 if not stat.S_ISREG(metadata.st_mode):
-                    raise NoFollowPathError(
-                        f"tree contains a special file: {entry.name}"
-                    )
+                    raise NoFollowPathError(f"tree contains a special file: {entry.name}")
                 child = os.open(
                     entry.name,
                     os.O_RDONLY
@@ -866,9 +873,7 @@ class _PosixAcquiredRoot:
         expected: object | None,
     ) -> None:
         if expected is not None and self._directory_identity(directory) != expected:
-            raise NoFollowPathError(
-                "authorized directory identity changed before mutation"
-            )
+            raise NoFollowPathError("authorized directory identity changed before mutation")
 
     def _remove_verified_name(
         self,
@@ -999,9 +1004,7 @@ class _PosixAcquiredRoot:
         directory = self._open_directory_optional(parts, missing_ok=missing_ok)
         if directory < 0:
             if expected_identity is not None:
-                raise NoFollowPathError(
-                    "authorized directory disappeared before mutation"
-                )
+                raise NoFollowPathError("authorized directory disappeared before mutation")
             return
         try:
             self._require_directory_identity(directory, expected_identity)
@@ -1025,9 +1028,7 @@ class _PosixAcquiredRoot:
                 directory = os.open(parts[-1], self._directory_flags, dir_fd=parent)
             except FileNotFoundError:
                 if expected_identity is not None:
-                    raise NoFollowPathError(
-                        "authorized directory disappeared before mutation"
-                    )
+                    raise NoFollowPathError("authorized directory disappeared before mutation")
                 if missing_ok:
                     return
                 raise
@@ -1099,8 +1100,8 @@ def _windows_root_bindings() -> tuple:
     """Cache native declarations, never acquired roots or query result buffers."""
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    ntdll = ctypes.WinDLL("ntdll")
+    kernel32 = _win32.load_library("kernel32", use_last_error=True)
+    ntdll = _win32.load_library("ntdll")
     close_handle = kernel32.CloseHandle
     close_handle.argtypes = (wintypes.HANDLE,)
     close_handle.restype = wintypes.BOOL
@@ -1227,7 +1228,7 @@ class _WindowsAcquiredRoot:  # noqa: C901
         )
         if handle == self._invalid_handle:
             raise NoFollowPathError(
-                f"could not acquire job root: Windows error {ctypes.get_last_error()}"
+                f"could not acquire job root: Windows error {_win32.last_error()}"
             )
         self._root_handle = int(handle)
         try:
@@ -1284,9 +1285,7 @@ class _WindowsAcquiredRoot:  # noqa: C901
         share_delete: bool = True,
     ) -> int:
         if create and directory:
-            raise NoFollowPathError(
-                "exclusive regular creation cannot create a directory"
-            )
+            raise NoFollowPathError("exclusive regular creation cannot create a directory")
         name_buffer = ctypes.create_unicode_buffer(name)
         encoded_length = len(name.encode("utf-16-le"))
         unicode_name = self._unicode_string(
@@ -1334,9 +1333,7 @@ class _WindowsAcquiredRoot:  # noqa: C901
             if missing_ok and code in {2, 3}:
                 return -1
             if create and code in {80, 183}:
-                raise FileExistsError(
-                    code, "exclusive regular-file target exists", name
-                )
+                raise FileExistsError(code, "exclusive regular-file target exists", name)
             raise NoFollowPathError(
                 f"path crossed a link or invalid component: Windows error {code}"
             )
@@ -1382,28 +1379,26 @@ class _WindowsAcquiredRoot:  # noqa: C901
             raise AssertionError("strict directory open returned a missing sentinel")
         return directory, close_directory
 
-    def open_regular(self, parts: tuple[str, ...]) -> BinaryIO:
-        import msvcrt
+    def open_regular(self, parts: tuple[str, ...]) -> _RegularReadHandle:
 
         parent, close_parent = self._open_directory(parts[:-1])
         final = -1
         try:
             final = self._open_relative(parent, parts[-1], directory=False)
             self._verify(final, directory=False, component=parts[-1])
-            descriptor = msvcrt.open_osfhandle(
+            descriptor = _win32.open_osfhandle(
                 final,
                 os.O_RDONLY | getattr(os, "O_BINARY", 0),
             )
             final = -1
-            return os.fdopen(descriptor, "rb", buffering=0, closefd=True)
+            return _RegularReadHandle(descriptor, "rb", closefd=True)
         finally:
             if final >= 0:
                 self._close_handle(self._wintypes.HANDLE(final))
             if close_parent:
                 self._close_handle(self._wintypes.HANDLE(parent))
 
-    def open_regular_update(self, parts: tuple[str, ...]) -> BinaryIO:
-        import msvcrt
+    def open_regular_update(self, parts: tuple[str, ...]) -> FileIO:
 
         parent, close_parent = self._open_directory(parts[:-1])
         final = -1
@@ -1415,7 +1410,7 @@ class _WindowsAcquiredRoot:  # noqa: C901
                 write=True,
             )
             self._verify(final, directory=False, component=parts[-1])
-            descriptor = msvcrt.open_osfhandle(
+            descriptor = _win32.open_osfhandle(
                 final,
                 os.O_RDWR | getattr(os, "O_BINARY", 0),
             )
@@ -1427,8 +1422,7 @@ class _WindowsAcquiredRoot:  # noqa: C901
             if close_parent:
                 self._close_handle(self._wintypes.HANDLE(parent))
 
-    def open_regular_locked(self, parts: tuple[str, ...]) -> BinaryIO:
-        import msvcrt
+    def open_regular_locked(self, parts: tuple[str, ...]) -> FileIO:
 
         parent, close_parent = self._open_directory(parts[:-1])
         final = -1
@@ -1441,7 +1435,7 @@ class _WindowsAcquiredRoot:  # noqa: C901
                 share_delete=False,
             )
             self._verify(final, directory=False, component=parts[-1])
-            descriptor = msvcrt.open_osfhandle(
+            descriptor = _win32.open_osfhandle(
                 final,
                 os.O_RDWR | getattr(os, "O_BINARY", 0),
             )
@@ -1457,7 +1451,6 @@ class _WindowsAcquiredRoot:  # noqa: C901
         self,
         parts: tuple[str, ...],
     ) -> tuple[BinaryIO, object]:
-        import msvcrt
 
         parent, close_parent = self._open_directory(parts[:-1])
         final = -1
@@ -1475,7 +1468,7 @@ class _WindowsAcquiredRoot:  # noqa: C901
                 directory=False,
                 component=parts[-1],
             )
-            descriptor = msvcrt.open_osfhandle(
+            descriptor = _win32.open_osfhandle(
                 final,
                 os.O_RDWR | getattr(os, "O_BINARY", 0),
             )
@@ -1526,12 +1519,10 @@ class _WindowsAcquiredRoot:  # noqa: C901
                 buffer,
                 len(buffer),
             ):
-                code = ctypes.get_last_error()
+                code = _win32.last_error()
                 if code == 18:
                     return
-                raise NoFollowPathError(
-                    f"directory enumeration failed: Windows error {code}"
-                )
+                raise NoFollowPathError(f"directory enumeration failed: Windows error {code}")
             restart = False
             yield from windows_file_id_extd_entries_v1(buffer, len(buffer))
 
@@ -1556,17 +1547,13 @@ class _WindowsAcquiredRoot:  # noqa: C901
                 component=entry.name,
             )
             if identity.file_id != entry.file_id:
-                raise NoFollowPathError(
-                    f"directory child changed before acquisition: {entry.name}"
-                )
+                raise NoFollowPathError(f"directory child changed before acquisition: {entry.name}")
             return child
         except BaseException:
             self._close_handle(self._wintypes.HANDLE(child))
             raise
 
-    def iter_directory(
-        self, parts: tuple[str, ...]
-    ) -> Iterator[ContainedDirectoryEntry]:
+    def iter_directory(self, parts: tuple[str, ...]) -> Iterator[ContainedDirectoryEntry]:
         directory, close_directory = self._open_directory(parts)
         try:
             for entry in self._iter_names(directory):
@@ -1606,9 +1593,7 @@ class _WindowsAcquiredRoot:  # noqa: C901
         expected: object | None,
     ) -> None:
         if expected is not None and self._directory_identity(directory) != expected:
-            raise NoFollowPathError(
-                "authorized directory identity changed before mutation"
-            )
+            raise NoFollowPathError("authorized directory identity changed before mutation")
 
     def directory_identity(
         self,
@@ -1687,9 +1672,7 @@ class _WindowsAcquiredRoot:  # noqa: C901
 
     def _name_present(self, directory: int, expected: str) -> bool:
         folded = expected.casefold()
-        return any(
-            entry.name.casefold() == folded for entry in self._iter_names(directory)
-        )
+        return any(entry.name.casefold() == folded for entry in self._iter_names(directory))
 
     def _delete_on_close(self, handle: int) -> None:
         delete = self._wintypes.BOOL(True)
@@ -1699,10 +1682,8 @@ class _WindowsAcquiredRoot:  # noqa: C901
             ctypes.byref(delete),
             ctypes.sizeof(delete),
         ):
-            code = ctypes.get_last_error()
-            raise NoFollowPathError(
-                f"safe handle deletion failed: Windows error {code}"
-            )
+            code = _win32.last_error()
+            raise NoFollowPathError(f"safe handle deletion failed: Windows error {code}")
 
     def _delete_directory_contents(self, directory: int) -> None:
         while True:
@@ -1750,9 +1731,7 @@ class _WindowsAcquiredRoot:  # noqa: C901
                 self._close_handle(self._wintypes.HANDLE(parent))
         if directory < 0:
             if expected_identity is not None:
-                raise NoFollowPathError(
-                    "authorized directory disappeared before mutation"
-                )
+                raise NoFollowPathError("authorized directory disappeared before mutation")
             return
         try:
             self._require_directory_identity(directory, expected_identity)
@@ -1781,9 +1760,7 @@ class _WindowsAcquiredRoot:  # noqa: C901
             )
             if directory < 0:
                 if expected_identity is not None:
-                    raise NoFollowPathError(
-                        "authorized directory disappeared before mutation"
-                    )
+                    raise NoFollowPathError("authorized directory disappeared before mutation")
                 return
             self._require_directory_identity(directory, expected_identity)
             self._delete_directory_contents(directory)
@@ -1791,9 +1768,7 @@ class _WindowsAcquiredRoot:  # noqa: C901
             self._close_handle(self._wintypes.HANDLE(directory))
             directory = -1
             if self._name_present(parent, parts[-1]):
-                raise NoFollowPathError(
-                    "deleted tree remains visible through its acquired parent"
-                )
+                raise NoFollowPathError("deleted tree remains visible through its acquired parent")
         finally:
             if directory >= 0:
                 self._close_handle(self._wintypes.HANDLE(directory))
@@ -1832,9 +1807,7 @@ class _WindowsAcquiredRoot:  # noqa: C901
             self._close_handle(self._wintypes.HANDLE(descriptor))
             descriptor = -1
             if self._name_present(parent, parts[-1]):
-                raise NoFollowPathError(
-                    "deleted file remains visible through its acquired parent"
-                )
+                raise NoFollowPathError("deleted file remains visible through its acquired parent")
         finally:
             if descriptor >= 0:
                 self._close_handle(self._wintypes.HANDLE(descriptor))
@@ -1848,9 +1821,7 @@ class AcquiredRoot:
     def __init__(self, job_root: Path) -> None:
         self.root = Path(os.path.abspath(os.fspath(job_root)))
         self._impl: _AcquiredRootImpl = (
-            _WindowsAcquiredRoot(self.root)
-            if os.name == "nt"
-            else _PosixAcquiredRoot(self.root)
+            _WindowsAcquiredRoot(self.root) if os.name == "nt" else _PosixAcquiredRoot(self.root)
         )
 
     def __enter__(self) -> AcquiredRoot:
@@ -1870,15 +1841,15 @@ class AcquiredRoot:
         parts = _relative_parts(self.root, Path(path), allow_root=False)
         return self._impl.attest_tree(parts, missing_ok=True) is None
 
-    def open_regular(self, path: Path) -> BinaryIO:
+    def open_regular(self, path: Path) -> _RegularReadHandle:
         parts = _relative_parts(self.root, Path(path))
         return self._impl.open_regular(parts)
 
-    def open_regular_update(self, path: Path) -> BinaryIO:
+    def open_regular_update(self, path: Path) -> FileIO:
         parts = _relative_parts(self.root, Path(path))
         return self._impl.open_regular_update(parts)
 
-    def open_regular_locked(self, path: Path) -> BinaryIO:
+    def open_regular_locked(self, path: Path) -> FileIO:
         parts = _relative_parts(self.root, Path(path))
         return self._impl.open_regular_locked(parts)
 
@@ -1900,7 +1871,7 @@ class AcquiredRoot:
         path: Path,
         *,
         missing_ok: bool = False,
-    ) -> object | None:
+    ) -> PersistedFileIdentityV1 | None:
         try:
             handle = self.open_regular(path)
         except (NoFollowPathError, FileNotFoundError) as error:
@@ -1945,7 +1916,7 @@ class AcquiredRoot:
             expected_identity=expected_identity,
         )
 
-    def open_regular_optional(self, path: Path) -> BinaryIO | None:
+    def open_regular_optional(self, path: Path) -> _RegularReadHandle | None:
         try:
             return self.open_regular(path)
         except NoFollowPathError as error:
@@ -1956,6 +1927,32 @@ class AcquiredRoot:
     def iter_directory(self, path: Path) -> Iterator[ContainedDirectoryEntry]:
         parts = _relative_parts(self.root, Path(path), allow_root=True)
         yield from self._impl.iter_directory(parts)
+
+
+def _digest_fixed_file(handle: FileIO, byte_count: int, check_cancelled: Callable[[], None]) -> str:
+    digest = hashlib.sha256()
+    buffer = bytearray(FIXED_FILE_HASH_STREAM_BYTES)
+    view = memoryview(buffer)
+    handle.seek(0)
+    remaining = byte_count
+    try:
+        while remaining:
+            check_cancelled()
+            requested = min(len(buffer), remaining)
+            measured = handle.readinto(view[:requested])
+            if type(measured) is not int or measured <= 0 or measured > requested:
+                raise NoFollowPathError("fixed file ended before its authenticated length")
+            digest.update(view[:measured])
+            remaining -= measured
+        check_cancelled()
+        extra = handle.readinto(view[:1])
+        if extra != 0:
+            raise NoFollowPathError("fixed file exceeds its authenticated length")
+    finally:
+        view.release()
+        del view, buffer
+    check_cancelled()
+    return digest.hexdigest()
 
 
 def scan_fixed_regular_v1(
@@ -1992,36 +1989,7 @@ def scan_fixed_regular_v1(
                 raise NoFollowPathError("fixed file byte count exceeds u64")
             if expected_byte_count is not None and byte_count != expected_byte_count:
                 raise NoFollowPathError("fixed file byte count differs")
-            digest = hashlib.sha256()
-            buffer = bytearray(FIXED_FILE_HASH_STREAM_BYTES)
-            view = memoryview(buffer)
-            handle.seek(0)
-            remaining = byte_count
-            try:
-                while remaining:
-                    check_cancelled()
-                    requested = min(len(buffer), remaining)
-                    measured = handle.readinto(view[:requested])
-                    if (
-                        type(measured) is not int
-                        or measured <= 0
-                        or measured > requested
-                    ):
-                        raise NoFollowPathError(
-                            "fixed file ended before its authenticated length"
-                        )
-                    digest.update(view[:measured])
-                    remaining -= measured
-                check_cancelled()
-                extra = handle.readinto(view[:1])
-                if extra != 0:
-                    raise NoFollowPathError(
-                        "fixed file exceeds its authenticated length"
-                    )
-            finally:
-                view.release()
-                del view, buffer
-            check_cancelled()
+            raw_sha256 = _digest_fixed_file(handle, byte_count, check_cancelled)
             after = os.fstat(handle.fileno())
             if (
                 int(after.st_size) != byte_count
@@ -2030,17 +1998,12 @@ def scan_fixed_regular_v1(
                 or file_identity_from_open_handle(handle) != frozen_identity
                 or acquired.persistent_regular_identity(candidate) != frozen_identity
             ):
-                raise NoFollowPathError(
-                    "fixed file changed during authenticated scan"
-                )
+                raise NoFollowPathError("fixed file changed during authenticated scan")
         if (
             acquired.directory_identity(candidate.parent) != parent_identity
             or acquired.persistent_identity != root_identity
         ):
-            raise NoFollowPathError(
-                "fixed file namespace changed during authenticated scan"
-            )
-        raw_sha256 = digest.hexdigest()
+            raise NoFollowPathError("fixed file namespace changed during authenticated scan")
         if expected_raw_sha256 is not None and raw_sha256 != expected_raw_sha256:
             raise NoFollowPathError("fixed file digest differs")
         return AuthenticatedFixedFileV1(
@@ -2094,17 +2057,13 @@ class SafeTreeMutation:
         try:
             return self._roots[lexical]
         except KeyError as error:
-            raise NoFollowPathError(
-                f"tree mutation root was not preflighted: {root}"
-            ) from error
+            raise NoFollowPathError(f"tree mutation root was not preflighted: {root}") from error
 
     def _still_absent(self, parts: tuple[str, ...], identity: object | None) -> bool:
         if identity is not None:
             return False
         if self._acquired._impl.attest_tree(parts, missing_ok=True) is not None:
-            raise NoFollowPathError(
-                "absent authorized directory appeared before mutation"
-            )
+            raise NoFollowPathError("absent authorized directory appeared before mutation")
         return True
 
     def clear_root(self, root: Path) -> None:
@@ -2135,9 +2094,7 @@ class SafeTreeMutation:
         try:
             relative = lexical_child.relative_to(lexical_root)
         except ValueError as error:
-            raise NoFollowPathError(
-                "regular-file deletion escaped its authorized root"
-            ) from error
+            raise NoFollowPathError("regular-file deletion escaped its authorized root") from error
         if not relative.parts:
             raise NoFollowPathError("regular-file deletion requires a child")
         child_parts = (*root_parts, *relative.parts)
@@ -2215,14 +2172,10 @@ class SafeTreeMutation:
         lexical_child = Path(os.path.abspath(os.fspath(child)))
         lexical_root = Path(os.path.abspath(os.fspath(root)))
         if lexical_child.parent != lexical_root:
-            raise NoFollowPathError(
-                "regular-file deletion is not a direct authorized child"
-            )
+            raise NoFollowPathError("regular-file deletion is not a direct authorized child")
         self._require_child_evidence(lexical_child, evidence, kind="regular")
         if evidence.parent_identity != identity:
-            raise NoFollowPathError(
-                "regular-file deletion parent changed after preflight"
-            )
+            raise NoFollowPathError("regular-file deletion parent changed after preflight")
         if evidence.identity is None:
             if (
                 self._acquired._impl.regular_identity(
@@ -2239,6 +2192,18 @@ class SafeTreeMutation:
             expected_parent_identity=identity,
             expected_identity=evidence.identity,
         )
+
+    @staticmethod
+    def _regular_descendant_path(root: Path, child: Path) -> tuple[Path, Path]:
+        lexical_child = Path(os.path.abspath(os.fspath(child)))
+        lexical_root = Path(os.path.abspath(os.fspath(root)))
+        try:
+            relative = lexical_child.relative_to(lexical_root)
+        except ValueError as error:
+            raise NoFollowPathError("regular-file deletion escaped its authorized root") from error
+        if len(relative.parts) < 2:
+            raise NoFollowPathError("descendant deletion requires a nested child")
+        return lexical_child, relative
 
     def unlink_descendant(
         self,
@@ -2258,19 +2223,8 @@ class SafeTreeMutation:
             missing_ok=False,
         )
         if actual_root_identity != expected_root_identity:
-            raise NoFollowPathError(
-                "authorized directory identity changed before mutation"
-            )
-        lexical_child = Path(os.path.abspath(os.fspath(child)))
-        lexical_root = Path(os.path.abspath(os.fspath(root)))
-        try:
-            relative = lexical_child.relative_to(lexical_root)
-        except ValueError as error:
-            raise NoFollowPathError(
-                "regular-file deletion escaped its authorized root"
-            ) from error
-        if len(relative.parts) < 2:
-            raise NoFollowPathError("descendant deletion requires a nested child")
+            raise NoFollowPathError("authorized directory identity changed before mutation")
+        lexical_child, relative = self._regular_descendant_path(root, child)
         self._require_child_evidence(lexical_child, evidence, kind="regular")
         child_parts = (*root_parts, *relative.parts)
         parent_identity = self._acquired._impl.directory_identity(
@@ -2291,9 +2245,7 @@ class SafeTreeMutation:
                 )
                 is not None
             ):
-                raise NoFollowPathError(
-                    "absent regular descendant appeared before mutation"
-                )
+                raise NoFollowPathError("absent regular descendant appeared before mutation")
             return
         self._acquired._impl.unlink_regular(
             child_parts,
@@ -2339,28 +2291,21 @@ class SafeTreeMutation:
         )
 
 
-class _OwnedBinaryHandle:
-    def __init__(self, handle: BinaryIO, acquired: AcquiredRoot) -> None:
-        self._handle = handle
-        self._acquired = acquired
+class _RegularReadHandle(FileIO):
+    """A raw read handle that can keep its acquired directory alive until close."""
 
-    def __getattr__(self, name: str):
-        return getattr(self._handle, name)
-
-    def __enter__(self) -> _OwnedBinaryHandle:
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        self.close()
+    root_owner: AcquiredRoot | None = None
 
     def close(self) -> None:
         try:
-            self._handle.close()
+            super().close()
         finally:
-            self._acquired.close()
+            owner, self.root_owner = self.root_owner, None
+            if owner is not None:
+                owner.close()
 
 
-def open_regular_beneath(job_root: Path, path: Path) -> BinaryIO:
+def open_regular_beneath(job_root: Path, path: Path) -> FileIO:
     """Open one regular file without following any relative path component."""
 
     acquired = AcquiredRoot(job_root)
@@ -2369,4 +2314,5 @@ def open_regular_beneath(job_root: Path, path: Path) -> BinaryIO:
     except BaseException:
         acquired.close()
         raise
-    return _OwnedBinaryHandle(handle, acquired)  # type: ignore[return-value]
+    handle.root_owner = acquired
+    return handle

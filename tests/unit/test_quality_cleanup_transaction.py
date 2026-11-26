@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import gc
 import hashlib
 import inspect
 import json
 import os
 from pathlib import Path
+import stat
 import weakref
 
 import pytest
@@ -61,9 +63,7 @@ def _complete_job(root: Path) -> None:
     }
     metadata["fingerprint"] = self_fingerprint(metadata)
     (diagnostics / "metadata.json").write_bytes(canonical_json_bytes(metadata))
-    (root / "final_video_manifest.json").write_bytes(
-        canonical_json_bytes({"schema_version": 4})
-    )
+    (root / "final_video_manifest.json").write_bytes(canonical_json_bytes({"schema_version": 4}))
     for relative in (
         "00_original_frames",
         "04_left_frames",
@@ -85,9 +85,7 @@ def test_payload_pruned_authorizes_only_persisted_identity_bound_roots(
     metadata = commit_payload_pruned(tmp_path)
 
     persisted = json.loads(
-        (tmp_path / "04_stereo_diagnostics" / "metadata.json").read_text(
-            encoding="ascii"
-        )
+        (tmp_path / "04_stereo_diagnostics" / "metadata.json").read_text(encoding="ascii")
     )
     assert metadata.status == "payload_pruned"
     assert persisted["fingerprint"] == metadata.fingerprint
@@ -106,12 +104,8 @@ def test_payload_pruned_authorizes_only_persisted_identity_bound_roots(
     assert removed == 8
     assert retained.read_text(encoding="ascii") == "keep"
     assert (tmp_path / "04_stereo_diagnostics" / "metadata.json").is_file()
-    assert (
-        tmp_path / "04_stereo_diagnostics" / "stereo_coverage_frames.jsonl"
-    ).is_file()
-    assert (
-        tmp_path / "04_stereo_diagnostics" / "stereo_coverage_summary.json"
-    ).is_file()
+    assert (tmp_path / "04_stereo_diagnostics" / "stereo_coverage_frames.jsonl").is_file()
+    assert (tmp_path / "04_stereo_diagnostics" / "stereo_coverage_summary.json").is_file()
     assert (tmp_path / "final_video_manifest.json").is_file()
     assert run_authorized_cleanup(tmp_path) == 0
 
@@ -135,6 +129,160 @@ def test_payload_pruned_rejects_oversized_final_manifest_before_bulk_read(
 
     with pytest.raises(CleanupTransactionError, match="exceeds its bound or is unsafe"):
         commit_payload_pruned(tmp_path)
+
+
+def test_historical_audit_requires_retained_evidence_not_pruned_payloads(tmp_path: Path):
+    _complete_job(tmp_path)
+    audit = cleanup_transaction.audit_payload_pruned_historical_diagnostics_v1
+    assert not audit(tmp_path)
+    authorization = commit_payload_pruned(tmp_path)
+    assert audit(tmp_path)
+    assert run_authorized_cleanup(tmp_path, metadata=authorization) > 0
+    assert audit(tmp_path)
+
+    manifest = tmp_path / "final_video_manifest.json"
+    original = manifest.read_bytes()
+    manifest.write_bytes(b"other export metadata")
+    assert not audit(tmp_path)
+    with pytest.raises(CleanupTransactionError, match="retained cleanup evidence hash differs"):
+        commit_payload_pruned(tmp_path)
+    assert manifest.read_bytes() == b"other export metadata"
+    manifest.write_bytes(original)
+    assert audit(tmp_path)
+    assert run_authorized_cleanup(tmp_path) == 0
+
+
+def test_cleanup_does_not_treat_another_jobs_cache_as_authority(tmp_path: Path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    for job in (first, second):
+        _complete_job(job)
+    first_cache = commit_payload_pruned(first)
+    second_cache = commit_payload_pruned(second)
+    assert first_cache.fingerprint != second_cache.fingerprint
+
+    with pytest.raises(CleanupTransactionError, match="cache differs from durable authorization"):
+        run_authorized_cleanup(second, metadata=first_cache)
+    for job in (first, second):
+        assert (job / "00_original_frames" / "payload.bin").read_bytes() == b"00_original_frames"
+    assert run_authorized_cleanup(second, metadata=second_cache) > 0
+    assert not (second / "00_original_frames").exists()
+    assert (first / "00_original_frames" / "payload.bin").is_file()
+
+
+@pytest.mark.parametrize(
+    ("evidence", "message"),
+    [
+        ("summary", "summary hash differs"),
+        ("jsonl", "JSONL hash differs"),
+        ("final-missing", "manifest exceeds its bound or is unsafe"),
+        ("metadata", "metadata is invalid"),
+    ],
+)
+def test_pruning_waits_for_intact_durable_evidence_before_creating_any_marker(
+    tmp_path, evidence, message
+):
+    _complete_job(tmp_path)
+    diagnostics = tmp_path / "04_stereo_diagnostics"
+    selected = {
+        "summary": diagnostics / "stereo_coverage_summary.json",
+        "jsonl": diagnostics / "stereo_coverage_frames.jsonl",
+        "final-missing": tmp_path / "final_video_manifest.json",
+        "metadata": diagnostics / "metadata.json",
+    }[evidence]
+    saved = selected.read_bytes()
+    if evidence == "final-missing":
+        selected.unlink()
+    else:
+        selected.write_bytes(b"interrupted output")
+    with pytest.raises(CleanupTransactionError, match=message):
+        commit_payload_pruned(tmp_path)
+    assert not list(tmp_path.rglob(".depth-surge-prune-*.marker"))
+    assert (tmp_path / "00_original_frames" / "payload.bin").read_bytes() == b"00_original_frames"
+    selected.write_bytes(saved)
+    assert commit_payload_pruned(tmp_path).status == "payload_pruned"
+
+
+def test_marker_fsync_failure_does_not_leave_deletion_authority(tmp_path, monkeypatch):
+    _complete_job(tmp_path)
+    metadata = tmp_path / "04_stereo_diagnostics" / "metadata.json"
+    original = metadata.read_bytes()
+    fsync = os.fsync
+
+    def fail_regular_sync(descriptor):
+        if stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("storage unavailable while syncing marker")
+        return fsync(descriptor)
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(os, "fsync", fail_regular_sync)
+        with pytest.raises(OSError, match="syncing marker"):
+            commit_payload_pruned(tmp_path)
+    assert metadata.read_bytes() == original
+    assert not list(tmp_path.rglob(".depth-surge-prune-*.marker"))
+    assert (tmp_path / "00_original_frames" / "payload.bin").read_bytes() == b"00_original_frames"
+    assert commit_payload_pruned(tmp_path).status == "payload_pruned"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX removal and directory sync")
+@pytest.mark.parametrize("stage", ["unsupported-rename", "sync-after-rename"])
+def test_retry_after_storage_refuses_cleanup_does_not_touch_unlisted_files(
+    tmp_path, monkeypatch, stage
+):
+    from src.depth_surge_3d.io import nofollow_io
+
+    _complete_job(tmp_path)
+    projection = commit_payload_pruned(tmp_path)
+    user_file = tmp_path / "my-receipt.txt"
+    user_file.write_bytes(b"must remain")
+    with monkeypatch.context() as fault:
+        if stage == "unsupported-rename":
+
+            def unsupported(*args):
+                raise OSError(errno.EOPNOTSUPP, "volume does not support this operation")
+
+            fault.setattr(nofollow_io, "_posix_quarantine_noreplace", unsupported)
+            expected_error = cleanup_transaction.CleanupCapabilityError
+        else:
+            real_fsync = os.fsync
+
+            def not_durable(fd):
+                if stat.S_ISDIR(os.fstat(fd).st_mode):
+                    raise OSError(errno.EIO, "device temporarily unavailable")
+                return real_fsync(fd)
+
+            fault.setattr(os, "fsync", not_durable)
+            expected_error = CleanupTransactionError
+        with pytest.raises(expected_error) as error:
+            run_authorized_cleanup(tmp_path, metadata=projection)
+    assert cleanup_transaction.cleanup_status_for_error(error.value) == "incomplete_error"
+    assert user_file.read_bytes() == b"must remain"
+    assert run_authorized_cleanup(tmp_path) > 0
+    assert user_file.read_bytes() == b"must remain"
+    assert run_authorized_cleanup(tmp_path) == 0
+
+
+@pytest.mark.parametrize("marker_state", ["missing", "truncated", "oversized"])
+def test_cleanup_preserves_nonempty_stage_until_its_own_marker_is_recovered(tmp_path, marker_state):
+    _complete_job(tmp_path)
+    auth = commit_payload_pruned(tmp_path)
+    first = auth.static_fields["prune_entries"][0]
+    stage = tmp_path / first["relative_path"]
+    marker = stage / first["marker"]["name"]
+    prior = marker.read_bytes()
+    if marker_state == "missing":
+        marker.unlink()
+    else:
+        marker.write_bytes(prior[:4] if marker_state == "truncated" else prior.ljust(65537, b" "))
+    with pytest.raises(CleanupIdentityMismatchError) as failure:
+        run_authorized_cleanup(tmp_path)
+    assert (
+        cleanup_transaction.cleanup_status_for_error(failure.value)
+        == "incomplete_identity_mismatch"
+    )
+    assert (stage / "payload.bin").read_bytes() == b"00_original_frames"
+    marker.write_bytes(prior)
+    assert run_authorized_cleanup(tmp_path) > 0
+    assert not stage.exists()
 
 
 def test_payload_pruned_streams_all_variable_diagnostics_artifacts(
@@ -176,9 +324,7 @@ def test_payload_pruned_preserves_an_unowned_metadata_temporary(tmp_path: Path) 
     assert temporary.read_bytes() == b"unowned"
 
 
-def test_payload_pruned_consumes_the_active_final_reservation(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_payload_pruned_consumes_the_active_final_reservation(tmp_path: Path, monkeypatch) -> None:
     _complete_job(tmp_path)
     original_raw = (tmp_path / "04_stereo_diagnostics" / "metadata.json").read_bytes()
     original = json.loads(original_raw)
@@ -227,9 +373,7 @@ def test_payload_pruned_consumes_the_active_final_reservation(
 
     assert len(committed_payloads) == 1
     assert committed_payloads[0] == (metadata.raw_byte_count, metadata.raw_sha256)
-    persisted = json.loads(
-        (tmp_path / "04_stereo_diagnostics" / "metadata.json").read_bytes()
-    )
+    persisted = json.loads((tmp_path / "04_stereo_diagnostics" / "metadata.json").read_bytes())
     assert persisted["fingerprint"] == metadata.fingerprint
     assert persisted["status"] == "payload_pruned"
     assert tuple(persisted["prune_entries"]) == entries
@@ -242,9 +386,7 @@ def test_schema5_cleanup_releases_settings_and_reservation_before_tree_walk(
     _complete_job(tmp_path)
     commit_payload_pruned(tmp_path)
     (tmp_path / "job-control-v1.json").write_bytes(b"control")
-    active_index = (
-        tmp_path / ".depth-surge-reservations-v1" / "final-encoding-reservation-v1.json"
-    )
+    active_index = tmp_path / ".depth-surge-reservations-v1" / "final-encoding-reservation-v1.json"
     active_index.parent.mkdir(exist_ok=True)
     active_index.write_bytes(b"index")
     references: dict[str, weakref.ReferenceType[object]] = {}
@@ -381,15 +523,8 @@ def test_posix_cleanup_rejects_name_swap_before_child_open(
 
     def swap_before_open(path, flags, mode=0o777, *, dir_fd=None):
         nonlocal injected
-        in_destructive_visit = any(
-            frame.function == "visit" for frame in inspect.stack()
-        )
-        if (
-            not injected
-            and path == victim.name
-            and dir_fd is not None
-            and in_destructive_visit
-        ):
+        in_destructive_visit = any(frame.function == "visit" for frame in inspect.stack())
+        if not injected and path == victim.name and dir_fd is not None and in_destructive_visit:
             injected = True
             os.rename(
                 victim.name,
@@ -488,13 +623,9 @@ def test_cleanup_resumes_a_durable_quarantine_after_a_crash(
         quarantine_name=None,
         recovering=False,
     ):
-        nonlocal crashed
-
         def fault(stage: str, _quarantine: str) -> None:
             nonlocal crashed
-            is_target = name == (
-                "00_original_frames" if removed_role == "root" else marker_name
-            )
+            is_target = name == ("00_original_frames" if removed_role == "root" else marker_name)
             if not crashed and is_target and stage == "after_quarantine_rename":
                 crashed = True
                 raise RuntimeError("simulated crash")
@@ -546,10 +677,8 @@ def test_cleanup_never_deletes_a_root_replacement_created_after_quarantine(
     replaced = False
 
     def remove_with_replacement(
-        parent, name, descriptor, *, directory, quarantine_name=None
+        parent, name, descriptor, *, directory, quarantine_name=None, recovering=False
     ):
-        nonlocal replaced
-
         def fault(stage: str, _quarantine: str) -> None:
             nonlocal replaced
             if (
@@ -583,6 +712,7 @@ def test_cleanup_never_deletes_a_root_replacement_created_after_quarantine(
             descriptor,
             directory=directory,
             quarantine_name=quarantine_name,
+            recovering=recovering,
             fault=fault,
         )
 
@@ -621,18 +751,14 @@ def test_cleanup_final_sweep_rejects_a_reappeared_prune_root(tmp_path: Path) -> 
 
 def test_payload_pruned_rejects_damaged_retained_aggregates(tmp_path: Path) -> None:
     _complete_job(tmp_path)
-    (tmp_path / "04_stereo_diagnostics" / "stereo_coverage_summary.json").write_bytes(
-        b"damaged"
-    )
+    (tmp_path / "04_stereo_diagnostics" / "stereo_coverage_summary.json").write_bytes(b"damaged")
 
     with pytest.raises(Exception, match="summary"):
         commit_payload_pruned(tmp_path)
 
     assert (
         json.loads(
-            (tmp_path / "04_stereo_diagnostics" / "metadata.json").read_text(
-                encoding="ascii"
-            )
+            (tmp_path / "04_stereo_diagnostics" / "metadata.json").read_text(encoding="ascii")
         )["status"]
         == "complete"
     )
@@ -670,25 +796,19 @@ def test_cleanup_rejects_forged_parent_or_retained_root_before_mutation(
 ) -> None:
     _complete_job(tmp_path)
     commit_payload_pruned(tmp_path)
-    persisted = json.loads(
-        (tmp_path / "04_stereo_diagnostics" / "metadata.json").read_bytes()
-    )
+    persisted = json.loads((tmp_path / "04_stereo_diagnostics" / "metadata.json").read_bytes())
     forged_root = tmp_path if relative_path == "." else tmp_path / relative_path
     entry = dict(persisted["prune_entries"][0])
     entry.update(
         {
             "stage_key": stage_key,
             "relative_path": relative_path,
-            "directory_identity": cleanup_transaction._directory_identity(
-                forged_root
-            ).to_object(),
+            "directory_identity": cleanup_transaction._directory_identity(forged_root).to_object(),
         }
     )
     forged = {**persisted, "prune_entries": [entry]}
     forged["fingerprint"] = self_fingerprint(forged)
-    (tmp_path / "04_stereo_diagnostics" / "metadata.json").write_bytes(
-        canonical_json_bytes(forged)
-    )
+    (tmp_path / "04_stereo_diagnostics" / "metadata.json").write_bytes(canonical_json_bytes(forged))
     sentinel = tmp_path / "final_video_manifest.json"
     sentinel_raw = sentinel.read_bytes()
     monkeypatch.setattr(

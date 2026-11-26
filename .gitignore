@@ -219,7 +219,7 @@ cache/
 .cache/
 .worktrees/
 *.lock
-uv.lock
+!/uv.lock
 
 # Hugging Face cache
 .cache/huggingface/

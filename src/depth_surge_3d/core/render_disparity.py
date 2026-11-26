@@ -216,7 +216,8 @@ def _audit_one_stabilized_shot(  # noqa: C901
     ):
         raise ValueError(f"Stabilized disparity shot manifest self-hash mismatch: {manifest_path}")
     if (
-        manifest.get("schema_version") != STABILIZED_SHOT_MANIFEST_SCHEMA_VERSION
+        not all(type(manifest[key]) is int for key in ("schema_version", "shot_id", "start", "end"))
+        or manifest.get("schema_version") != STABILIZED_SHOT_MANIFEST_SCHEMA_VERSION
         or manifest.get("shot_id") != shot_id
         or manifest.get("start") != shot["start"]
         or manifest.get("end") != shot["end"]
@@ -258,6 +259,25 @@ def _audit_one_stabilized_shot(  # noqa: C901
     return {"shot_id": shot_id, "shot_payload_sha256": shot_payload}
 
 
+def _completed_shot_index(metadata: dict[str, Any], shot_count: int) -> dict[int, dict[str, Any]]:
+    completed = metadata.get("completed_shots")
+    if not isinstance(completed, list):
+        raise ValueError("Stabilized disparity completed_shots must be a list")
+    previous_id = -1
+    records_by_id: dict[int, dict[str, Any]] = {}
+    for record in completed:
+        if type(record) is not dict:
+            raise ValueError("Stabilized disparity completed-shot record is not an object")
+        shot_id = record.get("shot_id")
+        if type(shot_id) is not int or shot_id < 0 or shot_id >= shot_count:
+            raise ValueError("Stabilized disparity completed-shot ID is invalid")
+        if shot_id <= previous_id:
+            raise ValueError("Stabilized disparity completed-shot IDs are not sorted and unique")
+        previous_id = shot_id
+        records_by_id[shot_id] = record
+    return records_by_id
+
+
 def audit_stabilized_shot_records(
     root: Path,
     *,
@@ -277,22 +297,7 @@ def audit_stabilized_shot_records(
     if _validate_shot_plan(shot_plan, len(frame_names)) != shot_plan:
         raise ValueError("Stabilized disparity shot plan is not canonical")
     _native_shape(list(native_shape))
-    completed = metadata.get("completed_shots")
-    if not isinstance(completed, list):
-        raise ValueError("Stabilized disparity completed_shots must be a list")
-    previous_id = -1
-    records_by_id: dict[int, dict[str, Any]] = {}
-    for record in completed:
-        if type(record) is not dict:
-            raise ValueError("Stabilized disparity completed-shot record is not an object")
-        shot_id = record.get("shot_id")
-        if type(shot_id) is not int or shot_id < 0 or shot_id >= len(shot_plan):
-            raise ValueError("Stabilized disparity completed-shot ID is invalid")
-        if shot_id <= previous_id:
-            raise ValueError("Stabilized disparity completed-shot IDs are not sorted and unique")
-        previous_id = shot_id
-        records_by_id[shot_id] = record
-
+    records_by_id = _completed_shot_index(metadata, len(shot_plan))
     reusable: list[int] = []
     invalid: list[int] = []
     pending: list[int] = []

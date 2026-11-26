@@ -14,10 +14,25 @@ from __future__ import annotations
 
 import os
 import re
+from fractions import Fraction
 from pathlib import Path
 
 
 _TIME_SECONDS_COMPONENT = re.compile(r"[+-]?\d+(?:\.\d{1,3})?", flags=re.ASCII)
+
+
+def _clock_parts(time_str: str) -> tuple[int, str] | None:
+    try:
+        parts = [part.strip() for part in time_str.strip().split(":")]
+        if _TIME_SECONDS_COMPONENT.fullmatch(parts[-1]) is None:
+            return None
+        if len(parts) == 2:
+            return int(parts[0]) * 60, parts[-1]
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60, parts[-1]
+    except (ValueError, AttributeError):
+        pass
+    return None
 
 
 def parse_time_string(time_str: str) -> float | None:
@@ -38,20 +53,8 @@ def parse_time_string(time_str: str) -> float | None:
         >>> parse_time_string("00:15.125")
         15.125
     """
-    try:
-        parts = [part.strip() for part in time_str.strip().split(":")]
-        if _TIME_SECONDS_COMPONENT.fullmatch(parts[-1]) is None:
-            return None
-        seconds = float(parts[-1])
-        if len(parts) == 2:  # mm:ss
-            minutes = int(parts[0])
-            return minutes * 60 + seconds
-        elif len(parts) == 3:  # hh:mm:ss
-            hours, minutes = map(int, parts[:2])
-            return hours * 3600 + minutes * 60 + seconds
-        return None
-    except (IndexError, ValueError, AttributeError):
-        return None
+    parts = _clock_parts(time_str)
+    return parts[0] + float(parts[1]) if parts is not None else None
 
 
 def format_ffmpeg_time(seconds: float) -> str:
@@ -60,9 +63,39 @@ def format_ffmpeg_time(seconds: float) -> str:
     return f"{seconds:.3f}".rstrip("0").rstrip(".")
 
 
+def _frame_at_time(value: str | None, rate: float | Fraction) -> int | None:
+    if not value:
+        return None
+    parts = _clock_parts(value)
+    if parts is None:
+        return None
+    # Historical jobs without a recorded rational must retain their binary64 frame selection.
+    seconds = Fraction(parts[1]) if isinstance(rate, Fraction) else float(parts[1])
+    return int((parts[0] + seconds) * rate)
+
+
+def ffmpeg_frame_interval(start: int, end: int, rate: Fraction) -> tuple[str, str]:
+    """Seek no later than the selected frame, in FFmpeg's microsecond time base."""
+    start_us = start * rate.denominator * 1_000_000 // rate.numerator
+    end_us = end * rate.denominator * 1_000_000 // rate.numerator
+
+    def seconds(us: int) -> str:
+        whole, fraction = divmod(us, 1_000_000)
+        return f"{whole}.{fraction:06d}".rstrip("0").rstrip(".")
+
+    return seconds(start_us), seconds(end_us - start_us)
+
+
+def calculate_start_frame(
+    total_frames: int | None, rate: float | Fraction, start_time: str | None
+) -> int:
+    start = max(0, _frame_at_time(start_time, rate) or 0)
+    return max(0, min(start, total_frames - 1)) if total_frames is not None else start
+
+
 def calculate_frame_range(
     total_frames: int,
-    fps: float,
+    fps: float | str | Fraction,
     start_time: str | None = None,
     end_time: str | None = None,
 ) -> tuple[int, int]:
@@ -84,21 +117,12 @@ def calculate_frame_range(
         >>> calculate_frame_range(1000, 30.0, "0:10", "0:20")
         (300, 600)
     """
-    start_frame = 0
-    end_frame = total_frames
-
-    if start_time:
-        start_seconds = parse_time_string(start_time)
-        if start_seconds is not None:
-            start_frame = max(0, int(start_seconds * fps))
-
-    if end_time:
-        end_seconds = parse_time_string(end_time)
-        if end_seconds is not None:
-            end_frame = min(total_frames, int(end_seconds * fps))
+    rate = Fraction(fps) if isinstance(fps, str) else fps
+    start_frame = calculate_start_frame(total_frames, rate, start_time)
+    end = _frame_at_time(end_time, rate)
+    end_frame = total_frames if end is None else end
 
     # Ensure valid range
-    start_frame = max(0, min(start_frame, total_frames - 1))
     end_frame = max(start_frame + 1, min(end_frame, total_frames))
 
     return start_frame, end_frame

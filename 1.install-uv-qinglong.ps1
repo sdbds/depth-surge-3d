@@ -1,167 +1,110 @@
-﻿Set-Location $PSScriptRoot
+[CmdletBinding()]
+param(
+    [string]$EnvironmentPath,
+    [switch]$WithMoGe2
+)
 
-$Env:HF_HOME = "huggingface"
-#$Env:HF_ENDPOINT="https://hf-mirror.com"
-$Env:PIP_DISABLE_PIP_VERSION_CHECK = 1
-$Env:PIP_NO_CACHE_DIR = 1
-#$Env:PIP_INDEX_URL="https://mirrors.aliyun.com/pypi/simple/"
-#$Env:UV_INDEX_URL="https://mirrors.aliyun.com/pypi/simple/"
-if ($env:LOCALAPPDATA) {
-    $Env:UV_CACHE_DIR = "$($env:LOCALAPPDATA)/uv/cache"
-} elseif ($env:HOME) {
-    $Env:UV_CACHE_DIR = "$($env:HOME)/.cache/uv"
-} else {
-    $Env:UV_CACHE_DIR = "$PSScriptRoot/.cache/uv"
-}
-$Env:UV_NO_BUILD_ISOLATION = "1"
-$Env:UV_NO_CACHE = "0"
-$Env:UV_LINK_MODE = "symlink"
-$Env:UV_INDEX_STRATEGY = "unsafe-best-match"
-$Env:GIT_LFS_SKIP_SMUDGE = 1
-$Env:CUDA_HOME = "${env:CUDA_PATH}"
+$ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false
 
-function InstallFail {
-    Write-Output "Install failed|安装失败。"
-    Read-Host | Out-Null ;
-    Exit
+if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'uv.lock') -PathType Leaf)) {
+    throw 'Missing uv.lock. Run this installer from a complete Depth Surge 3D checkout.'
 }
 
-function Check {
-    param (
-        $ErrorInfo
-    )
-    if (!($?)) {
-        Write-Output $ErrorInfo
-        InstallFail
+$uv = Get-Command uv -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $uv) {
+    throw 'Install uv from https://docs.astral.sh/uv/getting-started/installation/ and reopen PowerShell.'
+}
+if (-not (Get-Command git -CommandType Application -ErrorAction SilentlyContinue)) {
+    throw 'Install Git for Windows and reopen PowerShell. The lock includes Git dependencies.'
+}
+foreach ($tool in 'ffmpeg', 'ffprobe') {
+    if (-not (Get-Command $tool -CommandType Application -ErrorAction SilentlyContinue)) {
+        throw "Missing $tool. Install FFmpeg from https://ffmpeg.org/download.html and add its bin directory to PATH."
     }
 }
 
-function Get-UvEnvName {
-    if ($Env:VIRTUAL_ENV) {
-        return Split-Path -Path $Env:VIRTUAL_ENV -Leaf
+$previousTarget = $env:UV_PROJECT_ENVIRONMENT
+if (-not $EnvironmentPath) {
+    $EnvironmentPath = if (-not $previousTarget) {
+        Join-Path $PSScriptRoot '.venv'
+    } elseif ([IO.Path]::IsPathRooted($previousTarget)) {
+        $previousTarget
+    } else {
+        Join-Path $PSScriptRoot $previousTarget
     }
-    if (Test-Path "./.venv") {
-        return ".venv"
+}
+$target = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($EnvironmentPath)
+$python = Join-Path $target 'Scripts\python.exe'
+$cli = Join-Path $target 'Scripts\depth-surge-3d.exe'
+$request = '3.11'
+
+# uv sync can replace an environment when its interpreter does not match the request.
+$existing = Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+if ($existing) {
+    if (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        -not (Test-Path -LiteralPath (Join-Path $target 'pyvenv.cfg') -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $python -PathType Leaf)) {
+        throw "Refusing to replace existing path '$target'. Choose a new -EnvironmentPath."
     }
-    if (Test-Path "./venv") {
-        return "venv"
+    $check = "import os, struct, sys; sys.exit(not (sys.implementation.name == 'cpython' and sys.version_info[:2] == (3, 11) and struct.calcsize('P') == 8 and sys.prefix != sys.base_prefix and os.path.samefile(sys.prefix, sys.argv[1])))"
+    & $python -I -c $check $target
+    if ($LASTEXITCODE -ne 0) {
+        throw "Existing environment '$target' must be 64-bit CPython 3.11. Choose a new -EnvironmentPath; nothing was removed."
     }
-    return "uv-managed"
+    $request = $python
 }
 
-function Get-ProjectPython {
-    $Candidates = @(
-        "./.venv/Scripts/python.exe",
-        "./venv/Scripts/python.exe",
-        "./.venv/bin/python",
-        "./venv/bin/python"
-    )
+$syncArgs = @('sync', '--locked', '--no-editable', '--no-dev', '--inexact', '--python', $request, '--project', $PSScriptRoot)
+if ($WithMoGe2) { $syncArgs += '--extra', 'moge2' }
 
-    foreach ($Candidate in $Candidates) {
-        if (Test-Path $Candidate) {
-            return (Resolve-Path $Candidate).Path
-        }
-    }
-
-    $PythonCommand = Get-Command python -ErrorAction SilentlyContinue
-    if ($PythonCommand) {
-        return $PythonCommand.Source
-    }
-
-    return $null
-}
-
+Write-Host "Installing Depth Surge 3D into $target"
 try {
-    ~/.local/bin/uv --version
-    Write-Output "uv installed|UV模块已安装."
-}
-catch {
-    Write-Output "Installing uv|安装uv模块中..."
-    if ($Env:OS -ilike "*windows*") {
-        powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-        Check "uv install failed|安装uv模块失败。"
+    $env:UV_PROJECT_ENVIRONMENT = $target
+    & $uv @syncArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "uv sync failed (exit $LASTEXITCODE). See the error above. For native build errors install MSVC C++17 and the Windows SDK; see docs/INSTALLATION.md."
     }
-    else {
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        Check "uv install failed|安装uv模块失败。"
-    }
+} finally {
+    $env:UV_PROJECT_ENVIRONMENT = $previousTarget
 }
 
-if ($env:OS -ilike "*windows*") {
-    chcp 65001
-    # First check if UV cache directory already exists
-    if (Test-Path -Path "${env:LOCALAPPDATA}/uv/cache") {
-        Write-Host "UV cache directory already exists, skipping disk space check"
-    }
-    else {
-        # Check C drive free space with error handling
-        try {
-            $CDrive = Get-WmiObject Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop
-            if ($CDrive) {
-                $FreeSpaceGB = [math]::Round($CDrive.FreeSpace / 1GB, 2)
-                Write-Host "C: drive free space: ${FreeSpaceGB}GB"
-                
-                # $Env:UV cache directory based on available space
-                if ($FreeSpaceGB -lt 10) {
-                    Write-Host "Low disk space detected. Using local .cache directory"
-                    $Env:UV_CACHE_DIR = ".cache"
-                } 
-            }
-            else {
-                Write-Warning "C: drive not found. Using local .cache directory"
-                $Env:UV_CACHE_DIR = ".cache"
-            }
-        }
-        catch {
-            Write-Warning "Failed to check disk space: $_. Using local .cache directory"
-            $Env:UV_CACHE_DIR = ".cache"
-        }
-    }
-    if (Test-Path "./venv/Scripts/activate") {
-        Write-Output "Windows venv"
-        . ./venv/Scripts/activate
-    }
-    elseif (Test-Path "./.venv/Scripts/activate") {
-        Write-Output "Windows .venv"
-        . ./.venv/Scripts/activate
-    }
-    else {
-        Write-Output "Create .venv"
-        ~/.local/bin/uv venv -p 3.11 --seed
-        . ./.venv/Scripts/activate
+if (-not (Test-Path -LiteralPath $cli -PathType Leaf)) {
+    throw "Missing installed CLI: $cli. Check that uv installed the project, not just its dependencies."
+}
+if (-not $existing) {
+    & $uv pip check --python $python
+    if ($LASTEXITCODE -ne 0) {
+        throw "New environment failed dependency checks (exit $LASTEXITCODE). See the conflicting or missing packages above."
     }
 }
-elseif (Test-Path "./venv/bin/activate") {
-    Write-Output "Linux venv"
-    . ./venv/bin/Activate.ps1
+# -I excludes the working directory; check wheel ownership too, since .pth files still load.
+@'
+import json
+import sys
+from importlib.machinery import EXTENSION_SUFFIXES
+from importlib.metadata import distribution
+from pathlib import Path
+
+dist = distribution("depth-surge-3d")
+if json.loads(dist.read_text("direct_url.json") or "{}").get("dir_info", {}).get("editable"):
+    sys.exit("Found an editable installation instead of the project wheel.")
+import depth_surge_3d
+import _quality_kd_native
+
+native = Path(_quality_kd_native.__file__)
+if not any(native.name.endswith(suffix) for suffix in EXTENSION_SUFFIXES):
+    sys.exit(f"Not a compiled extension: {native}")
+files = {p.as_posix() for p in dist.files or ()}
+for name, module in (("depth_surge_3d/__init__.py", depth_surge_3d), (native.name, _quality_kd_native)):
+    actual = Path(module.__file__).resolve()
+    if (name not in files or actual != Path(dist.locate_file(name)).resolve()
+            or not actual.is_relative_to(Path(sys.prefix).resolve())):
+        sys.exit(f"Module does not belong to this environment's project wheel: {actual}")
+print(f"Installed Quality extension: {native}")
+'@ | & $python -I -
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not verify the installed project and Quality extension. See docs/INSTALLATION.md.'
 }
-elseif (Test-Path "./.venv/bin/activate") {
-    Write-Output "Linux .venv"
-    . ./.venv/bin/activate.ps1
-}
-else {
-    Write-Output "Create .venv"
-    ~/.local/bin/uv venv -p 3.11 --seed
-    . ./.venv/bin/activate.ps1
-}
-
-Write-Output "Exporting base project dependencies and MoGe-2 extra from pyproject.toml"
-Write-Output "uv pip install target environment: $(Get-UvEnvName)"
-Write-Output "uv pip install dependency profile: base+moge2"
-
-$PythonExe = Get-ProjectPython
-
-Write-Output "基础安装直接使用 uv pip install -r pyproject.toml，默认启用 moge2 extra"
-
-~/.local/bin/uv pip install --python .\.venv\Scripts\python.exe "hatchling>=1.25" "hatch-vcs>=0.4"
-
-if ($PythonExe) {
-    ~/.local/bin/uv pip install --no-build-isolation --python $PythonExe -r pyproject.toml --extra moge2
-}
-else {
-    ~/.local/bin/uv pip install --no-build-isolation -r pyproject.toml --extra moge2
-}
-Check "Install base and MoGe-2 requirements failed"
-
-Write-Output "Install finished"
-Read-Host | Out-Null ;
+Write-Host "Installed CLI: $cli"
+Write-Host 'Model weights are separate; see docs/INSTALLATION.md before the first conversion.'

@@ -8,6 +8,7 @@ from pathlib import PurePosixPath
 import re
 from typing import Any, Literal, cast
 
+from ...core.video_timing import EncodingTimeline, rate_text
 from ...io.file_identity import PersistedFileIdentityV1
 
 
@@ -38,9 +39,7 @@ def _argument_value(arguments: tuple[str, ...], option: str) -> str:
     return arguments[positions[0] + 1]
 
 
-def validate_raw_rgb24_input_v1(arguments: tuple[str, ...]) -> tuple[int, int]:
-    """Validate the closed raw input prefix of a normalized FFmpeg invocation."""
-
+def _raw_input_index(arguments: tuple[str, ...]) -> int:
     if not arguments or arguments[0] != "ffmpeg":
         raise ValueError("raw RGB24 invocation must start with ffmpeg")
     try:
@@ -59,6 +58,10 @@ def validate_raw_rgb24_input_v1(arguments: tuple[str, ...]) -> tuple[int, int]:
         raise ValueError("raw RGB24 options must bind the first image input")
     if sum(value.startswith("@image-sequence:") for value in arguments) != 1:
         raise ValueError("raw RGB24 requires exactly one image input")
+    return input_index
+
+
+def _raw_input_options(arguments: tuple[str, ...], input_index: int) -> dict[str, str]:
     required = {"-f", "-pixel_format", "-video_size", "-framerate"}
     if any(arguments.count(option) != 1 for option in required) or "-vcodec" in arguments:
         raise ValueError("raw RGB24 input options are missing or duplicated")
@@ -80,6 +83,10 @@ def validate_raw_rgb24_input_v1(arguments: tuple[str, ...]) -> tuple[int, int]:
         position += 2
     if not required <= values.keys():
         raise ValueError("raw RGB24 options must precede their image input")
+    return values
+
+
+def _raw_input_shape(values: dict[str, str]) -> tuple[int, int]:
     if values["-f"] != "rawvideo" or values["-pixel_format"] != "rgb24":
         raise ValueError("raw RGB24 input format is invalid")
     size = re.fullmatch(r"([1-9][0-9]{0,9})x([1-9][0-9]{0,9})", values["-video_size"], re.ASCII)
@@ -88,6 +95,15 @@ def validate_raw_rgb24_input_v1(arguments: tuple[str, ...]) -> tuple[int, int]:
     width, height = (int(value) for value in size.groups())
     if width > 2**32 - 1 or height > 2**32 - 1 or width * height * 3 > 2**64 - 1:
         raise ValueError("raw RGB24 video size exceeds its bounds")
+    return width, height
+
+
+def validate_raw_rgb24_input_v1(arguments: tuple[str, ...]) -> tuple[int, int]:
+    """Validate the closed raw input prefix of a normalized FFmpeg invocation."""
+
+    input_index = _raw_input_index(arguments)
+    values = _raw_input_options(arguments, input_index)
+    width, height = _raw_input_shape(values)
     try:
         rate = Fraction(values["-framerate"])
     except (ValueError, ZeroDivisionError) as error:
@@ -113,6 +129,12 @@ class StreamedVrInvocationV1:
     resolved_arguments_template: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        self._validate_frame_sequence()
+        self._validate_output_parameters()
+        self._validate_argument_vector()
+        self._validate_argument_bindings()
+
+    def _validate_frame_sequence(self) -> None:
         _hex(self.job_id, _HEX32, "streamed invocation job id")
         _hex(
             self.settings_identity_fingerprint,
@@ -136,6 +158,8 @@ class StreamedVrInvocationV1:
             or any(type(value) is not int or value <= 0 for value in self.expected_shape)
         ):
             raise ValueError("streamed invocation output shape is invalid")
+
+    def _validate_output_parameters(self) -> None:
         if self.resolved_encoder not in {"libx264", "libx265", "hevc_nvenc"}:
             raise ValueError("streamed invocation encoder is invalid")
         try:
@@ -149,6 +173,7 @@ class StreamedVrInvocationV1:
         ):
             raise ValueError("streamed invocation audio boundary is invalid")
 
+    def _validate_argument_vector(self) -> None:
         arguments = self.resolved_arguments_template
         if (
             not isinstance(arguments, tuple)
@@ -171,8 +196,23 @@ class StreamedVrInvocationV1:
             raise ValueError("streamed invocation lacks its unique self image token")
         if not arguments[-1].startswith("@output:path64="):
             raise ValueError("streamed invocation lacks its normalized output token")
-        if _argument_value(arguments, "-framerate") != self.resolved_fps:
-            raise ValueError("streamed invocation frame rate differs from its arguments")
+
+    def _validate_argument_bindings(self) -> None:
+        arguments = self.resolved_arguments_template
+        input_fps = _argument_value(arguments, "-framerate")
+        bounded_filter = "-frames:v" not in arguments
+        if input_fps != self.resolved_fps or bounded_filter:
+            timeline = EncodingTimeline.resolve(input_fps, self.resolved_fps)
+            expected_filter, limit = timeline.ffmpeg_video_options(
+                self.frame_count, drain_audio=bounded_filter
+            )
+            if (
+                input_fps != rate_text(timeline.source)
+                or (bounded_filter and self.audio_end_sample is None)
+                or _argument_value(arguments, "-vf") != expected_filter
+                or (limit and _argument_value(arguments, "-frames:v") != limit[1])
+            ):
+                raise ValueError("streamed invocation frame rate differs from its arguments")
         if _argument_value(arguments, "-c:v") != self.resolved_encoder:
             raise ValueError("streamed invocation encoder differs from its arguments")
         audio_filters = [value for value in arguments if value.startswith("atrim=end_sample=")]

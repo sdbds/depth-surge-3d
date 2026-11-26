@@ -16,7 +16,7 @@ elseif (Test-Path "venv\Scripts\Activate.ps1") {
 }
 else {
     Write-Host "❌ Error: Virtual environment not found." -ForegroundColor Red
-    Write-Host "   Run .\setup.sh first to create a virtual environment." -ForegroundColor Red
+    Write-Host "   Follow docs/INSTALLATION.md, then enable the dev group as described in docs/CONTRIBUTING.md." -ForegroundColor Red
     exit 1
 }
 

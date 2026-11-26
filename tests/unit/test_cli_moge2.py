@@ -2,25 +2,12 @@
 
 from __future__ import annotations
 
-import importlib
 import math
-import sys
-from pathlib import Path
 from unittest.mock import ANY, MagicMock
 
 import pytest
 
 from src.depth_surge_3d.inference.depth.backend_registry import BackendAvailability
-
-
-@pytest.fixture
-def cli_module():
-    project_root = Path(__file__).resolve().parents[2]
-    sys.path.insert(0, str(project_root / "src"))
-    try:
-        return importlib.import_module("depth_surge_3d.cli")
-    finally:
-        sys.path.pop(0)
 
 
 def test_cli_accepts_moge_and_normalizes_default_variant(cli_module) -> None:

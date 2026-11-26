@@ -116,26 +116,9 @@ def test_relative_fast_cuda_falls_back_to_one_host_offset_pair(monkeypatch, reas
     assert renderer._offset_transfer_bytes == source.shape[0] * source.shape[1] * 8
 
 
-@requires_triton_cuda
-@pytest.mark.parametrize("stage", ["allocation", "kernel", "first_band", "later_band"])
-def test_relative_fast_oom_releases_resident_planes_before_host_fallback(monkeypatch, stage):
-    source, canonical, settings = _fixture()
-    expected = renderer_module.StereoRenderer(device="cpu").render_relative_fast_compact(
-        source, canonical, settings
-    )
-    renderer = renderer_module.StereoRenderer(
-        device="cuda",
-        temporary_budget_bytes=31 * renderer_module.TRITON_SPLAT_BYTES_PER_PIXEL * 2,
-    )
-    original_to = torch.Tensor.to
-    original_empty = torch.empty
-    original_release = renderer._release_after_oom
-    original_host = renderer_module.calculate_eye_sample_offsets
-    original_splat = renderer_module._forward_splat_band_prevalidated
-    original_kernel = offsets_module._relative_offsets_kernel
-    resident_refs, injected, host_calls, releases = [], [], [], []
+def _observe_resident_allocations(monkeypatch, source, stage, injected, resident_refs):
+    original_to, original_empty = torch.Tensor.to, torch.empty
     offset_allocations = 0
-    splat_calls = 0
 
     def observe_transfer(tensor, *args, **kwargs):
         result = original_to(tensor, *args, **kwargs)
@@ -155,6 +138,30 @@ def test_relative_fast_oom_releases_resident_planes_before_host_fallback(monkeyp
         if is_offset:
             resident_refs.append(weakref.ref(result))
         return result
+
+    monkeypatch.setattr(torch.Tensor, "to", observe_transfer)
+    monkeypatch.setattr(torch, "empty", observe_allocation)
+
+
+@requires_triton_cuda
+@pytest.mark.parametrize("stage", ["allocation", "kernel", "first_band", "later_band"])
+def test_relative_fast_oom_releases_resident_planes_before_host_fallback(monkeypatch, stage):
+    source, canonical, settings = _fixture()
+    expected = renderer_module.StereoRenderer(device="cpu").render_relative_fast_compact(
+        source, canonical, settings
+    )
+    renderer = renderer_module.StereoRenderer(
+        device="cuda",
+        temporary_budget_bytes=31 * renderer_module.TRITON_SPLAT_BYTES_PER_PIXEL * 2,
+    )
+    original_release = renderer._release_after_oom
+    original_host = renderer_module.calculate_eye_sample_offsets
+    original_splat = renderer_module._forward_splat_band_prevalidated
+    original_kernel = offsets_module._relative_offsets_kernel
+    resident_refs, injected, host_calls, releases = [], [], [], []
+    splat_calls = 0
+
+    _observe_resident_allocations(monkeypatch, source, stage, injected, resident_refs)
 
     class ObservedKernel:
         def __getitem__(self, grid):
@@ -188,8 +195,6 @@ def test_relative_fast_oom_releases_resident_planes_before_host_fallback(monkeyp
         host_calls.append(near.device.type)
         return original_host(near, controls)
 
-    monkeypatch.setattr(torch.Tensor, "to", observe_transfer)
-    monkeypatch.setattr(torch, "empty", observe_allocation)
     monkeypatch.setattr(offsets_module, "_relative_offsets_kernel", ObservedKernel())
     monkeypatch.setattr(renderer_module, "_forward_splat_band_prevalidated", observe_splat)
     monkeypatch.setattr(renderer_module, "calculate_eye_sample_offsets", observe_host)

@@ -1,4 +1,4 @@
-"""Task 0 tests for the prebuilt native implicit k-d implementation."""
+"""Shared tests for the prebuilt native implicit k-d implementation."""
 
 from __future__ import annotations
 
@@ -8,22 +8,15 @@ import inspect
 import numpy as np
 import pytest
 
-from scripts.quality_task0 import implicit_kd, native_kd
-
 
 def test_native_kd_wrapper_module_is_importable() -> None:
     assert importlib.util.find_spec("scripts.quality_task0.native_kd") is not None
 
 
-def _api(name: str):
-    assert hasattr(native_kd, name), f"missing native Task 0 API: {name}"
-    return getattr(native_kd, name)
-
-
-def test_native_extension_is_prebuilt_and_reports_frozen_contract() -> None:
-    native_available = _api("native_available")
-    native_load_error = _api("native_load_error")
-    native_build_info = _api("native_build_info")
+def test_native_extension_is_prebuilt_and_reports_frozen_contract(native_kd) -> None:
+    native_available = native_kd.native_available
+    native_load_error = native_kd.native_load_error
+    native_build_info = native_kd.native_build_info
 
     assert native_available(), native_load_error()
     build_info = native_build_info()
@@ -76,12 +69,14 @@ def test_native_extension_is_prebuilt_and_reports_frozen_contract() -> None:
     ],
 )
 def test_native_build_is_byte_exact_with_python_oracle(
+    native_kd,
+    kd,
     region_ids: np.ndarray,
     region_count: int,
     include: np.ndarray | None,
 ) -> None:
-    build_native = _api("build_native_implicit_region_kd")
-    expected = implicit_kd.build_implicit_region_kd(
+    build_native = native_kd.build_native_implicit_region_kd
+    expected = kd.build_implicit_region_kd(
         region_ids,
         region_count=region_count,
         include=include,
@@ -96,38 +91,38 @@ def test_native_build_is_byte_exact_with_python_oracle(
     assert not actual.region_offsets.flags.writeable
 
 
-def test_native_optimized_large_build_is_byte_exact_with_python_oracle() -> None:
+def test_native_optimized_large_build_is_byte_exact_with_python_oracle(native_kd, kd) -> None:
     rows, columns = np.indices((19, 23), dtype=np.uint32)
     region_ids = ((rows + 2 * columns) % 3 + 1).astype(np.uint32)
 
-    expected = implicit_kd.build_implicit_region_kd(region_ids, region_count=3)
-    actual = _api("build_native_implicit_region_kd")(region_ids, region_count=3)
+    expected = kd.build_implicit_region_kd(region_ids, region_count=3)
+    actual = native_kd.build_native_implicit_region_kd(region_ids, region_count=3)
 
     assert np.array_equal(actual.member_index, expected.member_index)
     assert np.array_equal(actual.region_offsets, expected.region_offsets)
 
 
-def test_native_large_single_region_build_is_byte_exact_with_python_oracle() -> None:
+def test_native_large_single_region_build_is_byte_exact_with_python_oracle(native_kd, kd) -> None:
     region_ids = np.ones((31, 37), dtype=np.uint32)
 
-    expected = implicit_kd.build_implicit_region_kd(region_ids, region_count=1)
-    actual = _api("build_native_implicit_region_kd")(region_ids, region_count=1)
+    expected = kd.build_implicit_region_kd(region_ids, region_count=1)
+    actual = native_kd.build_native_implicit_region_kd(region_ids, region_count=1)
 
     assert np.array_equal(actual.member_index, expected.member_index)
     assert np.array_equal(actual.region_offsets, expected.region_offsets)
 
 
-def test_native_build_above_packed_coordinate_limit_remains_byte_exact() -> None:
+def test_native_build_above_packed_coordinate_limit_remains_byte_exact(native_kd, kd) -> None:
     region_ids = np.ones((1, 65_536), dtype=np.uint32)
     include = np.zeros_like(region_ids, dtype=np.bool_)
     include[0, [0, 1, 32_768, 65_534, 65_535]] = True
 
-    expected = implicit_kd.build_implicit_region_kd(
+    expected = kd.build_implicit_region_kd(
         region_ids,
         region_count=1,
         include=include,
     )
-    actual = _api("build_native_implicit_region_kd")(
+    actual = native_kd.build_native_implicit_region_kd(
         region_ids,
         region_count=1,
         include=include,
@@ -137,8 +132,8 @@ def test_native_build_above_packed_coordinate_limit_remains_byte_exact() -> None
     assert np.array_equal(actual.region_offsets, expected.region_offsets)
 
 
-def test_native_build_rejects_noncanonical_inputs_before_native_mutation() -> None:
-    build_native = _api("build_native_implicit_region_kd")
+def test_native_build_rejects_noncanonical_inputs_before_native_mutation(native_kd) -> None:
+    build_native = native_kd.build_native_implicit_region_kd
 
     with pytest.raises(TypeError, match="uint32"):
         build_native(np.ones((2, 2), dtype=np.int32), region_count=1)
@@ -146,9 +141,9 @@ def test_native_build_rejects_noncanonical_inputs_before_native_mutation() -> No
         build_native(np.asarray([[1, 3]], dtype=np.uint32), region_count=3)
 
 
-def test_native_repair_batch_matches_scalar_queries_and_preserves_no_donor() -> None:
-    build_native = _api("build_native_implicit_region_kd")
-    query_native = _api("query_native_repair_batch")
+def test_native_repair_batch_matches_scalar_queries_and_preserves_no_donor(native_kd, kd) -> None:
+    build_native = native_kd.build_native_implicit_region_kd
+    query_native = native_kd.query_native_repair_batch
     region_ids = np.asarray(
         [[1, 1, 1, 2, 2], [1, 1, 1, 2, 2], [1, 1, 1, 2, 2]],
         dtype=np.uint32,
@@ -162,7 +157,7 @@ def test_native_repair_batch_matches_scalar_queries_and_preserves_no_donor() -> 
         dtype=np.bool_,
     )
     native_index = build_native(region_ids, region_count=2, include=include)
-    oracle_index = implicit_kd.build_implicit_region_kd(
+    oracle_index = kd.build_implicit_region_kd(
         region_ids,
         region_count=2,
         include=include,
@@ -170,8 +165,8 @@ def test_native_repair_batch_matches_scalar_queries_and_preserves_no_donor() -> 
     query_regions = np.asarray([1, 1, 1, 2], dtype=np.uint32)
     target_y = np.asarray([0, 1, 2, 1], dtype=np.uint32)
     target_x = np.asarray([0, 1, 4, 4], dtype=np.uint32)
-    native_budget = implicit_kd.VisitBudget(limit=10_000)
-    oracle_budget = implicit_kd.VisitBudget(limit=10_000)
+    native_budget = kd.VisitBudget(limit=10_000)
+    oracle_budget = kd.VisitBudget(limit=10_000)
 
     actual = query_native(
         native_index,
@@ -205,13 +200,13 @@ def test_native_repair_batch_matches_scalar_queries_and_preserves_no_donor() -> 
     assert not actual.visited_nodes.flags.writeable
 
 
-def test_native_repair_batch_debits_before_fatal_next_node() -> None:
-    build_native = _api("build_native_implicit_region_kd")
-    query_native = _api("query_native_repair_batch")
+def test_native_repair_batch_debits_before_fatal_next_node(native_kd, kd) -> None:
+    build_native = native_kd.build_native_implicit_region_kd
+    query_native = native_kd.query_native_repair_batch
     index = build_native(np.ones((1, 7), dtype=np.uint32), region_count=1)
-    budget = implicit_kd.VisitBudget(limit=1)
+    budget = kd.VisitBudget(limit=1)
 
-    with pytest.raises(implicit_kd.QualityRepairFallbackQueryBudgetError, match="visit cap"):
+    with pytest.raises(kd.QualityRepairFallbackQueryBudgetError, match="visit cap"):
         query_native(
             index,
             np.asarray([1], dtype=np.uint32),
@@ -224,20 +219,20 @@ def test_native_repair_batch_debits_before_fatal_next_node() -> None:
     assert budget.consumed == 1
 
 
-def test_native_geometry_batch_matches_scalar_queries_bit_exactly() -> None:
-    build_native = _api("build_native_implicit_region_kd")
-    query_native = _api("query_native_geometry_batch")
+def test_native_geometry_batch_matches_scalar_queries_bit_exactly(native_kd, kd) -> None:
+    build_native = native_kd.build_native_implicit_region_kd
+    query_native = native_kd.query_native_geometry_batch
     region_ids = np.asarray(
         [[1, 1, 1, 2], [1, 1, 2, 2], [1, 2, 2, 2]],
         dtype=np.uint32,
     )
     native_index = build_native(region_ids, region_count=2)
-    oracle_index = implicit_kd.build_implicit_region_kd(region_ids, region_count=2)
+    oracle_index = kd.build_implicit_region_kd(region_ids, region_count=2)
     query_regions = np.asarray([1, 1, 2, 2, 2], dtype=np.uint32)
     target_y = np.asarray([-0.5, 0.5, 0.25, 1.5, 4.0], dtype=np.float64)
     target_x = np.asarray([-0.25, 1.5, 2.5, 3.5, 5.0], dtype=np.float64)
-    native_budget = implicit_kd.VisitBudget(limit=10_000)
-    oracle_budget = implicit_kd.VisitBudget(limit=10_000)
+    native_budget = kd.VisitBudget(limit=10_000)
+    oracle_budget = kd.VisitBudget(limit=10_000)
 
     actual = query_native(
         native_index,
@@ -262,13 +257,13 @@ def test_native_geometry_batch_matches_scalar_queries_bit_exactly() -> None:
     assert int(actual.visited_nodes.sum(dtype=np.uint64)) == native_budget.consumed
 
 
-def test_native_geometry_batch_uses_distinct_fatal_budget_error() -> None:
-    build_native = _api("build_native_implicit_region_kd")
-    query_native = _api("query_native_geometry_batch")
+def test_native_geometry_batch_uses_distinct_fatal_budget_error(native_kd, kd) -> None:
+    build_native = native_kd.build_native_implicit_region_kd
+    query_native = native_kd.query_native_geometry_batch
     index = build_native(np.ones((1, 7), dtype=np.uint32), region_count=1)
-    budget = implicit_kd.VisitBudget(limit=0)
+    budget = kd.VisitBudget(limit=0)
 
-    with pytest.raises(implicit_kd.QualityGeometryQueryBudgetError, match="visit cap"):
+    with pytest.raises(kd.QualityGeometryQueryBudgetError, match="visit cap"):
         query_native(
             index,
             np.asarray([1], dtype=np.uint32),
@@ -280,17 +275,17 @@ def test_native_geometry_batch_uses_distinct_fatal_budget_error() -> None:
     assert budget.consumed == 0
 
 
-def test_native_parallel_geometry_batch_preserves_ordered_budget_failure() -> None:
-    build_native = _api("build_native_implicit_region_kd")
-    query_native = _api("query_native_geometry_batch")
+def test_native_parallel_geometry_batch_preserves_ordered_budget_failure(native_kd, kd) -> None:
+    build_native = native_kd.build_native_implicit_region_kd
+    query_native = native_kd.query_native_geometry_batch
     index = build_native(np.ones((17, 19), dtype=np.uint32), region_count=1)
     query_count = 4096
     query_regions = np.ones(query_count, dtype=np.uint32)
     target_y = np.linspace(-2.0, 19.0, query_count, dtype=np.float64)
     target_x = np.linspace(21.0, -3.0, query_count, dtype=np.float64)
-    budget = implicit_kd.VisitBudget(limit=1234)
+    budget = kd.VisitBudget(limit=1234)
 
-    with pytest.raises(implicit_kd.QualityGeometryQueryBudgetError, match="visit cap"):
+    with pytest.raises(kd.QualityGeometryQueryBudgetError, match="visit cap"):
         query_native(
             index,
             query_regions,

@@ -23,7 +23,7 @@ if (Test-Path ".venv") {
     Write-Lime "Activating virtual environment (venv)..."
     & .\venv\Scripts\Activate.ps1
 } else {
-    Write-Host "Error: Virtual environment not found. Run .\setup.ps1 first." -ForegroundColor Red
+    Write-Host "Error: Virtual environment not found. Run .\1.install-uv-qinglong.ps1 first." -ForegroundColor Red
     exit 1
 }
 

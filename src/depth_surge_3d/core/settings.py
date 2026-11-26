@@ -246,7 +246,7 @@ def _validate_existing_setting(name: str, value: object) -> Any:
 
 
 def _validate_optional_integer(name: str, value: object) -> int | None:
-    if value is None and name in {"denoising_steps", "seed"}:
+    if value is None:
         return None
     return _integer(name, value, 0, 1_000_000)
 
@@ -318,6 +318,21 @@ def _validate_value(name: str, value: object) -> Any:
     return _validate_optional_setting(name, value)
 
 
+def _provided_settings(values: dict[str, Any], source: SettingsSource) -> dict[str, Any]:
+    provided = dict(values)
+    removed = sorted(REMOVED_SETTING_NAMES.intersection(provided))
+    unknown = sorted(set(provided) - _KNOWN_SETTING_NAMES - REMOVED_SETTING_NAMES)
+    if source == "explicit":
+        if removed:
+            raise ValueError(f"removed setting is not supported: {removed[0]}")
+        if unknown:
+            raise ValueError(f"unknown setting: {unknown[0]}")
+    else:
+        for name in removed + unknown:
+            provided.pop(name, None)
+    return provided
+
+
 def validate_settings(
     values: dict[str, Any],
     *,
@@ -330,18 +345,7 @@ def validate_settings(
     if not isinstance(values, dict):
         raise TypeError("settings values must be a dictionary")
 
-    provided = dict(values)
-    removed = sorted(REMOVED_SETTING_NAMES.intersection(provided))
-    unknown = sorted(set(provided) - _KNOWN_SETTING_NAMES - REMOVED_SETTING_NAMES)
-    if source == "explicit":
-        if removed:
-            raise ValueError(f"removed setting is not supported: {removed[0]}")
-        if unknown:
-            raise ValueError(f"unknown setting: {unknown[0]}")
-    else:
-        for name in removed + unknown:
-            provided.pop(name, None)
-
+    provided = _provided_settings(values, source)
     validated: dict[str, Any] = dict(DEFAULT_SETTINGS)
     if source == "legacy_disk":
         for override_name, override_value in _PERSISTED_DISK_DEFAULT_OVERRIDES.items():

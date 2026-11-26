@@ -60,13 +60,14 @@ def create_cache_entry(cache_dir: Path, video_file: Path, settings: dict, metada
 
 
 class TestGetCacheDir:
-    @patch.dict("os.environ", {"XDG_CACHE_HOME": "/tmp/xdg_cache"})
-    def test_cache_dir_with_xdg(self):
+    def test_cache_dir_with_xdg(self, monkeypatch, tmp_path):
+        xdg = tmp_path / "xdg"
+        monkeypatch.setenv("XDG_CACHE_HOME", str(xdg))
         cache_dir = get_cache_dir()
-        assert cache_dir == Path("/tmp/xdg_cache") / "depth-surge-3d" / "depth_cache"
+        assert cache_dir == xdg / "depth-surge-3d" / "depth_cache"
 
-    @patch.dict("os.environ", {}, clear=True)
-    def test_cache_dir_without_xdg(self, tmp_path):
+    def test_cache_dir_without_xdg(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
         with patch("pathlib.Path.home", return_value=tmp_path):
             cache_dir = get_cache_dir()
             assert cache_dir == tmp_path / ".cache" / "depth-surge-3d" / "depth_cache"

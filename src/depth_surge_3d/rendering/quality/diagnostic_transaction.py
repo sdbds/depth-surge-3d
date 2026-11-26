@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Executor, FIRST_EXCEPTION, Future, wait
+from functools import partial
 import hashlib
 import io
 import json
@@ -56,6 +57,7 @@ FaultHook = Callable[[str], None]
 _HEX_64 = frozenset("0123456789abcdef")
 _U64_MAX = 2**64 - 1
 _CANONICAL_UINT_TOKEN = re.compile(rb"[0-9]+")
+_CANONICAL_STRING_LITERAL = re.compile(rb'[^"\\]+')
 _QUALITY_RECORD_ARENA_BYTES = 64 * 1024 * 1024
 
 
@@ -76,67 +78,65 @@ def canonical_json_bytes(value: object) -> bytes:
     """Encode canonical JSON while streaming dense histogram pairs."""
 
     output = io.BytesIO()
-
-    def write(current: object) -> None:  # noqa: C901
-        if isinstance(current, DenseHistogramPairs):
-            output.write(b"[")
-            first = True
-            for bucket, count in _iter_dense_histogram_pairs(current.bins):
-                if not first:
-                    output.write(b",")
-                output.write(f"[{bucket},{count}]".encode("ascii"))
-                first = False
-            output.write(b"]")
-            return
-        if isinstance(current, _SparseHistogramPairs):
-            output.write(b"[")
-            for index, (bucket, count) in enumerate(current):
-                if index:
-                    output.write(b",")
-                output.write(f"[{bucket},{count}]".encode("ascii"))
-            output.write(b"]")
-            return
-        if current is None:
-            output.write(b"null")
-            return
-        if isinstance(current, (bool, np.bool_)):
-            output.write(b"true" if bool(current) else b"false")
-            return
-        if isinstance(current, (int, np.integer)):
-            output.write(str(int(current)).encode("ascii"))
-            return
-        if isinstance(current, (float, np.floating)):
-            output.write(
-                json.dumps(float(current), allow_nan=False, separators=(",", ":")).encode("ascii")
-            )
-            return
-        if isinstance(current, str):
-            output.write(json.dumps(current, ensure_ascii=True).encode("ascii"))
-            return
-        if isinstance(current, dict):
-            if not all(isinstance(key, str) for key in current):
-                raise TypeError("canonical JSON object keys must be strings")
-            output.write(b"{")
-            for index, key in enumerate(sorted(current)):
-                if index:
-                    output.write(b",")
-                write(key)
-                output.write(b":")
-                write(current[key])
-            output.write(b"}")
-            return
-        if isinstance(current, (list, tuple)):
-            output.write(b"[")
-            for index, item in enumerate(current):
-                if index:
-                    output.write(b",")
-                write(item)
-            output.write(b"]")
-            return
-        raise TypeError(f"unsupported canonical JSON value: {type(current).__name__}")
-
-    write(value)
+    _write_canonical_value(output, value)
     return output.getvalue()
+
+
+def _write_canonical_histogram(output: io.BytesIO, pairs: Iterable[tuple[int, int]]) -> None:
+    output.write(b"[")
+    for index, (bucket, count) in enumerate(pairs):
+        if index:
+            output.write(b",")
+        output.write(f"[{bucket},{count}]".encode("ascii"))
+    output.write(b"]")
+
+
+def _write_canonical_value(output: io.BytesIO, current: object) -> None:
+    if isinstance(current, DenseHistogramPairs):
+        _write_canonical_histogram(output, _iter_dense_histogram_pairs(current.bins))
+    elif isinstance(current, _SparseHistogramPairs):
+        _write_canonical_histogram(output, current)
+    elif isinstance(current, dict):
+        if not all(isinstance(key, str) for key in current):
+            raise TypeError("canonical JSON object keys must be strings")
+        output.write(b"{")
+        for index, key in enumerate(sorted(current)):
+            if index:
+                output.write(b",")
+            _write_canonical_scalar(output, key)
+            output.write(b":")
+            _write_canonical_value(output, current[key])
+        output.write(b"}")
+    elif isinstance(current, (list, tuple)):
+        output.write(b"[")
+        for index, item in enumerate(current):
+            if index:
+                output.write(b",")
+            _write_canonical_value(output, item)
+        output.write(b"]")
+    else:
+        _write_canonical_scalar(output, current)
+
+
+def _write_canonical_scalar(output: io.BytesIO, current: object) -> None:
+    if current is None:
+        output.write(b"null")
+        return
+    if isinstance(current, (bool, np.bool_)):
+        output.write(b"true" if bool(current) else b"false")
+        return
+    if isinstance(current, (int, np.integer)):
+        output.write(str(int(current)).encode("ascii"))
+        return
+    if isinstance(current, (float, np.floating)):
+        output.write(
+            json.dumps(float(current), allow_nan=False, separators=(",", ":")).encode("ascii")
+        )
+        return
+    if isinstance(current, str):
+        output.write(json.dumps(current, ensure_ascii=True).encode("ascii"))
+        return
+    raise TypeError(f"unsupported canonical JSON value: {type(current).__name__}")
 
 
 def self_fingerprint(value: dict[str, Any]) -> str:
@@ -734,7 +734,7 @@ def publish_quality_frame(  # noqa: C901
                 path for source_name, path, _source, _png in payload_sources if source_name == name
             )
             temporaries[path].replace(
-                after_replace=lambda name=name: _call_fault(fault, f"after_{name}_replace"),
+                after_replace=partial(_call_fault, fault, f"after_{name}_replace"),
             )
             _call_fault(fault, f"after_{name}_directory_sync")
         _call_fault(fault, "before_manifest_replace")
@@ -912,6 +912,18 @@ class _SparseHistogramPairs:
                 cursor += 1
 
 
+def _parse_histogram_pair(raw: bytearray | bytes, cursor: int) -> tuple[int, int, int]:
+    if cursor >= len(raw) or raw[cursor] != 91:
+        raise ValueError("diagnostic histogram pair is malformed")
+    bucket, cursor = _parse_canonical_uint(raw, cursor + 1)
+    if cursor >= len(raw) or raw[cursor] != 44:  # ,
+        raise ValueError("diagnostic histogram pair is malformed")
+    count, cursor = _parse_canonical_uint(raw, cursor + 1)
+    if cursor >= len(raw) or raw[cursor] != 93:  # ]
+        raise ValueError("diagnostic histogram pair is malformed")
+    return bucket, count, cursor
+
+
 def _parse_histogram_span(
     raw: bytearray | bytes,
     start: int,
@@ -925,14 +937,7 @@ def _parse_histogram_span(
     if cursor < len(raw) and raw[cursor] == 93:  # ]
         return _SparseHistogramPairs(raw, start, cursor + 1), cursor + 1
     while True:
-        if cursor >= len(raw) or raw[cursor] != 91:
-            raise ValueError("diagnostic histogram pair is malformed")
-        bucket, cursor = _parse_canonical_uint(raw, cursor + 1)
-        if cursor >= len(raw) or raw[cursor] != 44:  # ,
-            raise ValueError("diagnostic histogram pair is malformed")
-        count, cursor = _parse_canonical_uint(raw, cursor + 1)
-        if cursor >= len(raw) or raw[cursor] != 93:  # ]
-            raise ValueError("diagnostic histogram pair is malformed")
+        bucket, count, cursor = _parse_histogram_pair(raw, cursor)
         if bucket <= previous_bucket or bucket >= bin_count or count == 0:
             raise ValueError("diagnostic histogram pairs are not canonical sparse bins")
         previous_bucket = bucket
@@ -946,19 +951,9 @@ def _parse_histogram_span(
         cursor += 1
 
 
-def _parse_streaming_frame_stats(
-    raw: bytearray | bytes,
-    *,
-    render_width: int,
-    raw_end: int | None = None,
-) -> dict[str, Any]:
-    """Parse frame stats without materializing variable `[bucket,count]` lists."""
-
-    if raw_end is None:
-        raw_end = len(raw)
-    if raw_end <= 0 or raw_end > len(raw):
-        raise ValueError("diagnostic frame statistics byte range is invalid")
-
+def _frame_histogram_spans(
+    raw: bytearray | bytes, render_width: int
+) -> list[tuple[int, int, _SparseHistogramPairs]]:
     markers = (
         (b'"lane_count_histogram":', 16 * (render_width + 1)),
         (b'"touched_pixel_span_histogram":', render_width + 1),
@@ -988,7 +983,23 @@ def _parse_streaming_frame_stats(
         >= 0
     ):
         raise ValueError("diagnostic frame statistics contain extra histograms")
+    return spans
 
+
+def _parse_streaming_frame_stats(
+    raw: bytearray | bytes,
+    *,
+    render_width: int,
+    raw_end: int | None = None,
+) -> dict[str, Any]:
+    """Parse frame stats without materializing variable `[bucket,count]` lists."""
+
+    if raw_end is None:
+        raw_end = len(raw)
+    if raw_end <= 0 or raw_end > len(raw):
+        raise ValueError("diagnostic frame statistics byte range is invalid")
+
+    spans = _frame_histogram_spans(raw, render_width)
     compact_parts: list[bytes] = []
     cursor = 0
     for start, end, _histogram in spans:
@@ -1175,6 +1186,27 @@ def _validate_eye_statistics(
     )
     if _json_u64(value["pixel_count"], f"{field}.pixel_count", maximum=pixel_count) != pixel_count:
         raise ValueError(f"{field}.pixel_count does not equal render pixels")
+    _validate_eye_state_counts(value, field, pixel_count)
+    _validate_eye_hole_runs(value["hole_runs"], field, context.render_shape[1], lane_count)
+    _validate_eye_backend_counts(value, field, context, lane_count, pixel_count, record_cap)
+    _json_u64(
+        value["final_unresolved_lane_count"],
+        f"{field}.final_unresolved_lane_count",
+        maximum=lane_count,
+    )
+    requires_quality_plan = (
+        context.render_mode == "quality" and context.occlusion_fill == "background"
+    )
+    if requires_quality_plan:
+        _validate_quality_limits(value["quality_limits"], f"{field}.quality_limits")
+    elif value["quality_limits"] is not None:
+        raise ValueError(f"{field}.quality_limits must be null")
+
+    _validate_eye_quality_budgets(value["quality_budgets"], field, context, pixel_count, record_cap)
+    return value
+
+
+def _validate_eye_state_counts(value: dict[str, Any], field: str, pixel_count: int) -> None:
     counts = _exact_object(
         value["state_pixel_counts"], set(_STATE_FIELDS), f"{field}.state_pixel_counts"
     )
@@ -1191,17 +1223,19 @@ def _validate_eye_statistics(
         if ratio != float(count) / float(pixel_count):
             raise ValueError(f"{field}.state_pixel_ratios.{name} is not derived from its count")
 
-    holes = _exact_object(value["hole_runs"], _HOLE_RUN_FIELDS, f"{field}.hole_runs")
+
+def _validate_eye_hole_runs(hole_runs: object, field: str, width: int, lane_count: int) -> None:
+    holes = _exact_object(hole_runs, _HOLE_RUN_FIELDS, f"{field}.hole_runs")
     lane_total, lane_max, lane_p95 = _sparse_histogram_metrics(
         holes["lane_count_histogram"],
         field=f"{field}.hole_runs.lane_count_histogram",
-        maximum_bucket=16 * context.render_shape[1],
+        maximum_bucket=16 * width,
         maximum_count=lane_count,
     )
     span_total, span_max, span_p95 = _sparse_histogram_metrics(
         holes["touched_pixel_span_histogram"],
         field=f"{field}.hole_runs.touched_pixel_span_histogram",
-        maximum_bucket=context.render_shape[1],
+        maximum_bucket=width,
         maximum_count=lane_count,
     )
     if (
@@ -1222,10 +1256,19 @@ def _validate_eye_statistics(
     for name, expected in integer_derived.items():
         if _json_u64(holes[name], f"{field}.hole_runs.{name}") != expected:
             raise ValueError(f"{field}.hole_runs.{name} is not histogram-derived")
-    for name, expected in float_derived.items():
-        if _json_binary64(holes[name], f"{field}.hole_runs.{name}") != expected:
+    for name, expected_float in float_derived.items():
+        if _json_binary64(holes[name], f"{field}.hole_runs.{name}") != expected_float:
             raise ValueError(f"{field}.hole_runs.{name} is not histogram-derived")
 
+
+def _validate_eye_backend_counts(
+    value: dict[str, Any],
+    field: str,
+    context: DiagnosticsStageContext,
+    lane_count: int,
+    pixel_count: int,
+    record_cap: int,
+) -> None:
     for collection, maximum in (
         ("backend_lane_counts", lane_count),
         ("backend_pixel_counts", pixel_count),
@@ -1263,24 +1306,14 @@ def _validate_eye_statistics(
         elif component_count is not None:
             raise ValueError(f"{field}.backend_component_counts.{name} must be null")
 
-    _json_u64(
-        value["final_unresolved_lane_count"],
-        f"{field}.final_unresolved_lane_count",
-        maximum=lane_count,
-    )
-    requires_quality_plan = (
-        context.render_mode == "quality" and context.occlusion_fill == "background"
-    )
-    if requires_quality_plan:
-        _validate_quality_limits(value["quality_limits"], f"{field}.quality_limits")
-    elif value["quality_limits"] is not None:
-        raise ValueError(f"{field}.quality_limits must be null")
 
-    budgets = value["quality_budgets"]
+def _validate_eye_quality_budgets(
+    budgets: object, field: str, context: DiagnosticsStageContext, pixel_count: int, record_cap: int
+) -> None:
     if context.render_mode == "fast":
         if budgets is not None:
             raise ValueError(f"{field}.quality_budgets must be null")
-        return value
+        return
     budget_values = _exact_object(budgets, _QUALITY_BUDGET_FIELDS, f"{field}.quality_budgets")
     expected_budget_availability = (
         "quality_repair_plan"
@@ -1316,7 +1349,6 @@ def _validate_eye_statistics(
         )
     elif p95 is not None:
         raise ValueError(f"{field}.quality_budgets.fallback_visited_nodes_p95 must be null")
-    return value
 
 
 def _validate_frame_statistics_schema(
@@ -1406,7 +1438,12 @@ def _validate_frame_statistics_schema(
         if fraction != expected_fraction:
             raise ValueError("metric projection fraction is not count-derived")
 
-    nearest = value["geometry_nearest"]
+    _validate_nearest_statistics(value["geometry_nearest"], context, pixel_count)
+
+
+def _validate_nearest_statistics(
+    nearest: object, context: DiagnosticsStageContext, pixel_count: int
+) -> None:
     if context.render_mode == "fast":
         if nearest is not None:
             raise ValueError("Fast frame statistics require null geometry-nearest statistics")
@@ -1482,15 +1519,9 @@ class _PayloadAudit:
     prefix: bytes
 
 
-def _audit_payload_identity(
-    root: Path,
-    identity: object,
-    *,
-    expected_path: Path,
-    capture_limit: int | None = None,
-    prefix_bytes: int = 0,
-    acquired: AcquiredRoot,
-) -> _PayloadAudit:
+def _payload_slot(
+    root: Path, identity: object, expected_path: Path, capture_limit: int | None
+) -> tuple[Path, int, str]:
     if not isinstance(identity, dict) or set(identity) != {
         "relative_path",
         "sha256",
@@ -1511,6 +1542,19 @@ def _audit_payload_identity(
         raise ValueError("diagnostic payload identity is invalid")
     if capture_limit is not None and byte_count > capture_limit:
         raise ValueError("diagnostic payload exceeds its capture bound")
+    return path, byte_count, identity["sha256"]
+
+
+def _audit_payload_identity(
+    root: Path,
+    identity: object,
+    *,
+    expected_path: Path,
+    capture_limit: int | None = None,
+    prefix_bytes: int = 0,
+    acquired: AcquiredRoot,
+) -> _PayloadAudit:
+    path, byte_count, expected_sha = _payload_slot(root, identity, expected_path, capture_limit)
     digest = hashlib.sha256()
     total = 0
     captured = bytearray(byte_count) if capture_limit is not None else None
@@ -1534,7 +1578,7 @@ def _audit_payload_identity(
                 total += count
     except NoFollowPathError as error:
         raise ValueError(str(error)) from error
-    if total != byte_count or identity["sha256"] != digest.hexdigest():
+    if total != byte_count or expected_sha != digest.hexdigest():
         raise ValueError("diagnostic payload identity does not match its bytes")
     return _PayloadAudit(captured, bytes(prefix))
 
@@ -1955,6 +1999,24 @@ def legacy_fast_unavailable_aggregates_match(
         return False
 
 
+def _publish_empty_legacy_jsonl(jsonl_path: Path, fault: FaultHook | None) -> None:
+    owned = OwnedSiblingTemporary.create(jsonl_path)
+    try:
+        _call_fault(fault, "before_frames_jsonl_temporary_write")
+        owned.sync()
+        _call_fault(fault, "after_frames_jsonl_temporary_sync")
+        _call_fault(fault, "before_frames_jsonl_replace")
+        owned.replace(
+            after_replace=lambda: _call_fault(
+                fault,
+                "after_frames_jsonl_replace",
+            ),
+        )
+        _call_fault(fault, "after_frames_jsonl_directory_sync")
+    finally:
+        owned.cleanup()
+
+
 def publish_legacy_fast_unavailable(
     context: StreamingDiagnosticsStageContext,
     adoption: object,
@@ -2025,21 +2087,7 @@ def publish_legacy_fast_unavailable(
             raw_byte_count=0,
         )
         if not jsonl_present:
-            owned = OwnedSiblingTemporary.create(jsonl_path)
-            try:
-                _call_fault(fault, "before_frames_jsonl_temporary_write")
-                owned.sync()
-                _call_fault(fault, "after_frames_jsonl_temporary_sync")
-                _call_fault(fault, "before_frames_jsonl_replace")
-                owned.replace(
-                    after_replace=lambda: _call_fault(
-                        fault,
-                        "after_frames_jsonl_replace",
-                    ),
-                )
-                _call_fault(fault, "after_frames_jsonl_directory_sync")
-            finally:
-                owned.cleanup()
+            _publish_empty_legacy_jsonl(jsonl_path, fault)
 
         summary_present = _prepare_legacy_output(
             acquired,
@@ -2243,7 +2291,7 @@ def _iter_streaming_jsonl(
                     render_width=context.render_shape[1],
                     raw_end=len(line) - 1,
                 )
-                line = None
+                del line
                 yield value
                 del value
     if count != context.frame_count:
@@ -2302,6 +2350,15 @@ class _ExactCanonicalReader:
         return self._buffer[self._buffer_offset :]
 
     def _read_exact(self, byte_count: int) -> bytes:
+        buffered_count = byte_count - len(self._pending)
+        end = self._buffer_offset + buffered_count
+        if buffered_count >= 0 and end <= len(self._buffer):
+            raw = self._pending + self._buffer[self._buffer_offset : end]
+            self._pending = b""
+            self._buffer_offset = end
+            self.raw_digest.update(raw)
+            self.raw_byte_count += len(raw)
+            return raw
         chunks = bytearray()
         if self._pending and byte_count:
             chunks.extend(self._pending)
@@ -2363,6 +2420,19 @@ class _ExactCanonicalReader:
             self.self_digest.update(raw)
         return raw[1:-1].decode("ascii")
 
+    def fingerprint(self) -> str:
+        fingerprint = self.canonical_string(maximum_bytes=64, fingerprinted=False)
+        if not _is_hex64(fingerprint):
+            raise ValueError("diagnostics metadata fingerprint is malformed")
+        return fingerprint
+
+    def read_string_run(self, limit: int) -> bytes:
+        if self._buffer_offset == len(self._buffer) and not self._source_chunk():
+            raise ValueError("diagnostics metadata ended early")
+        start = self._buffer_offset
+        match = _CANONICAL_STRING_LITERAL.match(self._buffer, start, start + max(1, limit))
+        return b"" if match is None else self._read_exact(match.end() - start)
+
     def optional_hex64(self) -> str | None:
         first = self._read_exact(1)
         self.self_digest.update(first)
@@ -2400,126 +2470,14 @@ class _ExactCanonicalReader:
             <= 0
         ):
             raise ValueError("diagnostics canonical parser bounds must be positive")
-        raw = bytearray(self._read_exact(1))
-        first = raw[0]
-        container_count = 0
-        scalar_count = 0
-
-        def check_raw_bound() -> None:
-            if len(raw) > maximum_bytes:
-                raise StereoControlBudgetError(
-                    "diagnostics canonical value exceeds its byte budget"
-                )
-
-        def count_scalar() -> None:
-            nonlocal scalar_count
-            scalar_count += 1
-            if scalar_count > maximum_scalars:
-                raise StereoControlBudgetError(
-                    "diagnostics canonical value exceeds its scalar budget"
-                )
-
-        def count_container(depth: int) -> None:
-            nonlocal container_count
-            if depth > maximum_depth:
-                raise StereoControlBudgetError(
-                    "diagnostics canonical value exceeds its depth budget"
-                )
-            container_count += 1
-            if container_count > maximum_containers:
-                raise StereoControlBudgetError(
-                    "diagnostics canonical value exceeds its container budget"
-                )
-
-        if first == ord('"'):
-            count_scalar()
-            escaped = False
-            string_bytes = 0
-            while True:
-                character = self._read_exact(1)
-                raw.extend(character)
-                if escaped:
-                    escaped = False
-                elif character == b"\\":
-                    escaped = True
-                elif character == b'"':
-                    break
-                string_bytes += 1
-                if string_bytes > maximum_string_bytes:
-                    raise StereoControlBudgetError(
-                        "diagnostics canonical value exceeds its string budget"
-                    )
-                check_raw_bound()
-        elif first in {ord("["), ord("{")}:
-            count_container(1)
-            stack = [ord("]") if first == ord("[") else ord("}")]
-            in_string = False
-            escaped = False
-            scalar_active = False
-            scalar_bytes = 0
-            string_bytes = 0
-            while stack:
-                character = self._read_exact(1)
-                raw.extend(character)
-                byte = character[0]
-                if in_string:
-                    if escaped:
-                        escaped = False
-                        string_bytes += 1
-                    elif byte == ord("\\"):
-                        escaped = True
-                        string_bytes += 1
-                    elif byte == ord('"'):
-                        in_string = False
-                    else:
-                        string_bytes += 1
-                    if string_bytes > maximum_string_bytes:
-                        raise StereoControlBudgetError(
-                            "diagnostics canonical value exceeds its string budget"
-                        )
-                elif byte == ord('"'):
-                    count_scalar()
-                    in_string = True
-                    scalar_active = False
-                    string_bytes = 0
-                elif byte == ord("["):
-                    count_container(len(stack) + 1)
-                    stack.append(ord("]"))
-                    scalar_active = False
-                elif byte == ord("{"):
-                    count_container(len(stack) + 1)
-                    stack.append(ord("}"))
-                elif byte in {ord("]"), ord("}")}:
-                    if byte != stack.pop():
-                        raise ValueError("diagnostics canonical value nesting is malformed")
-                    scalar_active = False
-                elif byte in {ord(","), ord(":")}:
-                    scalar_active = False
-                elif byte in b" \t\r\n":
-                    raise ValueError("diagnostics canonical value is noncanonical")
-                else:
-                    if not scalar_active:
-                        count_scalar()
-                        scalar_active = True
-                        scalar_bytes = 0
-                    scalar_bytes += 1
-                    if scalar_bytes > maximum_string_bytes:
-                        raise StereoControlBudgetError(
-                            "diagnostics canonical value exceeds its scalar-token budget"
-                        )
-                check_raw_bound()
-        else:
-            while self.peek() not in {b",", b"}"}:
-                if not self.peek():
-                    raise ValueError("diagnostics canonical value ended early")
-                raw.extend(self._read_exact(1))
-                if raw[-1] in b" \t\r\n":
-                    raise ValueError("diagnostics canonical value is noncanonical")
-                if len(raw) > maximum_string_bytes:
-                    raise StereoControlBudgetError(
-                        "diagnostics canonical value exceeds its scalar-token budget"
-                    )
-                check_raw_bound()
+        raw = _CanonicalValueScanner(
+            self,
+            maximum_bytes,
+            maximum_depth,
+            maximum_containers,
+            maximum_scalars,
+            maximum_string_bytes,
+        ).scan()
         try:
             value = strict_canonical_json_loads(bytes(raw), max_bytes=maximum_bytes)
         except (MemoryError, RecursionError) as error:
@@ -2531,6 +2489,148 @@ class _ExactCanonicalReader:
         if fingerprinted:
             self.self_digest.update(raw)
         return value
+
+
+class _CanonicalValueScanner:
+    """Bounded lexical pass preceding strict JSON decoding, sharing the reader's byte cursor."""
+
+    def __init__(
+        self,
+        reader: _ExactCanonicalReader,
+        maximum_bytes: int,
+        maximum_depth: int,
+        maximum_containers: int,
+        maximum_scalars: int,
+        maximum_string_bytes: int,
+    ) -> None:
+        self.reader = reader
+        self.maximum_bytes = maximum_bytes
+        self.maximum_depth = maximum_depth
+        self.maximum_containers = maximum_containers
+        self.maximum_scalars = maximum_scalars
+        self.maximum_string_bytes = maximum_string_bytes
+        self.scalar_count = 0
+        self.container_count = 0
+        self.raw = bytearray(reader._read_exact(1))
+
+    def check_raw_bound(self) -> None:
+        if len(self.raw) > self.maximum_bytes:
+            raise StereoControlBudgetError("diagnostics canonical value exceeds its byte budget")
+
+    def count_scalar(self) -> None:
+        self.scalar_count += 1
+        if self.scalar_count > self.maximum_scalars:
+            raise StereoControlBudgetError("diagnostics canonical value exceeds its scalar budget")
+
+    def count_container(self, depth: int) -> None:
+        if depth > self.maximum_depth:
+            raise StereoControlBudgetError("diagnostics canonical value exceeds its depth budget")
+        self.container_count += 1
+        if self.container_count > self.maximum_containers:
+            raise StereoControlBudgetError(
+                "diagnostics canonical value exceeds its container budget"
+            )
+
+    def consume_string_run(self, string_bytes: int) -> int:
+        # Stop at the first byte that can exceed either existing budget.
+        limit = min(
+            self.maximum_string_bytes - string_bytes + 1,
+            self.maximum_bytes - len(self.raw) + 1,
+        )
+        run = self.reader.read_string_run(limit)
+        if not run:
+            return string_bytes
+        self.raw.extend(run)
+        string_bytes += len(run)
+        if string_bytes > self.maximum_string_bytes:
+            raise StereoControlBudgetError("diagnostics canonical value exceeds its string budget")
+        self.check_raw_bound()
+        return string_bytes
+
+    def _next_byte(self) -> int:
+        character = self.reader._read_exact(1)
+        self.raw.extend(character)
+        return character[0]
+
+    def _string(self) -> None:
+        escaped = False
+        size = 0
+        while True:
+            if not escaped:
+                size = self.consume_string_run(size)
+            byte = self._next_byte()
+            if escaped:
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == ord('"'):
+                return
+            size += 1
+            if size > self.maximum_string_bytes:
+                raise StereoControlBudgetError(
+                    "diagnostics canonical value exceeds its string budget"
+                )
+            self.check_raw_bound()
+
+    def _scalar_token_size(self, size: int) -> int:
+        if size > self.maximum_string_bytes:
+            raise StereoControlBudgetError(
+                "diagnostics canonical value exceeds its scalar-token budget"
+            )
+        return size
+
+    def _bare_value(self) -> None:
+        while self.reader.peek() not in {b",", b"}"}:
+            if not self.reader.peek():
+                raise ValueError("diagnostics canonical value ended early")
+            if self._next_byte() in b" \t\r\n":
+                raise ValueError("diagnostics canonical value is noncanonical")
+            self._scalar_token_size(len(self.raw))
+            self.check_raw_bound()
+
+    def _container(self, first: int) -> None:
+        self.count_container(1)
+        stack = [ord("]") if first == ord("[") else ord("}")]
+        scalar_bytes = 0
+        while stack:
+            byte = self._next_byte()
+            if byte == ord('"'):
+                self.count_scalar()
+                self.check_raw_bound()
+                self._string()
+                scalar_bytes = 0
+            elif byte in {ord("["), ord("{")}:
+                self.count_container(len(stack) + 1)
+                stack.append(ord("]") if byte == ord("[") else ord("}"))
+                if byte == ord("["):
+                    scalar_bytes = 0
+            elif byte in {ord("]"), ord("}")}:
+                if byte != stack.pop():
+                    raise ValueError("diagnostics canonical value nesting is malformed")
+                scalar_bytes = 0
+            elif byte in {ord(","), ord(":")}:
+                scalar_bytes = 0
+            else:
+                scalar_bytes = self._extend_token(byte, scalar_bytes)
+            self.check_raw_bound()
+
+    def _extend_token(self, byte: int, size: int) -> int:
+        if byte in b" \t\r\n":
+            raise ValueError("diagnostics canonical value is noncanonical")
+        if not size:
+            self.count_scalar()
+        return self._scalar_token_size(size + 1)
+
+    def scan(self) -> bytearray:
+        first = self.raw[0]
+        if first == ord('"'):
+            self.count_scalar()
+            self._string()
+        elif first in {ord("["), ord("{")}:
+            self._container(first)
+        else:
+            self._bare_value()
+        return self.raw
 
 
 class _BoundedReadHandle:
@@ -2581,6 +2681,18 @@ _DIAGNOSTICS_PRUNE_ENTRIES_MAX_CONTAINERS = 1 + 16 * 4
 _DIAGNOSTICS_PRUNE_ENTRIES_MAX_SCALARS = 16 * 21
 
 
+def _validate_diagnostics_provenance(fields: dict[str, Any], render_mode: str) -> None:
+    native_fingerprint = fields.get("native_geometry_fingerprint")
+    content_sha256 = fields.get("quality_input_manifest_sha256")
+    if render_mode == "quality":
+        if not _is_hex64(native_fingerprint):
+            raise ValueError("Quality diagnostics native geometry identity is invalid")
+        if not _is_hex64(content_sha256):
+            raise ValueError("Quality diagnostics content identity is invalid")
+    elif native_fingerprint is not None or content_sha256 is not None:
+        raise ValueError("Fast diagnostics carry Quality-only provenance")
+
+
 @dataclass(frozen=True, slots=True)
 class DiagnosticsMetadataProjection:
     path: Path
@@ -2624,16 +2736,7 @@ class DiagnosticsMetadataProjection:
         ):
             raise ValueError("diagnostics metadata scalar contract is invalid")
 
-        native_fingerprint = fields.get("native_geometry_fingerprint")
-        content_sha256 = fields.get("quality_input_manifest_sha256")
-        if render_mode == "quality":
-            if not _is_hex64(native_fingerprint):
-                raise ValueError("Quality diagnostics native geometry identity is invalid")
-            if not _is_hex64(content_sha256):
-                raise ValueError("Quality diagnostics content identity is invalid")
-        elif native_fingerprint is not None or content_sha256 is not None:
-            raise ValueError("Fast diagnostics carry Quality-only provenance")
-
+        _validate_diagnostics_provenance(fields, render_mode)
         ordered = fields.get("ordered_frame_manifest_fingerprint")
         frames_hash = fields.get("frames_jsonl_sha256")
         summary_hash = fields.get("summary_sha256")
@@ -2742,6 +2845,34 @@ class DiagnosticsMetadataProjection:
         )
 
 
+def _metadata_frame_names(reader: _ExactCanonicalReader) -> Iterator[str]:
+    previous_index: int | None = None
+    frame_count = 0
+    reader.expect(b"[")
+    while reader.peek() != b"]":
+        if frame_count >= STEREO_CONTROL_FRAME_CAP:
+            raise StereoControlBudgetError(
+                "diagnostics frame-name sequence exceeds the control cap"
+            )
+        if frame_count:
+            reader.expect(b",")
+        frame_name = reader.canonical_string(maximum_bytes=1024)
+        match = re.fullmatch(r"frame_([0-9]+)", frame_name, flags=re.ASCII)
+        frame_index = int(match.group(1)) if match is not None else -1
+        if (
+            match is None
+            or frame_index > (1 << 64) - 1
+            or frame_name != f"frame_{frame_index:06d}"
+            or previous_index is not None
+            and frame_index != previous_index + 1
+        ):
+            raise ValueError("diagnostics frame-name sequence is noncanonical")
+        previous_index = frame_index
+        frame_count += 1
+        yield frame_name
+    reader.expect(b"]")
+
+
 def _diagnostics_metadata_events(
     path: Path,
     *,
@@ -2760,7 +2891,6 @@ def _diagnostics_metadata_events(
     static_fields: dict[str, Any] = {}
     fingerprint = ""
     frame_count = 0
-    previous_index: int | None = None
     with acquired.open_regular(path) as handle:
         bounded = (
             _BoundedReadHandle(handle, raw_byte_count) if raw_byte_count is not None else handle
@@ -2772,12 +2902,7 @@ def _diagnostics_metadata_events(
             prefix = (b"," if position else b"") + canonical_json_bytes(key) + b":"
             reader.expect(prefix, fingerprinted=(key != "fingerprint"))
             if key == "fingerprint":
-                fingerprint = reader.canonical_string(
-                    maximum_bytes=64,
-                    fingerprinted=False,
-                )
-                if not _is_hex64(fingerprint):
-                    raise ValueError("diagnostics metadata fingerprint is malformed")
+                fingerprint = reader.fingerprint()
                 continue
             if key != "frame_names":
                 static_fields[key] = reader.canonical_value(
@@ -2790,29 +2915,9 @@ def _diagnostics_metadata_events(
                     ),
                 )
                 continue
-            reader.expect(b"[")
-            while reader.peek() != b"]":
-                if frame_count >= STEREO_CONTROL_FRAME_CAP:
-                    raise StereoControlBudgetError(
-                        "diagnostics frame-name sequence exceeds the control cap"
-                    )
-                if frame_count:
-                    reader.expect(b",")
-                frame_name = reader.canonical_string(maximum_bytes=1024)
-                match = re.fullmatch(r"frame_([0-9]+)", frame_name, flags=re.ASCII)
-                frame_index = int(match.group(1)) if match is not None else -1
-                if (
-                    match is None
-                    or frame_index > (1 << 64) - 1
-                    or frame_name != f"frame_{frame_index:06d}"
-                    or previous_index is not None
-                    and frame_index != previous_index + 1
-                ):
-                    raise ValueError("diagnostics frame-name sequence is noncanonical")
-                previous_index = frame_index
+            for frame_name in _metadata_frame_names(reader):
                 frame_count += 1
                 yield "frame", frame_name
-            reader.expect(b"]")
         reader.expect(b"}")
         if reader.peek():
             raise ValueError("diagnostics metadata has trailing bytes")
@@ -3221,6 +3326,17 @@ def validate_quality_input_binding(
     return content
 
 
+def _expect_context_frame_names(
+    reader: _ExactCanonicalReader, context: StreamingDiagnosticsStageContext
+) -> None:
+    reader.expect(b"[")
+    for index, frame_name in enumerate(_iter_streaming_frame_names(context)):
+        if index:
+            reader.expect(b",")
+        reader.expect(canonical_json_bytes(frame_name))
+    reader.expect(b"]")
+
+
 def _streaming_root_metadata_status(
     context: StreamingDiagnosticsStageContext,
     *,
@@ -3270,19 +3386,9 @@ def _streaming_root_metadata_status(
             prefix = (b"," if position else b"") + canonical_json_bytes(key) + b":"
             reader.expect(prefix, fingerprinted=(key != "fingerprint"))
             if key == "fingerprint":
-                fingerprint = reader.canonical_string(
-                    maximum_bytes=64,
-                    fingerprinted=False,
-                )
-                if not _is_hex64(fingerprint):
-                    raise ValueError("diagnostics metadata fingerprint is malformed")
+                fingerprint = reader.fingerprint()
             elif key == "frame_names":
-                reader.expect(b"[")
-                for index, frame_name in enumerate(_iter_streaming_frame_names(context)):
-                    if index:
-                        reader.expect(b",")
-                    reader.expect(canonical_json_bytes(frame_name))
-                reader.expect(b"]")
+                _expect_context_frame_names(reader, context)
             elif key in {
                 "frames_jsonl_sha256",
                 "metric_clamp_summary_sha256",
@@ -3299,6 +3405,12 @@ def _streaming_root_metadata_status(
             raise ValueError("diagnostics metadata has trailing bytes")
     if fingerprint != reader.self_digest.hexdigest():
         raise ValueError("diagnostics metadata self fingerprint changed")
+    return _streaming_status_from_hashes(status, hashes, context)
+
+
+def _streaming_status_from_hashes(
+    status: str, hashes: dict[str, str | None], context: StreamingDiagnosticsStageContext
+) -> Literal["building", "complete"]:
     if status == "building":
         if any(value is not None for value in hashes.values()):
             raise ValueError("building diagnostics metadata declares aggregates")

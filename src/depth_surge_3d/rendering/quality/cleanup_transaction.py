@@ -13,7 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Protocol
 
+from ...io import _win32
+from ...io.settings_artifact import ProcessingSettingsArtifactV5
 from ...io.file_identity import (
+    WindowsFileIdentityV1,
     DirectoryIdentityV1 as _DirectoryIdentity,
     PersistentIdentityCapabilityError,
     PersistentIdentitySchemaError,
@@ -57,7 +60,8 @@ FaultHook = Callable[[str], None]
 
 
 class FinalCleanupReservationV1(Protocol):
-    index_fingerprint: str
+    @property
+    def index_fingerprint(self) -> str: ...
 
     def validate_diagnostics_preflight(
         self,
@@ -300,20 +304,14 @@ def plan_prune_markers_v1(job_root: Path) -> tuple[PlannedPruneMarkerV1, ...]:
 
     root = Path(job_root).resolve()
     root_identity = _directory_identity(root)
-    root_mount = (
-        _path_mount_identity(root) if _requires_posix_mount_identity() else None
-    )
+    root_mount = _path_mount_identity(root) if _requires_posix_mount_identity() else None
     planned: list[PlannedPruneMarkerV1] = []
     for stage_key, prune_root in discover_prune_roots(root):
         identity = _directory_identity(prune_root)
         if identity.volume_key != root_identity.volume_key:
-            raise CleanupIdentityMismatchError(
-                f"prune root crosses the job volume: {prune_root}"
-            )
+            raise CleanupIdentityMismatchError(f"prune root crosses the job volume: {prune_root}")
         if root_mount is not None and _path_mount_identity(prune_root) != root_mount:
-            raise CleanupIdentityMismatchError(
-                f"prune root crosses a mount: {prune_root}"
-            )
+            raise CleanupIdentityMismatchError(f"prune root crosses a mount: {prune_root}")
         relative_path = _safe_relative_path(root, prune_root)
         token = secrets.token_hex(16)
         marker_name = f".depth-surge-prune-v2-{token}.marker"
@@ -348,23 +346,15 @@ def prune_entry_from_reservation_v1(
 ) -> dict[str, Any]:
     """Rebuild the fixed cleanup authorization carried by a marker extent."""
 
-    matches = [
-        stage_key
-        for stage_key, relative in _PRUNE_ROOT_ORDER
-        if relative == relative_path
-    ]
+    matches = [stage_key for stage_key, relative in _PRUNE_ROOT_ORDER if relative == relative_path]
     if len(matches) != 1:
-        raise CleanupTransactionError(
-            "reserved prune root is outside cleanup contract v2"
-        )
+        raise CleanupTransactionError("reserved prune root is outside cleanup contract v2")
     entry = {
         "stage_key": matches[0],
         "relative_path": relative_path,
         "operation": "delete_tree",
         "cleanup_contract_version": 2,
-        "directory_identity": _DirectoryIdentity.from_object(
-            directory_identity
-        ).to_object(),
+        "directory_identity": _DirectoryIdentity.from_object(directory_identity).to_object(),
         "marker": {
             "name": marker_name,
             "sha256": marker_payload_sha256,
@@ -415,9 +405,7 @@ def _validate_prune_entry(entry: object, *, previous_index: int) -> int:
         raise CleanupTransactionError("cleanup authorization path is invalid")
     index = _PRUNE_ROOT_INDEX.get((stage_key, relative_path))
     if index is None or index <= previous_index:
-        raise CleanupTransactionError(
-            "cleanup authorization roots are not unique pipeline order"
-        )
+        raise CleanupTransactionError("cleanup authorization roots are not unique pipeline order")
     _DirectoryIdentity.from_object(entry["directory_identity"])
     marker = entry["marker"]
     if not isinstance(marker, dict) or set(marker) != {"name", "sha256"}:
@@ -427,14 +415,17 @@ def _validate_prune_entry(entry: object, *, previous_index: int) -> int:
         not isinstance(name, str)
         or not name.startswith(".depth-surge-prune-v2-")
         or not name.endswith(".marker")
-        or _HEX32.fullmatch(name[len(".depth-surge-prune-v2-") : -len(".marker")])
-        is None
+        or _HEX32.fullmatch(name[len(".depth-surge-prune-v2-") : -len(".marker")]) is None
         or not _is_hex64(marker["sha256"])
     ):
-        raise CleanupTransactionError(
-            "cleanup authorization marker identity is invalid"
-        )
+        raise CleanupTransactionError("cleanup authorization marker identity is invalid")
     return index
+
+
+def _validate_ordered_prune_entries(entries: list[dict[str, Any]]) -> None:
+    previous_index = -1
+    for entry in entries:
+        previous_index = _validate_prune_entry(entry, previous_index=previous_index)
 
 
 def build_payload_pruned_document(
@@ -451,9 +442,7 @@ def build_payload_pruned_document(
         projection.validate_state_contract()
         validate_quality_input_binding(projection)
     except ValueError as error:
-        raise CleanupTransactionError(
-            "diagnostics state is invalid before pruning"
-        ) from error
+        raise CleanupTransactionError("diagnostics state is invalid before pruning") from error
     if projection.status not in {"complete", "legacy_fast_unavailable"}:
         raise CleanupTransactionError("diagnostics are not complete before pruning")
     if not _is_hex64(final_video_manifest_sha256):
@@ -461,9 +450,7 @@ def build_payload_pruned_document(
     entries = list(prune_entries)
     if len(entries) > len(_PRUNE_ROOT_ORDER):
         raise CleanupTransactionError("cleanup authorization has too many entries")
-    previous_index = -1
-    for entry in entries:
-        previous_index = _validate_prune_entry(entry, previous_index=previous_index)
+    _validate_ordered_prune_entries(entries)
     fields = dict(projection.static_fields)
     for key in (
         "frames_jsonl_sha256",
@@ -471,14 +458,10 @@ def build_payload_pruned_document(
         "summary_sha256",
     ):
         if not _is_hex64(fields.get(key)):
-            raise CleanupTransactionError(
-                "complete diagnostics aggregate identity is invalid"
-            )
+            raise CleanupTransactionError("complete diagnostics aggregate identity is invalid")
     metric_hash = fields.get("metric_clamp_summary_sha256")
     if metric_hash is not None and not _is_hex64(metric_hash):
-        raise CleanupTransactionError(
-            "metric diagnostics aggregate identity is invalid"
-        )
+        raise CleanupTransactionError("metric diagnostics aggregate identity is invalid")
     fields.update(
         {
             "status": "payload_pruned",
@@ -519,9 +502,7 @@ def _validate_payload_pruned_projection(
         projection.validate_state_contract()
         validate_quality_input_binding(projection, acquired=acquired)
     except ValueError as error:
-        raise CleanupTransactionError(
-            "payload-pruned diagnostics state is invalid"
-        ) from error
+        raise CleanupTransactionError("payload-pruned diagnostics state is invalid") from error
     fields = projection.static_fields
     if (
         projection.status != "payload_pruned"
@@ -537,8 +518,7 @@ def _validate_payload_pruned_projection(
     if (
         not isinstance(pruned_from, dict)
         or set(pruned_from) != _PRUNED_FROM_KEYS
-        or pruned_from.get("previous_status")
-        not in {"complete", "legacy_fast_unavailable"}
+        or pruned_from.get("previous_status") not in {"complete", "legacy_fast_unavailable"}
         or not _is_hex64(pruned_from.get("previous_diagnostics_fingerprint"))
         or not _is_hex64(pruned_from.get("ordered_frame_manifest_fingerprint"))
         or pruned_from.get("frames_jsonl_sha256") != fields["frames_jsonl_sha256"]
@@ -552,13 +532,17 @@ def _validate_payload_pruned_projection(
     entries = fields.get("prune_entries")
     if not isinstance(entries, list) or len(entries) > len(_PRUNE_ROOT_ORDER):
         raise CleanupTransactionError("payload-pruned cleanup entry list is invalid")
-    previous_index = -1
-    for entry in entries:
-        previous_index = _validate_prune_entry(entry, previous_index=previous_index)
+    _validate_ordered_prune_entries(entries)
 
-    root = Path(job_root)
+    _audit_retained_cleanup_files(Path(job_root), fields, acquired)
+    return projection
+
+
+def _audit_retained_cleanup_files(
+    root: Path, fields: dict[str, Any], acquired: AcquiredRoot
+) -> None:
     diagnostics = root / "04_stereo_diagnostics"
-    retained = (
+    retained: tuple[tuple[Path, Any], ...] = (
         (diagnostics / "stereo_coverage_frames.jsonl", fields["frames_jsonl_sha256"]),
         (diagnostics / "stereo_coverage_summary.json", fields["summary_sha256"]),
         (root / "final_video_manifest.json", fields["final_video_manifest_sha256"]),
@@ -569,20 +553,12 @@ def _validate_payload_pruned_projection(
             raise CleanupTransactionError("Quality cleanup content identity is invalid")
         retained += ((diagnostics / "quality_input_manifest.json", content_hash),)
     elif content_hash is not None:
-        raise CleanupTransactionError(
-            "Fast cleanup cannot bind a Quality content manifest"
-        )
+        raise CleanupTransactionError("Fast cleanup cannot bind a Quality content manifest")
     try:
-        if any(
-            _hash_file(path, acquired=acquired) != expected
-            for path, expected in retained
-        ):
+        if any(_hash_file(path, acquired=acquired) != expected for path, expected in retained):
             raise CleanupTransactionError("retained cleanup evidence hash differs")
     except (OSError, NoFollowPathError) as error:
-        raise CleanupTransactionError(
-            "retained cleanup evidence is unavailable"
-        ) from error
-    return projection
+        raise CleanupTransactionError("retained cleanup evidence is unavailable") from error
 
 
 def audit_payload_pruned_historical_diagnostics_v1(job_root: Path) -> bool:
@@ -680,15 +656,11 @@ def _commit_payload_pruned_acquired(  # noqa: C901
     fault: FaultHook | None,
     acquired: AcquiredRoot,
 ) -> DiagnosticsMetadataProjection:
-    active_index = (
-        root / ".depth-surge-reservations-v1" / "final-encoding-reservation-v1.json"
-    )
+    active_index = root / ".depth-surge-reservations-v1" / "final-encoding-reservation-v1.json"
     index_temporary = active_index.with_name(f".{active_index.name}.create-new.tmp")
     control_path = root / "job-control-v1.json"
     control_temporary = control_path.with_name(f".{control_path.name}.create-new.tmp")
-    schema5 = any(
-        path.exists() or path.is_symlink() for path in (control_path, control_temporary)
-    )
+    schema5 = any(path.exists() or path.is_symlink() for path in (control_path, control_temporary))
     active_pair = any(
         path.exists() or path.is_symlink() for path in (active_index, index_temporary)
     )
@@ -705,9 +677,7 @@ def _commit_payload_pruned_acquired(  # noqa: C901
         settings = recover_processing_control_prefix_v1(root)
         if active_pair:
             if settings is None:
-                raise CleanupTransactionError(
-                    "schema-5 cleanup has no recovered job control"
-                )
+                raise CleanupTransactionError("schema-5 cleanup has no recovered job control")
             reservation = load_final_encoding_reservation_v1(root, settings)
     elif schema5 and not hasattr(reservation, "index_fingerprint"):
         raise CleanupTransactionError("schema-5 cleanup reservation is not index-bound")
@@ -770,16 +740,12 @@ def _commit_payload_pruned_acquired(  # noqa: C901
             )
             != content_sha
         ):
-            raise CleanupTransactionError(
-                "retained Quality input manifest hash differs"
-            )
+            raise CleanupTransactionError("retained Quality input manifest hash differs")
     try:
         with acquired.open_regular(final_manifest_path) as handle:
             final_manifest_raw = handle.read(1024 * 1024 + 1)
         if len(final_manifest_raw) > 1024 * 1024:
-            raise CleanupTransactionError(
-                "final-video manifest exceeds its bound or is unsafe"
-            )
+            raise CleanupTransactionError("final-video manifest exceeds its bound or is unsafe")
     except (OSError, NoFollowPathError) as error:
         raise CleanupTransactionError(
             "final-video manifest exceeds its bound or is unsafe"
@@ -846,17 +812,13 @@ def _validate_marker_raw(entry: dict[str, Any], raw: bytes, marker_name: str) ->
             {
                 "cleanup_contract_version": 2,
                 "relative_path": entry["relative_path"],
-                "token": marker_name.removeprefix(
-                    ".depth-surge-prune-v2-"
-                ).removesuffix(".marker"),
+                "token": marker_name.removeprefix(".depth-surge-prune-v2-").removesuffix(".marker"),
             }
         )
         + b"\n"
     )
     if raw != expected:
-        raise CleanupIdentityMismatchError(
-            f"prune marker content differs: {marker_name}"
-        )
+        raise CleanupIdentityMismatchError(f"prune marker content differs: {marker_name}")
 
 
 def _entry_is_reparse(metadata: os.stat_result) -> bool:
@@ -960,9 +922,7 @@ def _delete_tree_posix(  # noqa: C901
                     continue
                 metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 if int(metadata.st_dev) != volume:
-                    raise CleanupIdentityMismatchError(
-                        f"cleanup crossed a mount at {name}"
-                    )
+                    raise CleanupIdentityMismatchError(f"cleanup crossed a mount at {name}")
                 if stat.S_ISDIR(metadata.st_mode) and not _entry_is_reparse(metadata):
                     child_fd = os.open(
                         name,
@@ -974,12 +934,10 @@ def _delete_tree_posix(  # noqa: C901
                         if (
                             int(child_metadata.st_dev) != int(metadata.st_dev)
                             or int(child_metadata.st_ino) != int(metadata.st_ino)
-                            or stat.S_IFMT(child_metadata.st_mode)
-                            != stat.S_IFMT(metadata.st_mode)
+                            or stat.S_IFMT(child_metadata.st_mode) != stat.S_IFMT(metadata.st_mode)
                         ):
                             raise CleanupIdentityMismatchError(
-                                "cleanup descendant changed before acquisition: "
-                                f"{name}"
+                                "cleanup descendant changed before acquisition: " f"{name}"
                             )
                         _require_same_invocation_mount(child_fd, mount_identity, name)
                         attest_tree(child_fd)
@@ -1005,9 +963,7 @@ def _delete_tree_posix(  # noqa: C901
             metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             if int(metadata.st_dev) != volume:
                 raise CleanupIdentityMismatchError(f"cleanup crossed a mount at {name}")
-            is_directory = stat.S_ISDIR(metadata.st_mode) and not _entry_is_reparse(
-                metadata
-            )
+            is_directory = stat.S_ISDIR(metadata.st_mode) and not _entry_is_reparse(metadata)
             if is_directory:
                 child_fd = os.open(
                     name,
@@ -1053,9 +1009,7 @@ def _delete_tree_posix(  # noqa: C901
         except PersistentIdentityCapabilityError as error:
             raise CleanupCapabilityError(str(error)) from error
         if opened_job_root_identity != expected_job_root:
-            raise CleanupIdentityMismatchError(
-                "job root identity changed during cleanup"
-            )
+            raise CleanupIdentityMismatchError("job root identity changed during cleanup")
         _require_same_invocation_mount(job_root_fd, mount_identity, job_root)
         relative_parts = PurePosixPath(entry["relative_path"]).parts
         for part in relative_parts[:-1]:
@@ -1067,9 +1021,7 @@ def _delete_tree_posix(  # noqa: C901
             try:
                 _require_same_invocation_mount(child, mount_identity, part)
                 if int(os.fstat(child).st_dev) != volume:
-                    raise CleanupIdentityMismatchError(
-                        f"cleanup crossed a mount at {part}"
-                    )
+                    raise CleanupIdentityMismatchError(f"cleanup crossed a mount at {part}")
             except BaseException:
                 os.close(child)
                 raise
@@ -1097,9 +1049,7 @@ def _delete_tree_posix(  # noqa: C901
         except PersistentIdentityCapabilityError as error:
             raise CleanupCapabilityError(str(error)) from error
         except PersistentIdentitySchemaError as error:
-            raise CleanupIdentityMismatchError(
-                f"prune root is unsafe: {root}"
-            ) from error
+            raise CleanupIdentityMismatchError(f"prune root is unsafe: {root}") from error
         if opened_identity != expected:
             raise CleanupIdentityMismatchError(f"prune root identity differs: {root}")
         active_marker_name: str | None = None
@@ -1144,19 +1094,13 @@ def _delete_tree_posix(  # noqa: C901
                 active_marker_metadata is None
                 or not stat.S_ISREG(marker_metadata.st_mode)
                 or int(marker_metadata.st_dev) != volume
-                or int(marker_metadata.st_dev)
-                != int(active_marker_metadata.st_dev)
-                or int(marker_metadata.st_ino)
-                != int(active_marker_metadata.st_ino)
+                or int(marker_metadata.st_dev) != int(active_marker_metadata.st_dev)
+                or int(marker_metadata.st_ino) != int(active_marker_metadata.st_ino)
                 or stat.S_IFMT(marker_metadata.st_mode)
                 != stat.S_IFMT(active_marker_metadata.st_mode)
             ):
-                raise CleanupIdentityMismatchError(
-                    f"prune marker is unsafe: {root / marker_name}"
-                )
-            _require_same_invocation_mount(
-                marker_fd, mount_identity, root / marker_name
-            )
+                raise CleanupIdentityMismatchError(f"prune marker is unsafe: {root / marker_name}")
+            _require_same_invocation_mount(marker_fd, mount_identity, root / marker_name)
             with os.fdopen(os.dup(marker_fd), "rb", buffering=0) as marker_handle:
                 marker_raw = marker_handle.read(64 * 1024)
                 if marker_handle.read(1):
@@ -1202,9 +1146,7 @@ def _delete_tree_posix(  # noqa: C901
         with os.scandir(root_fd) as iterator:
             repopulated = next(iterator, None) is not None
         if repopulated:
-            raise CleanupIdentityMismatchError(
-                f"prune root repopulated during cleanup: {root}"
-            )
+            raise CleanupIdentityMismatchError(f"prune root repopulated during cleanup: {root}")
         remove_verified(
             parent_fd,
             active_root_name,
@@ -1237,8 +1179,8 @@ def _delete_tree_windows(  # noqa: C901
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    ntdll = ctypes.WinDLL("ntdll")
+    kernel32 = _win32.load_library("kernel32", use_last_error=True)
+    ntdll = _win32.load_library("ntdll")
     invalid_handle = wintypes.HANDLE(-1).value
     file_attribute_directory = 0x10
     file_attribute_reparse = 0x400
@@ -1323,7 +1265,7 @@ def _delete_tree_windows(  # noqa: C901
     status_to_error.restype = wintypes.DWORD
 
     def win_error(code: int | None = None) -> OSError:
-        return ctypes.WinError(ctypes.get_last_error() if code is None else code)
+        return _win32.win_error(_win32.last_error() if code is None else code)
 
     def checked_close(handle: int, label: object) -> None:
         if not close_handle(wintypes.HANDLE(handle)):
@@ -1408,16 +1350,14 @@ def _delete_tree_windows(  # noqa: C901
                 buffer,
                 len(buffer),
             ):
-                code = ctypes.get_last_error()
+                code = _win32.last_error()
                 if code == 18:
                     return
                 raise win_error(code)
             restart = False
             yield from windows_file_id_extd_entries_v1(buffer, len(buffer))
 
-    def first_name(
-        handle: int, *, excluded: str | None = None
-    ) -> WindowsEnumeratedChildV1 | None:
+    def first_name(handle: int, *, excluded: str | None = None) -> WindowsEnumeratedChildV1 | None:
         # Restart after each deletion. Continuing a Windows directory cursor across
         # namespace mutation may skip the entry which moved into the current slot.
         for entry_value in iter_names(handle):
@@ -1427,10 +1367,7 @@ def _delete_tree_windows(  # noqa: C901
 
     def name_present(handle: int, expected: str) -> bool:
         folded = expected.casefold()
-        return any(
-            entry_value.name.casefold() == folded
-            for entry_value in iter_names(handle)
-        )
+        return any(entry_value.name.casefold() == folded for entry_value in iter_names(handle))
 
     def delete_on_close(handle: int) -> None:
         delete = wintypes.BOOL(True)
@@ -1468,24 +1405,15 @@ def _delete_tree_windows(  # noqa: C901
 
     def visit(directory_handle: int, marker_name: str | None = None) -> None:
         nonlocal removed
-        directory_identity, attributes = identity(
-            directory_handle, require_directory=True
-        )
-        if (
-            directory_identity.volume_serial != volume
-            or attributes & file_attribute_reparse
-        ):
-            raise CleanupIdentityMismatchError(
-                "cleanup crossed a volume or reparse point"
-            )
+        directory_identity, attributes = identity(directory_handle, require_directory=True)
+        if directory_identity.volume_serial != volume or attributes & file_attribute_reparse:
+            raise CleanupIdentityMismatchError("cleanup crossed a volume or reparse point")
         while True:
             next_entry = first_name(directory_handle, excluded=marker_name)
             if next_entry is None:
                 return
             name = next_entry.name
-            is_directory = bool(
-                next_entry.attributes & file_attribute_directory
-            )
+            is_directory = bool(next_entry.attributes & file_attribute_directory)
             child = open_relative(directory_handle, name, directory=is_directory)
             try:
                 child_identity, current_attributes = identity(
@@ -1494,9 +1422,7 @@ def _delete_tree_windows(  # noqa: C901
                     allow_reparse=True,
                 )
                 if child_identity.volume_serial != volume:
-                    raise CleanupIdentityMismatchError(
-                        f"cleanup crossed a volume at {name}"
-                    )
+                    raise CleanupIdentityMismatchError(f"cleanup crossed a volume at {name}")
                 if child_identity.file_id != next_entry.file_id:
                     raise CleanupIdentityMismatchError(
                         f"cleanup descendant changed before acquisition: {name}"
@@ -1525,9 +1451,7 @@ def _delete_tree_windows(  # noqa: C901
             or job_root_file_identity.volume_serial != volume
             or job_root_attributes & file_attribute_reparse
         ):
-            raise CleanupIdentityMismatchError(
-                "job root identity changed during cleanup"
-            )
+            raise CleanupIdentityMismatchError("job root identity changed during cleanup")
         parent_handle = job_root_handle
         relative_parts = PurePosixPath(entry["relative_path"]).parts
         for part_index, part in enumerate(relative_parts):
@@ -1536,14 +1460,9 @@ def _delete_tree_windows(  # noqa: C901
                 child_handle,
                 require_directory=True,
             )
-            if (
-                child_identity.volume_serial != volume
-                or child_attributes & file_attribute_reparse
-            ):
+            if child_identity.volume_serial != volume or child_attributes & file_attribute_reparse:
                 close_handle(wintypes.HANDLE(child_handle))
-                raise CleanupIdentityMismatchError(
-                    f"cleanup crossed a volume at {part}"
-                )
+                raise CleanupIdentityMismatchError(f"cleanup crossed a volume at {part}")
             if part_index == len(relative_parts) - 1:
                 root_handle = child_handle
             else:
@@ -1575,9 +1494,7 @@ def _delete_tree_windows(  # noqa: C901
             checked_close(root_handle, root)
             root_handle = -1
             if name_present(parent_handle, relative_parts[-1]):
-                raise CleanupIdentityMismatchError(
-                    f"deleted prune root remains visible: {root}"
-                )
+                raise CleanupIdentityMismatchError(f"deleted prune root remains visible: {root}")
             return 0
         marker_handle = open_relative(root_handle, marker_name, directory=False)
         try:
@@ -1590,9 +1507,7 @@ def _delete_tree_windows(  # noqa: C901
                 or marker_attributes & file_attribute_reparse
                 or marker_identity.file_id != marker_entry.file_id
             ):
-                raise CleanupIdentityMismatchError(
-                    f"prune marker is unsafe: {root / marker_name}"
-                )
+                raise CleanupIdentityMismatchError(f"prune marker is unsafe: {root / marker_name}")
             marker_raw = read_marker(marker_handle)
             _validate_marker_raw(entry, marker_raw, marker_name)
             visit(root_handle, marker_name)
@@ -1600,9 +1515,7 @@ def _delete_tree_windows(  # noqa: C901
             marker_still_present = False
             for enumerated in iter_names(root_handle):
                 remaining_count += 1
-                marker_still_present = (
-                    marker_still_present or enumerated.name == marker_name
-                )
+                marker_still_present = marker_still_present or enumerated.name == marker_name
                 if remaining_count > 1:
                     break
             if remaining_count != 1 or not marker_still_present:
@@ -1619,16 +1532,12 @@ def _delete_tree_windows(  # noqa: C901
         removed += 1
         after_marker_unlink()
         if first_name(root_handle) is not None:
-            raise CleanupIdentityMismatchError(
-                f"prune root repopulated during cleanup: {root}"
-            )
+            raise CleanupIdentityMismatchError(f"prune root repopulated during cleanup: {root}")
         delete_on_close(root_handle)
         checked_close(root_handle, root)
         root_handle = -1
         if name_present(parent_handle, relative_parts[-1]):
-            raise CleanupIdentityMismatchError(
-                f"deleted prune root remains visible: {root}"
-            )
+            raise CleanupIdentityMismatchError(f"deleted prune root remains visible: {root}")
         return removed
     finally:
         if root_handle >= 0:
@@ -1651,9 +1560,7 @@ def _delete_descendants_no_follow(
 ) -> int:
     if os.name == "nt":
         if not isinstance(volume, str):
-            raise CleanupCapabilityError(
-                "Windows cleanup has no stable volume identity"
-            )
+            raise CleanupCapabilityError("Windows cleanup has no stable volume identity")
         return _delete_tree_windows(
             job_root,
             root,
@@ -1699,70 +1606,91 @@ def run_authorized_cleanup(
     """Delete only persisted, identity-bound roots and keep each marker until last."""
 
     root = Path(job_root).resolve()
+    _require_cleanup_reservation(root, allocation_adapter, allocation_counter)
+    projection = _authorize_cleanup_projection(root, metadata)
+    _emit(fault, "before_cleanup_walk")
+    try:
+        namespace = AcquiredRoot(root)
+    except NoFollowPathError as error:
+        raise CleanupIdentityMismatchError("job root could not be acquired") from error
+    with namespace:
+        walk = _CleanupWalk.acquire(root, namespace)
+        removed = 0
+        authorized_roots: list[Path] = []
+        for index, entry in enumerate(projection.static_fields["prune_entries"]):
+            assert isinstance(entry, dict)
+            removed += walk.remove_entry(entry, index, fault, authorized_roots)
+            _emit(fault, f"after_prune_entry_{index}")
+        for path in authorized_roots:
+            if not walk.is_absent(path, "final prune-root attestation failed"):
+                raise CleanupIdentityMismatchError(
+                    f"prune root reappeared before cleanup completion: {path}"
+                )
+        return removed
+
+
+def _require_cleanup_reservation(
+    root: Path, allocation_adapter: Any, allocation_counter: Any
+) -> None:
     control_path = root / "job-control-v1.json"
     control_temporary = control_path.with_name(f".{control_path.name}.create-new.tmp")
-    if any(
-        path.exists() or path.is_symlink() for path in (control_path, control_temporary)
-    ):
-        from ...io.operations import recover_processing_control_prefix_v1
-        from ...processing.video.final_publication import (
-            FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
-            load_final_encoding_reservation_v1,
+    if not any(path.exists() or path.is_symlink() for path in (control_path, control_temporary)):
+        return
+
+    from ...io.operations import recover_processing_control_prefix_v1
+    from ...processing.video.final_publication import (
+        FINAL_ENCODING_RESERVATION_RELATIVE_PATH,
+    )
+
+    active_index = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
+    index_temporary = active_index.with_name(f".{active_index.name}.create-new.tmp")
+    if not any(path.exists() or path.is_symlink() for path in (active_index, index_temporary)):
+        raise CleanupTransactionError("schema-5 cleanup requires its active final reservation")
+
+    recovery_kwargs = {}
+    if allocation_adapter is not None:
+        recovery_kwargs["allocation_adapter"] = allocation_adapter
+    if allocation_counter is not None:
+        recovery_kwargs["allocation_counter"] = allocation_counter
+    try:
+        settings = recover_processing_control_prefix_v1(root, **recovery_kwargs)
+    except Exception as error:
+        raise CleanupTransactionError("schema-5 cleanup control recovery failed") from error
+    if settings is None:
+        raise CleanupTransactionError("schema-5 cleanup has no durable settings")
+    settings_value = settings.to_object()
+    cleanup_status = settings_value["metadata"]["cleanup_status"]
+    del settings_value
+    if cleanup_status != "pending":
+        raise CleanupTransactionError("schema-5 cleanup requires durable cleanup_status=pending")
+    _authenticate_final_cleanup_reservation(root, settings, recovery_kwargs)
+
+
+def _authenticate_final_cleanup_reservation(
+    root: Path, settings: ProcessingSettingsArtifactV5, recovery_kwargs: dict[str, Any]
+) -> None:
+    from ...processing.video.final_publication import load_final_encoding_reservation_v1
+
+    try:
+        reservation = load_final_encoding_reservation_v1(
+            root,
+            settings,
+            **recovery_kwargs,
         )
+        recovery = reservation.recover_publication_prefix()
+        recovery_phase = recovery.phase
+        del recovery
+    except Exception as error:
+        raise CleanupTransactionError(
+            "schema-5 cleanup could not reopen its final reservation"
+        ) from error
+    if recovery_phase != "publication_authenticated":
+        raise CleanupTransactionError("schema-5 cleanup requires authenticated final publication")
 
-        active_index = root / FINAL_ENCODING_RESERVATION_RELATIVE_PATH
-        index_temporary = active_index.with_name(f".{active_index.name}.create-new.tmp")
-        if not any(
-            path.exists() or path.is_symlink()
-            for path in (active_index, index_temporary)
-        ):
-            raise CleanupTransactionError(
-                "schema-5 cleanup requires its active final reservation"
-            )
 
-        recovery_kwargs = {}
-        if allocation_adapter is not None:
-            recovery_kwargs["allocation_adapter"] = allocation_adapter
-        if allocation_counter is not None:
-            recovery_kwargs["allocation_counter"] = allocation_counter
-        try:
-            settings = recover_processing_control_prefix_v1(root, **recovery_kwargs)
-        except Exception as error:
-            raise CleanupTransactionError(
-                "schema-5 cleanup control recovery failed"
-            ) from error
-        if settings is None:
-            raise CleanupTransactionError("schema-5 cleanup has no durable settings")
-        settings_value = settings.to_object()
-        cleanup_status = settings_value["metadata"]["cleanup_status"]
-        del settings_value
-        if cleanup_status != "pending":
-            raise CleanupTransactionError(
-                "schema-5 cleanup requires durable cleanup_status=pending"
-            )
-        load_kwargs = {}
-        if allocation_adapter is not None:
-            load_kwargs["allocation_adapter"] = allocation_adapter
-        if allocation_counter is not None:
-            load_kwargs["allocation_counter"] = allocation_counter
-        try:
-            reservation = load_final_encoding_reservation_v1(
-                root,
-                settings,
-                **load_kwargs,
-            )
-            recovery = reservation.recover_publication_prefix()
-            recovery_phase = recovery.phase
-            del recovery
-        except Exception as error:
-            raise CleanupTransactionError(
-                "schema-5 cleanup could not reopen its final reservation"
-            ) from error
-        if recovery_phase != "publication_authenticated":
-            raise CleanupTransactionError(
-                "schema-5 cleanup requires authenticated final publication"
-            )
-        del reservation, settings
+def _authorize_cleanup_projection(
+    root: Path, metadata: DiagnosticsMetadataProjection | None
+) -> DiagnosticsMetadataProjection:
     projection = _parse_payload_pruned(root)
     if metadata is not None:
         if not isinstance(metadata, DiagnosticsMetadataProjection):
@@ -1776,18 +1704,22 @@ def run_authorized_cleanup(
             raise CleanupTransactionError(
                 "cleanup metadata cache differs from durable authorization"
             )
-    value = projection.static_fields
-    _emit(fault, "before_cleanup_walk")
-    try:
-        namespace = AcquiredRoot(root)
-    except NoFollowPathError as error:
-        raise CleanupIdentityMismatchError("job root could not be acquired") from error
-    with namespace:
+    return projection
+
+
+@dataclass(frozen=True)
+class _CleanupWalk:
+    root: Path
+    namespace: AcquiredRoot
+    root_identity: _DirectoryIdentity
+    volume: int | str
+    mount: _InvocationMountIdentity | None
+
+    @classmethod
+    def acquire(cls, root: Path, namespace: AcquiredRoot) -> _CleanupWalk:
         root_identity = namespace.persistent_identity
         if not isinstance(root_identity, _DirectoryIdentity):
-            raise CleanupCapabilityError(
-                "job root has no persistent directory identity"
-            )
+            raise CleanupCapabilityError("job root has no persistent directory identity")
         mount_identity: _InvocationMountIdentity | None = None
         if os.name != "nt":
             directory_flag = getattr(os, "O_DIRECTORY", 0)
@@ -1803,100 +1735,54 @@ def run_authorized_cleanup(
             finally:
                 os.close(root_fd)
         else:
+            if not isinstance(root_identity.file_identity, WindowsFileIdentityV1):
+                raise CleanupCapabilityError("job root has no Windows file identity")
             root_volume = root_identity.file_identity.volume_serial
 
-        removed = 0
-        authorized_roots: list[Path] = []
-        for index, entry_value in enumerate(value["prune_entries"]):
-            assert isinstance(entry_value, dict)
-            entry = entry_value
-            relative = PurePosixPath(entry["relative_path"])
-            prune_root = root.joinpath(*relative.parts)
-            authorized_roots.append(prune_root)
-            expected = _DirectoryIdentity.from_object(entry["directory_identity"])
-            quarantined_root: Path | None = None
-            if os.name != "nt":
-                quarantined_root = prune_root.with_name(
-                    _posix_cleanup_quarantine_name(entry, role="root")
-                )
-                authorized_roots.append(quarantined_root)
-            try:
-                absent = namespace.directory_absent(prune_root)
-            except NoFollowPathError as error:
-                raise CleanupIdentityMismatchError(
-                    f"prune root could not be attested: {prune_root}"
-                ) from error
-            if absent:
-                if quarantined_root is not None:
-                    try:
-                        quarantine_absent = namespace.directory_absent(quarantined_root)
-                    except NoFollowPathError as error:
-                        raise CleanupIdentityMismatchError(
-                            f"prune-root quarantine could not be attested: {quarantined_root}"
-                        ) from error
-                    if not quarantine_absent:
-                        quarantine_identity = _directory_identity(quarantined_root)
-                        if (
-                            quarantine_identity != expected
-                            or quarantine_identity.volume_key
-                            != root_identity.volume_key
-                        ):
-                            raise CleanupIdentityMismatchError(
-                                f"prune-root quarantine identity differs: {quarantined_root}"
-                            )
-                        quarantine_entry = dict(entry)
-                        quarantine_entry["relative_path"] = PurePosixPath(
-                            *relative.parts[:-1], quarantined_root.name
-                        ).as_posix()
+        return cls(root, namespace, root_identity, root_volume, mount_identity)
 
-                        def emit_recovery_marker_unlink(index: int = index) -> None:
-                            _emit(fault, f"after_prune_marker_unlink_{index}")
+    def is_absent(self, path: Path, error_message: str) -> bool:
+        try:
+            return self.namespace.directory_absent(path)
+        except NoFollowPathError as error:
+            raise CleanupIdentityMismatchError(f"{error_message}: {path}") from error
 
-                        removed += _delete_descendants_no_follow(
-                            root,
-                            quarantined_root,
-                            quarantine_entry,
-                            expected,
-                            root_identity,
-                            root_volume,
-                            mount_identity,
-                            after_marker_unlink=emit_recovery_marker_unlink,
-                        )
-                _emit(fault, f"after_prune_entry_{index}")
-                continue
-            actual = _directory_identity(prune_root)
-            if actual != expected or actual.volume_key != root_identity.volume_key:
-                raise CleanupIdentityMismatchError(
-                    f"prune root identity differs: {prune_root}"
-                )
+    def remove_entry(
+        self, entry: dict[str, Any], index: int, fault: FaultHook | None, authorized: list[Path]
+    ) -> int:
+        relative = PurePosixPath(entry["relative_path"])
+        path = self.root.joinpath(*relative.parts)
+        authorized.append(path)
+        expected = _DirectoryIdentity.from_object(entry["directory_identity"])
+        quarantine = None
+        if os.name != "nt":
+            quarantine = path.with_name(_posix_cleanup_quarantine_name(entry, role="root"))
+            authorized.append(quarantine)
 
-            def emit_marker_unlink(index: int = index) -> None:
-                _emit(fault, f"after_prune_marker_unlink_{index}")
-
-            removed += _delete_descendants_no_follow(
-                root,
-                prune_root,
-                entry,
-                expected,
-                root_identity,
-                root_volume,
-                mount_identity,
-                after_marker_unlink=emit_marker_unlink,
-            )
-            _emit(fault, f"after_prune_entry_{index}")
-
-        for prune_root in authorized_roots:
-            try:
-                absent = namespace.directory_absent(prune_root)
-            except NoFollowPathError as error:
-                raise CleanupIdentityMismatchError(
-                    f"final prune-root attestation failed: {prune_root}"
-                ) from error
-            if not absent:
-                raise CleanupIdentityMismatchError(
-                    f"prune root reappeared before cleanup completion: {prune_root}"
-                )
-        return removed
+        mismatch = "prune root identity differs"
+        if self.is_absent(path, "prune root could not be attested"):
+            if quarantine is None or self.is_absent(
+                quarantine, "prune-root quarantine could not be attested"
+            ):
+                return 0
+            path = quarantine
+            mismatch = "prune-root quarantine identity differs"
+        actual = _directory_identity(path)
+        if actual != expected or actual.volume_key != self.root_identity.volume_key:
+            raise CleanupIdentityMismatchError(f"{mismatch}: {path}")
+        if path == quarantine:
+            entry = dict(entry)
+            entry["relative_path"] = (relative.parent / path.name).as_posix()
+        return _delete_descendants_no_follow(
+            self.root,
+            path,
+            entry,
+            expected,
+            self.root_identity,
+            self.volume,
+            self.mount,
+            after_marker_unlink=lambda: _emit(fault, f"after_prune_marker_unlink_{index}"),
+        )
 
 
 def cleanup_status_for_error(error: BaseException) -> str:

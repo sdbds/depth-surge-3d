@@ -82,6 +82,7 @@ def _write_settings(
     *,
     current_schema: bool = False,
     include_source_fingerprint: bool = True,
+    frame_range: tuple[int, int] = (0, 2),
 ) -> Path:
     source_video = output_dir / "source.mp4"
     if not source_video.exists():
@@ -119,7 +120,7 @@ def _write_settings(
     path.write_text(json.dumps(payload), encoding="utf-8")
     frame_files = sorted((output_dir / "00_original_frames").glob("frame_*.png"))
     if frame_files:
-        write_source_frame_manifest(frame_files, source_video)
+        write_source_frame_manifest(frame_files, source_video, frame_range)
     return path
 
 
@@ -331,6 +332,109 @@ def _write_current_depth_pipeline(
             np.full((4, 6), index * 1000, dtype=np.uint16),
         )
     return manifest, bounds, canonical
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        ({"schema_version": 1}, "schema"),
+        ({"frame_names": []}, "frame manifest"),
+        ({"camera_model": "orthogonal"}, "camera_model is invalid"),
+        ({"camera_model": "pinhole_fx"}, "camera_model fingerprint"),
+        ({"semantic_fingerprint.source_frame_fingerprint": "other"}, "source-frame"),
+        ({"semantic_fingerprint.depth_settings": []}, "model settings"),
+        ({"semantic_fingerprint.preprocessing_algorithm": "old"}, "preprocessing"),
+        ({"storage_status": "writing"}, "transaction status"),
+        ({"fingerprint": "wrong"}, "metadata fingerprint"),
+    ],
+)
+def test_raw_resume_explains_why_an_existing_payload_cannot_be_reused(tmp_path, change, reason):
+    frames, identity = _write_frames(tmp_path, count=1)
+    _write_current_depth_pipeline(tmp_path, frames, identity)
+    raw = tmp_path / "02_depth_raw"
+    path = raw / "metadata.json"
+    payload = raw / (frames[0].stem + ".npz")
+    before = payload.read_bytes()
+    saved = json.loads(path.read_text())
+    for field, value in change.items():
+        name, sep, child = field.partition(".")
+        if sep:
+            saved[name][child] = value
+        else:
+            saved[name] = value
+    path.write_text(json.dumps(saved))
+    result, metadata, count = resume_module._validate_raw_stage(
+        tmp_path, _current_settings(), frames, identity, True, None
+    )
+    assert result.disposition == "invalidate" and reason in result.reason
+    assert metadata is None and count == 0 and payload.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "case,disposition",
+    [
+        ("wrong lineage", "invalidate"),
+        ("missing raw", "invalidate"),
+        ("bad JSON", "invalidate"),
+        ("string dimension", "invalidate"),
+        ("fractional dimension", "invalidate"),
+        ("bad shape", "invalidate"),
+        ("unfinished scene", "invalidate"),
+        ("missing png", "resume"),
+        ("wrong bit depth", "resume"),
+        ("intact", "preserve"),
+    ],
+)
+def test_resume_renderer_and_png_reader_agree_on_canonical_evidence(tmp_path, case, disposition):
+    frames, identity = _write_frames(tmp_path, count=1)
+    manifest, bounds, canonical = _write_current_depth_pipeline(tmp_path, frames, identity)
+    raw = json.loads((tmp_path / "02_depth_raw/metadata.json").read_text())
+    stage = tmp_path / "03_disparity_maps"
+    picture = stage / frames[0].name
+    shapes = {"string dimension": ["4", 6], "fractional dimension": [4.1, 6], "bad shape": [0, 6]}
+    if case in shapes:
+        canonical["native_shape"] = shapes[case]
+        del canonical["fingerprint"]
+        canonical["fingerprint"] = canonical_json_hash(canonical)
+        (stage / "metadata.json").write_text(json.dumps(canonical))
+    elif case == "bad JSON":
+        (stage / "metadata.json").write_text("[")
+    elif case == "wrong lineage":
+        bounds["fingerprint"] = "different"
+    elif case == "missing png":
+        picture.unlink()
+    elif case == "wrong bit depth":
+        assert cv2.imwrite(str(picture), np.zeros((4, 6), dtype=np.uint8))
+    original = frames[0].read_bytes()
+    result, metadata = resume_module._validate_canonical_stage(
+        tmp_path,
+        frames,
+        manifest,
+        bounds,
+        None if case == "missing raw" else raw,
+        case != "unfinished scene",
+    )
+    assert result.disposition == disposition
+    assert (metadata is None) == (disposition == "invalidate")
+    assert frames[0].read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"sample_aspect_ratio_numerator": 1},
+        {"sample_aspect_ratio_numerator": True, "sample_aspect_ratio_denominator": 1},
+        {"sample_aspect_ratio_numerator": 1, "sample_aspect_ratio_denominator": 0},
+        {"sample_aspect_ratio_numerator": 4, "sample_aspect_ratio_denominator": 2},
+    ],
+)
+def test_metric_resume_does_not_silently_treat_bad_saved_sar_as_square(value, tmp_path):
+    settings = {"video_properties": value.copy()}
+    with pytest.raises(ValueError, match="sample aspect ratio"):
+        resume_module._resume_properties_with_sar(
+            settings, tmp_path / "absent.mp4", "metric_camera"
+        )
+    assert settings["video_properties"] == value
 
 
 def _write_complete_stabilized_stage(
@@ -814,19 +918,23 @@ def test_legacy_pretty_array_reader_rejects_a_line_over_64_kib(tmp_path):
             )
 
 
-def test_legacy_metric_fast_adoption_requires_old_clamp_evidence(tmp_path):
-    from src.depth_surge_3d.io.resume import build_resume_report
-
-    _frame_files, original_settings = _metric_job(tmp_path)
+def _schema4_metric_fast_job(tmp_path):
+    frame_files, original_settings = _metric_job(tmp_path)
     settings = {
         **original_settings,
         "keep_intermediates": False,
         "stereo_render_mode": "fast",
+        "per_eye_width": 6,
+        "per_eye_height": 4,
+        "vr_output_width": 12,
+        "vr_output_height": 4,
+        "source_width": 6,
+        "source_height": 4,
     }
     settings_path = tmp_path / "job-settings.json"
     payload = json.loads(settings_path.read_text(encoding="utf-8"))
     payload["metadata"]["settings_schema_version"] = 4
-    payload["processing_settings"]["keep_intermediates"] = False
+    payload["processing_settings"] = dict(settings)
     payload["processing_settings"].pop("stereo_render_mode", None)
     payload["processing_settings"].pop("occlusion_fill_max_px", None)
     settings_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -836,11 +944,205 @@ def test_legacy_metric_fast_adoption_requires_old_clamp_evidence(tmp_path):
         json.dumps(metadata, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    return frame_files, settings
 
-    report = build_resume_report(tmp_path, settings)
+
+def test_legacy_metric_fast_adoption_requires_old_clamp_evidence(tmp_path):
+    _frames, settings = _schema4_metric_fast_job(tmp_path)
+    report = resume_module.build_resume_report(tmp_path, settings)
 
     assert report.stage("stereo").disposition == "invalidate"
     assert report.legacy_fast_adoption is None
+
+
+@pytest.fixture
+def legacy_metric_capture(tmp_path):
+    frames, settings = _schema4_metric_fast_job(tmp_path)
+    left = tmp_path / "04_left_frames"
+    stats = left / "clamp_stats"
+    stats.mkdir()
+    for frame, valid, clamped in zip(frames, (8, 16), (4, 0), strict=True):
+        value = {
+            "schema_version": 1,
+            "frame_name": frame.stem,
+            "valid_pixel_count": valid,
+            "clamped_pixel_count": clamped,
+            "clamped_fraction": clamped / valid,
+        }
+        (stats / f"{frame.stem}.json").write_text(json.dumps(value, indent=2), encoding="utf-8")
+    summary = {
+        "schema_version": 1,
+        "frame_names": [frame.stem for frame in frames],
+        "clamped_fractions": [0.5, 0.0],
+        "affected_frame_count": 1,
+        "mean_clamped_fraction": 0.25,
+        "max_clamped_fraction": 0.5,
+    }
+    (left / "clamp_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return frames, settings
+
+
+def test_old_metric_job_replays_ordered_statistics_on_restart(tmp_path, legacy_metric_capture):
+    from src.depth_surge_3d.io.settings_artifact import ProcessingSettingsArtifactV5
+    from src.depth_surge_3d.rendering.quality.diagnostic_transaction import (
+        StreamingDiagnosticsStageContext,
+        publish_legacy_fast_unavailable,
+    )
+
+    frames, settings = legacy_metric_capture
+    left = tmp_path / "04_left_frames"
+    old_summary_hash = hashlib.sha256((left / "clamp_summary.json").read_bytes()).hexdigest()
+    old_payloads = {p: p.read_bytes() for p in left.rglob("*") if p.is_file()}
+    report = resume_module.build_resume_report(tmp_path, settings)
+    assert report.stage("stereo").disposition == "preserve"
+    proof = report.legacy_fast_adoption
+    assert proof is not None and proof.metric_clamp_summary_sha256 == old_summary_hash
+
+    resume_module.apply_legacy_migration(report, "archive")
+    recovered = resume_module.recover_legacy_fast_adoption_intent_v1(tmp_path)
+    assert recovered == proof
+    artifact = ProcessingSettingsArtifactV5.parse(
+        (tmp_path / "processing-settings-v5.json").read_bytes()
+    )
+    assert resume_module.revalidate_legacy_fast_adoption_v1(recovered, artifact) == proof
+    context = StreamingDiagnosticsStageContext(
+        job_root=tmp_path,
+        frame_count=len(frames),
+        frame_names=lambda: resume_module.iter_legacy_fast_frame_names(recovered),
+        render_shape=(4, 6),
+        render_mode="fast",
+        geometry_mode="metric",
+        occlusion_fill=proof.occlusion_fill,
+        mask_payloads_enabled=False,
+        rgb_stage_fingerprint=proof.rgb_stage_fingerprint,
+        source_guide_fingerprint=proof.source_guide_fingerprint,
+        native_geometry_fingerprint=None,
+        quality_input_manifest_sha256=None,
+    )
+    publish_legacy_fast_unavailable(
+        context,
+        recovered,
+        metric_projection=resume_module.legacy_fast_metric_projection(recovered),
+        metric_clamp_summary_sha256=old_summary_hash,
+    )
+    diagnostics = tmp_path / "04_stereo_diagnostics"
+    summary = json.loads((diagnostics / "stereo_coverage_summary.json").read_bytes())
+    assert summary["frame_names"] == [frame.stem for frame in frames]
+    assert summary["metric_projection"] == {
+        "valid_pixel_count": 24,
+        "clamped_pixel_count": 4,
+        "clamped_fraction": 4 / 24,
+        "clamped_fractions": [0.5, 0.0],
+        "affected_frame_count": 1,
+        "mean_clamped_fraction": 0.25,
+        "max_clamped_fraction": 0.5,
+    }
+    metadata = json.loads((diagnostics / "metadata.json").read_bytes())
+    assert metadata["metric_clamp_summary_sha256"] == old_summary_hash
+    assert metadata["status"] == "legacy_fast_unavailable"
+    assert resume_module.load_legacy_fast_adoption_intent_v1(tmp_path) is None
+    assert all(path.read_bytes() == raw for path, raw in old_payloads.items())
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("mean_clamped_fraction", 0.0),
+        ("frame_names", ["frame_000002", "frame_000001"]),
+        ("clamped_fractions", [0.0, 0.5]),
+    ],
+)
+def test_metric_adoption_refuses_summary_disagreeing_with_sidecars(
+    tmp_path, legacy_metric_capture, field, changed
+):
+    _frames, settings = legacy_metric_capture
+    path = tmp_path / "04_left_frames" / "clamp_summary.json"
+    summary = json.loads(path.read_bytes())
+    summary[field] = changed
+    path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    report = resume_module.build_resume_report(tmp_path, settings)
+    assert report.stage("stereo").disposition == "invalidate"
+    assert report.legacy_fast_adoption is None
+    assert json.loads(path.read_bytes())[field] == changed
+    assert not (tmp_path / "04_stereo_diagnostics").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("source_settings_schema_version", 5, "source schema"),
+        ("render_shape", [4, 0], "render shape"),
+        ("settings_fingerprint", "", "settings_fingerprint"),
+        ("metric_clamp_summary_sha256", None, "metric_clamp_summary_sha256"),
+        ("metric_valid_pixel_count", True, "metric_valid_pixel_count"),
+        ("metric_affected_frame_count", 3, "affected-frame count"),
+        ("metric_clamped_pixel_count", 25, "clamp counts"),
+        ("metric_max_clamped_fraction", 2.0, "metric_max_clamped_fraction"),
+    ],
+)
+def test_damaged_saved_metric_intent_never_becomes_recovery_authority(
+    tmp_path, legacy_metric_capture, field, value, reason
+):
+    from src.depth_surge_3d.io.canonical_json import canonical_json_bytes
+    from src.depth_surge_3d.io.reservation_protocol import ReservationConflictError
+
+    _frames, settings = legacy_metric_capture
+    proof = resume_module.build_resume_report(tmp_path, settings).legacy_fast_adoption
+    assert proof is not None
+    resume_module.publish_legacy_fast_adoption_intent_v1(proof)
+    intent = tmp_path / resume_module.LEGACY_FAST_ADOPTION_INTENT_RELATIVE_PATH
+    original = intent.read_bytes()
+    damaged = json.loads(original)
+    damaged[field] = value
+    raw = canonical_json_bytes(damaged)
+    intent.write_bytes(raw)
+    with pytest.raises(ValueError, match=reason):
+        resume_module.load_legacy_fast_adoption_intent_v1(tmp_path)
+    with pytest.raises(
+        ReservationConflictError, match="authoritative control artifact is malformed"
+    ):
+        resume_module.recover_legacy_fast_adoption_intent_v1(tmp_path)
+    assert intent.read_bytes() == raw
+    assert not (tmp_path / "04_stereo_diagnostics").exists()
+    intent.write_bytes(original)
+    assert resume_module.recover_legacy_fast_adoption_intent_v1(tmp_path) == proof
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "reason"),
+    [
+        ("metadata.json", "RGB metadata changed"),
+        ("frame_000001.png", "RGB payload sequence changed"),
+        ("clamp_stats/frame_000001.json", "metric clamp evidence changed"),
+    ],
+)
+def test_changed_legacy_input_is_rejected_before_diagnostics_publication(
+    tmp_path, legacy_metric_capture, artifact_name, reason
+):
+    from src.depth_surge_3d.io.settings_artifact import ProcessingSettingsArtifactV5
+
+    _frames, settings = legacy_metric_capture
+    report = resume_module.build_resume_report(tmp_path, settings)
+    resume_module.apply_legacy_migration(report, "archive")
+    proof = resume_module.load_legacy_fast_adoption_intent_v1(tmp_path)
+    assert proof is not None
+    fixed = ProcessingSettingsArtifactV5.parse(
+        (tmp_path / "processing-settings-v5.json").read_bytes()
+    )
+    changed = tmp_path / "04_left_frames" / artifact_name
+    original = changed.read_bytes()
+    if artifact_name.endswith(".png"):
+        assert cv2.imwrite(str(changed), np.full((4, 6, 3), 255, dtype=np.uint8))
+    else:
+        changed.write_bytes(original + b"\n")
+    with pytest.raises(ValueError, match=reason):
+        resume_module.revalidate_legacy_fast_adoption_v1(proof, fixed)
+    assert resume_module.load_legacy_fast_adoption_intent_v1(tmp_path) == proof
+    assert not (tmp_path / "04_stereo_diagnostics").exists()
+    changed.write_bytes(original)
+    assert resume_module.revalidate_legacy_fast_adoption_v1(proof, fixed) == proof
 
 
 def test_legacy_fast_intent_recovers_schema5_diagnostics_prefix(tmp_path):
@@ -1397,6 +1699,62 @@ def test_same_shape_frame_tampering_invalidates_original_frames(tmp_path):
     assert "frame fingerprint" in report.stage("frames").reason
 
 
+def test_resume_checks_requested_clip_even_when_saved_clip_has_same_length(tmp_path):
+    frame_files, fingerprint = _write_frames(tmp_path, count=1)
+    first = _current_settings(end_time="0:00.050")
+    second = _current_settings(start_time="0:00.050")
+    _write_settings(tmp_path, first, frame_range=(0, 1))
+    _write_candidate_manifest(tmp_path, frame_files, fingerprint)
+
+    same = resume_module.build_resume_report(tmp_path, first)
+    assert same.stage("frames").disposition == "preserve"
+    report = resume_module.build_resume_report(tmp_path, second)
+
+    assert report.stage("frames").disposition == "invalidate"
+    assert report.stage("scene_data").disposition == "invalidate"
+
+
+def test_resume_does_not_adopt_or_rewrite_an_unbound_v2_frame_manifest(tmp_path):
+    frame_files, fingerprint = _write_frames(tmp_path)
+    settings = _current_settings()
+    _write_settings(tmp_path, settings)
+    _write_candidate_manifest(tmp_path, frame_files, fingerprint)
+    _write_generated_stage(tmp_path, ("07_left_upscaled", "07_right_upscaled"), frame_files[0].name)
+    old = {
+        "schema_version": 2,
+        "algorithm_version": "png-stat-v1",
+        "source_video_fingerprint_algorithm": FILE_IDENTITY_ALGORITHM_VERSION,
+        "source_video_fingerprint": file_sample_fingerprint(tmp_path / "source.mp4"),
+        "num_frames": len(frame_files),
+        "frame_names": [path.name for path in frame_files],
+        "source_frame_fingerprint": fingerprint,
+    }
+    old["fingerprint"] = canonical_json_hash(old)
+    old_bytes = json.dumps(old).encode("utf-8")
+    path = frame_files[0].parent / "metadata.json"
+    path.write_bytes(old_bytes)
+
+    report = resume_module.build_resume_report(tmp_path, settings)
+
+    assert report.stage("frames").disposition == "invalidate"
+    assert report.stage("scene_data").disposition == "invalidate"
+    assert report.stage("upscale").disposition == "invalidate"
+    assert path.read_bytes() == old_bytes
+
+
+def test_resume_does_not_infer_clip_range_from_extracted_frame_count(tmp_path):
+    _write_frames(tmp_path)
+    settings = _current_settings()
+    settings_path = _write_settings(tmp_path, settings)
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    del payload["video_properties"]
+    settings_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = resume_module.build_resume_report(tmp_path, settings)
+
+    assert report.stage("frames").disposition == "invalidate"
+
+
 def test_invalid_original_frames_never_enter_migration_set(tmp_path):
     from src.depth_surge_3d.io.resume import apply_legacy_migration, build_resume_report
 
@@ -1445,6 +1803,126 @@ def test_settings_rewrite_failure_rolls_back_archived_stages(tmp_path, monkeypat
     assert (tmp_path / "04_left_frames").is_dir()
     assert not (tmp_path / "legacy_v1" / "02_depth_maps").exists()
     assert settings_file.read_bytes() == original_settings
+
+
+@pytest.mark.parametrize("mode", ["archive", "delete"])
+def test_second_stage_move_failure_rolls_back_payloads_and_new_adoption_intent(
+    tmp_path, monkeypatch, legacy_metric_capture, mode
+):
+    frames, settings = legacy_metric_capture
+    original_frame = frames[0].read_bytes()
+    original_settings = (tmp_path / "job-settings.json").read_bytes()
+    old_stages = [tmp_path / "01_supersampled_frames", tmp_path / "02_depth_maps"]
+    for stage in old_stages:
+        stage.mkdir()
+        (stage / "old.bin").write_bytes(stage.name.encode("ascii"))
+    report = resume_module.build_resume_report(tmp_path, settings)
+    assert report.legacy_fast_adoption is not None
+    assert all(stage in report.migration_paths for stage in old_stages)
+    move = resume_module.shutil.move
+
+    def fail_second_move(source, destination):
+        if Path(source) == old_stages[1]:
+            assert not old_stages[0].exists()
+            raise OSError("second stage unavailable")
+        return move(source, destination)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(resume_module.shutil, "move", fail_second_move)
+        with pytest.raises(OSError, match="second stage unavailable"):
+            resume_module.apply_legacy_migration(report, mode)
+    for stage in old_stages:
+        assert (stage / "old.bin").read_bytes() == stage.name.encode("ascii")
+    assert not (tmp_path / "legacy_v1").exists()
+    assert not (tmp_path / ".resume_delete_staging").exists()
+    assert resume_module.load_legacy_fast_adoption_intent_v1(tmp_path) is None
+    assert (tmp_path / "job-settings.json").read_bytes() == original_settings
+
+    resume_module.apply_legacy_migration(report, mode)
+    assert (
+        resume_module.load_legacy_fast_adoption_intent_v1(tmp_path) == report.legacy_fast_adoption
+    )
+    assert frames[0].read_bytes() == original_frame
+    assert all(not path.exists() for path in old_stages)
+    for stage in old_stages:
+        archived = tmp_path / "legacy_v1" / stage.name / "old.bin"
+        if mode == "archive":
+            assert archived.read_bytes() == stage.name.encode("ascii")
+        else:
+            assert not archived.exists()
+
+
+@pytest.mark.parametrize(
+    ("relative", "field", "value", "stage", "disposition"),
+    [
+        ("01_scene_data/scene_manifest.json", None, None, "scene_data", "invalidate"),
+        (
+            "01_scene_data/scene_manifest.json",
+            "source_frame_fingerprint",
+            "old-clip",
+            "scene_data",
+            "invalidate",
+        ),
+        ("01_scene_data/scene_manifest.json", "status", "incomplete", "scene_data", "invalidate"),
+        ("01_scene_data/depth_bounds.json", None, None, "scene_data", "invalidate"),
+        (
+            "01_scene_data/depth_bounds.json",
+            "scenes",
+            {"unfinished": {}},
+            "scene_data",
+            "invalidate",
+        ),
+        ("02_depth_raw/metadata.json", "frame_names", [], "depth_raw", "invalidate"),
+        ("02_depth_raw/metadata.json", "camera_model", "unavailable", "depth_raw", "invalidate"),
+        ("02_depth_raw/metadata.json", "schema_version", 99, "depth_raw", "invalidate"),
+        ("02_depth_raw/metadata.json", "storage_status", "unfinished", "depth_raw", "invalidate"),
+        ("03_disparity_maps/metadata.json", None, None, "disparity_maps", "invalidate"),
+        ("03_disparity_maps/frame_000001.png", None, None, "disparity_maps", "resume"),
+        ("03_metric_geometry/metadata.json", None, None, "metric_geometry", "invalidate"),
+        (
+            "03_metric_geometry/metadata.json",
+            "native_shape",
+            [3, 2],
+            "metric_geometry",
+            "invalidate",
+        ),
+        (
+            "03_metric_geometry/metadata.json",
+            "source_raw_fingerprint",
+            "old",
+            "metric_geometry",
+            "invalidate",
+        ),
+        ("04_left_frames/metadata.json", None, None, "stereo", "invalidate"),
+        ("04_left_frames/frame_000001.png", None, None, "stereo", "resume"),
+    ],
+)
+def test_resume_stage_evidence_does_not_change_the_original_clip(
+    tmp_path, relative, field, value, stage, disposition
+):
+    frames, settings = _metric_job(tmp_path)
+    originals = {frame: frame.read_bytes() for frame in frames}
+    broken = tmp_path / relative
+    previous = broken.read_bytes()
+    if field is None:
+        broken.unlink()
+    else:
+        data = json.loads(previous)
+        data[field] = value
+        broken.write_text(json.dumps(data), encoding="utf-8")
+    report = resume_module.build_resume_report(tmp_path, settings)
+    assert report.stage(stage).disposition == disposition
+    assert report.stage("frames").disposition == "preserve"
+    assert all(path.read_bytes() == raw for path, raw in originals.items())
+    assert not any(path.parent in report.migration_paths for path in frames)
+    if field is None:
+        assert not broken.exists()
+    else:
+        assert json.loads(broken.read_bytes())[field] == value
+    broken.write_bytes(previous)
+    assert (
+        resume_module.build_resume_report(tmp_path, settings).stage(stage).disposition == "preserve"
+    )
 
 
 def test_missing_source_fingerprint_invalidates_frames_instead_of_aborting(tmp_path):
@@ -1908,7 +2386,10 @@ def test_frame_stage_explicitly_invalidates_malformed_manifest(tmp_path, monkeyp
     import src.depth_surge_3d.io.resume as resume
 
     _write_frames(tmp_path)
-    settings_data = {"metadata": {"source_video_fingerprint": "source-fingerprint"}}
+    settings_data = {
+        "metadata": {"source_video_fingerprint": "source-fingerprint"},
+        "video_properties": {"frame_count": 2, "fps": 30.0},
+    }
     monkeypatch.setattr(resume, "read_source_frame_manifest", lambda _directory: manifest)
     monkeypatch.setattr(
         resume,

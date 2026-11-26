@@ -1,8 +1,7 @@
 # Depth Surge 3D
 
-[![CI](https://github.com/Tok/depth-surge-3d/actions/workflows/ci.yml/badge.svg)](https://github.com/Tok/depth-surge-3d/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/Tok/depth-surge-3d/branch/main/graph/badge.svg)](https://codecov.io/gh/Tok/depth-surge-3d)
-[![Python 3.9-3.12](https://img.shields.io/badge/python-3.9--3.12-blue.svg)](https://www.python.org/downloads/)
+[![CI](https://github.com/sdbds/depth-surge-3d/actions/workflows/ci.yml/badge.svg)](https://github.com/sdbds/depth-surge-3d/actions/workflows/ci.yml)
+[![Python 3.10-3.12](https://img.shields.io/badge/python-3.10--3.12-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **Convert 2D videos to 3D VR format using AI depth estimation.**
@@ -12,8 +11,8 @@ Depth Surge 3D transforms flat videos into stereoscopic 3D for VR headsets using
 ## Key Features
 
 - **Dual Depth Models**:
-  - **Depth Anything V3** (default): 50% lower VRAM, faster processing, optimized for modern GPUs
-  - **Video-Depth-Anything V2**: Shot-aware temporal consistency with fixed 32-frame windows, 10-frame overlap, and state resets at detected cuts
+  - **Depth Anything V3** (Web UI default): Select `v3` on the command line to use this backend without a separate source checkout.
+  - **Video-Depth-Anything V2** (CLI default): Shot-aware temporal consistency with fixed 32-frame windows, 10-frame overlap, and state resets at detected cuts
 - **Optional MoGe-2 Backend**: Pinned Small, Base, and Large variants with metric
   depth and focal output. Relative geometry remains the default.
 - **AI Upscaling**: Optional Real-ESRGAN enhancement (2x/4x) for higher output resolution
@@ -34,60 +33,29 @@ Depth Surge 3D transforms flat videos into stereoscopic 3D for VR headsets using
 
 ### Installation
 
-```bash
-git clone https://github.com/Tok/depth-surge-3d.git depth-surge-3d
+**Windows x64 / PowerShell:** Install [uv](https://docs.astral.sh/uv/getting-started/installation/), Git, [FFmpeg](https://ffmpeg.org/download.html) (`ffmpeg` and `ffprobe` on `PATH`), and [MSVC Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with **Desktop development with C++** and the Windows SDK. Use 64-bit CPython 3.11; uv can install it if missing.
+
+```powershell
+git clone https://github.com/sdbds/depth-surge-3d.git
 cd depth-surge-3d
-chmod +x setup.sh
-./setup.sh
+.\1.install-uv-qinglong.ps1
+.\.venv\Scripts\depth-surge-3d.exe --help
 ```
 
-The setup script automatically installs all dependencies, downloads the Video-Depth-Anything model (~1.3GB), and verifies your system.
-
-**See [Installation Guide](docs/INSTALLATION.md) for detailed setup instructions.**
+This installs the project from `uv.lock`, including the compiled Quality renderer. It does not install model weights. For another environment, other platforms, optional Linux FlashAttention, or offline weights, see the [installation guide](docs/INSTALLATION.md).
 
 ### Usage
 
-**Web UI (Recommended):**
-```bash
-./run_ui.sh
-# Opens http://localhost:5000 in your browser
+For a first conversion, replace `input.mp4` with a real clip. This selects the small V3 model (downloaded from Hugging Face on first use) and renders the first second in Quality mode:
+
+```powershell
+.\.venv\Scripts\depth-surge-3d.exe input.mp4 --depth-model-version v3 --model-size vits --end 00:01 --vr-resolution custom:640x360 --stereo-render-mode quality
 ```
 
-**Command Line:**
-```bash
-# Basic usage
-python depth_surge_3d.py input_video.mp4
+For the Web UI, run the following from the checkout, then open [localhost:5000](http://localhost:5000):
 
-# Process a millisecond-precise time range with custom settings
-python depth_surge_3d.py input_video.mp4 --start 01:30.000 --end 03:45.000 -f over_under --vr-resolution 16x9-4k
-
-# Add experimental generic temporal stabilization (CUDA generation only)
-python depth_surge_3d.py input_video.mp4 --temporal-postprocessor vdpp
-
-# Highest-quality offline stereo with a conservative 8 px repair limit at 1080p
-python depth_surge_3d.py input_video.mp4 --stereo-render-mode quality --occlusion-fill-max-px 8
-
-# Retain the legacy-compatible renderer
-python depth_surge_3d.py input_video.mp4 --stereo-render-mode fast
-```
-
-**UV Command Line**
-
-In WSL required to export a UV variable
-
-```bash
-export UV_LINK_MODE=copy
-```
-
-```bash
-# Basic usage
-uv run python depth_surge_3d.py input_video.mp4
-```
-
-**Quick Start Script:**
-```bash
-# Process a clip with optimized settings
-./start.sh 1:11 2:22
+```powershell
+.\.venv\Scripts\python.exe app.py
 ```
 
 **See [Usage Guide](docs/USAGE.md) for comprehensive usage examples.**
@@ -104,16 +72,15 @@ relative default.
 
 MoGe-2 performs per-frame depth and focal estimation. Temporal stability on video is not guaranteed; depth or focal drift may be visible across frames.
 
-Install the optional backend with `uv sync --extra moge2`; see the
+On Windows install the optional backend with `.\1.install-uv-qinglong.ps1 -WithMoGe2`; see the
 [Installation Guide](docs/INSTALLATION.md) for the pinned artifacts and the
 [Parameters Reference](docs/PARAMETERS.md) for the projection controls.
 
 ## Requirements
 
-- Python 3.9, 3.10, 3.11, or 3.12 (Python 3.13+ not yet supported due to dependency limitations)
-- FFmpeg
-- CUDA 13.0+ (required for GPU acceleration)
-- CUDA-compatible GPU (optional but strongly recommended; required to generate VDPP output)
+- Project metadata supports Python 3.10 through 3.12; Windows x64 with Python 3.11 is the recommended install.
+- Git, uv, a C++17 compiler, and FFmpeg with `ffprobe`.
+- A compatible NVIDIA driver and GPU for CUDA acceleration or VDPP generation. The project's native Quality renderer does not require the CUDA SDK to compile.
 
 ## Documentation
 

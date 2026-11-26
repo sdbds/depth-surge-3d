@@ -12,7 +12,7 @@ from ...core.file_identity import (
     file_sample_fingerprint,
 )
 
-SOURCE_FRAME_SCHEMA_VERSION = 2
+SOURCE_FRAME_SCHEMA_VERSION = 3
 SOURCE_FRAME_ALGORITHM_VERSION = "png-stat-v1"
 SOURCE_FRAME_METADATA_NAME = "metadata.json"
 
@@ -39,7 +39,7 @@ def frame_sequence_fingerprint(frame_files: list[Path]) -> str:
 
 
 def build_source_frame_manifest(
-    frame_files: list[Path], source_video: Path | str
+    frame_files: list[Path], source_video: Path | str, frame_range: tuple[int, int]
 ) -> dict[str, Any]:
     """Build immutable metadata for one completed frame extraction."""
 
@@ -53,6 +53,8 @@ def build_source_frame_manifest(
         "algorithm_version": SOURCE_FRAME_ALGORITHM_VERSION,
         "source_video_fingerprint_algorithm": FILE_IDENTITY_ALGORITHM_VERSION,
         "source_video_fingerprint": file_sample_fingerprint(source_path),
+        "start_frame": frame_range[0],
+        "end_frame_exclusive": frame_range[1],
         "num_frames": len(frame_files),
         "frame_names": [path.name for path in frame_files],
         "source_frame_fingerprint": frame_sequence_fingerprint(frame_files),
@@ -61,10 +63,12 @@ def build_source_frame_manifest(
     return metadata
 
 
-def write_source_frame_manifest(frame_files: list[Path], source_video: Path | str) -> Path:
+def write_source_frame_manifest(
+    frame_files: list[Path], source_video: Path | str, frame_range: tuple[int, int]
+) -> Path:
     """Atomically persist a completed source-frame manifest."""
 
-    metadata = build_source_frame_manifest(frame_files, source_video)
+    metadata = build_source_frame_manifest(frame_files, source_video, frame_range)
     metadata_path = frame_files[0].parent / SOURCE_FRAME_METADATA_NAME
     temporary = metadata_path.with_name(f"{metadata_path.name}.tmp")
     temporary.write_text(
@@ -89,11 +93,18 @@ def source_frame_manifest_mismatch_reason(
     metadata: dict[str, Any] | None,
     frame_files: list[Path],
     source_video_fingerprint: str,
+    frame_range: tuple[int, int],
 ) -> str | None:
     """Return why persisted source frames are not the completed extraction."""
 
     if metadata is None:
         return "source frame manifest is missing"
+    start = metadata.get("start_frame")
+    end = metadata.get("end_frame_exclusive")
+    if type(start) is not int or type(end) is not int:
+        return "source frame manifest does not record the selected frame range"
+    if (start, end) != frame_range:
+        return "source frame manifest selects a different frame range"
     fingerprint = metadata.get("fingerprint")
     unhashed = {key: value for key, value in metadata.items() if key != "fingerprint"}
     checks = (

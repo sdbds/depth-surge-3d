@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import ModuleType
 import math
 
 import numpy as np
@@ -110,9 +111,7 @@ def precompute_native_fallbacks(
     offsets_bytes = (count + 1) * np.dtype(np.uint32).itemsize
     use_full_bytes = count + 1
     referenced_bytes = count + 1
-    metadata_offset = (
-        offsets_bytes + use_full_bytes + referenced_bytes + 7
-    ) // 8 * 8
+    metadata_offset = (offsets_bytes + use_full_bytes + referenced_bytes + 7) // 8 * 8
     member_offset = (metadata_offset + 2 * np.dtype(np.uint64).itemsize + 63) // 64 * 64
     if member_offset > QUALITY_REPAIR_FALLBACK_INDEX_BYTES:
         raise QualityRepairFallbackQueryBudgetError(
@@ -180,6 +179,47 @@ def precompute_native_fallbacks(
         use_full,
         safe_cache_metadata,
     )
+    safe_cache_words = _safe_cache_words(safe_cache_metadata, member_storage, height, width)
+    members = member_storage[: int(donor_count)]
+    members.setflags(write=False)
+    offsets.setflags(write=False)
+    index = ImplicitRegionKdIndex(height, width, count, members, offsets)
+    if index.index_bytes > QUALITY_REPAIR_FALLBACK_INDEX_BYTES:
+        raise QualityRepairFallbackQueryBudgetError("safe-donor index exceeds its 48 MiB partition")
+    if query_count * np.dtype(np.uint32).itemsize > QUALITY_REPAIR_FALLBACK_VISITS_BYTES:
+        raise QualityRepairFallbackQueryBudgetError(
+            "fallback visit counts exceed their 16 MiB partition"
+        )
+
+    anchor_fallback_count = _query_native_fallbacks(
+        native,
+        index,
+        height,
+        width,
+        raw_records,
+        analysis,
+        visits_storage,
+        budgets,
+        query_count,
+    )
+    visits = visits_storage[:query_count]
+    output.setflags(write=False)
+    visits.setflags(write=False)
+    return FallbackPrecomputeResult(
+        records=output,
+        visited_nodes=visits,
+        indexed_donor_count=index.indexed_sample_count,
+        index_bytes=int(index_bytes),
+        query_count=query_count,
+        retained_safe_donor_mask_bytes=0,
+        anchor_fallback_count=int(anchor_fallback_count),
+        _safe_cache_words=safe_cache_words,
+    )
+
+
+def _safe_cache_words(
+    safe_cache_metadata: np.ndarray, member_storage: np.ndarray, height: int, width: int
+) -> np.ndarray | None:
     safe_cache_words: np.ndarray | None = None
     if safe_cache_metadata[0] != np.iinfo(np.uint64).max:
         cache_start = int(safe_cache_metadata[0])
@@ -192,22 +232,20 @@ def precompute_native_fallbacks(
             raise RuntimeError("native safe-donor cache metadata is invalid")
         safe_cache_words = member_storage[cache_start : cache_start + cache_count]
         safe_cache_words.setflags(write=False)
-    members = member_storage[: int(donor_count)]
-    members.setflags(write=False)
-    offsets.setflags(write=False)
-    index = ImplicitRegionKdIndex(height, width, count, members, offsets)
-    if index.index_bytes > QUALITY_REPAIR_FALLBACK_INDEX_BYTES:
-        raise QualityRepairFallbackQueryBudgetError(
-            "safe-donor index exceeds its 48 MiB partition"
-        )
-    if (
-        query_count * np.dtype(np.uint32).itemsize
-        > QUALITY_REPAIR_FALLBACK_VISITS_BYTES
-    ):
-        raise QualityRepairFallbackQueryBudgetError(
-            "fallback visit counts exceed their 16 MiB partition"
-        )
+    return safe_cache_words
 
+
+def _query_native_fallbacks(
+    native: ModuleType,
+    index: ImplicitRegionKdIndex,
+    height: int,
+    width: int,
+    raw_records: np.ndarray,
+    analysis: QualityVisibilityAnalysis,
+    visits_storage: np.ndarray,
+    budgets: QualityRepairBudgets,
+    query_count: int,
+) -> int:
     budget_state = np.asarray(
         [
             budgets.repair_fallback_visits_consumed,
@@ -244,19 +282,7 @@ def precompute_native_fallbacks(
         budgets.repair_fallback_visits_consumed = int(budget_state[0])
     if int(query_count_written) != query_count:
         raise RuntimeError("fallback query count changed during fixed-arena execution")
-    visits = visits_storage[:query_count]
-    output.setflags(write=False)
-    visits.setflags(write=False)
-    return FallbackPrecomputeResult(
-        records=output,
-        visited_nodes=visits,
-        indexed_donor_count=index.indexed_sample_count,
-        index_bytes=int(index_bytes),
-        query_count=query_count,
-        retained_safe_donor_mask_bytes=0,
-        anchor_fallback_count=int(anchor_fallback_count),
-        _safe_cache_words=safe_cache_words,
-    )
+    return int(anchor_fallback_count)
 
 
 def materialize_safe_donor_mask(
@@ -319,9 +345,7 @@ def materialize_safe_donor_mask(
     return safe, region_has_safe
 
 
-def finalize_safe_fallbacks(
-    records: np.ndarray, *, in_place: bool = False
-) -> np.ndarray:
+def finalize_safe_fallbacks(records: np.ndarray, *, in_place: bool = False) -> np.ndarray:
     """Commit every residual provisional colour as backend 3."""
 
     if (
@@ -382,10 +406,7 @@ def _validate_render_shape(render_shape: tuple[int, int]) -> tuple[int, int]:
     if (
         not isinstance(render_shape, tuple)
         or len(render_shape) != 2
-        or any(
-            isinstance(value, bool) or not isinstance(value, int)
-            for value in render_shape
-        )
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in render_shape)
     ):
         raise TypeError("render_shape must be an integer (height, width) tuple")
     height, width = render_shape
