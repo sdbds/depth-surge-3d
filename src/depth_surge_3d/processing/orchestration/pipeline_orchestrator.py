@@ -211,14 +211,20 @@ class ProcessingOrchestrator:
         frame_source = None
         can_stream_source = (
             settings.get("keep_intermediates", True) is False
-            and self.preselected_depth_files is None
             and settings.get("temporal_postprocessor", "off") == "off"
             and callable(getattr(self.video_encoder, "prepare_streaming_frame_source", None))
-            and bool(getattr(self.depth_processor, "supports_streaming_frame_source", False))
+            and (
+                self.preselected_depth_files is not None
+                or getattr(self.depth_processor, "supports_streaming_frame_source", False)
+            )
         )
         if can_stream_source:
             frame_source = self.video_encoder.prepare_streaming_frame_source(
-                video_path, directories, video_properties, settings
+                video_path,
+                directories,
+                video_properties,
+                settings,
+                reuse_index=self.preselected_depth_files is not None,
             )
 
         if frame_source is not None:

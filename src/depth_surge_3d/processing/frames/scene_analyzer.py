@@ -42,6 +42,10 @@ def _luma_histogram(path: Path) -> np.ndarray:
     frame = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if frame is None:
         raise OSError(f"Could not read source frame for scene analysis: {path}")
+    return luma_histogram(frame)
+
+
+def luma_histogram(frame: np.ndarray) -> np.ndarray:
     histogram = cv2.calcHist([frame], [0], None, [32], [0, 256]).astype(np.float32)
     normalized = np.empty_like(histogram)
     cv2.normalize(histogram, normalized, alpha=1.0, norm_type=cv2.NORM_L1)

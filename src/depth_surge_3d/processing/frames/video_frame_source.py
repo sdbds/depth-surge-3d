@@ -10,26 +10,43 @@ from pathlib import Path
 import struct
 import subprocess
 import threading
-from typing import Any
+from typing import IO, Any
 
 import cv2
 import numpy as np
 
 from ...core.file_identity import file_sample_fingerprint
 from ...core.video_timing import selected_frame_range
+from ...io.durable_publish import atomic_write_json
 from ...utils.path_utils import ffmpeg_frame_interval
+from .scene_analyzer import luma_histogram
+from .source_frame_manifest import SOURCE_FRAME_METADATA_NAME, read_source_frame_manifest
 
 
-STREAMING_SOURCE_ALGORITHM_VERSION = "ffmpeg-rawvideo-stream-v1"
+STREAMING_SOURCE_ALGORITHM_VERSION = "ffmpeg-rawvideo-stream-v2"
 
 
-def _compute_luma_histogram(gray_frame: np.ndarray) -> np.ndarray:
-    """Compute the exact 32-bin L1-normalized luma histogram used by scene analysis."""
+def streaming_frame_names(count: int) -> tuple[str, ...]:
+    return tuple(f"frame_{idx:06d}.png" for idx in range(1, count + 1))
 
-    histogram = cv2.calcHist([gray_frame], [0], None, [32], [0, 256]).astype(np.float32)
-    normalized = np.empty_like(histogram)
-    cv2.normalize(histogram, normalized, alpha=1.0, norm_type=cv2.NORM_L1)
-    return normalized.reshape(-1)
+
+def stream_index_for_clip(
+    metadata: dict[str, Any] | None, video_fp: str | None, frame_range: tuple[int, int]
+) -> dict[str, Any] | None:
+    if (
+        metadata
+        and metadata.get("algorithm_version") == STREAMING_SOURCE_ALGORITHM_VERSION
+        and video_fp
+        and metadata.get("source_video_fingerprint") == video_fp
+        and (metadata.get("start_frame"), metadata.get("end_frame_exclusive")) == frame_range
+        and all(
+            type(metadata.get(k)) is int and metadata[k] > 0
+            for k in ("width", "height", "num_frames")
+        )
+        and type(metadata.get("use_cuda")) is bool
+    ):
+        return metadata
+    return None
 
 
 def _read_exact(stream: Any, target: bytearray) -> int:
@@ -86,7 +103,28 @@ def _resolve_clip_interval(
     return frame_range, start_time, duration
 
 
-def _scan_gray_stream(
+def _read_png_histogram(stream: IO[bytes]) -> np.ndarray | None:
+    frame = bytearray(stream.read(8))
+    if not frame:
+        return None
+    # image2pipe concatenates PNGs; keep each frame's color chunks for OpenCV's gray decode.
+    while True:
+        header = stream.read(8)
+        length, kind = struct.unpack(">I4s", header)
+        frame.extend(header)
+        payload = stream.read(length + 4)  # Includes the chunk CRC.
+        if len(payload) != length + 4:
+            raise OSError("Incomplete PNG from FFmpeg")
+        frame.extend(payload)
+        if kind == b"IEND":
+            break
+    gray = cv2.imdecode(np.frombuffer(frame, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    if gray is None:
+        raise OSError("Could not decode PNG from FFmpeg")
+    return luma_histogram(gray)
+
+
+def _scan_video_stream(
     video_path: Path,
     *,
     start_time: str,
@@ -94,8 +132,14 @@ def _scan_gray_stream(
     width: int,
     height: int,
     compute_histograms: bool,
+    use_cuda: bool,
 ) -> tuple[int, tuple[np.ndarray, ...] | None] | None:
-    gray_nbytes = width * height
+    frame_nbytes = width * height
+    output = (
+        ["-pix_fmt", "rgb24", "-c:v", "png", "-compression_level", "0", "-f", "image2pipe"]
+        if compute_histograms
+        else ["-pix_fmt", "gray", "-f", "rawvideo"]
+    )
     cmd = [
         "ffmpeg",
         "-nostdin",
@@ -103,18 +147,16 @@ def _scan_gray_stream(
         "error",
         "-threads",
         "0",
+        *(["-hwaccel", "cuda"] if use_cuda else []),
         "-ss",
         start_time,
         "-i",
         str(video_path),
         "-t",
         duration,
-        "-pix_fmt",
-        "gray",
         "-fps_mode",
         "passthrough",
-        "-f",
-        "rawvideo",
+        *output,
         "pipe:1",
     ]
     try:
@@ -122,35 +164,32 @@ def _scan_gray_stream(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            bufsize=max(gray_nbytes * 4, 1024 * 1024),
+            bufsize=max(frame_nbytes, 1024 * 1024),
         )
     except OSError:
         return None
 
-    buf = bytearray(gray_nbytes)
     frame_count = 0
     histograms: list[np.ndarray] = []
-    partial_trailing = False
     try:
         assert proc.stdout is not None
-        while True:
-            got = _read_exact(proc.stdout, buf)
-            if got == 0:
-                break
-            if got < gray_nbytes:
-                partial_trailing = True
-                break
-            frame_count += 1
-            if compute_histograms:
-                gray = np.frombuffer(buf, dtype=np.uint8).reshape(height, width)
-                histograms.append(_compute_luma_histogram(gray))
+        if compute_histograms:
+            while (histogram := _read_png_histogram(proc.stdout)) is not None:
+                histograms.append(histogram)
+            frame_count = len(histograms)
+        else:
+            buf = bytearray(frame_nbytes)
+            while got := _read_exact(proc.stdout, buf):
+                if got != frame_nbytes:
+                    raise OSError("Incomplete gray frame from FFmpeg")
+                frame_count += 1
         proc.stdout.close()
         returncode = proc.wait(timeout=30.0)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, struct.error, cv2.error, subprocess.SubprocessError):
         _terminate_ffmpeg_process(proc)
         return None
 
-    if returncode != 0 or partial_trailing or frame_count <= 0:
+    if returncode != 0 or frame_count <= 0:
         return None
     return frame_count, (tuple(histograms) if compute_histograms else None)
 
@@ -218,6 +257,7 @@ class VideoFrameSource:
     source_fingerprint: str
     luma_histograms: tuple[np.ndarray, ...] | None
     virtual_dir: Path
+    use_cuda: bool = False
 
     def virtual_frame_files(self) -> list[Path]:
         """Return canonical virtual frame paths matching extract_frames naming."""
@@ -297,6 +337,7 @@ class SequentialVideoFrameReader:
             "error",
             "-threads",
             "0",
+            *(["-hwaccel", "cuda"] if self.source.use_cuda else []),
             "-ss",
             self.source.start_time,
             "-i",
@@ -304,7 +345,7 @@ class SequentialVideoFrameReader:
             "-t",
             self.source.duration,
             "-pix_fmt",
-            "bgr24",
+            "rgb24",
             "-fps_mode",
             "passthrough",
             "-f",
@@ -346,14 +387,15 @@ class SequentialVideoFrameReader:
         if got < self._frame_nbytes:
             tail = "; ".join(self._stderr_lines)
             self._stop_process()
+            decoder = "CUDA" if self.source.use_cuda else "CPU"
             raise OSError(
-                f"Streaming video frame {self._next_stream_index} truncated "
+                f"Streaming video frame {self._next_stream_index} truncated using {decoder} "
                 f"({got}/{self._frame_nbytes} bytes)" + (f": {tail}" if tail else "")
             )
         frame = np.frombuffer(self._buffer, dtype=np.uint8).reshape(
             self.source.height, self.source.width, 3
         )
-        return frame.copy()
+        return frame[:, :, ::-1].copy()
 
     def get_frame(self, index: int) -> np.ndarray:
         """Return contiguous uint8 BGR frame at 0-based stream index."""
@@ -378,19 +420,10 @@ class SequentialVideoFrameReader:
                 cur_idx = self._next_stream_index
                 frame = self._read_next_frame_locked()
                 self._next_stream_index += 1
-                if self.consume_once:
-                    if cur_idx == index:
-                        return frame
-                    self._cache[cur_idx] = frame
-                else:
-                    self._cache[cur_idx] = frame
-                    evict_before = cur_idx - self.window_size
-                    if evict_before >= 0:
-                        for old_idx in [k for k in self._cache if k <= evict_before]:
-                            del self._cache[old_idx]
+                self._cache.pop(cur_idx - self.window_size, None)
+                self._cache[cur_idx] = frame
 
-            result = self._cache[index]
-            return self._cache.pop(index) if self.consume_once else result
+            return self._cache.pop(index) if self.consume_once else self._cache[index]
 
     def close(self) -> None:
         with self._lock:
@@ -406,8 +439,9 @@ def build_video_frame_source(
     settings: dict[str, Any],
     *,
     compute_histograms: bool = True,
+    reuse_index: bool = False,
 ) -> VideoFrameSource | None:
-    """Index a video clip in one fast gray rawvideo FFmpeg pass (zero PNGs on disk)."""
+    """Index the selected clip without writing source PNGs."""
 
     source_path = Path(video_path)
     if not source_path.is_file():
@@ -416,26 +450,52 @@ def build_video_frame_source(
     if interval is None:
         return None
     frame_range, start_time, duration = interval
-    probed = _probe_ffmpeg_decoded_dimensions(source_path, start_time)
-    if probed is None:
-        return None
-    width, height = probed
-    scanned = _scan_gray_stream(
-        source_path,
-        start_time=start_time,
-        duration=duration,
-        width=width,
-        height=height,
-        compute_histograms=compute_histograms,
-    )
-    if scanned is None:
-        return None
-    frame_count, histograms = scanned
     start_frame, end_frame = frame_range
-    frame_names = tuple(f"frame_{idx:06d}.png" for idx in range(1, frame_count + 1))
     video_fp = file_sample_fingerprint(source_path)
+    saved = stream_index_for_clip(read_source_frame_manifest(frames_dir), video_fp, frame_range)
+    if reuse_index:
+        if saved is None:
+            return None
+        width, height = saved["width"], saved["height"]
+        frame_count, use_cuda = saved["num_frames"], saved["use_cuda"]
+        histograms = None
+    else:
+        probed = _probe_ffmpeg_decoded_dimensions(source_path, start_time)
+        if probed is None:
+            return None
+        width, height = probed
+        # Prefer the original decoder when resuming; CPU and CUDA can yield different RGB.
+        decoders = (False,) if saved and not saved["use_cuda"] else (True, False)
+        for use_cuda in decoders:
+            scanned = _scan_video_stream(
+                source_path,
+                start_time=start_time,
+                duration=duration,
+                width=width,
+                height=height,
+                compute_histograms=compute_histograms,
+                use_cuda=use_cuda,
+            )
+            if scanned is not None:
+                break
+        else:
+            return None
+        frame_count, histograms = scanned
+        atomic_write_json(
+            Path(frames_dir) / SOURCE_FRAME_METADATA_NAME,
+            {
+                "algorithm_version": STREAMING_SOURCE_ALGORITHM_VERSION,
+                "source_video_fingerprint": video_fp,
+                "start_frame": start_frame,
+                "end_frame_exclusive": end_frame,
+                "num_frames": frame_count,
+                "width": width,
+                "height": height,
+                "use_cuda": use_cuda,
+            },
+        )
     fp_payload = (
-        f"{STREAMING_SOURCE_ALGORITHM_VERSION}\0{video_fp}\0"
+        f"{STREAMING_SOURCE_ALGORITHM_VERSION}\0{use_cuda}\0{video_fp}\0"
         f"{start_frame}:{end_frame}\0{frame_count}\0{width}x{height}"
     ).encode("ascii")
     source_fingerprint = hashlib.sha256(fp_payload).hexdigest()
@@ -448,8 +508,9 @@ def build_video_frame_source(
         width=width,
         height=height,
         frame_count=frame_count,
-        frame_names=frame_names,
+        frame_names=streaming_frame_names(frame_count),
         source_fingerprint=source_fingerprint,
         luma_histograms=histograms,
         virtual_dir=Path(frames_dir),
+        use_cuda=use_cuda,
     )

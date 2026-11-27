@@ -951,6 +951,8 @@ class VideoEncoder:
         directories: dict[str, Path],
         video_properties: dict[str, Any],
         settings: dict[str, Any],
+        *,
+        reuse_index: bool = False,
     ) -> VideoFrameSource | None:
         """Build a zero-PNG streaming VideoFrameSource unless reusable PNGs already exist."""
 
@@ -967,6 +969,7 @@ class VideoEncoder:
             video_properties,
             settings,
             compute_histograms=bool(settings.get("scene_detection", True)),
+            reuse_index=reuse_index,
         )
 
     def extract_frames(

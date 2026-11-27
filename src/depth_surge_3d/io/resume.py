@@ -43,6 +43,11 @@ from ..processing.frames.stereo_generator import (
     QUALITY_STEREO_ALGORITHM_VERSION,
     STEREO_STAGE_ALGORITHM_VERSION,
 )
+from ..processing.frames.video_frame_source import (
+    STREAMING_SOURCE_ALGORITHM_VERSION,
+    stream_index_for_clip,
+    streaming_frame_names,
+)
 from ..processing.video.final_container_validation import verify_existing_final_video
 from ..utils.imaging.png_header import read_png_header
 from .durable_publish import atomic_write_bytes
@@ -319,10 +324,28 @@ def _validate_frame_stage(
 ) -> tuple[ResumeStage, list[Path], str | None]:
     frames_dir = root / "00_original_frames"
     frame_files = sorted(frames_dir.glob("frame_*.png")) if frames_dir.is_dir() else []
+    manifest = read_source_frame_manifest(frames_dir)
+    video_props = (settings_data or {}).get("video_properties", {})
     if not frame_files:
+        if manifest and manifest.get("algorithm_version") == STREAMING_SOURCE_ALGORITHM_VERSION:
+            source_fp = _current_source_fingerprint((settings_data or {}).get("metadata", {}))
+            if video_props and stream_index_for_clip(
+                manifest, source_fp, selected_frame_range(video_props, migrated_settings)
+            ):
+                count = manifest["num_frames"]
+                files = [frames_dir / name for name in streaming_frame_names(count)]
+                return (
+                    _stage("frames", (frames_dir,), "preserve", f"{count} indexed frames"),
+                    files,
+                    source_fp,
+                )
+            return (
+                _stage("frames", (frames_dir,), "invalidate", "streamed source or clip changed"),
+                [],
+                None,
+            )
         return _stage("frames", (frames_dir,), "missing", "no extracted frames present"), [], None
 
-    manifest = read_source_frame_manifest(frames_dir)
     if manifest is None:
         return (
             _stage("frames", (frames_dir,), "invalidate", "missing source frame manifest"),
@@ -336,7 +359,6 @@ def _validate_frame_stage(
             [],
             None,
         )
-    video_props = (settings_data or {}).get("video_properties", {})
     if isinstance(video_props, dict) and video_props.get("frame_count"):
         frame_range = selected_frame_range(video_props, migrated_settings)
         mismatch = source_frame_manifest_mismatch_reason(
@@ -371,7 +393,10 @@ def _validate_scene_stage(
         manifest is None
         or manifest.get("schema_version") != SCENE_SCHEMA_VERSION
         or manifest.get("algorithm_version") != SCENE_ALGORITHM_VERSION
-        or manifest.get("frame_count") != len(frame_files)
+        or (
+            manifest.get("frame_names") != [p.name for p in frame_files]
+            and manifest.get("frame_count") != len(frame_files)
+        )
     ):
         return (
             _stage("scene_data", (scene_dir,), "invalidate", "scene manifest invalid or stale"),
@@ -417,14 +442,17 @@ def _validate_raw_stage(
             None,
             0,
         )
-    if model_fingerprint is not None:
-        saved_fp = metadata.get("semantic_fingerprint")
-        if saved_fp != model_fingerprint:
-            return (
-                _stage("depth_raw", (raw_dir,), "invalidate", "depth model or settings changed"),
-                None,
-                0,
-            )
+    # The raw store also records the source frame identity and execution plan.
+    saved_fp = metadata.get("semantic_fingerprint")
+    if model_fingerprint is not None and (
+        not isinstance(saved_fp, dict)
+        or any(saved_fp.get(key) != value for key, value in model_fingerprint.items())
+    ):
+        return (
+            _stage("depth_raw", (raw_dir,), "invalidate", "depth model or settings changed"),
+            None,
+            0,
+        )
     try:
         store = RawDepthStore(raw_dir, metadata)
         completed = len(store.complete_files)
@@ -446,6 +474,12 @@ def _validate_raw_stage(
             ),
             metadata,
             completed,
+        )
+    if metadata.get("completed_count") == 0:
+        return (
+            _stage("depth_raw", (raw_dir,), "missing", "no retained raw depth frames"),
+            metadata,
+            0,
         )
     return _stage("depth_raw", (raw_dir,), "invalidate", "no valid raw depth payloads"), None, 0
 

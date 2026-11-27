@@ -10,14 +10,20 @@ import cv2
 import numpy as np
 import pytest
 
-from src.depth_surge_3d.io.operations import get_video_properties, verify_ffmpeg_installation
-from src.depth_surge_3d.processing.frames.depth_processor import DepthMapProcessor
-from src.depth_surge_3d.processing.frames.scene_analyzer import analyze_scenes_from_histograms
-from src.depth_surge_3d.processing.frames.stereo_generator import StereoPairGenerator
-from src.depth_surge_3d.processing.frames.stereo_input_manifest import (
-    publish_validated_stereo_input_manifest_v1,
+from src.depth_surge_3d.io.operations import (
+    get_video_properties,
+    save_processing_settings,
+    verify_ffmpeg_installation,
 )
+from src.depth_surge_3d.io.resume import build_resume_report
+from src.depth_surge_3d.processing.frames.depth_processor import DepthMapProcessor
+from src.depth_surge_3d.processing.frames.scene_analyzer import (
+    _luma_histogram,
+    analyze_scenes_from_histograms,
+)
+from src.depth_surge_3d.processing.frames.stereo_generator import StereoPairGenerator
 from src.depth_surge_3d.processing.frames.video_frame_source import build_video_frame_source
+from src.depth_surge_3d.processing.orchestration.pipeline_orchestrator import ProcessingOrchestrator
 from src.depth_surge_3d.processing.video.video_encoder import VideoEncoder
 from src.depth_surge_3d.inference.depth.types import DepthBatch, DepthRepresentation
 
@@ -129,6 +135,11 @@ def test_video_frame_source_zero_png_parity_concurrency_and_scene_cuts(tmp_path:
         for idx in range(8, 16):
             assert float(by_idx[idx].mean()) > 170.0
 
+    with source.open_reader(window_size=2, consume_once=True) as reader:
+        np.testing.assert_array_equal(reader.get_frame(15), by_idx[15])
+        assert len(reader._cache) <= 2
+        np.testing.assert_array_equal(reader.get_frame(0), by_idx[0])
+
     # Existing PNGs disable streaming source so resume reuses disk frames
     frames_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(frames_dir / "frame_000001.png"), np.zeros((48, 64, 3), dtype=np.uint8))
@@ -142,7 +153,69 @@ def test_video_frame_source_zero_png_parity_concurrency_and_scene_cuts(tmp_path:
 
 
 @pytest.mark.skipif(not verify_ffmpeg_installation(), reason="FFmpeg required")
-def test_depth_and_stereo_stages_run_end_to_end_with_zero_source_pngs(tmp_path: Path) -> None:
+@pytest.mark.parametrize("bt709_tags", [False, True])
+def test_streaming_histograms_match_extracted_pngs_at_bin_edges(
+    tmp_path: Path, bt709_tags: bool
+) -> None:
+    video = tmp_path / "luma.mp4"
+    pixels = 64 * 48
+    chroma = bytes([128]) * (pixels // 2)
+    samples = b"".join((bytes([y]) * pixels + chroma) * 8 for y in (106, 108))
+    samples += np.random.default_rng(7).integers(0, 256, pixels * 3 // 2, dtype=np.uint8).tobytes()
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-s",
+            "64x48",
+            "-r",
+            "24",
+            "-i",
+            "pipe:0",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "0",
+            "-colorspace",
+            "smpte170m",
+            "-color_trc",
+            "smpte170m",
+            "-color_primaries",
+            "smpte170m",
+            *(
+                [
+                    "-bsf:v",
+                    "h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1",
+                ]
+                if bt709_tags
+                else []
+            ),
+            str(video),
+        ],
+        input=samples,
+        check=True,
+    )
+    props = get_video_properties(str(video))
+    source = build_video_frame_source(video, tmp_path / "stream", props, {})
+    files = VideoEncoder().extract_frames(str(video), {"base": tmp_path}, props, {})
+    assert source is not None and source.luma_histograms is not None
+    with source.open_reader() as reader:
+        for index in (0, 8, 16):
+            np.testing.assert_array_equal(
+                source.luma_histograms[index], _luma_histogram(files[index])
+            )
+            np.testing.assert_array_equal(reader.get_frame(index), cv2.imread(str(files[index])))
+
+
+@pytest.mark.skipif(not verify_ffmpeg_installation(), reason="FFmpeg required")
+def test_depth_and_stereo_stages_run_end_to_end_with_zero_source_pngs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     video = tmp_path / "e2e_clip.mp4"
     _make_synthetic_mp4(video, num_frames=10, width=64, height=48)
     props = get_video_properties(str(video))
@@ -159,7 +232,6 @@ def test_depth_and_stereo_stages_run_end_to_end_with_zero_source_pngs(tmp_path: 
         "right_frames": job_root / "04_right_frames",
     }
     settings = {
-        "video_path": str(video),
         "keep_intermediates": False,
         "scene_detection": True,
         "scene_cut_threshold": 0.55,
@@ -186,22 +258,38 @@ def test_depth_and_stereo_stages_run_end_to_end_with_zero_source_pngs(tmp_path: 
     assert disp_files is not None and len(disp_files) == 10
     assert not frames_dir.exists() or list(frames_dir.glob("*.png")) == []
 
-    manifest = publish_validated_stereo_input_manifest_v1(
-        job_root=job_root,
-        guide_files=virtual_files,
-        geometry_files=disp_files,
-        geometry_mode="relative",
-        frame_source=source,
-    )
-    assert manifest.render_shape == (48, 64)
+    save_processing_settings(job_root, "stream", settings, props, str(video), transactional_v5=True)
+    report = build_resume_report(job_root, settings, source_video=video)
+    assert report.stage("frames").disposition == "preserve"
+    assert report.stage("scene_data").disposition == "preserve"
+    assert report.stage("disparity_maps").disposition == "preserve"
+    assert not report.migration_paths
+
     seen: list[str] = []
     stereo_gen = StereoPairGenerator()
-    ok = stereo_gen.create_stereo_pairs_from_manifest(
-        manifest,
-        dirs,
-        settings,
-        frame_consumer=lambda name, l_img, r_img: seen.append(name),
+    resume = ProcessingOrchestrator(
+        None,
+        stereo_gen,
+        None,
+        None,
+        None,
+        encoder,
+        preselected_depth_files=disp_files,
+        preselected_render_source="base",
     )
-    assert ok is True
+
+    def render_pairs(directories, settings, manifest, *_args):
+        assert manifest.render_shape == (48, 64)
+        assert manifest.frame_source.source_fingerprint == source.source_fingerprint
+        return stereo_gen.create_stereo_pairs_from_manifest(
+            manifest,
+            directories,
+            settings,
+            frame_consumer=lambda name, l_img, r_img: seen.append(name),
+        )
+
+    monkeypatch.setattr(resume, "_execute_remaining_steps", render_pairs)
+    monkeypatch.setattr(f"{source.__module__}._scan_video_stream", lambda *args, **kwargs: None)
+    assert resume._execute_pipeline(str(video), job_root, dirs, props, settings)
     assert len(seen) == 10
     assert not frames_dir.exists() or list(frames_dir.glob("*.png")) == []
