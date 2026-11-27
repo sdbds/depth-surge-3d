@@ -1023,14 +1023,19 @@ def _splat_unrepaired_eye_deferred_once(
 
     height, width = source.shape[:2]
     if renderer.device.type == "cuda" and source.dtype == np.uint8:
-        device_offsets = offsets if isinstance(offsets, torch.Tensor) else None
-        if device_frame is not None and isinstance(offsets, np.ndarray):
-            try:
-                device_offsets = renderer._transfer_offset_band(offsets)
-            except torch.cuda.OutOfMemoryError:
-                _release_after_oom(renderer)
-        pinned = _get_pinned_transfer_cache().ensure_d2h(height, width)
+        from ..fast_splat_triton import triton_splat_available
+
+        pinned = (
+            _get_pinned_transfer_cache().ensure_d2h(height, width)
+            if triton_splat_available(renderer.device)
+            else None
+        )
         if pinned is not None:
+            if device_frame is not None and isinstance(offsets, np.ndarray):
+                try:
+                    offsets = renderer._transfer_offset_band(offsets)
+                except torch.cuda.OutOfMemoryError:
+                    _release_after_oom(renderer)
             pin_rgb, pin_packed = pinned
             used_compact = True
             for start_row in range(0, height, band_height):
@@ -1043,7 +1048,6 @@ def _splat_unrepaired_eye_deferred_once(
                     start_row,
                     end_row,
                     device_frame=device_frame,
-                    device_offsets=device_offsets,
                 )
                 if compact_cuda is None:
                     used_compact = False

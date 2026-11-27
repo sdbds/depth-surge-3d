@@ -340,6 +340,42 @@ def test_quality_cuda_compact_compile_failure_falls_back_byte_exactly(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("unavailable", ["triton", "pinned", "compact"])
+def test_banded_cuda_fallback_uploads_offsets_only_once(
+    monkeypatch: pytest.MonkeyPatch, unavailable: str
+) -> None:
+    quality = importlib.import_module("src.depth_surge_3d.rendering.quality.renderer")
+    fast_splat = importlib.import_module("src.depth_surge_3d.rendering.fast_splat_triton")
+    renderer = StereoRenderer(device="cuda", profile=True)
+    frame = np.arange(6 * 11 * 3, dtype=np.uint8).reshape(6, 11, 3)
+    geometry = quality.prepare_relative_quality_frame(
+        frame=frame,
+        canonical=np.zeros((3, 5), dtype=np.float32),
+        settings=_quality_settings(stereo_strength=0.0),
+    ).geometry
+    device_frame = quality._preload_quality_device_frame(renderer, frame, geometry)
+    offsets = np.zeros(frame.shape[:2], dtype=np.int32)
+    if unavailable == "triton":
+        monkeypatch.setattr(fast_splat, "triton_splat_available", lambda _: False)
+    elif unavailable == "pinned":
+        monkeypatch.setattr(quality._get_pinned_transfer_cache(), "ensure_d2h", lambda *_: None)
+    else:
+        monkeypatch.setattr(fast_splat, "triton_compact_quality_winners", lambda *_: None)
+
+    result = quality._splat_unrepaired_eye_deferred_once(
+        renderer=renderer,
+        source=frame,
+        geometry=geometry,
+        offsets=offsets,
+        band_height=2,
+        device_frame=device_frame,
+    )
+
+    np.testing.assert_array_equal(result.image, frame)
+    assert renderer._offset_transfer_bytes == offsets.nbytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_quality_cuda_does_not_allocate_full_frame_lane_mask_buffer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

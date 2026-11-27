@@ -60,7 +60,7 @@ from .stereo_input_manifest import (
 
 STEREO_STAGE_SCHEMA_VERSION = 1
 STEREO_STAGE_ALGORITHM_VERSION = "torch-horizontal-16x-zbuffer-v3"
-QUALITY_STEREO_ALGORITHM_VERSION = "torch-horizontal-16x-rgb-geodesic-repair-v10"
+QUALITY_STEREO_ALGORITHM_VERSION = "torch-horizontal-16x-rgb-geodesic-repair-v11"
 METRIC_PROJECTION_ALGORITHM_VERSION = "crop-aware-metric-pinhole-v2"
 METRIC_CLAMP_STATS_SCHEMA_VERSION = 1
 METRIC_STEREO_COMPLETION_ERROR = "metric stereo requires completed clip-global convergence metadata"

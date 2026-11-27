@@ -1585,6 +1585,8 @@ py::tuple solve_geodesic_regions(
     statistics["queue_pops"] = pop_count;
     // Preserve the scratch-accounting field while charging the cached keys too.
     statistics["heap_pixel_bytes"] = heap_storage_bytes;
+    statistics["distance_bytes"] = distance.nbytes();
+    statistics["heap_position_bytes"] = position.nbytes();
     return py::make_tuple(
         std::move(owner),
         std::move(distance),
@@ -1673,22 +1675,24 @@ py::tuple solve_geodesic_regions_owner_only(
     py::array_t<std::uint32_t> owner({guide.shape(0), guide.shape(1)});
     auto* owner_values = owner.mutable_data();
     std::uint32_t band_count = 0;
+    std::uint32_t settled = 0;
+    std::uint32_t max_live_entries = 0;
+    std::uint64_t insertions = 0;
+    std::uint64_t decrease_keys = 0;
     std::uint64_t heap_storage_bytes = 0;
+    std::uint64_t distance_bytes = 0;
+    std::uint64_t position_bytes = 0;
     {
         py::gil_scoped_release release;
         constexpr std::uint32_t kThreadLocalSlotCap = 2500000U;
         thread_local std::vector<std::uint32_t> tl_band_slot;
         std::vector<std::uint32_t> local_band_slot;
-        std::uint32_t* band_slot = nullptr;
-        if (sample_count <= kThreadLocalSlotCap) {
-            if (tl_band_slot.size() < sample_count) {
-                tl_band_slot.assign(sample_count, kUint32Max);
-            }
-            band_slot = tl_band_slot.data();
-        } else {
-            local_band_slot.assign(sample_count, kUint32Max);
-            band_slot = local_band_slot.data();
+        auto& slots = sample_count <= kThreadLocalSlotCap ? tl_band_slot : local_band_slot;
+        if (slots.size() < sample_count) {
+            slots.assign(sample_count, kUint32Max);
         }
+        auto* band_slot = slots.data();
+        position_bytes = slots.capacity() * sizeof(std::uint32_t);
 
         std::memcpy(
             owner_values,
@@ -1697,20 +1701,6 @@ py::tuple solve_geodesic_regions_owner_only(
         );
         std::vector<std::uint32_t> band_pixels;
         band_pixels.reserve(sample_count / 16U + 64U);
-        for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
-            if (seed_values[pixel] >= rank_count) {
-                throw std::invalid_argument(
-                    "seed region exceeds region_rank_bits"
-                );
-            }
-            if (band_values[pixel] != 0) {
-                band_slot[pixel] = static_cast<std::uint32_t>(band_pixels.size());
-                band_pixels.push_back(pixel);
-            }
-        }
-        band_count = static_cast<std::uint32_t>(band_pixels.size());
-        heap_storage_bytes = static_cast<std::uint64_t>(band_count) * 20ULL;
-
         struct SlotCleaner {
             std::uint32_t* slots;
             const std::vector<std::uint32_t>& pixels;
@@ -1724,13 +1714,27 @@ py::tuple solve_geodesic_regions_owner_only(
             }
         } slot_cleaner{band_slot, band_pixels, sample_count <= kThreadLocalSlotCap};
 
+        for (std::uint32_t pixel = 0; pixel < sample_count; ++pixel) {
+            if (seed_values[pixel] >= rank_count) {
+                throw std::invalid_argument("seed region exceeds region_rank_bits");
+            }
+            if (band_values[pixel] != 0) {
+                band_pixels.push_back(pixel);
+                band_slot[pixel] = static_cast<std::uint32_t>(band_pixels.size() - 1);
+            }
+        }
+        band_count = static_cast<std::uint32_t>(band_pixels.size());
+        heap_storage_bytes = band_pixels.capacity() * sizeof(std::uint32_t);
+
         if (band_count > 0) {
             std::vector<std::uint64_t> band_dist(
                 band_count,
                 std::numeric_limits<std::uint64_t>::max()
             );
             std::vector<std::uint32_t> band_owner(band_count, 0);
-            std::vector<std::uint8_t> band_settled(band_count, 0);
+            std::vector<std::uint32_t> bucket_position(band_count);
+            distance_bytes = band_dist.capacity() * sizeof(std::uint64_t);
+            position_bytes += bucket_position.capacity() * sizeof(std::uint32_t);
 
             thread_local std::array<std::vector<std::uint32_t>, kDialBuckets> tl_buckets;
             thread_local std::vector<std::uint32_t> tl_active_bucket;
@@ -1751,8 +1755,31 @@ py::tuple solve_geodesic_regions_owner_only(
                 }
             } bucket_cleaner{tl_buckets, non_empty_mask};
 
-            const auto push_bucket = [&](std::uint64_t dist, std::uint32_t slot) {
+            const auto push_or_decrease = [&](std::uint64_t dist, std::uint32_t slot) {
+                const std::uint64_t old_dist = band_dist[slot];
+                if (old_dist != std::numeric_limits<std::uint64_t>::max()) {
+                    ++decrease_keys;
+                    if (old_dist == dist) {
+                        return;  // A better owner at the same distance keeps its bucket slot.
+                    }
+                    const auto old_b = static_cast<std::uint32_t>(old_dist & kDialMask);
+                    auto& old_bucket = tl_buckets[old_b];
+                    const std::uint32_t pos = bucket_position[slot];
+                    old_bucket[pos] = old_bucket.back();
+                    bucket_position[old_bucket[pos]] = pos;
+                    old_bucket.pop_back();
+                    if (old_bucket.empty()) {
+                        non_empty_mask[old_b >> 6U] &= ~(1ULL << (old_b & 63U));
+                    }
+                } else {
+                    ++insertions;
+                    max_live_entries = std::max(
+                        max_live_entries, static_cast<std::uint32_t>(insertions - settled)
+                    );
+                }
+                band_dist[slot] = dist;
                 const std::uint32_t b = static_cast<std::uint32_t>(dist & kDialMask);
+                bucket_position[slot] = static_cast<std::uint32_t>(tl_buckets[b].size());
                 tl_buckets[b].push_back(slot);
                 non_empty_mask[b >> 6U] |= (1ULL << (b & 63U));
             };
@@ -1761,9 +1788,8 @@ py::tuple solve_geodesic_regions_owner_only(
                 const std::uint32_t pixel = band_pixels[slot];
                 const std::uint32_t seed_owner = owner_values[pixel];
                 if (seed_owner != 0) {
-                    band_dist[slot] = 0;
                     band_owner[slot] = seed_owner;
-                    push_bucket(0, slot);
+                    push_or_decrease(0, slot);
                     continue;
                 }
                 std::uint64_t best_dist = std::numeric_limits<std::uint64_t>::max();
@@ -1795,16 +1821,14 @@ py::tuple solve_geodesic_regions_owner_only(
                     }
                 });
                 if (best_owner != 0) {
-                    band_dist[slot] = best_dist;
                     band_owner[slot] = best_owner;
-                    push_bucket(best_dist, slot);
+                    push_or_decrease(best_dist, slot);
                 }
             }
 
             const std::uint64_t maximum_prunable_source =
                 std::numeric_limits<std::uint64_t>::max() - maximum_movement;
             std::uint64_t cur_dist = 0;
-            std::uint32_t settled = 0;
             while (settled < band_count) {
                 const std::uint32_t b = static_cast<std::uint32_t>(cur_dist & kDialMask);
                 const std::uint32_t w0 = b >> 6U;
@@ -1814,7 +1838,8 @@ py::tuple solve_geodesic_regions_owner_only(
                 if (first_masked != 0) {
                     next_b = (w0 << 6U) | ctz64(first_masked);
                 } else {
-                    for (std::uint32_t step = 1; step < kDialBuckets / 64U; ++step) {
+                    // Revisit w0 last: it may still have occupied bits below bit0.
+                    for (std::uint32_t step = 1; step <= kDialBuckets / 64U; ++step) {
                         const std::uint32_t w = (w0 + step) & ((kDialBuckets / 64U) - 1U);
                         const std::uint64_t word = non_empty_mask[w];
                         if (word != 0) {
@@ -1840,10 +1865,7 @@ py::tuple solve_geodesic_regions_owner_only(
                         ? cur_dist + movement_base_cost
                         : 0;
                 for (const std::uint32_t slot : tl_active_bucket) {
-                    if (band_settled[slot] != 0 || band_dist[slot] != cur_dist) {
-                        continue;
-                    }
-                    band_settled[slot] = 1;
+                    bucket_position[slot] = kUint32Max;
                     ++settled;
                     const std::uint32_t pixel = band_pixels[slot];
                     const std::uint32_t source_owner = band_owner[slot];
@@ -1853,7 +1875,7 @@ py::tuple solve_geodesic_regions_owner_only(
                     const std::uint32_t x = pixel - y * width;
                     const auto relax_nb = [&](std::uint32_t nb) {
                         const std::uint32_t nb_slot = band_slot[nb];
-                        if (nb_slot == kUint32Max || band_settled[nb_slot] != 0) {
+                        if (nb_slot == kUint32Max || bucket_position[nb_slot] == kUint32Max) {
                             return;
                         }
                         const std::uint64_t nb_dist = band_dist[nb_slot];
@@ -1878,9 +1900,8 @@ py::tuple solve_geodesic_regions_owner_only(
                             band_owner[nb_slot],
                             rank_values
                         )) {
-                            band_dist[nb_slot] = cand_dist;
                             band_owner[nb_slot] = source_owner;
-                            push_bucket(cand_dist, nb_slot);
+                            push_or_decrease(cand_dist, nb_slot);
                         }
                     };
                     if (y != 0) {
@@ -1900,16 +1921,23 @@ py::tuple solve_geodesic_regions_owner_only(
             if (settled != band_count) {
                 throw std::invalid_argument("edge-band component has no seed");
             }
+            heap_storage_bytes += sizeof(tl_buckets) + sizeof(non_empty_mask) +
+                (band_owner.capacity() + tl_active_bucket.capacity()) * sizeof(std::uint32_t);
+            for (const auto& bucket : tl_buckets) {
+                heap_storage_bytes += bucket.capacity() * sizeof(std::uint32_t);
+            }
         }
     }
 
     py::dict statistics;
-    statistics["max_live_entries"] = band_count;
-    statistics["settled_count"] = band_count;
-    statistics["queue_insertions"] = static_cast<std::uint64_t>(band_count);
-    statistics["queue_decrease_keys"] = static_cast<std::uint64_t>(0);
-    statistics["queue_pops"] = static_cast<std::uint64_t>(band_count);
+    statistics["max_live_entries"] = max_live_entries;
+    statistics["settled_count"] = settled;
+    statistics["queue_insertions"] = insertions;
+    statistics["queue_decrease_keys"] = decrease_keys;
+    statistics["queue_pops"] = settled;
     statistics["heap_pixel_bytes"] = heap_storage_bytes;
+    statistics["distance_bytes"] = distance_bytes;
+    statistics["heap_position_bytes"] = position_bytes;
     return py::make_tuple(std::move(owner), std::move(statistics));
 }
 

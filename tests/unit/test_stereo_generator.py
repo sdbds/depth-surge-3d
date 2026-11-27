@@ -78,6 +78,34 @@ def test_relative_stereo_generation_and_resume_skip(tmp_path: Path, render_mode:
     assert gen.create_stereo_pairs_from_files(frames, disps, dirs, settings) is True
 
 
+def test_quality_resume_rebuilds_telea_frames_and_downstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.depth_surge_3d.processing.frames import stereo_generator
+
+    frames, disps, dirs = _write_relative_fixture(tmp_path, count=2)
+    gen = StereoPairGenerator(renderer=StereoRenderer(device="cpu"))
+    settings = {"stereo_render_mode": "quality", "occlusion_fill": "background"}
+    with monkeypatch.context() as legacy:
+        legacy.setattr(
+            stereo_generator,
+            "QUALITY_STEREO_ALGORITHM_VERSION",
+            "torch-horizontal-16x-rgb-geodesic-repair-v10",
+        )
+        assert gen.create_stereo_pairs_from_files(frames, disps, dirs, settings)
+
+    (dirs["left_frames"] / frames[1].name).unlink()
+    dirs["vr_frames"] = tmp_path / "vr_frames"
+    dirs["vr_frames"].mkdir()
+    stale_vr = dirs["vr_frames"] / frames[0].name
+    stale_vr.touch()
+
+    assert gen.create_stereo_pairs_from_files(frames, disps, dirs, settings)
+    assert gen.last_pipeline_stats is not None
+    assert gen.last_pipeline_stats.render_count == 2
+    assert not stale_vr.exists()
+
+
 def test_streamed_frame_consumer_skips_disk_rgb_writes(tmp_path: Path) -> None:
     frames, disps, dirs = _write_relative_fixture(tmp_path, count=2)
     manifest = publish_validated_stereo_input_manifest_v1(

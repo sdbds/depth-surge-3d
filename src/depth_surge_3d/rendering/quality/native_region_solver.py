@@ -52,9 +52,8 @@ def solve_native_geodesic_regions(
             )
             distance = np.empty((0, 0), dtype=np.uint64)
             position = np.empty((0, 0), dtype=np.int32)
-            sample_count = int(band_mask.size)
-            distance_bytes = sample_count * 8
-            position_bytes = sample_count * 4
+            distance_bytes = int(statistics["distance_bytes"])
+            position_bytes = int(statistics["heap_position_bytes"])
         else:
             owner, distance, position, statistics = native.solve_geodesic_regions(
                 guide,
